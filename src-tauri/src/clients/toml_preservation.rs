@@ -869,6 +869,130 @@ mod tests {
             assert_eq!(parsed["profiles"]["other"]["keep"].as_bool(), Some(true));
         }
     }
+    #[test]
+    fn security_legacy_move_restore_keeps_eof_comment_after_restored_entry() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("legacy-eof-boundary");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        let path = fixture.0.join("config.toml");
+        std::fs::write(
+            &path,
+            "# BEGIN NATIVE\n[mcp_servers.native]\ncommand = 'native'\n# END NATIVE\n",
+        )
+        .unwrap();
+        moved::record("fixture", Format::TomlMcpServers, &path).unwrap();
+        assert!(restore::toml_prefix_provenance("fixture", &path)
+            .unwrap()
+            .is_none());
+        std::fs::write(&path, "# END NATIVE").unwrap();
+        moved::restore("fixture", Format::TomlMcpServers, &path).unwrap();
+        let output = read_config_file(&path).unwrap();
+        assert_eq!(output.matches("# BEGIN NATIVE").count(), 1);
+        assert_eq!(output.matches("# END NATIVE").count(), 1);
+        assert!(
+            output.find("# BEGIN NATIVE").unwrap() < output.find("[mcp_servers.native]").unwrap(),
+            "{output}"
+        );
+        assert!(
+            output.find("[mcp_servers.native]").unwrap() < output.find("# END NATIVE").unwrap(),
+            "{output}"
+        );
+        let parsed: toml::Value = toml::from_str(&output).unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["native"]["command"].as_str(),
+            Some("native")
+        );
+    }
+
+    #[test]
+    fn security_renamed_gateway_keeps_native_transfer_evidence_and_boundary() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("renamed-gateway-boundary");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        let gateway = super::super::tests::sample_gateway(None, "codex");
+        let mut owned = gateway.clone();
+        owned.command = Some("conduit-gateway".into());
+        owned.env.clear();
+        let mut registry = crate::registry::Registry::default();
+        registry.set_client_managed_entry("codex", ManagedEntry::from_gateway_entry(&owned));
+        crate::registry::save(&registry).unwrap();
+        for user_gateway_edit in [false, true] {
+            let path = fixture.0.join(format!("{user_gateway_edit}.toml"));
+            std::fs::write(&path, "# BEGIN NATIVE\n[mcp_servers.native]\ncommand = 'native'\nmetadata = {keep = true}\n# END NATIVE\n[mcp_servers.conduit]\ncommand = 'conduit-gateway'\n# second alias comment\n[mcp_servers.Conduit]\ncommand = 'conduit-gateway'\n[profiles.work]\nmodel = 'before'\nextra = 'keep'\n").unwrap();
+            mutation::run("codex", &path, Format::TomlMcpServers, || {
+                moved::record_selected("codex", Format::TomlMcpServers, &path, &["native".into()])?;
+                moved::remove_selected(Format::TomlMcpServers, &path, &["native".into()])?;
+                edit_toml_gateway(&path, Some(&gateway))
+            })
+            .unwrap();
+            let mut edited: DocumentMut = read_config_file(&path)
+                .unwrap()
+                .replace("model = 'before'", "model = 'user-edit'")
+                .parse()
+                .unwrap();
+            if user_gateway_edit {
+                let table = edited["mcp_servers"]["toolport"].as_table_mut().unwrap();
+                table.insert(
+                    "user_extra",
+                    toml_edit::Item::Value(toml_edit::Value::from("keep")),
+                );
+                let prefix = table
+                    .decor()
+                    .prefix()
+                    .and_then(|raw| raw.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                table
+                    .decor_mut()
+                    .set_prefix(format!("# user gateway comment\n{prefix}"));
+            }
+            std::fs::write(&path, edited.to_string()).unwrap();
+            mutation::run("codex", &path, Format::TomlMcpServers, || {
+                assert!(restore::apply("codex", Format::TomlMcpServers, &path)?);
+                Ok(())
+            })
+            .unwrap();
+            let output = read_config_file(&path).unwrap();
+            assert_eq!(output.matches("# BEGIN NATIVE").count(), 1, "{output}");
+            assert_eq!(output.matches("# END NATIVE").count(), 1, "{output}");
+            assert_eq!(
+                output.matches("# second alias comment").count(),
+                1,
+                "{output}"
+            );
+            assert_eq!(
+                output.matches("# user gateway comment").count(),
+                usize::from(user_gateway_edit),
+                "{output}"
+            );
+            let native = output.find("[mcp_servers.native]").unwrap();
+            assert!(
+                output.find("# BEGIN NATIVE").unwrap() < native
+                    && native < output.find("# END NATIVE").unwrap(),
+                "{output}"
+            );
+            let parsed: toml::Value = toml::from_str(&output).unwrap();
+            assert!(parsed["mcp_servers"].get("conduit").is_none());
+            assert!(parsed["mcp_servers"].get("Conduit").is_none());
+            if user_gateway_edit {
+                assert_eq!(
+                    parsed["mcp_servers"]["toolport"]["user_extra"].as_str(),
+                    Some("keep")
+                );
+            } else {
+                assert!(parsed["mcp_servers"].get("toolport").is_none());
+            }
+            assert_eq!(
+                parsed["mcp_servers"]["native"]["metadata"]["keep"].as_bool(),
+                Some(true)
+            );
+            assert_eq!(
+                parsed["profiles"]["work"]["model"].as_str(),
+                Some("user-edit")
+            );
+            assert_eq!(parsed["profiles"]["work"]["extra"].as_str(), Some("keep"));
+        }
+    }
 }
 use toml_edit::{DocumentMut, Item, Table};
 
@@ -996,17 +1120,71 @@ pub(super) fn raw_entry(doc: &DocumentMut, name: &str) -> Option<(toml_edit::Key
 
 // 既存keyの書式は保ち、不在entryを戻す場合だけ記録したkeyの表記を使う。
 pub(super) fn put_raw(doc: &mut DocumentMut, key: toml_edit::Key, item: Item) {
+    // 復元は既存EOFコメントの前へ戻す。新規登録のputとは末尾の扱いを分ける。
+    super::toml_mcp_servers_mut(doc);
+    let trailing = doc.trailing().clone();
+    doc.set_trailing("");
     let name = key.get().to_string();
     let existed = doc
         .get("mcp_servers")
         .and_then(|servers| servers.get(&name))
         .is_some();
     put(doc, &name, item);
+    doc.set_trailing(trailing);
     if !existed {
         let servers = super::toml_mcp_servers_mut(doc);
         let item = servers.get(&name).unwrap().clone();
         servers.insert_formatted(&key, item);
     }
+}
+
+// edit_toml_gatewayと同じ先頭aliasの改名だけを再現し、実際の移送先と照合する。
+fn gateway_rename_layout(original: &DocumentMut, written: &DocumentMut) -> DocumentMut {
+    let mut layout = original.clone();
+    let Some(servers) = original.get("mcp_servers").and_then(Item::as_table_like) else {
+        return layout;
+    };
+    if servers.get(super::GATEWAY_ENTRY_NAME).is_some() {
+        return layout;
+    }
+    let Some(gateway) = written
+        .get("mcp_servers")
+        .and_then(|servers| servers.get(super::GATEWAY_ENTRY_NAME))
+    else {
+        return layout;
+    };
+    if !gateway
+        .get("command")
+        .and_then(Item::as_str)
+        .is_some_and(super::command_is_gateway_binary)
+    {
+        return layout;
+    }
+    let aliases: Vec<_> = servers
+        .iter()
+        .filter(|(name, item)| {
+            super::gateway_edit_matches(name, item.get("command").and_then(Item::as_str))
+        })
+        .map(|(name, _)| name.to_string())
+        .collect();
+    let Some(first) = aliases.first() else {
+        return layout;
+    };
+    if aliases.iter().any(|name| {
+        written
+            .get("mcp_servers")
+            .and_then(|servers| servers.get(name))
+            .is_some()
+    }) {
+        return layout;
+    }
+    rename(
+        &mut layout,
+        first,
+        super::GATEWAY_ENTRY_NAME,
+        gateway.clone(),
+    );
+    layout
 }
 
 pub(super) fn rename(doc: &mut DocumentMut, old: &str, new: &str, item: Item) {
@@ -1459,7 +1637,7 @@ pub(super) fn restore_raw_entries(
 ) {
     super::toml_mcp_servers_mut(doc);
     let evidence = doc.clone();
-    let mut layout = original.clone();
+    let mut layout = gateway_rename_layout(original, written);
     super::toml_mcp_servers_mut(&mut layout);
     let missing: Vec<_> = entries
         .iter()
@@ -1579,7 +1757,8 @@ pub(super) fn retained_prefix(
     written: &DocumentMut,
     current: &DocumentMut,
 ) -> Vec<String> {
-    let missing: Vec<_> = original
+    let mut replay = gateway_rename_layout(original, written);
+    let missing: Vec<_> = replay
         .get("mcp_servers")
         .and_then(Item::as_table_like)
         .map(|servers| {
@@ -1595,7 +1774,6 @@ pub(super) fn retained_prefix(
                 .collect()
         })
         .unwrap_or_default();
-    let mut replay = original.clone();
     remove(&mut replay, &missing)
         .into_iter()
         .filter(|transfer| {
