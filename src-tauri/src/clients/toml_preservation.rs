@@ -55,6 +55,167 @@ mod tests {
     }
 
     #[test]
+    fn restore_recovers_lost_header_decor_but_keeps_later_user_edit() {
+        let original: DocumentMut = "[mcp_servers.a] # END\ncommand = 'old'\n".parse().unwrap();
+        let written: DocumentMut = "[mcp_servers.a]\ncommand = 'new'\n".parse().unwrap();
+        for (suffix, expected) in [("", "# END"), (" # user", "# user")] {
+            let mut current: DocumentMut =
+                format!("[mcp_servers.a]{suffix}\ncommand = 'new'\n[profile]\nx = 1\n")
+                    .parse()
+                    .unwrap();
+            let raw = super::raw_entry(&original, "a").unwrap();
+            super::restore_raw_entries(&original, &written, &mut current, vec![raw]);
+            let text = current.to_string();
+            assert!(text.contains(expected), "{text}");
+            if !suffix.is_empty() {
+                assert!(!text.contains("# END"), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn restore_recovers_lost_prefix_and_respects_later_prefix_edit() {
+        let original: DocumentMut = "# END legacy\n[mcp_servers.a]\ncommand = 'old'\n"
+            .parse()
+            .unwrap();
+        let written: DocumentMut = "[mcp_servers.a]\ncommand = 'new'\n".parse().unwrap();
+        for (prefix, expected) in [("", "# END legacy"), ("# user\n", "# user")] {
+            let mut current: DocumentMut =
+                format!("{prefix}[mcp_servers.a]\ncommand = 'new'\n[profile]\nx = 1\n")
+                    .parse()
+                    .unwrap();
+            super::restore_raw_entries(
+                &original,
+                &written,
+                &mut current,
+                vec![super::raw_entry(&original, "a").unwrap()],
+            );
+            let text = current.to_string();
+            assert!(text.contains(expected), "{text}");
+            if !prefix.is_empty() {
+                assert!(!text.contains("# END legacy"), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn partial_args_and_env_updates_keep_child_comments() {
+        let fixture = Fixture::new("partial-fields");
+        let path = fixture.0.join("config.toml");
+        let mut gateway = super::super::tests::sample_gateway(None, "codex");
+        gateway.args = vec!["keep".into(), "new".into()];
+        gateway.env = vec![
+            EnvVar {
+                key: "KEEP".into(),
+                value: Some("same".into()),
+                secret: false,
+                unknown_fields: Default::default(),
+            },
+            EnvVar {
+                key: "CHANGE".into(),
+                value: Some("new".into()),
+                secret: false,
+                unknown_fields: Default::default(),
+            },
+        ];
+        let input = "[mcp_servers.toolport]\ncommand = 'toolport-gateway'\nargs = [\n  'keep', # keep argument\n  'old', # changed argument\n]\n[mcp_servers.toolport.env] # env header\nKEEP = 'same' # keep variable\nCHANGE = 'old' # changed variable\n";
+        for inventory in [true, false] {
+            std::fs::write(&path, input).unwrap();
+            if inventory {
+                write_toml(&path, std::slice::from_ref(&gateway)).unwrap();
+            } else {
+                edit_toml_gateway(&path, Some(&gateway)).unwrap();
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for comment in [
+                "# keep argument",
+                "# changed argument",
+                "# env header",
+                "# keep variable",
+                "# changed variable",
+            ] {
+                assert!(text.contains(comment), "missing {comment}: {text}");
+            }
+            let value: toml::Value = toml::from_str(&text).unwrap();
+            assert_eq!(
+                value["mcp_servers"]["toolport"]["args"][1].as_str(),
+                Some("new")
+            );
+            assert_eq!(
+                value["mcp_servers"]["toolport"]["env"]["CHANGE"].as_str(),
+                Some("new")
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_rebases_nested_tables_after_parent() {
+        let saved: DocumentMut = "[mcp_servers.a]\ncommand='old'\n[mcp_servers.a.env]\nX='y'\n"
+            .parse()
+            .unwrap();
+        let mut current: DocumentMut =
+            "[profile]\nx=1\n[mcp_servers.a]\ncommand='new'\n[other]\nx=2\n"
+                .parse()
+                .unwrap();
+        let (key, item) = super::raw_entry(&saved, "a").unwrap();
+        super::put_raw(&mut current, key, item);
+        let text = current.to_string();
+        assert!(
+            text.find("[mcp_servers.a]").unwrap() < text.find("[mcp_servers.a.env]").unwrap(),
+            "{text}"
+        );
+        text.parse::<DocumentMut>().unwrap();
+    }
+
+    #[test]
+    fn inline_container_comment_survives_inventory_and_gateway() {
+        let fixture = Fixture::new("inline-parent-comment");
+        let path = fixture.0.join("config.toml");
+        for input in [
+            "# parent\nmcp_servers = {}\n",
+            "# parent\nmcp_servers = { old = { command = 'old' } }\n",
+        ] {
+            std::fs::write(&path, input).unwrap();
+            let gateway = super::super::tests::sample_gateway(None, "codex");
+            write_toml(&path, std::slice::from_ref(&gateway)).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.contains("# parent"), "{text}");
+            std::fs::write(&path, input).unwrap();
+            edit_toml_gateway(&path, Some(&gateway)).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.contains("# parent"), "{text}");
+        }
+    }
+
+    #[test]
+    fn changed_inventory_and_gateway_alias_keep_unowned_fields() {
+        let fixture = Fixture::new("field-update");
+        let path = fixture.0.join("config.toml");
+        let gateway = super::super::tests::sample_gateway(None, "codex");
+        for name in [&gateway.name, "conduit"] {
+            let input = format!("[mcp_servers.{name}]\ncommand = 'toolport-gateway' # command comment\nstartup_timeout_sec = 600\n[mcp_servers.{name}.metadata]\ncustom = 'keep' # metadata comment\n");
+            std::fs::write(&path, &input).unwrap();
+            if name == &gateway.name {
+                write_toml(&path, std::slice::from_ref(&gateway)).unwrap();
+            } else {
+                edit_toml_gateway(&path, Some(&gateway)).unwrap();
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                text.contains("startup_timeout_sec = 600")
+                    && text.contains("# metadata comment")
+                    && text.contains("# command comment"),
+                "{text}"
+            );
+            let parsed: toml::Value = toml::from_str(&text).unwrap();
+            assert_eq!(
+                parsed["mcp_servers"][&gateway.name]["metadata"]["custom"].as_str(),
+                Some("keep")
+            );
+        }
+    }
+
+    #[test]
     fn boundary_comments_survive_gateway_update_and_remove() {
         for newline in ["\n", "\r\n"] {
             let fixture = Fixture::new("toml-marker-gateway");
@@ -2290,7 +2451,174 @@ pub(super) fn expand_container(doc: &mut DocumentMut) {
     }
 }
 
+// Inventory owns only these registration fields. Keep every other field and
+// retain the syntax of fields whose semantic value did not change.
+pub(super) fn update_entry(doc: &mut DocumentMut, name: &str, entry: &super::ServerEntry) {
+    let generated = super::toml_value_to_item(&super::entry_to_toml(entry));
+    let Some(existing) = super::toml_mcp_servers_mut(doc).get_mut(name) else {
+        put(doc, name, generated);
+        return;
+    };
+    let Some(table) = existing.as_table_like_mut() else {
+        put(doc, name, generated);
+        return;
+    };
+    let desired = generated.as_table_like().unwrap();
+    for field in ["command", "args", "url", "env"] {
+        let equal = match (table.get(field), desired.get(field)) {
+            (None, None) => true,
+            (Some(a), Some(b)) if field == "env" => {
+                let values = |item: &Item| {
+                    item.as_table_like().map(|t| {
+                        t.iter()
+                            .map(|(k, v)| (k.to_string(), v.as_str().map(str::to_string)))
+                            .collect::<std::collections::BTreeMap<_, _>>()
+                    })
+                };
+                values(a) == values(b)
+            }
+            (Some(a), Some(b)) if field == "args" => {
+                let values = |item: &Item| {
+                    item.as_array().map(|a| {
+                        a.iter()
+                            .map(|v| v.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                };
+                values(a) == values(b)
+            }
+            (Some(a), Some(b)) => a.as_str().is_some() && a.as_str() == b.as_str(),
+            _ => false,
+        };
+        if equal {
+            continue;
+        }
+        if field == "args" {
+            if let (Some(old), Some(new)) = (
+                table.get_mut(field).and_then(Item::as_array_mut),
+                desired.get(field).and_then(Item::as_array),
+            ) {
+                // Match equal values once, so their comments travel with them
+                // across insertions and reordering. A changed value inherits its
+                // old slot's decor only when that slot was not already claimed.
+                // Deleted elements and their comments leave together.
+                let previous: Vec<_> = old.iter().cloned().collect();
+                let mut used = vec![false; previous.len()];
+                let mut matches = vec![None; new.len()];
+                for (index, value) in new.iter().enumerate() {
+                    if let Some(found) = previous.iter().enumerate().position(|(i, old)| {
+                        !used[i] && old.as_str().is_some() && old.as_str() == value.as_str()
+                    }) {
+                        used[found] = true;
+                        matches[index] = Some(found);
+                    }
+                }
+                for (index, matched) in matches.iter_mut().enumerate() {
+                    if matched.is_none() && index < used.len() && !used[index] {
+                        used[index] = true;
+                        *matched = Some(index);
+                    }
+                }
+                let values: Vec<_> = new
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        let mut value = value.clone();
+                        if let Some(source) = matches[index] {
+                            if previous[source].as_str() == value.as_str() {
+                                value = previous[source].clone();
+                            } else {
+                                *value.decor_mut() = previous[source].decor().clone();
+                            }
+                        }
+                        value
+                    })
+                    .collect();
+                old.clear();
+                for value in values {
+                    old.push_formatted(value);
+                }
+                continue;
+            }
+        }
+        if field == "env" {
+            if let (Some(old), Some(new)) = (
+                table.get_mut(field).and_then(Item::as_table_like_mut),
+                desired.get(field).and_then(Item::as_table_like),
+            ) {
+                // Edit individual keys in place to retain the table header,
+                // quoting and comments. Removing a key removes its own decor;
+                // a changed value keeps its existing key and value decor.
+                let removed: Vec<_> = old
+                    .iter()
+                    .filter(|(key, _)| new.get(key).is_none())
+                    .map(|(key, _)| key.to_string())
+                    .collect();
+                for key in removed {
+                    old.remove(&key);
+                }
+                for (key, value) in new.iter() {
+                    if old.get(key).and_then(Item::as_str) == value.as_str() {
+                        continue;
+                    }
+                    let mut replacement = value.clone();
+                    if let (Some(previous), Some(next)) = (
+                        old.get(key).and_then(Item::as_value),
+                        replacement.as_value_mut(),
+                    ) {
+                        *next.decor_mut() = previous.decor().clone();
+                    }
+                    old.insert(key, replacement);
+                }
+                continue;
+            }
+        }
+        if let Some(value) = desired.get(field) {
+            let mut value = value.clone();
+            if let (Some(old), Some(new)) = (
+                table.get(field).and_then(Item::as_value),
+                value.as_value_mut(),
+            ) {
+                *new.decor_mut() = old.decor().clone();
+            }
+            table.insert(field, value);
+        } else {
+            table.remove(field);
+        }
+    }
+}
+
 pub(super) fn put(doc: &mut DocumentMut, name: &str, mut item: Item) {
+    // Replacing a table reserves positions for its entire incoming subtree.
+    // Otherwise a saved child can sort before its parent after unrelated edits.
+    let old_position = doc
+        .get("mcp_servers")
+        .and_then(|s| s.get(name))
+        .and_then(Item::as_table)
+        .and_then(Table::position);
+    if let (Some(position), Some(incoming)) = (old_position, item.as_table_mut()) {
+        let mut positions = Vec::new();
+        visit(incoming, &mut |table| {
+            positions.push(table.position().unwrap_or(usize::MAX))
+        });
+        let mut order: Vec<_> = (1..positions.len()).collect();
+        order.sort_by_key(|index| (positions[*index], *index));
+        let mut ranks = vec![0; positions.len()];
+        for (rank, index) in order.into_iter().enumerate() {
+            ranks[index] = rank + 1;
+        }
+        let extra = positions.len() - 1;
+        visit(doc.as_table_mut(), &mut |table| {
+            if let Some(at) = table.position().filter(|at| *at > position) {
+                table.set_position(at + extra);
+            }
+        });
+        let mut index = 0;
+        visit(incoming, &mut |table| {
+            table.set_position(position + ranks[index]);
+            index += 1;
+        });
+    }
     if doc
         .get("mcp_servers")
         .and_then(|servers| servers.get(name))
@@ -3486,6 +3814,35 @@ pub(super) fn restore_raw_entries_with_provenance(
             .is_some();
         if verified_live && !preserve_raw.contains(&index) {
             dedup_raw_prefix(original, written, &evidence, &mut key, &mut item);
+        }
+        // Recover decor lost by an older writer only when the user has not
+        // changed that specific boundary since the recorded write. The two
+        // boundaries are independent, so a later edit to one is retained.
+        if let (Some(saved), Some(written_table), Some(current)) = (
+            item.as_table(),
+            written
+                .get("mcp_servers")
+                .and_then(|s| s.get(key.get()))
+                .and_then(Item::as_table),
+            super::toml_mcp_servers_mut(doc)
+                .get_mut(key.get())
+                .and_then(Item::as_table_mut),
+        ) {
+            let text = |raw: Option<&toml_edit::RawString>| {
+                raw.and_then(|r| r.as_str()).unwrap_or("").to_string()
+            };
+            let saved_prefix = text(saved.decor().prefix());
+            let saved_suffix = text(saved.decor().suffix());
+            if text(written_table.decor().prefix()).is_empty()
+                && text(current.decor().prefix()).is_empty()
+            {
+                current.decor_mut().set_prefix(saved_prefix);
+            }
+            if text(written_table.decor().suffix()).is_empty()
+                && text(current.decor().suffix()).is_empty()
+            {
+                current.decor_mut().set_suffix(saved_suffix);
+            }
         }
         put_raw(doc, key, item);
     }

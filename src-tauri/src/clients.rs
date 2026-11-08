@@ -5586,6 +5586,17 @@ fn toml_mcp_servers_mut(doc: &mut toml_edit::DocumentMut) -> &mut toml_edit::Tab
 /// to prevent (SBS-884). Files with a bare header keep the old collapsed
 /// `[mcp_servers.name]` shape.
 fn toml_keeps_servers_header(doc: &toml_edit::DocumentMut) -> bool {
+    if doc
+        .get("mcp_servers")
+        .is_some_and(|item| item.is_inline_table())
+    {
+        return doc
+            .as_table()
+            .key("mcp_servers")
+            .and_then(|key| key.leaf_decor().prefix())
+            .and_then(|raw| raw.as_str())
+            .is_some_and(|prefix| prefix.contains('#'));
+    }
     let Some(table) = doc.get("mcp_servers").and_then(|item| item.as_table()) else {
         return false;
     };
@@ -6638,11 +6649,7 @@ fn write_toml(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
         if !unchanged {
             let before = doc.clone();
             let was_missing = toml_preservation::raw_entry(&before, &server.name).is_none();
-            toml_preservation::put(
-                &mut doc,
-                &server.name,
-                toml_value_to_item(&entry_to_toml(server)),
-            );
+            toml_preservation::update_entry(&mut doc, &server.name, server);
             if was_missing {
                 if let Some((_, item)) = toml_preservation::raw_entry(&doc, &server.name) {
                     if item.is_table() {
@@ -7966,30 +7973,24 @@ fn edit_toml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), Str
         .filter(|(name, _)| entry.is_none() || *name != GATEWAY_ENTRY_NAME)
         .map(|(name, _)| name.to_string())
         .collect();
-    if let Some(entry) = entry {
-        if !servers.contains_key(GATEWAY_ENTRY_NAME) && !remove.is_empty() {
-            let alias = remove.remove(0);
-            let before = doc.clone();
-            let old_destination = toml_preservation::raw_entry(&before, &alias)
-                .map(|(_, item)| toml_preservation::source_destination(&alias, &item));
-            toml_preservation::rename(
-                &mut doc,
-                &alias,
-                GATEWAY_ENTRY_NAME,
-                toml_value_to_item(&entry_to_toml(entry)),
-            );
-            if let (Some(old), Some((_, item))) = (
-                old_destination,
-                toml_preservation::raw_entry(&doc, GATEWAY_ENTRY_NAME),
-            ) {
-                moved::observe_toml_relocation(
-                    path,
-                    &before,
-                    &doc,
-                    &old,
-                    &toml_preservation::source_destination(GATEWAY_ENTRY_NAME, &item),
-                )?;
-            }
+    if entry.is_some() && !servers.contains_key(GATEWAY_ENTRY_NAME) && !remove.is_empty() {
+        let alias = remove.remove(0);
+        let before = doc.clone();
+        let old_destination = toml_preservation::raw_entry(&before, &alias)
+            .map(|(_, item)| toml_preservation::source_destination(&alias, &item));
+        let old_item = toml_preservation::raw_entry(&before, &alias).unwrap().1;
+        toml_preservation::rename(&mut doc, &alias, GATEWAY_ENTRY_NAME, old_item);
+        if let (Some(old), Some((_, item))) = (
+            old_destination,
+            toml_preservation::raw_entry(&doc, GATEWAY_ENTRY_NAME),
+        ) {
+            moved::observe_toml_relocation(
+                path,
+                &before,
+                &doc,
+                &old,
+                &toml_preservation::source_destination(GATEWAY_ENTRY_NAME, &item),
+            )?;
         }
     }
     let before = doc.clone();
@@ -7998,11 +7999,7 @@ fn edit_toml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), Str
     if let Some(entry) = entry {
         let before = doc.clone();
         let was_missing = toml_preservation::raw_entry(&before, GATEWAY_ENTRY_NAME).is_none();
-        toml_preservation::put(
-            &mut doc,
-            GATEWAY_ENTRY_NAME,
-            toml_value_to_item(&entry_to_toml(entry)),
-        );
+        toml_preservation::update_entry(&mut doc, GATEWAY_ENTRY_NAME, entry);
         if was_missing {
             if let Some((_, item)) = toml_preservation::raw_entry(&doc, GATEWAY_ENTRY_NAME) {
                 if item.is_table() {
