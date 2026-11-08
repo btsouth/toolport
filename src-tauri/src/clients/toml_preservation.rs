@@ -163,19 +163,24 @@ mod tests {
 
     #[test]
     fn removed_descendant_prefixes_follow_their_own_document_positions() {
-        let mut doc: DocumentMut = "[mcp_servers.gateway]\ncommand='gateway'\n[profiles.one]\nx=1\n# END NATIVE\n[mcp_servers.gateway.env]\nX='1'\n[profiles.two]\nx=2\n".parse().unwrap();
-        let transfers = remove(&mut doc, &["gateway".into()]);
-        let text = doc.to_string();
-        assert!(text.contains("# END NATIVE\n[profiles.two]"), "{text}");
-        assert_eq!(transfers.len(), 1);
-        assert_eq!(
-            transfers[0].source,
-            super::PrefixDestination::Table(vec![
-                ("mcp_servers".into(), None),
-                ("gateway".into(), None),
-                ("env".into(), None)
-            ])
-        );
+        for input in [
+            "[mcp_servers.gateway]\ncommand='gateway'\n[profiles.one]\nx=1\n# END NATIVE\n[mcp_servers.gateway.env]\nX='1'\n[profiles.two]\nx=2\n",
+            "# END NATIVE\n[mcp_servers.gateway.env]\nX='1'\n[profiles.two]\nx=2\n[mcp_servers.gateway]\ncommand='gateway'\n",
+        ] {
+            let mut doc: DocumentMut = input.parse().unwrap();
+            let transfers = remove(&mut doc, &["gateway".into()]);
+            let text = doc.to_string();
+            assert!(text.contains("# END NATIVE\n[profiles.two]"), "{text}");
+            assert_eq!(transfers.len(), 1);
+            assert_eq!(
+                transfers[0].source,
+                super::PrefixDestination::Table(vec![
+                    ("mcp_servers".into(), None),
+                    ("gateway".into(), None),
+                    ("env".into(), None)
+                ])
+            );
+        }
     }
 
     #[test]
