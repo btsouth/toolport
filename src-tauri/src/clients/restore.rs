@@ -502,6 +502,37 @@ pub(super) fn needs_moved(client_id: &str, path: &Path) -> Result<bool, String> 
     }))
 }
 
+pub(super) fn toml_prefix_provenance(
+    client_id: &str,
+    path: &Path,
+) -> Result<Option<(toml_edit::DocumentMut, toml_edit::DocumentMut)>, String> {
+    let Some(record) = load(client_id, path)? else {
+        return Ok(None);
+    };
+    if !matches!(record.format, Format::TomlMcpServers) {
+        return Ok(None);
+    }
+    let written = if record.disconnected {
+        record
+            .disconnect_before
+            .as_deref()
+            .or(record.last_written.as_deref())
+    } else {
+        record.last_written.as_deref()
+    };
+    let original = record
+        .original
+        .as_deref()
+        .unwrap_or("")
+        .parse()
+        .map_err(|e: toml_edit::TomlError| e.to_string())?;
+    let written = written
+        .unwrap_or("")
+        .parse()
+        .map_err(|e: toml_edit::TomlError| e.to_string())?;
+    Ok(Some((original, written)))
+}
+
 pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool, String> {
     let Some(record) = load(client_id, path)? else {
         return Ok(false);
@@ -640,6 +671,12 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
                 .unwrap_or("")
                 .parse::<toml_edit::DocumentMut>()
                 .map_err(|e| e.to_string())?;
+            let written_doc = written_text
+                .unwrap_or("")
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|e| e.to_string())?;
+            let mut restore_entries = Vec::new();
+            let mut recorded_order = std::collections::HashMap::new();
             let desired = latest.get(key).and_then(Value::as_object);
             let existing = doc
                 .get(key)
@@ -651,34 +688,62 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let servers = toml_mcp_servers_mut(&mut doc);
-            for name in existing {
-                if desired.is_none_or(|map| !map.contains_key(&name)) {
-                    servers.remove(&name);
-                }
-            }
+            let removed: Vec<_> = existing
+                .into_iter()
+                .filter(|name| desired.is_none_or(|map| !map.contains_key(name)))
+                .collect();
             if let Some(desired) = desired {
                 for (name, value) in desired {
                     if mutation::value(format, current.as_deref())?[key].get(name) != Some(value) {
-                        if let Some(item) = moved::toml_entry(client_id, path, name)? {
-                            servers.insert(name, item);
+                        if let Some((entry_key, item, index)) =
+                            moved::toml_entry(client_id, path, name)?
+                        {
+                            recorded_order.insert(entry_key.get().to_string(), index);
+                            restore_entries.push((entry_key, item));
                         } else if mutation::value(format, record.original.as_deref())?[key]
                             .get(name)
                             == Some(value)
                         {
-                            if let Some(item) = original.get(key).and_then(|table| table.get(name))
+                            if let Some((entry_key, item)) =
+                                toml_preservation::raw_entry(&original, name)
                             {
-                                servers.insert(name, item.clone());
+                                // A removed gateway may still occupy this exact
+                                // alias slot from the recorded Connect rename.
+                                let restored_slot =
+                                    removed.iter().any(|removed| removed == GATEWAY_ENTRY_NAME)
+                                        && toml_preservation::restore_renamed_slot(
+                                            &original,
+                                            &written_doc,
+                                            &mut doc,
+                                            name,
+                                            &item,
+                                        );
+                                if !restored_slot {
+                                    restore_entries.push((entry_key, item));
+                                }
                             }
                         } else {
                             let value: toml::Value =
                                 serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
-                            servers.insert(name, toml_value_to_item(&value));
+                            restore_entries
+                                .push((toml_edit::Key::new(name), toml_value_to_item(&value)));
                         }
                     }
                 }
             }
-            if latest.get(key).is_none() {
+            restore_entries.sort_by_key(|(key, _)| {
+                recorded_order.get(key.get()).copied().unwrap_or(usize::MAX)
+            });
+            let provenance = moved::toml_provenance(client_id, path, &restore_entries)?;
+            toml_preservation::restore_raw_entries_with_provenance(
+                &original,
+                &written_doc,
+                &mut doc,
+                restore_entries,
+                &provenance,
+            );
+            toml_preservation::remove(&mut doc, &removed);
+            if latest.get(key).is_none() && !super::toml_keeps_servers_header(&doc) {
                 doc.remove(key);
             }
             atomic_write(path, &doc.to_string())?;

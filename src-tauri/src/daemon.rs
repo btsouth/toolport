@@ -1205,8 +1205,19 @@ mod tests {
                 .unwrap();
         let budget = RecoveryBudget::new(Duration::from_millis(80), &cancelled);
         let started = Instant::now();
-        let result = rendezvous.ensure_with_budget(|| panic!("must not spawn"), Some(&budget));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let result = rendezvous.ensure_with_budget(
+            move || {
+                started_tx.send(()).unwrap();
+                panic!("must not spawn")
+            },
+            Some(&budget),
+        );
         assert!(result.unwrap_err().to_string().contains("deadline"));
+        assert_eq!(
+            started_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        );
         assert!(started.elapsed() < Duration::from_secs(1));
         drop(election);
         cancelled.store(true, Ordering::SeqCst);
@@ -1285,7 +1296,7 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let first = std::thread::spawn(move || {
             let cancelled = std::sync::atomic::AtomicBool::new(false);
-            let budget = RecoveryBudget::new(Duration::from_millis(80), &cancelled);
+            let budget = RecoveryBudget::cancellable(&cancelled);
             Rendezvous::new(&dir, worker_key.clone()).ensure_with_budget(
                 || {
                     first_spawns.fetch_add(1, Ordering::SeqCst);

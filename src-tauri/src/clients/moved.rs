@@ -21,6 +21,12 @@ struct Record {
     /// `CLAUDE_CONFIG_DIR`, say) is never applied.
     config_path: String,
     entries: Vec<Moved>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_optional_live"
+    )]
+    live_prefixes: Vec<toml_preservation::LivePrefix>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -40,6 +46,12 @@ enum Raw {
     /// comments survive the round trip.
     Toml {
         text: String,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_optional_capture"
+        )]
+        capture: Option<toml_preservation::TomlCapture>,
     },
     Yaml {
         text: String,
@@ -51,6 +63,22 @@ enum Raw {
     Native {
         text: String,
     },
+}
+
+// Provenance is optional recovery metadata. Invalid metadata disables its use,
+// but must not prevent loading the raw entry needed to restore legacy records.
+fn deserialize_optional_capture<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<toml_preservation::TomlCapture>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
+fn deserialize_optional_live<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<toml_preservation::LivePrefix>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 /// Where a format keeps its name -> definition server list.
@@ -129,13 +157,243 @@ pub(super) fn has_record(client_id: &str) -> bool {
 
 fn load(client_id: &str) -> Result<Option<Record>, String> {
     let path = record_path(client_id)?;
-    match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text)
+    let text = match mutation::read(&path) {
+        Some(value) => value,
+        None => match std::fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+        },
+    };
+    match text {
+        Some(text) => serde_json::from_str(&text)
             .map(Some)
             .map_err(|e| format!("could not read {}: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("could not read {}: {e}", path.display())),
+        None => Ok(None),
     }
+}
+
+// Record only transfers observed by the actual writer, applying the same offset
+// changes to existing witnesses. Layout simulations must not issue new evidence.
+pub(super) fn observe_toml_removal(
+    path: &Path,
+    before: &toml_edit::DocumentMut,
+    after: &toml_edit::DocumentMut,
+    transfers: &[toml_preservation::PrefixTransfer],
+) -> Result<(), String> {
+    let Some(client_id) = mutation::client_id(path) else {
+        return Ok(());
+    };
+    // This evidence is optional, so an unreadable record must not block the write.
+    let Ok(Some(mut record)) = load(&client_id) else {
+        return Ok(());
+    };
+    if record.config_path != path.display().to_string() {
+        return Ok(());
+    }
+    let unchanged = serde_json::to_string(&record.live_prefixes).ok();
+    let mut live = Vec::new();
+    for old in &record.live_prefixes {
+        let Some(bytes) = toml_preservation::valid_live(before, old) else {
+            continue;
+        };
+        let moved = transfers
+            .iter()
+            .find(|transfer| transfer.source == old.destination);
+        let (destination, range) = if let Some(transfer) = moved {
+            let Some(end) = transfer.landing.start.checked_add(old.range.end) else {
+                continue;
+            };
+            let Some(start) = transfer.landing.start.checked_add(old.range.start) else {
+                continue;
+            };
+            (transfer.destination.clone(), start..end)
+        } else {
+            let shift: usize = transfers
+                .iter()
+                .filter(|t| t.destination == old.destination)
+                .map(|t| t.prefix.len())
+                .sum();
+            let Some(start) = old.range.start.checked_add(shift) else {
+                continue;
+            };
+            let Some(end) = old.range.end.checked_add(shift) else {
+                continue;
+            };
+            (old.destination.clone(), start..end)
+        };
+        let Some(decor) = toml_preservation::destination_prefix(after, &destination) else {
+            continue;
+        };
+        if decor.get(range.clone()) != Some(bytes) {
+            continue;
+        }
+        live.push(toml_preservation::LivePrefix {
+            source_id: old.source_id.clone(),
+            source_range: old.source_range.clone(),
+            destination,
+            range,
+            decor_hash: crate::registry::sha256_hex(decor),
+        });
+    }
+    for entry in &record.entries {
+        let entry_transfers: Vec<_> = transfers
+            .iter()
+            .filter(|t| t.source_name == entry.name)
+            .collect();
+        if entry_transfers.is_empty() {
+            continue;
+        }
+        let Raw::Toml {
+            text,
+            capture: Some(capture),
+        } = &entry.raw
+        else {
+            continue;
+        };
+        let Some(actual_text) = toml_raw_text(before, &entry.name) else {
+            continue;
+        };
+        // A saved capture alone is insufficient: the current mutation must have
+        // captured this exact raw entry, and each capture can issue evidence once.
+        // Otherwise a re-added entry could reuse an old prefix's identity.
+        if actual_text != *text || !mutation::consume_toml_capture(path, &capture.id) {
+            continue;
+        }
+        let Ok(raw) = text.parse::<toml_edit::DocumentMut>() else {
+            continue;
+        };
+        let Some((key, item)) = toml_preservation::raw_entry(&raw, &entry.name) else {
+            continue;
+        };
+        let parent = toml_preservation::source_destination(&entry.name, &item);
+        for transfer in entry_transfers {
+            let (id, prefix, hash) = if transfer.source == parent {
+                (
+                    &capture.id,
+                    toml_preservation::capture_prefix(&key, &item),
+                    &capture.prefix_hash,
+                )
+            } else {
+                let Some(child) = capture
+                    .children
+                    .iter()
+                    .find(|child| child.source == transfer.source)
+                else {
+                    continue;
+                };
+                let Some(prefix) = toml_preservation::destination_prefix(&raw, &child.source)
+                else {
+                    continue;
+                };
+                (&child.id, prefix, &child.prefix_hash)
+            };
+            if prefix != transfer.prefix || crate::registry::sha256_hex(prefix) != *hash {
+                continue;
+            }
+            let Some(decor) = toml_preservation::destination_prefix(after, &transfer.destination)
+            else {
+                continue;
+            };
+            if decor.get(transfer.landing.clone()) != Some(prefix) {
+                continue;
+            }
+            live.push(toml_preservation::LivePrefix {
+                source_id: id.clone(),
+                source_range: 0..prefix.len(),
+                destination: transfer.destination.clone(),
+                range: transfer.landing.clone(),
+                decor_hash: crate::registry::sha256_hex(decor),
+            });
+        }
+    }
+    record.live_prefixes = live;
+    if serde_json::to_string(&record.live_prefixes).ok() == unchanged {
+        return Ok(());
+    }
+    atomic_write(
+        &record_path(&client_id)?,
+        &serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?,
+    )
+}
+
+// Follow renames and EOF transfers only at structural locations fixed by the writer.
+pub(super) fn observe_toml_relocation(
+    path: &Path,
+    before: &toml_edit::DocumentMut,
+    after: &toml_edit::DocumentMut,
+    from: &toml_preservation::PrefixDestination,
+    to: &toml_preservation::PrefixDestination,
+) -> Result<(), String> {
+    let Some(client_id) = mutation::client_id(path) else {
+        return Ok(());
+    };
+    // This evidence is optional, so an unreadable record must not block the write.
+    let Ok(Some(mut record)) = load(&client_id) else {
+        return Ok(());
+    };
+    if record.config_path != path.display().to_string() {
+        return Ok(());
+    }
+    let unchanged = serde_json::to_string(&record.live_prefixes).ok();
+    record.live_prefixes.retain_mut(|live| {
+        // Only an actual MCP server table rename moves descendant paths; EOF
+        // transfers and unrelated tables must never rewrite a nested witness.
+        let destination = if &live.destination == from {
+            to.clone()
+        } else if let (
+            toml_preservation::PrefixDestination::Table(old_root),
+            toml_preservation::PrefixDestination::Table(new_root),
+            toml_preservation::PrefixDestination::Table(path),
+        ) = (from, to, &live.destination)
+        {
+            if old_root.len() != 2
+                || new_root.len() != 2
+                || old_root[0] != ("mcp_servers".into(), None)
+                || new_root[0] != old_root[0]
+                || old_root[1].1.is_some()
+                || new_root[1].1.is_some()
+                || old_root[1].0 == new_root[1].0
+                || path.len() <= old_root.len()
+                || !path.starts_with(old_root)
+            {
+                return true;
+            }
+            let mut renamed = new_root.clone();
+            renamed.extend_from_slice(&path[old_root.len()..]);
+            toml_preservation::PrefixDestination::Table(renamed)
+        } else {
+            return true;
+        };
+        let Some(bytes) = toml_preservation::valid_live(before, live) else {
+            return false;
+        };
+        let Some(old_decor) = toml_preservation::destination_prefix(before, &live.destination)
+        else {
+            return false;
+        };
+        let Some(new_decor) = toml_preservation::destination_prefix(after, &destination) else {
+            return false;
+        };
+        let valid_decor = if &live.destination == from {
+            new_decor.starts_with(old_decor)
+        } else {
+            new_decor == old_decor
+        };
+        if !valid_decor || new_decor.get(live.range.clone()) != Some(bytes) {
+            return false;
+        }
+        live.destination = destination;
+        live.decor_hash = crate::registry::sha256_hex(new_decor);
+        true
+    });
+    if serde_json::to_string(&record.live_prefixes).ok() == unchanged {
+        return Ok(());
+    }
+    atomic_write(
+        &record_path(&client_id)?,
+        &serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?,
+    )
 }
 
 pub(super) fn matches_path(client_id: &str, path: &Path) -> Result<bool, String> {
@@ -184,7 +442,7 @@ pub(super) fn definition(
     };
     let value = match entry.raw {
         Raw::Json { value } => value,
-        Raw::Toml { text } => {
+        Raw::Toml { text, .. } => {
             let doc: toml::Value =
                 toml::from_str(&text).map_err(|_| "Could not read imported settings")?;
             serde_json::to_value(&doc["mcp_servers"][name])
@@ -222,10 +480,15 @@ pub(super) fn record_selected(
     names: &[String],
 ) -> Result<(), String> {
     let record_file = record_path(client_id)?;
-    let previous = match std::fs::read_to_string(&record_file) {
-        Ok(bytes) => Some(bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(format!("could not read {}: {e}", record_file.display())),
+    // A second move in the same mutation must see the first move's staged record,
+    // including its live witnesses, rather than the older copy still on disk.
+    let previous = match mutation::read(&record_file) {
+        Some(value) => value,
+        None => match std::fs::read_to_string(&record_file) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("could not read {}: {e}", record_file.display())),
+        },
     };
     let entries = if mutation::exists(path) {
         extract(format, &read_config_file(path)?)?
@@ -242,15 +505,79 @@ pub(super) fn record_selected(
         record = Record {
             config_path,
             entries: Vec::new(),
+            live_prefixes: Vec::new(),
         };
     }
     if entries.is_empty() && record.entries.is_empty() {
         return Ok(());
     }
-    for entry in entries
+    let current = if matches!(format, Format::TomlMcpServers) && mutation::exists(path) {
+        Some(load_toml_document(path)?)
+    } else {
+        None
+    };
+    let mut fresh_captures = Vec::new();
+    for mut entry in entries
         .into_iter()
         .filter(|entry| names.contains(&entry.name))
     {
+        if let (Some(doc), Raw::Toml { text, capture }) = (&current, &mut entry.raw) {
+            let single: toml_edit::DocumentMut = text
+                .parse()
+                .map_err(|e: toml_edit::TomlError| e.to_string())?;
+            if let Some((key, item)) = toml_preservation::raw_entry(&single, &entry.name) {
+                let prefix = toml_preservation::capture_prefix(&key, &item);
+                let destination = toml_preservation::source_destination(&entry.name, &item);
+                let mut id = [0u8; 16];
+                getrandom::getrandom(&mut id)
+                    .map_err(|e| format!("Could not generate capture ID: {e}"))?;
+                // A later move may capture comments transferred from an earlier
+                // entry. Record that relationship only while the source remains
+                // absent and the recorded ranges and destination decor still match.
+                let inherited_for = |destination: &toml_preservation::PrefixDestination,
+                                     prefix: &str| {
+                    record.live_prefixes.iter().filter_map(|live| {
+                    if &live.destination != destination { return None; }
+                    let source = record.entries.iter().find(|source| matches!(&source.raw, Raw::Toml { capture: Some(c), .. } if c.id == live.source_id || c.children.iter().any(|child| child.id == live.source_id)))?;
+                    if doc.get("mcp_servers").and_then(|s| s.get(&source.name)).is_some() { return None; }
+                    let Raw::Toml { text: source_text, capture: Some(source_capture) } = &source.raw else { return None; };
+                    let source_doc: toml_edit::DocumentMut = source_text.parse().ok()?;
+                    let (source_key, source_item) = toml_preservation::raw_entry(&source_doc, &source.name)?;
+                    let (source_prefix, source_hash) = if source_capture.id == live.source_id {
+                        (toml_preservation::capture_prefix(&source_key, &source_item), &source_capture.prefix_hash)
+                    } else {
+                        let child = source_capture.children.iter().find(|child| child.id == live.source_id)?;
+                        (toml_preservation::destination_prefix(&source_doc, &child.source)?, &child.prefix_hash)
+                    };
+                    if crate::registry::sha256_hex(source_prefix) != *source_hash { return None; }
+                    let observed = toml_preservation::valid_live(doc, live)?;
+                    if source_prefix.get(live.source_range.clone())? != observed || prefix.get(live.range.clone())? != observed { return None; }
+                    Some(toml_preservation::PrefixInheritance { range: live.range.clone(), source_id: live.source_id.clone(), source_range: live.source_range.clone() })
+                }).collect()
+                };
+                let inherited = inherited_for(&destination, prefix);
+                let mut children = Vec::new();
+                for (source, prefix) in toml_preservation::descendant_prefixes(&single, &entry.name)
+                {
+                    let mut child_id = [0u8; 16];
+                    getrandom::getrandom(&mut child_id)
+                        .map_err(|e| format!("Could not generate capture ID: {e}"))?;
+                    children.push(toml_preservation::ChildCapture {
+                        id: child_id.iter().map(|b| format!("{b:02x}")).collect(),
+                        inherited: inherited_for(&source, &prefix),
+                        source,
+                        prefix_hash: crate::registry::sha256_hex(&prefix),
+                    });
+                }
+                *capture = Some(toml_preservation::TomlCapture {
+                    id: id.iter().map(|b| format!("{b:02x}")).collect(),
+                    prefix_hash: crate::registry::sha256_hex(prefix),
+                    inherited,
+                    children,
+                });
+                fresh_captures.push(capture.as_ref().unwrap().id.clone());
+            }
+        }
         record
             .entries
             .retain(|kept| !kept.name.eq_ignore_ascii_case(&entry.name));
@@ -258,6 +585,8 @@ pub(super) fn record_selected(
     }
     let text = serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?;
     atomic_write(&record_file, &text)?;
+    // Enable new witnesses only after the recovery record has been staged.
+    mutation::remember_toml_captures(path, client_id, fresh_captures);
     Ok(())
 }
 
@@ -288,9 +617,9 @@ pub(super) fn remove_selected(format: Format, path: &Path, names: &[String]) -> 
         }
         Container::Toml => {
             let mut doc = load_toml_document(path)?;
-            for name in names {
-                toml_mcp_servers_mut(&mut doc).remove(name);
-            }
+            let before = doc.clone();
+            let transfers = toml_preservation::remove(&mut doc, names);
+            observe_toml_removal(path, &before, &doc, &transfers)?;
             atomic_write(path, &doc.to_string())
         }
         Container::YamlMap(key) | Container::YamlList(key) => {
@@ -460,26 +789,55 @@ pub(super) fn toml_entry(
     client_id: &str,
     path: &Path,
     name: &str,
-) -> Result<Option<toml_edit::Item>, String> {
+) -> Result<Option<(toml_edit::Key, toml_edit::Item, usize)>, String> {
     let Some(record) = load(client_id)? else {
         return Ok(None);
     };
     if record.config_path != path.to_string_lossy() {
         return Ok(None);
     }
-    let Some(entry) = record.entries.iter().find(|entry| entry.name == name) else {
+    let Some((index, entry)) = record
+        .entries
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| entry.name == name)
+    else {
         return Ok(None);
     };
-    let Raw::Toml { text } = &entry.raw else {
+    let Raw::Toml { text, .. } = &entry.raw else {
         return Ok(None);
     };
     let doc = text
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| e.to_string())?;
-    Ok(doc
-        .get("mcp_servers")
-        .and_then(|table| table.get(name))
-        .cloned())
+    Ok(toml_preservation::raw_entry(&doc, name).map(|(key, item)| (key, item, index)))
+}
+
+pub(super) fn toml_provenance(
+    client_id: &str,
+    path: &Path,
+    entries: &[(toml_edit::Key, toml_edit::Item)],
+) -> Result<Vec<toml_preservation::TomlProvenance>, String> {
+    let record = load(client_id)?.filter(|record| record.config_path == path.to_string_lossy());
+    Ok(entries
+        .iter()
+        .map(|(key, _)| {
+            let capture = record
+                .as_ref()
+                .and_then(|record| record.entries.iter().find(|entry| entry.name == key.get()))
+                .and_then(|entry| match &entry.raw {
+                    Raw::Toml { capture, .. } => capture.clone(),
+                    _ => None,
+                });
+            toml_preservation::TomlProvenance {
+                capture,
+                live: record
+                    .as_ref()
+                    .map(|record| record.live_prefixes.clone())
+                    .unwrap_or_default(),
+            }
+        })
+        .collect())
 }
 
 /// Recorded native entries (synced formats) for `path`, by server name.
@@ -552,7 +910,8 @@ pub(super) fn restore(
         return Ok(None);
     }
     let backup = || backup_file(client_id, path);
-    let (names, backup) = insert_missing(container(format), path, &record.entries, backup)?;
+    let (names, backup) =
+        insert_missing(client_id, container(format), path, &record.entries, backup)?;
     Ok(Some(Restored { names, backup }))
 }
 
@@ -572,6 +931,16 @@ fn json_command(definition: &serde_json::Value) -> Option<&str> {
         .as_str()
         // OpenCode keeps the whole argv in `command`.
         .or_else(|| command.as_array()?.first()?.as_str())
+}
+
+fn toml_raw_text(doc: &toml_edit::DocumentMut, name: &str) -> Option<String> {
+    let servers = doc.get("mcp_servers")?.as_table_like()?;
+    let mut table = toml_edit::Table::new();
+    table.set_implicit(true);
+    table.insert_formatted(servers.key(name)?, servers.get(name)?.clone());
+    let mut single = toml_edit::DocumentMut::new();
+    single.insert("mcp_servers", toml_edit::Item::Table(table));
+    Some(single.to_string())
 }
 
 fn yaml_command(definition: &serde_yaml::Value) -> Option<&str> {
@@ -626,13 +995,14 @@ fn extract(format: Format, text: &str) -> Result<Vec<Moved>, String> {
                 }
                 let mut table = toml_edit::Table::new();
                 table.set_implicit(true);
-                table.insert(name, item.clone());
+                table.insert_formatted(servers.key(name).unwrap(), item.clone());
                 let mut single = toml_edit::DocumentMut::new();
                 single.insert("mcp_servers", toml_edit::Item::Table(table));
                 out.push(Moved {
                     name: name.to_string(),
                     raw: Raw::Toml {
                         text: single.to_string(),
+                        capture: None,
                     },
                 });
             }
@@ -699,6 +1069,7 @@ fn has_name<'a>(mut existing: impl Iterator<Item = &'a str>, name: &str) -> bool
 /// Insert each recorded entry whose name (ignoring case) the config no longer
 /// has. Writes nothing, and takes no backup, when every name is already there.
 fn insert_missing(
+    client_id: &str,
     container: Container,
     path: &Path,
     entries: &[Moved],
@@ -752,28 +1123,54 @@ fn insert_missing(
         }
         Container::Toml => {
             let mut doc = load_toml_document(path)?;
-            let servers = toml_mcp_servers_mut(&mut doc);
+            let provenance = restore::toml_prefix_provenance(client_id, path)?;
+            let mut restore_entries = Vec::new();
+            let mut capture_provenance = Vec::new();
+            let record = load(client_id)?;
             for entry in entries {
-                let Raw::Toml { text } = &entry.raw else {
+                let Raw::Toml { text, .. } = &entry.raw else {
                     continue;
                 };
-                if has_name(servers.iter().map(|(name, _)| name), &entry.name) {
+                if has_name(
+                    toml_mcp_servers_mut(&mut doc).iter().map(|(name, _)| name),
+                    &entry.name,
+                ) {
                     continue;
                 }
                 let single = text
                     .parse::<toml_edit::DocumentMut>()
                     .map_err(|e| format!("could not read the recorded {}: {e}", entry.name))?;
-                let Some(item) = single
-                    .get("mcp_servers")
-                    .and_then(|item| item.get(&entry.name))
-                else {
+                let Some((key, item)) = toml_preservation::raw_entry(&single, &entry.name) else {
                     continue;
                 };
-                servers.insert(&entry.name, item.clone());
+                restore_entries.push((key, item));
+                let Raw::Toml { capture, .. } = &entry.raw else {
+                    unreachable!()
+                };
+                capture_provenance.push(toml_preservation::TomlProvenance {
+                    capture: capture.clone(),
+                    live: record
+                        .as_ref()
+                        .map(|r| r.live_prefixes.clone())
+                        .unwrap_or_default(),
+                });
                 names.push(entry.name.clone());
             }
             if names.is_empty() {
                 return Ok((names, None));
+            }
+            if let Some((original, written)) = &provenance {
+                toml_preservation::restore_raw_entries_with_provenance(
+                    original,
+                    written,
+                    &mut doc,
+                    restore_entries,
+                    &capture_provenance,
+                );
+            } else {
+                for (key, item) in restore_entries {
+                    toml_preservation::put_raw(&mut doc, key, item);
+                }
             }
             let backup = backup()?;
             atomic_write(path, &doc.to_string())?;
