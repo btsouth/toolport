@@ -1,5 +1,5 @@
 cask "toolport" do
-  version "2.3.3"
+  version "2.3.4"
 
   on_arm do
     sha256 "9b5697cb7031bab4e2d88eabfeabd8a6972d4393a8480179fa636193143059b4"

@@ -6,6 +6,26 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [2.3.4] - 2026-11-08
+
+Toolport 2.3.4 keeps your comments and layout when it edits Codex and Grok Build
+configs, and keeps those configs valid when a server switches between a command
+and a URL.
+
+If you are on Toolport 1.24.x, this is also your update to Toolport 2. Read the
+[upgrade guide](https://github.com/btsouth/toolport/blob/main/docs/migration.md)
+before updating.
+
+### Fixed
+
+- Editing a server in a TOML config (Codex, Grok Build) no longer drops the comment
+  above the next section. Unknown settings, formatting and comments on keys,
+  arguments and environment values stay as they were. Thanks @1llum1n4t1s. (#1315)
+- Moving servers into Toolport and restoring them no longer duplicates comments or
+  puts entries back outside their BEGIN/END blocks after you edit the file. (#1315)
+- Switching a server between a command and a URL now removes the other transport's
+  settings, which Codex refuses to load. (#1315)
+
 ## [2.3.3] - 2026-11-03
 
 Toolport 2.3.3 fixes the Servers page getting stuck on Initializing or Installing,
