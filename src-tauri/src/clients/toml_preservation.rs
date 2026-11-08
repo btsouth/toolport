@@ -43,6 +43,233 @@ mod tests {
     const BLOCK: &str = "# BEGIN PRUNLET MCP\n[mcp_servers.prunlet]\ncommand = 'prunlet'\nargs = ['mcp']\nstartup_timeout_sec = 600\n# END PRUNLET MCP\n";
 
     #[test]
+    fn restored_blocks_follow_user_reordered_live_spans() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("reordered-complete-blocks");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        for inline in [false, true] {
+            for partial in [false, true] {
+                for direct in [false, true] {
+                    for three in [false, true] {
+                        let path = fixture
+                            .0
+                            .join(format!("{inline}-{partial}-{direct}-{three}.toml"));
+                        let block = |name: &str| {
+                            let header = if inline {
+                                format!("'{name}' = {{command = '{name}'}}\n")
+                            } else {
+                                format!("[mcp_servers.{name}]\ncommand = '{name}'\n")
+                            };
+                            format!("# BEGIN {name}\n{header}# END {name}\n")
+                        };
+                        let a = block("a");
+                        let b = block("b");
+                        let c = block("c");
+                        let parent = if inline { "[mcp_servers]\n" } else { "" };
+                        let original = format!(
+                            "theme = 'before'\n{parent}{a}{b}{}[profiles.work]\nkeep = true\n",
+                            if three { &c } else { "" }
+                        );
+                        std::fs::write(&path, original).unwrap();
+                        let gateway = super::super::tests::sample_gateway(None, "codex");
+                        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                            edit_toml_gateway(&path, Some(&gateway))
+                        })
+                        .unwrap();
+                        let text = read_config_file(&path)
+                            .unwrap()
+                            .replace(&format!("{a}{b}"), &format!("{b}{a}"));
+                        std::fs::write(&path, text).unwrap();
+                        let names: Vec<String> = if three {
+                            vec!["b".into(), "a".into(), "c".into()]
+                        } else {
+                            vec!["b".into(), "a".into()]
+                        };
+                        if partial {
+                            for name in &names {
+                                mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                                    moved::record_selected(
+                                        "fixture",
+                                        Format::TomlMcpServers,
+                                        &path,
+                                        std::slice::from_ref(name),
+                                    )?;
+                                    moved::remove_selected(
+                                        Format::TomlMcpServers,
+                                        &path,
+                                        std::slice::from_ref(name),
+                                    )
+                                })
+                                .unwrap();
+                            }
+                        } else {
+                            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                                moved::record_selected(
+                                    "fixture",
+                                    Format::TomlMcpServers,
+                                    &path,
+                                    &names,
+                                )?;
+                                moved::remove_selected(Format::TomlMcpServers, &path, &names)
+                            })
+                            .unwrap();
+                        }
+                        std::fs::write(
+                            &path,
+                            read_config_file(&path)
+                                .unwrap()
+                                .replace("'before'", "'edited'"),
+                        )
+                        .unwrap();
+                        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                            if direct {
+                                moved::restore("fixture", Format::TomlMcpServers, &path)?;
+                            } else {
+                                assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+                            }
+                            Ok(())
+                        })
+                        .unwrap();
+                        let output = read_config_file(&path).unwrap();
+                        let mut previous = 0;
+                        for name in &names {
+                            let begin = format!("# BEGIN {name}");
+                            let end = format!("# END {name}");
+                            let header = if inline {
+                                format!("'{name}' =")
+                            } else {
+                                format!("[mcp_servers.{name}]")
+                            };
+                            assert_eq!(output.matches(&begin).count(), 1, "{output}");
+                            assert_eq!(output.matches(&end).count(), 1, "{output}");
+                            let (start, item, finish) = (
+                                output.find(&begin).unwrap(),
+                                output.find(&header).unwrap(),
+                                output.find(&end).unwrap(),
+                            );
+                            assert!(
+                                previous <= start && start < item && item < finish,
+                                "{inline}-{partial}-{direct}-{three}: {output}"
+                            );
+                            previous = finish;
+                        }
+                        assert!(
+                            previous < output.find("[profiles.work]").unwrap(),
+                            "{output}"
+                        );
+                        output.parse::<DocumentMut>().unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reordered_live_blocks_do_not_cycle_with_prefixless_sibling() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("reordered-prefixless-sibling");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        for direct in [false, true] {
+            for partial in [false, true] {
+                for front in [false, true] {
+                    let path = fixture.0.join(format!("{direct}-{partial}-{front}.toml"));
+                    let a = "# BEGIN a\n[mcp_servers.a]\ncommand = 'a'\n# END a\n";
+                    let b = "# BEGIN b\n[mcp_servers.b]\ncommand = 'b'\n# END b\n";
+                    let c = "[mcp_servers.c]\ncommand = 'c'\n";
+                    std::fs::write(
+                        &path,
+                        format!("theme = 'before'\n{a}{c}{b}[profiles.work]\nkeep = true\n"),
+                    )
+                    .unwrap();
+                    let gateway = super::super::tests::sample_gateway(None, "codex");
+                    mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                        edit_toml_gateway(&path, Some(&gateway))
+                    })
+                    .unwrap();
+                    let text = read_config_file(&path).unwrap().replace(
+                        &format!("{a}{c}{b}"),
+                        &if front {
+                            format!("{c}{b}{a}")
+                        } else {
+                            format!("{b}{c}{a}")
+                        },
+                    );
+                    std::fs::write(&path, text).unwrap();
+                    let names = if front {
+                        vec!["b".to_string(), "a".to_string(), "c".to_string()]
+                    } else {
+                        vec!["b".to_string(), "c".to_string(), "a".to_string()]
+                    };
+                    if partial {
+                        for name in &names {
+                            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                                moved::record_selected(
+                                    "fixture",
+                                    Format::TomlMcpServers,
+                                    &path,
+                                    std::slice::from_ref(name),
+                                )?;
+                                moved::remove_selected(
+                                    Format::TomlMcpServers,
+                                    &path,
+                                    std::slice::from_ref(name),
+                                )
+                            })
+                            .unwrap();
+                        }
+                    } else {
+                        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                            moved::record_selected(
+                                "fixture",
+                                Format::TomlMcpServers,
+                                &path,
+                                &names,
+                            )?;
+                            moved::remove_selected(Format::TomlMcpServers, &path, &names)
+                        })
+                        .unwrap();
+                    }
+                    std::fs::write(
+                        &path,
+                        read_config_file(&path)
+                            .unwrap()
+                            .replace("'before'", "'edited'"),
+                    )
+                    .unwrap();
+                    mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                        if direct {
+                            moved::restore("fixture", Format::TomlMcpServers, &path)?;
+                        } else {
+                            assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                    let output = read_config_file(&path).unwrap();
+                    let position = |s| output.find(s).unwrap();
+                    assert!(
+                        position("# BEGIN b") < position("[mcp_servers.b]")
+                            && position("[mcp_servers.b]") < position("# END b")
+                            && position("# END b") < position("# BEGIN a")
+                            && position("# BEGIN a") < position("[mcp_servers.a]")
+                            && position("[mcp_servers.a]") < position("# END a"),
+                        "{direct}-{partial}: {output}"
+                    );
+                    assert_eq!(output.matches("[mcp_servers.c]").count(), 1, "{output}");
+                    let cpos = position("[mcp_servers.c]");
+                    assert!(
+                        cpos < position("# BEGIN b")
+                            || (position("# END b") < cpos && cpos < position("# BEGIN a"))
+                            || position("# END a") < cpos,
+                        "{output}"
+                    );
+                    output.parse::<DocumentMut>().unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
     fn parent_prefix_inherited_by_child_returns_to_each_source() {
         let _lock = crate::registry::data_dir_test_lock();
         let fixture = Fixture::new("parent-to-child-inheritance");
@@ -4654,10 +4881,52 @@ pub(super) fn restore_raw_entries_with_provenance(
             preserve_raw.extend(indices);
             continue;
         }
-        // Prefer original order. Otherwise restore contained spans before their
-        // containers and disjoint spans in document order. Equal spans retain
-        // move-record order rather than sorting registrations by name.
+        // Live disjoint spans establish the user's latest order. An original
+        // order involving a prefixless sibling is ambiguous after an inversion;
+        // do not let those stale edges cycle against proven live boundaries.
+        let live_precedes = |first: usize, second: usize| -> Option<bool> {
+            let (a, b) = (spans.get(&first)?, spans.get(&second)?);
+            if !live_owners.contains(&first) || !live_owners.contains(&second) {
+                return None;
+            }
+            if a.end <= b.start {
+                return Some(true);
+            }
+            if b.end <= a.start {
+                return Some(false);
+            }
+            let edge_matches =
+                |child: usize,
+                 source: usize,
+                 child_span: &std::ops::Range<usize>,
+                 source_span: &std::ops::Range<usize>| {
+                    valid_edge(child, source).is_some_and(|edge| {
+                        child_span.start.checked_add(edge.range.start)
+                            == source_span.start.checked_add(edge.source_range.start)
+                    })
+                };
+            let source_first = edge_matches(second, first, b, a);
+            let source_second = edge_matches(first, second, a, b);
+            (source_first != source_second).then_some(source_first)
+        };
+        let reordered = indices.iter().any(|first| {
+            indices.iter().any(|second| {
+                let (Some(old_a), Some(old_b)) = (
+                    order.get(entries[*first].0.get()),
+                    order.get(entries[*second].0.get()),
+                ) else {
+                    return false;
+                };
+                live_precedes(*first, *second) == Some(true) && old_a > old_b
+            })
+        });
         let precedes = |first: usize, second: usize| {
+            if let Some(result) = live_precedes(first, second) {
+                return result;
+            }
+            if reordered && (!spans.contains_key(&first) || !spans.contains_key(&second)) {
+                return false;
+            }
             if let (Some(first_order), Some(second_order)) = (
                 order.get(entries[first].0.get()),
                 order.get(entries[second].0.get()),
