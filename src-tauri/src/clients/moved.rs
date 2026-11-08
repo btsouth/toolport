@@ -750,7 +750,7 @@ fn insert_missing(
         Container::Toml => {
             let mut doc = load_toml_document(path)?;
             let provenance = restore::toml_prefix_provenance(client_id, path)?;
-            let evidence_doc = doc.clone();
+            let mut restore_entries = Vec::new();
             for entry in entries {
                 let Raw::Toml { text } = &entry.raw else {
                     continue;
@@ -764,24 +764,26 @@ fn insert_missing(
                 let single = text
                     .parse::<toml_edit::DocumentMut>()
                     .map_err(|e| format!("could not read the recorded {}: {e}", entry.name))?;
-                let Some((mut key, mut item)) = toml_preservation::raw_entry(&single, &entry.name)
-                else {
+                let Some((key, item)) = toml_preservation::raw_entry(&single, &entry.name) else {
                     continue;
                 };
-                if let Some((original, written)) = &provenance {
-                    toml_preservation::dedup_raw_prefix(
-                        original,
-                        written,
-                        &evidence_doc,
-                        &mut key,
-                        &mut item,
-                    );
-                }
-                toml_preservation::put_raw(&mut doc, key, item);
+                restore_entries.push((key, item));
                 names.push(entry.name.clone());
             }
             if names.is_empty() {
                 return Ok((names, None));
+            }
+            if let Some((original, written)) = &provenance {
+                toml_preservation::restore_raw_entries(
+                    original,
+                    written,
+                    &mut doc,
+                    restore_entries,
+                );
+            } else {
+                for (key, item) in restore_entries {
+                    toml_preservation::put_raw(&mut doc, key, item);
+                }
             }
             let backup = backup()?;
             atomic_write(path, &doc.to_string())?;

@@ -675,7 +675,7 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
                 .unwrap_or("")
                 .parse::<toml_edit::DocumentMut>()
                 .map_err(|e| e.to_string())?;
-            let evidence_doc = doc.clone();
+            let mut restore_entries = Vec::new();
             let desired = latest.get(key).and_then(Value::as_object);
             let existing = doc
                 .get(key)
@@ -691,45 +691,36 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
                 .into_iter()
                 .filter(|name| desired.is_none_or(|map| !map.contains_key(name)))
                 .collect();
-            toml_preservation::remove(&mut doc, &removed);
             if let Some(desired) = desired {
                 for (name, value) in desired {
                     if mutation::value(format, current.as_deref())?[key].get(name) != Some(value) {
-                        if let Some((mut entry_key, mut item)) =
-                            moved::toml_entry(client_id, path, name)?
-                        {
-                            toml_preservation::dedup_raw_prefix(
-                                &original,
-                                &written_doc,
-                                &evidence_doc,
-                                &mut entry_key,
-                                &mut item,
-                            );
-                            toml_preservation::put_raw(&mut doc, entry_key, item);
+                        if let Some((entry_key, item)) = moved::toml_entry(client_id, path, name)? {
+                            restore_entries.push((entry_key, item));
                         } else if mutation::value(format, record.original.as_deref())?[key]
                             .get(name)
                             == Some(value)
                         {
-                            if let Some((mut entry_key, mut item)) =
+                            if let Some((entry_key, item)) =
                                 toml_preservation::raw_entry(&original, name)
                             {
-                                toml_preservation::dedup_raw_prefix(
-                                    &original,
-                                    &written_doc,
-                                    &evidence_doc,
-                                    &mut entry_key,
-                                    &mut item,
-                                );
-                                toml_preservation::put_raw(&mut doc, entry_key, item);
+                                restore_entries.push((entry_key, item));
                             }
                         } else {
                             let value: toml::Value =
                                 serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
-                            toml_preservation::put(&mut doc, name, toml_value_to_item(&value));
+                            restore_entries
+                                .push((toml_edit::Key::new(name), toml_value_to_item(&value)));
                         }
                     }
                 }
             }
+            toml_preservation::restore_raw_entries(
+                &original,
+                &written_doc,
+                &mut doc,
+                restore_entries,
+            );
+            toml_preservation::remove(&mut doc, &removed);
             if latest.get(key).is_none() {
                 doc.remove(key);
             }
