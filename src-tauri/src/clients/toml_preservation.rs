@@ -941,6 +941,23 @@ mod tests {
                 edit_toml_gateway(&path, Some(&gateway))
             })
             .unwrap();
+            let observed: DocumentMut = read_config_file(&path).unwrap().parse().unwrap();
+            let (key, item, _) = moved::toml_entry("codex", &path, "native")
+                .unwrap()
+                .unwrap();
+            let meta = moved::toml_provenance("codex", &path, &[(key, item)]).unwrap();
+            let capture = meta[0].capture.as_ref().unwrap();
+            let live = meta[0]
+                .live
+                .iter()
+                .find(|live| live.source_id == capture.id)
+                .unwrap();
+            let (_, gateway_item) = super::raw_entry(&observed, "toolport").unwrap();
+            assert_eq!(
+                live.destination,
+                super::source_destination("toolport", &gateway_item)
+            );
+            assert_eq!(super::valid_live(&observed, live), Some("# BEGIN NATIVE\n"));
             let mut edited: DocumentMut = read_config_file(&path)
                 .unwrap()
                 .replace("model = 'before'", "model = 'user-edit'")
@@ -1161,6 +1178,847 @@ mod tests {
             Some("extra")
         );
         assert_eq!(parsed["profiles"]["work"]["keep"].as_bool(), Some(true));
+    }
+    #[test]
+    fn successive_partial_moves_restore_overlapping_prefix_spans_once_in_source_order() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("partial-move-prefix-overlap");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        for added in [false, true] {
+            for inline in [false, true] {
+                for direct in [false, true] {
+                    for inter_comment in [false, true] {
+                        let path = fixture
+                            .0
+                            .join(format!("{added}-{inline}-{direct}-{inter_comment}.toml"));
+                        let between = if inter_comment {
+                            "# between partial entries\n"
+                        } else {
+                            ""
+                        };
+                        let native = if inline {
+                            format!("[mcp_servers]\n# BEGIN PARTIAL\n'zebra' = {{command = 'zebra', env = {{TOKEN = 'keep'}}}}\n{between}'middle' = {{command = 'middle'}}\n{between}'alpha' = {{command = 'alpha', metadata = {{keep = true}}}}\n# END PARTIAL\n")
+                        } else {
+                            format!("# BEGIN PARTIAL\n[mcp_servers.zebra]\ncommand = 'zebra'\n[mcp_servers.zebra.env]\nTOKEN = 'keep'\n{between}[mcp_servers.middle]\ncommand = 'middle'\n{between}[mcp_servers.alpha]\ncommand = 'alpha'\nmetadata = {{keep = true}}\n# END PARTIAL\n")
+                        };
+                        let full =
+                            format!("model = 'before'\n{native}[profiles.work]\nkeep = true\n");
+                        let gateway = super::super::tests::sample_gateway(None, "codex");
+                        if added {
+                            std::fs::write(
+                                &path,
+                                "model = 'before'\n[profiles.work]\nkeep = true\n",
+                            )
+                            .unwrap();
+                            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                                write_toml(&path, std::slice::from_ref(&gateway))
+                            })
+                            .unwrap();
+                            let connected: DocumentMut =
+                                read_config_file(&path).unwrap().parse().unwrap();
+                            let mut edited: DocumentMut = full.parse().unwrap();
+                            super::put(
+                                &mut edited,
+                                "toolport",
+                                connected["mcp_servers"]["toolport"].clone(),
+                            );
+                            std::fs::write(&path, edited.to_string()).unwrap();
+                        } else {
+                            std::fs::write(&path, full).unwrap();
+                        }
+                        for name in ["zebra", "middle", "alpha"] {
+                            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                                moved::record_selected(
+                                    "fixture",
+                                    Format::TomlMcpServers,
+                                    &path,
+                                    &[name.into()],
+                                )?;
+                                moved::remove_selected(
+                                    Format::TomlMcpServers,
+                                    &path,
+                                    &[name.into()],
+                                )?;
+                                edit_toml_gateway(&path, Some(&gateway))
+                            })
+                            .unwrap();
+                        }
+                        std::fs::write(
+                            &path,
+                            read_config_file(&path)
+                                .unwrap()
+                                .replace("model = 'before'", "model = 'user-edit'"),
+                        )
+                        .unwrap();
+                        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                            if direct {
+                                moved::restore("fixture", Format::TomlMcpServers, &path)?;
+                            } else {
+                                assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+                            }
+                            Ok(())
+                        })
+                        .unwrap();
+                        let output = read_config_file(&path).unwrap();
+                        assert_eq!(
+                            output.matches("# BEGIN PARTIAL").count(),
+                            1,
+                            "{added}-{inline}-{direct}-{inter_comment}: {output}"
+                        );
+                        assert_eq!(output.matches("# END PARTIAL").count(), 1, "{output}");
+                        assert_eq!(
+                            output.matches("# between partial entries").count(),
+                            2 * usize::from(inter_comment),
+                            "{output}"
+                        );
+                        let zebra = output
+                            .find(if inline {
+                                "'zebra' ="
+                            } else {
+                                "[mcp_servers.zebra]"
+                            })
+                            .unwrap();
+                        let middle = output
+                            .find(if inline {
+                                "'middle' ="
+                            } else {
+                                "[mcp_servers.middle]"
+                            })
+                            .unwrap();
+                        let alpha = output
+                            .find(if inline {
+                                "'alpha' ="
+                            } else {
+                                "[mcp_servers.alpha]"
+                            })
+                            .unwrap();
+                        assert!(
+                            output.find("# BEGIN PARTIAL").unwrap() < zebra
+                                && zebra < middle
+                                && middle < alpha
+                                && alpha < output.find("# END PARTIAL").unwrap(),
+                            "{output}"
+                        );
+                        if inter_comment {
+                            assert!(
+                                zebra < output.find(between.trim_end()).unwrap()
+                                    && output.find(between.trim_end()).unwrap() < middle,
+                                "{output}"
+                            );
+                        }
+                        let parsed: toml::Value = toml::from_str(&output).unwrap();
+                        assert_eq!(parsed["model"].as_str(), Some("user-edit"));
+                        assert_eq!(
+                            parsed["mcp_servers"]["zebra"]["env"]["TOKEN"].as_str(),
+                            Some("keep")
+                        );
+                        assert_eq!(
+                            parsed["mcp_servers"]["alpha"]["metadata"]["keep"].as_bool(),
+                            Some(true)
+                        );
+                        assert_eq!(parsed["profiles"]["work"]["keep"].as_bool(), Some(true));
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn original_eof_and_added_entry_share_one_actual_restore_plan() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("combined-eof-added-prefix");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        for (direct, external_rebind) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let path = fixture.0.join(format!("{direct}-{external_rebind}.toml"));
+            std::fs::write(&path, "model = 'before'\n# BEGIN ORIGINAL\n[mcp_servers.original]\ncommand = 'original'\n# END ORIGINAL\n").unwrap();
+            let gateway = super::super::tests::sample_gateway(None, "codex");
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                moved::record_selected(
+                    "fixture",
+                    Format::TomlMcpServers,
+                    &path,
+                    &["original".into()],
+                )?;
+                moved::remove_selected(Format::TomlMcpServers, &path, &["original".into()])?;
+                edit_toml_gateway(&path, Some(&gateway))
+            })
+            .unwrap();
+            let current = read_config_file(&path).unwrap();
+            let added = if external_rebind {
+                "# BEGIN ADDED\n[mcp_servers.added]\ncommand = 'added'\nmetadata = {keep = true}\n# END ADDED\n"
+            } else {
+                "# BEGIN ADDED\n[mcp_servers.added]\ncommand = 'added' # END ADDED\nmetadata = {keep = true}\n"
+            };
+            let edited = if external_rebind {
+                current.replace(
+                    "[mcp_servers.toolport]",
+                    &format!("{added}[mcp_servers.toolport]"),
+                )
+            } else {
+                current.replace("# BEGIN ORIGINAL\n", &format!("{added}# BEGIN ORIGINAL\n"))
+            };
+            if !external_rebind {
+                let before: DocumentMut = current.parse().unwrap();
+                let after: DocumentMut = edited.parse().unwrap();
+                let (_, gateway_item) = super::raw_entry(&before, "toolport").unwrap();
+                let destination = super::source_destination("toolport", &gateway_item);
+                assert_eq!(
+                    super::destination_prefix(&before, &destination),
+                    super::destination_prefix(&after, &destination)
+                );
+                let (key, item, _) = moved::toml_entry("fixture", &path, "original")
+                    .unwrap()
+                    .unwrap();
+                let provenance = moved::toml_provenance("fixture", &path, &[(key, item)]).unwrap();
+                let capture = provenance[0].capture.as_ref().unwrap();
+                let live = provenance[0]
+                    .live
+                    .iter()
+                    .find(|live| live.source_id == capture.id)
+                    .unwrap();
+                assert_eq!(
+                    super::valid_live(&before, live),
+                    super::valid_live(&after, live)
+                );
+                assert!(super::valid_live(&after, live).is_some());
+            }
+            std::fs::write(&path, edited).unwrap();
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                moved::record_selected(
+                    "fixture",
+                    Format::TomlMcpServers,
+                    &path,
+                    &["added".into()],
+                )?;
+                moved::remove_selected(Format::TomlMcpServers, &path, &["added".into()])?;
+                edit_toml_gateway(&path, Some(&gateway))
+            })
+            .unwrap();
+            std::fs::write(
+                &path,
+                read_config_file(&path)
+                    .unwrap()
+                    .replace("model = 'before'", "model = 'user-edit'"),
+            )
+            .unwrap();
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                if direct {
+                    moved::restore("fixture", Format::TomlMcpServers, &path)?;
+                } else {
+                    assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+                }
+                Ok(())
+            })
+            .unwrap();
+            let output = read_config_file(&path).unwrap();
+            if external_rebind {
+                let doc: DocumentMut = output.parse().unwrap();
+                let (key, item) = super::raw_entry(&doc, "original").unwrap();
+                assert_eq!(
+                    super::entry_prefix(&key, &item),
+                    "# BEGIN ORIGINAL\n",
+                    "{output}"
+                );
+                let (key, item) = super::raw_entry(&doc, "added").unwrap();
+                let prefix = super::entry_prefix(&key, &item);
+                assert!(
+                    prefix.ends_with("# BEGIN ORIGINAL\n# END ORIGINAL\n# BEGIN ADDED\n"),
+                    "{output}"
+                );
+                let current_prefix = if direct {
+                    let (key, item) = super::raw_entry(&doc, "toolport").unwrap();
+                    super::entry_prefix(&key, &item).to_string()
+                } else {
+                    prefix.to_string()
+                };
+                assert!(
+                    current_prefix.contains("# END ORIGINAL\n# BEGIN ADDED\n# END ADDED\n"),
+                    "{output}"
+                );
+                for (marker, expected) in [
+                    ("# BEGIN ORIGINAL", 2),
+                    ("# END ORIGINAL", 2),
+                    ("# BEGIN ADDED", 2),
+                    ("# END ADDED", 1),
+                ] {
+                    assert_eq!(output.matches(marker).count(), expected, "{output}");
+                }
+                let parsed: toml::Value = toml::from_str(&output).unwrap();
+                assert_eq!(parsed["model"].as_str(), Some("user-edit"));
+                assert_eq!(
+                    parsed["mcp_servers"]["original"]["command"].as_str(),
+                    Some("original")
+                );
+                assert_eq!(
+                    parsed["mcp_servers"]["added"]["metadata"]["keep"].as_bool(),
+                    Some(true)
+                );
+                continue;
+            }
+            for marker in [
+                "# BEGIN ORIGINAL",
+                "# END ORIGINAL",
+                "# BEGIN ADDED",
+                "# END ADDED",
+            ] {
+                assert_eq!(output.matches(marker).count(), 1, "{output}");
+            }
+            let positions: Vec<_> = [
+                "# BEGIN ADDED",
+                "[mcp_servers.added]",
+                "# END ADDED",
+                "# BEGIN ORIGINAL",
+                "[mcp_servers.original]",
+                "# END ORIGINAL",
+            ]
+            .iter()
+            .map(|needle| output.find(needle).unwrap())
+            .collect();
+            assert!(
+                positions.windows(2).all(|pair| pair[0] < pair[1]),
+                "{output}"
+            );
+            let parsed: toml::Value = toml::from_str(&output).unwrap();
+            assert_eq!(parsed["model"].as_str(), Some("user-edit"));
+            assert_eq!(
+                parsed["mcp_servers"]["added"]["metadata"]["keep"].as_bool(),
+                Some(true)
+            );
+        }
+    }
+
+    #[test]
+    fn independent_equal_comment_text_at_different_destinations_is_preserved() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("independent-prefix-destinations");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        let path = fixture.0.join("config.toml");
+        std::fs::write(&path, "model = 'before'\n# BEGIN A\n# shared note\n[mcp_servers.a]\ncommand = 'a'\n# END A\n[profiles.a]\nkeep = true\n# BEGIN B\n# shared note\n[mcp_servers.b]\ncommand = 'b'\n# END B\n[profiles.b]\nkeep = true\n").unwrap();
+        let gateway = super::super::tests::sample_gateway(None, "codex");
+        for name in ["a", "b"] {
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                moved::record_selected("fixture", Format::TomlMcpServers, &path, &[name.into()])?;
+                moved::remove_selected(Format::TomlMcpServers, &path, &[name.into()])?;
+                edit_toml_gateway(&path, Some(&gateway))
+            })
+            .unwrap();
+        }
+        std::fs::write(
+            &path,
+            read_config_file(&path)
+                .unwrap()
+                .replace("model = 'before'", "model = 'user-edit'"),
+        )
+        .unwrap();
+        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+            assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+            Ok(())
+        })
+        .unwrap();
+        let output = read_config_file(&path).unwrap();
+        assert_eq!(output.matches("# shared note").count(), 2, "{output}");
+        for (begin, header, end) in [
+            ("# BEGIN A", "[mcp_servers.a]", "# END A"),
+            ("# BEGIN B", "[mcp_servers.b]", "# END B"),
+        ] {
+            assert!(
+                output.find(begin).unwrap() < output.find(header).unwrap()
+                    && output.find(header).unwrap() < output.find(end).unwrap(),
+                "{output}"
+            );
+        }
+        let parsed: toml::Value = toml::from_str(&output).unwrap();
+        assert_eq!(parsed["profiles"]["a"]["keep"].as_bool(), Some(true));
+        assert_eq!(parsed["profiles"]["b"]["keep"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn crossing_or_lost_prefix_evidence_preserves_full_raw_and_current_decor() {
+        let original: DocumentMut = "[profiles.work]\nkeep = true\n".parse().unwrap();
+        let written: DocumentMut = "# a\n# b\n# c\n[profiles.work]\nkeep = true\n"
+            .parse()
+            .unwrap();
+        for lost in [false, true] {
+            let mut current = if lost {
+                "# user edited\n[profiles.work]\nkeep = true\n"
+                    .parse()
+                    .unwrap()
+            } else {
+                written.clone()
+            };
+            let entries: Vec<_> = [("one", "# a\n# b\n"), ("two", "# b\n# c\n")]
+                .iter()
+                .map(|(name, prefix)| {
+                    let raw: DocumentMut =
+                        format!("{prefix}[mcp_servers.{name}]\ncommand = '{name}'\n")
+                            .parse()
+                            .unwrap();
+                    super::raw_entry(&raw, name).unwrap()
+                })
+                .collect();
+            let prior = current["profiles"]["work"]
+                .as_table()
+                .unwrap()
+                .decor()
+                .prefix()
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
+            super::restore_raw_entries(&original, &written, &mut current, entries);
+            assert_eq!(
+                current["profiles"]["work"]
+                    .as_table()
+                    .unwrap()
+                    .decor()
+                    .prefix()
+                    .unwrap()
+                    .as_str()
+                    .unwrap(),
+                prior
+            );
+            for (name, prefix) in [("one", "# a\n# b\n"), ("two", "# b\n# c\n")] {
+                let (key, item) = super::raw_entry(&current, name).unwrap();
+                assert_eq!(super::entry_prefix(&key, &item), prefix);
+            }
+            let _: toml::Value = toml::from_str(&current.to_string()).unwrap();
+        }
+    }
+    #[test]
+    fn lost_original_prefix_does_not_borrow_an_independent_added_comment_span() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("independent-lost-prefix-owner");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        for direct in [false, true] {
+            let path = fixture.0.join(format!("{direct}.toml"));
+            std::fs::write(&path, "model = 'before'\n# X\n[mcp_servers.a]\ncommand = 'a'\nmetadata = {keep = true}\n[profiles.work]\nkeep = true\n").unwrap();
+            let gateway = super::super::tests::sample_gateway(None, "codex");
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                moved::record_selected("fixture", Format::TomlMcpServers, &path, &["a".into()])?;
+                moved::remove_selected(Format::TomlMcpServers, &path, &["a".into()])?;
+                edit_toml_gateway(&path, Some(&gateway))
+            })
+            .unwrap();
+            let edited = read_config_file(&path).unwrap().replace("# X\n", "").replace("[profiles.work]", "# X\n# Y\n[mcp_servers.b]\ncommand = 'b'\nmetadata = {keep = true}\n[profiles.work]");
+            std::fs::write(&path, edited).unwrap();
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                moved::record_selected("fixture", Format::TomlMcpServers, &path, &["b".into()])?;
+                moved::remove_selected(Format::TomlMcpServers, &path, &["b".into()])?;
+                edit_toml_gateway(&path, Some(&gateway))
+            })
+            .unwrap();
+            std::fs::write(
+                &path,
+                read_config_file(&path)
+                    .unwrap()
+                    .replace("model = 'before'", "model = 'user-edit'"),
+            )
+            .unwrap();
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                if direct {
+                    moved::restore("fixture", Format::TomlMcpServers, &path)?;
+                } else {
+                    assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+                }
+                Ok(())
+            })
+            .unwrap();
+            let output = read_config_file(&path).unwrap();
+            assert_eq!(output.matches("# X").count(), 2, "{output}");
+            assert_eq!(output.matches("# Y").count(), 1, "{output}");
+            for (name, prefix) in [("a", "# X\n"), ("b", "# X\n# Y\n")] {
+                let doc: DocumentMut = output.parse().unwrap();
+                let (key, item) = super::raw_entry(&doc, name).unwrap();
+                assert_eq!(super::entry_prefix(&key, &item), prefix, "{output}");
+            }
+            let parsed: toml::Value = toml::from_str(&output).unwrap();
+            assert_eq!(
+                parsed["mcp_servers"]["a"]["metadata"]["keep"].as_bool(),
+                Some(true)
+            );
+            assert_eq!(
+                parsed["mcp_servers"]["b"]["metadata"]["keep"].as_bool(),
+                Some(true)
+            );
+            assert_eq!(parsed["model"].as_str(), Some("user-edit"));
+            assert_eq!(parsed["profiles"]["work"]["keep"].as_bool(), Some(true));
+        }
+    }
+    #[test]
+    fn changed_original_and_added_equal_prefixes_remain_independent() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("changed-original-independent-prefix");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        for direct in [false, true] {
+            let path = fixture.0.join(format!("{direct}.toml"));
+            std::fs::write(&path, "model = 'before'\n# Y\n[mcp_servers.b]\ncommand = 'b'\n# X\n[profiles.work]\nkeep = true\n").unwrap();
+            let gateway = super::super::tests::sample_gateway(None, "codex");
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                edit_toml_gateway(&path, Some(&gateway))
+            })
+            .unwrap();
+            let edited = read_config_file(&path)
+                .unwrap()
+                .replace("# X\n[profiles.work]", "[profiles.work]")
+                .replace("# Y\n[mcp_servers.b]", "# X\n[mcp_servers.b]");
+            std::fs::write(&path, edited).unwrap();
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                moved::record_selected("fixture", Format::TomlMcpServers, &path, &["b".into()])?;
+                moved::remove_selected(Format::TomlMcpServers, &path, &["b".into()])?;
+                edit_toml_gateway(&path, Some(&gateway))
+            })
+            .unwrap();
+            let edited = read_config_file(&path)
+                .unwrap()
+                .replace("# X\n", "")
+                .replace(
+                    "[profiles.work]",
+                    "# X\n# Z\n[mcp_servers.c]\ncommand = 'c'\n[profiles.work]",
+                );
+            std::fs::write(&path, edited).unwrap();
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                moved::record_selected("fixture", Format::TomlMcpServers, &path, &["c".into()])?;
+                moved::remove_selected(Format::TomlMcpServers, &path, &["c".into()])?;
+                edit_toml_gateway(&path, Some(&gateway))
+            })
+            .unwrap();
+            std::fs::write(
+                &path,
+                read_config_file(&path)
+                    .unwrap()
+                    .replace("model = 'before'", "model = 'user-edit'"),
+            )
+            .unwrap();
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                if direct {
+                    moved::restore("fixture", Format::TomlMcpServers, &path)?;
+                } else {
+                    assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+                }
+                Ok(())
+            })
+            .unwrap();
+            let output = read_config_file(&path).unwrap();
+            assert_eq!(output.matches("# X").count(), 2, "{output}");
+            let doc: DocumentMut = output.parse().unwrap();
+            for (name, expected) in [("b", "# X\n"), ("c", "# X\n# Z\n")] {
+                let (key, item) = super::raw_entry(&doc, name).unwrap();
+                assert_eq!(super::entry_prefix(&key, &item), expected, "{output}");
+            }
+        }
+    }
+    #[test]
+    fn stale_capture_is_not_reissued_by_uncaptured_generic_removal() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("stale-generation-generic-removal");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        for direct in [false, true] {
+            let path = fixture.0.join(format!("{direct}.toml"));
+            std::fs::write(&path, "model = 'before'\n# X\n[mcp_servers.a]\ncommand = 'old-a'\nmetadata = {original = true}\n# Y\n[mcp_servers.b]\ncommand = 'b'\nmetadata = {keep = true}\n[profiles.work]\nkeep = true\n").unwrap();
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                moved::record_selected("fixture", Format::TomlMcpServers, &path, &["a".into()])?;
+                moved::remove_selected(Format::TomlMcpServers, &path, &["a".into()])
+            })
+            .unwrap();
+            let (key, item, _) = moved::toml_entry("fixture", &path, "a").unwrap().unwrap();
+            let old = moved::toml_provenance("fixture", &path, &[(key, item)]).unwrap();
+            let old_id = old[0].capture.as_ref().unwrap().id.clone();
+            let edited = read_config_file(&path).unwrap().replace("# X\n", "").replace("# Y\n[mcp_servers.b]", "# X\n[mcp_servers.a]\ncommand = 'new-a'\nmetadata = {new = true}\n# Y\n[mcp_servers.b]");
+            std::fs::write(&path, edited).unwrap();
+            let mut b = super::super::tests::sample_gateway(None, "codex");
+            b.name = "b".into();
+            b.command = Some("b".into());
+            b.args.clear();
+            b.env.clear();
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                write_toml(&path, &[b.clone()])
+            })
+            .unwrap();
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                moved::record_selected("fixture", Format::TomlMcpServers, &path, &["b".into()])?;
+                moved::remove_selected(Format::TomlMcpServers, &path, &["b".into()])
+            })
+            .unwrap();
+            let (key, item, _) = moved::toml_entry("fixture", &path, "b").unwrap().unwrap();
+            assert_eq!(super::entry_prefix(&key, &item), "# X\n# Y\n");
+            let b_meta = moved::toml_provenance("fixture", &path, &[(key, item)]).unwrap();
+            assert!(b_meta[0]
+                .capture
+                .as_ref()
+                .unwrap()
+                .inherited
+                .iter()
+                .all(|edge| edge.source_id != old_id));
+            std::fs::write(
+                &path,
+                read_config_file(&path)
+                    .unwrap()
+                    .replace("model = 'before'", "model = 'user-edit'"),
+            )
+            .unwrap();
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                if direct {
+                    moved::restore("fixture", Format::TomlMcpServers, &path)?;
+                } else {
+                    assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+                }
+                Ok(())
+            })
+            .unwrap();
+            let output = read_config_file(&path).unwrap();
+            assert_eq!(output.matches("# X").count(), 2, "{output}");
+            let parsed: toml::Value = toml::from_str(&output).unwrap();
+            assert_eq!(parsed["model"].as_str(), Some("user-edit"));
+            assert_eq!(
+                parsed["mcp_servers"]["a"]["command"].as_str(),
+                Some("old-a")
+            );
+            assert_eq!(
+                parsed["mcp_servers"]["a"]["metadata"]["original"].as_bool(),
+                Some(true)
+            );
+            assert_eq!(
+                parsed["mcp_servers"]["b"]["metadata"]["keep"].as_bool(),
+                Some(true)
+            );
+            assert_eq!(parsed["profiles"]["work"]["keep"].as_bool(), Some(true));
+        }
+    }
+    #[test]
+    fn capture_cannot_be_reused_after_removal_in_same_mutation() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("capture-consumed-once");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        let path = fixture.0.join("config.toml");
+        std::fs::write(
+            &path,
+            "# X\n[mcp_servers.a]\ncommand = 'a'\n# Y\n[mcp_servers.b]\ncommand = 'b'\n",
+        )
+        .unwrap();
+        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+            moved::record_selected("fixture", Format::TomlMcpServers, &path, &["a".into()])?;
+            moved::remove_selected(Format::TomlMcpServers, &path, &["a".into()])?;
+            let replacement = read_config_file(&path)?.replace("# X\n", "").replace(
+                "# Y\n[mcp_servers.b]",
+                "# X\n[mcp_servers.a]\ncommand = 'a'\n# Y\n[mcp_servers.b]",
+            );
+            atomic_write(&path, &replacement)?;
+            moved::remove_selected(Format::TomlMcpServers, &path, &["a".into()])?;
+            moved::record_selected("fixture", Format::TomlMcpServers, &path, &["b".into()])?;
+            Ok(())
+        })
+        .unwrap();
+        let (key, item, _) = moved::toml_entry("fixture", &path, "b").unwrap().unwrap();
+        assert_eq!(super::entry_prefix(&key, &item), "# X\n# Y\n");
+        let provenance = moved::toml_provenance("fixture", &path, &[(key, item)]).unwrap();
+        assert!(provenance[0].capture.as_ref().unwrap().inherited.is_empty());
+    }
+    #[test]
+    fn captured_source_changed_within_mutation_does_not_issue_witness() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("changed-source-after-capture");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        let path = fixture.0.join("config.toml");
+        std::fs::write(
+            &path,
+            "# X\n[mcp_servers.a]\ncommand = 'old'\n# Y\n[mcp_servers.b]\ncommand = 'b'\n",
+        )
+        .unwrap();
+        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+            moved::record_selected("fixture", Format::TomlMcpServers, &path, &["a".into()])?;
+            let updated = read_config_file(&path)?.replace("command = 'old'", "command = 'new'");
+            atomic_write(&path, &updated)?;
+            moved::remove_selected(Format::TomlMcpServers, &path, &["a".into()])
+        })
+        .unwrap();
+        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+            moved::record_selected("fixture", Format::TomlMcpServers, &path, &["b".into()])?;
+            moved::remove_selected(Format::TomlMcpServers, &path, &["b".into()])
+        })
+        .unwrap();
+        let (key, item, _) = moved::toml_entry("fixture", &path, "b").unwrap().unwrap();
+        assert_eq!(super::entry_prefix(&key, &item), "# X\n# Y\n");
+        let provenance = moved::toml_provenance("fixture", &path, &[(key, item)]).unwrap();
+        assert!(provenance[0].capture.as_ref().unwrap().inherited.is_empty());
+    }
+    #[test]
+    fn generic_writer_provenance_checks_source_generation_and_invalid_records() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("provenance-source-generation");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        for mode in [
+            "valid",
+            "legacy",
+            "invalid",
+            "missing",
+            "current",
+            "removed-again",
+            "bad-range",
+        ] {
+            let path = fixture.0.join(format!("{mode}.toml"));
+            std::fs::write(&path, "model = 'before'\n# OWN A\n[mcp_servers.a]\ncommand = 'a'\n# OWN B\n[mcp_servers.b]\ncommand = 'b'\nmetadata = {keep = true}\n[profiles.work]\nkeep = true\n").unwrap();
+            let mut b = super::super::tests::sample_gateway(None, "codex");
+            b.name = "b".into();
+            b.command = Some("b".into());
+            b.args.clear();
+            b.env.clear();
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                moved::record_selected("fixture", Format::TomlMcpServers, &path, &["a".into()])?;
+                write_toml(&path, &[b.clone()])
+            })
+            .unwrap();
+            let record_path = backup_dir("fixture").unwrap().join("moved-servers.json");
+            let mut record: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+            match mode {
+                "legacy" => {
+                    record.as_object_mut().unwrap().remove("livePrefixes");
+                    record["entries"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("capture");
+                }
+                "invalid" => record["entries"][0]["capture"] = serde_json::json!({"id": 1}),
+                "missing" => record["entries"].as_array_mut().unwrap().clear(),
+                "bad-range" => {
+                    record["livePrefixes"][0]["range"]["end"] = serde_json::json!(999999)
+                }
+                _ => {}
+            }
+            if matches!(mode, "legacy" | "invalid" | "missing" | "bad-range") {
+                std::fs::write(&record_path, serde_json::to_string_pretty(&record).unwrap())
+                    .unwrap();
+            }
+            if matches!(mode, "current" | "removed-again") {
+                let edited = format!(
+                    "{}\n# NEW A\n[mcp_servers.a]\ncommand = 'new-a'\n",
+                    read_config_file(&path).unwrap()
+                );
+                std::fs::write(&path, edited).unwrap();
+            }
+            if mode == "removed-again" {
+                mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                    moved::record_selected(
+                        "fixture",
+                        Format::TomlMcpServers,
+                        &path,
+                        &["a".into()],
+                    )?;
+                    moved::remove_selected(Format::TomlMcpServers, &path, &["a".into()])
+                })
+                .unwrap();
+            }
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                moved::record_selected("fixture", Format::TomlMcpServers, &path, &["b".into()])?;
+                moved::remove_selected(Format::TomlMcpServers, &path, &["b".into()])
+            })
+            .unwrap();
+            let (key, item, _) = moved::toml_entry("fixture", &path, "b").unwrap().unwrap();
+            assert_eq!(
+                super::entry_prefix(&key, &item),
+                "# OWN A\n# OWN B\n",
+                "{mode}"
+            );
+            let meta = moved::toml_provenance("fixture", &path, &[(key, item)]).unwrap();
+            let inherited = &meta[0].capture.as_ref().unwrap().inherited;
+            assert_eq!(
+                !inherited.is_empty(),
+                mode == "valid",
+                "{mode}: {inherited:?}"
+            );
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                moved::restore("fixture", Format::TomlMcpServers, &path)?;
+                Ok(())
+            })
+            .unwrap();
+            let output = read_config_file(&path).unwrap();
+            if mode == "valid" {
+                assert_eq!(output.matches("# OWN A").count(), 1, "{output}");
+                assert_eq!(output.matches("# OWN B").count(), 1, "{output}");
+            } else {
+                assert!(output.contains("# OWN A\n# OWN B\n"), "{mode}: {output}");
+            }
+            let parsed: toml::Value = toml::from_str(&output).unwrap();
+            assert_eq!(
+                parsed["mcp_servers"]["b"]["metadata"]["keep"].as_bool(),
+                Some(true)
+            );
+        }
+    }
+    #[test]
+    fn provenance_auxiliary_record_rolls_back_on_config_commit_conflict() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("provenance-rollback");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        let path = fixture.0.join("config.toml");
+        let initial = "# A\n[mcp_servers.a]\ncommand = 'a'\n# B\n[mcp_servers.b]\ncommand = 'b'\n";
+        std::fs::write(&path, initial).unwrap();
+        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+            moved::record_selected("fixture", Format::TomlMcpServers, &path, &["a".into()])?;
+            moved::remove_selected(Format::TomlMcpServers, &path, &["a".into()])
+        })
+        .unwrap();
+        let record_path = backup_dir("fixture").unwrap().join("moved-servers.json");
+        let before_record = std::fs::read(&record_path).unwrap();
+        let native = read_config_file(&path)
+            .unwrap()
+            .replace("command = 'b'", "command = 'user-b'");
+        let native_write = native.clone();
+        crate::registry::client_file::HOOK.with(|slot| {
+            *slot.borrow_mut() = Some((
+                "commit",
+                Box::new(move |path| std::fs::write(path, &native_write).unwrap()),
+            ));
+        });
+        let error = mutation::run("fixture", &path, Format::TomlMcpServers, || {
+            moved::record_selected("fixture", Format::TomlMcpServers, &path, &["b".into()])?;
+            moved::remove_selected(Format::TomlMcpServers, &path, &["b".into()])
+        })
+        .unwrap_err();
+        assert!(
+            error.contains("changed") || error.contains("conflict"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&record_path).unwrap(), before_record);
+        assert_eq!(read_config_file(&path).unwrap(), native);
+    }
+    #[test]
+    fn inherited_prefix_cannot_extend_beyond_the_independent_owner_union() {
+        let original: DocumentMut = "# X\n[mcp_servers.a]\ncommand = 'a'\n# Y\n[mcp_servers.b]\ncommand = 'old-b'\n[profiles.work]\nkeep = true\n# X\n# Y\n[profiles.unrelated]\nkeep = true\n".parse().unwrap();
+        let written: DocumentMut = "# X\n# Y\n[profiles.work]\nkeep = true\n".parse().unwrap();
+        let raw_b: DocumentMut =
+            "# X\n# Y\n[mcp_servers.b]\ncommand = 'latest-b'\nmetadata = {latest = true}\n"
+                .parse()
+                .unwrap();
+        let entries = vec![
+            super::raw_entry(&original, "a").unwrap(),
+            super::raw_entry(&raw_b, "b").unwrap(),
+        ];
+        let mut current = written.clone();
+        super::restore_raw_entries(&original, &written, &mut current, entries);
+        assert_eq!(
+            current["profiles"]["work"]
+                .as_table()
+                .unwrap()
+                .decor()
+                .prefix()
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "# Y\n"
+        );
+        let (key, item) = super::raw_entry(&current, "b").unwrap();
+        assert_eq!(super::entry_prefix(&key, &item), "# X\n# Y\n");
+        let parsed: toml::Value = toml::from_str(&current.to_string()).unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["b"]["command"].as_str(),
+            Some("latest-b")
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["b"]["metadata"]["latest"].as_bool(),
+            Some(true)
+        );
     }
 }
 use toml_edit::{DocumentMut, Item, Table};
@@ -1417,18 +2275,71 @@ fn visit(table: &mut Table, f: &mut impl FnMut(&mut Table)) {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum PrefixDestination {
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub(super) enum PrefixDestination {
     Table(Vec<(String, Option<usize>)>),
     InlineKey(Vec<(String, Option<usize>)>, String),
     Eof,
 }
 
 pub(super) struct PrefixTransfer {
-    source_name: String,
-    prefix: String,
-    destination: PrefixDestination,
-    expected_destination_prefix: String,
+    pub source_name: String,
+    pub prefix: String,
+    pub destination: PrefixDestination,
+    pub expected_destination_prefix: String,
+    pub landing: std::ops::Range<usize>,
+}
+
+// 実Moveが観測した範囲だけを保存する。同文検索を継承の証拠にはしない。
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct TomlCapture {
+    pub id: String,
+    pub prefix_hash: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inherited: Vec<PrefixInheritance>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct PrefixInheritance {
+    pub range: std::ops::Range<usize>,
+    pub source_id: String,
+    pub source_range: std::ops::Range<usize>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct LivePrefix {
+    pub source_id: String,
+    pub source_range: std::ops::Range<usize>,
+    pub destination: PrefixDestination,
+    pub range: std::ops::Range<usize>,
+    pub decor_hash: String,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct TomlProvenance {
+    pub capture: Option<TomlCapture>,
+    pub live: Vec<LivePrefix>,
+}
+
+pub(super) fn capture_prefix<'a>(key: &'a toml_edit::Key, item: &'a Item) -> &'a str {
+    entry_prefix(key, item)
+}
+
+pub(super) fn source_destination(name: &str, item: &Item) -> PrefixDestination {
+    let path = vec![("mcp_servers".to_string(), None)];
+    if item.is_table() {
+        PrefixDestination::Table(vec![("mcp_servers".into(), None), (name.into(), None)])
+    } else {
+        PrefixDestination::InlineKey(path, name.into())
+    }
+}
+
+pub(super) fn valid_live<'a>(doc: &'a DocumentMut, live: &LivePrefix) -> Option<&'a str> {
+    let decor = destination_prefix(doc, &live.destination)?;
+    if crate::registry::sha256_hex(decor) != live.decor_hash {
+        return None;
+    }
+    decor.get(live.range.clone())
 }
 
 fn table_path(table: &Table, position: usize) -> Option<Vec<(String, Option<usize>)>> {
@@ -1458,7 +2369,7 @@ fn table_path(table: &Table, position: usize) -> Option<Vec<(String, Option<usiz
     None
 }
 
-fn destination_prefix<'a>(
+pub(super) fn destination_prefix<'a>(
     doc: &'a DocumentMut,
     destination: &PrefixDestination,
 ) -> Option<&'a str> {
@@ -1797,15 +2708,117 @@ fn insert_before_anchor(
     }
 }
 
-// 同じ移送先へまとまった登録は、prefixのない兄弟も含めて元の順で境界内へ戻す。
+fn merge_prefix_spans(mut spans: Vec<std::ops::Range<usize>>) -> Vec<std::ops::Range<usize>> {
+    spans.sort_by_key(|span| (span.start, span.end));
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+    for span in spans {
+        if let Some(last) = merged.last_mut().filter(|last| span.start <= last.end) {
+            last.end = last.end.max(span.end);
+        } else {
+            merged.push(span);
+        }
+    }
+    merged
+}
+
+fn unassigned_prefix_spans(
+    span: &std::ops::Range<usize>,
+    assigned: &[std::ops::Range<usize>],
+) -> Vec<std::ops::Range<usize>> {
+    let mut next = span.start;
+    let mut remaining = Vec::new();
+    for prior in assigned {
+        if prior.end <= next || prior.start >= span.end {
+            continue;
+        }
+        if prior.start > next {
+            remaining.push(next..prior.start.min(span.end));
+        }
+        next = next.max(prior.end);
+    }
+    if next < span.end {
+        remaining.push(next..span.end);
+    }
+    remaining
+}
+
+fn proven_prefix_span(
+    written: &DocumentMut,
+    current: &DocumentMut,
+    destination: &PrefixDestination,
+    prefix: &str,
+) -> Option<std::ops::Range<usize>> {
+    if prefix_locations(written)
+        .iter()
+        .map(|(_, decor)| line_prefix_matches(decor, prefix))
+        .sum::<usize>()
+        != 1
+        || prefix_locations(current)
+            .iter()
+            .map(|(_, decor)| line_prefix_matches(decor, prefix))
+            .sum::<usize>()
+            != 1
+        || line_prefix_matches(destination_prefix(written, destination)?, prefix) != 1
+    {
+        return None;
+    }
+    let decor = destination_prefix(current, destination)?;
+    let start = decor
+        .match_indices(prefix)
+        .find(|(offset, _)| *offset == 0 || decor.as_bytes()[offset - 1] == b'\n')?
+        .0;
+    Some(start..start + prefix.len())
+}
+
+// 同じactual移送先の計画を統合し、証明された物理spanを一度だけ復元へ割り当てる。
+// 継承の因果や同文コメントの同一性は推測せず、crossingや曖昧な証拠はRawを保全する。
+#[cfg(test)]
 pub(super) fn restore_raw_entries(
     original: &DocumentMut,
     written: &DocumentMut,
     doc: &mut DocumentMut,
     entries: Vec<(toml_edit::Key, Item)>,
 ) {
+    restore_raw_entries_with_provenance(original, written, doc, entries, &[]);
+}
+
+pub(super) fn restore_raw_entries_with_provenance(
+    original: &DocumentMut,
+    written: &DocumentMut,
+    doc: &mut DocumentMut,
+    entries: Vec<(toml_edit::Key, Item)>,
+    provenance: &[TomlProvenance],
+) {
     super::toml_mcp_servers_mut(doc);
     let evidence = doc.clone();
+    // ownerは初期証拠だけで独立に確定し、借用を通じて追加しない。
+    let mut owners: std::collections::HashMap<_, _> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (key, item))| {
+            raw_prefix_location(original, written, &evidence, key, item)
+                .map(|destination| (index, destination))
+        })
+        .collect();
+    for (index, (key, item)) in entries.iter().enumerate() {
+        let Some(meta) = provenance.get(index) else {
+            continue;
+        };
+        let Some(capture) = &meta.capture else {
+            continue;
+        };
+        let prefix = entry_prefix(key, item);
+        if crate::registry::sha256_hex(prefix) != capture.prefix_hash {
+            continue;
+        }
+        if let Some(live) = meta.live.iter().find(|live| {
+            live.source_id == capture.id
+                && live.source_range == (0..prefix.len())
+                && valid_live(&evidence, live) == Some(prefix)
+        }) {
+            owners.insert(index, live.destination.clone());
+        }
+    }
     let mut layout = gateway_rename_layout(original, written);
     super::toml_mcp_servers_mut(&mut layout);
     let missing: Vec<_> = entries
@@ -1840,6 +2853,7 @@ pub(super) fn restore_raw_entries(
         })
         .unwrap_or_default();
     let mut groups = std::collections::BTreeMap::<PrefixDestination, Vec<usize>>::new();
+    let mut preserve_raw = std::collections::HashSet::new();
     for (index, (key, item)) in entries.iter().enumerate() {
         if !missing.iter().any(|name| name == key.get()) {
             continue;
@@ -1849,87 +2863,319 @@ pub(super) fn restore_raw_entries(
             .and_then(|table| table.get(key.get()))
         {
             if old.is_table() != item.is_table() {
+                preserve_raw.insert(index);
                 continue;
             }
         }
         let anchor = original_anchor(&layout, &remaining, &evidence, key.get())
-            .or_else(|| raw_prefix_location(original, written, &evidence, key, item));
+            .or_else(|| owners.get(&index).cloned());
         if let Some(anchor) = anchor {
             groups.entry(anchor).or_default().push(index);
         }
     }
-    let mut handled = std::collections::HashSet::new();
-    for (anchor, mut indices) in groups {
-        indices.sort_by_key(|index| {
-            order
-                .get(entries[*index].0.get())
-                .copied()
-                .unwrap_or((usize::MAX, usize::MAX))
-        });
+    let mut actual_groups = std::collections::BTreeMap::<PrefixDestination, Vec<usize>>::new();
+    for (anchor, indices) in groups {
         let locations: Vec<_> = indices
             .iter()
-            .filter_map(|index| {
-                raw_prefix_location(
-                    original,
-                    written,
-                    &evidence,
-                    &entries[*index].0,
-                    &entries[*index].1,
-                )
-                .map(|destination| (*index, destination))
-            })
+            .filter_map(|index| owners.get(index).cloned())
             .collect();
-        let Some((_, actual)) = locations.first() else {
+        let Some(actual) = locations.first() else {
             continue;
         };
         let eof_redirect = matches!(anchor, PrefixDestination::Eof)
             && matches!(actual, PrefixDestination::Table(path) if path.len() == 2 && path[0].0 == "mcp_servers" && original.get("mcp_servers").and_then(|table| table.get(&path[1].0)).is_none());
         if (actual != &anchor && !eof_redirect)
-            || locations
-                .iter()
-                .any(|(_, destination)| destination != actual)
+            || locations.iter().any(|destination| destination != actual)
         {
+            preserve_raw.extend(indices);
             continue;
         }
-        if locations.len() == indices.len() {
-            // 各entryの転送prefixを証明できる場合は、移送decor内の実順序を優先する。
-            let decor = destination_prefix(&evidence, actual).unwrap();
-            indices.sort_by_key(|index| {
-                let prefix = entry_prefix(&entries[*index].0, &entries[*index].1);
-                decor
-                    .match_indices(prefix)
-                    .find(|(offset, _)| *offset == 0 || decor.as_bytes()[offset - 1] == b'\n')
-                    .unwrap()
-                    .0
-            });
-        }
-        for (index, _) in &locations {
+        actual_groups
+            .entry(actual.clone())
+            .or_default()
+            .extend(indices);
+    }
+    let mut plans = Vec::new();
+    let mut handled = std::collections::HashSet::new();
+    for (actual, mut indices) in actual_groups {
+        indices.sort_by_key(|index| {
+            order
+                .get(entries[*index].0.get())
+                .copied()
+                .unwrap_or((usize::MAX, *index))
+        });
+        let mut spans = std::collections::HashMap::new();
+        let mut invalid = false;
+        for index in &indices {
+            if owners.get(index) != Some(&actual) {
+                continue;
+            }
             let prefix = entry_prefix(&entries[*index].0, &entries[*index].1);
-            let current = destination_prefix(doc, actual).unwrap().to_string();
-            if let Some(offset) = current
-                .match_indices(prefix)
-                .find(|(offset, _)| *offset == 0 || current.as_bytes()[offset - 1] == b'\n')
-                .map(|(offset, _)| offset)
+            let observed = provenance.get(*index).and_then(|meta| {
+                let capture = meta.capture.as_ref()?;
+                if crate::registry::sha256_hex(prefix) != capture.prefix_hash {
+                    return None;
+                }
+                meta.live
+                    .iter()
+                    .find(|live| {
+                        live.source_id == capture.id
+                            && live.destination == actual
+                            && live.source_range == (0..prefix.len())
+                            && valid_live(&evidence, live) == Some(prefix)
+                    })
+                    .map(|live| live.range.clone())
+            });
+            if let Some(span) =
+                observed.or_else(|| proven_prefix_span(written, &evidence, &actual, prefix))
             {
-                let mut updated = current;
-                updated.replace_range(offset..offset + prefix.len(), "");
-                set_destination_prefix(doc, actual, updated);
+                spans.insert(*index, span);
             }
         }
-        let batch = indices
+        // crossingは所有者の採否とは別に検知し、移送先全体をそのまま保つ。
+        let geometry: Vec<_> = indices
             .iter()
-            .map(|index| {
-                handled.insert(*index);
-                entries[*index].clone()
+            .filter_map(|index| {
+                spans.get(index).cloned().or_else(|| {
+                    let prefix = entry_prefix(&entries[*index].0, &entries[*index].1);
+                    proven_prefix_span(written, &evidence, &actual, prefix)
+                })
             })
             .collect();
-        insert_before_anchor(doc, actual, batch);
+        if geometry.iter().enumerate().any(|(i, a)| {
+            geometry.iter().skip(i + 1).any(|b| {
+                a.start < b.end
+                    && b.start < a.end
+                    && !((a.start <= b.start && a.end >= b.end)
+                        || (b.start <= a.start && b.end >= a.end))
+            })
+        }) {
+            preserve_raw.extend(indices);
+            continue;
+        }
+        // 明示された継承を座標へ変換する。文面一致は因果の根拠にしない。
+        let valid_edge = |child: usize, source: usize| -> Option<&PrefixInheritance> {
+            let child_capture = provenance.get(child)?.capture.as_ref()?;
+            let source_capture = provenance.get(source)?.capture.as_ref()?;
+            let child_prefix = entry_prefix(&entries[child].0, &entries[child].1);
+            let source_prefix = entry_prefix(&entries[source].0, &entries[source].1);
+            if child_capture.id == source_capture.id
+                || crate::registry::sha256_hex(child_prefix) != child_capture.prefix_hash
+                || crate::registry::sha256_hex(source_prefix) != source_capture.prefix_hash
+            {
+                return None;
+            }
+            child_capture.inherited.iter().find(|edge| {
+                edge.source_id == source_capture.id
+                    && edge.range.start < edge.range.end
+                    && child_prefix
+                        .get(edge.range.clone())
+                        .zip(source_prefix.get(edge.source_range.clone()))
+                        .is_some_and(|(a, b)| a == b)
+            })
+        };
+        for _ in 0..indices.len() {
+            let mut added = Vec::new();
+            for child in &indices {
+                if spans.contains_key(child) {
+                    continue;
+                }
+                for source in &indices {
+                    let (Some(edge), Some(source_span)) =
+                        (valid_edge(*child, *source), spans.get(source))
+                    else {
+                        continue;
+                    };
+                    let Some(start) = source_span
+                        .start
+                        .checked_add(edge.source_range.start)
+                        .and_then(|v| v.checked_sub(edge.range.start))
+                    else {
+                        continue;
+                    };
+                    let prefix = entry_prefix(&entries[*child].0, &entries[*child].1);
+                    let Some(end) = start.checked_add(prefix.len()) else {
+                        continue;
+                    };
+                    if destination_prefix(&evidence, &actual).and_then(|d| d.get(start..end))
+                        == Some(prefix)
+                    {
+                        added.push((*child, start..end));
+                        break;
+                    }
+                }
+            }
+            if added.is_empty() {
+                break;
+            }
+            spans.extend(added);
+        }
+        let owner_union = merge_prefix_spans(spans.values().cloned().collect());
+        if owner_union.is_empty() {
+            preserve_raw.extend(indices);
+            continue;
+        }
+        indices.retain(|index| {
+            let (key, item) = &entries[*index];
+            let prefix = entry_prefix(key, item);
+            if !prefix.contains('#') || spans.contains_key(index) {
+                return true;
+            }
+            preserve_raw.insert(*index);
+            false
+        });
+        // 同じ物理spanを複数Rawに割り当てるのは、範囲が一致する実継承だけ。
+        let mut independent = std::collections::HashSet::new();
+        for (position, first) in indices.iter().enumerate() {
+            for second in indices.iter().skip(position + 1) {
+                let (Some(a), Some(b)) = (spans.get(first), spans.get(second)) else {
+                    continue;
+                };
+                let overlap = a.start.max(b.start)..a.end.min(b.end);
+                if overlap.start >= overlap.end {
+                    continue;
+                }
+                let explains =
+                    |child: usize,
+                     source: usize,
+                     child_span: &std::ops::Range<usize>,
+                     source_span: &std::ops::Range<usize>| {
+                        valid_edge(child, source).is_some_and(|edge| {
+                            child_span.start.checked_add(edge.range.start)
+                                == source_span.start.checked_add(edge.source_range.start)
+                                && child_span.start + edge.range.start <= overlap.start
+                                && child_span.start + edge.range.end >= overlap.end
+                        })
+                    };
+                if !explains(*first, *second, a, b) && !explains(*second, *first, b, a) {
+                    independent.insert(*second);
+                }
+            }
+        }
+        indices.retain(|index| {
+            if independent.contains(index) {
+                spans.remove(index);
+                preserve_raw.insert(*index);
+                false
+            } else {
+                true
+            }
+        });
+        for first in spans.values() {
+            for second in spans.values() {
+                let intersects = first.start < second.end && second.start < first.end;
+                let contains = (first.start <= second.start && first.end >= second.end)
+                    || (second.start <= first.start && second.end >= first.end);
+                if intersects && !contains {
+                    invalid = true;
+                }
+            }
+        }
+        if invalid {
+            preserve_raw.extend(indices);
+            continue;
+        }
+        // 原本順を保ち、不在entryは包含spanの短→長、非重複spanの実順を使う。
+        // 同一spanは既存のMove記録順をtie-breakにし、名前順へ置き換えない。
+        let precedes = |first: usize, second: usize| {
+            if let (Some(first_order), Some(second_order)) = (
+                order.get(entries[first].0.get()),
+                order.get(entries[second].0.get()),
+            ) {
+                return first_order < second_order;
+            }
+            let (Some(first_span), Some(second_span)) = (spans.get(&first), spans.get(&second))
+            else {
+                return false;
+            };
+            if first_span == second_span {
+                return first < second;
+            }
+            if first_span.start >= second_span.start && first_span.end <= second_span.end {
+                return true;
+            }
+            if second_span.start >= first_span.start && second_span.end <= first_span.end {
+                return false;
+            }
+            first_span.end <= second_span.start
+        };
+        let mut pending = indices.clone();
+        let mut sorted = Vec::new();
+        while !pending.is_empty() {
+            let Some(next) = pending.iter().position(|index| {
+                !pending
+                    .iter()
+                    .any(|other| other != index && precedes(*other, *index))
+            }) else {
+                invalid = true;
+                break;
+            };
+            sorted.push(pending.remove(next));
+        }
+        if invalid {
+            preserve_raw.extend(indices);
+            continue;
+        }
+        let decor = destination_prefix(&evidence, &actual).unwrap();
+        let mut assigned = Vec::new();
+        let mut batch = Vec::new();
+        for index in sorted {
+            let (mut key, mut item) = entries[index].clone();
+            if let Some(span) = spans.get(&index) {
+                let prefix = unassigned_prefix_spans(span, &assigned)
+                    .iter()
+                    .map(|range| &decor[range.clone()])
+                    .collect::<String>();
+                if let Some(table) = item.as_table_mut() {
+                    table.decor_mut().set_prefix(prefix);
+                } else {
+                    key.leaf_decor_mut().set_prefix(prefix);
+                }
+                assigned.push(span.clone());
+                assigned = merge_prefix_spans(assigned);
+            }
+            handled.insert(index);
+            batch.push((key, item));
+        }
+        plans.push((
+            actual,
+            merge_prefix_spans(spans.into_values().collect()),
+            batch,
+        ));
+    }
+    // 全計画は初期evidence座標。挿入に先立って各actualを一度だけ更新する。
+    for (actual, spans, _) in &plans {
+        let mut updated = destination_prefix(&evidence, actual).unwrap().to_string();
+        for span in spans.iter().rev() {
+            updated.replace_range(span.clone(), "");
+        }
+        set_destination_prefix(doc, actual, updated);
+    }
+    for (actual, _, batch) in plans {
+        insert_before_anchor(doc, &actual, batch);
     }
     for (index, (mut key, mut item)) in entries.into_iter().enumerate() {
         if handled.contains(&index) {
             continue;
         }
-        dedup_raw_prefix(original, written, &evidence, &mut key, &mut item);
+        let verified_live = provenance
+            .get(index)
+            .and_then(|meta| {
+                let capture = meta.capture.as_ref()?;
+                let prefix = entry_prefix(&key, &item);
+                if crate::registry::sha256_hex(prefix) != capture.prefix_hash {
+                    return None;
+                }
+                meta.live.iter().find(|live| {
+                    live.source_id == capture.id
+                        && live.source_range == (0..prefix.len())
+                        && valid_live(&evidence, live) == Some(prefix)
+                })
+            })
+            .is_some();
+        if verified_live && !preserve_raw.contains(&index) {
+            dedup_raw_prefix(original, written, &evidence, &mut key, &mut item);
+        }
         put_raw(doc, key, item);
     }
 }
@@ -2064,6 +3310,7 @@ pub(super) fn remove(doc: &mut DocumentMut, names: &[String]) -> Vec<PrefixTrans
                             next.clone(),
                         ),
                         expected_destination_prefix: String::new(),
+                        landing: 0..0,
                     });
                     inline_prefixes
                         .entry(next.clone())
@@ -2115,6 +3362,7 @@ pub(super) fn remove(doc: &mut DocumentMut, names: &[String]) -> Vec<PrefixTrans
             prefix: prefix.clone(),
             destination,
             expected_destination_prefix: String::new(),
+            landing: 0..0,
         });
         destinations.entry(next).or_default().push_str(&prefix);
     }
@@ -2137,7 +3385,11 @@ pub(super) fn remove(doc: &mut DocumentMut, names: &[String]) -> Vec<PrefixTrans
             doc.set_trailing(format!("{prefix}{}", doc.trailing().as_str().unwrap_or("")));
         }
     }
+    let mut offsets = std::collections::BTreeMap::new();
     for transfer in &mut transfers {
+        let offset = offsets.entry(transfer.destination.clone()).or_insert(0);
+        transfer.landing = *offset..*offset + transfer.prefix.len();
+        *offset += transfer.prefix.len();
         transfer.expected_destination_prefix = destination_prefix(doc, &transfer.destination)
             .unwrap_or("")
             .to_string();

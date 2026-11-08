@@ -6627,18 +6627,35 @@ fn write_toml(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
         .filter(|(name, _)| !servers.iter().any(|server| server.name == *name))
         .map(|(name, _)| name.to_string())
         .collect();
-    toml_preservation::remove(&mut doc, &removed);
+    let before = doc.clone();
+    let transfers = toml_preservation::remove(&mut doc, &removed);
+    moved::observe_toml_removal(path, &before, &doc, &transfers)?;
     for server in servers {
         let unchanged = doc
             .get("mcp_servers")
             .and_then(|table| table.get(&server.name))
             .is_some_and(|item| toml_server_matches(item, server));
         if !unchanged {
+            let before = doc.clone();
+            let was_missing = toml_preservation::raw_entry(&before, &server.name).is_none();
             toml_preservation::put(
                 &mut doc,
                 &server.name,
                 toml_value_to_item(&entry_to_toml(server)),
             );
+            if was_missing {
+                if let Some((_, item)) = toml_preservation::raw_entry(&doc, &server.name) {
+                    if item.is_table() {
+                        moved::observe_toml_relocation(
+                            path,
+                            &before,
+                            &doc,
+                            &toml_preservation::PrefixDestination::Eof,
+                            &toml_preservation::source_destination(&server.name, &item),
+                        )?;
+                    }
+                }
+            }
         }
     }
     toml_mcp_servers_mut(&mut doc).set_implicit(!servers.is_empty() && !keep_header);
@@ -7951,21 +7968,53 @@ fn edit_toml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), Str
     if let Some(entry) = entry {
         if !servers.contains_key(GATEWAY_ENTRY_NAME) && !remove.is_empty() {
             let alias = remove.remove(0);
+            let before = doc.clone();
+            let old_destination = toml_preservation::raw_entry(&before, &alias)
+                .map(|(_, item)| toml_preservation::source_destination(&alias, &item));
             toml_preservation::rename(
                 &mut doc,
                 &alias,
                 GATEWAY_ENTRY_NAME,
                 toml_value_to_item(&entry_to_toml(entry)),
             );
+            if let (Some(old), Some((_, item))) = (
+                old_destination,
+                toml_preservation::raw_entry(&doc, GATEWAY_ENTRY_NAME),
+            ) {
+                moved::observe_toml_relocation(
+                    path,
+                    &before,
+                    &doc,
+                    &old,
+                    &toml_preservation::source_destination(GATEWAY_ENTRY_NAME, &item),
+                )?;
+            }
         }
     }
-    toml_preservation::remove(&mut doc, &remove);
+    let before = doc.clone();
+    let transfers = toml_preservation::remove(&mut doc, &remove);
+    moved::observe_toml_removal(path, &before, &doc, &transfers)?;
     if let Some(entry) = entry {
+        let before = doc.clone();
+        let was_missing = toml_preservation::raw_entry(&before, GATEWAY_ENTRY_NAME).is_none();
         toml_preservation::put(
             &mut doc,
             GATEWAY_ENTRY_NAME,
             toml_value_to_item(&entry_to_toml(entry)),
         );
+        if was_missing {
+            if let Some((_, item)) = toml_preservation::raw_entry(&doc, GATEWAY_ENTRY_NAME) {
+                if item.is_table() {
+                    moved::observe_toml_relocation(
+                        path,
+                        &before,
+                        &doc,
+                        &toml_preservation::PrefixDestination::Eof,
+                        &toml_preservation::source_destination(GATEWAY_ENTRY_NAME, &item),
+                    )?;
+                }
+            }
+        }
     }
     let servers = toml_mcp_servers_mut(&mut doc);
     if servers.is_empty() || keep_header {

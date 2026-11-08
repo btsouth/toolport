@@ -676,6 +676,7 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
                 .parse::<toml_edit::DocumentMut>()
                 .map_err(|e| e.to_string())?;
             let mut restore_entries = Vec::new();
+            let mut recorded_order = std::collections::HashMap::new();
             let desired = latest.get(key).and_then(Value::as_object);
             let existing = doc
                 .get(key)
@@ -694,7 +695,10 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
             if let Some(desired) = desired {
                 for (name, value) in desired {
                     if mutation::value(format, current.as_deref())?[key].get(name) != Some(value) {
-                        if let Some((entry_key, item)) = moved::toml_entry(client_id, path, name)? {
+                        if let Some((entry_key, item, index)) =
+                            moved::toml_entry(client_id, path, name)?
+                        {
+                            recorded_order.insert(entry_key.get().to_string(), index);
                             restore_entries.push((entry_key, item));
                         } else if mutation::value(format, record.original.as_deref())?[key]
                             .get(name)
@@ -714,11 +718,16 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
                     }
                 }
             }
-            toml_preservation::restore_raw_entries(
+            restore_entries.sort_by_key(|(key, _)| {
+                recorded_order.get(key.get()).copied().unwrap_or(usize::MAX)
+            });
+            let provenance = moved::toml_provenance(client_id, path, &restore_entries)?;
+            toml_preservation::restore_raw_entries_with_provenance(
                 &original,
                 &written_doc,
                 &mut doc,
                 restore_entries,
+                &provenance,
             );
             toml_preservation::remove(&mut doc, &removed);
             if latest.get(key).is_none() {

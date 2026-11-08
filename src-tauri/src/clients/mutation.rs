@@ -8,11 +8,13 @@ use std::collections::BTreeMap;
 
 #[derive(Default)]
 struct Pending {
+    client_id: String,
     legacy_gateway_ownership: bool,
     path: PathBuf,
     original: Option<String>,
     output: Option<String>,
     auxiliary: BTreeMap<PathBuf, String>,
+    toml_captures: std::collections::HashSet<String>,
     strict_json: bool,
     remove: bool,
     disconnecting: bool,
@@ -34,6 +36,36 @@ pub(super) fn legacy_gateway_ownership() -> bool {
         slot.borrow()
             .as_ref()
             .is_some_and(|pending| pending.legacy_gateway_ownership)
+    })
+}
+
+pub(super) fn client_id(path: &Path) -> Option<String> {
+    PENDING.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|pending| pending.path == path)
+            .map(|pending| pending.client_id.clone())
+    })
+}
+
+// 記録世代の有効範囲は現在のmutationと、その再描画試行だけに限定する。
+pub(super) fn remember_toml_captures(path: &Path, client_id: &str, ids: Vec<String>) {
+    PENDING.with(|slot| {
+        if let Some(pending) = slot
+            .borrow_mut()
+            .as_mut()
+            .filter(|p| p.path == path && p.client_id == client_id)
+        {
+            pending.toml_captures.extend(ids);
+        }
+    });
+}
+
+pub(super) fn consume_toml_capture(path: &Path, id: &str) -> bool {
+    PENDING.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .is_some_and(|p| p.path == path && p.toml_captures.remove(id))
     })
 }
 
@@ -266,6 +298,7 @@ fn run_inner<T>(
         }
         PENDING.with(|slot| {
             *slot.borrow_mut() = Some(Pending {
+                client_id: client_id.into(),
                 legacy_gateway_ownership: locations::legacy_gateway_ownership(client_id),
                 path: path.into(),
                 original: original.clone(),
