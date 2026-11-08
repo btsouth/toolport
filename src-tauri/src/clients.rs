@@ -6662,7 +6662,8 @@ fn write_toml(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
     atomic_write(path, &doc.to_string())
 }
 
-// 登録形式で扱う値だけを比較し、未知の設定や元の書式は変更対象にしない。
+// Compare only values represented by this registration format, leaving unknown
+// settings and the original formatting outside the update's scope.
 fn toml_server_matches(item: &toml_edit::Item, server: &ServerEntry) -> bool {
     let expected = entry_to_toml(server);
     let string = |key: &str| item.get(key).and_then(|value| value.as_str());

@@ -65,6 +65,8 @@ enum Raw {
     },
 }
 
+// Provenance is optional recovery metadata. Invalid metadata disables its use,
+// but must not prevent loading the raw entry needed to restore legacy records.
 fn deserialize_optional_capture<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<toml_preservation::TomlCapture>, D::Error> {
@@ -171,7 +173,8 @@ fn load(client_id: &str) -> Result<Option<Record>, String> {
     }
 }
 
-// 実writerで観測した移送だけを記録し、既存の証拠も同じ座標変換で追跡する。
+// Record only transfers observed by the actual writer, applying the same offset
+// changes to existing witnesses. Layout simulations must not issue new evidence.
 pub(super) fn observe_toml_removal(
     path: &Path,
     before: &toml_edit::DocumentMut,
@@ -252,6 +255,9 @@ pub(super) fn observe_toml_removal(
         let Some(actual_text) = toml_raw_text(before, &entry.name) else {
             continue;
         };
+        // A saved capture alone is insufficient: the current mutation must have
+        // captured this exact raw entry, and each capture can issue evidence once.
+        // Otherwise a re-added entry could reuse an old prefix's identity.
         if !mutation::consume_toml_capture(path, &capture.id) || actual_text != *text {
             continue;
         }
@@ -287,7 +293,7 @@ pub(super) fn observe_toml_removal(
     )
 }
 
-// rename・EOF移送はwriterが確定した構造位置だけを追跡する。
+// Follow renames and EOF transfers only at structural locations fixed by the writer.
 pub(super) fn observe_toml_relocation(
     path: &Path,
     before: &toml_edit::DocumentMut,
@@ -414,6 +420,8 @@ pub(super) fn record_selected(
     names: &[String],
 ) -> Result<(), String> {
     let record_file = record_path(client_id)?;
+    // A second move in the same mutation must see the first move's staged record,
+    // including its live witnesses, rather than the older copy still on disk.
     let previous = match mutation::read(&record_file) {
         Some(value) => value,
         None => match std::fs::read_to_string(&record_file) {
@@ -463,6 +471,9 @@ pub(super) fn record_selected(
                 let mut id = [0u8; 16];
                 getrandom::getrandom(&mut id)
                     .map_err(|e| format!("Could not generate capture ID: {e}"))?;
+                // A later move may capture comments transferred from an earlier
+                // entry. Record that relationship only while the source remains
+                // absent and the recorded ranges and destination decor still match.
                 let inherited = record.live_prefixes.iter().filter_map(|live| {
                     if live.destination != destination { return None; }
                     let source = record.entries.iter().find(|source| matches!(&source.raw, Raw::Toml { capture: Some(c), .. } if c.id == live.source_id))?;
@@ -491,6 +502,7 @@ pub(super) fn record_selected(
     }
     let text = serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?;
     atomic_write(&record_file, &text)?;
+    // Enable new witnesses only after the recovery record has been staged.
     mutation::remember_toml_captures(path, client_id, fresh_captures);
     Ok(())
 }

@@ -1,3 +1,11 @@
+//! Preserve TOML formatting while editing and restoring MCP registrations.
+//!
+//! A boundary comment may belong to the next table's prefix or to EOF, rather
+//! than to the registration it encloses. Track where writers actually move that
+//! text; equal comment text alone does not prove that two saved copies share an
+//! origin. If transfer evidence is missing or invalid, retain recoverable raw
+//! text even when that can leave duplicate comments.
+
 #[cfg(test)]
 mod tests {
     use super::super::*;
@@ -2218,7 +2226,7 @@ mod tests {
 }
 use toml_edit::{DocumentMut, Item, Table};
 
-// rootのinline mapを展開しても、境界のコメントは元のentriesの外側へ残す。
+// Expanding the root inline map must leave boundary comments outside its entries.
 pub(super) fn expand_container(doc: &mut DocumentMut) {
     let Some(inline) = doc
         .get("mcp_servers")
@@ -2316,7 +2324,7 @@ pub(super) fn put(doc: &mut DocumentMut, name: &str, mut item: Item) {
                     .and_then(|raw| raw.as_str())
                     .unwrap_or("")
                     .to_string();
-                // EOFコメントと見出しが同じ物理行にならない分だけ終端する。
+                // Terminate the EOF comment so it cannot comment out the appended header.
                 if !trailing.ends_with('\n')
                     && trailing
                         .rsplit('\n')
@@ -2340,9 +2348,9 @@ pub(super) fn raw_entry(doc: &DocumentMut, name: &str) -> Option<(toml_edit::Key
     Some((servers.key(name)?.clone(), servers.get(name)?.clone()))
 }
 
-// 既存keyの書式は保ち、不在entryを戻す場合だけ記録したkeyの表記を使う。
+// Keep existing key formatting; use the saved spelling only for a missing entry.
 pub(super) fn put_raw(doc: &mut DocumentMut, key: toml_edit::Key, item: Item) {
-    // 復元は既存EOFコメントの前へ戻す。新規登録のputとは末尾の扱いを分ける。
+    // Restore before the EOF footer; new registrations inserted by put follow it.
     super::toml_mcp_servers_mut(doc);
     let trailing = doc.trailing().clone();
     doc.set_trailing("");
@@ -2360,7 +2368,8 @@ pub(super) fn put_raw(doc: &mut DocumentMut, key: toml_edit::Key, item: Item) {
     }
 }
 
-// edit_toml_gatewayと同じ先頭aliasの改名だけを再現し、実際の移送先と照合する。
+// Replay only the first alias rename performed by edit_toml_gateway, so transfer
+// evidence is checked against the destination the writer actually produced.
 fn gateway_rename_layout(original: &DocumentMut, written: &DocumentMut) -> DocumentMut {
     let mut layout = original.clone();
     let Some(servers) = original.get("mcp_servers").and_then(Item::as_table_like) else {
@@ -2425,14 +2434,14 @@ pub(super) fn rename(doc: &mut DocumentMut, old: &str, new: &str, item: Item) {
             (key, item.clone())
         })
         .collect();
-    // clearは見出しのdecor・position・implicitを変えず、keyの元のslotを再現する。
+    // clear preserves header decor, position and implicitness while rebuilding key slots.
     servers.clear();
     for (key, item) in entries {
         servers.insert_formatted(&key, item);
     }
 }
 
-// 同名の値だけを更新し、見出しの位置・コメント・引用されたkeyを引き継ぐ。
+// Replace only the named value, retaining header position, comments and key quoting.
 pub(super) fn insert(servers: &mut Table, name: &str, mut item: Item) {
     let key = servers.key(name).cloned();
     if let Some(old) = servers.get(name) {
@@ -2477,6 +2486,7 @@ pub(super) enum PrefixDestination {
     Eof,
 }
 
+// An observation from an actual removal, with byte offsets in the resulting decor.
 pub(super) struct PrefixTransfer {
     pub source_name: String,
     pub prefix: String,
@@ -2485,7 +2495,8 @@ pub(super) struct PrefixTransfer {
     pub landing: std::ops::Range<usize>,
 }
 
-// 実Moveが観測した範囲だけを保存する。同文検索を継承の証拠にはしない。
+// Identify one raw capture, not a server name: re-added entries get a new identity.
+// Inheritance records only observed transfers, never matches of equal comment text.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct TomlCapture {
     pub id: String,
@@ -2496,6 +2507,7 @@ pub(super) struct TomlCapture {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct PrefixInheritance {
+    // Byte ranges in the child's captured prefix and the source capture's prefix.
     pub range: std::ops::Range<usize>,
     pub source_id: String,
     pub source_range: std::ops::Range<usize>,
@@ -2507,6 +2519,8 @@ pub(super) struct LivePrefix {
     pub source_range: std::ops::Range<usize>,
     pub destination: PrefixDestination,
     pub range: std::ops::Range<usize>,
+    // Bind the range to the entire destination decor. An external edit invalidates
+    // the witness instead of allowing equal text elsewhere to claim its identity.
     pub decor_hash: String,
 }
 
@@ -2669,7 +2683,8 @@ fn line_prefix_matches(decor: &str, prefix: &str) -> usize {
         .count()
 }
 
-// 最新Rawのprefixだけを判定し、値や未知のフィールドは原本へ差し替えない。
+// Locate only the latest raw prefix; never replace its values or unknown fields
+// with those from the first snapshot.
 fn raw_prefix_location(
     original: &DocumentMut,
     written: &DocumentMut,
@@ -2691,7 +2706,8 @@ fn raw_prefix_location(
             return None;
         }
     } else {
-        // 初回snapshot後の追加・再Moveは、対応decorの一意な完全prefix一致だけを証拠にする。
+        // For entries added or moved again after the first snapshot, require a
+        // unique complete-prefix match at the corresponding decor location.
         if prefix_locations(original)
             .iter()
             .any(|(_, decor)| line_prefix_matches(decor, prefix) != 0)
@@ -2813,8 +2829,9 @@ fn original_anchor(
         .or(Some(PrefixDestination::Eof))
 }
 
-// 新gatewayの追加で原本のEOFコメントが見出しへ移った場合、そこを位置の境界にする。
-// コメントは変更せず、構造位置と書込み後のdecor全体が維持された場合だけ追従する。
+// A newly appended gateway can carry the original EOF footer on its header.
+// Follow that structural boundary only while the whole written decor survives;
+// selecting an insertion position here does not consume or deduplicate comments.
 fn eof_gateway_anchor(
     original: &DocumentMut,
     written: &DocumentMut,
@@ -2887,7 +2904,8 @@ fn insert_before_anchor(
         }
     });
     if place_parent {
-        // inline値は親headerと共に描画されるため、anchor前に親の枠も確保する。
+        // Inline values render with their parent header, which also needs a slot
+        // before the anchor.
         super::toml_mcp_servers_mut(doc).set_position(next);
         next += 1;
     }
@@ -3000,8 +3018,6 @@ fn proven_prefix_span(
     Some(start..start + prefix.len())
 }
 
-// 同じactual移送先の計画を統合し、証明された物理spanを一度だけ復元へ割り当てる。
-// 継承の因果や同文コメントの同一性は推測せず、crossingや曖昧な証拠はRawを保全する。
 #[cfg(test)]
 pub(super) fn restore_raw_entries(
     original: &DocumentMut,
@@ -3012,6 +3028,8 @@ pub(super) fn restore_raw_entries(
     restore_raw_entries_with_provenance(original, written, doc, entries, &[]);
 }
 
+// Group plans by actual destination and assign each proven physical span once.
+// Crossing or ambiguous spans preserve raw text; equal text does not prove origin.
 pub(super) fn restore_raw_entries_with_provenance(
     original: &DocumentMut,
     written: &DocumentMut,
@@ -3020,8 +3038,10 @@ pub(super) fn restore_raw_entries_with_provenance(
     provenance: &[TomlProvenance],
 ) {
     super::toml_mcp_servers_mut(doc);
+    // Freeze evidence before editing: earlier insertions must not establish new
+    // ownership or shift the coordinates used to validate later entries.
     let evidence = doc.clone();
-    // ownerは初期証拠だけで独立に確定し、借用を通じて追加しない。
+    // Establish owners independently; inherited spans must not create new owners.
     let mut owners: std::collections::HashMap<_, _> = entries
         .iter()
         .enumerate()
@@ -3110,7 +3130,8 @@ pub(super) fn restore_raw_entries_with_provenance(
             .filter_map(|index| owners.get(index).cloned())
             .collect();
         let Some(actual) = locations.first() else {
-            // コメント転送が不要な原本entryは、所有spanがなくても構造位置で戻す。
+            // An original entry without comments still has a structural position.
+            // Requiring a transfer owner would append it beyond its closing marker.
             let mut placeable = Vec::new();
             for index in indices {
                 let (key, item) = &entries[index];
@@ -3198,7 +3219,7 @@ pub(super) fn restore_raw_entries_with_provenance(
                 spans.insert(*index, span);
             }
         }
-        // crossingは所有者の採否とは別に検知し、移送先全体をそのまま保つ。
+        // Detect crossing spans independently of ownership and preserve their decor.
         let geometry: Vec<_> = indices
             .iter()
             .filter_map(|index| {
@@ -3232,7 +3253,8 @@ pub(super) fn restore_raw_entries_with_provenance(
             }
             continue;
         }
-        // 明示された継承を座標へ変換する。文面一致は因果の根拠にしない。
+        // Map explicit inheritance into destination coordinates. Text equality
+        // validates the recorded edge; it cannot establish an edge on its own.
         let valid_edge = |child: usize, source: usize| -> Option<&PrefixInheritance> {
             let child_capture = provenance.get(child)?.capture.as_ref()?;
             let source_capture = provenance.get(source)?.capture.as_ref()?;
@@ -3307,7 +3329,8 @@ pub(super) fn restore_raw_entries_with_provenance(
             preserve_raw.insert(*index);
             false
         });
-        // 同じ物理spanを複数Rawに割り当てるのは、範囲が一致する実継承だけ。
+        // Share a physical span between saved entries only when an observed
+        // inheritance edge explains the overlapping coordinates.
         let mut independent = std::collections::HashSet::new();
         for (position, first) in indices.iter().enumerate() {
             for second in indices.iter().skip(position + 1) {
@@ -3358,8 +3381,9 @@ pub(super) fn restore_raw_entries_with_provenance(
             preserve_raw.extend(indices);
             continue;
         }
-        // 原本順を保ち、不在entryは包含spanの短→長、非重複spanの実順を使う。
-        // 同一spanは既存のMove記録順をtie-breakにし、名前順へ置き換えない。
+        // Prefer original order. Otherwise restore contained spans before their
+        // containers and disjoint spans in document order. Equal spans retain
+        // move-record order rather than sorting registrations by name.
         let precedes = |first: usize, second: usize| {
             if let (Some(first_order), Some(second_order)) = (
                 order.get(entries[first].0.get()),
@@ -3426,7 +3450,8 @@ pub(super) fn restore_raw_entries_with_provenance(
             batch,
         ));
     }
-    // 全計画は初期evidence座標。挿入に先立って各actualを一度だけ更新する。
+    // All plans use frozen evidence coordinates. Update each destination once
+    // before insertion so an earlier removal cannot invalidate a later span.
     for (actual, spans, _) in &plans {
         if spans.is_empty() {
             continue;
@@ -3466,7 +3491,8 @@ pub(super) fn restore_raw_entries_with_provenance(
     }
 }
 
-// 原本から実際に転送されたprefixが同じ移送先へ残る証拠がある場合だけ重複を省く。
+// Deduplicate only when evidence shows that a transferred original prefix still
+// survives at the same destination.
 pub(super) fn retained_prefix(
     original: &DocumentMut,
     written: &DocumentMut,
@@ -3502,7 +3528,7 @@ pub(super) fn retained_prefix(
                 if !matches!(destination, PrefixDestination::Eof) {
                     return false;
                 }
-                // appendがEOFから最初の新規server見出しへ移した場合だけ、その構造位置を照合する。
+                // Check the first new server header only when append moved EOF decor there.
                 let first = written
                     .get("mcp_servers")
                     .and_then(Item::as_table_like)
@@ -3544,7 +3570,8 @@ pub(super) fn retained_prefix(
         .collect()
 }
 
-// 削除対象の外側にあるprefixだけを、文書上の次の見出し（なければ末尾）へ残す。
+// Preserve prefixes outside removed subtrees on the next header in document
+// order, or at EOF when no header follows.
 pub(super) fn remove(doc: &mut DocumentMut, names: &[String]) -> Vec<PrefixTransfer> {
     let mut prefixes = Vec::new();
     let mut transfers = Vec::new();

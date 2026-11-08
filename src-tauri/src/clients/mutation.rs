@@ -48,7 +48,8 @@ pub(super) fn client_id(path: &Path) -> Option<String> {
     })
 }
 
-// 記録世代の有効範囲は現在のmutationと、その再描画試行だけに限定する。
+// Captures are valid only in this mutation's current render attempt. A retry
+// starts fresh, so earlier attempts cannot authorize evidence for changed input.
 pub(super) fn remember_toml_captures(path: &Path, client_id: &str, ids: Vec<String>) {
     PENDING.with(|slot| {
         if let Some(pending) = slot
@@ -61,6 +62,8 @@ pub(super) fn remember_toml_captures(path: &Path, client_id: &str, ids: Vec<Stri
     });
 }
 
+// Consume rather than inspect: removing a re-added entry without capturing it
+// again must not issue a second witness for the old capture generation.
 pub(super) fn consume_toml_capture(path: &Path, id: &str) -> bool {
     PENDING.with(|slot| {
         slot.borrow_mut()
