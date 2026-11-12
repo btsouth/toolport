@@ -3602,6 +3602,7 @@ mod tests {
                 url: None,
                 cwd: None,
                 inherit_env: None,
+                hide_prompts: None,
             },
         )
         .unwrap();

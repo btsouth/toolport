@@ -627,6 +627,7 @@ pub(super) struct ServerView {
     pub(super) url: Option<String>,
     pub(super) cwd: Option<String>,
     pub(super) inherit_env: bool,
+    pub(super) hide_prompts: bool,
     pub(super) secret_keys: Vec<String>,
     /// Nonsecret environment values, editable in Edit server.
     pub(super) plain_env: Vec<PlainEnvView>,
@@ -748,6 +749,7 @@ impl RegistrySnapshot {
                     url: server.url.clone(),
                     cwd: server.cwd.clone(),
                     inherit_env: server.inherit_env,
+                    hide_prompts: server.hide_prompts,
                     secret_references: server
                         .env
                         .iter()
@@ -1172,7 +1174,9 @@ mod tests {
             unknown_fields: Default::default(),
         });
         registry.servers.push(local);
-        registry.servers.push(server("remote", "GitHub", "http"));
+        let mut remote = server("remote", "GitHub", "http");
+        remote.hide_prompts = true;
+        registry.servers.push(remote);
         registry.set_global_server_enabled("remote", true).unwrap();
 
         let fingerprints = registry
@@ -1199,6 +1203,7 @@ mod tests {
                     url: None,
                     cwd: None,
                     inherit_env: false,
+                    hide_prompts: false,
                     secret_keys: vec!["TOKEN".into()],
                     plain_env: Vec::new(),
                     secret_references: Default::default(),
@@ -1220,6 +1225,7 @@ mod tests {
                     url: None,
                     cwd: None,
                     inherit_env: false,
+                    hide_prompts: true,
                     secret_keys: Vec::new(),
                     plain_env: Vec::new(),
                     secret_references: Default::default(),
