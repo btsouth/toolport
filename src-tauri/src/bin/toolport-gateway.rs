@@ -4737,6 +4737,30 @@ fn prepare_dispatch(
     recheck_live_policy(router, live_router, target)
 }
 
+/// Refuse a prompt dispatch whose server had its prompts hidden (`hidePrompts`)
+/// after this request took its router snapshot. The snapshot still routes the
+/// prompt, and [`recheck_live_policy`] only asks whether the server is on, so
+/// without this an in-flight `prompts/get` or prompt completion would still
+/// reach a prompt the user just hid. Only prompt dispatch calls this, so the
+/// server's tools are never affected. The refusal reads like an unknown prompt,
+/// the same as a request admitted after the change.
+fn recheck_live_prompt_visibility(
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
+    owner: &str,
+    exposed: &str,
+) -> Result<(), String> {
+    let hidden = live_router.is_some_and(|slot| {
+        slot.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .prompts_hidden(owner)
+    });
+    if hidden {
+        Err(format!("no route for prompt '{exposed}'"))
+    } else {
+        Ok(())
+    }
+}
+
 const STALE_LIVE_VIEW: &str =
     "this connection's profile changed during the request; send the request again";
 
@@ -8644,7 +8668,8 @@ fn handle_request_with_cancel(
                     DispatchTarget::Server(owner),
                     cancel.as_ref(),
                     !mrtr.is_empty(),
-                ),
+                )
+                .and_then(|()| recheck_live_prompt_visibility(live_router, owner, name)),
                 None => Ok(()),
             };
             match live_policy.and_then(|()| {
@@ -8701,6 +8726,13 @@ fn handle_request_with_cancel(
                             ));
                         }
                     }
+                    // A prompt reference is refused once its server's prompts are
+                    // hidden live; a resource-template reference is unaffected.
+                    let prompt_ref = params
+                        .get("ref")
+                        .filter(|r| r.get("type").and_then(Value::as_str) == Some("ref/prompt"))
+                        .and_then(|r| r.get("name"))
+                        .and_then(Value::as_str);
                     match prepare_dispatch(
                         router,
                         live_router,
@@ -8708,6 +8740,10 @@ fn handle_request_with_cancel(
                         cancel.as_ref(),
                         false,
                     )
+                    .and_then(|()| match prompt_ref {
+                        Some(name) => recheck_live_prompt_visibility(live_router, &server_id, name),
+                        None => Ok(()),
+                    })
                     .and_then(|()| router.complete_with_cancel(params, cancel.clone()))
                     {
                         Ok(result) => Some(success(id, result)),
@@ -12197,11 +12233,15 @@ fn watch_tick(
         // Hiding or showing a server's prompts changes prompts/list, not tools/list,
         // and the rebuild below only announces tools. Compare before republishing
         // so the client re-fetches its prompts (its slash-command menu) right away.
-        let prompts_visibility_changed = {
+        // Keep the router from before the republish so the prompt notice reaches
+        // only the HTTP sessions whose visible prompt list actually changed. A
+        // session scoped away from the toggled server hears nothing about it.
+        let prompts_before = {
             let live = router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            live.registry_policy().hidden_prompts != policy.hidden_prompts
+            (live.registry_policy().hidden_prompts != policy.hidden_prompts)
+                .then(|| Arc::clone(&live))
         };
         let policy_changed = republish_registry_policy(router, policy);
         publish_registry(new_reg.clone());
@@ -12209,8 +12249,18 @@ fn watch_tick(
             host.invalidate_root_views();
             host.invalidate_tool_scope_views();
             notify_tools_changed(stdio, mcp_sessions);
-            if prompts_visibility_changed {
-                notify_list_changed(stdio, mcp_sessions, "notifications/prompts/list_changed");
+            if let Some(previous) = prompts_before {
+                let current = router
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                notify_list_changed_for_router_diff(
+                    stdio,
+                    mcp_sessions,
+                    &previous,
+                    &current,
+                    ChangedListKind::Prompts,
+                );
             }
             glog("registry policy changed; enforcing it on live connections");
             eprintln!("toolport: registry policy changed; enforcing it on live connections");
@@ -42461,6 +42511,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A prompt request admitted before `hidePrompts` went live still holds a
+    /// router that routes the prompt; the live recheck must refuse it like an
+    /// unknown prompt, and only for the server whose prompts are hidden.
+    #[test]
+    fn live_prompt_recheck_refuses_prompts_hidden_after_admission() {
+        let live = Router::with_policy(
+            RegistryPolicy {
+                hidden_prompts: HashSet::from(["docs".to_string()]),
+                ..RegistryPolicy::default()
+            }
+            .with_quarantine(BTreeSet::new(), false),
+        );
+        let slot = Arc::new(Mutex::new(Arc::new(live)));
+        assert_eq!(
+            recheck_live_prompt_visibility(Some(&slot), "docs", "docs__init"),
+            Err("no route for prompt 'docs__init'".to_string())
+        );
+        assert!(recheck_live_prompt_visibility(Some(&slot), "github", "github__review").is_ok());
+        assert!(recheck_live_prompt_visibility(None, "docs", "docs__init").is_ok());
+    }
+
     /// Turning on `hidePrompts` for a connected server hides its prompts on the
     /// live router through the policy republish (no reconnect), keeps its tools,
     /// and tells the client to re-fetch prompts/list.
@@ -42500,6 +42571,34 @@ mod tests {
             None,
             None,
         );
+        // HTTP sessions scoped to the toggled server and to an unrelated one.
+        // Only the first one's prompt list changes, so only it hears about it.
+        let session = |server: &str| {
+            Arc::new(SessionState::new_http(Some(McpSessionOwner {
+                identity: server.into(),
+                profile: None,
+                tool_scope: None,
+                scope: Some(vec![server.into()]),
+            })))
+        };
+        let affected = session("cache");
+        let unrelated = session("other");
+        host.mcp_sessions.lock().unwrap().extend([
+            ("affected".into(), Arc::clone(&affected)),
+            ("unrelated".into(), Arc::clone(&unrelated)),
+        ]);
+        let prompt_notices = |session: &SessionState| {
+            session
+                .outbound
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|queued| {
+                    serde_json::from_str::<Value>(&queued.json).unwrap()["method"]
+                        == "notifications/prompts/list_changed"
+                })
+                .count()
+        };
         let stdio = test_stdio_session();
         watch_tick(
             &reg_path,
@@ -42514,6 +42613,12 @@ mod tests {
             &host,
         );
 
+        assert_eq!(prompt_notices(&affected), 1);
+        assert_eq!(
+            prompt_notices(&unrelated),
+            0,
+            "a session scoped away from the server must not hear about its prompts"
+        );
         let current = Arc::clone(&host.router.lock().unwrap());
         assert!(current.aggregated_prompts().is_empty());
         assert!(current.get_prompt("cache__cached", json!({})).is_err());

@@ -2361,6 +2361,13 @@ impl Router {
         }
     }
 
+    /// Whether this router's policy hides `server_id`'s prompts (`hidePrompts`).
+    /// The gateway asks the live router this before an in-flight prompt dispatch,
+    /// since an older snapshot still routes the prompt.
+    pub fn prompts_hidden(&self, server_id: &str) -> bool {
+        self.policy.hidden_prompts.contains(server_id)
+    }
+
     /// Recheck a dispatch this router is about to make against the policy of a
     /// newer `live` router. A request keeps the router it started with, so without
     /// this a call admitted just before a policy change would still go out under
