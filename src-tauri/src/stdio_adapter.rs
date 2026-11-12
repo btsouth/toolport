@@ -1272,17 +1272,15 @@ impl Session {
                     "recovered the host daemon session (stale={stale})"
                 ));
             }
-            let descriptor = self.descriptor();
-            let sent_session = self.session_id();
-            self.remember_handshake(body);
             drop(serial);
             // The write gate only has to cover the rebuild. Keeping it for the
             // POST itself made every other call wait for this one: up to the
             // request timeout for an ordinary call, and forever for a
-            // subscription, which has no overall deadline. A stale outcome of
-            // this POST cannot touch the rebuilt session (see `apply_post_state`).
+            // subscription, which has no overall deadline. Send through the
+            // healthy path instead, so a bounded call holds the read gate like
+            // any other in-flight call (a later rebuild waits for it and a
+            // refusal is still retried), while a subscription releases it.
             drop(recovering);
-            return self.post(body, descriptor, sent_session);
         }
     }
 
@@ -1808,8 +1806,10 @@ impl Session {
 /// Whether `body` is a `subscriptions/listen` request, matching the check in
 /// `Session::post` that sends it without an overall deadline.
 fn is_subscription(body: &str) -> bool {
-    // Cheap pre-check so ordinary calls are not parsed twice.
-    if !body.contains("subscriptions/listen") {
+    // Cheap pre-check so ordinary calls are not parsed twice. A method written
+    // with JSON escapes (`subscriptions\/listen`, `\u002f`) has no literal
+    // match but always contains a backslash, so those bodies are parsed too.
+    if !body.contains("subscriptions/listen") && !body.contains('\\') {
         return false;
     }
     serde_json::from_str::<serde_json::Value>(body).is_ok_and(|message| {
@@ -3125,6 +3125,13 @@ mod tests {
     #[test]
     fn only_subscription_requests_are_treated_as_unbounded() {
         assert!(is_subscription(&subscription(7)));
+        // `post` decodes the method, so escaped spellings open a subscription too.
+        assert!(is_subscription(
+            r#"{"jsonrpc":"2.0","id":7,"method":"subscriptions\/listen"}"#
+        ));
+        assert!(is_subscription(
+            r#"{"jsonrpc":"2.0","id":7,"method":"subscriptions/listen"}"#
+        ));
         assert!(!is_subscription(
             r#"{"jsonrpc":"2.0","method":"subscriptions/listen"}"#
         ));
@@ -3724,6 +3731,7 @@ mod tests {
 
     #[test]
     fn a_refused_session_is_reopened_and_the_request_sent_once_more() {
+        let _env = crate::registry::DataDirTestEnv::new("adapter-refused-reopen");
         let executed = Arc::new(AtomicUsize::new(0));
         let runs = Arc::clone(&executed);
         let (daemon, minted) = session_daemon(move |posted| {
@@ -3765,6 +3773,7 @@ mod tests {
 
     #[test]
     fn a_second_refusal_is_returned_without_another_send() {
+        let _env = crate::registry::DataDirTestEnv::new("adapter-second-refusal");
         let (daemon, minted) = session_daemon(|_| Answer::refused());
         let sink = Sink::default();
         let session = scripted_session(&daemon, &sink, TEST_TIMEOUT);
@@ -3916,6 +3925,7 @@ mod tests {
 
     #[test]
     fn concurrent_refusals_reopen_the_session_once() {
+        let _env = crate::registry::DataDirTestEnv::new("adapter-concurrent-refusals");
         let executed = Arc::new(Mutex::new(Vec::new()));
         let runs = Arc::clone(&executed);
         let (daemon, minted) = session_daemon(move |posted| {
