@@ -2620,6 +2620,11 @@ impl Router {
             }
         }
 
+        // Prompts: namespace names like tools so two servers can't collide, and
+        // allocate them in the same order-independent way. Allocate even when
+        // hidden, like disabled tools, so toggling one server never renames
+        // another server's prompts.
+        let prompt_names = self.allocate_exposed_names(server_id, prompts);
         // Prompts the user hid for this server (`hidePrompts`) are never indexed,
         // so they drop out of prompts/list, prompts/get and prompt completion
         // together. The server's cached prompt list is kept, so turning the
@@ -2628,9 +2633,6 @@ impl Router {
         if self.policy.hidden_prompts.contains(server_id) {
             return;
         }
-        // Prompts: namespace names like tools so two servers can't collide, and
-        // allocate them in the same order-independent way.
-        let prompt_names = self.allocate_exposed_names(server_id, prompts);
         for (idx, prompt) in prompts.iter().enumerate() {
             let Some(orig) = prompt.get("name").and_then(|n| n.as_str()) else {
                 continue;

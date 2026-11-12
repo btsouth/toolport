@@ -4383,6 +4383,9 @@ fn local_team_server_id(
 }
 
 fn restore_personal_definition(entry: &mut ServerEntry, old: &ServerEntry) {
+    // `hidePrompts` is this member's local choice and is never part of the shared
+    // definition, so a re-sync must not turn it back off.
+    entry.hide_prompts = old.hide_prompts;
     if old.unknown_fields.get("personalSyncEntry") != Some(&json!(true)) {
         restore_local_references(entry, old);
         return;
@@ -7228,6 +7231,26 @@ mod tests {
             team[0].id, "team_github",
             "team server deduped away from the local id"
         );
+    }
+
+    #[test]
+    fn team_resync_keeps_a_members_hide_prompts_choice() {
+        let mut r = base_registry();
+        let cfg = json!({ "servers": [{
+            "id": "docs",
+            "name": "Docs",
+            "transport": "http",
+            "url": "https://1.2.3.4/mcp",
+            "hidePrompts": true
+        }]});
+        apply_team_config(&mut r, "t1", &cfg);
+        let id = member_id(&r, "docs");
+        let server = r.servers.iter_mut().find(|s| s.id == id).unwrap();
+        assert!(!server.hide_prompts, "a team cannot set it for the member");
+        server.hide_prompts = true;
+        apply_team_config(&mut r, "t1", &cfg);
+        let server = r.servers.iter().find(|s| s.id == id).unwrap();
+        assert!(server.hide_prompts, "a re-sync keeps the member's choice");
     }
 
     #[test]

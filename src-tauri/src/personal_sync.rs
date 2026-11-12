@@ -1544,6 +1544,9 @@ fn execution_changed(before: Option<&Value>, after: &Value) -> bool {
     command && before.is_none_or(|b| command_identity(b) != command_identity(after))
 }
 pub(crate) fn restore_local(entry: &mut ServerEntry, old: &ServerEntry) {
+    // Hiding prompts is a per-machine choice that never syncs, so a received
+    // update must not reset it.
+    entry.hide_prompts = old.hide_prompts;
     entry.inherit_env = old.inherit_env; // Never import ambient-env consent.
                                          // Preserve masked arguments on their originating machine; masking is a wire
                                          // boundary, not permission to erase the owner's installed setup.
@@ -3848,6 +3851,28 @@ mod tests {
         assert_eq!(merge(&cloud, &state(&r).unwrap().pending).unwrap().0, cloud);
         apply(&mut r, &config(vec![]), 2).unwrap();
         assert_eq!(r.servers.len(), 1);
+    }
+    #[test]
+    fn received_update_keeps_this_machines_hide_prompts_choice() {
+        let _data = crate::registry::DataDirTestEnv::new("sync-hide-prompts");
+        let mut r = machine();
+        apply(&mut r, &config(vec![http("docs")]), 1).unwrap();
+        r.servers[0].hide_prompts = true;
+        assert!(
+            !export(&r.servers[0])
+                .as_object()
+                .unwrap()
+                .contains_key("hidePrompts"),
+            "hidePrompts is local and is not sent"
+        );
+        let mut changed = http("docs");
+        changed["url"] = json!("https://example.com/mcp/v2");
+        apply(&mut r, &config(vec![changed]), 2).unwrap();
+        assert_eq!(
+            r.servers[0].url.as_deref(),
+            Some("https://example.com/mcp/v2")
+        );
+        assert!(r.servers[0].hide_prompts, "the update must not reset it");
     }
     #[test]
     fn new_servers_can_default_to_this_machine_only() {

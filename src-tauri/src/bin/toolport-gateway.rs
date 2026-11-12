@@ -42461,6 +42461,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Turning on `hidePrompts` for a connected server hides its prompts on the
+    /// live router through the policy republish (no reconnect), keeps its tools,
+    /// and tells the client to re-fetch prompts/list.
+    #[test]
+    fn watch_tick_hides_a_servers_prompts_live_and_announces_it() {
+        let _env = DataDirTestEnv::new("hide-prompts-tick");
+        let mut live = Registry {
+            servers: vec![stub_server("cache", "Cache")],
+            ..Default::default()
+        };
+        live.servers[0].enabled = true;
+        let mut router = router_with_registry_policy(&live);
+        let mut server =
+            DownstreamServer::connect("cache".to_string(), Box::new(CacheRoute)).unwrap();
+        server.load_resources_prompts();
+        router.add(server);
+        assert_eq!(router.aggregated_prompts().len(), 1);
+
+        let reg_path = registry::resolved_path().unwrap();
+        let mut on_disk = live.clone();
+        on_disk.servers[0].hide_prompts = true;
+        registry::save_to(&reg_path, &on_disk).unwrap();
+        // Treat the edit as already rebuilt so this checks the live policy path
+        // on the existing connection, not a fresh router.
+        let mut watcher = WatchLoopState {
+            last_mtime: None,
+            last_relevant: router_relevant(&on_disk),
+        };
+        let host = host_from_parts(
+            Arc::new(Mutex::new(live)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(Mutex::new(Arc::new(router))),
+            Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default()))),
+            Arc::new(AtomicU8::new(0)),
+            Arc::new(|_| None),
+            Arc::new(Mutex::new(())),
+            None,
+            None,
+        );
+        let stdio = test_stdio_session();
+        watch_tick(
+            &reg_path,
+            &stdio,
+            &Arc::new(Mutex::new(None)),
+            None,
+            None,
+            false,
+            &Arc::new(Mutex::new(None)),
+            None,
+            &mut watcher,
+            &host,
+        );
+
+        let current = Arc::clone(&host.router.lock().unwrap());
+        assert!(current.aggregated_prompts().is_empty());
+        assert!(current.get_prompt("cache__cached", json!({})).is_err());
+        assert_eq!(
+            current.aggregated_tools().len(),
+            1,
+            "the server's tools stay listed"
+        );
+        assert_eq!(
+            deferred_count(&stdio, "notifications/prompts/list_changed"),
+            1
+        );
+    }
+
     #[test]
     fn watch_tick_publishes_client_discovery_without_catalog_fanout() {
         let _env = DataDirTestEnv::new("client-discovery-tick");

@@ -165,11 +165,11 @@ but drop its prompts, turn on **Hide prompts** when you edit the server, or set
 
 ```json
 {
-  "id": "avalonia-docs",
-  "name": "avalonia-docs",
+  "id": "docs",
+  "name": "Docs",
   "transport": "stdio",
   "command": "npx",
-  "args": ["-y", "avalonia-docs-mcp"],
+  "args": ["-y", "example-docs-mcp"],
   "hidePrompts": true
 }
 ```
@@ -178,5 +178,5 @@ Hidden prompts are left out of `prompts/list`, and `prompts/get` and prompt
 completion refuse them. The server's tools and resources are unaffected. The
 setting is a policy edit, so it applies to connected clients without restarting
 the server, and Toolport sends `notifications/prompts/list_changed` so clients
-refresh their list. It is off by default and stays on this machine: team and
-personal sync do not share it.
+that support it refresh their list. It is off by default and stays on this
+machine: team and personal sync neither share it nor reset it.
