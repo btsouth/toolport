@@ -3747,6 +3747,7 @@ fn seed_member_review(reg: &Registry, team_id: &str, config: &Value, review: &mu
         saved["id"] = json!(format!("team_{}", slugify_id(original)));
         saved["enabled"] = json!(false);
         saved.as_object_mut().unwrap().remove("inheritEnv");
+        saved.as_object_mut().unwrap().remove("hidePrompts");
         if let Some(launch) = &server.launch {
             saved["launch"] = json!(launch.without_values());
         }
@@ -10177,6 +10178,26 @@ mod member_review_tests {
             .unwrap()
             .pending
             .contains_key("server:remote"));
+    }
+
+    #[test]
+    fn member_review_upgrade_ignores_a_members_hidden_prompts() {
+        let mut reg = registry();
+        let cfg = config("first");
+        apply_team_config(&mut reg, "review-team", &cfg);
+        let id = remote_id(&reg);
+        reg.servers
+            .iter_mut()
+            .find(|s| s.id == id)
+            .unwrap()
+            .hide_prompts = true;
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        let review = member_review(&reg).unwrap();
+        assert!(!review.pending.contains_key("server:remote"));
+        assert!(!review.accepted["server:remote"]
+            .to_string()
+            .contains("hidePrompts"));
+        assert!(!server_change_held(&reg, &id));
     }
 
     #[test]
