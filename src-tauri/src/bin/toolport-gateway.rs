@@ -9052,9 +9052,16 @@ fn registry_policy(
     let servers = router_servers(reg, profile, http_mode, daemon_mode);
     // Per-tool disables + the global destructive switch, from the same server set.
     let mut disabled = std::collections::HashMap::new();
+    // Servers whose prompts the user hid (`hidePrompts`). Carried in the policy,
+    // not baked into the connection, so the toggle applies to a live router
+    // without reconnecting the server.
+    let mut hidden_prompts = HashSet::new();
     for s in &servers {
         if !s.disabled_tools.is_empty() {
             disabled.insert(s.id.clone(), s.disabled_tools.iter().cloned().collect());
+        }
+        if s.hide_prompts {
+            hidden_prompts.insert(s.id.clone());
         }
     }
     // Tool-granular profile scope (SOU-189 / SOU-167): per-server ORIGINAL tool allow-lists.
@@ -9082,6 +9089,7 @@ fn registry_policy(
         disabled,
         allow,
         deny_destructive: reg.deny_destructive_effective(),
+        hidden_prompts,
     }
 }
 
@@ -12186,12 +12194,24 @@ fn watch_tick(
             http_mode,
             host.daemon_mode.load(Ordering::SeqCst),
         );
+        // Hiding or showing a server's prompts changes prompts/list, not tools/list,
+        // and the rebuild below only announces tools. Compare before republishing
+        // so the client re-fetches its prompts (its slash-command menu) right away.
+        let prompts_visibility_changed = {
+            let live = router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            live.registry_policy().hidden_prompts != policy.hidden_prompts
+        };
         let policy_changed = republish_registry_policy(router, policy);
         publish_registry(new_reg.clone());
         if policy_changed {
             host.invalidate_root_views();
             host.invalidate_tool_scope_views();
             notify_tools_changed(stdio, mcp_sessions);
+            if prompts_visibility_changed {
+                notify_list_changed(stdio, mcp_sessions, "notifications/prompts/list_changed");
+            }
             glog("registry policy changed; enforcing it on live connections");
             eprintln!("toolport: registry policy changed; enforcing it on live connections");
         }
@@ -24115,6 +24135,24 @@ mod tests {
         }
     }
 
+    /// A server's `hidePrompts` flag reaches the router through the registry
+    /// policy (so it applies live), and only for that server.
+    #[test]
+    fn registry_policy_carries_hide_prompts_per_server() {
+        let _env = DataDirTestEnv::new("registry-policy-hide-prompts");
+        let mut reg = Registry::default();
+        for (id, hide) in [("docs", true), ("other", false)] {
+            let mut server = stub_server(id, id);
+            server.enabled = true;
+            server.hide_prompts = hide;
+            reg.servers.push(server);
+            reg.profiles[0].enabled_server_ids.push(id.into());
+        }
+        let policy = registry_policy(&reg, None, false, false);
+        assert_eq!(policy.hidden_prompts, HashSet::from(["docs".to_string()]));
+        assert!(policy.disabled.is_empty(), "tools are not disabled by it");
+    }
+
     #[test]
     fn access_review_default_tool_revocation_while_call_waits_for_startup() {
         let _env = DataDirTestEnv::new("access-review-startup");
@@ -31763,6 +31801,7 @@ mod tests {
                 url: None,
                 source: None,
                 disabled_tools: vec![],
+                hide_prompts: false,
                 cwd: None,
                 client_credentials: None,
                 request_timeout_ms: None,
@@ -31836,6 +31875,7 @@ mod tests {
                 url: Some(format!("https://mcp.{id}.example/mcp")),
                 source: None,
                 disabled_tools: vec![],
+                hide_prompts: false,
                 cwd: None,
                 client_credentials: None,
                 request_timeout_ms: None,
@@ -31923,6 +31963,7 @@ mod tests {
             url: Some("https://mcp.github.example/mcp".into()),
             source: None,
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -33619,6 +33660,7 @@ mod tests {
             url: None,
             source: None,
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -38213,6 +38255,7 @@ mod tests {
             url: None,
             source: None,
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,

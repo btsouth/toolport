@@ -629,6 +629,7 @@ fn mock_server_entry(id: &str, transcript: &Path, cwd: Option<&str>) -> ServerEn
         url: None,
         source: Some("manual".to_string()),
         disabled_tools: vec![],
+        hide_prompts: false,
         cwd: cwd.map(str::to_string),
         client_credentials: None,
         request_timeout_ms: None,

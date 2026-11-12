@@ -6,6 +6,13 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Added
+
+- A new **Hide prompts** switch on each server keeps its MCP prompts out of your
+  clients and leaves its tools available. Clients like Claude Code show prompts as
+  slash commands, so this clears out commands you never use. The registry key is
+  `hidePrompts`, and changing it takes effect without restarting the server.
+
 ## [2.3.4] - 2026-11-08
 
 Toolport 2.3.4 keeps your comments and layout when it edits Codex and Grok Build

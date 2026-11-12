@@ -3689,6 +3689,7 @@ mod tests {
             url: Some(url.into()),
             source: source.map(String::from),
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,

@@ -109,6 +109,7 @@ export function ServerDialog({
     url: initial?.url ?? "",
     cwd: initial?.cwd ?? "",
     inheritEnv: initial?.inheritEnv ?? false,
+    hidePrompts: initial?.hidePrompts ?? false,
     initializeTimeoutSeconds:
       initial?.initializeTimeoutMs == null
         ? ""
@@ -195,6 +196,7 @@ export function ServerDialog({
         url: initial?.url ?? "",
         cwd: initial?.cwd ?? "",
         inheritEnv: initial?.inheritEnv ?? false,
+        hidePrompts: initial?.hidePrompts ?? false,
         initializeTimeoutSeconds:
           initial?.initializeTimeoutMs == null
             ? ""
@@ -272,6 +274,7 @@ export function ServerDialog({
         url: s.url ?? "",
         cwd: "",
         inheritEnv: false,
+        hidePrompts: false,
         initializeTimeoutSeconds: "",
       });
       setEnvRows(
@@ -347,6 +350,7 @@ export function ServerDialog({
       source: bindingCleared ? "manual" : (initial?.source ?? "manual"),
       cwd: isStdio ? form.cwd.trim() || null : null,
       inheritEnv: isStdio && form.inheritEnv,
+      hidePrompts: form.hidePrompts,
       requestTimeoutMs:
         isStdio || initialUsesLocalCommand ? null : initial?.requestTimeoutMs,
       initializeTimeoutMs: form.initializeTimeoutSeconds.trim()
@@ -871,6 +875,24 @@ export function ServerDialog({
                 "Seconds to wait for this server to initialize. Raise this for a slow first start, such as a model download or index build. ",
               )}
             </p>
+          </div>
+
+          {/* Prompts become slash commands in clients like Claude Code. This hides a
+              server's prompts from every client while its tools stay available. */}
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex flex-col gap-1">
+              <Label htmlFor="srv-hide-prompts">{t("Hide prompts")}</Label>
+              <p className="text-meta text-muted-foreground">
+                {t(
+                  "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available.",
+                )}
+              </p>
+            </div>
+            <Switch
+              id="srv-hide-prompts"
+              checked={form.hidePrompts}
+              onCheckedChange={(checked) => set("hidePrompts", checked)}
+            />
           </div>
 
           <div className="flex flex-col gap-2">

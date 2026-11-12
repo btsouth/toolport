@@ -307,6 +307,36 @@ describe("ServerDialog", () => {
     );
   });
 
+  it("hides a server's prompts and keeps the rest of the entry", async () => {
+    const initial: ServerEntry = {
+      id: "docs",
+      name: "Docs",
+      transport: "stdio",
+      command: "docs-server",
+      args: [],
+      env: [],
+      url: null,
+      source: "manual",
+      disabledTools: ["delete_everything"],
+    };
+    api.updateServer.mockResolvedValue(savedRegistry("docs"));
+    const user = userEvent.setup();
+
+    render(<ServerDialog autoOpen editId="docs" initial={initial} onSaved={vi.fn()} />);
+    const hide = screen.getByRole("switch", { name: "Hide prompts" });
+    expect(hide).not.toBeChecked();
+    await user.click(hide);
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(api.updateServer).toHaveBeenCalledTimes(1));
+    expect(api.updateServer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        hidePrompts: true,
+        disabledTools: ["delete_everything"],
+      }),
+    );
+  });
+
   it("saves the startup timeout in milliseconds", async () => {
     const initial: ServerEntry = {
       id: "remote",

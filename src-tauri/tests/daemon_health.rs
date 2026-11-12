@@ -174,6 +174,7 @@ fn write_registry(dir: &Path, extra_env: &[(&str, &str)]) {
         url: None,
         source: Some("manual".to_string()),
         disabled_tools: vec![],
+        hide_prompts: false,
         cwd: None,
         client_credentials: None,
         request_timeout_ms: None,

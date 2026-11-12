@@ -825,6 +825,13 @@ pub struct ServerEntry {
     /// an empty list means every tool the server advertises is exposed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_tools: Vec<String>,
+    /// Keep this server's MCP prompts out of the gateway's `prompts/list` and
+    /// refuse `prompts/get` for them, while its tools and resources stay
+    /// available. Clients such as Claude Code turn prompts into slash commands,
+    /// so this lets a user drop a server's commands without losing its tools.
+    /// Default (false, omitted on save) exposes prompts as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hide_prompts: bool,
     /// Headless outbound OAuth for an HTTP server (SBS-524). Presence of this
     /// block is what selects the client-credentials flow; absence leaves
     /// interactive OAuth and pasted-token behaviour exactly as before.
@@ -5564,6 +5571,7 @@ pub(crate) mod tests {
             url: None,
             source: Some("manual".to_string()),
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -6551,6 +6559,33 @@ pub(crate) mod tests {
         assert!(json.contains("\"inheritEnv\":true"), "{json}");
         let back: ServerEntry = serde_json::from_str(&json).unwrap();
         assert!(back.inherit_env);
+        assert_eq!(back, on);
+    }
+
+    /// `hidePrompts` is additive like `inheritEnv`: an entry written before it
+    /// existed loads with prompts exposed and saves without the key, and an
+    /// entry that opts in keeps the `true`. It must never land in
+    /// `unknown_fields`, or the gateway would ignore it.
+    #[test]
+    fn hide_prompts_is_additive_and_round_trips() {
+        let server = sample_server("avalonia-docs");
+        assert!(!server.hide_prompts);
+        let json = serde_json::to_string(&server).unwrap();
+        assert!(
+            !json.contains("hidePrompts"),
+            "unset hidePrompts must not be serialized: {json}"
+        );
+        let loaded: ServerEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, server);
+        assert_eq!(serde_json::to_string(&loaded).unwrap(), json);
+
+        let mut on = server;
+        on.hide_prompts = true;
+        let json = serde_json::to_string(&on).unwrap();
+        assert!(json.contains("\"hidePrompts\":true"), "{json}");
+        let back: ServerEntry = serde_json::from_str(&json).unwrap();
+        assert!(back.hide_prompts);
+        assert!(!back.unknown_fields.contains_key("hidePrompts"));
         assert_eq!(back, on);
     }
 
@@ -7767,6 +7802,7 @@ pub(crate) mod tests {
             url: None,
             source: None,
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -8725,6 +8761,7 @@ mod registry_version_tests {
             url: None,
             source: Some("manual".to_string()),
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
