@@ -1222,7 +1222,7 @@ impl Session {
         loop {
             if self.stale.load(Ordering::SeqCst) == HEALTHY {
                 let gate = self.current_gate();
-                let _healthy = gate
+                let healthy = gate
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let serial = self
@@ -1237,11 +1237,20 @@ impl Session {
                     let sent_session = self.session_id();
                     self.remember_handshake(body);
                     drop(serial);
+                    // A subscription POST has no overall deadline (it stays open
+                    // as long as the daemon sends keepalives). Holding the read
+                    // gate for its lifetime would leave any later recovery
+                    // waiting on the write gate forever, and with it every call
+                    // queued behind that writer. Calls with a deadline keep the
+                    // gate so idle recovery still sees them as in flight.
+                    if is_subscription(body) {
+                        drop(healthy);
+                    }
                     return self.post(body, descriptor, sent_session);
                 }
             }
             let gate = self.current_gate();
-            let _recovering = gate
+            let recovering = gate
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let serial = self
@@ -1257,11 +1266,22 @@ impl Session {
                     self.stale.fetch_max(stale, Ordering::SeqCst);
                     return Err(ExchangeError::Failed(error));
                 }
+                // Without this, a recovery that succeeded left no trace, so a
+                // later stall could not be told apart from one that never ran.
+                crate::gatewaylog::append(&format!(
+                    "recovered the host daemon session (stale={stale})"
+                ));
             }
             let descriptor = self.descriptor();
             let sent_session = self.session_id();
             self.remember_handshake(body);
             drop(serial);
+            // The write gate only has to cover the rebuild. Keeping it for the
+            // POST itself made every other call wait for this one: up to the
+            // request timeout for an ordinary call, and forever for a
+            // subscription, which has no overall deadline. A stale outcome of
+            // this POST cannot touch the rebuilt session (see `apply_post_state`).
+            drop(recovering);
             return self.post(body, descriptor, sent_session);
         }
     }
@@ -1783,6 +1803,19 @@ impl Session {
         });
         Ok(())
     }
+}
+
+/// Whether `body` is a `subscriptions/listen` request, matching the check in
+/// `Session::post` that sends it without an overall deadline.
+fn is_subscription(body: &str) -> bool {
+    // Cheap pre-check so ordinary calls are not parsed twice.
+    if !body.contains("subscriptions/listen") {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(body).is_ok_and(|message| {
+        message["method"].as_str() == Some("subscriptions/listen")
+            && message.get("id").is_some_and(|id| !id.is_null())
+    })
 }
 
 /// Open the daemon's long-lived `GET /mcp` SSE stream and forward server-initiated
@@ -3007,6 +3040,98 @@ mod tests {
             "a recovered user call must not hold the recovery mutex"
         );
         assert_eq!(daemon.posted("tools/call").len(), 1);
+    }
+
+    /// Script a daemon whose `subscriptions/listen` POST stays open until the
+    /// test releases it, like a real subscription kept alive by keepalives.
+    fn daemon_with_open_subscription() -> (
+        ScriptedDaemon,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let daemon = ScriptedDaemon::start(move |posted| {
+            if posted.message["method"] == "subscriptions/listen" {
+                opened_tx.send(()).unwrap();
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10));
+            }
+            Answer::result(posted, serde_json::json!({})).with_session("new".into())
+        });
+        (daemon, opened_rx, release_tx)
+    }
+
+    fn subscription(id: u64) -> String {
+        serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "subscriptions/listen"})
+            .to_string()
+    }
+
+    /// Run `call` on its own thread and report whether it finished in time.
+    fn finishes_within(session: &Arc<Session>, body: String, limit: Duration) -> bool {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let calling = Arc::clone(session);
+        std::thread::spawn(move || {
+            let _ = done_tx.send(calling.exchange(&body).is_ok());
+        });
+        done_rx.recv_timeout(limit) == Ok(true)
+    }
+
+    #[test]
+    fn a_subscription_admitted_by_recovery_does_not_block_later_calls() {
+        // Regression: the recovering caller kept the write gate for its whole
+        // POST. When that caller was a subscription, which has no overall
+        // deadline, every later call waited on the gate forever after a
+        // daemon restart.
+        let _env = crate::registry::DataDirTestEnv::new("adapter-recovered-subscription");
+        let (daemon, opened_rx, release_tx) = daemon_with_open_subscription();
+        let session = Arc::new(scripted_session(&daemon, &Sink::default(), TEST_TIMEOUT));
+        session.remember_handshake(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#);
+        session.stale.store(SESSION_REFUSED, Ordering::SeqCst);
+        let subscribing = Arc::clone(&session);
+        let listener = std::thread::spawn(move || subscribing.exchange(&subscription(2)));
+        opened_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let answered = finishes_within(&session, tool_call(3), Duration::from_secs(2));
+        release_tx.send(()).unwrap();
+        listener.join().unwrap().unwrap();
+        assert!(answered, "a call must not wait for an open subscription");
+        assert_eq!(daemon.posted("initialize").len(), 1);
+        assert_eq!(daemon.posted("tools/call").len(), 1);
+    }
+
+    #[test]
+    fn recovery_does_not_wait_for_an_open_subscription() {
+        // A healthy subscription must not pin the read gate either: the next
+        // recovery takes the write gate and would otherwise never get it.
+        let _env = crate::registry::DataDirTestEnv::new("adapter-subscription-recovery");
+        let (daemon, opened_rx, release_tx) = daemon_with_open_subscription();
+        let session = Arc::new(scripted_session(&daemon, &Sink::default(), TEST_TIMEOUT));
+        session.remember_handshake(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#);
+        let subscribing = Arc::clone(&session);
+        let listener = std::thread::spawn(move || subscribing.exchange(&subscription(2)));
+        opened_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        session.stale.store(SESSION_REFUSED, Ordering::SeqCst);
+        let answered = finishes_within(&session, tool_call(3), Duration::from_secs(2));
+        release_tx.send(()).unwrap();
+        let _ = listener.join().unwrap();
+        assert!(answered, "recovery must not wait for an open subscription");
+        assert_eq!(daemon.posted("initialize").len(), 1);
+        assert_eq!(session.stale.load(Ordering::SeqCst), HEALTHY);
+    }
+
+    #[test]
+    fn only_subscription_requests_are_treated_as_unbounded() {
+        assert!(is_subscription(&subscription(7)));
+        assert!(!is_subscription(
+            r#"{"jsonrpc":"2.0","method":"subscriptions/listen"}"#
+        ));
+        assert!(!is_subscription(&tool_call(7)));
+        assert!(!is_subscription(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"subscriptions/listen"}}"#
+        ));
     }
 
     #[test]

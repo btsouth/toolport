@@ -6,6 +6,12 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Fixed
+
+- A client no longer stops getting answers after the background gateway restarts
+  while it holds a subscription open. Calls used to wait behind that subscription
+  until the client gave up, so the client had to be restarted.
+
 ## [2.3.4] - 2026-11-08
 
 Toolport 2.3.4 keeps your comments and layout when it edits Codex and Grok Build
