@@ -3747,6 +3747,7 @@ fn seed_member_review(reg: &Registry, team_id: &str, config: &Value, review: &mu
         saved["id"] = json!(format!("team_{}", slugify_id(original)));
         saved["enabled"] = json!(false);
         saved.as_object_mut().unwrap().remove("inheritEnv");
+        saved.as_object_mut().unwrap().remove("hidePrompts");
         if let Some(launch) = &server.launch {
             saved["launch"] = json!(launch.without_values());
         }
@@ -4383,6 +4384,9 @@ fn local_team_server_id(
 }
 
 fn restore_personal_definition(entry: &mut ServerEntry, old: &ServerEntry) {
+    // `hidePrompts` is this member's local choice and is never part of the shared
+    // definition, so a re-sync must not turn it back off.
+    entry.hide_prompts = old.hide_prompts;
     if old.unknown_fields.get("personalSyncEntry") != Some(&json!(true)) {
         restore_local_references(entry, old);
         return;
@@ -5172,6 +5176,8 @@ pub(crate) fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         url: None,
         source: Some(tag.to_string()),
         disabled_tools: str_array("disabledTools"),
+        // A local display preference, not part of the shared definition.
+        hide_prompts: false,
         cwd: str_field("cwd").map(String::from),
         // Carried through so a shared headless server stays headless. Dropping it
         // silently downgraded the member to interactive OAuth, which is exactly
@@ -6497,6 +6503,7 @@ mod tests {
             url: None,
             source: Some("manual".into()),
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -7187,6 +7194,7 @@ mod tests {
             url: None,
             source: Some("manual".into()),
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -7224,6 +7232,26 @@ mod tests {
             team[0].id, "team_github",
             "team server deduped away from the local id"
         );
+    }
+
+    #[test]
+    fn team_resync_keeps_a_members_hide_prompts_choice() {
+        let mut r = base_registry();
+        let cfg = json!({ "servers": [{
+            "id": "docs",
+            "name": "Docs",
+            "transport": "http",
+            "url": "https://1.2.3.4/mcp",
+            "hidePrompts": true
+        }]});
+        apply_team_config(&mut r, "t1", &cfg);
+        let id = member_id(&r, "docs");
+        let server = r.servers.iter_mut().find(|s| s.id == id).unwrap();
+        assert!(!server.hide_prompts, "a team cannot set it for the member");
+        server.hide_prompts = true;
+        apply_team_config(&mut r, "t1", &cfg);
+        let server = r.servers.iter().find(|s| s.id == id).unwrap();
+        assert!(server.hide_prompts, "a re-sync keeps the member's choice");
     }
 
     #[test]
@@ -7329,6 +7357,7 @@ mod tests {
             url: None,
             source: Some("manual".into()),
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -7934,6 +7963,7 @@ mod tests {
             url: Some("https://crm.example.com/mcp".into()),
             source: Some("manual".into()),
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -8430,6 +8460,7 @@ mod tests {
             url: None,
             source: Some("manual".into()),
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -8450,6 +8481,7 @@ mod tests {
             url: Some("https://example.com/mcp".into()),
             source: Some("team:abc".into()),
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -8941,6 +8973,7 @@ mod tests {
             url: None,
             source: Some("team:t1".into()),
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -10145,6 +10178,26 @@ mod member_review_tests {
             .unwrap()
             .pending
             .contains_key("server:remote"));
+    }
+
+    #[test]
+    fn member_review_upgrade_ignores_a_members_hidden_prompts() {
+        let mut reg = registry();
+        let cfg = config("first");
+        apply_team_config(&mut reg, "review-team", &cfg);
+        let id = remote_id(&reg);
+        reg.servers
+            .iter_mut()
+            .find(|s| s.id == id)
+            .unwrap()
+            .hide_prompts = true;
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        let review = member_review(&reg).unwrap();
+        assert!(!review.pending.contains_key("server:remote"));
+        assert!(!review.accepted["server:remote"]
+            .to_string()
+            .contains("hidePrompts"));
+        assert!(!server_change_held(&reg, &id));
     }
 
     #[test]

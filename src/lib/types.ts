@@ -533,6 +533,9 @@ export interface ServerEntry {
   /** Pass the user's whole shell environment to this stdio server instead of
    * the default allowlist. Servers migrated from 1.x start with it on. */
   inheritEnv?: boolean;
+  /** Keep this server's MCP prompts out of clients' prompt lists (often shown
+   * as slash commands) while its tools stay available. Unset = exposed. */
+  hidePrompts?: boolean;
   /** Headless outbound OAuth (SBS-524). Present = this server uses the
    * client-credentials flow instead of the interactive browser one. */
   clientCredentials?: ClientCredentials | null;

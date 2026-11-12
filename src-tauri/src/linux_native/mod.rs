@@ -11750,6 +11750,11 @@ fn open_server_editor_prefilled(
         .build();
     let url_row = editor_field(crate::i18n::msg("Server URL"), &url);
     connection.append(&url_row);
+    // Prompts become slash commands in clients like Claude Code. This applies to
+    // every transport, so it stays visible when the transport changes.
+    let (hide_prompts_row, hide_prompts) =
+        hide_prompts_field(server.as_ref().is_some_and(|server| server.hide_prompts));
+    connection.append(&hide_prompts_row);
     test.set_halign(gtk::Align::End);
     connection.append(&test);
     form.append(&connection);
@@ -12090,6 +12095,7 @@ fn open_server_editor_prefilled(
         let mut fields =
             collect_server_fields(&name, &transport, &command, &args, &url, &cwd, &inherit_env);
         fields.sync_local_only = local_only.is_active();
+        fields.hide_prompts = Some(hide_prompts.is_active());
         let binding_changed =
             fields.command != original_command_for_save || fields.args != original_args_for_save;
         let launch_values = launch_for_save
@@ -12465,7 +12471,45 @@ fn collect_server_fields(
         url: Some(url.text().to_string()),
         cwd: Some(cwd.text().to_string()),
         inherit_env: Some(inherit_env.is_active()),
+        hide_prompts: None,
     }
+}
+
+/// The "Hide prompts" row of the server editor, matching the web dialog's switch.
+fn hide_prompts_field(active: bool) -> (gtk::Box, gtk::Switch) {
+    let switch = gtk::Switch::builder()
+        .active(active)
+        .valign(gtk::Align::Center)
+        .build();
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    row.set_margin_top(6);
+    let copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    copy.set_hexpand(true);
+    let label = {
+        let widget = gtk::Label::builder()
+            .label(crate::i18n::tr("Hide prompts"))
+            .halign(gtk::Align::Start)
+            .css_classes(["toolport-field-label"])
+            .build();
+        l10n::bind_label(&widget, "Hide prompts");
+        widget
+    };
+    copy.append(&label);
+    copy.append(&{
+        let widget = gtk::Label::builder()
+            .label(crate::i18n::tr("Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available."))
+            .halign(gtk::Align::Start)
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["toolport-muted", "caption"])
+            .build();
+        l10n::bind_label(&widget, "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available.");
+        widget
+    });
+    switch.update_relation(&[gtk::accessible::Relation::LabelledBy(&[label.upcast_ref()])]);
+    row.append(&copy);
+    row.append(&switch);
+    (row, switch)
 }
 
 fn editor_intro(icon: &str, title: &'static str, subtitle: &'static str) -> gtk::Box {
@@ -16326,6 +16370,7 @@ mod tests {
             url: None,
             cwd: None,
             inherit_env: false,
+            hide_prompts: false,
             secret_keys: Vec::new(),
             plain_env: Vec::new(),
             secret_references: Default::default(),
@@ -16592,6 +16637,32 @@ mod tests {
             missing_value_editor("could not save the registry", &secrets),
             None
         );
+    }
+
+    #[test]
+    #[ignore = "requires GTK; explicitly run in the isolated omabox session"]
+    fn hide_prompts_switch_starts_from_the_saved_choice_and_is_labelled() {
+        gtk::init().expect("this regression runs inside omabox");
+        for saved in [false, true] {
+            let (row, switch) = hide_prompts_field(saved);
+            assert_eq!(switch.is_active(), saved);
+            switch.set_active(!saved);
+            assert_eq!(switch.is_active(), !saved);
+            let copy = row.first_child().expect("the label column comes first");
+            let label = copy
+                .first_child()
+                .and_downcast::<gtk::Label>()
+                .expect("the switch has a visible label");
+            assert_eq!(label.text(), "Hide prompts");
+            assert!(label.has_css_class("toolport-field-label"));
+            let note = label
+                .next_sibling()
+                .and_downcast::<gtk::Label>()
+                .expect("the switch explains itself");
+            assert!(note.text().contains("Its tools stay available."));
+            assert!(note.has_css_class("caption"));
+            assert_eq!(row.last_child().as_ref(), Some(switch.upcast_ref()));
+        }
     }
 }
 

@@ -1063,5 +1063,7 @@
   "Configuration could not be read safely": "Configuration could not be read safely",
   "Client is no longer available": "Client is no longer available",
   "MCP server": "MCP server",
-  "Server is no longer available": "Server is no longer available"
+  "Server is no longer available": "Server is no longer available",
+  "Hide prompts": "Hide prompts",
+  "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available.": "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available."
 }

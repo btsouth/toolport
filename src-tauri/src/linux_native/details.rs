@@ -1282,6 +1282,7 @@ mod tests {
             url: None,
             cwd: Some("/fixture/work".into()),
             inherit_env: false,
+            hide_prompts: false,
             secret_keys: vec!["API_KEY".into()],
             plain_env: vec![],
             secret_references: Default::default(),

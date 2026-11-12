@@ -1063,5 +1063,7 @@
   "Configuration could not be read safely": "無法安全讀取設定",
   "Client is no longer available": "用戶端已無法使用",
   "MCP server": "MCP 伺服器",
-  "Server is no longer available": "伺服器已無法使用"
+  "Server is no longer available": "伺服器已無法使用",
+  "Hide prompts": "隱藏提示詞",
+  "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available.": "不在 AI 用戶端中顯示此伺服器的提示詞（它們常以斜線命令的形式出現）。其工具仍可使用。"
 }

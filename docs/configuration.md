@@ -155,3 +155,28 @@ calls in flight. Changed servers get a new supervisor and start on their next
 use, or immediately when they have active resource subscriptions. The new
 connection restores those subscriptions. Policy-only edits do not restart
 connections. Fresh catalogs pass the integrity gate before calls can use them.
+
+### Hiding a server's prompts
+
+Some clients, including Claude Code, show MCP prompts as slash commands. A server
+that ships prompts you never use can crowd that menu. To keep a server's tools
+but drop its prompts, turn on **Hide prompts** when you edit the server, or set
+`hidePrompts` on its entry in `registry.json`:
+
+```json
+{
+  "id": "docs",
+  "name": "Docs",
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["-y", "example-docs-mcp"],
+  "hidePrompts": true
+}
+```
+
+Hidden prompts are left out of `prompts/list`, and `prompts/get` and prompt
+completion refuse them. The server's tools and resources are unaffected. The
+setting is a policy edit, so it applies to connected clients without restarting
+the server, and Toolport sends `notifications/prompts/list_changed` so clients
+that support it refresh their list. It is off by default and stays on this
+machine: team and personal sync neither share it nor reset it.

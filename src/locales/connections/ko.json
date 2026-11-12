@@ -1063,5 +1063,7 @@
   "Configuration could not be read safely": "구성을 안전하게 읽을 수 없습니다.",
   "Client is no longer available": "클라이언트를 더 이상 사용할 수 없습니다",
   "MCP server": "MCP 서버",
-  "Server is no longer available": "서버를 더 이상 사용할 수 없습니다"
+  "Server is no longer available": "서버를 더 이상 사용할 수 없습니다",
+  "Hide prompts": "프롬프트 숨기기",
+  "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available.": "이 서버의 프롬프트를 AI 클라이언트에 표시하지 않습니다. 프롬프트는 슬래시 명령으로 표시되는 경우가 많습니다. 도구는 계속 사용할 수 있습니다."
 }

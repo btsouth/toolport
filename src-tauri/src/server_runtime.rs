@@ -304,6 +304,7 @@ mod tests {
             cwd: None,
             source: None,
             disabled_tools: Vec::new(),
+            hide_prompts: false,
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,

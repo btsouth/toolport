@@ -1063,5 +1063,7 @@
   "Configuration could not be read safely": "構成を安全に読み取ることができませんでした",
   "Client is no longer available": "クライアントは利用できなくなりました",
   "MCP server": "MCP サーバー",
-  "Server is no longer available": "サーバーは利用できなくなりました"
+  "Server is no longer available": "サーバーは利用できなくなりました",
+  "Hide prompts": "プロンプトを非表示",
+  "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available.": "このサーバーのプロンプトを AI クライアントに表示しません。プロンプトはスラッシュコマンドとして表示されることがよくあります。ツールは引き続き使用できます。"
 }

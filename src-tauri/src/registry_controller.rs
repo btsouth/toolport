@@ -178,6 +178,8 @@ pub struct ServerFields {
     pub cwd: Option<String>,
     /// "Use my shell environment" for a local server. `None` keeps the saved choice.
     pub inherit_env: Option<bool>,
+    /// "Hide prompts" for any transport. `None` keeps the saved choice.
+    pub hide_prompts: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -386,6 +388,7 @@ fn entry_from_fields(fields: ServerFields) -> Result<ServerEntry, String> {
         cwd: fields.cwd,
         source: Some("manual".into()),
         disabled_tools: Vec::new(),
+        hide_prompts: fields.hide_prompts.unwrap_or(false),
         client_credentials: None,
         request_timeout_ms: None,
         initialize_timeout_ms: None,
@@ -425,6 +428,7 @@ pub(crate) fn server_from_detected(server: &clients::McpServer, client_id: &str)
         url: server.url.clone(),
         source: Some(format!("imported:{client_id}")),
         disabled_tools: Vec::new(),
+        hide_prompts: false,
         cwd: None,
         client_credentials: None,
         request_timeout_ms: None,
@@ -746,6 +750,9 @@ pub fn apply_update_server_fields(
     if let Some(inherit_env) = fields.inherit_env {
         server.inherit_env = inherit_env;
     }
+    if let Some(hide_prompts) = fields.hide_prompts {
+        server.hide_prompts = hide_prompts;
+    }
     Ok(())
 }
 
@@ -958,6 +965,7 @@ pub fn add_snippet_servers_inputs(
             url: server.url,
             cwd: None,
             inherit_env: None,
+            hide_prompts: None,
         })?;
         let definition = serde_json::json!({"env": server.env.into_iter().map(|e| (e.key,e.value.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null))).collect::<serde_json::Map<_,_>>()});
         let choice = choices.get(&entry.name);
@@ -993,6 +1001,7 @@ fn catalog_server(entry: crate::catalog::CatalogEntry) -> ServerEntry {
         cwd: None,
         source: Some(format!("catalog:{}", entry.source)),
         disabled_tools: Vec::new(),
+        hide_prompts: false,
         client_credentials: None,
         request_timeout_ms: entry.request_timeout_ms,
         initialize_timeout_ms: None,
@@ -1151,6 +1160,7 @@ pub fn server_entry_for_probe(
                 cwd: fields.cwd,
                 source: Some("manual".into()),
                 disabled_tools: Vec::new(),
+                hide_prompts: false,
                 client_credentials: None,
                 request_timeout_ms: None,
                 initialize_timeout_ms: None,
@@ -4975,6 +4985,7 @@ API_KEY = "synthetic-first-origin"
             cwd: None,
             source: None,
             disabled_tools: Vec::new(),
+            hide_prompts: false,
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
@@ -4993,6 +5004,7 @@ API_KEY = "synthetic-first-origin"
             url: (transport != "stdio").then(|| "https://example.com/mcp".into()),
             cwd: (transport == "stdio").then(|| " /tmp/project ".into()),
             inherit_env: None,
+            hide_prompts: None,
         }
     }
 
@@ -5256,6 +5268,36 @@ API_KEY = "synthetic-first-origin"
     }
 
     #[test]
+    fn native_field_edit_sets_or_keeps_hidden_prompts_on_any_transport() {
+        let mut registry = Registry::default();
+        let mut existing = server("one");
+        existing.hide_prompts = true;
+        registry.servers.push(existing);
+        apply_update_server_fields(&mut registry, "one", fields("One", "stdio")).unwrap();
+        assert!(
+            registry.servers[0].hide_prompts,
+            "None keeps the saved choice"
+        );
+        let mut off = fields("One", "stdio");
+        off.hide_prompts = Some(false);
+        apply_update_server_fields(&mut registry, "one", off).unwrap();
+        assert!(!registry.servers[0].hide_prompts);
+        // Unlike the shell environment, hiding prompts applies to remote servers too.
+        let mut remote = fields("Remote", "http");
+        remote.hide_prompts = Some(true);
+        apply_update_server_fields(&mut registry, "one", remote).unwrap();
+        assert!(registry.servers[0].hide_prompts);
+        let mut new = fields("New", "http");
+        new.hide_prompts = Some(true);
+        assert!(entry_from_fields(new).unwrap().hide_prompts);
+        assert!(
+            !entry_from_fields(fields("New", "stdio"))
+                .unwrap()
+                .hide_prompts
+        );
+    }
+
+    #[test]
     fn native_field_edit_keeps_or_clears_generated_binding_explicitly() {
         let mut registry = Registry::default();
         let mut existing = server("one");
@@ -5291,6 +5333,7 @@ API_KEY = "synthetic-first-origin"
             url: None,
             cwd: None,
             inherit_env: None,
+            hide_prompts: None,
         };
         apply_update_server_fields(&mut registry, "one", same.clone()).unwrap();
         assert_eq!(
@@ -5334,6 +5377,7 @@ API_KEY = "synthetic-first-origin"
                     url: Some("file:///tmp/not-an-mcp-server".into()),
                     cwd: None,
                     inherit_env: None,
+                    hide_prompts: None,
                 },
             )
         });

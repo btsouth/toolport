@@ -587,6 +587,10 @@ pub struct ToolPolicy {
     pub allow: HashMap<String, HashSet<String>>,
     /// Hide and block any tool annotated `destructiveHint: true`.
     pub deny_destructive: bool,
+    /// Server ids whose prompts are kept out of `prompts/list` and refused by
+    /// `prompts/get` and prompt completion. Their tools and resources are not
+    /// affected. Empty = every server's prompts are exposed (the default).
+    pub hidden_prompts: HashSet<String>,
     /// Exposed (namespaced) tool names quarantined after a high-risk drift; hidden
     /// until the user re-approves them. Empty unless quarantine-on-drift is enabled.
     pub quarantined: BTreeSet<String>,
@@ -668,6 +672,7 @@ pub struct RegistryPolicy {
     pub disabled: HashMap<String, HashSet<String>>,
     pub allow: HashMap<String, HashSet<String>>,
     pub deny_destructive: bool,
+    pub hidden_prompts: HashSet<String>,
 }
 
 impl RegistryPolicy {
@@ -682,6 +687,7 @@ impl RegistryPolicy {
             disabled: self.disabled,
             allow: self.allow,
             deny_destructive: self.deny_destructive,
+            hidden_prompts: self.hidden_prompts,
             quarantined,
             fail_closed_catalog,
         }
@@ -2303,6 +2309,7 @@ impl Router {
             disabled: self.policy.disabled.clone(),
             allow: self.policy.allow.clone(),
             deny_destructive: self.policy.deny_destructive,
+            hidden_prompts: self.policy.hidden_prompts.clone(),
         }
     }
 
@@ -2352,6 +2359,13 @@ impl Router {
                 }
             }
         }
+    }
+
+    /// Whether this router's policy hides `server_id`'s prompts (`hidePrompts`).
+    /// The gateway asks the live router this before an in-flight prompt dispatch,
+    /// since an older snapshot still routes the prompt.
+    pub fn prompts_hidden(&self, server_id: &str) -> bool {
+        self.policy.hidden_prompts.contains(server_id)
     }
 
     /// Recheck a dispatch this router is about to make against the policy of a
@@ -2614,8 +2628,18 @@ impl Router {
         }
 
         // Prompts: namespace names like tools so two servers can't collide, and
-        // allocate them in the same order-independent way.
+        // allocate them in the same order-independent way. Allocate even when
+        // hidden, like disabled tools, so toggling one server never renames
+        // another server's prompts.
         let prompt_names = self.allocate_exposed_names(server_id, prompts);
+        // Prompts the user hid for this server (`hidePrompts`) are never indexed,
+        // so they drop out of prompts/list, prompts/get and prompt completion
+        // together. The server's cached prompt list is kept, so turning the
+        // setting back off restores them on the next policy republish without
+        // reconnecting.
+        if self.policy.hidden_prompts.contains(server_id) {
+            return;
+        }
         for (idx, prompt) in prompts.iter().enumerate() {
             let Some(orig) = prompt.get("name").and_then(|n| n.as_str()) else {
                 continue;
@@ -9427,6 +9451,62 @@ for line in sys.stdin:
         let result = router.get_prompt("github__greet", json!({})).unwrap();
         assert_eq!(result["messages"][0]["content"], "github:greet");
         assert!(router.get_prompt("nope__greet", json!({})).is_err());
+    }
+
+    /// `hidePrompts` drops one server's prompts from prompts/list, prompts/get and
+    /// prompt completion, leaves its tools and the other servers alone, and can be
+    /// switched back on the same connection through a policy republish.
+    #[test]
+    fn hidden_prompts_policy_hides_one_servers_prompts_but_keeps_its_tools() {
+        let prompt_names = |router: &Router| -> Vec<String> {
+            router
+                .aggregated_prompts()
+                .iter()
+                .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(String::from))
+                .collect()
+        };
+        let mut router = Router::with_policy(ToolPolicy {
+            hidden_prompts: HashSet::from(["github".to_string()]),
+            ..Default::default()
+        });
+        router.add(mock_server("github"));
+        router.add(mock_server("postgres"));
+        let tools_before = exposed_names(&router);
+        assert!(
+            tools_before.iter().any(|name| name.starts_with("github__")),
+            "the hidden server's tools stay listed: {tools_before:?}"
+        );
+
+        assert_eq!(prompt_names(&router), vec!["postgres__greet"]);
+        assert!(router.prompt_server("github__greet").is_none());
+        let err = router.get_prompt("github__greet", json!({})).unwrap_err();
+        assert!(err.contains("no route"), "{err}");
+        assert!(router
+            .resolve_completion(&json!({"ref": {"type": "ref/prompt", "name": "github__greet"}}))
+            .is_err());
+        assert!(router.get_prompt("postgres__greet", json!({})).is_ok());
+
+        // Showing them again needs no reconnect and leaves the tool list as it was.
+        let mut policy = router.registry_policy();
+        policy.hidden_prompts.clear();
+        assert!(router.apply_registry_policy(policy.clone()));
+        assert!(
+            !router.apply_registry_policy(policy),
+            "an identical policy is not a change"
+        );
+        assert_eq!(
+            prompt_names(&router),
+            vec!["github__greet", "postgres__greet"]
+        );
+        let result = router.get_prompt("github__greet", json!({})).unwrap();
+        assert_eq!(result["messages"][0]["content"], "github:greet");
+        assert_eq!(exposed_names(&router), tools_before);
+
+        // And hiding them again on the live router takes effect immediately.
+        let mut policy = router.registry_policy();
+        policy.hidden_prompts.insert("postgres".to_string());
+        assert!(router.apply_registry_policy(policy));
+        assert_eq!(prompt_names(&router), vec!["github__greet"]);
     }
 
     #[test]

@@ -4737,6 +4737,30 @@ fn prepare_dispatch(
     recheck_live_policy(router, live_router, target)
 }
 
+/// Refuse a prompt dispatch whose server had its prompts hidden (`hidePrompts`)
+/// after this request took its router snapshot. The snapshot still routes the
+/// prompt, and [`recheck_live_policy`] only asks whether the server is on, so
+/// without this an in-flight `prompts/get` or prompt completion would still
+/// reach a prompt the user just hid. Only prompt dispatch calls this, so the
+/// server's tools are never affected. The refusal reads like an unknown prompt,
+/// the same as a request admitted after the change.
+fn recheck_live_prompt_visibility(
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
+    owner: &str,
+    exposed: &str,
+) -> Result<(), String> {
+    let hidden = live_router.is_some_and(|slot| {
+        slot.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .prompts_hidden(owner)
+    });
+    if hidden {
+        Err(format!("no route for prompt '{exposed}'"))
+    } else {
+        Ok(())
+    }
+}
+
 const STALE_LIVE_VIEW: &str =
     "this connection's profile changed during the request; send the request again";
 
@@ -8644,7 +8668,8 @@ fn handle_request_with_cancel(
                     DispatchTarget::Server(owner),
                     cancel.as_ref(),
                     !mrtr.is_empty(),
-                ),
+                )
+                .and_then(|()| recheck_live_prompt_visibility(live_router, owner, name)),
                 None => Ok(()),
             };
             match live_policy.and_then(|()| {
@@ -8701,6 +8726,13 @@ fn handle_request_with_cancel(
                             ));
                         }
                     }
+                    // A prompt reference is refused once its server's prompts are
+                    // hidden live; a resource-template reference is unaffected.
+                    let prompt_ref = params
+                        .get("ref")
+                        .filter(|r| r.get("type").and_then(Value::as_str) == Some("ref/prompt"))
+                        .and_then(|r| r.get("name"))
+                        .and_then(Value::as_str);
                     match prepare_dispatch(
                         router,
                         live_router,
@@ -8708,6 +8740,10 @@ fn handle_request_with_cancel(
                         cancel.as_ref(),
                         false,
                     )
+                    .and_then(|()| match prompt_ref {
+                        Some(name) => recheck_live_prompt_visibility(live_router, &server_id, name),
+                        None => Ok(()),
+                    })
                     .and_then(|()| router.complete_with_cancel(params, cancel.clone()))
                     {
                         Ok(result) => Some(success(id, result)),
@@ -9052,9 +9088,16 @@ fn registry_policy(
     let servers = router_servers(reg, profile, http_mode, daemon_mode);
     // Per-tool disables + the global destructive switch, from the same server set.
     let mut disabled = std::collections::HashMap::new();
+    // Servers whose prompts the user hid (`hidePrompts`). Carried in the policy,
+    // not baked into the connection, so the toggle applies to a live router
+    // without reconnecting the server.
+    let mut hidden_prompts = HashSet::new();
     for s in &servers {
         if !s.disabled_tools.is_empty() {
             disabled.insert(s.id.clone(), s.disabled_tools.iter().cloned().collect());
+        }
+        if s.hide_prompts {
+            hidden_prompts.insert(s.id.clone());
         }
     }
     // Tool-granular profile scope (SOU-189 / SOU-167): per-server ORIGINAL tool allow-lists.
@@ -9082,6 +9125,7 @@ fn registry_policy(
         disabled,
         allow,
         deny_destructive: reg.deny_destructive_effective(),
+        hidden_prompts,
     }
 }
 
@@ -9865,6 +9909,52 @@ fn notify_list_changed_for_router_diff(
                 != visible_changed_list(current, allowed.as_ref(), kind)
         });
         if !changed {
+            continue;
+        }
+        if let Some(json) = session.notification_json(&msg) {
+            if !session.push_message(json, None) {
+                eprintln!("toolport: MCP session could not take a notification; dropped");
+            }
+        }
+    }
+}
+
+/// Announce `notifications/prompts/list_changed` after `hidePrompts` flipped for
+/// `servers`. The stdio client always hears it. An HTTP session hears it only when
+/// its scope can see one of those servers (an unscoped session sees them all), so a
+/// client limited to other servers learns nothing about the toggle. Matching by
+/// server id also covers a daemon's `${ROOT}` servers, which only per-session
+/// rooted views hold and a base-router diff therefore cannot see.
+fn notify_prompts_changed_for_servers(
+    stdio: &SessionState,
+    mcp_sessions: Option<&McpSessions>,
+    servers: &HashSet<String>,
+) {
+    let method = "notifications/prompts/list_changed";
+    notify_list_changed(stdio, None, method);
+    let Some(sessions) = mcp_sessions else {
+        return;
+    };
+    let sessions: Vec<Arc<SessionState>> = sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .cloned()
+        .collect();
+    let msg = json!({ "jsonrpc": "2.0", "method": method });
+    for session in sessions {
+        if !session.takes_notifications() {
+            continue;
+        }
+        let in_scope = match session
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.scope.as_ref())
+        {
+            Some(scope) => scope.iter().any(|id| servers.contains(id)),
+            None => true,
+        };
+        if !in_scope {
             continue;
         }
         if let Some(json) = session.notification_json(&msg) {
@@ -12186,12 +12276,32 @@ fn watch_tick(
             http_mode,
             host.daemon_mode.load(Ordering::SeqCst),
         );
+        // Hiding or showing a server's prompts changes prompts/list, not tools/list,
+        // and the rebuild below only announces tools. Compare before republishing
+        // so the client re-fetches its prompts (its slash-command menu) right away.
+        // The servers whose hidePrompts flipped. The notice goes by these ids, not
+        // by diffing the base router: a daemon's `${ROOT}` servers live only in
+        // per-session rooted views, so the base router would show no change for
+        // them even though those views are rebuilt below.
+        let prompts_toggled: HashSet<String> = {
+            let live = router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            live.registry_policy()
+                .hidden_prompts
+                .symmetric_difference(&policy.hidden_prompts)
+                .cloned()
+                .collect()
+        };
         let policy_changed = republish_registry_policy(router, policy);
         publish_registry(new_reg.clone());
         if policy_changed {
             host.invalidate_root_views();
             host.invalidate_tool_scope_views();
             notify_tools_changed(stdio, mcp_sessions);
+            if !prompts_toggled.is_empty() {
+                notify_prompts_changed_for_servers(stdio, mcp_sessions, &prompts_toggled);
+            }
             glog("registry policy changed; enforcing it on live connections");
             eprintln!("toolport: registry policy changed; enforcing it on live connections");
         }
@@ -24115,6 +24225,24 @@ mod tests {
         }
     }
 
+    /// A server's `hidePrompts` flag reaches the router through the registry
+    /// policy (so it applies live), and only for that server.
+    #[test]
+    fn registry_policy_carries_hide_prompts_per_server() {
+        let _env = DataDirTestEnv::new("registry-policy-hide-prompts");
+        let mut reg = Registry::default();
+        for (id, hide) in [("docs", true), ("other", false)] {
+            let mut server = stub_server(id, id);
+            server.enabled = true;
+            server.hide_prompts = hide;
+            reg.servers.push(server);
+            reg.profiles[0].enabled_server_ids.push(id.into());
+        }
+        let policy = registry_policy(&reg, None, false, false);
+        assert_eq!(policy.hidden_prompts, HashSet::from(["docs".to_string()]));
+        assert!(policy.disabled.is_empty(), "tools are not disabled by it");
+    }
+
     #[test]
     fn access_review_default_tool_revocation_while_call_waits_for_startup() {
         let _env = DataDirTestEnv::new("access-review-startup");
@@ -31763,6 +31891,7 @@ mod tests {
                 url: None,
                 source: None,
                 disabled_tools: vec![],
+                hide_prompts: false,
                 cwd: None,
                 client_credentials: None,
                 request_timeout_ms: None,
@@ -31836,6 +31965,7 @@ mod tests {
                 url: Some(format!("https://mcp.{id}.example/mcp")),
                 source: None,
                 disabled_tools: vec![],
+                hide_prompts: false,
                 cwd: None,
                 client_credentials: None,
                 request_timeout_ms: None,
@@ -31923,6 +32053,7 @@ mod tests {
             url: Some("https://mcp.github.example/mcp".into()),
             source: None,
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -33619,6 +33750,7 @@ mod tests {
             url: None,
             source: None,
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -38213,6 +38345,7 @@ mod tests {
             url: None,
             source: None,
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -42416,6 +42549,165 @@ mod tests {
             "an instructions-only edit must not rebuild the router"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A prompt request admitted before `hidePrompts` went live still holds a
+    /// router that routes the prompt; the live recheck must refuse it like an
+    /// unknown prompt, and only for the server whose prompts are hidden.
+    #[test]
+    fn live_prompt_recheck_refuses_prompts_hidden_after_admission() {
+        let live = Router::with_policy(
+            RegistryPolicy {
+                hidden_prompts: HashSet::from(["docs".to_string()]),
+                ..RegistryPolicy::default()
+            }
+            .with_quarantine(BTreeSet::new(), false),
+        );
+        let slot = Arc::new(Mutex::new(Arc::new(live)));
+        assert_eq!(
+            recheck_live_prompt_visibility(Some(&slot), "docs", "docs__init"),
+            Err("no route for prompt 'docs__init'".to_string())
+        );
+        assert!(recheck_live_prompt_visibility(Some(&slot), "github", "github__review").is_ok());
+        assert!(recheck_live_prompt_visibility(None, "docs", "docs__init").is_ok());
+    }
+
+    /// The hidePrompts notice is keyed by server id, so it reaches a session whose
+    /// toggled server is not in the base router at all (a daemon's `${ROOT}`
+    /// server lives only in rooted views) and skips sessions scoped elsewhere.
+    #[test]
+    fn prompt_visibility_notice_follows_server_scope_not_the_base_router() {
+        let session = |scope: Option<&str>| {
+            Arc::new(SessionState::new_http(Some(McpSessionOwner {
+                identity: "client".into(),
+                profile: None,
+                tool_scope: None,
+                scope: scope.map(|id| vec![id.to_string()]),
+            })))
+        };
+        let rooted = session(Some("rooted"));
+        let unscoped = session(None);
+        let elsewhere = session(Some("other"));
+        let sessions: McpSessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions.lock().unwrap().extend([
+            ("rooted".into(), Arc::clone(&rooted)),
+            ("unscoped".into(), Arc::clone(&unscoped)),
+            ("elsewhere".into(), Arc::clone(&elsewhere)),
+        ]);
+        let stdio = test_stdio_session();
+        notify_prompts_changed_for_servers(
+            &stdio,
+            Some(&sessions),
+            &HashSet::from(["rooted".to_string()]),
+        );
+        assert_eq!(rooted.outbound.lock().unwrap().len(), 1);
+        assert_eq!(unscoped.outbound.lock().unwrap().len(), 1);
+        assert!(elsewhere.outbound.lock().unwrap().is_empty());
+        assert_eq!(
+            deferred_count(&stdio, "notifications/prompts/list_changed"),
+            1
+        );
+    }
+
+    /// Turning on `hidePrompts` for a connected server hides its prompts on the
+    /// live router through the policy republish (no reconnect), keeps its tools,
+    /// and tells the client to re-fetch prompts/list.
+    #[test]
+    fn watch_tick_hides_a_servers_prompts_live_and_announces_it() {
+        let _env = DataDirTestEnv::new("hide-prompts-tick");
+        let mut live = Registry {
+            servers: vec![stub_server("cache", "Cache")],
+            ..Default::default()
+        };
+        live.servers[0].enabled = true;
+        let mut router = router_with_registry_policy(&live);
+        let mut server =
+            DownstreamServer::connect("cache".to_string(), Box::new(CacheRoute)).unwrap();
+        server.load_resources_prompts();
+        router.add(server);
+        assert_eq!(router.aggregated_prompts().len(), 1);
+
+        let reg_path = registry::resolved_path().unwrap();
+        let mut on_disk = live.clone();
+        on_disk.servers[0].hide_prompts = true;
+        registry::save_to(&reg_path, &on_disk).unwrap();
+        // Treat the edit as already rebuilt so this checks the live policy path
+        // on the existing connection, not a fresh router.
+        let mut watcher = WatchLoopState {
+            last_mtime: None,
+            last_relevant: router_relevant(&on_disk),
+        };
+        let host = host_from_parts(
+            Arc::new(Mutex::new(live)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(Mutex::new(Arc::new(router))),
+            Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default()))),
+            Arc::new(AtomicU8::new(0)),
+            Arc::new(|_| None),
+            Arc::new(Mutex::new(())),
+            None,
+            None,
+        );
+        // HTTP sessions scoped to the toggled server and to an unrelated one.
+        // Only the first one's prompt list changes, so only it hears about it.
+        let session = |server: &str| {
+            Arc::new(SessionState::new_http(Some(McpSessionOwner {
+                identity: server.into(),
+                profile: None,
+                tool_scope: None,
+                scope: Some(vec![server.into()]),
+            })))
+        };
+        let affected = session("cache");
+        let unrelated = session("other");
+        host.mcp_sessions.lock().unwrap().extend([
+            ("affected".into(), Arc::clone(&affected)),
+            ("unrelated".into(), Arc::clone(&unrelated)),
+        ]);
+        let prompt_notices = |session: &SessionState| {
+            session
+                .outbound
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|queued| {
+                    serde_json::from_str::<Value>(&queued.json).unwrap()["method"]
+                        == "notifications/prompts/list_changed"
+                })
+                .count()
+        };
+        let stdio = test_stdio_session();
+        watch_tick(
+            &reg_path,
+            &stdio,
+            &Arc::new(Mutex::new(None)),
+            None,
+            None,
+            false,
+            &Arc::new(Mutex::new(None)),
+            None,
+            &mut watcher,
+            &host,
+        );
+
+        assert_eq!(prompt_notices(&affected), 1);
+        assert_eq!(
+            prompt_notices(&unrelated),
+            0,
+            "a session scoped away from the server must not hear about its prompts"
+        );
+        let current = Arc::clone(&host.router.lock().unwrap());
+        assert!(current.aggregated_prompts().is_empty());
+        assert!(current.get_prompt("cache__cached", json!({})).is_err());
+        assert_eq!(
+            current.aggregated_tools().len(),
+            1,
+            "the server's tools stay listed"
+        );
+        assert_eq!(
+            deferred_count(&stdio, "notifications/prompts/list_changed"),
+            1
+        );
     }
 
     #[test]

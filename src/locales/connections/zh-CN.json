@@ -1063,5 +1063,7 @@
   "Configuration could not be read safely": "无法安全读取配置",
   "Client is no longer available": "客户端已不可用",
   "MCP server": "MCP 服务器",
-  "Server is no longer available": "服务器已不可用"
+  "Server is no longer available": "服务器已不可用",
+  "Hide prompts": "隐藏提示词",
+  "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available.": "不在 AI 客户端中显示此服务器的提示词（它们常以斜杠命令的形式出现）。其工具仍可使用。"
 }
