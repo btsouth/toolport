@@ -315,7 +315,7 @@ fn tool_list(cfg: &Config, grown: bool) -> Value {
     if std::env::var("MOCK_MCP_CONFORMANCE").as_deref() == Ok("1") {
         tools.extend([
             json!({"name":"structured", "description":"Return typed fixture data.",
-                "inputSchema":{"type":"object","properties":{}},
+                "inputSchema":{"type":"object","properties":{"bytes":{"type":"integer"}}},
                 "outputSchema":{"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"]}}),
             json!({"name":"large", "description":"Return a bounded large fixture result.",
                 "inputSchema":{"type":"object","properties":{"bytes":{"type":"integer"}}}}),
@@ -680,9 +680,13 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
             }
             let text = match name {
                 "structured" if std::env::var("MOCK_MCP_CONFORMANCE").as_deref() == Ok("1") => {
+                    let mut data = json!({"answer": 42});
+                    if let Some(bytes) = args.get("bytes").and_then(Value::as_u64) {
+                        data["payload"] = json!("x".repeat(bytes.min(1024 * 1024) as usize));
+                    }
                     return Some(success(
                         id,
-                        json!({"content":[{"type":"text","text":"{\"answer\":42}"}],"structuredContent":{"answer":42},"isError":false}),
+                        json!({"content":[{"type":"text","text":data.to_string()}],"structuredContent":data,"isError":false}),
                     ));
                 }
                 "large" if std::env::var("MOCK_MCP_CONFORMANCE").as_deref() == Ok("1") => {
