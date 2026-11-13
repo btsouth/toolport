@@ -6,18 +6,35 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [2.3.5] - 2026-11-13
+
+Toolport 2.3.5 lets you hide a server's prompts while keeping its tools, keeps
+clients answering after the background gateway restarts, and gets large results
+from tools with output schemas through to Claude Code.
+
+If you are on Toolport 1.24.x, this is also your update to Toolport 2. Read the
+[upgrade guide](https://github.com/btsouth/toolport/blob/main/docs/migration.md)
+before updating.
+
 ### Added
 
 - A new **Hide prompts** switch on each server keeps its MCP prompts out of your
   clients and leaves its tools available. Clients like Claude Code show prompts as
   slash commands, so this clears out commands you never use. The registry key is
   `hidePrompts`, and changing it takes effect without restarting the server.
+  Thanks @1llum1n4t1s. (#1320)
 
 ### Fixed
 
 - A client no longer stops getting answers after the background gateway restarts
   while it holds a subscription open. Calls used to wait behind that subscription
-  until the client gave up, so the client had to be restarted.
+  until the client gave up, so the client had to be restarted. Thanks
+  @1llum1n4t1s. (#1321)
+- Large results from tools that declare an output schema now reach strict clients
+  like Claude Code. Toolport shortens oversized results to a preview, which Claude
+  Code rejected because the tool still advertised its output schema. Toolport no
+  longer passes those schemas on. Thanks @wsj040303 and @Farisarditiyanto.
+  (#1322, #1323)
 
 ## [2.3.4] - 2026-11-08
 
