@@ -49,6 +49,21 @@ with real processes and a scripted old-version daemon. It is not acceptance of
 an actual pair of released gateway artifacts. Both tests also run in the normal
 headless CI integration-test command.
 
+## Structured tool results
+
+Gateway discovery omits downstream `outputSchema` declarations because result
+shaping can replace `structuredContent` with a preview and a fetch cursor. The
+input schema is preserved, small structured results still pass through, and
+retained structured results remain available through `toolport_fetch_result`
+projections. This applies to Full, Lazy and Grouped discovery, including exact
+searches and pinned tools. Output schemas stay omitted when shaping is disabled,
+so changing a server's result budget does not invalidate a client's cached tool
+contract. The original downstream catalog is unchanged.
+
+The fixture replay covers small structured results, oversized structured results
+and cursor retrieval through the real adapter and daemon. It does not claim
+acceptance by an authenticated Claude Code or other client application.
+
 ## Tool name budgets
 
 Client profiles in `clients.rs` declare combined name budgets. Cursor has a

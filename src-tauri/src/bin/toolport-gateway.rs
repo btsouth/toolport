@@ -3403,12 +3403,16 @@ fn explain_match(query: &str, tool: &Value) -> Vec<String> {
 
 /// Neutralize every model-visible string on one catalog entry so a tool
 /// definition cannot deliver a fake Toolport voice (SBS-896): `description`,
-/// `title`, `annotations`, and every string in `inputSchema` / `outputSchema`
+/// `title`, `annotations`, and every string in `inputSchema`
 /// (a parameter description, a schema `title`, an `enum` value, a `default`, a
 /// property name). `name` is deliberately untouched - it is the routing key the
-/// model must echo back verbatim to call the tool.
+/// model must echo back verbatim to call the tool. Downstream output schemas are
+/// omitted because gateway results may be shaped instead of returned verbatim.
 fn neutralize_listed_tool(tool: &mut Value) {
     if let Some(map) = tool.as_object_mut() {
+        // Shaping can replace structuredContent with a preview and cursor. Do not
+        // promise the downstream output contract on any gateway discovery path.
+        map.remove("outputSchema");
         for (key, child) in map.iter_mut() {
             if key != "name" {
                 integrity::neutralize_value_strings(child);
@@ -44403,6 +44407,66 @@ mod tests {
     }
 
     #[test]
+    fn advertised_output_schema_accepts_small_and_shaped_results() {
+        let _env = DataDirTestEnv::new("shaped-output-schema");
+        let host = dispatch_host(false);
+        let router = routed_router("x", "getItem");
+        let cat = vec![json!({
+            "name": "x__getItem",
+            "inputSchema": {"type": "object", "properties": {
+                "outputSchema": {"type": "string"}
+            }},
+            "outputSchema": {"type": "object", "required": ["answer"],
+                "properties": {"answer": {"type": "integer"}}},
+            "annotations": {"readOnlyHint": true}
+        })];
+        for budget in [0, 1024] {
+            let mut reg = Registry::default();
+            reg.result_budgets.insert("x".into(), budget);
+            let tools = tool_surface(&host, &reg, &router, &cat, None, DiscoveryMode::Full);
+            let tool = tools.iter().find(|t| t["name"] == "x__getItem").unwrap();
+            assert_eq!(tool["inputSchema"], cat[0]["inputSchema"]);
+            assert_eq!(tool["annotations"], cat[0]["annotations"]);
+            for bytes in [4, 100_000] {
+                let data = json!({"answer": 42, "payload": "x".repeat(bytes)});
+                let original = json!({"content": [{"type": "text", "text": data.to_string()}],
+                    "structuredContent": data, "isError": false});
+                let result =
+                    defend_and_shape(&reg, "x", "x__getItem", None, original, "", true).result;
+                if let Some(schema) = tool.get("outputSchema") {
+                    let structured = result.get("structuredContent").expect(
+                        "advertised outputSchema requires structuredContent even after shaping",
+                    );
+                    assert!(jsonschema::is_valid(schema, structured));
+                }
+                if budget == 0 || bytes == 4 {
+                    assert_eq!(result["structuredContent"], data);
+                } else {
+                    assert!(result.get("structuredContent").is_none());
+                    let text = result["content"][0]["text"].as_str().unwrap();
+                    let cursor = text
+                        .split("\"cursor\":\"")
+                        .nth(1)
+                        .unwrap()
+                        .split('"')
+                        .next()
+                        .unwrap();
+                    let fetched = shaping::fetch_result(cursor, 0, 0, None, Some("answer"));
+                    assert_ne!(fetched["isError"], true);
+                    assert!(fetched["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("42"));
+                }
+            }
+        }
+        assert!(
+            cat[0].get("outputSchema").is_some(),
+            "source catalog must remain intact"
+        );
+    }
+
+    #[test]
     fn exact_exposed_name_promotes_tool_and_restores_schema() {
         let cat = vec![
             json!({
@@ -44430,10 +44494,13 @@ mod tests {
             "string"
         );
         assert!(hits[0].get("schemaOmitted").is_none());
+        let mut expected = cat[1].clone();
+        expected.as_object_mut().unwrap().remove("outputSchema");
         assert_eq!(
-            hits[0], cat[1],
-            "exact lookup must keep the full definition"
+            hits[0], expected,
+            "exact lookup must keep the input contract"
         );
+        assert!(cat[1].get("outputSchema").is_some());
         let index = CatalogSearchIndex::build(&cat);
         let indexed = search_catalog_indexed(
             &cat,
@@ -44522,10 +44589,11 @@ mod tests {
         .unwrap();
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         let hits: Vec<Value> = serde_json::from_str(text.split_once("\n\n").unwrap().1).unwrap();
+        let mut expected = cat.clone();
+        expected[1].as_object_mut().unwrap().remove("outputSchema");
         assert_eq!(
-            hits,
-            vec![cat[0].clone(), cat[1].clone()],
-            "exact lookup must preserve the complete definition and prerequisite"
+            hits, expected,
+            "exact lookup must preserve input definitions and prerequisites"
         );
         assert!(text.contains("pinned prerequisite tool(s) included with full schema"));
         assert!(text.contains("Pick by description"));
