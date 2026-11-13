@@ -138,11 +138,33 @@ async function replay(profile) {
     }
     const initial = await catalog(client, "mock__echo");
     const typed = initial.find((t) => t.name === client.spell("mock__structured"));
-    assert.equal(typed?.outputSchema?.properties?.answer?.type, "integer");
+    assert(typed, "typed fixture tool must be listed");
+    assert.equal(typed.inputSchema.properties.bytes.type, "integer");
     const structured = await client.call("mock__structured");
     success(structured);
     assert.equal(structured.result.structuredContent.answer, 42);
-    pass(`${profile.id}: captured startup, outputSchema and structuredContent`);
+    const shaped = await client.call("mock__structured", { bytes: 256 * 1024 });
+    success(shaped);
+    if (typed.outputSchema) {
+      assert(
+        shaped.result.structuredContent,
+        "advertised outputSchema requires structuredContent even after shaping",
+      );
+    }
+    assert.equal(typed.outputSchema, undefined);
+    assert.equal(shaped.result.structuredContent, undefined);
+    const preview = textOf(shaped);
+    assert(preview.includes("[Toolport shaped this result:"));
+    assert(preview.length < 256 * 1024);
+    const cursor = preview.match(/"cursor":"([^"]+)"/)?.[1];
+    assert(cursor, "shaped result must offer a cursor");
+    const fetched = await client.call("toolport_fetch_result", {
+      cursor,
+      projection: "answer",
+    });
+    success(fetched);
+    assert(textOf(fetched).includes("42"));
+    pass(`${profile.id}: small structured results, shaped previews and cursor retrieval`);
 
     // All profiles get the same event. Re-list only for verified refresh behavior;
     // an unknown client is not credited with a handler it has not demonstrated.
