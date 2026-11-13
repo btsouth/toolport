@@ -473,15 +473,21 @@ pub fn detected_is_gateway(server: &McpServer) -> bool {
     gateway_identity_matches(&server.name, &server.name, server.command.as_deref())
 }
 
-// Cargo puts integration-test executables under deps; shipped test-support
-// binaries remain usable without fixture roots. Guard before any host resolver
+// Cargo puts integration-test executables under deps (before 1.100) or
+// build/<package>/<hash>/out (1.100 and later); shipped test-support binaries
+// remain usable without fixture roots. Guard before any host resolver
 // or ambient client-path override can read outside an in-process fixture.
 #[cfg(all(not(test), feature = "test-support"))]
 fn assert_integration_test_root() {
     static INTEGRATION_TEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let integration_test = INTEGRATION_TEST.get_or_init(|| {
         std::env::current_exe().ok().is_some_and(|exe| {
-            exe.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("deps"))
+            matches!(
+                exe.parent()
+                    .and_then(Path::file_name)
+                    .and_then(|name| name.to_str()),
+                Some("deps" | "out")
+            )
         })
     });
     assert!(
