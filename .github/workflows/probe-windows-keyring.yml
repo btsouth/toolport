@@ -1,0 +1,44 @@
+name: Probe Windows keyring race
+
+on:
+  push:
+    branches: ["probe/**"]
+  workflow_dispatch:
+    inputs:
+      secs:
+        default: "120"
+      readers:
+        default: "3"
+      scenarios:
+        default: "same,cross"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri
+          key: ci-headless
+          cache-bin: "false"
+          save-if: "false"
+      - name: Build probe
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support,search-static --lib --no-run
+      - name: Run probe
+        env:
+          TP_PROBE_SECS: ${{ inputs.secs || '120' }}
+          TP_PROBE_READERS: ${{ inputs.readers || '3' }}
+          TP_PROBE_SCENARIOS: ${{ inputs.scenarios || 'same,cross' }}
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support,search-static --lib secrets::probe::parent -- --ignored --exact --nocapture

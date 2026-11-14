@@ -2320,3 +2320,7 @@ pub(crate) mod tests {
         );
     }
 }
+
+#[cfg(all(test, target_os = "windows"))]
+#[path = "secrets_probe.rs"]
+mod probe;
