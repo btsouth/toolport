@@ -193,3 +193,163 @@ fn parent() {
         run_scenario(scenario, readers, secs);
     }
 }
+
+/// Child for `lock_integrity`. Exit codes: 0 opened, saw it held, then acquired
+/// it; 2 could not open; 3 opened but it was not held (different object); 4 never
+/// acquired after release.
+#[test]
+#[ignore = "probe child, spawned by probe::lock_integrity"]
+fn lock_child() {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{ReleaseMutex, WaitForSingleObject};
+    let handle = match super::platform::open_lock_mutex_for_test() {
+        Ok(handle) => handle,
+        Err(error) => {
+            eprintln!("lock child open failed: {error}");
+            std::process::exit(2)
+        }
+    };
+    if unsafe { WaitForSingleObject(handle, 0) } != WAIT_TIMEOUT {
+        std::process::exit(3);
+    }
+    match unsafe { WaitForSingleObject(handle, 15_000) } {
+        WAIT_OBJECT_0 | WAIT_ABANDONED => unsafe {
+            ReleaseMutex(handle);
+            CloseHandle(handle);
+            std::process::exit(0)
+        },
+        _ => std::process::exit(4),
+    }
+}
+
+fn spawn_at_integrity(label_sid: &str) -> windows_sys::Win32::Foundation::HANDLE {
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+    use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+    use windows_sys::Win32::Security::{
+        DuplicateTokenEx, GetLengthSid, SecurityImpersonation, SetTokenInformation,
+        TokenIntegrityLevel, TokenPrimary, SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT,
+        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, PROCESS_INFORMATION,
+        STARTUPINFOW,
+    };
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        assert!(
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ASSIGN_PRIMARY,
+                &mut token
+            ) != 0
+        );
+        let mut lowered: HANDLE = std::ptr::null_mut();
+        assert!(
+            DuplicateTokenEx(
+                token,
+                0,
+                std::ptr::null(),
+                SecurityImpersonation,
+                TokenPrimary,
+                &mut lowered
+            ) != 0
+        );
+        let sid_text: Vec<u16> = label_sid.encode_utf16().chain([0]).collect();
+        let mut sid = std::ptr::null_mut();
+        assert!(ConvertStringSidToSidW(sid_text.as_ptr(), &mut sid) != 0);
+        let label = TOKEN_MANDATORY_LABEL {
+            Label: SID_AND_ATTRIBUTES {
+                Sid: sid,
+                Attributes: 0x20, // SE_GROUP_INTEGRITY
+            },
+        };
+        assert!(
+            SetTokenInformation(
+                lowered,
+                TokenIntegrityLevel,
+                (&label as *const TOKEN_MANDATORY_LABEL).cast(),
+                std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32 + GetLengthSid(sid),
+            ) != 0,
+            "SetTokenInformation: {}",
+            std::io::Error::last_os_error()
+        );
+        let exe = std::env::current_exe().unwrap();
+        let mut command: Vec<u16> = format!(
+            "\"{}\" --exact secrets::probe::lock_child --ignored --nocapture",
+            exe.display()
+        )
+        .encode_utf16()
+        .chain([0])
+        .collect();
+        let mut startup: STARTUPINFOW = std::mem::zeroed();
+        startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        let mut info: PROCESS_INFORMATION = std::mem::zeroed();
+        assert!(
+            CreateProcessAsUserW(
+                lowered,
+                std::ptr::null(),
+                command.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                &startup,
+                &mut info
+            ) != 0,
+            "CreateProcessAsUserW: {}",
+            std::io::Error::last_os_error()
+        );
+        LocalFree(sid.cast());
+        CloseHandle(token);
+        CloseHandle(lowered);
+        CloseHandle(info.hThread);
+        info.hProcess
+    }
+}
+
+/// Elevated (runner) process holds the lock; children at medium and low
+/// integrity must open the same mutex, see it held, and get it once released.
+#[test]
+#[ignore = "manual Windows probe"]
+fn lock_integrity() {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, WaitForSingleObject,
+    };
+    let elevated = unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token);
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut len = 0;
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        );
+        CloseHandle(token);
+        elevation.TokenIsElevated != 0
+    };
+    println!("PROBE_ELEVATED {elevated}");
+    for (name, sid) in [("medium", "S-1-16-8192"), ("low", "S-1-16-4096")] {
+        let handle = super::platform::open_lock_mutex_for_test().unwrap();
+        assert_eq!(unsafe { WaitForSingleObject(handle, 5_000) }, 0, "parent lock");
+        let process = spawn_at_integrity(sid);
+        std::thread::sleep(Duration::from_secs(2));
+        unsafe {
+            windows_sys::Win32::System::Threading::ReleaseMutex(handle);
+            CloseHandle(handle);
+        }
+        let mut code = 99u32;
+        unsafe {
+            WaitForSingleObject(process, 30_000);
+            GetExitCodeProcess(process, &mut code);
+            CloseHandle(process);
+        }
+        println!("PROBE_INTEGRITY {name} exit={code}");
+    }
+}

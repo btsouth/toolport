@@ -68,3 +68,24 @@ jobs:
             if cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support,search-static --lib secrets::tests::windows_cross_process_access_never_tears_a_chunked_secret -- --exact --nocapture > out.txt 2>&1; then pass=$((pass+1)); else fail=$((fail+1)); grep -aE "torn|left behind|panicked|child failed" out.txt | head -4; fi
           done
           echo "REGRESSION_SUMMARY pass=$pass fail=$fail"
+
+  integrity:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri
+          key: ci-headless
+          cache-bin: "false"
+          save-if: "false"
+      - name: Build
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support,search-static --lib --no-run
+      - name: Lock across integrity levels
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support,search-static --lib secrets::probe::lock_integrity -- --ignored --exact --nocapture
+      - name: New tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support,search-static --lib secrets::tests::windows_ -- --nocapture --test-threads=1

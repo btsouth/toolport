@@ -186,6 +186,11 @@ fn credential_lock() -> Option<CredentialLock> {
 }
 
 #[cfg(test)]
+pub fn open_lock_mutex_for_test() -> Result<windows_sys::Win32::Foundation::HANDLE, String> {
+    open_lock_mutex()
+}
+
+#[cfg(test)]
 pub fn lock_mutex_opens_for_test() -> Result<(), String> {
     let handle = open_lock_mutex()?;
     unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
