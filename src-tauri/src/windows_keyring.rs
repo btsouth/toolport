@@ -61,8 +61,7 @@ fn lock_identity() -> Option<&'static LockIdentity> {
 
 /// The current process's user SID, which is the same with or without elevation.
 fn user_sid() -> Option<String> {
-    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
-    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     let mut token: HANDLE = std::ptr::null_mut();
@@ -80,13 +79,22 @@ fn user_sid() -> Option<String> {
         return None;
     }
     let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
-    let mut text: *mut u16 = std::ptr::null_mut();
-    if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut text) } == 0 {
+    sid_string(user.User.Sid)
+}
+
+/// A SID in its `S-1-...` string form.
+fn sid_string(sid: windows_sys::Win32::Security::PSID) -> Option<String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    // Written by the call on success, and only read then.
+    let mut text = std::mem::MaybeUninit::<*mut u16>::uninit();
+    if unsafe { ConvertSidToStringSidW(sid, text.as_mut_ptr()) } == 0 {
         return None;
     }
-    let sid = unsafe { wide_string(text) };
+    let text = unsafe { text.assume_init() };
+    let string = unsafe { wide_string(text) };
     unsafe { LocalFree(text.cast()) };
-    sid
+    string
 }
 
 /// Read a NUL-terminated UTF-16 string.
@@ -194,9 +202,7 @@ fn open_owned_mutex(
 /// The owner SID of a kernel object, as a string.
 fn mutex_owner(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<String> {
     use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertSidToStringSidW, GetSecurityInfo, SE_KERNEL_OBJECT,
-    };
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
     use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
     let mut owner: PSID = std::ptr::null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -215,14 +221,7 @@ fn mutex_owner(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<String>
     {
         return None;
     }
-    let mut text: *mut u16 = std::ptr::null_mut();
-    let sid = if unsafe { ConvertSidToStringSidW(owner, &mut text) } != 0 {
-        let sid = unsafe { wide_string(text) };
-        unsafe { LocalFree(text.cast()) };
-        sid
-    } else {
-        None
-    };
+    let sid = sid_string(owner);
     // `owner` points into `descriptor`.
     unsafe { LocalFree(descriptor.cast()) };
     sid
