@@ -2090,6 +2090,9 @@ pub(crate) mod tests {
         let _data = crate::registry::DataDirTestEnv::new(
             "windows_cross_process_access_never_tears_a_chunked_secret",
         );
+        // Keep env-switching tests (e.g. CONDUIT_SECRET_KEY) from changing the
+        // backend for the parent or the children it spawns.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
