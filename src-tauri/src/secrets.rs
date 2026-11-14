@@ -2362,8 +2362,8 @@ pub(crate) mod tests {
     }
 
     /// A vault slow enough to list that one snapshot outlasts a whole batch must
-    /// still be swept to completion in bounded time, and saving a secret never
-    /// waits on the sweep.
+    /// still be swept to completion in bounded time, and the lock stays free for
+    /// other callers while the sweep lists the vault.
     #[test]
     #[cfg(target_os = "windows")]
     fn windows_sweep_terminates_when_snapshots_are_slow() {
@@ -2413,14 +2413,28 @@ pub(crate) mod tests {
             assert!(!platform::raw_entry_exists_for_test(account).unwrap());
         }
 
-        let started = std::time::Instant::now();
-        platform::with_slow_sweep_snapshots(std::time::Duration::from_secs(5), || {
-            set_secret(&servers[0], key, "short replacement").unwrap()
+        // While another thread's sweep is in a slow listing, the lock stays free:
+        // the listing is taken before the lock, so other credential calls do not
+        // queue behind it.
+        let sweeper = std::thread::spawn({
+            let sid = sid.clone();
+            move || {
+                platform::with_slow_sweep_snapshots(std::time::Duration::from_secs(3), || {
+                    platform::sweep_orphaned_chunks_for_test(std::time::Duration::ZERO, &sid)
+                })
+            }
         });
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let waited = platform::credential_lock_wait_for_test().expect("credential lock");
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "set_secret waited on the sweep"
+            !sweeper.is_finished(),
+            "the sweep's listing ended before the lock was tried"
         );
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "the lock waited {waited:?} behind the sweep's listing"
+        );
+        assert_eq!(sweeper.join().unwrap(), 0);
         for server in &servers {
             assert!(get_secret_result(server, key).unwrap().is_some());
         }

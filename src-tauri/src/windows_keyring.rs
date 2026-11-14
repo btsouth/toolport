@@ -183,10 +183,10 @@ fn open_owned_mutex(
         Some(found) if found == owner => Ok(handle),
         found => {
             unsafe { CloseHandle(handle) };
-            Err(format!(
-                "the lock name is held by another account ({})",
-                found.as_deref().unwrap_or("unknown owner")
-            ))
+            Err(match found {
+                Some(found) => format!("the lock name is held by another account ({found})"),
+                None => "could not check the lock's owner".to_string(),
+            })
         }
     }
 }
@@ -716,7 +716,8 @@ fn sweep_orphaned_chunks(
     use std::time::Instant;
     let deadline = Instant::now() + limits.total;
     let mut finished = std::collections::HashSet::new();
-    // First time each base was seen missing from both the vault and its reads.
+    // Start of the first listing in which each base was missing from both the
+    // vault and its reads.
     let mut absent_since: std::collections::HashMap<String, Instant> =
         std::collections::HashMap::new();
     let mut removed = 0;
@@ -726,13 +727,18 @@ fn sweep_orphaned_chunks(
         }
         let mut waiting_until = None;
         {
-            let Some(_lock) = credential_lock() else {
-                break;
-            };
+            // List without the lock: on a vault swollen with leaked chunks the
+            // listing alone can outlast every peer's lock wait. That is safe
+            // because each verdict re-reads its base under the lock, and chunks
+            // written after the listing are younger than `min_age`.
+            let listed_at = Instant::now();
             let Some((bases, chunks)) = chunk_snapshot(min_age, scope) else {
                 break;
             };
-            // The batch budget covers work, not the listing that precedes it.
+            let Some(_lock) = credential_lock() else {
+                break;
+            };
+            // The batch budget covers work done while holding the lock.
             let started = Instant::now();
             let mut pending: Vec<_> = chunks
                 .into_iter()
@@ -760,11 +766,11 @@ fn sweep_orphaned_chunks(
                         live
                     }
                     BaseVerdict::Absent => {
-                        let first = *absent_since
-                            .entry(base.clone())
-                            .or_insert_with(Instant::now);
+                        // Compare listing start times, so two listings really
+                        // are `absence_gap` apart.
+                        let first = *absent_since.entry(base.clone()).or_insert(listed_at);
                         let confirmed_at = first + limits.absence_gap;
-                        if Instant::now() < confirmed_at {
+                        if listed_at < confirmed_at {
                             waiting_until = Some(
                                 waiting_until
                                     .map_or(confirmed_at, |at: Instant| at.min(confirmed_at)),
@@ -820,8 +826,11 @@ fn production_sweep() -> (std::time::Duration, Option<&'static str>, SweepLimits
 }
 
 /// Sweep once per process, on a background thread started by the first write:
-/// writes are what add chunks, and a sweep, however long, must never hold up a
-/// save. Test builds skip it, so tests never sweep a developer's real vault.
+/// writes are what add chunks, and the save that starts it does not wait for it.
+/// Other credential calls can still wait for the lock while a batch holds it,
+/// which is at most about `SWEEP_LIMITS.batch` of work; the vault listing is
+/// taken without the lock. Test builds skip it, so tests never sweep a
+/// developer's real vault.
 fn sweep_once() {
     #[cfg(not(test))]
     {
@@ -843,6 +852,16 @@ fn sweep_once() {
             }
         }
     }
+}
+
+/// Test-only: how long taking the credential lock took on this thread.
+#[cfg(test)]
+pub fn credential_lock_wait_for_test() -> Option<std::time::Duration> {
+    let started = std::time::Instant::now();
+    let lock = credential_lock()?;
+    let waited = started.elapsed();
+    drop(lock);
+    Some(waited)
 }
 
 #[cfg(test)]
