@@ -4,12 +4,27 @@
 one-gateway-conformance = { max-threads = 1 }
 daemon-health = { max-threads = 1 }
 daemon-crash-recovery = { max-threads = 1 }
+windows-credential-manager = { max-threads = 1 }
 
 # Without /proc this case counts daemons machine-wide, so nothing else may run with it.
 [[profile.default.overrides]]
 platform = 'cfg(not(target_os = "linux"))'
 filter = "binary_id(conduit::one_gateway_conformance) and test(=matrix_cold_start_twenty_simultaneous_adapters_elect_exactly_one_daemon)"
 threads-required = "num-test-threads"
+
+# These secrets tests use the real per-user Windows Credential Manager. ENV_LOCK
+# serialized them under cargo test, but not across nextest processes. The
+# generation-swap case rewrites credentials as fast as it can, which can make
+# another process's freshly written chunk read back as missing, so it runs alone.
+[[profile.default.overrides]]
+platform = 'cfg(target_os = "windows")'
+filter = "binary_id(conduit) and test(=secrets::tests::windows_chunk_reader_survives_concurrent_generation_swaps)"
+threads-required = "num-test-threads"
+
+[[profile.default.overrides]]
+platform = 'cfg(target_os = "windows")'
+filter = "binary_id(conduit) and test(/^secrets::tests::(windows_|set_get_delete_round_trip$)/)"
+test-group = "windows-credential-manager"
 
 [[profile.default.overrides]]
 filter = "binary_id(conduit::one_gateway_conformance)"
