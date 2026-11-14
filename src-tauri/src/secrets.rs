@@ -2035,6 +2035,403 @@ pub(crate) mod tests {
         }
     }
 
+    /// One process of `windows_cross_process_access_never_tears_a_chunked_secret`.
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "spawned by windows_cross_process_access_never_tears_a_chunked_secret"]
+    fn windows_cross_process_child() {
+        let _data = crate::registry::DataDirTestEnv::new("windows_cross_process_child");
+        let sid = std::env::var("TOOLPORT_CROSS_PROCESS_SID").unwrap();
+        let writer = std::env::var("TOOLPORT_CROSS_PROCESS_ROLE").as_deref() == Ok("writer");
+        let values = cross_process_values();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (mut reads, mut torn) = (0u64, Vec::new());
+        let mut index = 0;
+        while std::time::Instant::now() < deadline {
+            if writer {
+                set_secret(&sid, "OAUTH_TOKEN", &values[index % values.len()]).unwrap();
+                index += 1;
+                continue;
+            }
+            reads += 1;
+            match get_secret_result(&sid, "OAUTH_TOKEN") {
+                Ok(Some(value)) if values.contains(&value) => {}
+                Ok(Some(value)) => torn.push(format!("mixed value of {} bytes", value.len())),
+                Ok(None) => torn.push("absent".to_string()),
+                Err(error) => torn.push(error),
+            }
+        }
+        assert!(
+            torn.is_empty(),
+            "{} of {reads} reads were torn, first: {:?}",
+            torn.len(),
+            torn.iter().take(3).collect::<Vec<_>>()
+        );
+        println!("cross-process child done: writes {index}, reads {reads}");
+    }
+
+    #[cfg(target_os = "windows")]
+    fn cross_process_values() -> [String; 3] {
+        [
+            format!("{}{}", "a".repeat(3_500), "🔒".repeat(300)),
+            format!("{}{}", "b".repeat(6_100), "🚀".repeat(100)),
+            "short replacement".to_string(),
+        ]
+    }
+
+    /// The app and the gateway are separate processes sharing one vault. A chunked
+    /// secret must read back whole in one process while another rewrites it, and
+    /// replaced generations must not be leaked.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_cross_process_access_never_tears_a_chunked_secret() {
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_NOT_FOUND};
+        use windows_sys::Win32::Security::Credentials::{CredEnumerateW, CredFree, CREDENTIALW};
+        let _data = crate::registry::DataDirTestEnv::new(
+            "windows_cross_process_access_never_tears_a_chunked_secret",
+        );
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sid = format!("toolport-windows-cross-process-{unique}");
+        let _cleanup = SecretCleanupGuard::new(&sid, "OAUTH_TOKEN");
+        set_secret(&sid, "OAUTH_TOKEN", &cross_process_values()[0]).unwrap();
+        let children: Vec<_> = ["writer", "reader", "reader", "reader"]
+            .into_iter()
+            .map(|role| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "secrets::tests::windows_cross_process_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("TOOLPORT_CROSS_PROCESS_SID", &sid)
+                    .env("TOOLPORT_CROSS_PROCESS_ROLE", role)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        // Reap every child before asserting, so none outlives the test.
+        let outputs: Vec<_> = children
+            .into_iter()
+            .map(|child| child.wait_with_output().unwrap())
+            .collect();
+        for output in &outputs {
+            assert!(
+                output.status.success(),
+                "cross-process child failed: {}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        delete_secret(&sid, "OAUTH_TOKEN").unwrap();
+        let filter: Vec<u16> = format!("{sid}::*").encode_utf16().chain([0]).collect();
+        let mut count = 0;
+        let mut entries: *mut *mut CREDENTIALW = std::ptr::null_mut();
+        if unsafe { CredEnumerateW(filter.as_ptr(), 0, &mut count, &mut entries) } != 0 {
+            unsafe { CredFree(entries.cast()) };
+        } else {
+            // Only "nothing matched" may count as zero leftovers.
+            let error = unsafe { GetLastError() };
+            assert_eq!(error, ERROR_NOT_FOUND, "CredEnumerateW failed: {error}");
+        }
+        assert_eq!(count, 0, "replaced chunk generations were left behind");
+    }
+
+    /// Orphaned chunk generations, from crashed or racing writes, are removed. The
+    /// live generation and anything that is not exactly a Toolport chunk stay.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_sweep_removes_only_orphaned_toolport_chunks() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "windows_sweep_removes_only_orphaned_toolport_chunks",
+        );
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        // Every account here starts with `sid`, the only scope the sweep may see.
+        let sid = format!("toolport-windows-sweep-{unique}");
+        let gone_sid = format!("{sid}-gone");
+        let key = "OAUTH_TOKEN";
+        let _cleanup = SecretCleanupGuard::new(&sid, key);
+        let value = format!("{}{}", "a".repeat(3_500), "🔒".repeat(300));
+        set_secret(&sid, key, &value).unwrap();
+        let live = platform::raw_entries_for_test(&sid, key).unwrap();
+        assert!(live.len() > 1, "fixture must be chunked");
+
+        let base = format!("{sid}::{key}");
+        let stale = "0123456789abcdef0123456789abcdef";
+        let orphans = [
+            // A replaced generation the cleanup never removed.
+            platform::plant_chunk_for_test(&base, stale, 0).unwrap(),
+            platform::plant_chunk_for_test(&base, stale, 1).unwrap(),
+            // Chunks whose base credential no longer exists at all.
+            platform::plant_chunk_for_test(&format!("{gone_sid}::{key}"), stale, 0).unwrap(),
+        ];
+        // Look-alikes that are not Toolport chunks must never be touched.
+        let lookalikes = [
+            format!("{base}::toolport-chunk::not-a-generation::0"),
+            format!("{base}::toolport-chunk::{stale}::x"),
+        ];
+        for account in &lookalikes {
+            platform::set_raw_account_for_test(account, "keep me").unwrap();
+        }
+        let foreign = keyring::Entry::new(
+            "toolport-sweep-other-app",
+            &format!("{base}::toolport-chunk::{stale}::0"),
+        )
+        .unwrap();
+        foreign.set_password("other app").unwrap();
+
+        // Fresh orphans are left alone: a pre-lock process may still be writing them.
+        assert_eq!(
+            platform::sweep_orphaned_chunks_for_test(std::time::Duration::from_secs(3600), &sid),
+            0
+        );
+        for account in &orphans {
+            assert!(platform::raw_entry_exists_for_test(account).unwrap());
+        }
+
+        assert_eq!(
+            platform::sweep_orphaned_chunks_for_test(std::time::Duration::ZERO, &sid),
+            orphans.len()
+        );
+        for account in &orphans {
+            assert!(
+                !platform::raw_entry_exists_for_test(account).unwrap(),
+                "orphaned chunk {account} survived the sweep"
+            );
+        }
+        for account in &live {
+            assert!(
+                platform::raw_entry_exists_for_test(account).unwrap(),
+                "the sweep removed live entry {account}"
+            );
+        }
+        assert_eq!(
+            get_secret_result(&sid, key).unwrap().as_deref(),
+            Some(value.as_str())
+        );
+        assert_eq!(foreign.get_password().unwrap(), "other app");
+        foreign.delete_credential().unwrap();
+        for account in &lookalikes {
+            assert!(
+                platform::raw_entry_exists_for_test(account).unwrap(),
+                "the sweep removed non-chunk entry {account}"
+            );
+            platform::delete_raw_account_for_test(account).unwrap();
+        }
+    }
+
+    /// The sweep deletes only on positive evidence. A base that the vault lists but
+    /// a read reports absent (Windows does this mid-rewrite), a damaged manifest,
+    /// and a manifest version newer than this build all keep every generation.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_sweep_keeps_chunks_it_cannot_prove_orphaned() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "windows_sweep_keeps_chunks_it_cannot_prove_orphaned",
+        );
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(platform::lock_mutex_opens_for_test().is_ok());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sid = format!("toolport-windows-sweep-keep-{unique}");
+        let (future_sid, damaged_sid) = (format!("{sid}-future"), format!("{sid}-damaged"));
+        let key = "OAUTH_TOKEN";
+        let _cleanup = [
+            SecretCleanupGuard::new(&sid, key),
+            SecretCleanupGuard::new(&future_sid, key),
+            SecretCleanupGuard::new(&damaged_sid, key),
+        ];
+        let value = format!("{}{}", "a".repeat(3_500), "🔒".repeat(300));
+        set_secret(&sid, key, &value).unwrap();
+        let live = platform::raw_entries_for_test(&sid, key).unwrap();
+        let stale = "0123456789abcdef0123456789abcdef";
+        let replaced = platform::plant_chunk_for_test(&format!("{sid}::{key}"), stale, 0).unwrap();
+
+        // Listed by the vault, absent to every read: nothing is provably orphaned.
+        let removed = platform::with_sweep_reads_absent(|| {
+            platform::sweep_orphaned_chunks_for_test(std::time::Duration::ZERO, &sid)
+        });
+        assert_eq!(
+            removed, 0,
+            "a false absence must not condemn any generation"
+        );
+        for account in live.iter().chain([&replaced]) {
+            assert!(
+                platform::raw_entry_exists_for_test(account).unwrap(),
+                "a false absence removed {account}"
+            );
+        }
+
+        // Manifests this build cannot read keep their chunks too.
+        platform::set_raw_for_test(&future_sid, key, "toolport-chunked-v2:from-a-newer-build")
+            .unwrap();
+        platform::set_raw_for_test(&damaged_sid, key, "toolport-chunked-v1:damaged").unwrap();
+        let unreadable = [
+            platform::plant_chunk_for_test(&format!("{future_sid}::{key}"), stale, 0).unwrap(),
+            platform::plant_chunk_for_test(&format!("{damaged_sid}::{key}"), stale, 0).unwrap(),
+        ];
+        // With honest reads the replaced generation is provably orphaned; only it goes.
+        assert_eq!(
+            platform::sweep_orphaned_chunks_for_test(std::time::Duration::ZERO, &sid),
+            1
+        );
+        assert!(!platform::raw_entry_exists_for_test(&replaced).unwrap());
+        for account in live.iter().chain(&unreadable) {
+            assert!(
+                platform::raw_entry_exists_for_test(account).unwrap(),
+                "the sweep removed {account}"
+            );
+        }
+        assert_eq!(
+            get_secret_result(&sid, key).unwrap().as_deref(),
+            Some(value.as_str())
+        );
+        for account in &unreadable {
+            platform::delete_raw_account_for_test(account).unwrap();
+        }
+    }
+
+    /// SIDs are not secret, so another account can pre-create the lock name. A
+    /// mutex this user does not own is refused rather than waited on.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_lock_refuses_a_mutex_another_account_owns() {
+        use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows_sys::Win32::System::Threading::CreateMutexExW;
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        // A name nobody holds is created with this user as owner and accepted.
+        assert_eq!(
+            platform::open_lock_mutex_named_for_test(&format!(
+                "Global\\toolport-test-fresh-lock-{unique}"
+            )),
+            Ok(())
+        );
+        // Stand-in squatter: owner Administrators instead of this user, which an
+        // elevated test process may assign. Elsewhere this case cannot be set up.
+        let squatted = format!("Global\\toolport-test-squatted-lock-{unique}");
+        let name: Vec<u16> = squatted.encode_utf16().chain([0]).collect();
+        let sddl: Vec<u16> = "O:BAD:(A;;GA;;;WD)".encode_utf16().chain([0]).collect();
+        let mut descriptor = std::ptr::null_mut();
+        assert!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            } != 0
+        );
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let squatter = unsafe { CreateMutexExW(&attributes, name.as_ptr(), 0, 0x001F_0001) };
+        unsafe { LocalFree(descriptor.cast()) };
+        if squatter.is_null() {
+            eprintln!(
+                "skipping: cannot create a mutex owned by Administrators here ({})",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        let refused = platform::open_lock_mutex_named_for_test(&squatted);
+        unsafe { CloseHandle(squatter) };
+        let error = refused.expect_err("a mutex owned by another account must be refused");
+        assert!(error.contains("another account"), "{error}");
+    }
+
+    /// A vault slow enough to list that one snapshot outlasts a whole batch must
+    /// still be swept to completion in bounded time, and saving a secret never
+    /// waits on the sweep.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_sweep_terminates_when_snapshots_are_slow() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "windows_sweep_terminates_when_snapshots_are_slow",
+        );
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sid = format!("toolport-windows-sweep-slow-{unique}");
+        let key = "OAUTH_TOKEN";
+        let value = format!("{}{}", "a".repeat(3_500), "🔒".repeat(300));
+        let stale = "0123456789abcdef0123456789abcdef";
+        let servers: Vec<String> = (0..4).map(|index| format!("{sid}-{index}")).collect();
+        let _cleanup: Vec<_> = servers
+            .iter()
+            .map(|server| SecretCleanupGuard::new(server, key))
+            .collect();
+        let mut orphans = Vec::new();
+        for server in &servers {
+            set_secret(server, key, &value).unwrap();
+            for index in 0..3 {
+                orphans.push(
+                    platform::plant_chunk_for_test(&format!("{server}::{key}"), stale, index)
+                        .unwrap(),
+                );
+            }
+        }
+        // And chunks whose base is gone, which need two snapshots to condemn.
+        orphans
+            .push(platform::plant_chunk_for_test(&format!("{sid}-gone::{key}"), stale, 0).unwrap());
+
+        let started = std::time::Instant::now();
+        let removed =
+            platform::with_slow_sweep_snapshots(std::time::Duration::from_millis(300), || {
+                platform::sweep_orphaned_chunks_for_test(std::time::Duration::ZERO, &sid)
+            });
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "the sweep ran for {elapsed:?}"
+        );
+        assert_eq!(removed, orphans.len());
+        for account in &orphans {
+            assert!(!platform::raw_entry_exists_for_test(account).unwrap());
+        }
+
+        let started = std::time::Instant::now();
+        platform::with_slow_sweep_snapshots(std::time::Duration::from_secs(5), || {
+            set_secret(&servers[0], key, "short replacement").unwrap()
+        });
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "set_secret waited on the sweep"
+        );
+        for server in &servers {
+            assert!(get_secret_result(server, key).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_production_sweep_covers_the_whole_vault_with_production_limits() {
+        assert!(platform::production_sweep_is_whole_vault_with_production_limits());
+    }
+
     /// Cross-platform: setting `CONDUIT_SECRET_KEY` activates the file backend.
     /// Runs on every OS (the env-var precedence is platform-independent).
     ///
