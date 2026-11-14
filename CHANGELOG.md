@@ -6,6 +6,23 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [2.3.6] - 2026-11-14
+
+Toolport 2.3.6 makes saved secrets reliable on Windows when the app and the
+gateway use them at the same time.
+
+If you are on Toolport 1.24.x, this is also your update to Toolport 2. Read the
+[upgrade guide](https://github.com/btsouth/toolport/blob/main/docs/migration.md)
+before updating.
+
+### Fixed
+
+- On Windows, a secret no longer reads as missing or fails to load while another
+  Toolport process is saving one. (#1332)
+- Toolport now cleans up the leftover credential pieces earlier versions left in
+  Windows Credential Manager. Enough of them could fill your credential store
+  until new secrets, in Toolport and other apps, failed to save. (#1332)
+
 ## [2.3.5] - 2026-11-13
 
 Toolport 2.3.5 lets you hide a server's prompts while keeping its tools, keeps
