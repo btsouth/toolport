@@ -2035,6 +2035,111 @@ pub(crate) mod tests {
         }
     }
 
+    /// One process of `windows_cross_process_access_never_tears_a_chunked_secret`.
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "spawned by windows_cross_process_access_never_tears_a_chunked_secret"]
+    fn windows_cross_process_child() {
+        let _data = crate::registry::DataDirTestEnv::new("windows_cross_process_child");
+        let sid = std::env::var("TOOLPORT_CROSS_PROCESS_SID").unwrap();
+        let writer = std::env::var("TOOLPORT_CROSS_PROCESS_ROLE").as_deref() == Ok("writer");
+        let values = cross_process_values();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (mut reads, mut torn) = (0u64, Vec::new());
+        let mut index = 0;
+        while std::time::Instant::now() < deadline {
+            if writer {
+                set_secret(&sid, "OAUTH_TOKEN", &values[index % values.len()]).unwrap();
+                index += 1;
+                continue;
+            }
+            reads += 1;
+            match get_secret_result(&sid, "OAUTH_TOKEN") {
+                Ok(Some(value)) if values.contains(&value) => {}
+                Ok(Some(value)) => torn.push(format!("mixed value of {} bytes", value.len())),
+                Ok(None) => torn.push("absent".to_string()),
+                Err(error) => torn.push(error),
+            }
+        }
+        assert!(
+            torn.is_empty(),
+            "{} of {reads} reads were torn, first: {:?}",
+            torn.len(),
+            torn.iter().take(3).collect::<Vec<_>>()
+        );
+        println!("cross-process child done: writes {index}, reads {reads}");
+    }
+
+    #[cfg(target_os = "windows")]
+    fn cross_process_values() -> [String; 3] {
+        [
+            format!("{}{}", "a".repeat(3_500), "🔒".repeat(300)),
+            format!("{}{}", "b".repeat(6_100), "🚀".repeat(100)),
+            "short replacement".to_string(),
+        ]
+    }
+
+    /// The app and the gateway are separate processes sharing one vault. A chunked
+    /// secret must read back whole in one process while another rewrites it, and
+    /// replaced generations must not be leaked.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_cross_process_access_never_tears_a_chunked_secret() {
+        use windows_sys::Win32::Security::Credentials::{
+            CredEnumerateW, CredFree, CREDENTIALW,
+        };
+        let _data = crate::registry::DataDirTestEnv::new(
+            "windows_cross_process_access_never_tears_a_chunked_secret",
+        );
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sid = format!("toolport-windows-cross-process-{unique}");
+        let _cleanup = SecretCleanupGuard::new(&sid, "OAUTH_TOKEN");
+        set_secret(&sid, "OAUTH_TOKEN", &cross_process_values()[0]).unwrap();
+        let children: Vec<_> = ["writer", "reader", "reader", "reader"]
+            .into_iter()
+            .map(|role| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "secrets::tests::windows_cross_process_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("TOOLPORT_CROSS_PROCESS_SID", &sid)
+                    .env("TOOLPORT_CROSS_PROCESS_ROLE", role)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        // Reap every child before asserting, so none outlives the test.
+        let outputs: Vec<_> = children
+            .into_iter()
+            .map(|child| child.wait_with_output().unwrap())
+            .collect();
+        for output in &outputs {
+            assert!(
+                output.status.success(),
+                "cross-process child failed: {}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        delete_secret(&sid, "OAUTH_TOKEN").unwrap();
+        let filter: Vec<u16> = format!("{sid}::*").encode_utf16().chain([0]).collect();
+        let mut count = 0;
+        let mut entries: *mut *mut CREDENTIALW = std::ptr::null_mut();
+        if unsafe { CredEnumerateW(filter.as_ptr(), 0, &mut count, &mut entries) } != 0 {
+            unsafe { CredFree(entries.cast()) };
+        }
+        assert_eq!(count, 0, "replaced chunk generations were left behind");
+    }
+
     /// Cross-platform: setting `CONDUIT_SECRET_KEY` activates the file backend.
     /// Runs on every OS (the env-var precedence is platform-independent).
     ///
