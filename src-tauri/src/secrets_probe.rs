@@ -87,6 +87,28 @@ fn child() {
     );
 }
 
+/// Count (and then delete) every credential whose target starts with `prefix`.
+fn sweep(prefix: &str) -> usize {
+    use windows_sys::Win32::Security::Credentials::{
+        CredDeleteW, CredEnumerateW, CredFree, CREDENTIALW, CRED_TYPE_GENERIC,
+    };
+    let filter: Vec<u16> = format!("{prefix}*").encode_utf16().chain([0]).collect();
+    let mut count = 0;
+    let mut entries: *mut *mut CREDENTIALW = std::ptr::null_mut();
+    if unsafe { CredEnumerateW(filter.as_ptr(), 0, &mut count, &mut entries) } == 0 {
+        return 0;
+    }
+    let targets: Vec<*const u16> = unsafe { std::slice::from_raw_parts(entries, count as usize) }
+        .iter()
+        .map(|entry| unsafe { (**entry).TargetName as *const u16 })
+        .collect();
+    for target in &targets {
+        unsafe { CredDeleteW(*target, CRED_TYPE_GENERIC, 0) };
+    }
+    unsafe { CredFree(entries.cast()) };
+    targets.len()
+}
+
 fn spawn(role: &str, sid: &str, secs: u64, valid: &str) -> std::process::Child {
     Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "secrets::probe::child", "--ignored", "--nocapture"])
@@ -139,6 +161,12 @@ fn run_scenario(name: &str, readers: usize, secs: u64) {
             })
             .to_string();
         println!("{name}: {line}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let deferred = stderr.matches("cleanup deferred").count();
+        let invalid = stderr.matches("replacing invalid").count();
+        if deferred + invalid > 0 {
+            println!("{name}: child stderr cleanup_deferred={deferred} invalid_manifest={invalid}");
+        }
         let mut parts = line.splitn(3, ' ');
         let role = parts.nth(1).unwrap().to_string();
         let result: serde_json::Value = serde_json::from_str(parts.next().unwrap()).unwrap();
@@ -149,12 +177,16 @@ fn run_scenario(name: &str, readers: usize, secs: u64) {
     println!("PROBE_SUMMARY {name} readers={readers} secs={secs} {totals:?}");
     let _ = super::delete_secret(&read_sid, KEY);
     let _ = super::delete_secret(&write_sid, KEY);
+    // Anything left now is unreachable: leaked chunks from old generations.
+    let leaked = sweep("toolport-probe-");
+    println!("PROBE_LEAKED {name} {leaked}");
 }
 
 #[test]
 #[ignore = "manual Windows probe"]
 fn parent() {
     let _data = crate::registry::DataDirTestEnv::new("keyring-probe-parent");
+    println!("PROBE_PRESWEEP {}", sweep("toolport-probe-"));
     let secs: u64 = env("TP_PROBE_SECS").parse().unwrap_or(60);
     let readers: usize = env("TP_PROBE_READERS").parse().unwrap_or(3);
     for scenario in env("TP_PROBE_SCENARIOS").split(',').filter(|s| !s.is_empty()) {

@@ -22,7 +22,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2]
+        scenario: [same, cross]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -40,5 +41,5 @@ jobs:
         env:
           TP_PROBE_SECS: ${{ inputs.secs || '120' }}
           TP_PROBE_READERS: ${{ inputs.readers || '3' }}
-          TP_PROBE_SCENARIOS: ${{ inputs.scenarios || 'same,cross' }}
+          TP_PROBE_SCENARIOS: ${{ matrix.scenario }}
         run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support,search-static --lib secrets::probe::parent -- --ignored --exact --nocapture
