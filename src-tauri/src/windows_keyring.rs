@@ -19,6 +19,61 @@ struct ChunkManifest {
     checksum: String,
 }
 
+/// Name of the mutex that serializes this backend across processes.
+///
+/// The app and the gateway are separate processes using the same credentials. A
+/// chunked value is several Credential Manager entries, so without this a reader
+/// in one process can read a manifest whose chunks another process is replacing
+/// or deleting ("chunk N is missing"), or see the base entry as absent mid-write.
+/// A writer that misreads the previous manifest that way also leaks its chunks,
+/// and enough leaked chunks make every later `CredWriteW` fail. The Linux
+/// backend serializes Secret Service access across processes the same way.
+const LOCK_NAME: &str = "Local\\toolport-conduit-mcp-credentials";
+
+/// Bounded like the Linux lock: a stuck peer must not hang credential access
+/// forever. Past the deadline the operation runs unlocked, as it did before.
+const LOCK_TIMEOUT_MS: u32 = 5_000;
+
+/// Held for one whole backend operation. A Windows mutex is owned by a thread, so
+/// this also serializes threads in one process, and re-entry on the owning thread
+/// is allowed.
+struct CredentialLock(windows_sys::Win32::Foundation::HANDLE);
+
+impl Drop for CredentialLock {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::ReleaseMutex;
+        unsafe {
+            ReleaseMutex(self.0);
+            CloseHandle(self.0);
+        }
+    }
+}
+
+fn credential_lock() -> Option<CredentialLock> {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+    let name: Vec<u16> = LOCK_NAME.encode_utf16().chain([0]).collect();
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        eprintln!(
+            "toolport: credential lock unavailable ({}); continuing unlocked",
+            std::io::Error::last_os_error()
+        );
+        return None;
+    }
+    // An abandoned mutex means a peer exited mid-operation. Its writes are either
+    // committed or unreachable, so taking ownership is safe.
+    match unsafe { WaitForSingleObject(handle, LOCK_TIMEOUT_MS) } {
+        WAIT_OBJECT_0 | WAIT_ABANDONED => Some(CredentialLock(handle)),
+        _ => {
+            eprintln!("toolport: credential lock timed out; continuing unlocked");
+            unsafe { CloseHandle(handle) };
+            None
+        }
+    }
+}
+
 fn entry(account: &str) -> Result<Entry, String> {
     Entry::new(SERVICE, account).map_err(|e| e.to_string())
 }
@@ -226,6 +281,7 @@ fn cleanup_chunks(base: &str, manifest: &ChunkManifest) {
 }
 
 pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+    let _lock = credential_lock();
     let base = account(server_id, key);
     let previous_manifest =
         read_entry(&base)?
@@ -292,6 +348,7 @@ pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String>
 }
 
 pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
+    let _lock = credential_lock();
     let base = account(server_id, key);
     // Keep the most recent integrity error. A later transient absence must not
     // erase evidence that we read a base credential but could not assemble it.
@@ -348,6 +405,7 @@ pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, S
 }
 
 pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
+    let _lock = credential_lock();
     let base = account(server_id, key);
     let manifest = read_entry(&base)?
         .as_deref()
