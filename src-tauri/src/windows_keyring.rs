@@ -280,8 +280,148 @@ fn cleanup_chunks(base: &str, manifest: &ChunkManifest) {
     }
 }
 
+/// Generations younger than this are never swept. A process that predates the
+/// lock can be partway through a write, with chunks stored but no manifest yet.
+const ORPHAN_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Split a chunk account into its base account and generation, but only when it
+/// has exactly the shape `chunk_account` produces.
+fn parse_chunk_account(account: &str) -> Option<(&str, &str)> {
+    let (rest, index) = account.rsplit_once("::")?;
+    let (base, generation) = rest.rsplit_once("::toolport-chunk::")?;
+    (!base.is_empty()
+        && !index.is_empty()
+        && index.bytes().all(|byte| byte.is_ascii_digit())
+        && generation.len() == 32
+        && generation
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+    .then_some((base, generation))
+}
+
+/// The generation a base credential currently names, read with the same retries
+/// as `get_secret_result`. `Err` means "unknown", and the caller must keep the
+/// chunks. Uses `read_entry`, so a sweep never consumes a test's scripted reads.
+fn live_generation(base: &str) -> Result<Option<String>, String> {
+    for attempt in 0..READ_ATTEMPTS {
+        if let Some(value) = read_entry(base)? {
+            return Ok(parse_manifest(&value)
+                .ok()
+                .flatten()
+                .map(|manifest| manifest.generation));
+        }
+        if attempt + 1 < READ_ATTEMPTS {
+            read_backoff(attempt);
+        }
+    }
+    Ok(None)
+}
+
+/// Delete Toolport chunk generations that no base credential names any more.
+///
+/// They come from writes that crashed between storing chunks and committing the
+/// manifest, cleanup that failed, damaged manifests, and (before the lock) two
+/// processes racing on one credential. They are unreachable, and enough of them
+/// fill the per-user store until every `CredWriteW` fails, for Toolport and for
+/// other apps. Only generic `conduit-mcp` credentials whose account has the exact
+/// chunk shape are considered. Callers hold the credential lock. Returns the
+/// number of entries removed.
+fn sweep_orphaned_chunks(min_age: std::time::Duration) -> usize {
+    use windows_sys::Win32::Security::Credentials::{
+        CredEnumerateW, CredFree, CREDENTIALW, CRED_TYPE_GENERIC,
+    };
+    unsafe fn wide(mut ptr: *const u16) -> Option<String> {
+        if ptr.is_null() {
+            return None;
+        }
+        let mut units = Vec::new();
+        while unsafe { *ptr } != 0 {
+            units.push(unsafe { *ptr });
+            ptr = unsafe { ptr.add(1) };
+        }
+        String::from_utf16(&units).ok()
+    }
+    // FILETIME counts 100ns ticks since 1601.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos() as u64 / 100 + 116_444_736_000_000_000)
+        .unwrap_or(0);
+    let min_ticks = min_age.as_nanos() as u64 / 100;
+    let mut count = 0;
+    let mut entries: *mut *mut CREDENTIALW = std::ptr::null_mut();
+    if unsafe { CredEnumerateW(std::ptr::null(), 0, &mut count, &mut entries) } == 0 {
+        return 0;
+    }
+    // base -> generation -> (chunk accounts, every chunk old enough)
+    let mut found: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, (Vec<String>, bool)>,
+    > = std::collections::HashMap::new();
+    for entry in unsafe { std::slice::from_raw_parts(entries, count as usize) } {
+        let entry = unsafe { &**entry };
+        if entry.Type != CRED_TYPE_GENERIC {
+            continue;
+        }
+        let (Some(target), Some(user)) = (unsafe { wide(entry.TargetName) }, unsafe {
+            wide(entry.UserName)
+        }) else {
+            continue;
+        };
+        if target != format!("{user}.{SERVICE}") {
+            continue;
+        }
+        let Some((base, generation)) = parse_chunk_account(&user) else {
+            continue;
+        };
+        let written = (u64::from(entry.LastWritten.dwHighDateTime) << 32)
+            | u64::from(entry.LastWritten.dwLowDateTime);
+        let old = now.saturating_sub(written) >= min_ticks;
+        let slot = found
+            .entry(base.to_string())
+            .or_default()
+            .entry(generation.to_string())
+            .or_insert_with(|| (Vec::new(), true));
+        slot.0.push(user.clone());
+        slot.1 &= old;
+    }
+    unsafe { CredFree(entries.cast()) };
+    let mut removed = 0;
+    for (base, generations) in found {
+        let Ok(live) = live_generation(&base) else {
+            continue;
+        };
+        for (generation, (accounts, old)) in generations {
+            if !old || live.as_deref() == Some(generation.as_str()) {
+                continue;
+            }
+            for account in accounts {
+                match delete_entry(&account) {
+                    Ok(()) => removed += 1,
+                    Err(error) => {
+                        eprintln!("toolport: orphaned credential chunk not removed: {error}")
+                    }
+                }
+            }
+        }
+    }
+    removed
+}
+
+/// Sweep once per process, on its first write: writes are what add chunks, and a
+/// store that is already full needs the space back before that write can land.
+fn sweep_once() {
+    static SWEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SWEPT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let removed = sweep_orphaned_chunks(ORPHAN_MIN_AGE);
+        if removed > 0 {
+            eprintln!("toolport: removed {removed} orphaned Windows credential chunk(s)");
+        }
+    }
+}
+
 pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
     let _lock = credential_lock();
+    sweep_once();
     let base = account(server_id, key);
     let previous_manifest =
         read_entry(&base)?
@@ -416,6 +556,34 @@ pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
         cleanup_chunks(&base, &manifest);
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub fn sweep_orphaned_chunks_for_test(min_age: std::time::Duration) -> usize {
+    let _lock = credential_lock();
+    sweep_orphaned_chunks(min_age)
+}
+
+/// Store one raw chunk entry, as a crashed or racing writer would leave it.
+#[cfg(test)]
+pub fn plant_chunk_for_test(base: &str, generation: &str, index: usize) -> Result<String, String> {
+    let account = chunk_account(base, generation, index);
+    entry(&account)?
+        .set_password("orphaned chunk")
+        .map_err(|error| error.to_string())?;
+    Ok(account)
+}
+
+#[cfg(test)]
+pub fn set_raw_account_for_test(account: &str, value: &str) -> Result<(), String> {
+    entry(account)?
+        .set_password(value)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+pub fn delete_raw_account_for_test(account: &str) -> Result<(), String> {
+    delete_entry(account)
 }
 
 #[cfg(test)]
