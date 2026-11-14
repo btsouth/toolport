@@ -2085,9 +2085,7 @@ pub(crate) mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn windows_cross_process_access_never_tears_a_chunked_secret() {
-        use windows_sys::Win32::Security::Credentials::{
-            CredEnumerateW, CredFree, CREDENTIALW,
-        };
+        use windows_sys::Win32::Security::Credentials::{CredEnumerateW, CredFree, CREDENTIALW};
         let _data = crate::registry::DataDirTestEnv::new(
             "windows_cross_process_access_never_tears_a_chunked_secret",
         );
@@ -2138,6 +2136,90 @@ pub(crate) mod tests {
             unsafe { CredFree(entries.cast()) };
         }
         assert_eq!(count, 0, "replaced chunk generations were left behind");
+    }
+
+    /// Orphaned chunk generations, from crashed or racing writes, are removed. The
+    /// live generation and anything that is not exactly a Toolport chunk stay.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_sweep_removes_only_orphaned_toolport_chunks() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "windows_sweep_removes_only_orphaned_toolport_chunks",
+        );
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let (sid, gone_sid) = (
+            format!("toolport-windows-sweep-{unique}"),
+            format!("toolport-windows-sweep-gone-{unique}"),
+        );
+        let key = "OAUTH_TOKEN";
+        let _cleanup = SecretCleanupGuard::new(&sid, key);
+        let value = format!("{}{}", "a".repeat(3_500), "🔒".repeat(300));
+        set_secret(&sid, key, &value).unwrap();
+        let live = platform::raw_entries_for_test(&sid, key).unwrap();
+        assert!(live.len() > 1, "fixture must be chunked");
+
+        let base = format!("{sid}::{key}");
+        let stale = "0123456789abcdef0123456789abcdef";
+        let orphans = [
+            // A replaced generation the cleanup never removed.
+            platform::plant_chunk_for_test(&base, stale, 0).unwrap(),
+            platform::plant_chunk_for_test(&base, stale, 1).unwrap(),
+            // Chunks whose base credential no longer exists at all.
+            platform::plant_chunk_for_test(&format!("{gone_sid}::{key}"), stale, 0).unwrap(),
+        ];
+        // Look-alikes that are not Toolport chunks must never be touched.
+        let lookalikes = [
+            format!("{base}::toolport-chunk::not-a-generation::0"),
+            format!("{base}::toolport-chunk::{stale}::x"),
+        ];
+        for account in &lookalikes {
+            platform::set_raw_account_for_test(account, "keep me").unwrap();
+        }
+        let foreign = keyring::Entry::new(
+            "toolport-sweep-other-app",
+            &format!("{base}::toolport-chunk::{stale}::0"),
+        )
+        .unwrap();
+        foreign.set_password("other app").unwrap();
+
+        // Fresh orphans are left alone: a pre-lock process may still be writing them.
+        platform::sweep_orphaned_chunks_for_test(std::time::Duration::from_secs(3600));
+        for account in &orphans {
+            assert!(platform::raw_entry_exists_for_test(account).unwrap());
+        }
+
+        assert!(
+            platform::sweep_orphaned_chunks_for_test(std::time::Duration::ZERO) >= orphans.len()
+        );
+        for account in &orphans {
+            assert!(
+                !platform::raw_entry_exists_for_test(account).unwrap(),
+                "orphaned chunk {account} survived the sweep"
+            );
+        }
+        for account in &live {
+            assert!(
+                platform::raw_entry_exists_for_test(account).unwrap(),
+                "the sweep removed live entry {account}"
+            );
+        }
+        assert_eq!(
+            get_secret_result(&sid, key).unwrap().as_deref(),
+            Some(value.as_str())
+        );
+        assert_eq!(foreign.get_password().unwrap(), "other app");
+        foreign.delete_credential().unwrap();
+        for account in &lookalikes {
+            assert!(
+                platform::raw_entry_exists_for_test(account).unwrap(),
+                "the sweep removed non-chunk entry {account}"
+            );
+            platform::delete_raw_account_for_test(account).unwrap();
+        }
     }
 
     /// Cross-platform: setting `CONDUIT_SECRET_KEY` activates the file backend.
