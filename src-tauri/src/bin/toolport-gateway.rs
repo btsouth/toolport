@@ -25671,6 +25671,11 @@ mod tests {
         state.ready.store(false, Ordering::SeqCst);
         let mut live = Router::new();
         live.add(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap());
+        // Test builds encode search vectors inline on the request thread, while
+        // production hands them to the encoder thread. Encode this catalog once
+        // before timing, so the bound measures the bootstrap wait and not a
+        // debug-build BGE pass that only exists under cfg(test).
+        drop(CatalogSnapshot::new(live.shared_tools()));
         *state.router.lock().unwrap() = Arc::new(live);
         let requester = state.clone();
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
