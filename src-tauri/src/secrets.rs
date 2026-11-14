@@ -2085,6 +2085,7 @@ pub(crate) mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn windows_cross_process_access_never_tears_a_chunked_secret() {
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_NOT_FOUND};
         use windows_sys::Win32::Security::Credentials::{CredEnumerateW, CredFree, CREDENTIALW};
         let _data = crate::registry::DataDirTestEnv::new(
             "windows_cross_process_access_never_tears_a_chunked_secret",
@@ -2134,6 +2135,10 @@ pub(crate) mod tests {
         let mut entries: *mut *mut CREDENTIALW = std::ptr::null_mut();
         if unsafe { CredEnumerateW(filter.as_ptr(), 0, &mut count, &mut entries) } != 0 {
             unsafe { CredFree(entries.cast()) };
+        } else {
+            // Only "nothing matched" may count as zero leftovers.
+            let error = unsafe { GetLastError() };
+            assert_eq!(error, ERROR_NOT_FOUND, "CredEnumerateW failed: {error}");
         }
         assert_eq!(count, 0, "replaced chunk generations were left behind");
     }
@@ -2151,10 +2156,9 @@ pub(crate) mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let (sid, gone_sid) = (
-            format!("toolport-windows-sweep-{unique}"),
-            format!("toolport-windows-sweep-gone-{unique}"),
-        );
+        // Every account here starts with `sid`, the only scope the sweep may see.
+        let sid = format!("toolport-windows-sweep-{unique}");
+        let gone_sid = format!("{sid}-gone");
         let key = "OAUTH_TOKEN";
         let _cleanup = SecretCleanupGuard::new(&sid, key);
         let value = format!("{}{}", "a".repeat(3_500), "🔒".repeat(300));
@@ -2187,13 +2191,17 @@ pub(crate) mod tests {
         foreign.set_password("other app").unwrap();
 
         // Fresh orphans are left alone: a pre-lock process may still be writing them.
-        platform::sweep_orphaned_chunks_for_test(std::time::Duration::from_secs(3600));
+        assert_eq!(
+            platform::sweep_orphaned_chunks_for_test(std::time::Duration::from_secs(3600), &sid),
+            0
+        );
         for account in &orphans {
             assert!(platform::raw_entry_exists_for_test(account).unwrap());
         }
 
-        assert!(
-            platform::sweep_orphaned_chunks_for_test(std::time::Duration::ZERO) >= orphans.len()
+        assert_eq!(
+            platform::sweep_orphaned_chunks_for_test(std::time::Duration::ZERO, &sid),
+            orphans.len()
         );
         for account in &orphans {
             assert!(
@@ -2218,6 +2226,79 @@ pub(crate) mod tests {
                 platform::raw_entry_exists_for_test(account).unwrap(),
                 "the sweep removed non-chunk entry {account}"
             );
+            platform::delete_raw_account_for_test(account).unwrap();
+        }
+    }
+
+    /// The sweep deletes only on positive evidence. A base that the vault lists but
+    /// a read reports absent (Windows does this mid-rewrite), a damaged manifest,
+    /// and a manifest version newer than this build all keep every generation.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_sweep_keeps_chunks_it_cannot_prove_orphaned() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "windows_sweep_keeps_chunks_it_cannot_prove_orphaned",
+        );
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(platform::lock_mutex_opens_for_test().is_ok());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sid = format!("toolport-windows-sweep-keep-{unique}");
+        let (future_sid, damaged_sid) = (format!("{sid}-future"), format!("{sid}-damaged"));
+        let key = "OAUTH_TOKEN";
+        let _cleanup = [
+            SecretCleanupGuard::new(&sid, key),
+            SecretCleanupGuard::new(&future_sid, key),
+            SecretCleanupGuard::new(&damaged_sid, key),
+        ];
+        let value = format!("{}{}", "a".repeat(3_500), "🔒".repeat(300));
+        set_secret(&sid, key, &value).unwrap();
+        let live = platform::raw_entries_for_test(&sid, key).unwrap();
+        let stale = "0123456789abcdef0123456789abcdef";
+        let replaced = platform::plant_chunk_for_test(&format!("{sid}::{key}"), stale, 0).unwrap();
+
+        // Listed by the vault, absent to every read: nothing is provably orphaned.
+        let removed = platform::with_sweep_reads_absent(|| {
+            platform::sweep_orphaned_chunks_for_test(std::time::Duration::ZERO, &sid)
+        });
+        assert_eq!(
+            removed, 0,
+            "a false absence must not condemn any generation"
+        );
+        for account in live.iter().chain([&replaced]) {
+            assert!(
+                platform::raw_entry_exists_for_test(account).unwrap(),
+                "a false absence removed {account}"
+            );
+        }
+
+        // Manifests this build cannot read keep their chunks too.
+        platform::set_raw_for_test(&future_sid, key, "toolport-chunked-v2:from-a-newer-build")
+            .unwrap();
+        platform::set_raw_for_test(&damaged_sid, key, "toolport-chunked-v1:damaged").unwrap();
+        let unreadable = [
+            platform::plant_chunk_for_test(&format!("{future_sid}::{key}"), stale, 0).unwrap(),
+            platform::plant_chunk_for_test(&format!("{damaged_sid}::{key}"), stale, 0).unwrap(),
+        ];
+        // With honest reads the replaced generation is provably orphaned; only it goes.
+        assert_eq!(
+            platform::sweep_orphaned_chunks_for_test(std::time::Duration::ZERO, &sid),
+            1
+        );
+        assert!(!platform::raw_entry_exists_for_test(&replaced).unwrap());
+        for account in live.iter().chain(&unreadable) {
+            assert!(
+                platform::raw_entry_exists_for_test(account).unwrap(),
+                "the sweep removed {account}"
+            );
+        }
+        assert_eq!(
+            get_secret_result(&sid, key).unwrap().as_deref(),
+            Some(value.as_str())
+        );
+        for account in &unreadable {
             platform::delete_raw_account_for_test(account).unwrap();
         }
     }

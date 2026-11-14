@@ -19,7 +19,7 @@ struct ChunkManifest {
     checksum: String,
 }
 
-/// Name of the mutex that serializes this backend across processes.
+/// Serializes this backend across processes.
 ///
 /// The app and the gateway are separate processes using the same credentials. A
 /// chunked value is several Credential Manager entries, so without this a reader
@@ -28,7 +28,68 @@ struct ChunkManifest {
 /// A writer that misreads the previous manifest that way also leaks its chunks,
 /// and enough leaked chunks make every later `CredWriteW` fail. The Linux
 /// backend serializes Secret Service access across processes the same way.
-const LOCK_NAME: &str = "Local\\toolport-conduit-mcp-credentials";
+///
+/// The vault belongs to the user, not the session or the integrity level, so the
+/// lock does too: a `Global\` name carrying the user SID (OpenSSH and scheduled
+/// tasks run in other sessions), a DACL granting only that SID the rights a lock
+/// needs, and a low mandatory label so an elevated creator does not lock out a
+/// medium-integrity app through no-write-up.
+fn lock_name_and_sddl() -> Option<&'static (Vec<u16>, Vec<u16>)> {
+    static LOCK: std::sync::OnceLock<Option<(Vec<u16>, Vec<u16>)>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| {
+        let sid = user_sid()?;
+        let wide = |text: String| text.encode_utf16().chain([0]).collect::<Vec<u16>>();
+        Some((
+            wide(format!("Global\\toolport-conduit-mcp-credentials-{sid}")),
+            // 0x100001 is SYNCHRONIZE | MUTEX_MODIFY_STATE.
+            wide(format!("D:P(A;;0x100001;;;{sid})S:(ML;;NW;;;LW)")),
+        ))
+    })
+    .as_ref()
+}
+
+/// The current process's user SID, which is the same with or without elevation.
+fn user_sid() -> Option<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token: HANDLE = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return None;
+    }
+    let mut len = 0u32;
+    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len) };
+    // u64 storage keeps TOKEN_USER suitably aligned.
+    let mut buffer = vec![0u64; (len as usize).div_ceil(8).max(1)];
+    let ok =
+        unsafe { GetTokenInformation(token, TokenUser, buffer.as_mut_ptr().cast(), len, &mut len) };
+    unsafe { CloseHandle(token) };
+    if ok == 0 {
+        return None;
+    }
+    let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    let mut text: *mut u16 = std::ptr::null_mut();
+    if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut text) } == 0 {
+        return None;
+    }
+    let sid = unsafe { wide_string(text) };
+    unsafe { LocalFree(text.cast()) };
+    sid
+}
+
+/// Read a NUL-terminated UTF-16 string.
+unsafe fn wide_string(mut ptr: *const u16) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let mut units = Vec::new();
+    while unsafe { *ptr } != 0 {
+        units.push(unsafe { *ptr });
+        ptr = unsafe { ptr.add(1) };
+    }
+    String::from_utf16(&units).ok()
+}
 
 /// Bounded like the Linux lock: a stuck peer must not hang credential access
 /// forever. Past the deadline the operation runs unlocked, as it did before.
@@ -50,21 +111,67 @@ impl Drop for CredentialLock {
     }
 }
 
-fn credential_lock() -> Option<CredentialLock> {
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
-    use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
-    let name: Vec<u16> = LOCK_NAME.encode_utf16().chain([0]).collect();
-    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
-    if handle.is_null() {
-        eprintln!(
-            "toolport: credential lock unavailable ({}); continuing unlocked",
-            std::io::Error::last_os_error()
-        );
-        return None;
+/// Open (or create) the per-user mutex with only the rights a lock needs. The
+/// handle is not waited on, so callers decide how long to wait.
+fn open_lock_mutex() -> Result<windows_sys::Win32::Foundation::HANDLE, String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows_sys::Win32::System::Threading::{
+        CreateMutexExW, MUTEX_MODIFY_STATE, SYNCHRONIZATION_SYNCHRONIZE,
+    };
+    let (name, sddl) = lock_name_and_sddl().ok_or("could not read the user SID")?;
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().to_string());
     }
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    // CreateMutexW would ask for MUTEX_ALL_ACCESS, which the DACL above denies to
+    // every opener after the creator.
+    let handle = unsafe {
+        CreateMutexExW(
+            &attributes,
+            name.as_ptr(),
+            0,
+            SYNCHRONIZATION_SYNCHRONIZE | MUTEX_MODIFY_STATE,
+        )
+    };
+    let error = std::io::Error::last_os_error();
+    unsafe { LocalFree(descriptor.cast()) };
+    if handle.is_null() {
+        Err(error.to_string())
+    } else {
+        Ok(handle)
+    }
+}
+
+fn credential_lock_for(timeout_ms: u32) -> Option<CredentialLock> {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    let handle = match open_lock_mutex() {
+        Ok(handle) => handle,
+        Err(error) => {
+            eprintln!("toolport: credential lock unavailable ({error}); continuing unlocked");
+            return None;
+        }
+    };
     // An abandoned mutex means a peer exited mid-operation. Its writes are either
     // committed or unreachable, so taking ownership is safe.
-    match unsafe { WaitForSingleObject(handle, LOCK_TIMEOUT_MS) } {
+    match unsafe { WaitForSingleObject(handle, timeout_ms) } {
         WAIT_OBJECT_0 | WAIT_ABANDONED => Some(CredentialLock(handle)),
         _ => {
             eprintln!("toolport: credential lock timed out; continuing unlocked");
@@ -72,6 +179,17 @@ fn credential_lock() -> Option<CredentialLock> {
             None
         }
     }
+}
+
+fn credential_lock() -> Option<CredentialLock> {
+    credential_lock_for(LOCK_TIMEOUT_MS)
+}
+
+#[cfg(test)]
+pub fn lock_mutex_opens_for_test() -> Result<(), String> {
+    let handle = open_lock_mutex()?;
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+    Ok(())
 }
 
 fn entry(account: &str) -> Result<Entry, String> {
@@ -282,7 +400,15 @@ fn cleanup_chunks(base: &str, manifest: &ChunkManifest) {
 
 /// Generations younger than this are never swept. A process that predates the
 /// lock can be partway through a write, with chunks stored but no manifest yet.
+#[cfg_attr(test, allow(dead_code))]
 const ORPHAN_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Longest the sweep holds the credential lock at once. Peers wait at most
+/// `LOCK_TIMEOUT_MS`, so a big first sweep must hand the lock back in between.
+const SWEEP_BATCH: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Any chunked manifest format, including versions this build does not know.
+const CHUNKED_FAMILY_PREFIX: &str = "toolport-chunked-";
 
 /// Split a chunk account into its base account and generation, but only when it
 /// has exactly the shape `chunk_account` produces.
@@ -299,129 +425,227 @@ fn parse_chunk_account(account: &str) -> Option<(&str, &str)> {
     .then_some((base, generation))
 }
 
-/// The generation a base credential currently names, read with the same retries
-/// as `get_secret_result`. `Err` means "unknown", and the caller must keep the
-/// chunks. Uses `read_entry`, so a sweep never consumes a test's scripted reads.
-fn live_generation(base: &str) -> Result<Option<String>, String> {
+#[cfg(test)]
+thread_local! {
+    /// Test-only: make the sweep's base reads report absent, the false absence
+    /// Windows shows while a peer rewrites the base.
+    static SWEEP_READS_ABSENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub fn with_sweep_reads_absent<T>(test: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SWEEP_READS_ABSENT.with(|absent| absent.set(false));
+        }
+    }
+    SWEEP_READS_ABSENT.with(|absent| absent.set(true));
+    let _reset = Reset;
+    test()
+}
+
+/// Base reads for the sweep. Plain `read_entry`, so a sweep never consumes a
+/// test's scripted `read_base` results.
+fn read_sweep_base(base: &str) -> Result<Option<String>, String> {
+    #[cfg(test)]
+    if SWEEP_READS_ABSENT.with(std::cell::Cell::get) {
+        return Ok(None);
+    }
+    read_entry(base)
+}
+
+/// What the sweep may do with one base's chunk generations.
+enum BaseVerdict {
+    /// Delete every generation except this one (`None`: the base names none).
+    Live(Option<String>),
+    /// Not provably orphaned. Keep all of them.
+    Keep,
+}
+
+/// Decide from positive evidence only. Windows can report a present credential
+/// as absent, and an unlocked peer (elevated, pre-lock, timed out, or another
+/// app) can be rewriting it, so "absent" alone never condemns a generation that
+/// the base might still name.
+fn base_verdict(base: &str, in_snapshot: bool) -> BaseVerdict {
     for attempt in 0..READ_ATTEMPTS {
-        if let Some(value) = read_entry(base)? {
-            return Ok(parse_manifest(&value)
-                .ok()
-                .flatten()
-                .map(|manifest| manifest.generation));
+        match read_sweep_base(base) {
+            Err(_) => return BaseVerdict::Keep,
+            Ok(Some(value)) if value.starts_with(CHUNKED_FAMILY_PREFIX) => {
+                return match parse_manifest(&value) {
+                    Ok(Some(manifest)) => BaseVerdict::Live(Some(manifest.generation)),
+                    // Damaged, or a manifest version newer than this build.
+                    _ => BaseVerdict::Keep,
+                };
+            }
+            // A direct value names no generation.
+            Ok(Some(_)) => return BaseVerdict::Live(None),
+            Ok(None) => {}
         }
         if attempt + 1 < READ_ATTEMPTS {
             read_backoff(attempt);
         }
     }
-    Ok(None)
+    if in_snapshot {
+        BaseVerdict::Keep
+    } else {
+        BaseVerdict::Live(None)
+    }
 }
 
-/// Delete Toolport chunk generations that no base credential names any more.
-///
-/// They come from writes that crashed between storing chunks and committing the
-/// manifest, cleanup that failed, damaged manifests, and (before the lock) two
-/// processes racing on one credential. They are unreachable, and enough of them
-/// fill the per-user store until every `CredWriteW` fails, for Toolport and for
-/// other apps. Only generic `conduit-mcp` credentials whose account has the exact
-/// chunk shape are considered. Callers hold the credential lock. Returns the
-/// number of entries removed.
-fn sweep_orphaned_chunks(min_age: std::time::Duration) -> usize {
+type ChunkGenerations = std::collections::HashMap<String, (Vec<String>, bool)>;
+
+/// One read-only pass over the vault: which base accounts exist, and each base's
+/// chunk generations with their accounts and whether every chunk is old enough.
+/// `scope` limits the pass to targets starting with it. `None` if enumeration
+/// failed for any reason other than an empty result.
+fn chunk_snapshot(
+    min_age: std::time::Duration,
+    scope: Option<&str>,
+) -> Option<(
+    std::collections::HashSet<String>,
+    std::collections::HashMap<String, ChunkGenerations>,
+)> {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_NOT_FOUND};
     use windows_sys::Win32::Security::Credentials::{
         CredEnumerateW, CredFree, CREDENTIALW, CRED_TYPE_GENERIC,
     };
-    unsafe fn wide(mut ptr: *const u16) -> Option<String> {
-        if ptr.is_null() {
-            return None;
-        }
-        let mut units = Vec::new();
-        while unsafe { *ptr } != 0 {
-            units.push(unsafe { *ptr });
-            ptr = unsafe { ptr.add(1) };
-        }
-        String::from_utf16(&units).ok()
-    }
     // FILETIME counts 100ns ticks since 1601.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_nanos() as u64 / 100 + 116_444_736_000_000_000)
-        .unwrap_or(0);
+        .ok()?;
     let min_ticks = min_age.as_nanos() as u64 / 100;
+    let filter: Option<Vec<u16>> =
+        scope.map(|prefix| format!("{prefix}*").encode_utf16().chain([0]).collect());
     let mut count = 0;
     let mut entries: *mut *mut CREDENTIALW = std::ptr::null_mut();
-    if unsafe { CredEnumerateW(std::ptr::null(), 0, &mut count, &mut entries) } == 0 {
-        return 0;
+    let mut bases = std::collections::HashSet::new();
+    let mut chunks: std::collections::HashMap<String, ChunkGenerations> =
+        std::collections::HashMap::new();
+    if unsafe {
+        CredEnumerateW(
+            filter
+                .as_ref()
+                .map_or(std::ptr::null(), |filter| filter.as_ptr()),
+            0,
+            &mut count,
+            &mut entries,
+        )
+    } == 0
+    {
+        return (unsafe { GetLastError() } == ERROR_NOT_FOUND).then_some((bases, chunks));
     }
-    // base -> generation -> (chunk accounts, every chunk old enough)
-    let mut found: std::collections::HashMap<
-        String,
-        std::collections::HashMap<String, (Vec<String>, bool)>,
-    > = std::collections::HashMap::new();
     for entry in unsafe { std::slice::from_raw_parts(entries, count as usize) } {
         let entry = unsafe { &**entry };
         if entry.Type != CRED_TYPE_GENERIC {
             continue;
         }
-        let (Some(target), Some(user)) = (unsafe { wide(entry.TargetName) }, unsafe {
-            wide(entry.UserName)
-        }) else {
+        let target = unsafe { wide_string(entry.TargetName) };
+        let user = unsafe { wide_string(entry.UserName) };
+        let (Some(target), Some(user)) = (target, user) else {
             continue;
         };
         if target != format!("{user}.{SERVICE}") {
             continue;
         }
         let Some((base, generation)) = parse_chunk_account(&user) else {
+            bases.insert(user);
             continue;
         };
         let written = (u64::from(entry.LastWritten.dwHighDateTime) << 32)
             | u64::from(entry.LastWritten.dwLowDateTime);
-        let old = now.saturating_sub(written) >= min_ticks;
-        let slot = found
+        let slot = chunks
             .entry(base.to_string())
             .or_default()
             .entry(generation.to_string())
             .or_insert_with(|| (Vec::new(), true));
         slot.0.push(user.clone());
-        slot.1 &= old;
+        slot.1 &= now.saturating_sub(written) >= min_ticks;
     }
     unsafe { CredFree(entries.cast()) };
+    Some((bases, chunks))
+}
+
+/// Delete Toolport chunk generations that no base credential names any more.
+///
+/// They come from writes that crashed between storing chunks and committing the
+/// manifest, cleanup that failed, and (before the lock) processes racing on one
+/// credential. They are unreachable, and enough of them fill the per-user store
+/// until every `CredWriteW` fails, for Toolport and for other apps.
+///
+/// Only generic `conduit-mcp` credentials whose account has the exact chunk shape
+/// are considered, and only under the credential lock: if the lock cannot be
+/// taken, nothing is swept. Work is done in batches of at most `SWEEP_BATCH`,
+/// each from a fresh snapshot, releasing the lock in between. Returns the number
+/// of entries removed.
+fn sweep_orphaned_chunks(min_age: std::time::Duration, scope: Option<&str>) -> usize {
+    let mut finished = std::collections::HashSet::new();
     let mut removed = 0;
-    for (base, generations) in found {
-        let Ok(live) = live_generation(&base) else {
-            continue;
+    loop {
+        let Some(_lock) = credential_lock() else {
+            return removed;
         };
-        for (generation, (accounts, old)) in generations {
-            if !old || live.as_deref() == Some(generation.as_str()) {
-                continue;
-            }
-            for account in accounts {
-                match delete_entry(&account) {
-                    Ok(()) => removed += 1,
-                    Err(error) => {
-                        eprintln!("toolport: orphaned credential chunk not removed: {error}")
+        let started = std::time::Instant::now();
+        let Some((bases, chunks)) = chunk_snapshot(min_age, scope) else {
+            return removed;
+        };
+        let mut pending = chunks
+            .into_iter()
+            .filter(|(base, _)| !finished.contains(base))
+            .peekable();
+        if pending.peek().is_none() {
+            return removed;
+        }
+        'batch: for (base, generations) in pending {
+            if let BaseVerdict::Live(live) = base_verdict(&base, bases.contains(&base)) {
+                for (generation, (accounts, old)) in generations {
+                    if !old || live.as_deref() == Some(generation.as_str()) {
+                        continue;
+                    }
+                    for account in accounts {
+                        if started.elapsed() >= SWEEP_BATCH {
+                            // Resume this base from the next snapshot.
+                            break 'batch;
+                        }
+                        match delete_entry(&account) {
+                            Ok(()) => removed += 1,
+                            Err(error) => {
+                                eprintln!(
+                                    "toolport: orphaned credential chunk not removed: {error}"
+                                )
+                            }
+                        }
                     }
                 }
             }
+            finished.insert(base);
+            if started.elapsed() >= SWEEP_BATCH {
+                break;
+            }
         }
     }
-    removed
 }
 
-/// Sweep once per process, on its first write: writes are what add chunks, and a
-/// store that is already full needs the space back before that write can land.
+/// Sweep once per process, before its first write: writes are what add chunks,
+/// and a store that is already full needs the space back before that write can
+/// land. Test builds skip it, so tests never sweep a developer's real vault.
 fn sweep_once() {
-    static SWEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !SWEPT.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        let removed = sweep_orphaned_chunks(ORPHAN_MIN_AGE);
-        if removed > 0 {
-            eprintln!("toolport: removed {removed} orphaned Windows credential chunk(s)");
+    #[cfg(not(test))]
+    {
+        static SWEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SWEPT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let removed = sweep_orphaned_chunks(ORPHAN_MIN_AGE, None);
+            if removed > 0 {
+                eprintln!("toolport: removed {removed} orphaned Windows credential chunk(s)");
+            }
         }
     }
 }
 
 pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
-    let _lock = credential_lock();
     sweep_once();
+    let _lock = credential_lock();
     let base = account(server_id, key);
     let previous_manifest =
         read_entry(&base)?
@@ -559,9 +783,8 @@ pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
-pub fn sweep_orphaned_chunks_for_test(min_age: std::time::Duration) -> usize {
-    let _lock = credential_lock();
-    sweep_orphaned_chunks(min_age)
+pub fn sweep_orphaned_chunks_for_test(min_age: std::time::Duration, scope: &str) -> usize {
+    sweep_orphaned_chunks(min_age, Some(scope))
 }
 
 /// Store one raw chunk entry, as a crashed or racing writer would leave it.
