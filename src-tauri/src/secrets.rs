@@ -2303,6 +2303,135 @@ pub(crate) mod tests {
         }
     }
 
+    /// SIDs are not secret, so another account can pre-create the lock name. A
+    /// mutex this user does not own is refused rather than waited on.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_lock_refuses_a_mutex_another_account_owns() {
+        use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows_sys::Win32::System::Threading::CreateMutexExW;
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        // A name nobody holds is created with this user as owner and accepted.
+        assert_eq!(
+            platform::open_lock_mutex_named_for_test(&format!(
+                "Global\\toolport-test-fresh-lock-{unique}"
+            )),
+            Ok(())
+        );
+        // Stand-in squatter: owner Administrators instead of this user, which an
+        // elevated test process may assign. Elsewhere this case cannot be set up.
+        let squatted = format!("Global\\toolport-test-squatted-lock-{unique}");
+        let name: Vec<u16> = squatted.encode_utf16().chain([0]).collect();
+        let sddl: Vec<u16> = "O:BAD:(A;;GA;;;WD)".encode_utf16().chain([0]).collect();
+        let mut descriptor = std::ptr::null_mut();
+        assert!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            } != 0
+        );
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let squatter = unsafe { CreateMutexExW(&attributes, name.as_ptr(), 0, 0x001F_0001) };
+        unsafe { LocalFree(descriptor.cast()) };
+        if squatter.is_null() {
+            eprintln!(
+                "skipping: cannot create a mutex owned by Administrators here ({})",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        let refused = platform::open_lock_mutex_named_for_test(&squatted);
+        unsafe { CloseHandle(squatter) };
+        let error = refused.expect_err("a mutex owned by another account must be refused");
+        assert!(error.contains("another account"), "{error}");
+    }
+
+    /// A vault slow enough to list that one snapshot outlasts a whole batch must
+    /// still be swept to completion in bounded time, and saving a secret never
+    /// waits on the sweep.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_sweep_terminates_when_snapshots_are_slow() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "windows_sweep_terminates_when_snapshots_are_slow",
+        );
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sid = format!("toolport-windows-sweep-slow-{unique}");
+        let key = "OAUTH_TOKEN";
+        let value = format!("{}{}", "a".repeat(3_500), "🔒".repeat(300));
+        let stale = "0123456789abcdef0123456789abcdef";
+        let servers: Vec<String> = (0..4).map(|index| format!("{sid}-{index}")).collect();
+        let _cleanup: Vec<_> = servers
+            .iter()
+            .map(|server| SecretCleanupGuard::new(server, key))
+            .collect();
+        let mut orphans = Vec::new();
+        for server in &servers {
+            set_secret(server, key, &value).unwrap();
+            for index in 0..3 {
+                orphans.push(
+                    platform::plant_chunk_for_test(&format!("{server}::{key}"), stale, index)
+                        .unwrap(),
+                );
+            }
+        }
+        // And chunks whose base is gone, which need two snapshots to condemn.
+        orphans
+            .push(platform::plant_chunk_for_test(&format!("{sid}-gone::{key}"), stale, 0).unwrap());
+
+        let started = std::time::Instant::now();
+        let removed =
+            platform::with_slow_sweep_snapshots(std::time::Duration::from_millis(300), || {
+                platform::sweep_orphaned_chunks_for_test(std::time::Duration::ZERO, &sid)
+            });
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "the sweep ran for {elapsed:?}"
+        );
+        assert_eq!(removed, orphans.len());
+        for account in &orphans {
+            assert!(!platform::raw_entry_exists_for_test(account).unwrap());
+        }
+
+        let started = std::time::Instant::now();
+        platform::with_slow_sweep_snapshots(std::time::Duration::from_secs(5), || {
+            set_secret(&servers[0], key, "short replacement").unwrap()
+        });
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "set_secret waited on the sweep"
+        );
+        for server in &servers {
+            assert!(get_secret_result(server, key).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_production_sweep_covers_the_whole_vault_with_production_limits() {
+        assert!(platform::production_sweep_is_whole_vault_with_production_limits());
+    }
+
     /// Cross-platform: setting `CONDUIT_SECRET_KEY` activates the file backend.
     /// Runs on every OS (the env-var precedence is platform-independent).
     ///
