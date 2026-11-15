@@ -5725,6 +5725,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The pending marker is never written through a link someone planted.
+    #[cfg(unix)]
+    #[test]
+    fn the_pending_scrub_marker_never_writes_through_a_link() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let root = std::env::temp_dir().join(format!("tp-pending-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (dir, outside) = (root.join("data"), root.join("outside"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        std::fs::write(dir.join("gateway.log"), "saw pending-link-value-8Hq3Zt\n").unwrap();
+        let (sym_target, hard_target) = (outside.join("notes.txt"), outside.join("copy.txt"));
+        std::fs::write(&sym_target, "keep me\n").unwrap();
+        std::fs::write(&hard_target, "keep me too\n").unwrap();
+        let mut kept = Vec::new();
+        let links: [fn(&Path, &Path) -> std::io::Result<()>; 2] = [
+            |t, at| std::os::unix::fs::symlink(t, at),
+            |t, at| std::fs::hard_link(t, at),
+        ];
+        for (i, link) in links.iter().enumerate() {
+            let target = if i == 0 { &sym_target } else { &hard_target };
+            let _ = std::fs::remove_file(dir.join(SCRUB_PENDING_FILE));
+            link(target, &dir.join(SCRUB_PENDING_FILE)).unwrap();
+            SCRUB_ENABLED.store(true, Ordering::Release);
+            register(
+                "pending-srv",
+                "PENDING_KEY",
+                &format!("pending-link-value-8Hq3Z{i}"),
+            );
+            SCRUB_ENABLED.store(false, Ordering::Release);
+            flush_pending_scrub(std::time::Duration::from_secs(10));
+            kept.push(std::fs::read_to_string(target).unwrap());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(kept, ["keep me\n", "keep me too\n"]);
+    }
+
     #[test]
     fn a_queued_scrub_is_durable_and_drained_on_exit() {
         let _lock = crate::registry::data_dir_test_lock();
