@@ -3420,6 +3420,17 @@ impl Held {
         self.text.len() + self.seps.iter().map(|(_, s)| s.len()).sum::<usize>()
     }
 
+    /// The held separators, written now; the held text (a start of a secret,
+    /// at most the longest form) stays held as one piece, so the secret is
+    /// still matched whole when the rest of it comes.
+    fn release_seps(&mut self) -> String {
+        let mut out = String::new();
+        for (_, sep) in std::mem::take(&mut self.seps) {
+            out.push_str(&sep);
+        }
+        out
+    }
+
     /// Stop waiting: [`WITHHELD`] in place of the held text, then the held
     /// separators, so a held start of a secret is never written in part.
     fn withhold(&mut self) -> String {
@@ -3440,7 +3451,8 @@ impl Held {
 /// private key in its longest registered spelling (JSON-escaped twice, about
 /// 4.5 KiB); two further percent levels make that at most 9 times longer,
 /// about 40 KiB. 64 KiB leaves room for it to be wrapped over lines. Past it
-/// the stream writes [`WITHHELD`] in place of the held text and goes on.
+/// the stream writes the held separators and keeps holding only the text
+/// (written after them); held text past it alone becomes [`WITHHELD`].
 pub const MAX_HELD_BYTES: usize = 64 * 1024;
 
 impl Stream {
@@ -3501,7 +3513,11 @@ impl Stream {
         );
         let mut out = self.held.take(m, cut, &spans);
         if self.held.bytes() > MAX_HELD_BYTES {
-            out.push_str(&self.held.withhold());
+            if self.held.text.len() > MAX_HELD_BYTES {
+                out.push_str(&self.held.withhold());
+            } else {
+                out.push_str(&self.held.release_seps());
+            }
         }
         out
     }
