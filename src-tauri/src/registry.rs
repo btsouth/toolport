@@ -1469,6 +1469,12 @@ pub struct ManagedEntry {
     /// Unix epoch seconds when we last wrote this entry.
     #[serde(default)]
     pub updated_at: u64,
+    /// Codex entry settings Toolport has already handled for this entry: written
+    /// once, or found set by the user. Startup repair adds only keys missing from this
+    /// list, so a key the user later deletes stays deleted. Kept here, in Toolport's
+    /// own state, never in the client's config.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codex_settings: Vec<String>,
     /// Fields from newer builds, preserved on every registry save.
     #[serde(flatten)]
     pub unknown_fields: serde_json::Map<String, serde_json::Value>,
@@ -1516,6 +1522,7 @@ impl ManagedEntry {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            codex_settings: Vec::new(),
             unknown_fields: Default::default(),
         }
     }
@@ -6216,6 +6223,7 @@ pub(crate) mod tests {
             transport: "stdio".into(),
             url: None,
             updated_at: 42,
+            codex_settings: Vec::new(),
             unknown_fields: Default::default(),
         };
         r.set_client_managed_entry("claude-desktop", entry.clone());

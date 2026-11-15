@@ -363,11 +363,17 @@ Use this when Codex has already created its home directory (`$CODEX_HOME`, or `~
    The entry also sets three Codex keys, each only when it is absent, so a value you
    wrote is never changed: `supports_parallel_tool_calls = true` (Toolport serves
    overlapping calls), `startup_timeout_sec = 75` (a cold start can elect and wait for
-   the shared daemon before the first tool list; a `startup_timeout_ms` you set counts
-   as set) and `tool_timeout_sec = 600` (a call can wait up to 120 seconds on an
+   the shared daemon before the first tool list, up to about 68 seconds, while Codex
+   waits 30 seconds, or 10 on builds before 0.118; a `startup_timeout_ms` you set
+   counts as set) and `tool_timeout_sec = 600` (a call can wait up to 120 seconds on an
    approval prompt before it runs, and Toolport's adapter ends any request at 600
-   seconds). Existing Toolport-managed Codex entries get the missing keys on the next
-   Toolport launch. To opt out of one, write your own value for it.
+   seconds, while Codex stops waiting at 300 seconds, 120 on 0.105 to 0.140 and 60
+   before that).
+   Existing Toolport-managed Codex entries get the missing keys once, on the next
+   Toolport launch; a Shared HTTP entry gets the parallel and tool timeout keys, with
+   its URL and other keys left as they are. Toolport remembers which keys it has
+   handled for the entry, so a key you delete stays deleted. To opt out of one, delete
+   it or write your own value.
 4. Start a new Codex session so it re-reads the config. In Toolport, the Codex row changes to **connected to Toolport**; in Codex, Toolport-managed tools are served through the one `toolport` MCP server. With lazy discovery enabled, Codex gets Toolport's compact search tools instead of every downstream tool up front.
 
 Gotcha: when running Toolport from source, build the gateway first with `npm run build:gateway`. The desktop dev server does not build the separate binary that Codex spawns, so Codex will report the gateway as missing until that binary exists.
