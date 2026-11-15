@@ -1,0 +1,92 @@
+name: macOS acceptance
+
+# On-demand check of a published release on a clean Apple Silicon runner, done
+# the way a new Mac user would: download, Gatekeeper, first launch, keychain,
+# client setup, upgrade and uninstall. Evidence (screenshots, logs, leftover
+# files, crash reports) is uploaded as artifacts; the job summary lists every
+# check and everything the runner could not test.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published release tag to test (empty: the latest release)"
+        required: false
+        type: string
+        default: ""
+  # Temporary while the job is developed: runs only when the job itself changes.
+  pull_request:
+    paths:
+      - .github/workflows/macos-acceptance.yml
+      - scripts/macos-acceptance/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-acceptance-${{ github.ref }}-${{ inputs.tag }}
+  cancel-in-progress: true
+
+jobs:
+  dmg:
+    name: dmg install and first run
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EVIDENCE: ${{ runner.temp }}/macos-acceptance
+      TPUI: ${{ runner.temp }}/macos-acceptance/bin/tpui
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve the release under test
+        id: release
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+        run: bash scripts/macos-acceptance/resolve-release.sh "$TAG_INPUT" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Record the runner
+        run: |
+          mkdir -p "$EVIDENCE/logs" "$EVIDENCE/bin"
+          { sw_vers; uname -a; id; echo "console user: $(stat -f %Su /dev/console)"; launchctl managername; } \
+            | tee "$EVIDENCE/logs/runner.txt"
+          printf 'runner\tINFO\tmacOS\t%s\n' "$(sw_vers -productVersion) $(uname -m)" >>"$EVIDENCE/results.tsv"
+
+      - name: Build the window and accessibility probe
+        run: swiftc -O scripts/macos-acceptance/tpui.swift -o "$TPUI"
+
+      - name: Install the Apple Silicon dmg
+        run: bash scripts/macos-acceptance/install-dmg.sh "${{ steps.release.outputs.tag }}" Toolport_aarch64-apple-darwin.dmg
+
+      - name: Check the installed bundle
+        if: ${{ !cancelled() }}
+        run: bash scripts/macos-acceptance/bundle-checks.sh /Applications/Toolport.app arm64 "Apple Silicon"
+
+      - name: Check the Intel dmg
+        if: ${{ !cancelled() }}
+        run: |
+          bash scripts/macos-acceptance/install-dmg.sh "${{ steps.release.outputs.tag }}" Toolport_x86_64-apple-darwin.dmg --no-install
+          bash scripts/macos-acceptance/bundle-checks.sh "$RUNNER_TEMP/inspect/Toolport_x86_64-apple-darwin.dmg/Toolport.app" x86_64 Intel
+
+      - name: First launch
+        if: ${{ !cancelled() }}
+        run: bash scripts/macos-acceptance/first-run.sh
+
+      - name: Write the job summary
+        if: always()
+        run: |
+          ls -1 "$HOME/Library/Logs/DiagnosticReports" 2>/dev/null | grep -iE 'toolport|conduit' | while read -r f; do
+            mkdir -p "$EVIDENCE/crash-reports"; cp "$HOME/Library/Logs/DiagnosticReports/$f" "$EVIDENCE/crash-reports/"
+          done || true
+          python3 scripts/macos-acceptance/render_summary.py "$EVIDENCE/results.tsv" \
+            "macOS acceptance: ${{ steps.release.outputs.tag }} dmg" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-acceptance-dmg
+          path: ${{ runner.temp }}/macos-acceptance
+          if-no-files-found: error
+          retention-days: 14

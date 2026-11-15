@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# First launch of the installed app, the way a new user opens it from
+# Applications: Gatekeeper's first-open check for a quarantined download, the
+# main window, the menu bar item, the gateway process, crash reports, and how
+# far UI automation reaches on this runner.
+#
+# usage: first-run.sh [label]
+set -uo pipefail
+AREA="first run${1:+ ($1)}"
+LABEL="${1:-first}"
+# shellcheck source=common.sh
+source "$(dirname "$0")/common.sh"
+
+EXE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Contents/Info.plist")"
+EXE_PATH="$APP_PATH/Contents/MacOS/$EXE"
+app_pid() { pgrep -f "^$EXE_PATH" | head -n 1; }
+crash_list() { ls -1 "$HOME/Library/Logs/DiagnosticReports" 2>/dev/null | grep -iE 'toolport|conduit' || true; }
+windows_json() { "$TPUI" windows; }
+
+crashes_before="$(crash_list)"
+"$TPUI" trust >"$EVIDENCE/logs/tcc-$LABEL.json" 2>&1
+info "automation grants for the job's processes" "$(tr -d ' \n' <"$EVIDENCE/logs/tcc-$LABEL.json")"
+
+quarantine="$(xattr -p com.apple.quarantine "$APP_PATH" 2>/dev/null || true)"
+log "Opening $APP_PATH (quarantine: ${quarantine:-none})"
+open "$APP_PATH"
+
+# A quarantined, notarized download gets Gatekeeper's "downloaded from the
+# Internet" confirmation before the app's own process starts.
+gk_pid=""
+if [[ -n "$quarantine" ]]; then
+  for _ in $(seq 1 20); do
+    [[ -n "$(app_pid)" ]] && break
+    gk_pid="$(windows_json | python3 -c '
+import json, sys
+for w in json.load(sys.stdin):
+    if w["owner"] in ("CoreServicesUIAgent", "UserNotificationCenter") and w["layer"] >= 0 and w["w"] > 100:
+        print(w["pid"]); break' 2>/dev/null)"
+    [[ -n "$gk_pid" ]] && break
+    sleep 1
+  done
+  if [[ -n "$gk_pid" ]]; then
+    shot "$LABEL-gatekeeper-prompt" >/dev/null && info "Gatekeeper first-open prompt" "shown (screenshots/$LABEL-gatekeeper-prompt.png)"
+    "$TPUI" dump "$gk_pid" 12 >"$EVIDENCE/logs/ax-gatekeeper-$LABEL.txt" 2>&1
+    if "$TPUI" press "$gk_pid" "Open" >"$EVIDENCE/logs/gatekeeper-press-$LABEL.log" 2>&1; then
+      pass "Gatekeeper prompt accepted through accessibility" "$(cat "$EVIDENCE/logs/gatekeeper-press-$LABEL.log")"
+    else
+      fail "Gatekeeper prompt accepted through accessibility" "$(tail -n 2 "$EVIDENCE/logs/gatekeeper-press-$LABEL.log" | tr '\n' ' ')"
+    fi
+  elif [[ -n "$(app_pid)" ]]; then
+    info "Gatekeeper first-open prompt" "none appeared; the app started directly"
+  fi
+fi
+
+if wait_for 45 app_pid; then
+  pass "app process starts" "pid $(app_pid)"
+else
+  fail "app process starts" "no $EXE process 45s after open"
+  shot "$LABEL-no-process" >/dev/null || true
+  finish_step
+fi
+PID="$(app_pid)"
+echo "$PID" >"$EVIDENCE/app.pid"
+
+# The window is created hidden and shown once the UI loads.
+has_window() {
+  windows_json | python3 -c '
+import json, sys
+pid = int(sys.argv[1])
+ok = [w for w in json.load(sys.stdin) if w["pid"] == pid and w["layer"] == 0 and w["onscreen"] and w["w"] >= 400]
+sys.exit(0 if ok else 1)' "$PID"
+}
+if wait_for 45 has_window; then
+  pass "main window appears" "$(windows_json | python3 -c '
+import json, sys
+pid = int(sys.argv[1])
+for w in json.load(sys.stdin):
+    if w["pid"] == pid and w["layer"] == 0 and w["onscreen"]:
+        print("%s %dx%d at %d,%d" % (w["name"] or "(title hidden without screen recording)", w["w"], w["h"], w["x"], w["y"]))' "$PID" | head -1)"
+else
+  fail "main window appears" "no on-screen window for pid $PID after 45s"
+fi
+windows_json >"$EVIDENCE/logs/windows-$LABEL.json"
+sleep 3
+if shot "$LABEL-window" >/dev/null; then
+  pass "screenshot of the first window" "screenshots/$LABEL-window.png"
+else
+  fail "screenshot of the first window" "$(cat "$EVIDENCE/logs/screencapture-$LABEL-window.err")"
+fi
+
+# Menu bar status item: a layer-25 window owned by the app in CGWindowList, and
+# the AX extras menu bar when accessibility is available.
+tray="$(windows_json | python3 -c '
+import json, sys
+pid = int(sys.argv[1])
+for w in json.load(sys.stdin):
+    if w["pid"] == pid and w["layer"] == 25:
+        print("%dx%d at %d,%d" % (w["w"], w["h"], w["x"], w["y"]))' "$PID" | head -1)"
+if [[ -n "$tray" ]]; then
+  pass "menu bar item exists" "status item window $tray"
+else
+  fail "menu bar item exists" "no layer-25 window owned by pid $PID"
+fi
+"$TPUI" menubar "$PID" >"$EVIDENCE/logs/ax-menubar-$LABEL.txt" 2>&1 || true
+
+if wait_for 30 pgrep -f 'toolport-gateway'; then
+  pass "gateway process starts" "$(pgrep -fl toolport-gateway | head -3 | tr '\n' ';')"
+else
+  fail "gateway process starts" "no toolport-gateway process 30s after launch"
+fi
+ps -axo pid,ppid,user,command | grep -iE 'toolport|conduit' | grep -v grep >"$EVIDENCE/logs/processes-$LABEL.txt" || true
+
+# How far accessibility reaches into the window (a WKWebView).
+if "$TPUI" dump "$PID" 40 >"$EVIDENCE/logs/ax-tree-$LABEL.txt" 2>"$EVIDENCE/logs/ax-tree-$LABEL.err"; then
+  n="$(wc -l <"$EVIDENCE/logs/ax-tree-$LABEL.txt" | tr -d ' ')"
+  web="$(grep -c 'AXWebArea' "$EVIDENCE/logs/ax-tree-$LABEL.txt" || true)"
+  buttons="$(grep -c 'AXButton' "$EVIDENCE/logs/ax-tree-$LABEL.txt" || true)"
+  info "accessibility tree" "$n elements, $web web areas, $buttons buttons (logs/ax-tree-$LABEL.txt)"
+else
+  info "accessibility tree" "unavailable: $(cat "$EVIDENCE/logs/ax-tree-$LABEL.err")"
+fi
+
+sleep 5
+crashes_after="$(crash_list)"
+new_crashes="$(comm -13 <(printf '%s\n' "$crashes_before" | sort) <(printf '%s\n' "$crashes_after" | sort) | grep -v '^$' || true)"
+if [[ -z "$new_crashes" ]]; then
+  pass "no crash report written"
+else
+  fail "no crash report written" "$(printf '%s ' $new_crashes)"
+fi
+if [[ -z "$(app_pid)" ]]; then
+  fail "app still running after first launch" "process $PID exited"
+fi
+finish_step
