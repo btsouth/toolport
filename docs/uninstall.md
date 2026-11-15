@@ -24,12 +24,49 @@ Backups of imported credentials are stored in the vault with a recovery copy
 that omits secret values. At desktop startup, Toolport also seals older plaintext
 backups before updating client gateway paths. If that migration cannot use the
 vault, it retains the original backup and reports the failure; unlock the vault
-and restart Toolport to retry. If the original vault is locked or unavailable,
-restoration still recovers the config and names each missing credential in the
-result. Missing values are labeled `TOOLPORT_MISSING_CREDENTIAL_<number>`.
-Recovery data is retained. Linux recovery does not open keyring unlock prompts.
-Unlock the original vault, then run `toolport-gateway --disconnect-all` again to
-re-insert those credentials, even if the client already says it is disconnected.
+and restart Toolport to retry. If a saved value cannot be read, restoration still recovers the config and
+keeps a placeholder for that value. **Clients** lists each server and key with
+its reason and next step. A locked keyring needs unlocking; an unavailable store
+needs starting or reconnecting; duplicate matches need resolving. A missing or
+damaged saved value can be re-entered in the client, or entered in Toolport before
+choosing **Retry**. Access rejection and cancellation have their own messages.
+Technical placeholder names appear only in **Details**.
+
+Retry restores unchanged placeholder leaves, including entries you moved, while
+preserving your edits, comments and ordering. A value you replaced yourself or a
+server entry you deleted is accounted for without being overwritten or restored.
+Results state how many values were restored and how many still need attention.
+The receipt and saved values are retained until the committed file has no owed
+placeholders. Partial recovery never removes its receipt. Recovery also works
+from `toolport-gateway --disconnect-all`, even for an already disconnected client.
+
+Pending notices survive restarting either shell. **Dismiss** only hides a notice;
+**Show recovery** brings it back. The notice and confirmation show the backup path
+and explain that it does not expire automatically. **Discard these saved values**
+is separate and permanent: its confirmation names the config and saved-value
+names. It removes that config's owned recovery copies and their vaulted payloads,
+without changing the current client config or server credentials. Failed cleanup
+keeps the inventory for another attempt. Malformed or untrusted receipts are
+listed separately with a repair reason and cannot authorize unsafe writes or
+deletion. One bad receipt does not hide other recoveries.
+
+Linux backup reads and deletion never open keyring unlock prompts. macOS backup
+queries use `kSecUseAuthenticationUIFail`: interaction-not-allowed, authentication
+failure and cancellation map to separate states. Credential Manager maps reported
+Windows access, authentication, cancellation, missing and corrupt-data errors.
+Windows has no separately lockable generic-credential vault, so normal reads do
+not produce a keyring-locked state or an unlock prompt to cancel. Its unique
+credential target names also do not produce Secret Service's duplicate-match
+state. Keychain's service/account/access-group query does not report that Linux
+match-cardinality state either. Payload integrity failures are checked by
+Toolport on every platform.
+
+Status mapping and backup round-trip tests run in **Headless Rust tests
+(macos-latest, core)** and **Headless Rust tests (windows-latest, core)** in
+`.github/workflows/ci.yml`. Unsigned macOS runners assert the production Keychain
+entitlement refusal instead of publishing an unprotected backup; real Keychain
+round-trip acceptance needs the signed app with its provisioning profile.
+
 Data removal refuses to discard incomplete recovery.
 After verified restoration, historical backup payloads are deleted and only
 empty ownership metadata remains, so a later uninstall cannot claim native entries.

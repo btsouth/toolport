@@ -20,7 +20,9 @@ pub(crate) mod backup_permissions;
 pub(crate) mod backup_storage;
 mod claude_profiles;
 pub use claude_profiles::ClaudeProfile;
+mod diagnostics;
 mod disconnect;
+mod recovery_values;
 pub(crate) use disconnect::for_purge as disconnect_all_for_purge;
 pub use disconnect::{all as disconnect_all, ClientResult as DisconnectResult};
 mod codewhale;
@@ -3776,12 +3778,7 @@ fn parse_json_value(content: &str) -> Result<serde_json::Value, String> {
         return Ok(v);
     }
     let err = serde_json::from_str::<serde_json::Value>(content).unwrap_err();
-    Err(format!(
-        "JSON syntax error at line {} column {}: {}",
-        err.line(),
-        err.column(),
-        err
-    ))
+    Err(diagnostics::json(&err))
 }
 
 /// Extract a server definition from a `claude mcp add-json` CLI invocation.
@@ -3863,8 +3860,8 @@ pub fn parse_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String> 
 
     // 1. Claude Code CLI: `claude mcp add-json ... <name> '{...}'`
     if let Some((name, json_str)) = extract_claude_cli(trimmed) {
-        let value: serde_json::Value = serde_json::from_str(&json_str)
-            .map_err(|e| format!("Invalid JSON in CLI command: {e}"))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&json_str).map_err(|e| diagnostics::json(&e))?;
         // Bare server object (the common case from the CLI).
         if value.is_object() && (value.get("command").is_some() || value.get("url").is_some()) {
             return Ok(vec![json_server_with_values(&name, &value)]);
@@ -4174,7 +4171,8 @@ fn parse_json_snippet(
 
 /// Parse a TOML snippet with `[mcp_servers.<name>]` tables.
 fn parse_toml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String> {
-    let value: toml::Value = toml::from_str(content).map_err(|e| e.to_string())?;
+    let value: toml::Value = toml::from_str(content)
+        .map_err(|e: toml::de::Error| diagnostics::offset("TOML", content, e.span()))?;
     let table = value
         .get("mcp_servers")
         .and_then(|v| v.as_table())
@@ -4249,7 +4247,8 @@ fn yaml_value_to_string(v: &serde_yaml::Value) -> Option<String> {
 
 /// Parse a YAML snippet (Hermes `mcp_servers:`, Goose `extensions:`, or Continue `mcpServers:`).
 fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String> {
-    let value: serde_yaml::Value = serde_yaml::from_str(content).map_err(|e| e.to_string())?;
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(content).map_err(|e| diagnostics::yaml(&e))?;
 
     // Try Hermes format: `mcp_servers:` map.
     if let Some(servers_map) = value.get("mcp_servers").and_then(|v| v.as_mapping()) {
@@ -4404,7 +4403,7 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
 
 /// Parse YAML, preserving serde_yaml's line/column in the error text.
 fn parse_yaml_value(content: &str) -> Result<serde_yaml::Value, String> {
-    serde_yaml::from_str(content).map_err(|e| format!("YAML syntax error: {e}"))
+    serde_yaml::from_str(content).map_err(|e| diagnostics::yaml(&e))
 }
 
 /// Read an existing JSON config we're about to modify. Tolerant of JSONC/JSON5. A
@@ -4435,7 +4434,7 @@ fn read_existing_toml(content: &str) -> Result<toml::Value, String> {
         return Ok(toml::Value::Table(toml::map::Map::new()));
     }
     toml::from_str::<toml::Value>(content)
-        .map_err(|e| format!("Could not parse the existing config ({e}); leaving it untouched."))
+        .map_err(|e: toml::de::Error| diagnostics::offset("TOML", content, e.span()))
 }
 
 fn parse_json(content: &str, key: &str) -> Result<Vec<McpServer>, String> {
@@ -4635,8 +4634,8 @@ fn parse_opencode_json(content: &str) -> Result<Vec<McpServer>, String> {
 }
 
 fn parse_toml(content: &str) -> Result<Vec<McpServer>, String> {
-    let value: toml::Value =
-        toml::from_str(content).map_err(|e| format!("TOML syntax error: {e}"))?;
+    let value: toml::Value = toml::from_str(content)
+        .map_err(|e: toml::de::Error| diagnostics::offset("TOML", content, e.span()))?;
     let table = match value.get("mcp_servers") {
         None => return Ok(Vec::new()),
         Some(v) if v.is_table() => v.as_table().unwrap(),
@@ -5774,10 +5773,11 @@ fn backup_file_named(
     };
     crate::registry::atomic_write(
         &dest,
-        &backup_storage::encode_recovery(
+        &backup_storage::encode_backup(
             &dest,
             &read_config_file(path)?,
             mutation::is_disconnecting(),
+            path,
         )?,
     )?;
     prune_backups(&dir, backup_name);
@@ -6168,7 +6168,8 @@ fn reject_duplicate_top_level_key(original: &str, key: &str) -> Result<(), Strin
     use jsonc_parser::cst::CstRootNode;
     use jsonc_parser::ParseOptions;
 
-    let root = CstRootNode::parse(original, &ParseOptions::default()).map_err(|e| e.to_string())?;
+    let root = CstRootNode::parse(original, &ParseOptions::default())
+        .map_err(|e| diagnostics::jsonc(&e))?;
     let Some(obj) = root.object_value() else {
         return Ok(());
     };
@@ -6194,7 +6195,8 @@ fn rewrite_json_key_preserving(
     use jsonc_parser::cst::CstRootNode;
     use jsonc_parser::ParseOptions;
 
-    let root = CstRootNode::parse(original, &ParseOptions::default()).map_err(|e| e.to_string())?;
+    let root = CstRootNode::parse(original, &ParseOptions::default())
+        .map_err(|e| diagnostics::jsonc(&e))?;
     // Client configs we edit are always root objects. Non-objects fall through
     // to the pretty-print path via the caller.
     let Some(obj) = root.object_value() else {
@@ -6274,7 +6276,8 @@ fn remove_json_key_preserving(original: &str, key: &str) -> Result<String, Strin
     use jsonc_parser::cst::CstRootNode;
     use jsonc_parser::ParseOptions;
 
-    let root = CstRootNode::parse(original, &ParseOptions::default()).map_err(|e| e.to_string())?;
+    let root = CstRootNode::parse(original, &ParseOptions::default())
+        .map_err(|e| diagnostics::jsonc(&e))?;
     let Some(obj) = root.object_value() else {
         return Err("JSONC root is not an object".into());
     };
@@ -6415,7 +6418,9 @@ fn load_toml_document(path: &Path) -> Result<toml_edit::DocumentMut, String> {
     }
     content
         .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| format!("Could not parse the existing config ({e}); leaving it untouched."))
+        .map_err(|e: toml_edit::TomlError| {
+            diagnostics::at(path, diagnostics::offset("TOML", &content, e.span()))
+        })
 }
 
 /// Guarantee `item` is a standard table. Inline tables and non-table values
@@ -7212,9 +7217,7 @@ fn parse_existing_yaml_content(content: &str) -> Result<serde_yaml::Value, Strin
     if content.trim().is_empty() {
         return Ok(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
     }
-    serde_yaml::from_str(content).map_err(|e| {
-        format!("Could not parse the existing config.yaml ({e}); leaving it untouched.")
-    })
+    serde_yaml::from_str(content).map_err(|e| diagnostics::yaml(&e))
 }
 
 /// Read an existing YAML config and keep the original text so the write can
@@ -7805,7 +7808,8 @@ fn parse_continue_yaml_servers(content: &str) -> Result<Vec<McpServer>, String> 
         return Ok(Vec::new());
     }
 
-    let value: serde_yaml::Value = serde_yaml::from_str(content).map_err(|e| e.to_string())?;
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(content).map_err(|e| diagnostics::yaml(&e))?;
 
     let entries = match value.get("mcpServers") {
         None => return Ok(Vec::new()),
@@ -9298,6 +9302,7 @@ fn keep_only_missing_codex_settings(
 /// a failure in between leaves the client with both, never with neither.
 pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
     backup_storage::reset_missing();
+    recovery_values::reset_progress();
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
     if let Some(location) = &def.location {
@@ -9305,9 +9310,6 @@ pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
     }
     let mut outcome = mutation::run(client_id, &path, def.format, || {
         let mut outcome = revision_outcome(client_id, uninstall_gateway_inner(client_id))?;
-        outcome
-            .warnings
-            .extend(recovery::warnings(client_id, Path::new(&outcome.path)));
         outcome
             .warnings
             .extend(disconnect_warnings(def.format, &path)?);
@@ -9323,7 +9325,11 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
     restore::prepare_disconnect(client_id, &path)?;
-    let backup = backup_file(client_id, &path)?;
+    let backup = if restore::pending_values(client_id, &path)? {
+        None
+    } else {
+        backup_file(client_id, &path)?
+    };
     let mut restored_names = moved::missing_names(client_id, def.format, &path)?;
     if restore::apply(client_id, def.format, &path)? {
         if restore::needs_moved(client_id, &path)? {
@@ -9397,6 +9403,14 @@ pub fn finish_uninstall(client_id: &str, outcome: &WriteOutcome) -> Result<(), S
         outcome.revision.as_deref(),
     )?;
     Ok(())
+}
+
+pub fn finish_uninstall_with_warnings(
+    client_id: &str,
+    outcome: &WriteOutcome,
+) -> Result<Vec<String>, String> {
+    finish_uninstall(client_id, outcome)?;
+    Ok(recovery::warnings(client_id, Path::new(&outcome.path)))
 }
 
 /// Snapshot token binds review to the server container, including credential changes.
@@ -10620,6 +10634,40 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn client_parse_diagnostics_never_expose_credential_source() {
+        let _data = crate::registry::DataDirTestEnv::new("client-safe-parse-errors");
+        let log = crate::registry::conduit_dir()
+            .unwrap()
+            .join("safe-error.log");
+        let credential = "sk-d2-private-fixture-never-display";
+        let toml = format!("[mcp_servers.native.env]\nAPI_KEY = \"{credential}\" invalid\n");
+        let json = format!("{{\"mcpServers\":{{}},\"{credential}\":invalid}}");
+        for (format, text) in [
+            (Format::TomlMcpServers, toml),
+            (Format::JsonMcpServers, json),
+        ] {
+            let error = parse_client_content(format, &text).unwrap_err();
+            assert!(
+                !error.contains(credential),
+                "diagnostic leaked a config value: {error}"
+            );
+            crate::gatewaylog::append_to(&log, &error);
+            assert!(!std::fs::read_to_string(&log).unwrap().contains(credential));
+            let event = serde_json::to_value(disconnect::ClientResult {
+                client_id: "codex".into(),
+                path: "config.toml".into(),
+                dry_run: false,
+                error: Some(error.clone()),
+                warnings: Vec::new(),
+            })
+            .unwrap();
+            assert!(!event.to_string().contains(credential));
+            assert!(error.contains("line") && error.contains("column"));
+        }
+    }
+
     use crate::registry::EnvVar;
 
     #[test]

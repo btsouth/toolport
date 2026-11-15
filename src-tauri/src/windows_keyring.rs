@@ -280,11 +280,70 @@ fn entry(account: &str) -> Result<Entry, String> {
     Entry::new(SERVICE, account).map_err(|e| e.to_string())
 }
 
+thread_local! { static BACKUP_ERROR: std::cell::Cell<Option<super::BackupSecretError>>=const {std::cell::Cell::new(None)}; }
+pub fn get_backup_secret_status(
+    server_id: &str,
+    key: &str,
+) -> Result<Option<String>, super::BackupSecretError> {
+    BACKUP_ERROR.with(|s| s.set(None));
+    get_secret_result(server_id, key).map_err(|_| {
+        BACKUP_ERROR
+            .with(|s| s.get())
+            .unwrap_or(super::BackupSecretError::Corrupt)
+    })
+}
+pub fn delete_backup_secret_status(
+    server_id: &str,
+    key: &str,
+) -> Result<(), super::BackupSecretError> {
+    BACKUP_ERROR.with(|s| s.set(None));
+    let _lock = credential_lock();
+    let base = account(server_id, key);
+    // Enumerate owned chunk names; do not decode the value being discarded.
+    // A corrupt base/blob/manifest must still be removable, including old chunks.
+    let (_, mut chunks) =
+        chunk_snapshot(std::time::Duration::ZERO, Some(&base)).ok_or_else(|| {
+            super::BackupSecretError::windows(unsafe {
+                windows_sys::Win32::Foundation::GetLastError()
+            })
+        })?;
+    let remove = |name: &str| {
+        delete_entry(name).map_err(|_| {
+            BACKUP_ERROR
+                .with(|s| s.get())
+                .unwrap_or(super::BackupSecretError::Unavailable)
+        })
+    };
+    remove(&base)?;
+    if let Some(generations) = chunks.remove(&base) {
+        for (names, _) in generations.into_values() {
+            for name in names {
+                remove(&name)?;
+            }
+        }
+    }
+    Ok(())
+}
+fn remember_backup_error(error: &keyring::Error) {
+    let state = match error {
+        keyring::Error::PlatformFailure(e) | keyring::Error::NoStorageAccess(e) => e
+            .downcast_ref::<keyring::windows::Error>()
+            .map(|e| super::BackupSecretError::windows(e.0))
+            .unwrap_or(super::BackupSecretError::Unavailable),
+        keyring::Error::BadEncoding(_) => super::BackupSecretError::Corrupt,
+        keyring::Error::Ambiguous(_) => super::BackupSecretError::Ambiguous,
+        _ => super::BackupSecretError::Unavailable,
+    };
+    BACKUP_ERROR.with(|s| s.set(Some(state)));
+}
 fn read_entry(account: &str) -> Result<Option<String>, String> {
     match entry(account)?.get_password() {
         Ok(value) => Ok(Some(value)),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(error) => Err(error.to_string()),
+        Err(error) => {
+            remember_backup_error(&error);
+            Err("Credential Manager read failed".into())
+        }
     }
 }
 
@@ -361,7 +420,10 @@ fn read_base(account: &str) -> Result<Option<String>, String> {
 fn delete_entry(account: &str) -> Result<(), String> {
     match entry(account)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => Err(error.to_string()),
+        Err(error) => {
+            remember_backup_error(&error);
+            Err("Credential Manager deletion failed".into())
+        }
     }
 }
 
@@ -1060,4 +1122,54 @@ pub fn raw_entries_for_test(server_id: &str, key: &str) -> Result<Vec<String>, S
 #[cfg(test)]
 pub fn raw_entry_exists_for_test(account: &str) -> Result<bool, String> {
     Ok(read_entry(account)?.is_some())
+}
+
+#[cfg(test)]
+mod backup_cleanup_tests {
+    use super::*;
+    #[test]
+    fn windows_backup_discard_deletes_a_corrupt_blob_and_all_owned_chunks() {
+        let _data = crate::registry::DataDirTestEnv::new("windows-corrupt-backup-discard");
+        let id = format!(
+            "client-backup-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let key = "payload";
+        let base = account(&id, key);
+        let other = account(&id, "payload-other");
+        struct Cleanup(Vec<String>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for account in &self.0 {
+                    let _ = delete_entry(account);
+                }
+            }
+        }
+        let mut cleanup = Cleanup(vec![base.clone(), other.clone()]);
+        entry(&base).unwrap().set_secret(&[0x00, 0xd8]).unwrap();
+        let chunk = plant_chunk_for_test(&base, &"a".repeat(32), 0).unwrap();
+        cleanup.0.push(chunk.clone());
+        entry(&other)
+            .unwrap()
+            .set_password("preserve unrelated backup")
+            .unwrap();
+        delete_backup_secret_status(&id, key).unwrap();
+        assert!(matches!(
+            entry(&base).unwrap().get_secret(),
+            Err(keyring::Error::NoEntry)
+        ));
+        assert!(matches!(
+            entry(&chunk).unwrap().get_secret(),
+            Err(keyring::Error::NoEntry)
+        ));
+        assert_eq!(
+            entry(&other).unwrap().get_password().unwrap(),
+            "preserve unrelated backup"
+        );
+        delete_entry(&other).unwrap();
+    }
 }

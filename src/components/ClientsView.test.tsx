@@ -9,6 +9,7 @@ vi.mock("@/lib/api", () => ({
   listClientRecoveries: vi.fn().mockResolvedValue([]),
   retryClientRecovery: vi.fn(),
   dismissClientRecovery: vi.fn(),
+  discardClientRecovery: vi.fn(),
 }));
 beforeEach(() => vi.mocked(getClientSessions).mockResolvedValue([]));
 

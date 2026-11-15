@@ -244,7 +244,7 @@ pub(super) fn run<T>(
     format: Format,
     edit: impl FnMut() -> Result<T, String>,
 ) -> Result<T, String> {
-    run_inner(client_id, path, format, false, edit)
+    run_inner(client_id, path, format, false, edit).map_err(|error| diagnostics::at(path, error))
 }
 
 pub(super) fn settings<T>(
@@ -253,6 +253,7 @@ pub(super) fn settings<T>(
     mut edit: impl FnMut() -> Result<T, String>,
 ) -> Result<T, String> {
     run_inner(client_id, path, Format::JsonMcpServers, true, &mut edit)
+        .map_err(|error| diagnostics::at(path, error))
 }
 
 fn run_inner<T>(

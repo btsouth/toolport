@@ -56,7 +56,7 @@ fn root_from_content(content: &str) -> Result<Value, String> {
     if !content.trim().is_empty() {
         let cst =
             jsonc_parser::cst::CstRootNode::parse(content, &jsonc_parser::ParseOptions::default())
-                .map_err(|error| format!("Could not parse the OpenHands MCP config: {error}"))?;
+                .map_err(|error| super::diagnostics::jsonc(&error))?;
         if let Some(object) = cst.object_value() {
             zcode::duplicate_keys(&object, "", CLIENT)?;
         }

@@ -1376,8 +1376,9 @@ pub fn disconnect_client_stdio_with(
     }
     let _lock = acquire_auth_lock(&format!("client-config:{client_id}"))?;
     let outcome = clients::uninstall_gateway(client_id)?;
-    let result = finish_client_config_mutation(outcome, write_registry)?;
-    clients::finish_uninstall(client_id, &result.outcome)?;
+    let mut result = finish_client_config_mutation(outcome, write_registry)?;
+    let warnings = clients::finish_uninstall_with_warnings(client_id, &result.outcome)?;
+    result.outcome.warnings.extend(warnings);
     Ok(result)
 }
 
@@ -2555,7 +2556,8 @@ fn finish_http_disconnect(
     result: &mut ClientMutationResult,
     revoke: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    clients::finish_uninstall(client_id, &result.outcome)?;
+    let warnings = clients::finish_uninstall_with_warnings(client_id, &result.outcome)?;
+    result.outcome.warnings.extend(warnings);
     if let Err(error) = revoke() {
         result.outcome.warnings.push(format!(
             "config restored; could not remove the revoked keychain token: {error}"

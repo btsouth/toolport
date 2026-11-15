@@ -692,6 +692,12 @@ export interface ClientRecovery {
   missing: { server: string; key: string }[];
   dismissed: boolean;
   message: string;
+  description: string;
+  valueLines: string[];
+  discardValues: string[];
+  error: string | null;
+  canDiscard: boolean;
+  cleanup: boolean;
   instructions: string;
   retention: string;
   details: string;
@@ -701,8 +707,21 @@ export function listClientRecoveries(): Promise<ClientRecovery[]> {
   return invoke<ClientRecovery[]>("list_client_recoveries");
 }
 
-export function retryClientRecovery(id: string): Promise<ClientRecovery | null> {
-  return invoke<ClientRecovery | null>("retry_client_recovery", { id });
+export interface RecoveryAttempt {
+  id: string;
+  clientId: string;
+  clientName: string;
+  restored: number;
+  accounted: number;
+  remaining: number;
+  message: string;
+  pending: ClientRecovery | null;
+}
+export function retryClientRecovery(id: string): Promise<RecoveryAttempt> {
+  return invoke<RecoveryAttempt>("retry_client_recovery", { id });
+}
+export function discardClientRecovery(id: string): Promise<void> {
+  return invoke<void>("discard_client_recovery", { id });
 }
 
 export function dismissClientRecovery(id: string, dismissed: boolean): Promise<void> {

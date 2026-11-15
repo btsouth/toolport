@@ -28,9 +28,7 @@ fn root(text: &str) -> Result<Map<String, Json>, String> {
         Ok(_) => Err(format!(
             "The Codewhale MCP config must be a JSON object; {UNTOUCHED}."
         )),
-        Err(e) => Err(format!(
-            "Could not parse the Codewhale MCP config ({e}); {UNTOUCHED}."
-        )),
+        Err(e) => Err(super::diagnostics::json(&e)),
     }
 }
 

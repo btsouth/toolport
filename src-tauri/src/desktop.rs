@@ -617,21 +617,34 @@ fn revoke_client_http_token_with(
 async fn list_client_recoveries() -> Result<Vec<clients::recovery::ClientRecovery>, String> {
     tauri::async_runtime::spawn_blocking(clients::recovery::list)
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|_| clients::recovery::worker_error())?
 }
 #[tauri::command]
-async fn retry_client_recovery(
-    id: String,
-) -> Result<Option<clients::recovery::ClientRecovery>, String> {
-    tauri::async_runtime::spawn_blocking(move || clients::recovery::retry(&id))
-        .await
-        .map_err(|e| e.to_string())?
+async fn retry_client_recovery(id: String) -> Result<clients::recovery::RecoveryAttempt, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        clients::recovery::retry_with_report(&id)
+            .map_err(|error| clients::recovery::safe_action_error(&id, &error))
+    })
+    .await
+    .map_err(|_| clients::recovery::worker_error())?
+}
+#[tauri::command]
+async fn discard_client_recovery(id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        clients::recovery::discard(&id)
+            .map_err(|error| clients::recovery::safe_action_error(&id, &error))
+    })
+    .await
+    .map_err(|_| clients::recovery::worker_error())?
 }
 #[tauri::command]
 async fn dismiss_client_recovery(id: String, dismissed: bool) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || clients::recovery::dismiss(&id, dismissed))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        clients::recovery::dismiss(&id, dismissed)
+            .map_err(|error| clients::recovery::safe_action_error(&id, &error))
+    })
+    .await
+    .map_err(|_| clients::recovery::worker_error())?
 }
 
 /// Remove the Toolport gateway from a client.
@@ -646,7 +659,7 @@ async fn uninstall_gateway(
 ) -> Result<clients::WriteOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<RegistryState>();
-        let outcome = clients::uninstall_gateway(&client_id)?;
+        let mut outcome = clients::uninstall_gateway(&client_id)?;
         // Config entry is gone; also revoke the bridge bearer so a leftover backup or
         // stale token cannot keep authenticating (WS3-4). A vault or registry
         // failure must fail Disconnect — the bearer is still live (SBS-845).
@@ -656,7 +669,8 @@ async fn uninstall_gateway(
             reg.clear_client_managed_entry(&client_id);
             Ok(())
         })?;
-        clients::finish_uninstall(&client_id, &outcome)?;
+        let warnings = clients::finish_uninstall_with_warnings(&client_id, &outcome)?;
+        outcome.warnings.extend(warnings);
         Ok(outcome)
     })
     .await
@@ -4453,6 +4467,7 @@ pub fn run() {
             detect_clients,
             list_client_recoveries,
             retry_client_recovery,
+            discard_client_recovery,
             dismiss_client_recovery,
             client_location_types,
             add_client_location,

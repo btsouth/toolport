@@ -136,6 +136,21 @@ fn all_with_clients(
             error: result.err(),
         });
     }
+    // A corrupt receipt or saved-location store must not prevent the valid
+    // clients above from restoring, or disappear from noninteractive reports.
+    for row in recovery::list()? {
+        if let Some(error) = row.error {
+            if !results.iter().any(|result| result.path == row.backup_path) {
+                results.push(ClientResult {
+                    client_id: row.client_id,
+                    path: row.backup_path,
+                    dry_run,
+                    error: Some(error),
+                    warnings: Vec::new(),
+                });
+            }
+        }
+    }
     Ok(results)
 }
 
@@ -146,10 +161,13 @@ pub(super) fn restore_path(
     managed: Option<&ManagedEntry>,
 ) -> Result<Vec<String>, String> {
     backup_storage::reset_missing();
+    recovery_values::reset_progress();
     let (revision, used_move_record) = restore::run(id, path, format, || {
         mutation::disconnecting();
         restore::prepare_disconnect(id, path)?;
-        backup_file(id, path)?;
+        if !restore::pending_values(id, path)? {
+            backup_file(id, path)?;
+        }
         if !restore::apply(id, format, path)? {
             restore::check_legacy_gateway(format, path, managed)?;
             moved::restore(id, format, path)?;
@@ -177,7 +195,7 @@ pub(super) fn restore_path(
             )
         })
         .unwrap_or_default();
-    finish_uninstall(
+    let recovery_warnings = finish_uninstall_with_warnings(
         id,
         &WriteOutcome {
             path: path.to_string_lossy().into_owned(),
@@ -190,7 +208,7 @@ pub(super) fn restore_path(
             recovery_path: None,
         },
     )?;
-    warnings.extend(recovery::warnings(id, path));
+    warnings.extend(recovery_warnings);
     Ok(warnings)
 }
 

@@ -43,7 +43,15 @@ struct Envelope {
     #[serde(default)]
     reference_markers: Vec<usize>,
     #[serde(default)]
+    value_hashes: Vec<String>,
+    #[serde(default)]
+    source_config_path: Option<String>,
+    #[serde(default)]
     recovery_dismissed: Option<bool>,
+    #[serde(default)]
+    published_hash: Option<String>,
+    #[serde(default)]
+    exact_eligible: Option<bool>,
 }
 fn envelope(text: &str) -> Option<Envelope> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
@@ -55,6 +63,16 @@ fn envelope(text: &str) -> Option<Envelope> {
 
 // Rewrite string values, never syntax, field names, hashes or recovery paths.
 // Recurse through serialized config strings without reformatting their bytes.
+fn substitute(text: &str, from: &str, to: &str) -> String {
+    if from
+        .strip_prefix("TOOLPORT_MISSING_CREDENTIAL_")
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+    {
+        recovery_values::replace_markers(text, &[(from.into(), to.into())])
+    } else {
+        text.replace(from, to)
+    }
+}
 fn redact(text: &str, secret: &str, marker: &str, depth: usize) -> String {
     if depth > 8 {
         return text.into();
@@ -108,7 +126,7 @@ fn redact(text: &str, secret: &str, marker: &str, depth: usize) -> String {
                 }
             }
             let comment = &text[start..index];
-            let replacement = comment.replace(secret, marker);
+            let replacement = substitute(comment, secret, marker);
             if replacement != comment {
                 output.push_str(&text[cursor..start]);
                 output.push_str(&replacement);
@@ -153,6 +171,7 @@ fn redact(text: &str, secret: &str, marker: &str, depth: usize) -> String {
                 "configPath"
                     | "originalHash"
                     | "lastWrittenHash"
+                    | "publishedHash"
                     | "format"
                     | "toolportVersion"
                     | "vaultRecovery"
@@ -165,7 +184,7 @@ fn redact(text: &str, secret: &str, marker: &str, depth: usize) -> String {
             ) {
                 redact(&value, secret, marker, depth + 1)
             } else if value == secret || secret.len() >= 8 && value.contains(secret) {
-                value.replace(secret, marker)
+                substitute(&value, secret, marker)
             } else {
                 value.clone()
             };
@@ -207,6 +226,22 @@ pub(super) fn encode_recovery(
     path: &Path,
     text: &str,
     disconnecting: bool,
+) -> Result<String, String> {
+    encode_internal(path, text, disconnecting, None)
+}
+pub(super) fn encode_backup(
+    path: &Path,
+    text: &str,
+    disconnecting: bool,
+    source: &Path,
+) -> Result<String, String> {
+    encode_internal(path, text, disconnecting, Some(source))
+}
+fn encode_internal(
+    path: &Path,
+    text: &str,
+    disconnecting: bool,
+    source: Option<&Path>,
 ) -> Result<String, String> {
     let mut values = IMPORTS.with(|v| v.borrow().clone());
     if !missing() || !disconnecting {
@@ -262,7 +297,12 @@ pub(super) fn encode_recovery(
             retained_values.push(value);
             continue;
         }
-        let marker_index = references.len();
+        let mut marker_index = references.len();
+        while text.contains(&format!("TOOLPORT_MISSING_CREDENTIAL_{marker_index}"))
+            || reference_markers.contains(&marker_index)
+        {
+            marker_index += 1;
+        }
         let marker = format!("TOOLPORT_MISSING_CREDENTIAL_{marker_index}");
         let before = fallback.clone();
         fallback = redact(&fallback, &value, &marker, 0);
@@ -289,8 +329,11 @@ pub(super) fn encode_recovery(
             .ok_or("Invalid backup path")?,
     );
     let key = format!(
-        "{}-{hash}",
-        crate::registry::sha256_hex(&path.to_string_lossy())
+        "{}-{}{hash}",
+        crate::registry::sha256_hex(&path.to_string_lossy()),
+        source
+            .map(|p| format!("{}-", crate::registry::sha256_hex(&p.to_string_lossy())))
+            .unwrap_or_default()
     );
     // The complete byte spelling lives only in the vault. Publish the fallback
     // only after a verified vault write, before modifying the client's file.
@@ -310,7 +353,14 @@ pub(super) fn encode_recovery(
         fallback,
         references,
         reference_markers,
+        source_config_path: source.map(|p| p.to_string_lossy().into_owned()),
+        value_hashes: retained_values
+            .iter()
+            .map(|value| crate::registry::sha256_hex(value))
+            .collect(),
         recovery_dismissed: None,
+        published_hash: None,
+        exact_eligible: None,
     })
     .map_err(|e| e.to_string())
 }
@@ -321,7 +371,13 @@ pub(super) fn raw_metadata(text: &str) -> Result<(serde_json::Value, Vec<Referen
     let mut text = text.to_owned();
     let mut refs = Vec::new();
     let mut dismissed = None;
+    let mut issues = None;
+    let mut cleanup_state = None;
     for _ in 0..8 {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            issues = issues.or_else(|| value.get("recoveryIssues").cloned());
+            cleanup_state = cleanup_state.or_else(|| value.get("recoveryCleanupState").cloned());
+        }
         if let Some(saved) = envelope(&text) {
             dismissed = dismissed.or(saved.recovery_dismissed);
             refs.extend(saved.references);
@@ -329,7 +385,7 @@ pub(super) fn raw_metadata(text: &str) -> Result<(serde_json::Value, Vec<Referen
             continue;
         }
         let mut value: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            serde_json::from_str(&text).map_err(|e| diagnostics::json(&e))?;
         dismissed = dismissed.or(value["recoveryDismissed"].as_bool());
         if let Some(recovery) = value["vaultRecovery"].as_str() {
             if let Some(saved) = envelope(recovery) {
@@ -337,28 +393,48 @@ pub(super) fn raw_metadata(text: &str) -> Result<(serde_json::Value, Vec<Referen
             }
         }
         value["recoveryDismissed"] = dismissed.unwrap_or(false).into();
+        if let Some(issues) = issues {
+            value["recoveryIssues"] = issues;
+        }
+        if let Some(state) = cleanup_state {
+            value["recoveryCleanupState"] = state;
+        }
         refs.sort_by(|a, b| (&a.server, &a.key).cmp(&(&b.server, &b.key)));
         refs.dedup_by(|a, b| a.server == b.server && a.key == b.key);
         return Ok((value, refs));
     }
     Err("Client recovery metadata is nested too deeply".into())
 }
-fn merge_dismissal(payload: String, dismissed: Option<bool>) -> Result<String, String> {
-    let Some(dismissed) = dismissed else {
+fn merge_recovery_metadata(
+    payload: String,
+    dismissed: Option<bool>,
+    published: Option<&str>,
+    eligible: Option<bool>,
+) -> Result<String, String> {
+    if dismissed.is_none() && published.is_none() && eligible.is_none() {
         return Ok(payload);
-    };
+    }
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&payload) else {
         return Ok(payload);
     };
     if value.get("originalHash").is_none() {
         return Ok(payload);
     }
-    value["recoveryDismissed"] = dismissed.into();
-    serde_json::to_string(&value).map_err(|e| e.to_string())
+    if let Some(dismissed) = dismissed {
+        value["recoveryDismissed"] = dismissed.into();
+    }
+    if let Some(published) = published {
+        value["publishedHash"] = published.into();
+    }
+    if let Some(eligible) = eligible {
+        value["exactEligible"] = eligible.into();
+    }
+    serde_json::to_string(&value).map_err(|e| diagnostics::json(&e))
 }
 pub(super) fn set_dismissed(path: &Path, dismissed: bool) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let mut value: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| diagnostics::json(&e))?;
     value["recoveryDismissed"] = dismissed.into();
     crate::registry::atomic_write(
         path,
@@ -372,9 +448,27 @@ pub(super) fn decode(text: &str) -> Result<String, String> {
     };
     match crate::secrets::get_backup_secret_result(&saved.account, &saved.key) {
         Ok(Some(payload)) if crate::registry::sha256_hex(&payload) == saved.hash => {
-            merge_dismissal(payload, saved.recovery_dismissed)
+            merge_recovery_metadata(
+                payload,
+                saved.recovery_dismissed,
+                saved.published_hash.as_deref(),
+                saved.exact_eligible,
+            )
         }
-        _ => {
+        result => {
+            // A missing/damaged full payload can still be reconstructed exactly
+            // from its independent copies. The full hash authenticates legacy
+            // envelopes too; no partial unauthenticated copy is ever accepted.
+            if matches!(result, Ok(None) | Ok(Some(_))) {
+                if let Some(payload) = verified_copy_payload(&saved) {
+                    return merge_recovery_metadata(
+                        payload,
+                        saved.recovery_dismissed,
+                        saved.published_hash.as_deref(),
+                        saved.exact_eligible,
+                    );
+                }
+            }
             MISSING.with(|v| *v.borrow_mut() = true);
             for reference in &saved.references {
                 let warning = crate::i18n::trf(
@@ -407,10 +501,47 @@ pub(super) fn decode(text: &str) -> Result<String, String> {
                     fallback = serde_json::to_string(&record).map_err(|e| e.to_string())?;
                 }
             }
-            merge_dismissal(fallback, saved.recovery_dismissed)
+            merge_recovery_metadata(
+                fallback,
+                saved.recovery_dismissed,
+                saved.published_hash.as_deref(),
+                saved.exact_eligible,
+            )
         }
     }
 }
+fn verified_copy_payload(saved: &Envelope) -> Option<String> {
+    let mut payload = saved.fallback.clone();
+    for (index, reference) in saved.references.iter().enumerate() {
+        let copy = crate::secrets::backup_secret_status(
+            &saved.account,
+            &format!("{}-credential-{index}", saved.key),
+        )
+        .ok()
+        .flatten();
+        let value = copy
+            .filter(|value| {
+                saved
+                    .value_hashes
+                    .get(index)
+                    .is_none_or(|hash| crate::registry::sha256_hex(value) == *hash)
+            })
+            .or_else(|| {
+                crate::secrets::backup_secret_status(&reference.server, &reference.key)
+                    .ok()
+                    .flatten()
+                    .filter(|v| {
+                        saved
+                            .value_hashes
+                            .get(index)
+                            .is_some_and(|h| crate::registry::sha256_hex(v) == *h)
+                    })
+            })?;
+        payload = redact(&payload, &marker(saved, index), &value, 0);
+    }
+    (crate::registry::sha256_hex(&payload) == saved.hash).then_some(payload)
+}
+
 pub(super) fn read(path: &Path) -> Result<String, std::io::Error> {
     let text = std::fs::read_to_string(path)?;
     decode(&text).map_err(std::io::Error::other)
@@ -422,6 +553,7 @@ pub(super) fn reset_missing() {
     MISSING.with(|v| *v.borrow_mut() = false);
     WARNINGS.with(|v| v.borrow_mut().clear());
 }
+#[cfg(test)]
 pub(super) fn warnings() -> Vec<String> {
     WARNINGS.with(|v| v.borrow().clone())
 }
@@ -434,8 +566,33 @@ pub(crate) fn install_account(dir: &Path) -> String {
     )
 }
 pub(super) fn release(path: &Path) -> Result<(), String> {
-    if let Ok(text) = std::fs::read_to_string(path) {
-        if let Some(mut saved) = envelope(&text) {
+    release_owned(path, false)
+}
+pub(super) fn release_for_discard(path: &Path) -> Result<(), String> {
+    release_owned(path, true)
+}
+fn release_owned(path: &Path, discard_all: bool) -> Result<(), String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("Could not inspect the recovery file; saved copies retained".into()),
+    };
+    if !metadata.is_file() || crate::purge::is_link(&metadata) {
+        return Err("Recovery file is not a regular file; saved copies retained".into());
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|_| "Could not read the recovery file; saved copies retained")?;
+    fn release_text(
+        path: &Path,
+        text: &str,
+        depth: usize,
+        discard_all: bool,
+    ) -> Result<(), String> {
+        if depth > 8 {
+            return Err("Client recovery metadata is nested too deeply".into());
+        }
+        if let Some(mut saved) = envelope(text) {
+            let fallback = saved.fallback.clone();
             let Some(dir) = path.parent().and_then(Path::parent).and_then(Path::parent) else {
                 return Ok(());
             };
@@ -457,17 +614,30 @@ pub(super) fn release(path: &Path) -> Result<(), String> {
                 if !key.starts_with(&prefix) {
                     continue;
                 }
-                crate::secrets::delete_backup_secret(&saved.account, &key)?;
+                crate::secrets::delete_backup_secret_copies_status(
+                    &saved.account,
+                    &key,
+                    discard_all,
+                )
+                .map_err(|e| recovery::next_step(e, false))?;
                 for index in 0..count {
-                    crate::secrets::delete_backup_secret(
+                    crate::secrets::delete_backup_secret_copies_status(
                         &saved.account,
                         &format!("{key}-credential-{index}"),
-                    )?;
+                        discard_all,
+                    )
+                    .map_err(|e| recovery::next_step(e, false))?;
                 }
             }
+            release_text(path, &fallback, depth + 1, discard_all)?;
+        } else if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+            if let Some(inner) = value["vaultRecovery"].as_str() {
+                release_text(path, inner, depth + 1, discard_all)?;
+            }
         }
+        Ok(())
     }
-    Ok(())
+    release_text(path, &text, 0, discard_all)
 }
 
 fn owned_backup_paths() -> Result<Vec<PathBuf>, String> {
@@ -1081,4 +1251,294 @@ mod tests {
         assert_eq!(result["originalHash"], "keep1");
         assert_eq!(result["configPath"], "/keep1");
     }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryIssue {
+    pub reference: Reference,
+    pub marker: String,
+    pub state: crate::secrets::BackupSecretError,
+}
+pub(super) struct RecoveryValue {
+    pub reference: Reference,
+    pub marker: String,
+    pub secret: Option<String>,
+    pub state: crate::secrets::BackupSecretError,
+}
+fn marker(saved: &Envelope, index: usize) -> String {
+    format!(
+        "TOOLPORT_MISSING_CREDENTIAL_{}",
+        saved.reference_markers.get(index).copied().unwrap_or(index)
+    )
+}
+fn envelopes(text: &str, out: &mut Vec<Envelope>, depth: usize) -> Result<(), String> {
+    if depth > 8 {
+        return Err("Client recovery metadata is nested too deeply".into());
+    }
+    if let Some(saved) = envelope(text) {
+        let fallback = saved.fallback.clone();
+        out.push(saved);
+        envelopes(&fallback, out, depth + 1)?;
+    } else {
+        let value: serde_json::Value =
+            serde_json::from_str(text).map_err(|e| diagnostics::json(&e))?;
+        if let Some(inner) = value["vaultRecovery"].as_str() {
+            envelopes(inner, out, depth + 1)?;
+        }
+    }
+    Ok(())
+}
+pub(super) fn raw_markers(text: &str) -> Result<Vec<(Reference, String)>, String> {
+    let mut saved = Vec::new();
+    envelopes(text, &mut saved, 0)?;
+    Ok(saved
+        .iter()
+        .flat_map(|saved| {
+            saved
+                .references
+                .iter()
+                .enumerate()
+                .map(|(index, r)| (r.clone(), marker(saved, index)))
+        })
+        .collect())
+}
+// Infer a missing duplicate only from the verified full payload, never from an
+// unauthenticated independent copy. Nested config strings retain their spelling.
+fn infer_value(fallback: &str, payload: &str, marker: &str) -> Option<String> {
+    fn strings(f: &str, p: &str, m: &str) -> Option<String> {
+        if f == p || !recovery_values::contains_marker(f, m) {
+            return None;
+        }
+        let ranges = recovery_values::marker_ranges(f, m);
+        let mut pieces = Vec::new();
+        let mut cursor = 0;
+        for range in ranges {
+            pieces.push(&f[cursor..range.start]);
+            cursor = range.end;
+        }
+        pieces.push(&f[cursor..]);
+        let n = pieces.len() - 1;
+        let fixed: usize = pieces.iter().map(|s| s.len()).sum();
+        if let Some(size) = p
+            .len()
+            .checked_sub(fixed)
+            .filter(|nbytes| nbytes % n == 0)
+            .map(|nbytes| nbytes / n)
+        {
+            let start = pieces[0].len();
+            if let Some(value) = p.get(start..start + size) {
+                if substitute(f, m, value) == p {
+                    return Some(value.into());
+                }
+            }
+        }
+        for parse in [0, 1, 2] {
+            let parse_value = |text: &str| -> Option<serde_json::Value> {
+                match parse {
+                    0 => json5::from_str(text).ok(),
+                    1 => serde_json::to_value(toml::from_str::<toml::Value>(text).ok()?).ok(),
+                    _ => {
+                        serde_json::to_value(serde_yaml::from_str::<serde_yaml::Value>(text).ok()?)
+                            .ok()
+                    }
+                }
+            };
+            if let (Some(f), Some(p)) = (parse_value(f), parse_value(p)) {
+                if f.is_object() || f.is_array() {
+                    if let Some(v) = walk(&f, &p, m) {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+        None
+    }
+    fn walk(f: &serde_json::Value, p: &serde_json::Value, m: &str) -> Option<String> {
+        match (f, p) {
+            (serde_json::Value::String(f), serde_json::Value::String(p)) => strings(f, p, m),
+            (serde_json::Value::Object(f), serde_json::Value::Object(p)) => {
+                f.iter().find_map(|(k, v)| walk(v, p.get(k)?, m))
+            }
+            (serde_json::Value::Array(f), serde_json::Value::Array(p)) => {
+                f.iter().zip(p).find_map(|(f, p)| walk(f, p, m))
+            }
+            _ => None,
+        }
+    }
+    strings(fallback, payload, marker)
+}
+pub(super) fn recovery_values(path: &Path) -> Result<Vec<RecoveryValue>, String> {
+    use crate::secrets::{backup_secret_status as get, BackupSecretError as State};
+    let text =
+        std::fs::read_to_string(path).map_err(|_| "Could not read the saved recovery file")?;
+    let mut saved = Vec::new();
+    envelopes(&text, &mut saved, 0)?;
+    let mut values: Vec<RecoveryValue> = Vec::new();
+    for saved in saved {
+        let payload = get(&saved.account, &saved.key);
+        let valid = payload
+            .as_ref()
+            .ok()
+            .and_then(|s| s.as_ref())
+            .filter(|s| crate::registry::sha256_hex(s) == saved.hash);
+        let full_state = match &payload {
+            Ok(Some(_)) => State::Corrupt,
+            Ok(None) => State::Missing,
+            Err(state) => *state,
+        };
+        let mut copies = Vec::new();
+        for (i, _) in saved.references.iter().enumerate() {
+            copies.push(get(
+                &saved.account,
+                &format!("{}-credential-{i}", saved.key),
+            ));
+        }
+        // Old envelopes had no individual hashes. Accept their copies together
+        // only if they reconstruct the authenticated payload exactly.
+        let legacy_valid = if saved.value_hashes.is_empty() {
+            let mut recovered = saved.fallback.clone();
+            let mut all = true;
+            for (i, copy) in copies.iter().enumerate() {
+                if let Ok(Some(value)) = copy {
+                    recovered = redact(&recovered, &marker(&saved, i), value, 0);
+                } else {
+                    all = false;
+                }
+            }
+            all && crate::registry::sha256_hex(&recovered) == saved.hash
+        } else {
+            false
+        };
+        for (i, reference) in saved.references.iter().enumerate() {
+            let m = marker(&saved, i);
+            let inferred = valid.and_then(|p| infer_value(&saved.fallback, p, &m));
+            let copy = copies[i].as_ref().ok().and_then(|v| v.clone());
+            let authenticated = |v: &String| {
+                saved
+                    .value_hashes
+                    .get(i)
+                    .is_some_and(|h| crate::registry::sha256_hex(v) == *h)
+                    || legacy_valid
+            };
+            let source = if inferred.is_none() && copy.as_ref().is_none_or(|v| !authenticated(v)) {
+                get(&reference.server, &reference.key)
+                    .ok()
+                    .flatten()
+                    .filter(authenticated)
+            } else {
+                None
+            };
+            let secret = inferred.or_else(|| copy.filter(authenticated)).or(source);
+            let state = if secret.is_some() {
+                State::Unchecked
+            } else {
+                match &copies[i] {
+                    Err(state) => *state,
+                    Ok(Some(_)) => State::Corrupt,
+                    Ok(None) => full_state,
+                }
+            };
+            values.push(RecoveryValue {
+                reference: reference.clone(),
+                marker: m,
+                secret,
+                state,
+            });
+        }
+    }
+    // Shared values may have several references. One authenticated copy is
+    // sufficient for their shared marker; conflicting authenticated copies aren't.
+    for i in 0..values.len() {
+        let candidates: Vec<_> = values
+            .iter()
+            .filter(|v| v.marker == values[i].marker)
+            .filter_map(|v| v.secret.clone())
+            .collect();
+        if candidates.windows(2).any(|pair| pair[0] != pair[1]) {
+            values[i].secret = None;
+            values[i].state = State::Ambiguous;
+        } else if let Some(secret) = candidates.first() {
+            values[i].secret = Some(secret.clone());
+        }
+    }
+    Ok(values)
+}
+pub(super) fn set_issues(path: &Path, issues: &[RecoveryIssue]) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|_| "Could not update recovery status")?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| diagnostics::json(&e))?;
+    value["recoveryIssues"] = serde_json::to_value(issues).map_err(|e| diagnostics::json(&e))?;
+    crate::registry::atomic_write(
+        path,
+        &serde_json::to_string(&value).map_err(|e| diagnostics::json(&e))?,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn test_recovery_key(path: &Path) -> (String, String, usize) {
+    let raw = std::fs::read_to_string(path).unwrap();
+    let mut records = Vec::new();
+    envelopes(&raw, &mut records, 0).unwrap();
+    let record = records.last().unwrap();
+    (
+        record.account.clone(),
+        record.key.clone(),
+        record.references.len(),
+    )
+}
+
+pub(super) fn source_path(path: &Path) -> Result<Option<String>, String> {
+    let raw = std::fs::read_to_string(path).map_err(|_| "Could not inspect saved recovery copy")?;
+    let Some(saved) = envelope(&raw) else {
+        return Ok(None);
+    };
+    if let Some(source) = saved.source_config_path {
+        let expected = format!(
+            "{}-{}-{}",
+            crate::registry::sha256_hex(&path.to_string_lossy()),
+            crate::registry::sha256_hex(&source),
+            saved.hash
+        );
+        if saved.key != expected {
+            return Err("Saved recovery copy has conflicting path provenance".into());
+        }
+        Ok(Some(source))
+    } else {
+        Ok(None)
+    }
+}
+
+pub(super) fn set_cleanup_state(
+    path: &Path,
+    state: crate::secrets::BackupSecretError,
+) -> Result<(), String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|_| "Could not update saved recovery status")?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| diagnostics::json(&e))?;
+    value["recoveryCleanupState"] =
+        serde_json::to_value(state).map_err(|e| diagnostics::json(&e))?;
+    crate::registry::atomic_write(
+        path,
+        &serde_json::to_string(&value).map_err(|e| diagnostics::json(&e))?,
+    )
+}
+
+pub(super) fn remember_pending_revision(
+    path: &Path,
+    raw: &str,
+    published: Option<&str>,
+    eligible: bool,
+) -> Result<(), String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| diagnostics::json(&e))?;
+    value["publishedHash"] = published
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null);
+    value["exactEligible"] = eligible.into();
+    crate::registry::atomic_write(
+        path,
+        &serde_json::to_string(&value).map_err(|e| diagnostics::json(&e))?,
+    )
 }

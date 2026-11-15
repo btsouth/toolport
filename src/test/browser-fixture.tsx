@@ -1026,6 +1026,7 @@ mockIPC(
       case "retry_client_recovery":
         return null;
       case "dismiss_client_recovery":
+      case "discard_client_recovery":
         return null;
       case "detect_clients":
         return [
