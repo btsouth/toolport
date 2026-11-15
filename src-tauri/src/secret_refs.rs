@@ -1477,22 +1477,29 @@ mod tests {
                 {"key":"API_KEY","value":"abcd1234efgh"},
                 {"key":"DB_PASSWORD","value":"postgres://app:pw-Zx81kq@db.example.invalid/app"},
                 {"key":"HOOK_TOKEN","value":"https://hooks.example.invalid/services/abcdEFGHijklMNOPqrst"},
+                {"key":"AUTH_METHOD","value":"password"},
+                {"key":"OAUTH_FLOW","value":"authorization_code"},
+                {"key":"AUTH_PROVIDER","value":"github-oauth"},
+                {"key":"TOKEN_TYPE","value":"bearer_token"},
+                {"key":"KEY_FILE","value":"keys.json"},
+                {"key":"GITHUB_TOKEN","value":"correcthorsebatterystaple"},
+                {"key":"API_KEY_OVERRIDE","value":"abcd1234efgh5678ijkl"},
                 {"key":"PIN","value":"4821","secret":true}
             ]}"#,
         )
         .unwrap();
         super::register_inline_secrets(&server);
-        let ordinary = r#"{"enabled": true, "ttl": 3600, "min": 8, "use": 1} /var/cache/tokens https://auth.example.invalid/login 1500ms"#;
+        let ordinary = r#"{"enabled": true, "ttl": 3600, "min": 8, "use": 1} /var/cache/tokens https://auth.example.invalid/login 1500ms password authorization_code github-oauth bearer_token keys.json"#;
         let kept = crate::secret_redact::redact_text(ordinary).into_owned();
         let secrets = crate::secret_redact::redact_text(
-            "key abcd1234efgh pass postgres://app:pw-Zx81kq@db.example.invalid/app hook https://hooks.example.invalid/services/abcdEFGHijklMNOPqrst pin 4821",
+            "key abcd1234efgh pass postgres://app:pw-Zx81kq@db.example.invalid/app hook https://hooks.example.invalid/services/abcdEFGHijklMNOPqrst pin 4821 gh correcthorsebatterystaple override abcd1234efgh5678ijkl",
         )
         .into_owned();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(kept, ordinary);
         assert_eq!(
             secrets,
-            "key [secret:API_KEY] pass [secret:DB_PASSWORD] hook [secret:HOOK_TOKEN] pin [secret:PIN]"
+            "key [secret:API_KEY] pass [secret:DB_PASSWORD] hook [secret:HOOK_TOKEN] pin [secret:PIN] gh [secret:GITHUB_TOKEN] override [secret:API_KEY_OVERRIDE]"
         );
     }
 
