@@ -159,14 +159,15 @@ const BASE64_ENGINES: [&base64::engine::GeneralPurpose; 4] = [
 /// it, in both alphabets. A character covers six bits; it is stable when all six
 /// fall inside the value's bytes, so the first `ceil(8k/6)` characters (the
 /// prefix's influence) and the last partial one (the suffix's) are dropped.
-fn base64_inner(value: &[u8]) -> Vec<String> {
+/// Strings shorter than `min_chars` are dropped ([`MIN_BASE64_INNER_CHARS`]).
+fn base64_inner_with(value: &[u8], min_chars: usize) -> Vec<String> {
     let mut out = Vec::new();
     for k in 0..3usize {
         let mut shifted = vec![0u8; k];
         shifted.extend_from_slice(value);
         let start = (8 * k).div_ceil(6);
         let end = 8 * (k + value.len()) / 6;
-        if end <= start || end - start < MIN_BASE64_INNER_CHARS {
+        if end <= start || end - start < min_chars {
             continue;
         }
         for engine in [
@@ -180,10 +181,47 @@ fn base64_inner(value: &[u8]) -> Vec<String> {
     out
 }
 
+#[cfg(test)]
+fn base64_inner(value: &[u8]) -> Vec<String> {
+    base64_inner_with(value, MIN_BASE64_INNER_CHARS)
+}
+
 /// Length of the windows [`fragment_windows`] takes from a secret.
 pub const FRAGMENT_CHARS: usize = 8;
 /// Secrets at least this long are also matched by fragment.
 pub const FRAGMENT_MIN_SECRET_CHARS: usize = 12;
+
+/// The length thresholds a [`Matcher`] is built with. Production always uses
+/// [`Thresholds::default`] (the constants above); other values exist only so
+/// the secret-redact-false-positives example can measure each one.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct Thresholds {
+    /// [`FRAGMENT_CHARS`].
+    pub fragment_chars: usize,
+    /// [`FRAGMENT_MIN_SECRET_CHARS`]; `usize::MAX` turns fragment windows off.
+    pub fragment_min_secret_chars: usize,
+    /// Edge length for [`Matcher::redact_fragment`] ([`SHORT_SECRET_CHARS`]);
+    /// `usize::MAX` turns dangling-edge removal off.
+    pub edge_chars: usize,
+    /// [`MIN_BASE64_INNER_CHARS`]; `usize::MAX` turns embedded base64 off.
+    pub base64_inner_chars: usize,
+    /// Count upper- and lowercase letters as one class when choosing windows,
+    /// so a window must hold a digit or a symbol. Off in production.
+    pub letters_one_class: bool,
+}
+
+impl Default for Thresholds {
+    fn default() -> Self {
+        Self {
+            fragment_chars: FRAGMENT_CHARS,
+            fragment_min_secret_chars: FRAGMENT_MIN_SECRET_CHARS,
+            edge_chars: SHORT_SECRET_CHARS,
+            base64_inner_chars: MIN_BASE64_INNER_CHARS,
+            letters_one_class: false,
+        }
+    }
+}
 
 /// Every [`FRAGMENT_CHARS`]-character window of a secret of at least
 /// [`FRAGMENT_MIN_SECRET_CHARS`], so any piece of it that long is found wherever it
@@ -196,17 +234,24 @@ pub const FRAGMENT_MIN_SECRET_CHARS: usize = 12;
 /// state) or an auth header with its scheme would otherwise turn `https://`,
 /// `{"access_` or `Bearer a` into markers everywhere. The secrets inside them are
 /// registered on their own and windowed there.
-fn fragment_windows(value: &str) -> Vec<String> {
+fn fragment_windows(value: &str, t: &Thresholds) -> Vec<String> {
     let chars: Vec<char> = value.chars().collect();
-    if chars.len() < FRAGMENT_MIN_SECRET_CHARS || is_container(value) {
+    if chars.len() < t.fragment_min_secret_chars || is_container(value) {
         return Vec::new();
     }
     chars
-        .windows(FRAGMENT_CHARS)
+        .windows(t.fragment_chars.max(1))
         .filter(|window| {
+            let lower = window.iter().any(|c| c.is_lowercase());
+            let upper = window.iter().any(|c| c.is_uppercase());
+            let (lower, upper) = if t.letters_one_class {
+                (lower || upper, false)
+            } else {
+                (lower, upper)
+            };
             let classes = [
-                window.iter().any(|c| c.is_lowercase()),
-                window.iter().any(|c| c.is_uppercase()),
+                lower,
+                upper,
                 window.iter().any(|c| c.is_numeric()),
                 window
                     .iter()
@@ -288,7 +333,7 @@ fn case_free_forms(value: &str) -> Vec<String> {
     out
 }
 
-fn variants(value: &str) -> Vec<String> {
+fn variants(value: &str, t: &Thresholds) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let push = |v: String, out: &mut Vec<String>| {
         if !v.is_empty() && !out.contains(&v) {
@@ -317,7 +362,7 @@ fn variants(value: &str) -> Vec<String> {
     for engine in BASE64_ENGINES {
         push(engine.encode(format!(":{value}")), &mut out);
     }
-    for inner in base64_inner(value.as_bytes()) {
+    for inner in base64_inner_with(value.as_bytes(), t.base64_inner_chars) {
         push(inner, &mut out);
     }
     out
@@ -416,6 +461,17 @@ impl Matcher {
         secrets: &[(N, V)],
         whole_only: &HashSet<String>,
     ) -> Self {
+        Self::new_tuned(secrets, whole_only, &Thresholds::default())
+    }
+
+    /// [`Matcher::new_with`] with other [`Thresholds`]; for measurement only.
+    #[doc(hidden)]
+    pub fn new_tuned<N: AsRef<str>, V: AsRef<str>>(
+        secrets: &[(N, V)],
+        whole_only: &HashSet<String>,
+        t: &Thresholds,
+    ) -> Self {
+        let edge_chars = t.edge_chars;
         let mut names: Vec<String> = Vec::new();
         let mut raw_patterns: Vec<(String, Pattern)> = Vec::new();
         let mut seen = HashSet::new();
@@ -437,7 +493,7 @@ impl Matcher {
             // A short secret keeps the whole-token rule in every encoding: its hex or
             // base64 is long enough to look specific but is still only a few bytes.
             let short = value.chars().count() < SHORT_SECRET_CHARS;
-            for variant in variants(value) {
+            for variant in variants(value, t) {
                 if seen.insert(variant.clone()) {
                     let whole_token = short || variant.chars().count() < SHORT_SECRET_CHARS;
                     raw_patterns.push((
@@ -453,7 +509,7 @@ impl Matcher {
             let windows = if whole_only.contains(value) {
                 Vec::new()
             } else {
-                fragment_windows(value)
+                fragment_windows(value, t)
             };
             for window in windows {
                 if seen.insert(window.clone()) {
@@ -490,18 +546,18 @@ impl Matcher {
             .unwrap_or(0);
         let edge_patterns = || {
             raw_patterns.iter().enumerate().filter(|(_, (text, meta))| {
-                !meta.whole_token && !meta.fragment && text.chars().count() > SHORT_SECRET_CHARS
+                !meta.whole_token && !meta.fragment && text.chars().count() > edge_chars
             })
         };
         let heads = edge_index(
             edge_patterns()
-                .map(|(i, (text, _))| (text.chars().take(SHORT_SECRET_CHARS).collect(), i))
+                .map(|(i, (text, _))| (text.chars().take(edge_chars).collect(), i))
                 .collect(),
         );
         let tails = edge_index(
             edge_patterns()
                 .map(|(i, (text, _))| {
-                    let skip = text.chars().count() - SHORT_SECRET_CHARS;
+                    let skip = text.chars().count() - edge_chars;
                     (text.chars().skip(skip).collect(), i)
                 })
                 .collect(),
