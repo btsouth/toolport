@@ -247,7 +247,10 @@ pub(super) fn t3_code_badge_tooltip(uses: &[crate::clients::T3CodeUse]) -> Strin
                     &[("name", &instance.display_name)],
                 )
             } else {
-                crate::i18n::trf("{name} is off in T3 Code", &[("name", &instance.display_name)])
+                crate::i18n::trf(
+                    "{name} is off in T3 Code",
+                    &[("name", &instance.display_name)],
+                )
             }
         })
         .collect::<Vec<_>>()

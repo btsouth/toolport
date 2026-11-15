@@ -544,7 +544,9 @@ fn instance_of(id: &str, provider: Provider, raw: RawInstance, home: &Path) -> O
             .map(|dir| claude_code_config_path(&dir)),
         // A shadow home links the shared home's config.toml (T3 Code's
         // CodexHomeLayout), so the instance reads the shared home's MCP servers.
-        Provider::Codex => home_or("CODEX_HOME").ok()?.map(|dir| codex_config_path(&dir)),
+        Provider::Codex => home_or("CODEX_HOME")
+            .ok()?
+            .map(|dir| codex_config_path(&dir)),
         Provider::OpenCode => folder(environment_value(&raw.environment, "XDG_CONFIG_HOME"))
             .ok()?
             .map(|dir| dir.join("opencode").join("opencode.json")),
