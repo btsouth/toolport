@@ -50,7 +50,6 @@ fn details_expander(title: &str) -> (gtk::Expander, gtk::Box) {
 
 // Keep all reviewed dialog fields and its confirmation callback together.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub(super) fn review(
     parent: &gtk::Window,
     title: &str,
