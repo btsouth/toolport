@@ -559,6 +559,9 @@ fn t3_homes_without_launchers_become_locations_once() {
         ),
     )
     .unwrap();
+    // `automatic` reads the saved locations, so the data folder must be a scratch one.
+    let _lock = crate::registry::data_dir_test_lock();
+    let _data = crate::registry::DataDirOverride::set(root.join("data"));
     let _home = TestHome::set(&home);
     let real = std::fs::canonicalize(&home).unwrap();
     let known = vec![locations::ClientLocation {
