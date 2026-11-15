@@ -75,6 +75,13 @@ func walk(_ el: AXUIElement, _ depth: Int, _ maxDepth: Int, _ visit: (AXUIElemen
     for c in children(el) { walk(c, depth + 1, maxDepth, visit) }
 }
 
+func walkSkipping(_ el: AXUIElement, _ depth: Int, _ maxDepth: Int, skipMenuBar: Bool, _ visit: (AXUIElement, Int) -> Void) {
+    if skipMenuBar && str(el, kAXRoleAttribute) == "AXMenuBar" { return }
+    visit(el, depth)
+    if depth >= maxDepth { return }
+    for c in children(el) { walkSkipping(c, depth + 1, maxDepth, skipMenuBar: skipMenuBar, visit) }
+}
+
 func appElement(_ pidArg: String) -> AXUIElement {
     guard let pid = pid_t(pidArg) else { die("bad pid \(pidArg)") }
     let app = AXUIElementCreateApplication(pid)
@@ -90,7 +97,10 @@ func matches(_ pidArg: String, _ text: String, roles: Set<String>? = nil) -> [AX
     let needle = text.lowercased()
     var exact: [AXUIElement] = []
     var partial: [AXUIElement] = []
-    walk(appElement(pidArg), 0, 60) { el, _ in
+    // Menu bars are skipped unless TPUI_MENUS=1: a partial match must never
+    // land on a system menu item such as "System Settings…".
+    let menus = ProcessInfo.processInfo.environment["TPUI_MENUS"] == "1"
+    walkSkipping(appElement(pidArg), 0, 60, skipMenuBar: !menus) { el, _ in
         let role = str(el, kAXRoleAttribute)
         if let roles = roles, !roles.contains(role) { return }
         let parts = [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute, kAXPlaceholderValueAttribute, kAXHelpAttribute]

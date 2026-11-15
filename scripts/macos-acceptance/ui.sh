@@ -18,9 +18,12 @@ ui_evidence() {
   shot "fail-$UI_FAILS-$(_slug "$why")" >/dev/null || true
 }
 
+# Bring the window forward and wait until its web content is exposed to
+# accessibility (the sidebar's Servers button), which takes a moment after launch.
 ui_activate() {
   tmo 15 osascript -e 'tell application id "com.tsout.conduit" to activate' >/dev/null 2>&1 || true
   sleep 0.5
+  ui_wait "Servers" 30 || true
 }
 
 # ui_wait <text> [seconds]: wait until an element labelled <text> exists.

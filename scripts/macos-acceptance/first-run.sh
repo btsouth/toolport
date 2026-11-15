@@ -115,7 +115,7 @@ if tpui menubar "$PID" >"$EVIDENCE/logs/ax-menubar-$LABEL.txt" 2>&1; then
     tpui click $((${xy% *} + 12)) $((${xy#* } + 12)) >/dev/null 2>&1
     sleep 1.5
     shot "$LABEL-tray-menu" >/dev/null || true
-    if tpui find "$PID" "Quit Toolport" >"$EVIDENCE/logs/tray-menu-$LABEL.txt" 2>&1; then
+    if TPUI_MENUS=1 tpui find "$PID" "Quit Toolport" >"$EVIDENCE/logs/tray-menu-$LABEL.txt" 2>&1; then
       pass "menu bar item opens its menu" "has Quit Toolport (screenshots/$LABEL-tray-menu.png)"
     else
       fail "menu bar item opens its menu" "no Quit Toolport item after clicking it (screenshots/$LABEL-tray-menu.png)"

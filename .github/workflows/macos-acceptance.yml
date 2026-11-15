@@ -186,7 +186,7 @@ jobs:
 
   current-ref:
     name: Build from this ref (unsigned)
-    if: ${{ inputs.build_ref }}
+    if: ${{ inputs.build_ref || github.event_name == 'pull_request' }}
     runs-on: macos-latest
     timeout-minutes: 90
     # Same CI-only release-profile overrides as ci.yml's macOS payload job.
