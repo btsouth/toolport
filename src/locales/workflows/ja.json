@@ -417,8 +417,10 @@
   "Toolport still could not read the missing values. Unlock your keyring, then choose Retry.": "Toolport はまだ不足している値を読み取れませんでした。キーリングのロックを解除してから「再試行」を選んでください。",
   "The recovery stopped unexpectedly. Choose Retry to try again.": "復元が予期せず停止しました。「再試行」を選んでやり直してください。",
   "{key} for {server}": "{server} の {key}",
-  "{client} is disconnected and its original config is back, except values Toolport could not read because your keyring is locked or unavailable: {values}. The config has placeholders for those values for now.": "{client} は切断され、元の設定が復元されました。ただし、キーリングがロックされているか利用できないため、Toolport が読み取れなかった値があります: {values}。設定内の該当箇所には現在、仮の値が入っています。",
-  "Unlock your keyring, then choose Retry to put the values back. From a terminal, run toolport-gateway --disconnect-all again.": "キーリングのロックを解除してから「再試行」を選ぶと、値を元に戻せます。ターミナルでは toolport-gateway --disconnect-all をもう一度実行してください。",
-  "{client} recovery backup is kept at {path} until recovery succeeds or you remove Toolport data. It does not expire automatically.": "{client} の復元用バックアップは、復元が成功するか Toolport のデータを削除するまで {path} に保存されます。自動的に期限切れになることはありません。",
-  "{client} still has values waiting for recovery. Choose Retry on the Clients page before removing this location.": "{client} にはまだ復元待ちの値があります。この場所を削除する前に、クライアントページで「再試行」を選んでください。"
+  "{client} still has values waiting for recovery. Choose Retry on the Clients page before removing this location.": "{client} にはまだ復元待ちの値があります。この場所を削除する前に、クライアントページで「再試行」を選んでください。",
+  "{client} is disconnected.\n\nIts original config is back, except for values Toolport could not read because your keyring is locked or unavailable:\n\n{values}\n\nThe config has placeholders for these values for now.": "{client} は切断されています。\n\n元の設定は復元されましたが、キーリングがロックされているか利用できないため、Toolport が読み取れなかった値があります:\n\n{values}\n\n設定内の該当箇所には現在、仮の値が入っています。",
+  "Unlock your keyring, then choose Retry to put the values back.": "キーリングのロックを解除してから「再試行」を選ぶと、値を元に戻せます。",
+  "{client} recovery backup is kept at:\n{path}\nIt is kept until recovery succeeds or you remove Toolport data. It does not expire automatically.": "{client} の復元用バックアップは次の場所に保存されています:\n{path}\n復元が成功するか Toolport のデータを削除するまで保存されます。自動的に期限切れになることはありません。",
+  "Config file:\n{config}\n\nRecovery backup:\n{backup}\n\nTemporary placeholder format:\nTOOLPORT_MISSING_CREDENTIAL_*\n\nTo retry from a terminal:\ntoolport-gateway --disconnect-all": "設定ファイル:\n{config}\n\n復元用バックアップ:\n{backup}\n\n仮の値の形式:\nTOOLPORT_MISSING_CREDENTIAL_*\n\nターミナルから再試行するには:\ntoolport-gateway --disconnect-all",
+  "Client recovery is no longer pending. Refresh the Clients page.": "クライアントの復元は保留中ではなくなりました。クライアントページを更新してください。"
 }

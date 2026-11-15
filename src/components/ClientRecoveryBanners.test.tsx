@@ -21,7 +21,7 @@ function recovery(overrides: Partial<ClientRecovery> = {}): ClientRecovery {
     dismissed: false,
     missing: [{ server: "keyring-echo", key: "API_KEY" }],
     message:
-      "Cursor is disconnected. API_KEY for keyring-echo could not be read. The config has a placeholder for now.",
+      "Cursor is disconnected.\n\nIts original config is back, except for values Toolport could not read because your keyring is locked or unavailable:\n\n• API_KEY for keyring-echo\n\nThe config has placeholders for these values for now.",
     instructions: "Unlock your keyring, then choose Retry to put the values back.",
     retention:
       "The recovery backup is kept at /fixture/backups/cursor/original.json until recovery succeeds or you remove Toolport data. It does not expire.",
@@ -45,7 +45,12 @@ it("shows one complete selectable inline message, keeping markers in expandable 
   expect(within(notice).getAllByText(/Cursor is disconnected/)).toHaveLength(1);
   expect(notice).toHaveClass("select-text");
   const message = within(notice).getByText(/Cursor is disconnected/);
-  expect(message).toHaveClass("whitespace-pre-wrap", "break-words");
+  expect(message).toHaveClass("whitespace-pre-wrap", "break-words", "font-semibold");
+  expect(within(notice).getByText(/Its original config is back/)).toHaveClass(
+    "whitespace-pre-wrap",
+    "break-words",
+  );
+  expect(within(notice).getByText(/The recovery backup is kept/)).toBeVisible();
   expect(message).not.toHaveClass("truncate");
   const technical = within(notice).getByText(/TOOLPORT_MISSING_CREDENTIAL_0/);
   expect(technical.closest("details")).not.toHaveAttribute("open");
@@ -61,6 +66,7 @@ it("retries only the selected receipt and replaces its warning with success", as
   expect(await screen.findByRole("status")).toHaveTextContent(
     "Cursor config is fully restored. The missing values are back.",
   );
+  expect(screen.getByRole("status")).toHaveFocus();
   expect(screen.queryByRole("region")).not.toBeInTheDocument();
   expect(onRecovered).toHaveBeenCalledOnce();
 });
@@ -86,6 +92,7 @@ it("requires an informed dismissal and keeps the receipt discoverable after remo
   await userEvent.click(within(dialog).getByRole("button", { name: "Dismiss" }));
   expect(api.dismissClientRecovery).toHaveBeenCalledWith("receipt-cursor", true);
   expect(await screen.findByRole("button", { name: "Show recovery" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Show recovery" })).toHaveFocus();
   first.unmount();
   api.listClientRecoveries.mockResolvedValue([recovery({ dismissed: true })]);
   render(<ClientRecoveryBanners refreshKey="reopened" />);
@@ -94,12 +101,13 @@ it("requires an informed dismissal and keeps the receipt discoverable after remo
   expect(await screen.findByRole("button", { name: "Retry" })).toBeEnabled();
 });
 
-it("shows multiple clients once and constrains a 20-value message without truncating it", async () => {
+it("shows multiple clients once and all 20 bullet values in natural page flow", async () => {
   const missing = Array.from({ length: 20 }, (_, index) => ({
     server: `server-${index}`,
     key: `API_KEY_${index}`,
   }));
-  const message = missing.map((item) => `${item.key} for ${item.server}`).join("; ");
+  const body = missing.map((item) => `• ${item.key} for ${item.server}`).join("\n");
+  const message = `Cursor is disconnected.\n\n${body}`;
   api.listClientRecoveries.mockResolvedValue([
     recovery({ missing, message }),
     recovery({
@@ -110,10 +118,17 @@ it("shows multiple clients once and constrains a 20-value message without trunca
   ]);
   const { rerender } = render(<ClientRecoveryBanners refreshKey="initial" />);
   expect(await screen.findAllByRole("region")).toHaveLength(2);
-  const complete = screen.getByText(message);
-  expect(complete).toHaveAttribute("tabindex", "0");
-  expect(complete).toHaveClass("max-h-52", "overflow-y-auto");
-  expect(complete).toHaveTextContent("API_KEY_19 for server-19");
+  const complete = screen.getByText(
+    (_, element) => element?.tagName === "P" && element.textContent === body,
+  );
+  expect(complete).not.toHaveAttribute("tabindex");
+  expect(complete).not.toHaveClass("max-h-52", "overflow-y-auto", "truncate");
+  expect(complete).toHaveClass("whitespace-pre-wrap", "break-words");
+  for (const value of missing)
+    expect(complete).toHaveTextContent(`• ${value.key} for ${value.server}`);
+  expect(complete.textContent?.split("\n")).toHaveLength(20);
+  const section = complete.closest("section");
+  expect(section?.querySelector('[class*="overflow-y"], [class*="max-h-"]')).toBeNull();
   rerender(<ClientRecoveryBanners clientId="cursor" refreshKey="initial" />);
   expect(screen.getAllByRole("region")).toHaveLength(1);
 });
@@ -128,4 +143,37 @@ it("uses keyboard order Retry, Dismiss, Details for a short notice", async () =>
   expect(screen.getByRole("button", { name: "Dismiss" })).toHaveFocus();
   await user.tab();
   expect(screen.getByText("Details")).toHaveFocus();
+});
+
+it("keeps unsplit messages readable under the recovery heading", async () => {
+  api.listClientRecoveries.mockResolvedValue([
+    recovery({ message: "Legacy complete recovery message." }),
+  ]);
+  render(<ClientRecoveryBanners refreshKey="initial" />);
+  expect(await screen.findByText("Client config recovery")).toHaveClass("font-semibold");
+  expect(screen.getByText("Legacy complete recovery message.")).toHaveClass(
+    "whitespace-pre-wrap",
+    "break-words",
+  );
+});
+
+it("closes only the retried receipt's details while preserving the other receipt", async () => {
+  api.listClientRecoveries.mockResolvedValue([
+    recovery(),
+    recovery({
+      id: "receipt-claude",
+      clientId: "claude-code",
+      clientName: "Claude Code",
+    }),
+  ]);
+  api.retryClientRecovery.mockResolvedValue(recovery());
+  render(<ClientRecoveryBanners refreshKey="initial" />);
+  const notices = await screen.findAllByRole("region");
+  for (const notice of notices)
+    await userEvent.click(within(notice).getByText("Details"));
+  expect(notices[0].querySelector("details")).toHaveAttribute("open");
+  expect(notices[1].querySelector("details")).toHaveAttribute("open");
+  await userEvent.click(within(notices[0]).getByRole("button", { name: "Retry" }));
+  expect(notices[0].querySelector("details")).not.toHaveAttribute("open");
+  expect(notices[1].querySelector("details")).toHaveAttribute("open");
 });

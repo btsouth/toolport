@@ -7,6 +7,8 @@ fn selectable(value: &str) -> gtk::Label {
         .xalign(0.0)
         .halign(gtk::Align::Fill)
         .hexpand(true)
+        .valign(gtk::Align::Start)
+        .vexpand(false)
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
         .selectable(true)
@@ -53,6 +55,22 @@ fn recovery_label(
     label
 }
 
+fn message_label(record: &crate::clients::recovery::ClientRecovery, heading: bool) -> gtk::Label {
+    let label = selectable("");
+    let id = record.id.clone();
+    let fallback = record.message.clone();
+    l10n::bind_label_with(&label, move || {
+        let message = current_text(&id, |record| &record.message, &fallback);
+        match (message.split_once("\n\n"), heading) {
+            (Some((first, _)), true) => first.to_string(),
+            (Some((_, rest)), false) => rest.to_string(),
+            (None, true) => crate::i18n::tr("Client config recovery"),
+            (None, false) => message,
+        }
+    });
+    label
+}
+
 impl ClientPage {
     pub(super) fn reload_recoveries(&self) {
         match crate::clients::recovery::list() {
@@ -86,9 +104,14 @@ impl ClientPage {
             let card = gtk::Box::new(gtk::Orientation::Vertical, 8);
             card.add_css_class("toolport-feedback");
             card.add_css_class("warning");
+            card.set_valign(gtk::Align::Start);
+            card.set_vexpand(false);
             card.set_widget_name(&format!("client-recovery:{}", record.id));
             if record.dismissed {
-                card.append(&l10n::label("Recovery notice dismissed"));
+                let heading = selectable("");
+                heading.add_css_class("heading");
+                l10n::bind_label(&heading, "Recovery notice dismissed");
+                card.append(&heading);
                 card.append(&recovery_label(record, |record| &record.retention));
                 let show = l10n::button("Show recovery");
                 show.set_halign(gtk::Align::Start);
@@ -102,19 +125,22 @@ impl ClientPage {
                 parent.append(&card);
                 continue;
             }
-            // Long lists remain fully selectable and reachable by scrolling.
-            // No ellipsis/max-width character limits are used in recovery text.
-            let message = recovery_label(record, |record| &record.message);
-            let scroll = gtk::ScrolledWindow::builder()
-                .hscrollbar_policy(gtk::PolicyType::Never)
-                .vscrollbar_policy(gtk::PolicyType::Automatic)
-                .propagate_natural_height(true)
-                .min_content_height(if record.missing.len() > 5 { 208 } else { -1 })
-                .max_content_height(208)
-                .child(&message)
-                .build();
-            card.append(&scroll);
+            let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            heading.set_valign(gtk::Align::Start);
+            let icon = gtk::Image::from_icon_name("dialog-warning-symbolic");
+            icon.add_css_class("warning");
+            icon.set_valign(gtk::Align::Start);
+            icon.set_pixel_size(16);
+            heading.append(&icon);
+            let title = message_label(record, true);
+            title.add_css_class("heading");
+            heading.append(&title);
+            card.append(&heading);
+            // Let the page scroll as one document. Even twenty missing values
+            // remain selectable, naturally wrapped, and free of nested scrollers.
+            card.append(&message_label(record, false));
             card.append(&recovery_label(record, |record| &record.instructions));
+            card.append(&recovery_label(record, |record| &record.retention));
             if let Some((_, feedback)) = self
                 .recovery_feedback
                 .borrow()
@@ -227,8 +253,9 @@ impl ClientPage {
         let dialog = adw::MessageDialog::new(
             Some(&parent),
             Some(&crate::i18n::tr("Dismiss recovery notice?")),
-            Some(&record.retention),
+            None,
         );
+        dialog.set_extra_child(Some(&recovery_label(record, |record| &record.retention)));
         l10n::bind_dialog_heading(&dialog, "Dismiss recovery notice?");
         dialog.add_response("cancel", &crate::i18n::tr("Cancel"));
         l10n::bind_dialog_response(&dialog, "cancel", "Cancel");
@@ -284,7 +311,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
-    fn recovery_notice_is_selectable_wrapped_bounded_and_has_explicit_actions() {
+    fn recovery_notice_is_selectable_wrapped_and_has_explicit_actions() {
         let _data = crate::registry::DataDirTestEnv::new("gtk-recovery-notice");
         adw::init().unwrap();
         let app = adw::Application::builder()
@@ -294,10 +321,12 @@ mod tests {
         app.register(gtk::gio::Cancellable::NONE).unwrap();
         let (_, servers, _) = build_content(&app, crate::approval_broker::start_native());
         let page = ClientPage::new(&app, servers);
-        let message = (0..20)
-            .map(|index| format!("API_KEY_{index:02} for server-{index:02}"))
+        let values = (0..20)
+            .map(|index| format!("• API_KEY_{index:02} for server-{index:02}"))
             .collect::<Vec<_>>()
-            .join("; ");
+            .join("\n");
+        let body = format!("Its original config is back, except for values Toolport could not read because your keyring is locked or unavailable:\n\n{values}\n\nThe config has placeholders for these values for now.");
+        let message = format!("Cursor is disconnected.\n\n{body}");
         let record = crate::clients::recovery::ClientRecovery {
             id: "fixture-receipt".into(),
             client_id: "cursor".into(),
@@ -319,28 +348,42 @@ mod tests {
         page.recoveries.borrow_mut().push(record.clone());
         page.append_recoveries(&page.recovery_box, None);
         let card = page.recovery_box.first_child().unwrap();
-        let scroll = card
+        let heading = card.first_child().unwrap().downcast::<gtk::Box>().unwrap();
+        let icon = heading
             .first_child()
             .unwrap()
-            .downcast::<gtk::ScrolledWindow>()
+            .downcast::<gtk::Image>()
             .unwrap();
-        assert_eq!(scroll.hscrollbar_policy(), gtk::PolicyType::Never);
-        assert_eq!(scroll.max_content_height(), 208);
-        assert_eq!(scroll.min_content_height(), 208);
-        let label = scroll
-            .child()
-            .unwrap()
-            .downcast::<gtk::Viewport>()
-            .unwrap()
-            .child()
+        assert_eq!(icon.icon_name().as_deref(), Some("dialog-warning-symbolic"));
+        let title = heading
+            .last_child()
             .unwrap()
             .downcast::<gtk::Label>()
             .unwrap();
-        assert_eq!(label.text(), message);
+        assert_eq!(title.text(), "Cursor is disconnected.");
+        assert!(title.has_css_class("heading"));
+        assert_eq!(title.xalign(), 0.0);
+        assert!(title.is_selectable());
+        let label = heading
+            .next_sibling()
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        assert_eq!(label.text(), body);
+        for index in 0..20 {
+            assert!(label.text().contains(&format!("API_KEY_{index:02}")));
+        }
         assert!(label.is_selectable());
         assert!(label.wraps());
+        assert_eq!(label.wrap_mode(), gtk::pango::WrapMode::WordChar);
+        assert_eq!(label.valign(), gtk::Align::Start);
         assert_eq!(label.ellipsize(), gtk::pango::EllipsizeMode::None);
         assert!(!label.text().contains("TOOLPORT_MISSING_CREDENTIAL"));
+        let mut child = card.first_child();
+        while let Some(widget) = child {
+            assert!(!widget.is::<gtk::ScrolledWindow>());
+            child = widget.next_sibling();
+        }
         let details = card
             .last_child()
             .unwrap()

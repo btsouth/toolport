@@ -23,6 +23,7 @@ export function ClientRecoveryBanners({
   const { t, locale } = useI18n();
   const root = useRef<HTMLDivElement>(null);
   const focusTarget = useRef<string | null>(null);
+  const details = useRef(new Map<string, HTMLDetailsElement>());
   const [rows, setRows] = useState<ClientRecovery[]>([]);
   const [error, setError] = useState("");
   const [successClient, setSuccessClient] = useState<{ id: string; name: string } | null>(
@@ -59,6 +60,8 @@ export function ClientRecoveryBanners({
   }, [busy, rows, successClient]);
 
   async function retry(row: ClientRecovery) {
+    const expanded = details.current.get(row.id);
+    if (expanded) expanded.open = false;
     setBusy(row.id);
     setError("");
     try {
@@ -117,6 +120,8 @@ export function ClientRecoveryBanners({
       {showSuccess && (
         <p
           role="status"
+          tabIndex={-1}
+          data-recovery-focus="success"
           className="toolport-alert flex select-text items-start gap-2 break-words border-success p-3 text-sm"
         >
           <Check className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
@@ -125,90 +130,106 @@ export function ClientRecoveryBanners({
           })}
         </p>
       )}
-      {visible.map((row) => (
-        <section
-          key={row.id}
-          aria-label={`${t("Client config recovery")}: ${row.clientName}`}
-          className="toolport-alert min-w-0 select-text border-warning bg-warning/5 p-4 text-sm"
-        >
-          {row.dismissed ? (
-            <>
-              <p className="font-semibold">{t("Recovery notice dismissed")}</p>
-              <p className="mt-2 whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
-                {row.retention}
-              </p>
-              <Button
-                className="mt-3"
-                variant="outline"
-                disabled={busy === row.id}
-                onClick={() => void dismiss(row, false).catch(() => undefined)}
-              >
-                {t("Show recovery")}
-              </Button>
-            </>
-          ) : (
-            <>
-              <div className="flex items-start gap-2">
-                <TriangleAlert
-                  className="mt-0.5 size-4 shrink-0 text-warning"
-                  aria-hidden="true"
-                />
-                <p
-                  className="max-h-52 min-w-0 overflow-y-auto overscroll-contain whitespace-pre-wrap break-words [overflow-wrap:anywhere]"
-                  tabIndex={row.missing.length > 5 ? 0 : undefined}
-                >
-                  {row.message}
+      {visible.map((row) => {
+        const separator = row.message.indexOf("\n\n");
+        const heading =
+          separator < 0 ? t("Client config recovery") : row.message.slice(0, separator);
+        const body = separator < 0 ? row.message : row.message.slice(separator + 2);
+        return (
+          <section
+            key={row.id}
+            aria-label={`${t("Client config recovery")}: ${row.clientName}`}
+            className="toolport-alert min-w-0 select-text border-warning bg-warning/5 p-4 text-sm"
+          >
+            {row.dismissed ? (
+              <>
+                <p className="font-semibold">{t("Recovery notice dismissed")}</p>
+                <p className="mt-2 whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+                  {row.retention}
                 </p>
-              </div>
-              <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
-                {row.instructions}
-              </p>
-              {retryPending === row.id && (
-                <p role="status" className="mt-2 whitespace-pre-wrap break-words">
-                  {t(
-                    "Toolport still could not read the missing values. Unlock your keyring, then choose Retry.",
-                  )}
-                </p>
-              )}
-              <div className="mt-3 flex flex-wrap gap-2">
                 <Button
-                  data-recovery-focus={`retry-${row.id}`}
+                  data-recovery-focus={`show-${row.id}`}
+                  className="mt-3"
+                  variant="outline"
                   disabled={busy === row.id}
-                  onClick={() => void retry(row)}
+                  onClick={() => void dismiss(row, false).catch(() => undefined)}
                 >
-                  {t("Retry")}
+                  {t("Show recovery")}
                 </Button>
-                <ConfirmDialog
-                  trigger={
-                    <Button variant="outline" disabled={busy === row.id}>
-                      {t("Dismiss")}
-                    </Button>
-                  }
-                  title={t("Dismiss recovery notice?")}
-                  description={
-                    <div className="select-text whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
-                      {row.retention}
-                    </div>
-                  }
-                  confirmLabel={t("Dismiss")}
-                  onConfirm={() => dismiss(row, true)}
-                />
-              </div>
-              <details className="mt-3 min-w-0">
-                <summary
-                  tabIndex={0}
-                  className="cursor-pointer rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  {t("Details")}
-                </summary>
-                <p className="mt-2 whitespace-pre-wrap break-words font-mono text-meta [overflow-wrap:anywhere]">
-                  {row.details}
+              </>
+            ) : (
+              <>
+                <div className="flex items-start gap-2">
+                  <TriangleAlert
+                    className="mt-0.5 size-4 shrink-0 text-warning"
+                    aria-hidden="true"
+                  />
+                  <p className="min-w-0 whitespace-pre-wrap break-words font-semibold [overflow-wrap:anywhere]">
+                    {heading}
+                  </p>
+                </div>
+                <p className="mt-3 whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+                  {body}
                 </p>
-              </details>
-            </>
-          )}
-        </section>
-      ))}
+                <p className="mt-3 whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+                  {row.instructions}
+                </p>
+                <p className="mt-3 whitespace-pre-wrap break-words text-muted-foreground [overflow-wrap:anywhere]">
+                  {row.retention}
+                </p>
+                {retryPending === row.id && (
+                  <p role="status" className="mt-2 whitespace-pre-wrap break-words">
+                    {t(
+                      "Toolport still could not read the missing values. Unlock your keyring, then choose Retry.",
+                    )}
+                  </p>
+                )}
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Button
+                    data-recovery-focus={`retry-${row.id}`}
+                    disabled={busy === row.id}
+                    onClick={() => void retry(row)}
+                  >
+                    {t("Retry")}
+                  </Button>
+                  <ConfirmDialog
+                    trigger={
+                      <Button variant="outline" disabled={busy === row.id}>
+                        {t("Dismiss")}
+                      </Button>
+                    }
+                    title={t("Dismiss recovery notice?")}
+                    description={
+                      <div className="select-text whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+                        {row.retention}
+                      </div>
+                    }
+                    confirmLabel={t("Dismiss")}
+                    onConfirm={() => dismiss(row, true)}
+                  />
+                </div>
+                <details
+                  className="mt-3 min-w-0"
+                  ref={(element) => {
+                    if (element) details.current.set(row.id, element);
+                    else details.current.delete(row.id);
+                  }}
+                >
+                  <summary
+                    tabIndex={0}
+                    className="cursor-pointer rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    {t("Details")}
+                  </summary>
+                  <p className="mt-2 whitespace-pre-wrap break-words font-mono text-meta [overflow-wrap:anywhere]">
+                    {row.details}
+                  </p>
+                </details>
+              </>
+            )}
+          </section>
+        );
+      })}
     </div>
   );
 }

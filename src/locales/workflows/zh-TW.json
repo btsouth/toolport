@@ -417,8 +417,10 @@
   "Toolport still could not read the missing values. Unlock your keyring, then choose Retry.": "Toolport 仍無法讀取缺少的值。請解鎖金鑰圈，然後選擇「重試」。",
   "The recovery stopped unexpectedly. Choose Retry to try again.": "復原意外停止。請選擇「重試」以再次嘗試。",
   "{key} for {server}": "{server} 的 {key}",
-  "{client} is disconnected and its original config is back, except values Toolport could not read because your keyring is locked or unavailable: {values}. The config has placeholders for those values for now.": "{client} 已中斷連線，原始設定已復原，但因為金鑰圈已鎖定或無法使用，Toolport 無法讀取下列值：{values}。設定中的這些位置暫時填入了預留值。",
-  "Unlock your keyring, then choose Retry to put the values back. From a terminal, run toolport-gateway --disconnect-all again.": "請解鎖金鑰圈，然後選擇「重試」以還原這些值。在終端機中，請再次執行 toolport-gateway --disconnect-all。",
-  "{client} recovery backup is kept at {path} until recovery succeeds or you remove Toolport data. It does not expire automatically.": "{client} 的復原備份會保留在 {path}，直到復原成功或你移除 Toolport 資料。它不會自動到期。",
-  "{client} still has values waiting for recovery. Choose Retry on the Clients page before removing this location.": "{client} 仍有等待復原的值。請先在用戶端頁面選擇「重試」，再移除此位置。"
+  "{client} still has values waiting for recovery. Choose Retry on the Clients page before removing this location.": "{client} 仍有等待復原的值。請先在用戶端頁面選擇「重試」，再移除此位置。",
+  "{client} is disconnected.\n\nIts original config is back, except for values Toolport could not read because your keyring is locked or unavailable:\n\n{values}\n\nThe config has placeholders for these values for now.": "{client} 已中斷連線。\n\n原始設定已復原，但因為金鑰圈已鎖定或無法使用，Toolport 無法讀取下列值：\n\n{values}\n\n設定中的這些位置暫時填入了預留值。",
+  "Unlock your keyring, then choose Retry to put the values back.": "請解鎖金鑰圈，然後選擇「重試」以還原這些值。",
+  "{client} recovery backup is kept at:\n{path}\nIt is kept until recovery succeeds or you remove Toolport data. It does not expire automatically.": "{client} 的復原備份保存在這裡：\n{path}\n備份會保留到復原成功或你移除 Toolport 資料時。它不會自動到期。",
+  "Config file:\n{config}\n\nRecovery backup:\n{backup}\n\nTemporary placeholder format:\nTOOLPORT_MISSING_CREDENTIAL_*\n\nTo retry from a terminal:\ntoolport-gateway --disconnect-all": "設定檔：\n{config}\n\n復原備份：\n{backup}\n\n暫時預留值格式：\nTOOLPORT_MISSING_CREDENTIAL_*\n\n從終端機重試：\ntoolport-gateway --disconnect-all",
+  "Client recovery is no longer pending. Refresh the Clients page.": "用戶端復原已不再待處理。請重新整理用戶端頁面。"
 }

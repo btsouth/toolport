@@ -1306,7 +1306,7 @@ mod tests {
             for path in &paths {
                 disconnect("cursor", path, Format::JsonMcpServers).unwrap();
             }
-            let cli = recovery::warnings("cursor");
+            let cli = recovery::warnings("cursor", &paths[1]);
             backup_storage::reset_missing();
             assert_eq!(
                 backup_storage::upgrade_legacy().unwrap(),
@@ -1315,13 +1315,17 @@ mod tests {
             );
             let pending = recovery::list().unwrap();
             assert_eq!(pending.len(), 2);
+            let notice = pending
+                .iter()
+                .find(|row| row.path == paths[1].to_string_lossy())
+                .unwrap();
             assert_eq!(
                 cli,
                 vec![format!(
-                    "{} {}",
-                    pending[0].message, pending[0].instructions
+                    "{}\n\n{}\n\n{}",
+                    notice.message, notice.instructions, notice.retention
                 )],
-                "CLI and both shell DTOs share exact prose"
+                "CLI and both shell DTOs share exact prose and retention"
             );
             assert!(
                 !backup_storage::missing(),

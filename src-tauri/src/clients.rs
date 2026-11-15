@@ -9305,7 +9305,9 @@ pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
     }
     let mut outcome = mutation::run(client_id, &path, def.format, || {
         let mut outcome = revision_outcome(client_id, uninstall_gateway_inner(client_id))?;
-        outcome.warnings.extend(recovery::warnings(client_id));
+        outcome
+            .warnings
+            .extend(recovery::warnings(client_id, Path::new(&outcome.path)));
         outcome
             .warnings
             .extend(disconnect_warnings(def.format, &path)?);

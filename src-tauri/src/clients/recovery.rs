@@ -16,13 +16,27 @@ pub struct ClientRecovery {
     pub retention: String,
     pub details: String,
 }
-const MESSAGE: &str = crate::i18n::msg("{client} is disconnected and its original config is back, except values Toolport could not read because your keyring is locked or unavailable: {values}. The config has placeholders for those values for now.");
-const INSTRUCTIONS: &str = crate::i18n::msg("Unlock your keyring, then choose Retry to put the values back. From a terminal, run toolport-gateway --disconnect-all again.");
-const RETENTION: &str = crate::i18n::msg("{client} recovery backup is kept at {path} until recovery succeeds or you remove Toolport data. It does not expire automatically.");
+const MESSAGE: &str = crate::i18n::msg("{client} is disconnected.\n\nIts original config is back, except for values Toolport could not read because your keyring is locked or unavailable:\n\n{values}\n\nThe config has placeholders for these values for now.");
+const INSTRUCTIONS: &str =
+    crate::i18n::msg("Unlock your keyring, then choose Retry to put the values back.");
+const RETENTION: &str = crate::i18n::msg("{client} recovery backup is kept at:\n{path}\nIt is kept until recovery succeeds or you remove Toolport data. It does not expire automatically.");
 fn message(name: &str, values: &[String]) -> String {
-    crate::i18n::format_message(MESSAGE, &[("client", name), ("values", &values.join("; "))])
+    crate::i18n::format_message(
+        MESSAGE,
+        &[
+            ("client", name),
+            (
+                "values",
+                &values
+                    .iter()
+                    .map(|value| format!("• {value}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        ],
+    )
 }
-pub(super) fn warnings(id: &str) -> Vec<String> {
+pub(super) fn warnings(id: &str, path: &Path) -> Vec<String> {
     let values = backup_storage::warnings();
     if values.is_empty() {
         return Vec::new();
@@ -30,11 +44,14 @@ pub(super) fn warnings(id: &str) -> Vec<String> {
     let name = find_def(id)
         .map(|d| d.name.to_string())
         .unwrap_or_else(|| id.into());
-    vec![format!(
-        "{} {}",
-        message(&name, &values),
-        crate::i18n::lookup(INSTRUCTIONS)
-    )]
+    let mut parts = vec![message(&name, &values), crate::i18n::lookup(INSTRUCTIONS)];
+    if let Ok(backup) = restore::record_path(id, path) {
+        parts.push(crate::i18n::format_message(
+            RETENTION,
+            &[("client", &name), ("path", &backup.to_string_lossy())],
+        ));
+    }
+    vec![parts.join("\n\n")]
 }
 struct Receipt {
     notice: ClientRecovery,
@@ -109,7 +126,7 @@ fn receipts() -> Result<Vec<Receipt>, String> {
                     RETENTION,
                     &[("client", def.name), ("path", &backup_path)],
                 ),
-                details: format!("{path}\n{backup_path}\nTOOLPORT_MISSING_CREDENTIAL_*"),
+                details: crate::i18n::trf("Config file:\n{config}\n\nRecovery backup:\n{backup}\n\nTemporary placeholder format:\nTOOLPORT_MISSING_CREDENTIAL_*\n\nTo retry from a terminal:\ntoolport-gateway --disconnect-all", &[("config", path), ("backup", &backup_path)]),
             };
             notices.push(Receipt {
                 notice,
@@ -129,7 +146,9 @@ fn find(id: &str) -> Result<Receipt, String> {
     receipts()?
         .into_iter()
         .find(|r| r.notice.id == id)
-        .ok_or_else(|| "Client recovery is no longer pending. Refresh the Clients page.".into())
+        .ok_or_else(|| {
+            crate::i18n::tr("Client recovery is no longer pending. Refresh the Clients page.")
+        })
 }
 pub fn dismiss(id: &str, dismissed: bool) -> Result<(), String> {
     let receipt = find(id)?;

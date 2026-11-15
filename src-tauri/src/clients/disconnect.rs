@@ -190,7 +190,7 @@ pub(super) fn restore_path(
             recovery_path: None,
         },
     )?;
-    warnings.extend(recovery::warnings(id));
+    warnings.extend(recovery::warnings(id, path));
     Ok(warnings)
 }
 

@@ -417,8 +417,10 @@
   "Toolport still could not read the missing values. Unlock your keyring, then choose Retry.": "Toolport가 아직 누락된 값을 읽지 못했습니다. 키링 잠금을 해제한 뒤 다시 시도를 선택하세요.",
   "The recovery stopped unexpectedly. Choose Retry to try again.": "복구가 예기치 않게 중단되었습니다. 다시 시도를 선택해 재시도하세요.",
   "{key} for {server}": "{server}의 {key}",
-  "{client} is disconnected and its original config is back, except values Toolport could not read because your keyring is locked or unavailable: {values}. The config has placeholders for those values for now.": "{client}의 연결이 해제되고 원래 설정이 복원되었습니다. 다만 키링이 잠겨 있거나 사용할 수 없어 Toolport가 읽지 못한 값이 있습니다: {values}. 현재 설정의 해당 위치에는 임시 값이 들어 있습니다.",
-  "Unlock your keyring, then choose Retry to put the values back. From a terminal, run toolport-gateway --disconnect-all again.": "키링 잠금을 해제한 뒤 다시 시도를 선택하면 값을 복원할 수 있습니다. 터미널에서는 toolport-gateway --disconnect-all을 다시 실행하세요.",
-  "{client} recovery backup is kept at {path} until recovery succeeds or you remove Toolport data. It does not expire automatically.": "{client} 복구 백업은 복구가 성공하거나 Toolport 데이터를 삭제할 때까지 {path}에 보관됩니다. 자동으로 만료되지 않습니다.",
-  "{client} still has values waiting for recovery. Choose Retry on the Clients page before removing this location.": "{client}에 아직 복구를 기다리는 값이 있습니다. 이 위치를 제거하기 전에 클라이언트 페이지에서 다시 시도를 선택하세요."
+  "{client} still has values waiting for recovery. Choose Retry on the Clients page before removing this location.": "{client}에 아직 복구를 기다리는 값이 있습니다. 이 위치를 제거하기 전에 클라이언트 페이지에서 다시 시도를 선택하세요.",
+  "{client} is disconnected.\n\nIts original config is back, except for values Toolport could not read because your keyring is locked or unavailable:\n\n{values}\n\nThe config has placeholders for these values for now.": "{client}의 연결이 해제되었습니다.\n\n원래 설정은 복원되었지만 키링이 잠겨 있거나 사용할 수 없어 Toolport가 읽지 못한 값이 있습니다:\n\n{values}\n\n현재 설정의 해당 위치에는 임시 값이 들어 있습니다.",
+  "Unlock your keyring, then choose Retry to put the values back.": "키링 잠금을 해제한 뒤 다시 시도를 선택하면 값을 복원할 수 있습니다.",
+  "{client} recovery backup is kept at:\n{path}\nIt is kept until recovery succeeds or you remove Toolport data. It does not expire automatically.": "{client} 복구 백업은 다음 위치에 보관됩니다:\n{path}\n복구가 성공하거나 Toolport 데이터를 삭제할 때까지 보관됩니다. 자동으로 만료되지 않습니다.",
+  "Config file:\n{config}\n\nRecovery backup:\n{backup}\n\nTemporary placeholder format:\nTOOLPORT_MISSING_CREDENTIAL_*\n\nTo retry from a terminal:\ntoolport-gateway --disconnect-all": "설정 파일:\n{config}\n\n복구 백업:\n{backup}\n\n임시 값의 형식:\nTOOLPORT_MISSING_CREDENTIAL_*\n\n터미널에서 다시 시도하려면:\ntoolport-gateway --disconnect-all",
+  "Client recovery is no longer pending. Refresh the Clients page.": "클라이언트 복구가 더 이상 대기 중이 아닙니다. 클라이언트 페이지를 새로 고침하세요."
 }
