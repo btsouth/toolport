@@ -2743,6 +2743,15 @@ impl Stream {
     }
 }
 
+/// A server URL for text that leaves the machine or the app (a team push, copied
+/// diagnostics): userinfo, a key-like path segment and every query value are
+/// replaced as in a public share, then any registered secret still in it.
+pub fn redact_config_url(url: &str) -> String {
+    // Registered values only: the credential heuristics of `redact_log_text`
+    // would replace the whole URL, and teammates need its host and path.
+    redact_text(&crate::sharing_controller::redact_share_url(url)).into_owned()
+}
+
 /// Text for a diagnostic log: registered secrets, URL userinfo and
 /// credential-shaped strings (a key typed straight into a URL or argument) are
 /// all removed. Every log Toolport writes goes through this.

@@ -3283,7 +3283,9 @@ fn team_server_export(reg: &Registry) -> Value {
                     }
                 })
                 .collect();
-            let url = s.url.as_deref().map(crate::redact_url_userinfo);
+            // A key in the URL's path or query is a secret value too: replaced
+            // with a placeholder like a public share, then any registered value.
+            let url = s.url.as_deref().map(crate::secret_redact::redact_config_url);
             serde_json::json!({
                 "id": s.id,
                 "name": s.name,
@@ -8304,6 +8306,30 @@ mod tests {
             "secret leaked: {serialized}"
         );
         assert!(serialized.contains("<redacted>"));
+    }
+
+    #[test]
+    fn team_server_export_sends_no_key_carried_in_a_url() {
+        let mut reg = base_registry();
+        let server = reg
+            .servers
+            .iter_mut()
+            .find(|s| s.id == "mine")
+            .expect("fixture server");
+        server.transport = "http".into();
+        server.command = None;
+        server.url = Some(
+            "https://mcp.example.com/mcp/sk-PathKeyTeam0123456789?tavilyApiKey=tvly-QueryKey987654"
+                .into(),
+        );
+        let serialized = serde_json::to_string(&team_server_export(&reg)).unwrap();
+        for value in ["sk-PathKeyTeam0123456789", "tvly-QueryKey987654"] {
+            assert!(!serialized.contains(value), "{value} sent: {serialized}");
+        }
+        assert!(
+            serialized.contains("https://mcp.example.com/mcp/"),
+            "{serialized}"
+        );
     }
 
     /// A server with no block, or a blank client id, must not be treated as
