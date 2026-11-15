@@ -22465,15 +22465,14 @@ fn main() {
             };
             let mut report =
                 conduit_lib::purge::run_with_scope(all_installs).unwrap_or_else(|error| {
-                    conduit_lib::purge::Report {
-                        leftovers: vec![conduit_lib::purge::Leftover {
-                            path: conduit_lib::registry::conduit_dir()
-                                .map(|path| path.display().to_string())
-                                .unwrap_or_default(),
-                            error,
-                        }],
-                        ..Default::default()
-                    }
+                    let mut report = conduit_lib::purge::Report::default();
+                    report.leftovers.push(conduit_lib::purge::Leftover {
+                        path: conduit_lib::registry::conduit_dir()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default(),
+                        error,
+                    });
+                    report
                 });
             if !after_exit {
                 if let Err(error) = conduit_lib::purge::write_report(&report_path, &report) {

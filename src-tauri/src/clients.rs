@@ -45,8 +45,8 @@ mod moved;
 mod mutation;
 #[cfg(test)]
 mod paths_tests;
-mod relocate;
 pub mod recovery;
+mod relocate;
 mod restore;
 mod toml_preservation;
 #[cfg(test)]
