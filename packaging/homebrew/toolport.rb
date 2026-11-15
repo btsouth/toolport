@@ -25,24 +25,62 @@ cask "toolport" do
   app "Toolport.app"
 
   # Homebrew also runs this block when it upgrades or reinstalls the cask, and
-  # does not tell the block which. Its call stack does, so an upgrade keeps every
-  # client connected and all data in place. A real uninstall restores each
-  # client's config while the gateway still exists, removes Toolport's own
-  # launch-at-login entry (it would point at the removed app), and stops the
-  # Toolport daemon unless a client is connected right now; that daemon exits
-  # on its own when its last client disconnects, because its binary is gone.
-  # Zap does the same through Toolport's "Remove Toolport data", which also
-  # deletes the registry, logs, backups and this install's keychain items.
+  # does not tell the block which. Two independent signals do:
+  #  1. The call stack. Upgrades come through Cask::Upgrade.upgrade_cask, which
+  #     calls Installer#start_upgrade (Library/Homebrew/cask/upgrade.rb), and
+  #     reinstalls through Installer#uninstall_existing_cask
+  #     (Library/Homebrew/cask/installer.rb, from cask/reinstall.rb).
+  #  2. The brew command this Ruby process runs. brew.sh normalizes it (rm and
+  #     remove become uninstall) and passes it as brew.rb's first argument
+  #     (Library/Homebrew/brew.sh), so the process's own argv shows it even
+  #     though brew.rb then drops it from ARGV. brew bundle runs upgrade,
+  #     reinstall and uninstall as child brew processes, so they show here too.
+  # Checked against Homebrew/brew 1cd7b3e1341b257955f5d31106637d7696019129.
+  # Clients are disconnected only when both signals say this is a real
+  # uninstall. A Homebrew change that breaks either signal leaves every client
+  # connected and prints how to finish by hand, rather than disconnecting
+  # clients during an upgrade.
+  #
+  # A real uninstall restores each client's config while the gateway still
+  # exists, removes Toolport's own launch-at-login entry (it would point at the
+  # removed app), and stops the Toolport daemon unless a client is connected
+  # right now; that daemon exits on its own when its last client disconnects,
+  # because its binary is gone. Zap does the same through Toolport's "Remove
+  # Toolport data", which also deletes the registry, logs, backups and this
+  # install's keychain items.
   uninstall_preflight do
     frames = caller_locations
     labels = frames.map { |frame| frame.label.to_s.split(/[#.]/).last }
-    replacing = frames.any? { |frame| frame.path.to_s.end_with?("/cask/upgrade.rb", "/cask/reinstall.rb") } ||
-                labels.intersect?(%w[start_upgrade revert_upgrade uninstall_existing_cask])
-    zapping = !replacing && labels.include?("zap")
+    stack_replacing = frames.any? { |frame| frame.path.to_s.end_with?("/cask/upgrade.rb", "/cask/reinstall.rb") } ||
+                      labels.intersect?(%w[start_upgrade revert_upgrade uninstall_existing_cask])
+    argv = begin
+      command.run("/bin/ps", args: ["-o", "command=", "-p", Process.pid.to_s], print_stderr: false).stdout
+    rescue
+      ""
+    end
+    brew_command = argv[%r{/Homebrew/brew\.rb\s+(\S+)}, 1]
+    # Test only (scripts/test-homebrew-cask-lifecycle.sh): hide one signal to
+    # check that a disagreement disconnects nothing. Hiding a signal can only
+    # stop a disconnect, never cause one.
+    stack_replacing = false if ENV["HOMEBREW_TOOLPORT_CASK_TEST_IGNORE_STACK"] == "1"
+    brew_command = nil if ENV["HOMEBREW_TOOLPORT_CASK_TEST_IGNORE_COMMAND"] == "1"
+    command_replacing = %w[upgrade reinstall install].include?(brew_command)
+    command_uninstall = %w[uninstall rm remove].include?(brew_command)
+    zapping = labels.include?("zap")
     gateway = "#{appdir}/Toolport.app/Contents/MacOS/toolport-gateway"
 
-    if replacing
+    if stack_replacing && command_replacing
       ohai "Keeping Toolport's client connections and data for the new version"
+    elsif stack_replacing || !command_uninstall
+      opoo <<~EOS
+        Toolport could not tell whether Homebrew is upgrading or removing it
+        (call stack: #{stack_replacing ? "upgrade or reinstall" : "uninstall"}, brew command: #{brew_command || "unknown"}),
+        so every client stays connected and all its data stays in place.
+        After an upgrade or reinstall nothing more is needed. To remove Toolport,
+        reinstall it, run
+          "#{gateway}" #{zapping ? "--remove-data --confirm" : "--disconnect-all --uninstall"}
+        (or choose "#{zapping ? "Remove Toolport data" : "Remove Toolport from all clients"}" in Settings), then uninstall again.
+      EOS
     elsif !File.executable?(gateway)
       opoo <<~EOS
         #{gateway} is missing, so client configs were not restored.

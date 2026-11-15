@@ -39,7 +39,9 @@ loses its gateway at that point.
 **Homebrew:** the cask in the `btsouth/homebrew-toolport` tap runs the same
 operation on `brew uninstall --cask toolport`, while the app is still installed,
 then quits Toolport. Upgrades and reinstalls skip it, so clients stay connected.
-If it cannot restore a client it prints a warning and the uninstall continues;
+The cask checks both Homebrew's call stack and the brew command; if they
+disagree it leaves every client connected and prints the command to run by
+hand. If it cannot restore a client it prints a warning and the uninstall continues;
 Toolport's data, which holds the original configs, is kept.
 
 **AppImage, Tauri .deb, and dragging macOS to the Trash:** use the in-app action

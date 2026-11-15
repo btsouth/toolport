@@ -92,8 +92,12 @@ jobs:
           persist-credentials: false
       # Real Homebrew against packaging/homebrew/toolport.rb with a stub app:
       # reinstall and upgrade must not touch clients, uninstall and zap must.
+      # Runs on the newest Homebrew each build, since the cask tells an upgrade
+      # from an uninstall by Homebrew's own call stack and command line.
       - name: Homebrew cask lifecycle (reinstall, upgrade, uninstall, zap)
-        run: bash scripts/test-homebrew-cask-lifecycle.sh
+        run: |
+          brew update --quiet
+          bash scripts/test-homebrew-cask-lifecycle.sh
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24

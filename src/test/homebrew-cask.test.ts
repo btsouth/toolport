@@ -35,16 +35,30 @@ describe("homebrew cask snapshot (packaging/homebrew/toolport.rb)", () => {
   it("restores clients on uninstall, never on upgrade or reinstall", () => {
     const preflight = cask.match(/uninstall_preflight do([\s\S]*?)\n {2}end\n/)?.[1];
     expect(preflight).toBeDefined();
-    // Homebrew runs this block for upgrades and reinstalls too; the call stack
-    // is what tells them apart.
+    // Homebrew runs this block for upgrades and reinstalls too. The call stack
+    // and the brew command line tell them apart, and both must agree.
     for (const marker of [
       "/cask/upgrade.rb",
       "/cask/reinstall.rb",
       "start_upgrade",
       "uninstall_existing_cask",
+      '"/bin/ps", args: ["-o", "command=", "-p", Process.pid.to_s]',
+      "%r{/Homebrew/brew\\.rb\\s+(\\S+)}",
+      "%w[upgrade reinstall install].include?(brew_command)",
+      "%w[uninstall rm remove].include?(brew_command)",
+      "if stack_replacing && command_replacing",
+      "elsif stack_replacing || !command_uninstall",
+      "Toolport could not tell whether Homebrew is upgrading or removing it",
     ]) {
       expect(preflight).toContain(marker);
     }
+    // The test-only switches can only hide a signal, never invent one.
+    expect(preflight).toContain(
+      'stack_replacing = false if ENV["HOMEBREW_TOOLPORT_CASK_TEST_IGNORE_STACK"] == "1"',
+    );
+    expect(preflight).toContain(
+      'brew_command = nil if ENV["HOMEBREW_TOOLPORT_CASK_TEST_IGNORE_COMMAND"] == "1"',
+    );
     expect(preflight).toContain('args: ["--disconnect-all", "--uninstall"]');
     expect(preflight).toContain('args: ["--remove-data", "--confirm"]');
     expect(preflight).toContain('labels.include?("zap")');
