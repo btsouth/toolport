@@ -16,6 +16,7 @@ mod onboarding;
 mod package_updates;
 mod page_header;
 mod pairing;
+mod quiet_tooltips;
 mod settings;
 mod setup;
 mod single_instance;
@@ -1436,6 +1437,7 @@ fn install_sidebar_footer(root: &gtk::Box, nav: &gtk::Box, page: &ServerPage) {
     items.append(&quit);
     popover.set_child(Some(&items));
     help.set_popover(Some(&popover));
+    quiet_tooltips::guard_menu(&help);
     footer.append(&help);
     root.append(&footer);
 }
@@ -3701,6 +3703,7 @@ fn connected_client_actions_menu(client: state::ClientView, page: ClientPage) ->
     content.append(&disconnect);
     popover.set_child(Some(&content));
     menu.set_popover(Some(&popover));
+    quiet_tooltips::guard_menu(&menu);
     menu
 }
 
@@ -3763,6 +3766,7 @@ fn client_scope_menu(client: state::ClientView, page: ClientPage) -> gtk::MenuBu
     }
     popover.set_child(Some(&content));
     menu.set_popover(Some(&popover));
+    quiet_tooltips::guard_menu(&menu);
     menu
 }
 
@@ -4068,6 +4072,7 @@ impl ActivityPage {
         export_actions.append(&export_csv);
         export_menu.set_child(Some(&export_actions));
         export_button.set_popover(Some(&export_menu));
+        quiet_tooltips::guard_menu(&export_button);
         header.add_action(&export_button);
         header.add_action(&clear_button);
         header.add_action(&refresh_button);
@@ -8083,6 +8088,7 @@ fn approval_card(
         }
         popover.set_child(Some(&choices));
         remember.set_popover(Some(&popover));
+        quiet_tooltips::guard_menu(&remember);
         actions.append(&remember);
     }
 
@@ -8190,6 +8196,7 @@ fn build_content(
     profile_action_list.append(&disable_all);
     profile_popover.set_child(Some(&profile_action_list));
     profile_actions.set_popover(Some(&profile_popover));
+    quiet_tooltips::guard_menu(&profile_actions);
     header.add_action(&profile_actions);
     let check_servers = header_icon_button("view-refresh-symbolic");
     l10n::bind_tooltip(&check_servers, "Check servers again (Ctrl+R)");
@@ -10005,6 +10012,7 @@ l10n::bind_dialog_response(&dialog, "enable", "Enable");
         .popover(&popover)
         .css_classes(["flat"])
         .build();
+    quiet_tooltips::guard_menu(&menu);
     if !detail {
         card.append(&menu);
     }
