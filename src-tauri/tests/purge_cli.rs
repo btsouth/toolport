@@ -221,12 +221,18 @@ fn purge_override_with_registry_preserves_user_files_for_both_brand_overrides() 
                 "user bytes",
                 "{name}"
             );
+            // Unknown folders are preserved and reported as a unit.
+            let reported = match name {
+                "backups/personal/tax.zip" => "backups/personal",
+                "backups/notes/original-report.json" => "backups/notes",
+                other => other,
+            };
             assert!(
                 report["preserved"]
                     .as_array()
                     .unwrap()
                     .iter()
-                    .any(|entry| entry.as_str().unwrap().contains(name)),
+                    .any(|entry| entry.as_str().unwrap().contains(reported)),
                 "{name}"
             );
         }
