@@ -16548,6 +16548,46 @@ for line in sys.stdin:
                 .resource_subscriptions,
             vec!["fixture://a".to_string()]
         );
+        // A resource whose URI holds a secret is advertised under an alias;
+        // the server is subscribed to its own URI, and unsubscribed from it.
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-sub-alias-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        crate::secret_redact::register("modern", "RES_KEY", "res-secret-4Kp9Wz");
+        let mut resources = vec![json!({"uri": "mem://res-secret-4Kp9Wz/doc", "name": "r"})];
+        crate::secret_redact::screen_definitions(
+            "modern",
+            crate::secret_redact::Catalog::Resource,
+            &mut resources,
+        )
+        .commit();
+        let alias = resources[0]["uri"].as_str().unwrap().to_string();
+        assert!(alias.contains("[secret:"), "{alias}");
+        server.subscribe_resource(&alias).unwrap();
+        let listened = filters
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .resource_subscriptions
+            .clone();
+        server.unsubscribe_resource(&alias).unwrap();
+        let after = filters
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .resource_subscriptions
+            .clone();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            listened,
+            vec![
+                "fixture://a".to_string(),
+                "mem://res-secret-4Kp9Wz/doc".to_string()
+            ]
+        );
+        assert_eq!(after, vec!["fixture://a".to_string()]);
         assert!(
             requests
                 .lock()
