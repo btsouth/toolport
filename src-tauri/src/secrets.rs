@@ -1698,7 +1698,7 @@ fn set_secret_raw(server_id: &str, key: &str, value: &str) -> Result<(), String>
     }
     // Before the write, so a refreshed OAuth token is covered even if the store fails.
     crate::secret_redact::register(server_id, key, value);
-    scrub_previous(server_id, key, Some(value));
+    scrub_previous(server_id, key, Some(value))?;
     if file::active() {
         return file::set_secret(server_id, key, value);
     }
@@ -2019,10 +2019,12 @@ fn env_var_nonblank(name: &str) -> Option<String> {
 /// Before a stored value is replaced or deleted, scrub the logs for it: once it
 /// is gone from the vault nothing could find a copy an older build (or another
 /// tool) left on disk. Reads the stored value directly, never an environment
-/// override, and skips Toolport's own internal keys.
-fn scrub_previous(server_id: &str, key: &str, replacement: Option<&str>) {
+/// override, and skips Toolport's own internal keys. An error when a log may
+/// still hold the old value and it could not be kept for a later cleanup: the
+/// caller then changes nothing, so the stored value is not lost.
+fn scrub_previous(server_id: &str, key: &str, replacement: Option<&str>) -> Result<(), String> {
     if server_id == INTERNAL_SERVER_ID {
-        return;
+        return Ok(());
     }
     let stored = if file::active() {
         file::get_secret_result(server_id, key)
@@ -2035,10 +2037,11 @@ fn scrub_previous(server_id: &str, key: &str, replacement: Option<&str>) {
                 // A log may still hold it: keep the value in the vault, under
                 // Toolport's own namespace, until a later scrub succeeds.
                 eprintln!("toolport: {error}; keeping the old value for a later cleanup");
-                retire(server_id, key, &old);
+                retire(server_id, key, &old)?;
             }
         }
     }
+    Ok(())
 }
 
 /// Values replaced or deleted while a log may still hold them, as a JSON list of
@@ -2082,15 +2085,18 @@ fn retired_save(entries: &[(String, String, String)]) -> Result<(), String> {
     )
 }
 
-fn retire(server_id: &str, key: &str, value: &str) {
+fn retire(server_id: &str, key: &str, value: &str) -> Result<(), String> {
     let mut entries = retired_load();
     let entry = (server_id.to_string(), key.to_string(), value.to_string());
     if !entries.contains(&entry) {
         entries.push(entry);
     }
-    if let Err(error) = retired_save(&entries) {
+    retired_save(&entries).map_err(|error| {
         eprintln!("toolport: could not keep a retired secret for cleanup: {error}");
-    }
+        crate::i18n::tr(
+            "The old value could not be kept for its log cleanup, so nothing was changed. Try again.",
+        )
+    })
 }
 
 /// Register every retired value and retry its cleanup; entries whose scrub now
@@ -2121,7 +2127,7 @@ pub fn retired_scrubs_pending() -> usize {
 }
 
 fn delete_secret_raw(server_id: &str, key: &str) -> Result<(), String> {
-    scrub_previous(server_id, key, None);
+    scrub_previous(server_id, key, None)?;
     if file::active() {
         return file::delete_secret(server_id, key);
     }
