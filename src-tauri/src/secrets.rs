@@ -1694,6 +1694,7 @@ mod file {
 fn set_secret_raw(server_id: &str, key: &str, value: &str) -> Result<(), String> {
     // Before the write, so a refreshed OAuth token is covered even if the store fails.
     crate::secret_redact::register(server_id, key, value);
+    scrub_previous(server_id, key, Some(value));
     if file::active() {
         return file::set_secret(server_id, key, value);
     }
@@ -2011,7 +2012,28 @@ fn env_var_nonblank(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
+/// Before a stored value is replaced or deleted, scrub the logs for it: once it
+/// is gone from the vault nothing could find a copy an older build (or another
+/// tool) left on disk. Reads the stored value directly, never an environment
+/// override, and skips Toolport's own internal keys.
+fn scrub_previous(server_id: &str, key: &str, replacement: Option<&str>) {
+    if server_id == INTERNAL_SERVER_ID {
+        return;
+    }
+    let stored = if file::active() {
+        file::get_secret_result(server_id, key)
+    } else {
+        platform::get_secret_result(server_id, key)
+    };
+    if let Ok(Some(old)) = stored {
+        if Some(old.as_str()) != replacement {
+            crate::secret_redact::scrub_value_now(server_id, key, &old);
+        }
+    }
+}
+
 fn delete_secret_raw(server_id: &str, key: &str) -> Result<(), String> {
+    scrub_previous(server_id, key, None);
     if file::active() {
         return file::delete_secret(server_id, key);
     }

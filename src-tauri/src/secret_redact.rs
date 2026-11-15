@@ -1173,6 +1173,53 @@ pub fn scrub_data_dir(dir: &Path) -> std::io::Result<usize> {
     Ok(rewritten)
 }
 
+/// Scrub every log for one value right now, whatever the marker says: called just
+/// before Toolport replaces or deletes a stored secret, the last moment the old
+/// value is known. The value stays registered, so this process keeps redacting it.
+/// Synchronous (a read of each log, a rewrite only on a hit) and serialized with
+/// every other scrub of the directory.
+pub fn scrub_value_now(owner: &str, key: &str, value: &str) {
+    register(owner, key, value);
+    let Some(dir) = scrub_dir_now() else {
+        return;
+    };
+    if !persisted_log_files(&dir).iter().any(|path| path.is_file()) {
+        return;
+    }
+    let id = format!("{owner}/{key}");
+    let pairs: Vec<(String, String)> = REGISTRY
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|map| map.get(&scope_of(&dir)))
+        .map(|reg| {
+            reg.secrets
+                .iter()
+                .filter(|(i, _, _)| *i == id)
+                .map(|(_, n, v)| (n.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Only this id's forms: the value being retired and what it derived.
+    let pairs = if pairs.is_empty() {
+        vec![(key.to_string(), value.to_string())]
+    } else {
+        pairs
+    };
+    let matcher = Matcher::new(&pairs);
+    let result = crate::registry::lock_at_for(&dir.join("secret-scrub"), SCRUB_LOCK_WAIT)
+        .map_err(std::io::Error::other)
+        .and_then(|_scrub| {
+            for path in persisted_log_files(&dir) {
+                scrub_file_with(&matcher, &path)?;
+            }
+            Ok(())
+        });
+    if let Err(error) = result {
+        eprintln!("toolport: scrub before retiring secret '{key}' failed: {error}");
+    }
+}
+
 static SCRUB_PENDING: Mutex<Option<PathBuf>> = Mutex::new(None);
 static SCRUB_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -1546,6 +1593,34 @@ mod tests {
         assert_eq!(scrub_data_dir(&dir).unwrap(), 0);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replacing_or_deleting_a_secret_scrubs_its_old_value_first() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let dir = crate::registry::conduit_dir().unwrap();
+            let old = "rotating-secret-old-1a2b3c";
+            let new = "rotating-secret-new-4d5e6f";
+            crate::secrets::set_secret("rotate-srv", "ROTATE_KEY", old).unwrap();
+            // A copy something unaware of it (an older build) left behind.
+            let line = |v: &str| {
+                serde_json::json!({"ok":false,"error":format!("rejected {v}")}).to_string() + "\n"
+            };
+            std::fs::write(dir.join("audit.jsonl"), line(old)).unwrap();
+            crate::secrets::set_secret("rotate-srv", "ROTATE_KEY", new).unwrap();
+            let audit = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+            assert!(!audit.contains(old), "{audit}");
+            assert!(audit.contains("rejected [secret:ROTATE_KEY]"), "{audit}");
+
+            std::fs::write(dir.join("gateway.log"), format!("saw {new}\n")).unwrap();
+            crate::secrets::delete_secret("rotate-srv", "ROTATE_KEY").unwrap();
+            let log = std::fs::read_to_string(dir.join("gateway.log")).unwrap();
+            assert_eq!(log, "saw [secret:ROTATE_KEY]\n");
+            assert_eq!(
+                crate::secrets::get_secret_result("rotate-srv", "ROTATE_KEY").unwrap(),
+                None
+            );
+        });
     }
 
     #[test]
