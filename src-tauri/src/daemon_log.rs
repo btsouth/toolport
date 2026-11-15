@@ -923,7 +923,9 @@ pub fn install_stderr_redaction() -> StderrRedaction {
 /// the original file or whole in the pipe. Bytes written before the swap are
 /// already in the original file; the relay writes only bytes written after it,
 /// through a duplicate of the same open file (same offset), so a thread's later
-/// lines always follow its earlier ones. Rust's stderr is unbuffered, so no
+/// lines always follow its earlier ones. Its first write waits for any Rust
+/// write still running on the original ([`relay_writer`]): not every system
+/// serializes writes that share an offset. Rust's stderr is unbuffered, so no
 /// bytes wait in-process across the switch. No lock a writer holds is taken
 /// here, so a registration on a thread that holds stderr cannot deadlock; nor
 /// can one on the relay's own threads, which take neither lock held here (their
@@ -1459,6 +1461,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(output.status.success(), "{stdout}\n{text}");
         (stdout, text)
+    }
+
+    /// Child half of the in-flight-write test: a thread holds Rust's stderr
+    /// lock (as a write does while it runs) across the switch.
+    #[cfg(unix)]
+    #[test]
+    fn stderr_inflight_write_child() {
+        let Some(secret) = std::env::var_os("TOOLPORT_STDERR_INFLIGHT_CHILD") else {
+            return;
+        };
+        let secret = secret.to_string_lossy().to_string();
+        let _ = install_stderr_redaction();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let lock = std::io::stderr().lock();
+            held_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            drop(lock);
+        });
+        held_rx.recv().unwrap();
+        crate::secret_redact::register("inflight-server", "INFLIGHT_TOKEN", &secret);
+        // Into the pipe, without the lock: the relay has it to write.
+        let line = b"relayed while held\n";
+        // SAFETY: writes a live buffer to fd 2.
+        unsafe {
+            libc::write(2, line.as_ptr().cast(), line.len());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let err = std::env::var("TOOLPORT_STDERR_INFLIGHT_FILE").unwrap();
+        let early = std::fs::read_to_string(err).unwrap();
+        println!(
+            "written-while-held={}",
+            early.contains("relayed while held")
+        );
+        go_tx.send(()).unwrap();
+        holder.join().unwrap();
+        flush_stderr_relay(std::time::Duration::from_secs(5));
+    }
+
+    /// Failure mode: the relay writes to the original stderr while a write
+    /// begun before the switch is still running on it. They share one offset,
+    /// and where writes on it are not serialized (macOS) one overwrites the
+    /// other: lines written right after the switch were lost.
+    #[cfg(unix)]
+    #[test]
+    fn the_relay_waits_for_a_write_running_on_the_original_stderr() {
+        let dir = scratch("stderr-inflight");
+        let err = dir.join("stderr.txt");
+        let file = std::fs::File::create(&err).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon_log::tests::stderr_inflight_write_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(
+                "TOOLPORT_STDERR_INFLIGHT_CHILD",
+                "inflight-canary-7Qz2-SECRET",
+            )
+            .env("TOOLPORT_STDERR_INFLIGHT_FILE", &err)
+            .stderr(file)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let text = std::fs::read_to_string(&err).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(output.status.success(), "{stdout}\n{text}");
+        assert!(stdout.contains("written-while-held=false"), "{stdout}");
+        assert!(text.contains("relayed while held\n"), "{text}");
     }
 
     /// Failure mode: every process that wants redaction starts the relay (two
