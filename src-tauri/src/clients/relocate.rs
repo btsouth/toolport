@@ -173,15 +173,20 @@ pub(super) fn relocate(
     };
     let target = resolved_definition_path(&def)?;
     for (legacy, server) in stale_files(&def, &target, managed)? {
-        if !target_has_gateway(&def, &target)? {
-            // A Shared HTTP entry carries a bearer and endpoint the stdio repair
-            // cannot rebuild. Leave it, and the old file, for an explicit reconnect.
-            if server.url.is_some() || server.args.iter().any(|arg| arg == "mcp-remote") {
+        // A Shared HTTP entry carries an endpoint, args and a bearer the stdio
+        // repair cannot rebuild. It stays exactly as it is, whatever the new file
+        // holds, until the user reconnects the client.
+        if !is_local_gateway(&server) {
+            if !target_has_gateway(&def, &target)? {
                 return Err(format!(
-                    "Toolport's Shared HTTP entry is in {}, which this client no longer reads. Reconnect the client to move it.",
+                    "Toolport's Shared HTTP entry is in {}, which this client may no longer read. Reconnect the client to move it.",
                     legacy.display()
                 ));
             }
+            outcome.kept.push(legacy);
+            continue;
+        }
+        if !target_has_gateway(&def, &target)? {
             let mut entry = repair_gateway_entry(def.format, &legacy, &server.name, client_id)?;
             entry.command = Some(gateway.to_string());
             outcome.managed = install_or_remove(client_id, Some(&entry))?.managed;
@@ -241,9 +246,28 @@ fn same_connection(
     Ok(scope_of(&current) == scope_of(&old))
 }
 
-/// Point the old file's Toolport entry at `gateway`, keeping its scope.
+/// Whether an entry is a local stdio Toolport gateway: a gateway binary command
+/// with no URL and no `mcp-remote` bridge. Only such an entry may be rebuilt by
+/// [`repair_gateway_entry`]; anything else would lose its endpoint and auth.
+fn is_local_gateway(server: &McpServer) -> bool {
+    server.url.is_none()
+        && !server.args.iter().any(|arg| arg == "mcp-remote")
+        && command_is_gateway_binary(server.command.as_deref().unwrap_or(""))
+}
+
+/// Point the old file's Toolport entry at `gateway`, keeping its scope. Under the
+/// config lock the entry is read again, and anything but a local gateway entry is
+/// left untouched.
 fn refresh_legacy(def: &ClientDef, legacy: &Path, name: &str, gateway: &str) -> Result<(), String> {
     mutation::run(def.id, legacy, def.format, || {
+        let servers = parse_client_content(def.format, &read_config_file(legacy)?)?;
+        if !servers
+            .iter()
+            .find(|server| server.name == name)
+            .is_some_and(is_local_gateway)
+        {
+            return Ok(());
+        }
         backup_file(def.id, legacy)?;
         let mut entry = repair_gateway_entry(def.format, legacy, name, def.id)?;
         entry.command = Some(gateway.to_string());
@@ -432,7 +456,7 @@ pub(super) fn old_file_status(client_id: &str, legacy: &Path) -> OldFile {
 /// `MaybeRead`. Evidence per client is in docs/clients.md.
 pub(super) fn resolve_old_file_status(
     client_id: &str,
-    legacy: &Path,
+    _legacy: &Path,
     home: &Path,
     platform: Platform,
     env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
@@ -446,29 +470,26 @@ pub(super) fn resolve_old_file_status(
         }
         // Cline 4 migrates the old storage file once and records it in globalState
         // (mcp-settings-legacy-migration.ts@v4.1.26); 3.x reads only the old file.
-        ("cline", _) if cline_moved(home) => {
-            OldFile::Unread("Cline 4 is installed or recorded its one-time migration")
+        // Only Cline's own record proves the migration ran: a downloaded Cline 4
+        // folder may not be active yet while Cline 3 still reads the old file.
+        // A rollback to Cline 3 keeps that record, so an installed 3.x (the newest
+        // folder in VS Code's extensions) reads the old file again.
+        ("cline", _)
+            if cline_migrated(home)
+                && installed_cline_major(home).is_none_or(|major| major >= 4) =>
+        {
+            OldFile::Unread("Cline 4 recorded its one-time migration and no Cline 3 is installed")
         }
         // The Windows installer sets HERMES_HOME (install.ps1@v2026.5.16), and Hermes
         // then reads only that folder (hermes_constants.py@v0.23.1).
         ("hermes", Platform::Windows) if env("HERMES_HOME").is_some_and(|v| !v.is_empty()) => {
             OldFile::Unread("HERMES_HOME is set, so Hermes reads only that folder")
         }
-        // LM Studio reads the home named in ~/.lmstudio-home-pointer
-        // (findLMStudioHome.ts@2025945), so other default homes are unused.
-        ("lm-studio", _) if home.join(".lmstudio-home-pointer").is_file() => {
-            OldFile::Unread("~/.lmstudio-home-pointer names the LM Studio home")
-        }
-        // Reasonix falls back to a legacy config.toml only while its home file is
-        // missing (paths.go@cd20bb50be); Toolport writes the legacy file until then.
-        ("reasonix", _)
-            if legacy.parent().is_some_and(|dir| {
-                resolve_client_config_path_env("reasonix", home, platform, env)
-                    .is_some_and(|primary| primary.is_file() && primary.parent() != Some(dir))
-            }) =>
-        {
-            OldFile::Unread("Reasonix reads only its home config.toml once it exists")
-        }
+        // LM Studio's home pointer is written by lmstudio-js (the CLI and SDK);
+        // the closed-source app may predate it and read ~/.lmstudio. Reasonix
+        // reads only its home config.toml once it exists, but a rollback to a
+        // release that knew only the legacy file reads that again. Both keep the
+        // old entry.
         // Devin Desktop still imports ~/.codeium/windsurf by default
         // (read_config_from.windsurf), Crush still merges %LOCALAPPDATA%\crush last,
         // Amazon Q still loads mcp.json while useLegacyMcpJson is on, and Antigravity
@@ -477,15 +498,21 @@ pub(super) fn resolve_old_file_status(
     }
 }
 
-/// Cline 4's own record that it migrated the VS Code storage file, or an installed
-/// Cline 4 extension in VS Code (whose storage the old file is).
+/// Cline 4's own record, in `~/.cline/data/globalState.json`, that it migrated the
+/// VS Code storage file (mcp-settings-legacy-migration.ts@v4.1.26). The only
+/// evidence that lets Toolport remove its entry from the old file.
+pub(super) fn cline_migrated(home: &Path) -> bool {
+    std::fs::read_to_string(home.join(".cline").join("data").join("globalState.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .is_some_and(|state| state.get("__vscodeLegacyMcpSettingsMigration").is_some())
+}
+
+/// Where to write Cline's entry: the new file once Cline 4 migrated or is present
+/// in VS Code's extensions folder. A present folder only guides the write; the old
+/// file keeps its entry until [`cline_migrated`].
 pub(super) fn cline_moved(home: &Path) -> bool {
-    let migrated =
-        std::fs::read_to_string(home.join(".cline").join("data").join("globalState.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-            .is_some_and(|state| state.get("__vscodeLegacyMcpSettingsMigration").is_some());
-    migrated || installed_cline_major(home).is_some_and(|major| major >= 4)
+    cline_migrated(home) || installed_cline_major(home).is_some_and(|major| major >= 4)
 }
 
 /// The newest `saoudrizwan.claude-dev-<version>` major in VS Code's extensions folder.

@@ -671,7 +671,23 @@ fn json_connections_reach_the_current_file_and_leave_old_ones_only_on_evidence()
             },
             true,
         ),
-        // Cline 4 installed in VS Code.
+        // A rollback to Cline 3 after the migration: the record stays, the old
+        // file is read again.
+        (
+            "cline",
+            |h| cline_legacy_settings_path(h, Platform::current(), &client_path_env),
+            |h| {
+                write(
+                    &h.join(".cline/data/globalState.json"),
+                    &json!({"__vscodeLegacyMcpSettingsMigration": {"done": true}}),
+                );
+                std::fs::create_dir_all(h.join(".vscode/extensions/saoudrizwan.claude-dev-3.89.2"))
+                    .unwrap()
+            },
+            false,
+        ),
+        // R2-3: a downloaded Cline 4 folder guides the write but proves nothing about
+        // which file the running extension reads, so the old entry stays.
         (
             "cline",
             |h| cline_legacy_settings_path(h, Platform::current(), &client_path_env),
@@ -679,7 +695,7 @@ fn json_connections_reach_the_current_file_and_leave_old_ones_only_on_evidence()
                 std::fs::create_dir_all(h.join(".vscode/extensions/saoudrizwan.claude-dev-4.1.26"))
                     .unwrap()
             },
-            true,
+            false,
         ),
         // Amazon Q CLI and IDEs with legacy reading on still load mcp.json.
         (
@@ -709,7 +725,8 @@ fn json_connections_reach_the_current_file_and_leave_old_ones_only_on_evidence()
                 std::fs::create_dir_all(&cache).unwrap();
                 std::fs::write(h.join(".lmstudio-home-pointer"), cache.to_str().unwrap()).unwrap();
             },
-            true,
+            // The app may predate the pointer lmstudio-js writes.
+            false,
         ),
     ];
     for (client, legacy_of, prepare, moves) in cases {
@@ -933,6 +950,45 @@ fn a_hand_edited_or_shared_http_legacy_entry_and_an_unreadable_target_block_the_
     );
     assert!(relocate::relocate("windsurf", fixture.gateway(), Some(&managed)).is_err());
     assert_eq!(read(&legacy), shared);
+
+    // R2-1: with a Toolport entry already in the current file, the Shared HTTP
+    // entry is still never rebuilt into a local gateway: endpoint, args and auth
+    // stay byte for byte until the user reconnects.
+    let shared = json!({"mcpServers": {"toolport": {"command": "npx",
+        "args": ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp", "--header", "Authorization:Bearer abc"]}}});
+    write(&legacy, &shared);
+    let legacy_bytes = std::fs::read_to_string(&legacy).unwrap();
+    let managed = ManagedEntry::from_gateway_entry(
+        &serde_json::from_value(json!({"id": "toolport", "name": "toolport",
+            "transport": "stdio", "command": "npx",
+            "args": ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp", "--header", "Authorization:Bearer abc"]}))
+        .unwrap(),
+    );
+    write(
+        &target,
+        &json!({"mcpServers": {"toolport": {"command": fixture.gateway(), "args": [],
+            "env": {"TOOLPORT_CLIENT_ID": "devin-cli"}}}}),
+    );
+    let target_bytes = std::fs::read_to_string(&target).unwrap();
+    for verdict in [
+        relocate::OldFile::MaybeRead,
+        relocate::OldFile::Unread("test"),
+    ] {
+        relocate::STATUS_OVERRIDE.with(|cell| cell.set(Some(verdict)));
+        let moved = relocate::relocate("windsurf", fixture.gateway(), Some(&managed));
+        relocate::STATUS_OVERRIDE.with(|cell| cell.set(None));
+        let moved = moved.unwrap();
+        assert!(
+            moved.cleaned.is_empty() && moved.managed.is_none(),
+            "{verdict:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&legacy).unwrap(),
+            legacy_bytes,
+            "{verdict:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), target_bytes);
+    }
 }
 
 #[test]
