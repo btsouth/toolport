@@ -311,3 +311,176 @@ fn updater_shutdown_waits_for_a_client_session_then_exits_without_the_idle_grace
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A copy of the gateway in its own folder, standing in for an installed app the
+/// user can delete or move to the Trash while its daemon runs.
+fn installed_copy(dir: &Path) -> PathBuf {
+    let app = dir.join("app");
+    std::fs::create_dir_all(&app).expect("create the app folder");
+    let name = Path::new(env!("CARGO_BIN_EXE_toolport-gateway"))
+        .file_name()
+        .expect("gateway file name");
+    let copy = app.join(name);
+    std::fs::copy(env!("CARGO_BIN_EXE_toolport-gateway"), &copy).expect("copy the gateway");
+    copy
+}
+
+fn spawn_daemon_from(binary: &Path, dir: &Path, grace_ms: u64) -> ChildGuard {
+    let child = Command::new(binary)
+        .arg("--daemon")
+        .env("TOOLPORT_DATA_DIR", dir)
+        .env("TOOLPORT_REGISTRY", dir.join("registry.json"))
+        .env("TOOLPORT_DAEMON_IDLE_GRACE_MS", grace_ms.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the daemon");
+    ChildGuard(child)
+}
+
+/// "Uninstall" the copy the way each platform allows while it runs: Unix
+/// deletes it, Windows can only move a running image (as the Recycle Bin does).
+fn uninstall_copy(binary: &Path) {
+    #[cfg(unix)]
+    std::fs::remove_file(binary).expect("delete the running gateway");
+    #[cfg(not(unix))]
+    std::fs::rename(binary, binary.with_extension("trashed")).expect("move the running gateway");
+}
+
+#[test]
+fn a_daemon_whose_app_was_removed_exits_without_waiting_out_the_idle_grace() {
+    let dir = scratch_dir();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let binary = installed_copy(&dir);
+    // Far longer than the deadline below: only the removal can end it in time.
+    let mut child = spawn_daemon_from(&binary, &dir, 600_000);
+    wait_for_descriptor(&mut child, &dir);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        child.0.try_wait().expect("daemon status").is_none(),
+        "the daemon exited before its app was removed\n{}",
+        diagnostics(&dir)
+    );
+    uninstall_copy(&binary);
+    let status = wait_for_exit(&mut child, &dir, Duration::from_secs(15));
+    assert!(
+        status.success(),
+        "unexpected daemon exit: {status:?}\n{}",
+        diagnostics(&dir)
+    );
+    assert!(
+        read_descriptor(&dir).is_none(),
+        "the descriptor outlived the daemon\n{}",
+        diagnostics(&dir)
+    );
+    assert!(
+        diagnostics(&dir).contains("reason=binary_removed"),
+        "the exit was not attributed to the removed binary\n{}",
+        diagnostics(&dir)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_removed_app_keeps_serving_a_live_session_until_it_ends() {
+    let dir = scratch_dir();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let binary = installed_copy(&dir);
+    let mut child = spawn_daemon_from(&binary, &dir, 600_000);
+    let descriptor = wait_for_descriptor(&mut child, &dir);
+    let endpoint = descriptor["endpoint"].as_str().expect("endpoint");
+    let token = descriptor["token"].as_str().expect("token");
+    let initialize = post_mcp(
+        endpoint,
+        token,
+        None,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "removed-app-test", "version": "1" }
+            }
+        }),
+    );
+    let session = initialize
+        .headers()
+        .get("Mcp-Session-Id")
+        .and_then(|value| value.to_str().ok())
+        .expect("session id")
+        .to_string();
+    let mut listen = TcpStream::connect(endpoint).expect("connect session listen stream");
+    listen
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set listen timeout");
+    write!(
+        listen,
+        "GET /mcp HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {token}\r\nAccept: text/event-stream\r\nMcp-Session-Id: {session}\r\n\r\n"
+    )
+    .expect("write listen request");
+    listen.flush().expect("flush listen request");
+    let mut head = [0u8; 128];
+    let read = listen.read(&mut head).expect("read listen response");
+    assert!(String::from_utf8_lossy(&head[..read]).starts_with("HTTP/1.1 200"));
+
+    uninstall_copy(&binary);
+    // Several binary checks later, the connected client is still served.
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        child.0.try_wait().expect("daemon status").is_none(),
+        "the daemon dropped a live client when its app was removed\n{}",
+        diagnostics(&dir)
+    );
+    conduit_lib::http_client::agent()
+        .delete(&format!("http://{endpoint}/mcp"))
+        .set_header("Authorization", &format!("Bearer {token}"))
+        .set_header("Mcp-Session-Id", &session)
+        .call()
+        .retain_status_body()
+        .expect("close client session");
+    drop(listen);
+    let status = wait_for_exit(&mut child, &dir, Duration::from_secs(10));
+    assert!(status.success(), "unexpected daemon exit: {status:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stop_when_idle_stops_an_idle_daemon_at_once() {
+    let dir = scratch_dir();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let mut child = spawn_daemon(&dir, 600_000);
+    let descriptor = wait_for_descriptor(&mut child, &dir);
+    let pid = descriptor["pid"].as_u64().expect("pid") as u32;
+    // Reap it as it exits, the way its real parent would: an unreaped child is a
+    // zombie, and a zombie still has a pid.
+    let (exited, status) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = exited.send(child.0.wait());
+        drop(child);
+    });
+    let outcomes = conduit_lib::daemon::stop_when_idle(&dir, Duration::from_secs(10));
+    let status = status
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_else(|_| {
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+            panic!("the daemon did not exit\n{}", diagnostics(&dir))
+        })
+        .expect("daemon status");
+    assert!(status.success(), "unexpected daemon exit: {status:?}");
+    assert!(
+        matches!(
+            outcomes.as_slice(),
+            [conduit_lib::daemon::IdleStop::Stopped(stopped)
+                | conduit_lib::daemon::IdleStop::Serving(stopped)] if *stopped == pid
+        ),
+        "{outcomes:?}\n{}",
+        diagnostics(&dir)
+    );
+    // Nothing is left to stop on a second call.
+    assert!(conduit_lib::daemon::stop_when_idle(&dir, Duration::ZERO).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -340,6 +340,188 @@ pub fn request_shutdown_if_idle(descriptor: &DaemonDescriptor) -> Result<(), Str
         .map_err(|error| format!("could not request idle daemon shutdown: {error}"))
 }
 
+/// What [`stop_when_idle`] found for one advertised daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdleStop {
+    /// It exited (or was already gone).
+    Stopped(u32),
+    /// It accepted the request but is still serving a client session. It exits
+    /// on its own as soon as that session ends.
+    Serving(u32),
+    /// It could not be asked: its identity did not check out, or the request failed.
+    Failed(u32, String),
+}
+
+/// Ask every daemon this data directory advertises to exit once no client
+/// session is open, then wait up to `wait` for the idle ones to go. A daemon
+/// whose identity does not authenticate against its descriptor is never asked:
+/// it may be an unrelated process that reused the pid.
+///
+/// Used when Toolport's own presence ends: the app quits ("no wait"), the user
+/// removes Toolport from every client, or an uninstaller runs `--disconnect-all`.
+/// A daemon serving a live client keeps serving; the request stays set inside it,
+/// so it exits the moment that client disconnects instead of after the idle grace.
+pub fn stop_when_idle(data_dir: &Path, wait: Duration) -> Vec<IdleStop> {
+    let mut asked = Vec::new();
+    let mut outcomes = Vec::new();
+    for path in purge_descriptors(data_dir) {
+        let Some(descriptor) = read_descriptor(&path) else {
+            continue;
+        };
+        let pid = descriptor.pid;
+        let request = match attempt_identity_probe(&descriptor) {
+            Ok(identity) if identity.pid == pid && identity.compat == descriptor.compat => {
+                request_shutdown_if_idle(&descriptor)
+            }
+            Ok(_) => Err("its identity does not match its descriptor".to_string()),
+            // Nothing is listening: the daemon is already gone.
+            Err(ProbeFailure::Unreachable) if !process_exists(pid) => {
+                outcomes.push(IdleStop::Stopped(pid));
+                continue;
+            }
+            Err(ProbeFailure::Unreachable | ProbeFailure::Answered(_)) => {
+                Err("it does not answer as a Toolport daemon".to_string())
+            }
+            Err(ProbeFailure::Silent) => Err("it did not answer".to_string()),
+        };
+        match request {
+            Ok(()) => asked.push(pid),
+            Err(error) => outcomes.push(IdleStop::Failed(pid, error)),
+        }
+    }
+    let deadline = Instant::now() + wait;
+    loop {
+        let running = asked.iter().any(|pid| process_exists(*pid));
+        if !running || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::park_timeout(Duration::from_millis(50));
+    }
+    outcomes.extend(asked.into_iter().map(|pid| {
+        if process_exists(pid) {
+            IdleStop::Serving(pid)
+        } else {
+            IdleStop::Stopped(pid)
+        }
+    }));
+    outcomes
+}
+
+/// Called as the desktop app (either shell) exits: ask this data directory's
+/// daemons to stop once no client is connected. Never blocks the quit for long;
+/// a wedged daemon is left to its idle grace.
+pub fn stop_when_idle_on_app_quit() {
+    let Some(dir) = registry::conduit_dir() else {
+        return;
+    };
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let outcomes = stop_when_idle(&dir, Duration::ZERO);
+        for line in describe_idle_stops(&outcomes) {
+            crate::gatewaylog::append(&format!("app quit: {line}"));
+        }
+        let _ = done.send(());
+    });
+    let _ = finished.recv_timeout(Duration::from_secs(3));
+}
+
+/// After Toolport was removed from every client (Settings, `--disconnect-all`,
+/// or an uninstaller): stop the daemons that no connected client still uses.
+pub fn stop_when_idle_after_disconnect() -> Vec<String> {
+    let Some(dir) = registry::conduit_dir() else {
+        return Vec::new();
+    };
+    let lines = describe_idle_stops(&stop_when_idle(&dir, Duration::from_secs(5)));
+    for line in &lines {
+        crate::gatewaylog::append(&format!("disconnect all: {line}"));
+    }
+    lines
+}
+
+/// One line per outcome for logs and stderr.
+pub fn describe_idle_stops(outcomes: &[IdleStop]) -> Vec<String> {
+    outcomes
+        .iter()
+        .map(|outcome| match outcome {
+            IdleStop::Stopped(pid) => format!("Toolport daemon pid {pid} stopped."),
+            IdleStop::Serving(pid) => format!(
+                "Toolport daemon pid {pid} is serving a connected client; it stops when that client disconnects."
+            ),
+            IdleStop::Failed(pid, error) => {
+                format!("Toolport daemon pid {pid} was not stopped: {error}.")
+            }
+        })
+        .collect()
+}
+
+/// The identity of the executable a daemon was started from, so it can notice
+/// that its app was deleted, moved to the Trash, or replaced by a package
+/// upgrade. Unix compares device and inode; elsewhere size and mtime (Windows
+/// cannot delete or overwrite a running image, but it can rename one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutableIdentity {
+    path: PathBuf,
+    id: FileId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileId {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(not(unix))]
+    len: u64,
+    #[cfg(not(unix))]
+    modified: Option<SystemTime>,
+}
+
+impl FileId {
+    fn of(path: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(Self {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Some(Self {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+            })
+        }
+    }
+}
+
+impl ExecutableIdentity {
+    /// This process's executable, as launched. `None` when it cannot be read,
+    /// in which case the daemon never treats its binary as gone.
+    pub fn current() -> Option<Self> {
+        Self::of(&std::env::current_exe().ok()?)
+    }
+
+    pub fn of(path: &Path) -> Option<Self> {
+        // Resolve `Contents/MacOS/../Helpers/...` and symlinks now: after the
+        // app moves, the launch path no longer resolves at all.
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let id = FileId::of(&path)?;
+        Some(Self { path, id })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Whether the file the process started from is still at its path.
+    pub fn still_installed(&self) -> bool {
+        FileId::of(&self.path).as_ref() == Some(&self.id)
+    }
+}
+
 /// Stale or malformed descriptors are data, not live-process evidence.
 fn purge_descriptors(data_dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(data_dir)

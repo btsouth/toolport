@@ -4890,6 +4890,8 @@ pub fn run() {
             if matches!(event, tauri::RunEvent::Exit) {
                 // Land any queued audit/savings/search-trace lines before the app exits.
                 crate::telemetry::shutdown();
+                // Quitting with no client connected leaves no gateway behind.
+                crate::daemon::stop_when_idle_on_app_quit();
                 if let Some(stop) = app_handle.try_state::<TeamLifecycleStop>() {
                     stop.0.store(true, std::sync::atomic::Ordering::Release);
                 }

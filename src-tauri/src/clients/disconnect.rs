@@ -12,8 +12,16 @@ pub struct ClientResult {
     pub warnings: Vec<String>,
 }
 
+/// Restore every client, then stop the daemons nothing connected still uses:
+/// with Toolport out of every config, an idle daemon has no one left to serve.
 pub fn all(dry_run: bool) -> Result<Vec<ClientResult>, String> {
-    all_with_registry(dry_run, false)
+    let results = all_with_registry(dry_run, false)?;
+    if !dry_run {
+        for line in crate::daemon::stop_when_idle_after_disconnect() {
+            eprintln!("{line}");
+        }
+    }
+    Ok(results)
 }
 
 pub(crate) fn for_purge(all_installs: bool) -> Result<Vec<ClientResult>, String> {
@@ -131,7 +139,7 @@ fn all_with_clients(
     Ok(results)
 }
 
-fn restore_path(
+pub(super) fn restore_path(
     id: &str,
     path: &Path,
     format: Format,

@@ -66,8 +66,17 @@
     ; The template checks again after this hook, but cancellation must precede
     ; disconnecting clients while the gateway binary still exists.
     !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
-    nsExec::ExecToLog /TIMEOUT=30000 '"$INSTDIR\toolport-gateway.exe" --disconnect-all'
+    ; Restores every client and stops daemons no connected client still uses.
+    nsExec::ExecToLog /TIMEOUT=30000 '"$INSTDIR\toolport-gateway.exe" --disconnect-all --uninstall'
     Pop $0
+    ; Windows cannot remove a running gateway image, so a client still
+    ; connected right now loses its gateway here (it was just disconnected).
+    ; Same policy as installs: owned gateways stop, their parent apps never do.
+    nsExec::ExecToLog /TIMEOUT=60000 '"$INSTDIR\toolport-gateway.exe" --installer-preflight "$INSTDIR"'
+    Pop $R8
+    ${If} $R8 != 0
+      DetailPrint "Some Toolport gateway processes could not be stopped ($R8). Close the affected MCP clients; files still in use are removed when Windows restarts."
+    ${EndIf}
     ${If} $0 != 0
       ; Recovery requires the backups, even when Delete app data was selected.
       StrCpy $DeleteAppDataCheckboxState 0

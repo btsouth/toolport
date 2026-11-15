@@ -509,3 +509,58 @@ fn a_modern_client_keeps_its_daemon_alive_while_idle() {
         "the daemon idled out under a connected client"
     );
 }
+
+fn pid_alive(pid: u64) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Quitting the app (or removing Toolport from every client) asks the daemon to
+/// stop. A client that is connected right now keeps its daemon; the daemon goes
+/// as soon as that client does, without waiting out the idle grace.
+#[test]
+fn a_stop_request_spares_a_connected_client_and_leaves_with_it() {
+    let mut harness = Harness::start_with_env(&[("TOOLPORT_DAEMON_IDLE_GRACE_MS", "600000")]);
+    harness.send(modern_request(1, "server/discover", serde_json::json!({})));
+    assert!(
+        harness.response_to(1).get("result").is_some(),
+        "the first request failed\n{}",
+        harness.diagnostics()
+    );
+    let pid = daemon_pid(&harness.dir).expect("a daemon descriptor");
+    let outcomes = conduit_lib::daemon::stop_when_idle(&harness.dir, Duration::from_secs(3));
+    assert_eq!(
+        outcomes,
+        vec![conduit_lib::daemon::IdleStop::Serving(pid as u32)],
+        "{}",
+        harness.diagnostics()
+    );
+    // Well past several watchdog polls, the same daemon still answers.
+    std::thread::sleep(Duration::from_secs(3));
+    harness.send(modern_request(2, "server/discover", serde_json::json!({})));
+    assert!(
+        harness.response_to(2).get("result").is_some(),
+        "a call after the stop request failed\n{}",
+        harness.diagnostics()
+    );
+    assert_eq!(
+        daemon_pid(&harness.dir),
+        Some(pid),
+        "the daemon was replaced"
+    );
+    // The client disconnects: the adapter exits and closes its lifetime stream.
+    let _ = harness.child.kill();
+    let _ = harness.child.wait();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while pid_alive(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon outlived its last client\n{}",
+            harness.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
