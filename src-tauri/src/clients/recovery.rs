@@ -320,7 +320,28 @@ fn receipts() -> Result<Vec<Receipt>, String> {
             .into_iter()
             .find(|d| d.id == id.split('@').next().unwrap_or(""))
         else {
-            records.push(error_receipt(&id,&crate::i18n::tr("Client config recovery"),dir.path(),Format::JsonMcpServers,crate::i18n::msg("This recovery belongs to an unsupported client. Use a compatible Toolport version to recover it.")));
+            // The shared backup root can also contain the user's own files.
+            // An unknown folder is a recovery candidate only when it contains
+            // a canonical receipt name; never follow a link to find one.
+            let has_receipt = std::fs::symlink_metadata(dir.path())
+                .ok()
+                .filter(|meta| meta.is_dir() && !crate::purge::is_link(meta))
+                .and_then(|_| std::fs::read_dir(dir.path()).ok())
+                .is_some_and(|entries| {
+                    entries.filter_map(Result::ok).any(|entry| {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        name.strip_prefix("original-")
+                            .and_then(|name| name.strip_suffix(".json"))
+                            .is_some_and(|hash| {
+                                hash.len() == 64
+                                    && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            })
+                    })
+                });
+            if has_receipt {
+                records.push(error_receipt(&id,&crate::i18n::tr("Client config recovery"),dir.path(),Format::JsonMcpServers,crate::i18n::msg("This recovery belongs to an unsupported client. Use a compatible Toolport version to recover it.")));
+            }
             continue;
         };
         if id != base.id && !locations::valid_id(&id) {
@@ -605,14 +626,31 @@ mod tests {
             )
             .unwrap();
             std::fs::create_dir(data.join("client-locations.json")).unwrap();
+            let root = data.join("backups");
+            std::fs::write(root.join("tax.zip"), "user bytes").unwrap();
+            std::fs::create_dir_all(root.join("notes")).unwrap();
+            std::fs::write(root.join("notes/original-report.json"), "user bytes").unwrap();
+            std::fs::create_dir_all(root.join("future-client")).unwrap();
+            std::fs::write(
+                root.join("future-client")
+                    .join(format!("original-{}.json", "0".repeat(64))),
+                "{}",
+            )
+            .unwrap();
             let rows = list().unwrap();
-            assert_eq!(rows.len(), 5);
+            assert_eq!(rows.len(), 6);
+            assert!(rows
+                .iter()
+                .any(|r| r.client_id == "future-client" && r.error.is_some()));
+            assert!(!rows
+                .iter()
+                .any(|r| r.backup_path.ends_with("tax.zip") || r.backup_path.contains("/notes")));
             assert!(rows.iter().any(|r| r.id == good.id && r.can_discard));
             assert_eq!(
                 rows.iter()
                     .filter(|r| !r.can_discard && r.error.is_some())
                     .count(),
-                4
+                5
             );
             assert!(!serde_json::to_string(&rows)
                 .unwrap()

@@ -171,6 +171,8 @@ fn purge_override_with_registry_preserves_user_files_for_both_brand_overrides() 
         .unwrap();
         for name in [
             "backups/tax.zip",
+            "backups/personal/tax.zip",
+            "backups/notes/original-report.json",
             "bin/personal-script",
             "logs/other-app.log",
             "daemon-notes.json",
@@ -208,6 +210,8 @@ fn purge_override_with_registry_preserves_user_files_for_both_brand_overrides() 
         );
         for name in [
             "backups/tax.zip",
+            "backups/personal/tax.zip",
+            "backups/notes/original-report.json",
             "bin/personal-script",
             "logs/other-app.log",
             "daemon-notes.json",
