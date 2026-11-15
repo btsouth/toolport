@@ -3034,26 +3034,38 @@ pub fn status_notes() -> Vec<String> {
             "secret redaction could not be prepared for the configured secrets, so logs and messages show {WITHHELD} in place of their text until it can. Remove or shorten unusually long secret values."
         ));
     }
-    let short: Vec<String> = REGISTRY
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .and_then(|map| map.get(&scope_now()))
-        .map(|reg| {
-            let mut ids: Vec<String> = reg
-                .secrets
-                .iter()
-                .filter(|(id, _, v)| {
-                    !id.starts_with("__toolport_internal__/")
-                        && v.trim().chars().count() < SHORT_SECRET_CHARS
-                })
-                .map(|(id, _, _)| id.clone())
-                .collect();
-            ids.sort();
-            ids.dedup();
-            ids
-        })
-        .unwrap_or_default();
+    let ids_where = |keep: &dyn Fn(&str) -> bool| -> Vec<String> {
+        REGISTRY
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|map| map.get(&scope_now()))
+            .map(|reg| {
+                let mut ids: Vec<String> = reg
+                    .secrets
+                    .iter()
+                    .filter(|(id, _, v)| !id.starts_with("__toolport_internal__/") && keep(v))
+                    .map(|(id, _, _)| id.clone())
+                    .collect();
+                ids.sort();
+                ids.dedup();
+                ids
+            })
+            .unwrap_or_default()
+    };
+    let short = ids_where(&|v| v.trim().chars().count() < SHORT_SECRET_CHARS);
+    let short_numbers = ids_where(&|v| {
+        let v = v.trim();
+        !v.is_empty()
+            && v.len() < MIN_NUMERIC_SECRET_DIGITS
+            && v.bytes().all(|b| b.is_ascii_digit())
+    });
+    if !short_numbers.is_empty() {
+        notes.push(format!(
+            "numeric secret(s) with fewer than {MIN_NUMERIC_SECRET_DIGITS} digits are not replaced where they appear as a JSON number (a port or a count would be replaced too): {} (server/key).",
+            short_numbers.join(", ")
+        ));
+    }
     if !short.is_empty() {
         notes.push(format!(
             "secret(s) shorter than {SHORT_SECRET_CHARS} characters are redacted only as whole words, so a copy run into other text may be logged: {} (server/key). Use a longer value where the service allows it.",
@@ -3903,6 +3915,25 @@ mod tests {
         assert!(!m.truncate_chars(line, 200).contains("Unbuilt"));
         // A buildable set is unaffected.
         assert!(!self::m(&[("KEY", "sk-UnbuiltSecret77")]).is_broken());
+    }
+
+    #[test]
+    fn status_names_numeric_secrets_too_short_to_replace_as_numbers() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-short-num-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        register("pin-server", "PIN", "4821");
+        register("pin-server", "ACCOUNT", "48213377");
+        let notes = status_notes().join("\n");
+        let line = notes
+            .lines()
+            .find(|l| l.starts_with("numeric secret(s)"))
+            .unwrap_or_else(|| panic!("{notes}"));
+        assert!(line.contains("pin-server/PIN"), "{line}");
+        assert!(
+            !line.contains("ACCOUNT") && !line.contains("4821"),
+            "{line}"
+        );
     }
 
     #[test]
