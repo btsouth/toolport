@@ -75,26 +75,117 @@ fn marker_name(name: &str) -> String {
     }
 }
 
-/// The forms an upstream plausibly echoes. Deduplicated; the raw value first.
-fn variants(value: &str) -> Vec<String> {
+/// Shortest base64 inner string registered for a secret embedded at an unknown
+/// byte offset inside a longer base64 blob. Sixteen characters carry 96 bits of
+/// the secret, so a coincidental match in unrelated base64 is not a real risk;
+/// shorter inner strings would start matching random blobs. A secret too short
+/// to reach it (under 13 bytes) is still matched in its whole-value encodings,
+/// which is how an upstream that encodes the bare secret writes it.
+pub const MIN_BASE64_INNER_CHARS: usize = 16;
+
+const BASE64_ENGINES: [&base64::engine::GeneralPurpose; 4] = [
+    &base64::engine::general_purpose::STANDARD,
+    &base64::engine::general_purpose::STANDARD_NO_PAD,
+    &base64::engine::general_purpose::URL_SAFE,
+    &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+];
+
+/// The characters of `base64(prefix ++ value ++ suffix)` that depend only on
+/// `value`, for each of the three alignments a prefix of unknown bytes can give
+/// it, in both alphabets. A character covers six bits; it is stable when all six
+/// fall inside the value's bytes, so the first `ceil(8k/6)` characters (the
+/// prefix's influence) and the last partial one (the suffix's) are dropped.
+fn base64_inner(value: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    for k in 0..3usize {
+        let mut shifted = vec![0u8; k];
+        shifted.extend_from_slice(value);
+        let start = (8 * k).div_ceil(6);
+        let end = 8 * (k + value.len()) / 6;
+        if end <= start || end - start < MIN_BASE64_INNER_CHARS {
+            continue;
+        }
+        for engine in [
+            &base64::engine::general_purpose::STANDARD_NO_PAD,
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        ] {
+            let encoded = engine.encode(&shifted);
+            out.push(encoded[start..end].to_string());
+        }
+    }
+    out
+}
+
+/// Text forms an upstream error formatter realistically applies to a value it
+/// quotes: the value itself, trimmed, upper- and lowercased, Unicode NFC/NFKC
+/// (a formatter or terminal that normalizes), and each line of a multi-line value
+/// (a PEM key quoted one line at a time, or with its newlines collapsed).
+fn text_forms(value: &str) -> Vec<String> {
+    use unicode_normalization::UnicodeNormalization as _;
     let mut out = vec![value.to_string()];
     let mut push = |v: String| {
+        if !v.trim().is_empty() && !out.contains(&v) {
+            out.push(v);
+        }
+    };
+    push(value.trim().to_string());
+    push(value.to_uppercase());
+    push(value.to_lowercase());
+    if !value.is_ascii() {
+        push(value.nfc().collect());
+        push(value.nfkc().collect());
+    }
+    if value.contains(['\n', '\r']) {
+        for line in value.lines().map(str::trim) {
+            if line.chars().count() >= MIN_BASE64_INNER_CHARS {
+                push(line.to_string());
+            }
+        }
+        push(value.split_whitespace().collect::<Vec<_>>().join(" "));
+    }
+    out
+}
+
+/// Every form an upstream plausibly echoes. Deduplicated; the raw value first.
+///
+/// For the value and each [`text_forms`] form: itself, percent-encoded (upper and
+/// lower hex, and form encoding), hex of its bytes (lower and upper), JSON-escaped
+/// once and twice (a JSON document quoted inside a JSON string), and base64 in
+/// four variants. For the value alone: base64 of `:value` (HTTP Basic with an
+/// empty username) and the [`base64_inner`] strings, which find it at any offset
+/// inside a longer base64 blob, Basic credentials with an unknown username among
+/// them.
+fn variants(value: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |v: String, out: &mut Vec<String>| {
         if !v.is_empty() && !out.contains(&v) {
             out.push(v);
         }
     };
-    let percent = urlencoding::encode(value).into_owned();
-    push(percent.to_ascii_lowercase_hex());
-    push(percent);
-    push(url::form_urlencoded::byte_serialize(value.as_bytes()).collect());
-    let bytes = value.as_bytes();
-    for engine in [
-        &base64::engine::general_purpose::STANDARD,
-        &base64::engine::general_purpose::STANDARD_NO_PAD,
-        &base64::engine::general_purpose::URL_SAFE,
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-    ] {
-        push(engine.encode(bytes));
+    for form in text_forms(value) {
+        push(form.clone(), &mut out);
+        let percent = urlencoding::encode(&form).into_owned();
+        push(percent.to_ascii_lowercase_hex(), &mut out);
+        push(percent, &mut out);
+        push(
+            url::form_urlencoded::byte_serialize(form.as_bytes()).collect(),
+            &mut out,
+        );
+        let hex: String = form.bytes().map(|b| format!("{b:02x}")).collect();
+        push(hex.to_ascii_uppercase(), &mut out);
+        push(hex, &mut out);
+        let once = json_escaped(&form);
+        push(json_escaped(&once), &mut out);
+        push(once, &mut out);
+        for engine in BASE64_ENGINES {
+            push(engine.encode(form.as_bytes()), &mut out);
+        }
+    }
+    for engine in BASE64_ENGINES {
+        push(engine.encode(format!(":{value}")), &mut out);
+    }
+    for inner in base64_inner(value.as_bytes()) {
+        push(inner, &mut out);
     }
     out
 }
@@ -158,9 +249,12 @@ impl Matcher {
                     names.len() - 1
                 }
             };
+            // A short secret keeps the whole-token rule in every encoding: its hex or
+            // base64 is long enough to look specific but is still only a few bytes.
+            let short = value.chars().count() < SHORT_SECRET_CHARS;
             for variant in variants(value) {
                 if seen.insert(variant.clone()) {
-                    let whole_token = variant.chars().count() < SHORT_SECRET_CHARS;
+                    let whole_token = short || variant.chars().count() < SHORT_SECRET_CHARS;
                     raw_patterns.push((variant, Pattern { name, whole_token }));
                 }
             }
@@ -633,8 +727,17 @@ fn register_forms(scope: &Scope, id: &str, key: &str, value: &str) -> bool {
         if url.has_host() {
             if let Some(password) = url.password() {
                 added |= add(scope, &id, key, password);
-                if let Ok(decoded) = urlencoding::decode(password) {
-                    added |= add(scope, &id, key, &decoded);
+                let decoded = urlencoding::decode(password).map(|d| d.into_owned());
+                if let Ok(decoded) = &decoded {
+                    added |= add(scope, &id, key, decoded);
+                }
+                // The same userinfo sent as HTTP Basic: `base64(user:password)`.
+                let user = url.username();
+                if !user.is_empty() {
+                    added |= add(scope, &id, key, &format!("{user}:{password}"));
+                    if let (Ok(user), Ok(password)) = (urlencoding::decode(user), &decoded) {
+                        added |= add(scope, &id, key, &format!("{user}:{password}"));
+                    }
                 }
             }
             for (name, v) in url.query_pairs() {
@@ -1025,6 +1128,121 @@ mod tests {
                 assert!(!out.contains(v), "{text} still has {v}: {out}");
             }
         }
+    }
+
+    #[test]
+    fn hex_and_twice_escaped_json_are_redacted() {
+        let secret = "pa\"ss\\word-Kx93";
+        let m = m(&[("PW", secret)]);
+        let hex: String = secret.bytes().map(|b| format!("{b:02x}")).collect();
+        for text in [
+            format!("digest {hex}"),
+            format!("DIGEST {}", hex.to_uppercase()),
+        ] {
+            assert!(m.redact_text(&text).contains("[secret:PW]"), "{text}");
+        }
+        // A JSON document quoted inside a JSON string, inside an audit line.
+        let inner = serde_json::json!({ "detail": format!("bad {secret}") }).to_string();
+        let middle = serde_json::json!({ "upstream": inner }).to_string();
+        let line = serde_json::json!({ "ok": false, "error": middle }).to_string();
+        let out = m.redact_line(&line);
+        let parsed: Value = serde_json::from_str(&out).expect("still one valid JSON line");
+        let error = parsed["error"].as_str().unwrap();
+        assert!(error.contains("[secret:PW]"), "{error}");
+        assert!(!out.contains("Kx93"), "{out}");
+    }
+
+    #[test]
+    fn base64_at_any_offset_inside_a_blob_is_redacted() {
+        let secret = "inner-blob-secret-Qm7Z";
+        let m = m(&[("TOKEN", secret)]);
+        for prefix_len in 0..6usize {
+            for engine in [
+                &base64::engine::general_purpose::STANDARD,
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            ] {
+                let mut blob = vec![0xA5u8; prefix_len];
+                blob.extend_from_slice(secret.as_bytes());
+                blob.extend_from_slice(&[0x3Cu8, 0xFF, 0x10, 0x7E]);
+                let encoded = engine.encode(&blob);
+                let line =
+                    serde_json::json!({ "ok": false, "error": format!("payload={encoded}") })
+                        .to_string();
+                let out = m.redact_line(&line);
+                let parsed: Value = serde_json::from_str(&out).expect("valid JSON");
+                let error = parsed["error"].as_str().unwrap();
+                assert!(
+                    error.contains("[secret:TOKEN]"),
+                    "offset {prefix_len}: {error}"
+                );
+                // At most the few edge characters that also encode neighbouring
+                // bytes survive around the marker; never a run of the secret.
+                let rest = error.replace("[secret:TOKEN]", "");
+                let stable = base64_inner(secret.as_bytes());
+                assert!(
+                    stable.iter().all(|inner| !rest.contains(&inner[..8])),
+                    "offset {prefix_len}: {error}"
+                );
+                assert!(
+                    error.len() < encoded.len() + 24,
+                    "length stays in class: {error}"
+                );
+            }
+        }
+        // The floor: a short secret has no inner form, so a blob at an offset is
+        // not matched, while its whole-value encoding still is.
+        assert!(base64_inner(b"short-Qm7").is_empty());
+        let short = m_short();
+        let whole = base64::engine::general_purpose::STANDARD.encode("short-Qm7");
+        assert!(short
+            .redact_text(&format!("x {whole} y"))
+            .contains("[secret:S]"));
+    }
+
+    fn m_short() -> Matcher {
+        Matcher::new(&[("S", "short-Qm7")])
+    }
+
+    #[test]
+    fn basic_auth_forms_are_redacted() {
+        let secret = "basic-auth-secret-Lp44";
+        let m = m(&[("PW", secret)]);
+        for user in ["", "alice", "a-much-longer-service-account"] {
+            let header =
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{secret}"));
+            let text = format!("Authorization: Basic {header}");
+            let out = m.redact_text(&text);
+            assert!(out.contains("[secret:PW]"), "user {user:?}: {out}");
+        }
+        // Userinfo the gateway learns from a credential URL registers the exact
+        // credential, so the whole Basic value is replaced.
+        register(
+            "basic-url-server",
+            "URL_KEY",
+            "https://svc-user:url-pass-Zr88xx@api.example.invalid/mcp",
+        );
+        let header = base64::engine::general_purpose::STANDARD.encode("svc-user:url-pass-Zr88xx");
+        assert_eq!(
+            redact_text(&format!("Basic {header}")),
+            "Basic [secret:URL_KEY]"
+        );
+    }
+
+    #[test]
+    fn formatter_normalisations_are_redacted() {
+        let m = m(&[
+            ("KEY", "MixedCase-Secret-88"),
+            ("WIDE", "ｗｉｄｅ-ｓｅｃｒｅｔ-７"),
+        ]);
+        assert_eq!(m.redact_text("got mixedcase-secret-88"), "got [secret:KEY]");
+        assert_eq!(m.redact_text("GOT MIXEDCASE-SECRET-88"), "GOT [secret:KEY]");
+        assert_eq!(m.redact_text("nfkc wide-secret-7"), "nfkc [secret:WIDE]");
+        let pem = "-----BEGIN KEY-----\nMIIBVQIBADANBgkqhkiG9w0BAQEFAASC\nAT8wggE7AgEAAkEAq7BFUpkGp3+LQmlQ\n-----END KEY-----";
+        let p = Matcher::new(&[("PEM", pem)]);
+        let out = p.redact_text("line echoed: AT8wggE7AgEAAkEAq7BFUpkGp3+LQmlQ");
+        assert_eq!(out, "line echoed: [secret:PEM]");
+        let collapsed = pem.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(!p.redact_text(&collapsed).contains("MIIBVQ"));
     }
 
     #[test]

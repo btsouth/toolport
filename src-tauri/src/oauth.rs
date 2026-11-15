@@ -1520,10 +1520,15 @@ fn client_secret_basic_header(client_id: &str, client_secret: &str) -> String {
         urlencoding::encode(client_id),
         urlencoding::encode(client_secret)
     );
-    format!(
+    let header = format!(
         "Basic {}",
         base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes())
-    )
+    );
+    // The client secret is registered from the vault already; this registers the
+    // exact credential string too, so the whole header value redacts as one.
+    crate::secret_redact::register(client_id, "client_secret_basic", &header);
+    crate::secret_redact::register(client_id, "client_secret_basic", &credentials);
+    header
 }
 
 /// Strip a credential out of text that is about to be surfaced or logged.
