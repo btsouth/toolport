@@ -103,13 +103,16 @@ impl Diff {
     }
 }
 
+/// A stateful line redactor for [`rewrite_stream`].
+pub type StreamRedact<'a> = dyn FnMut(Option<&[u8]>, &mut Vec<u8>) + 'a;
+
 /// [`rewrite_lines`] for a stateful redactor: `redact` gets each line (with
 /// its `\n`) and appends whatever output is ready, which may lag behind and
 /// may span lines, then gets `None` at the end to write the rest.
 pub fn rewrite_stream(
     dir: &Path,
     path: &Path,
-    redact: &mut dyn FnMut(Option<&[u8]>, &mut Vec<u8>),
+    redact: &mut StreamRedact<'_>,
     skipped: &mut dyn FnMut(Skip),
     on_multi_link: &mut dyn FnMut() -> std::io::Result<bool>,
 ) -> std::io::Result<bool> {

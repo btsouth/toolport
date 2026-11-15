@@ -10837,6 +10837,10 @@ struct ProgressRoute {
     owner: Option<downstream::CancelContext>,
 }
 
+/// Hands a finished progress notification to one client session.
+type ProgressDeliver =
+    Arc<dyn Fn(&str, &Value, Option<&downstream::CancelContext>) + Send + Sync>;
+
 /// A stdio progress message and the request instance it belongs to.
 type StdioProgress = (Value, Option<downstream::CancelContext>);
 
@@ -10861,7 +10865,7 @@ struct ProgressRoutes {
     /// Delivers a finished notification to a session: set by
     /// [`make_progress_sink`], used for a notification still held when its call
     /// ends.
-    deliver: Option<Arc<dyn Fn(&str, &Value, Option<&downstream::CancelContext>) + Send + Sync>>,
+    deliver: Option<ProgressDeliver>,
     /// Minting counter for our own progress tokens: monotonic, so a token is never
     /// reused while an earlier call is still in flight. It lives on the table
     /// rather than in a process global because a token is only ever resolved

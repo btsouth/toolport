@@ -2945,8 +2945,11 @@ struct IdBuilder {
     /// was refused, and the identifiers to record once it is accepted.
     found: Vec<String>,
     refused: bool,
-    pending: Vec<(Part, String, String, Vec<(String, String)>)>,
+    pending: Vec<PendingId>,
 }
+
+/// `(part, advertised, original, alias pieces)` waiting for its item.
+type PendingId = (Part, String, String, Vec<(String, String)>);
 
 impl IdBuilder {
     fn new(server: &str, catalog: Catalog) -> Self {
