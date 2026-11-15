@@ -36,6 +36,10 @@ interface Props {
   ) => void;
 }
 
+/** A disclosure toggle with the same hover and focus ring as the dialog's buttons. */
+export const disclosureSummary =
+  "w-fit cursor-pointer rounded-md -mx-1 px-1 transition-colors outline-none hover:bg-muted hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50";
+
 /** Review and choose detected client servers before adding them to Toolport. */
 export function ImportReviewDialog({
   open,
@@ -170,7 +174,7 @@ function ImportReviewContent({
         {notice}
         {details && (
           <details>
-            <summary className="text-meta">{t("Details")}</summary>
+            <summary className={`text-meta ${disclosureSummary}`}>{t("Details")}</summary>
             <p className="mt-2 whitespace-pre-wrap break-all text-meta text-muted-foreground">
               {details}
             </p>
@@ -191,7 +195,7 @@ function ImportReviewContent({
                   aria-pressed={isSelected}
                   disabled={busy || !!item.unsupported}
                   data-failed={!!error?.includes(item.name)}
-                  className={`w-full rounded-md text-left transition-colors ${
+                  className={`w-full rounded-md text-left transition-colors outline-none hover:bg-muted/60 focus-visible:ring-3 focus-visible:ring-ring/50 disabled:hover:bg-transparent ${
                     error?.includes(item.name)
                       ? "ring-1 ring-warning"
                       : isSelected
@@ -247,7 +251,7 @@ function ImportReviewContent({
                 </button>
                 {!!item.credentials?.length && (
                   <details className="px-3 pb-3 text-meta">
-                    <summary className="cursor-pointer">
+                    <summary className={disclosureSummary}>
                       {item.name} {t("credentials and settings")}
                     </summary>
                     <div className="flex flex-col gap-2 pt-2">

@@ -4,7 +4,7 @@ import { Check, Loader2 } from "lucide-react";
 import { migrateClient, previewClientSetup } from "@/lib/api";
 import type { ClientSetupReview, MigrateResult, Registry } from "@/lib/types";
 import { GatewaySettingsNotice } from "./GatewaySettingsNotice";
-import { ImportReviewDialog } from "./ImportReviewDialog";
+import { disclosureSummary, ImportReviewDialog } from "./ImportReviewDialog";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "./ui/dialog";
 import { Button } from "./ui/button";
 
@@ -131,7 +131,9 @@ export function ConnectReviewDialog({
                 </p>
               ))}
               <details>
-                <summary>{t("What your agent sees")}</summary>
+                <summary className={disclosureSummary}>
+                  {t("What your agent sees")}
+                </summary>
                 <ul className="mt-2 font-mono text-meta">
                   {result.tools.map((t) => (
                     <li key={t.name}>{t.name}</li>
@@ -139,7 +141,7 @@ export function ConnectReviewDialog({
                 </ul>
               </details>
               <details>
-                <summary>{t("Details")}</summary>
+                <summary className={disclosureSummary}>{t("Details")}</summary>
                 <p className="mt-2 break-all">
                   {t("Config: {path}", { path: result.outcome.path })}
                 </p>
