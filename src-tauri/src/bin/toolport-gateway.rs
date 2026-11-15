@@ -12418,9 +12418,22 @@ fn save_server_catalogs_for_launches(router: &Router, profile: Option<&str>, key
         })
     };
     if let Ok(raw) = raw {
-        let raw = conduit_lib::secret_redact::redact_definition_line(&raw);
-        let _ = registry::atomic_write(&path, &raw);
+        write_catalog_cache(&path, &raw);
     }
+}
+
+/// Replace a cached tool catalog under the lock the secret scrub rewrites it
+/// with, redacting inside it so a secret learned while a scrub runs is caught
+/// and the scrub cannot put back the catalog it read. A cache that cannot take
+/// the lock is not written: the next build saves it again, and the previous
+/// cache stays usable meanwhile.
+fn write_catalog_cache(path: &Path, raw: &str) {
+    let Ok(_lock) = registry::lock_at(path) else {
+        glog("tool cache not saved: its lock stayed busy past the store deadline");
+        return;
+    };
+    let raw = conduit_lib::secret_redact::redact_definition_line(raw);
+    let _ = registry::atomic_write(path, &raw);
 }
 
 fn save_tool_cache(tools: &dyn ToolCatalog, profile: Option<&str>) {
@@ -12437,8 +12450,7 @@ fn save_tool_cache(tools: &dyn ToolCatalog, profile: Option<&str>) {
         if let Ok(s) = serde_json::to_string(&wrapped) {
             // Atomic + unique temp: several gateways share this cache file, so a
             // torn or interleaved write would leave an inconsistent catalog.
-            let s = conduit_lib::secret_redact::redact_definition_line(&s);
-            let _ = registry::atomic_write(&path, &s);
+            write_catalog_cache(&path, &s);
         }
     }
 }
@@ -26152,6 +26164,50 @@ mod tests {
             &json!({"command":"changed"})
         )
         .is_empty());
+    }
+
+    /// Failure mode: a tool catalog is replaced without the scrub's lock, so a
+    /// catalog saved while a scrub runs keeps a secret the scrub just learned,
+    /// or the scrub's replace puts back the older catalog.
+    #[test]
+    fn tool_caches_wait_for_the_scrub_lock_and_redact_inside_it() {
+        let _env = DataDirTestEnv::new("tool-cache-scrub-lock");
+        let text = conduit_lib::secret_redact::append_during_scrub_for_test(
+            &tool_cache_path(None).unwrap(),
+            ("tool-cache-lock", "TOKEN", "cache-late-token-P3vN8kQd"),
+            || {
+                let tools = vec![
+                    json!({"name":"cache__t", "description":"uses cache-late-token-P3vN8kQd"}),
+                ];
+                save_tool_cache(&tools, None);
+            },
+        );
+        assert!(text.contains("cache__t"), "{text}");
+        assert!(!text.contains("cache-late-token-P3vN8kQd"), "{text}");
+
+        let text = conduit_lib::secret_redact::append_during_scrub_for_test(
+            &server_catalog_path(None).unwrap(),
+            ("tool-cache-lock", "SERVERS", "servers-late-token-T6jR4mWx"),
+            || {
+                let mut router = Router::new();
+                router.add_supervised(
+                    "cache".into(),
+                    vec![json!({"name":"cached", "description":"uses servers-late-token-T6jR4mWx"})],
+                    Arc::new(|| {
+                        let mut server =
+                            DownstreamServer::connect("cache".into(), Box::new(CacheRoute))
+                                .unwrap();
+                        server.load_resources_prompts();
+                        Ok(server)
+                    }),
+                    ReconnectBackoff::default(),
+                    json!({"revision":1}),
+                );
+                save_server_catalogs(&router, None);
+            },
+        );
+        assert!(text.contains("\"cached\""), "{text}");
+        assert!(!text.contains("servers-late-token-T6jR4mWx"), "{text}");
     }
 
     #[test]
