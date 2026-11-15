@@ -22602,11 +22602,17 @@ fn detach_from_client_session() {}
 
 /// Entry point: classify the command line, then run the requested role.
 fn main() {
+    gateway_main(std::env::args().skip(1).collect());
+    // A role that returns (the stdio loop, the HTTP servers) lands its last
+    // stderr lines; every other exit goes through `telemetry::exit_with`.
+    conduit_lib::daemon_log::flush_stderr_relay(Duration::from_millis(500));
+}
+
+fn gateway_main(cli_args: Vec<String>) {
     conduit_lib::secret_refs::enable_gateway_cache();
     // `--help`/`--version`/an unrecognized flag are decided before anything
     // else touches disk, the keychain, or stdin - see #605. Positional args
     // and the existing four flags fall through to `Run` unchanged.
-    let cli_args: Vec<String> = std::env::args().skip(1).collect();
     if cli_args.first().map(String::as_str) == Some(worker::WORKER_ARG) {
         worker::worker_main();
     }
@@ -22778,6 +22784,11 @@ fn main() {
         }
         ArgAction::Run => {}
     }
+    // Every serving role (adapter, private gateway, daemon, HTTP bridge and
+    // proxy, direct stdio) redacts its stderr from here on: an adapter's goes
+    // to the client's log, the daemon's to daemon.log. A relay that cannot
+    // start leaves stderr on the null device, never unredacted.
+    conduit_lib::daemon_log::install_stderr_redaction();
     if daemon_requested(&cli_args) {
         gateway_memory::configure_daemon();
     }
@@ -22877,7 +22888,6 @@ fn main() {
         }
         if daemon_requested(&cli_args) {
             conduit_lib::daemon_log::install_panic_hook(dir.clone());
-            conduit_lib::daemon_log::install_stderr_redactor();
         }
     }
     // Diagnostic: `toolport-gateway --selftest-secrets` reads every vaulted secret
@@ -23468,6 +23478,59 @@ mod tests {
 
     mod search_scale {
         include!("../gateway/search_eval_scale.rs");
+    }
+
+    /// Child half of `every_gateway_role_redacts_its_stderr`: runs the real
+    /// entry point in its own process, because it replaces the process's stderr.
+    #[test]
+    fn gateway_stderr_child() {
+        let Some(secret) = std::env::var_os("TOOLPORT_GATEWAY_STDERR_CHILD") else {
+            return;
+        };
+        let secret = secret.to_string_lossy().to_string();
+        conduit_lib::secret_redact::register("proxy-server", "PROXY_TOKEN", &secret);
+        // An invalid port is echoed to stderr before the proxy starts, the same
+        // early point at which an adapter, private gateway or daemon writes.
+        super::gateway_main(vec!["--http-proxy".into(), secret]);
+    }
+
+    /// Before the relay was installed for every role, only the daemon's stderr
+    /// was redacted; an adapter's or proxy's went straight to the client's log.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn every_gateway_role_redacts_its_stderr() {
+        let dir = std::env::temp_dir().join(format!(
+            "tp-gateway-stderr-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("client-stderr.log");
+        let secret = "proxy-canary-5Rt9-SECRET";
+        let file = std::fs::File::create(&log).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::gateway_stderr_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TOOLPORT_GATEWAY_STDERR_CHILD", secret)
+            .stdout(std::process::Stdio::null())
+            .stderr(file)
+            .status()
+            .unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!status.success(), "an invalid port exits 1: {text}");
+        assert!(!text.contains(secret), "{text}");
+        assert!(
+            text.contains("invalid HTTP proxy port: [secret:PROXY_TOKEN]"),
+            "{text}"
+        );
     }
 
     #[test]

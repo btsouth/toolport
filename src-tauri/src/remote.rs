@@ -85,6 +85,13 @@ fn now_epoch_seconds() -> u64 {
         .as_secs()
 }
 
+/// A diagnostic line on stderr with every registered secret removed. A server's
+/// rejection or a vault error can quote the credential it was given; the relay
+/// also redacts, but this holds where it could not start.
+fn warn(text: &str) {
+    eprintln!("{}", crate::secret_redact::redact_log_text(text));
+}
+
 fn refresh_decision(state: &OAuthState, now: u64) -> RefreshDecision {
     let Some(expires_at) = state.expires_at else {
         // Backward-compatible and provider-compatible: without a known expiry,
@@ -521,7 +528,7 @@ impl CredentialState {
         if secrets::set_secret(server_id, secrets::HTTP_AUTH_KEY, token).is_ok() {
             self.vaulted_access = Some(token.to_string());
         } else {
-            eprintln!("OAuth refreshed access token could not be saved; using it in memory.");
+            warn("OAuth refreshed access token could not be saved; using it in memory.");
         }
     }
 }
@@ -728,7 +735,7 @@ fn refresh_token_under_lock(
     // Even on timeout, a peer may have saved a usable winner just before our
     // reread. Otherwise no exchange is allowed without a held lock.
     let _refresh_lock = refresh_lock.map_err(|cause| {
-        eprintln!("OAuth refresh lock unavailable: {cause}");
+        warn(&format!("OAuth refresh lock unavailable: {cause}"));
         OAUTH_REFRESH_LOCK_ERROR.to_string()
     })?;
     // Client-credentials servers have no refresh token by construction, so they
@@ -873,7 +880,7 @@ fn refresh_token_under_lock(
             credentials.save_access(server_id, &token.access_token);
         }
         Err(_) => {
-            eprintln!("OAuth refresh metadata could not be saved; will retry.");
+            warn("OAuth refresh metadata could not be saved; will retry.");
             // An unchanged refresh token remains safe to retry from the vault.
             // Preserve a previously pending rotation even if this response omits it.
             if rotated || credentials.pending.is_some() {
@@ -1947,11 +1954,11 @@ fn connect_remote_inner(
                     Err(vault_error) => {
                         // Keep the downstream rejection out of the returned string but
                         // not out of the record of what happened.
-                        eprintln!(
+                        warn(&format!(
                             "toolport: could not tell whether the transport refreshed during the \
                              failed connect to {server_id:?}; the server rejected the credential \
                              with: {e}"
-                        );
+                        ));
                         return Err(format!(
                             "{vault_error} (the server rejected the credential Toolport sent, and \
                              without the vault there is no way to tell whether it had already been \

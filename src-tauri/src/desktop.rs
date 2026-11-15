@@ -4392,6 +4392,9 @@ fn open_external(url: String) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Before anything can resolve a secret: the shell's stderr (a terminal, the
+    // journal, or a console) and its children's are redacted from here on.
+    crate::daemon_log::install_stderr_redaction();
     let _ = crate::i18n::initialize();
     // `generate_context!()` must expand exactly once in this crate: on macOS dev
     // builds each expansion embeds a `_EMBED_INFO_PLIST` byte section, and two
@@ -4986,6 +4989,9 @@ pub fn run() {
                 if let Some(broker) = app_handle.try_state::<approval_broker::ApprovalBroker>() {
                     broker.clear_endpoint();
                 }
+                // Tauri exits the process after this event; land the last
+                // redacted stderr lines first.
+                crate::daemon_log::flush_stderr_relay(std::time::Duration::from_millis(500));
             }
         });
 }

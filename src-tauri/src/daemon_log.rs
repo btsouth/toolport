@@ -863,6 +863,164 @@ pub fn end_run_cleanly(dir: &Path) {
     let _ = std::fs::remove_file(marker_path(dir, std::process::id()));
 }
 
+/// Whether what this process writes to stderr passes the secret redactor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StderrRedaction {
+    /// [`install_stderr_redaction`] has not run in this process.
+    NotInstalled,
+    /// Stderr is the relay: this process's writes, and those of every child that
+    /// inherits stderr, are redacted before they reach the original destination.
+    Relayed,
+    /// The process had no stderr to begin with; stderr is the null device.
+    NoStderr,
+    /// The relay could not start, so stderr is the null device: what is written
+    /// there is lost, never written unredacted.
+    Silenced { reason: String },
+    /// Neither the relay nor the null device could be put in place; stderr still
+    /// goes where it did, unredacted.
+    Unprotected { reason: String },
+}
+
+static STDERR_REDACTION: Mutex<StderrRedaction> = Mutex::new(StderrRedaction::NotInstalled);
+
+/// What [`install_stderr_redaction`] achieved, for status reporting.
+pub fn stderr_redaction_state() -> StderrRedaction {
+    STDERR_REDACTION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Route stderr through the redactor (see [`install_stderr_redactor`]) for every
+/// Toolport process: each gateway mode and both desktop shells. Call it first
+/// thing, before anything can write a secret to stderr. If the relay cannot
+/// start, stderr is pointed at the null device rather than left unredacted, and
+/// [`stderr_redaction_state`] says why. Call [`flush_stderr_relay`] before the
+/// process ends normally so its last lines are not lost.
+pub fn install_stderr_redaction() -> StderrRedaction {
+    let mut state = STDERR_REDACTION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let relayed = || {
+        STDERR_RELAY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    };
+    if relayed() {
+        *state = StderrRedaction::Relayed;
+        return state.clone();
+    }
+    // With no stderr at all there is nothing to relay to, and on Unix the
+    // relay's own pipe would take the free fd 2.
+    let had_stderr = has_stderr();
+    if had_stderr {
+        install_stderr_redactor();
+        if relayed() {
+            // A panic that ends the process (the main thread's, or an abort)
+            // must not take its own report with it.
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                previous(info);
+                sync_stderr_relay(std::time::Duration::from_millis(300));
+            }));
+            *state = StderrRedaction::Relayed;
+            return state.clone();
+        }
+    }
+    let failure = std::io::Error::last_os_error();
+    *state = match silence_stderr() {
+        Ok(()) if !had_stderr => StderrRedaction::NoStderr,
+        Err(error) if !had_stderr => StderrRedaction::Unprotected {
+            reason: format!("stderr was closed and the null device could not replace it ({error})"),
+        },
+        Ok(()) => StderrRedaction::Silenced {
+            reason: format!("the stderr redaction relay could not start ({failure})"),
+        },
+        Err(error) => StderrRedaction::Unprotected {
+            reason: format!(
+                "the stderr redaction relay could not start ({failure}), and the null \
+                 device could not replace stderr ({error})"
+            ),
+        },
+    };
+    state.clone()
+}
+
+#[cfg(unix)]
+fn has_stderr() -> bool {
+    // SAFETY: F_GETFD only reads the descriptor's flags.
+    unsafe { libc::fcntl(2, libc::F_GETFD) >= 0 }
+}
+
+#[cfg(windows)]
+fn has_stderr() -> bool {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+    // SAFETY: reads the process's standard error handle.
+    let handle = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+    !handle.is_null() && handle != INVALID_HANDLE_VALUE
+}
+
+#[cfg(not(any(unix, windows)))]
+fn has_stderr() -> bool {
+    true
+}
+
+/// Point fd 2 at `/dev/null`. Works even with no descriptor to spare: fd 2 is
+/// closed first, so the reopen takes its slot.
+#[cfg(unix)]
+fn silence_stderr() -> std::io::Result<()> {
+    // SAFETY: plain fd syscalls on descriptors this function opens, plus fd 2.
+    unsafe {
+        let mut null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+        if null < 0 {
+            libc::close(2);
+            null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            if null < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        if null == 2 {
+            // Children inherit stderr: keep fd 2 open across exec.
+            libc::fcntl(2, libc::F_SETFD, 0);
+            return Ok(());
+        }
+        let pointed = libc::dup2(null, 2);
+        let error = std::io::Error::last_os_error();
+        libc::close(null);
+        if pointed < 0 {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn silence_stderr() -> std::io::Result<()> {
+    use std::os::windows::io::IntoRawHandle as _;
+    use windows_sys::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE};
+    let null = std::fs::OpenOptions::new()
+        .write(true)
+        .open("NUL")?
+        .into_raw_handle();
+    // SAFETY: the NUL handle is leaked on purpose: it stays this process's stderr
+    // until exit, and the CRT's fd 2 gets its own duplicate.
+    unsafe {
+        crt_flush();
+        crt_point_fd2(null as _);
+        if SetStdHandle(STD_ERROR_HANDLE, null as _) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn silence_stderr() -> std::io::Result<()> {
+    Err(std::io::Error::other("unsupported platform"))
+}
+
 #[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 mod tests {
     use super::*;
@@ -1070,6 +1228,75 @@ mod tests {
             text.contains("partial line without newline [secret:RELAY_TOKEN]"),
             "the last unterminated line is flushed, redacted: {text}"
         );
+    }
+
+    /// Child half of `a_relay_that_cannot_start_silences_stderr`: leaves room for
+    /// one new descriptor, and the relay's pipe needs two.
+    #[cfg(unix)]
+    #[test]
+    fn stderr_relay_unavailable_child() {
+        let Some(secret) = std::env::var_os("TOOLPORT_STDERR_UNAVAILABLE_CHILD") else {
+            return;
+        };
+        let secret = secret.to_string_lossy().to_string();
+        crate::secret_redact::register("relay-server", "RELAY_TOKEN", &secret);
+        // SAFETY: F_GETFD probes descriptors; the limit is restored below.
+        let (lowest, old) = unsafe {
+            let lowest = (0..).find(|fd| libc::fcntl(*fd, libc::F_GETFD) < 0).unwrap();
+            let mut old: libc::rlimit = std::mem::zeroed();
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut old), 0);
+            (lowest, old)
+        };
+        let tight = libc::rlimit {
+            rlim_cur: (lowest + 1) as libc::rlim_t,
+            rlim_max: old.rlim_max,
+        };
+        // SAFETY: lowers this child process's own soft descriptor limit.
+        unsafe {
+            assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &tight), 0);
+        }
+        let state = install_stderr_redaction();
+        // SAFETY: restores the soft limit read above.
+        unsafe {
+            libc::setrlimit(libc::RLIMIT_NOFILE, &old);
+        }
+        eprintln!("written after a failed relay start {secret}");
+        println!("state={state:?}");
+        println!("recorded={:?}", stderr_redaction_state());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relay_that_cannot_start_silences_stderr() {
+        let dir = scratch("stderr-unavailable");
+        let err = dir.join("stderr.txt");
+        let secret = "unavailable-canary-9Wd4-SECRET";
+        let file = std::fs::File::create(&err).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon_log::tests::stderr_relay_unavailable_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TOOLPORT_STDERR_UNAVAILABLE_CHILD", secret)
+            .stderr(file)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let text = std::fs::read_to_string(&err).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(output.status.success(), "{stdout}");
+        assert!(!text.contains(secret), "{text}");
+        assert!(
+            !text.contains("written after a failed relay start"),
+            "stderr points at the null device: {text}"
+        );
+        assert!(
+            stdout.contains("state=Silenced { reason: \"the stderr redaction relay could not start"),
+            "{stdout}"
+        );
+        assert!(stdout.contains("recorded=Silenced"), "{stdout}");
     }
 
     fn scratch(label: &str) -> PathBuf {
