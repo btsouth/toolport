@@ -94,9 +94,10 @@ CLIENTS = [
     {
         "id": "windsurf",
         "name": "Devin Desktop (Cascade)",
-        "path": ".codeium/windsurf/mcp_config.json",
+        # Cascade reads the Devin file; ~/.codeium/windsurf only feeds optional discovery.
+        "path": ".config/devin/mcp_config.json",
         "format": "json-mcpServers",
-        "doc": "https://docs.windsurf.com/windsurf/cascade/mcp (~/.codeium/windsurf/mcp_config.json, mcpServers)",
+        "doc": "https://docs.devin.ai/windsurf/plugins/cascade/mcp (~/.config/devin/mcp_config.json, mcpServers)",
         "seed": {"mcpServers": {"filesystem": USER_SERVER}},
     },
     {
