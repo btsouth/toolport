@@ -4996,6 +4996,151 @@ fn recheck_live_policy(
     }
 }
 
+/// Whether any of `candidates` (or another server `visible` admits) is still
+/// loading its first catalog.
+fn first_catalog_loading(
+    view: &Router,
+    candidates: &[String],
+    visible: impl Fn(&str) -> bool + Copy,
+) -> bool {
+    view.any_discovering(visible)
+        || view.any_publishing_first_catalog(visible)
+        || candidates.iter().any(|owner| {
+            view.kick_pending(owner, |id| id == owner)
+                .is_some_and(|status| status.connecting)
+        })
+}
+
+/// Wait, up to `budget`, for a demand-started server's first catalog. Stops early
+/// once `done` holds on the latest live router, nothing visible is loading any
+/// more, or the request is cancelled. Returns the latest live router.
+#[allow(clippy::too_many_arguments)]
+fn wait_for_first_catalog(
+    router: &Router,
+    mut fresh: Option<Arc<Router>>,
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
+    budget: Duration,
+    candidates: &[String],
+    visible: impl Fn(&str) -> bool + Copy,
+    done: impl Fn(&Router) -> bool,
+    cancel: Option<&downstream::CancelContext>,
+) -> Option<Arc<Router>> {
+    let deadline = Instant::now() + budget;
+    let mut seen = started_supervisors();
+    loop {
+        let view = fresh.as_deref().unwrap_or(router);
+        if done(view)
+            || !first_catalog_loading(view, candidates, visible)
+            || Instant::now() >= deadline
+            || cancel.is_some_and(downstream::CancelContext::is_cancelled)
+        {
+            break;
+        }
+        seen = wait_for_started_supervisor(
+            seen,
+            deadline.min(Instant::now() + Duration::from_millis(25)),
+        );
+        fresh = clone_live_router(live_router);
+    }
+    clone_live_router(live_router)
+}
+
+/// Resolve a Tools tab target (`_toolportTarget`) whose server has no catalog
+/// yet. Starts only that exact server, and only when it is visible to this
+/// request, enabled and allowed by policy. `Ok(None)` keeps the generic
+/// unavailable message; `Err` is a tool result to return as is. Everything
+/// after the alias (tool scope, quarantine, approval) stays in `execute_call`.
+#[allow(clippy::too_many_arguments)]
+fn cold_start_target(
+    reg: &Registry,
+    router: &Router,
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
+    allowed: Option<&std::collections::HashSet<String>>,
+    server: &str,
+    tool: &str,
+    cancel: Option<&downstream::CancelContext>,
+) -> Result<Option<String>, Value> {
+    let failure =
+        |text: String| json!({"content": [{"type": "text", "text": text}], "isError": true});
+    if server.is_empty()
+        || tool.is_empty()
+        || !allowed.is_none_or(|scope| server_in_allowed_scope(server, scope))
+        || !reg.servers.iter().any(|entry| entry.id == server)
+    {
+        return Ok(None);
+    }
+    if !reg.server_enabled(server) {
+        return Err(failure(format!(
+            "Blocked by Toolport: {server} is turned off. Change it in Toolport > Servers."
+        )));
+    }
+    // A tool the request could not call once the catalog is in (outside a
+    // tool-granular scope, switched off, quarantined, or a fail-closed catalog)
+    // does not start its server. Check the request's own view, which carries an
+    // adapter's tool scope, and the live policy.
+    let switched_off = reg
+        .servers
+        .iter()
+        .any(|entry| entry.id == server && entry.disabled_tools.iter().any(|t| t == tool));
+    if switched_off || router.refuses_before_catalog(server, tool) {
+        return Ok(None);
+    }
+    // Without a live slot nothing can publish a new catalog to this request.
+    let Some(fresh) = clone_live_router(live_router) else {
+        return Ok(None);
+    };
+    let view = fresh.as_ref();
+    recheck_live_policy(router, live_router, DispatchTarget::Server(server))
+        .map_err(|message| failure(format!("Toolport: {message}")))?;
+    if view.authorize(DispatchTarget::Server(server)).is_err()
+        || view.refuses_before_catalog(server, tool)
+    {
+        return Ok(None);
+    }
+    if let Some(alias) = view.exposed_tool_name(server, tool) {
+        return Ok(Some(alias.to_string()));
+    }
+    view.prepare_lazy_use(server);
+    view.kick_pending(server, |id| id == server);
+    let candidates = [server.to_string()];
+    let only_target = |id: &str| id == server;
+    let fresh = wait_for_first_catalog(
+        router,
+        Some(fresh),
+        live_router,
+        downstream::SETUP_CATALOG_WAIT_BUDGET,
+        &candidates,
+        only_target,
+        |view| view.exposed_tool_name(server, tool).is_some(),
+        cancel,
+    );
+    let view = fresh.as_deref().unwrap_or(router);
+    if cancel.is_some_and(downstream::CancelContext::is_cancelled) {
+        return Err(failure(
+            "Toolport: request cancelled while the server was starting".to_string(),
+        ));
+    }
+    let Some(alias) = view.exposed_tool_name(server, tool).map(str::to_string) else {
+        if first_catalog_loading(view, &candidates, only_target) {
+            return Err(failure(format!(
+                "Toolport: {server} is still starting. Run it again in a moment."
+            )));
+        }
+        return Ok(None);
+    };
+    // Recheck policy on both sides of readiness. The server is Ready once its
+    // catalog published, so this returns at once.
+    prepare_dispatch(
+        view,
+        live_router,
+        DispatchTarget::Server(server),
+        cancel,
+        false,
+    )
+    .map_err(|message| failure(format!("Toolport: {message}")))?;
+    Ok(Some(alias))
+}
+
 /// Startup may outlast a policy edit, so check on both sides of the wait.
 fn prepare_dispatch(
     router: &Router,
@@ -5305,33 +5450,16 @@ fn execute_call(
             }
             fresh = clone_live_router(live_router);
         } else if fresh.is_some() {
-            let deadline = Instant::now() + FIRST_CATALOG_WAIT;
-            let mut seen = started_supervisors();
-            loop {
-                let view = fresh.as_deref().unwrap_or(router);
-                let loading = view.any_discovering(catalog_visible)
-                    || view.any_publishing_first_catalog(catalog_visible)
-                    || candidates.iter().any(|owner| {
-                        view.kick_pending(owner, |id| id == owner)
-                            .is_some_and(|status| status.connecting)
-                    });
-                if view.route_of(name).is_some()
-                    || view.is_blocked(name)
-                    || !loading
-                    || Instant::now() >= deadline
-                    || cancel
-                        .as_ref()
-                        .is_some_and(downstream::CancelContext::is_cancelled)
-                {
-                    break;
-                }
-                seen = wait_for_started_supervisor(
-                    seen,
-                    deadline.min(Instant::now() + Duration::from_millis(25)),
-                );
-                fresh = clone_live_router(live_router);
-            }
-            fresh = clone_live_router(live_router);
+            fresh = wait_for_first_catalog(
+                router,
+                fresh,
+                live_router,
+                FIRST_CATALOG_WAIT,
+                &candidates,
+                catalog_visible,
+                |view| view.route_of(name).is_some() || view.is_blocked(name),
+                cancel.as_ref(),
+            );
         }
     }
     let router = fresh.as_deref().unwrap_or(router);
@@ -8746,14 +8874,31 @@ fn handle_request_with_cancel(
                 if let Some(target) = arguments.get("_toolportTarget") {
                     let server = target.get("serverId").and_then(Value::as_str).unwrap_or("");
                     let tool = target.get("tool").and_then(Value::as_str).unwrap_or("");
-                    let Some(alias) = router.exposed_tool_name(server, tool) else {
+                    let alias = match router.exposed_tool_name(server, tool) {
+                        Some(alias) => Some(alias.to_string()),
+                        // A cold server has no routes yet (D123). Start that exact
+                        // server through the same scope, enabled and policy checks.
+                        None => match cold_start_target(
+                            reg,
+                            router,
+                            live_router,
+                            allowed,
+                            server,
+                            tool,
+                            cancel.as_ref(),
+                        ) {
+                            Ok(alias) => alias,
+                            Err(result) => return Some(success(id, result)),
+                        },
+                    };
+                    let Some(alias) = alias else {
                         return Some(success(
                             id,
                             json!({"content": [{"type": "text", "text": "Tool unavailable in this client's access set or blocked by gateway policy."}], "isError": true}),
                         ));
                     };
                     (
-                        alias.to_string(),
+                        alias,
                         arguments
                             .get("arguments")
                             .cloned()
@@ -39409,6 +39554,642 @@ mod tests {
         .unwrap();
         assert_eq!(result["result"]["isError"], true, "{result}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A downstream for the D123 cold Tools tab tests: one tool, counted calls.
+    struct ColdTargetRoute {
+        calls: Arc<AtomicUsize>,
+        destructive: bool,
+        tools: &'static [&'static str],
+    }
+
+    impl conduit_lib::downstream::Transport for ColdTargetRoute {
+        fn request(
+            &mut self,
+            method: &str,
+            params: Value,
+        ) -> Result<Value, conduit_lib::downstream::TransportError> {
+            match method {
+                "initialize" => Ok(json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": { "tools": {} }
+                })),
+                "tools/list" => {
+                    let annotations = if self.destructive {
+                        json!({"destructiveHint": true})
+                    } else {
+                        json!({"readOnlyHint": true, "destructiveHint": false})
+                    };
+                    let tools: Vec<_> = self
+                        .tools
+                        .iter()
+                        .map(|name| json!({"name": name, "inputSchema": {"type": "object"}, "annotations": annotations}))
+                        .collect();
+                    Ok(json!({ "tools": tools }))
+                }
+                "tools/call" => {
+                    let name = params["name"].as_str().unwrap_or_default();
+                    assert!(self.tools.contains(&name), "{params}");
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({"content":[{"type":"text","text":"cold result"}],"isError":false}))
+                }
+                "resources/list" => Ok(json!({ "resources": [] })),
+                "resources/templates/list" => Ok(json!({ "resourceTemplates": [] })),
+                "prompts/list" => Ok(json!({ "prompts": [] })),
+                other => Err(conduit_lib::downstream::TransportError::Fatal(format!(
+                    "unexpected {other}"
+                ))),
+            }
+        }
+
+        fn notify(
+            &mut self,
+            _method: &str,
+            _params: Value,
+        ) -> Result<(), conduit_lib::downstream::TransportError> {
+            Ok(())
+        }
+    }
+
+    struct ColdTarget {
+        state: GatewayState,
+        starts: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    /// A gateway whose only server, `cold`, is supervised and has never started:
+    /// it has no routes, so a Tools tab target cannot resolve without a start.
+    fn cold_target(reg: Registry, destructive: bool) -> ColdTarget {
+        cold_target_with(reg, destructive, Arc::new(|| {}))
+    }
+
+    /// `before_connect` runs inside the supervisor's start, before the server
+    /// connects, so a test can hold the first catalog at a known point.
+    fn cold_target_with(
+        reg: Registry,
+        destructive: bool,
+        before_connect: Arc<dyn Fn() + Send + Sync>,
+    ) -> ColdTarget {
+        cold_target_tools(reg, destructive, &["run-item"], before_connect)
+    }
+
+    fn cold_target_tools(
+        reg: Registry,
+        destructive: bool,
+        tools: &'static [&'static str],
+        before_connect: Arc<dyn Fn() + Send + Sync>,
+    ) -> ColdTarget {
+        let state = http_state(false);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = router_with_registry_policy(&reg);
+        let (counted_starts, counted_calls) = (Arc::clone(&starts), Arc::clone(&calls));
+        router.add_supervised(
+            "cold".into(),
+            Vec::new(),
+            Arc::new(move || {
+                counted_starts.fetch_add(1, Ordering::SeqCst);
+                before_connect();
+                let mut server = DownstreamServer::connect(
+                    "cold".to_string(),
+                    Box::new(ColdTargetRoute {
+                        calls: Arc::clone(&counted_calls),
+                        destructive,
+                        tools,
+                    }),
+                )
+                .unwrap();
+                server.load_resources_prompts();
+                Ok(server)
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":1}),
+        );
+        assert!(router.exposed_tool_name("cold", tools[0]).is_none());
+        *state.host.registry.lock().unwrap() = reg;
+        *state.router.lock().unwrap() = Arc::new(router);
+        ColdTarget {
+            state,
+            starts,
+            calls,
+        }
+    }
+
+    fn cold_registry(enabled: bool, disabled_tools: Vec<String>) -> Registry {
+        Registry {
+            servers: vec![ServerEntry {
+                enabled,
+                disabled_tools,
+                ..stub_server("cold", "Cold")
+            }],
+            safety_level: None,
+            // Version 3 reads enablement from the server rows.
+            version: 3,
+            ..Registry::default()
+        }
+    }
+
+    /// Send one Tools tab Run while a helper thread publishes finished starts, the
+    /// way the gateway's reconnect loop does in production.
+    fn cold_target_request() -> Value {
+        json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params": {
+            "name":"toolport_call_tool", "arguments": {
+                "_toolportTarget":{"serverId":"cold", "tool":"run-item"}, "arguments":{}
+            }
+        }})
+    }
+
+    fn run_cold_target(
+        fixture: &ColdTarget,
+        allowed: Option<&std::collections::HashSet<String>>,
+    ) -> Value {
+        run_cold_request(fixture, allowed, cold_target_request())
+    }
+
+    /// The same call by exposed name, as any MCP client can send it.
+    fn cold_by_name_request() -> Value {
+        json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params": {
+            "name":"toolport_call_tool", "arguments": {"name":"cold__run_item", "arguments":{}}
+        }})
+    }
+
+    fn run_cold_request(
+        fixture: &ColdTarget,
+        allowed: Option<&std::collections::HashSet<String>>,
+        req: Value,
+    ) -> Value {
+        let state = &fixture.state;
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::SeqCst) {
+                    drive_reconnects(&state.host, &state.stdio_upstream, &state.profile);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+            let reply = process_request(
+                state,
+                &req,
+                &SearchGuard::default(),
+                allowed,
+                None,
+                None,
+                None,
+                None,
+                None,
+                DiscoveryMode::Full,
+            );
+            stop.store(true, Ordering::SeqCst);
+            reply.unwrap()
+        })
+    }
+
+    #[test]
+    fn tools_tab_target_starts_a_cold_server_once_and_runs() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-start");
+        let fixture = cold_target(cold_registry(true, Vec::new()), false);
+        let started = Instant::now();
+        let reply = run_cold_target(&fixture, None);
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert_eq!(reply["result"]["content"][0]["text"], "cold result");
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            started.elapsed() < downstream::SETUP_CATALOG_WAIT_BUDGET,
+            "the cold Run waited out its budget"
+        );
+        // Warm now: the next Run resolves its route and never starts it again.
+        let reply = run_cold_target(&fixture, None);
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn tools_tab_target_never_starts_a_turned_off_server() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-disabled");
+        let fixture = cold_target(cold_registry(false, Vec::new()), false);
+        let reply = run_cold_target(&fixture, None);
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            "Blocked by Toolport: cold is turned off. Change it in Toolport > Servers."
+        );
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn tools_tab_target_never_starts_a_server_outside_the_access_set() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-scope");
+        let fixture = cold_target(cold_registry(true, Vec::new()), false);
+        let allowed = std::collections::HashSet::from(["other".to_string()]);
+        let reply = run_cold_target(&fixture, Some(&allowed));
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            "Tool unavailable in this client's access set or blocked by gateway policy."
+        );
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn tools_tab_cold_destructive_target_still_needs_human_approval() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-approval");
+        let reg = Registry {
+            confirm_destructive: true,
+            ..cold_registry(true, Vec::new())
+        };
+        assert_eq!(reg.safety_level_selected(), registry::SafetyLevel::Ask);
+        let fixture = cold_target(reg, true);
+        let reply = run_cold_target(&fixture, None);
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert!(
+            reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("approval service was unreachable"),
+            "{reply}"
+        );
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture.calls.load(Ordering::SeqCst),
+            0,
+            "the destructive downstream call must not run without approval"
+        );
+    }
+
+    #[test]
+    fn tools_tab_cold_target_cancelled_before_its_catalog_never_runs_later() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-cancel");
+        // A destructive tool under Ask: had the abandoned Run gone on, it would
+        // have reached approval and said the approval service was unreachable.
+        let reg = Registry {
+            confirm_destructive: true,
+            ..cold_registry(true, Vec::new())
+        };
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let started_tx = Mutex::new(started_tx);
+        let release_rx = Mutex::new(release_rx);
+        let fixture = cold_target_with(
+            reg,
+            true,
+            Arc::new(move || {
+                let _ = started_tx.lock().unwrap().send(());
+                let _ = release_rx.lock().unwrap().recv();
+            }),
+        );
+        let state = &fixture.state;
+        let cancellations = downstream::CancelRegistry::new();
+        let cancel = cancellations
+            .begin_client_request("run".into())
+            .expect("a fresh request id begins");
+        let req = cold_target_request();
+        let stop = AtomicBool::new(false);
+        let reply = std::thread::scope(|scope| {
+            let driver = scope.spawn(|| {
+                while !stop.load(Ordering::SeqCst) {
+                    drive_reconnects(&state.host, &state.stdio_upstream, &state.profile);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+            let request = scope.spawn(|| {
+                process_request(
+                    state,
+                    &req,
+                    &SearchGuard::default(),
+                    None,
+                    None,
+                    None,
+                    Some(cancel),
+                    None,
+                    None,
+                    DiscoveryMode::Full,
+                )
+                .unwrap()
+            });
+            // The server is starting and its first catalog is held. The caller
+            // goes away now, as an adapter whose Tools tab gave up does.
+            started_rx.recv().unwrap();
+            assert!(cancellations.cancel("run", Some("HTTP caller disconnected")));
+            let reply = request.join().unwrap();
+            // Only now let the catalog publish, and wait until the route exists.
+            release_tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while state
+                .router
+                .lock()
+                .unwrap()
+                .exposed_tool_name("cold", "run-item")
+                .is_none()
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            stop.store(true, Ordering::SeqCst);
+            driver.join().unwrap();
+            reply
+        });
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            "Toolport: request cancelled while the server was starting",
+            "{reply}"
+        );
+        assert!(
+            state
+                .router
+                .lock()
+                .unwrap()
+                .exposed_tool_name("cold", "run-item")
+                .is_some(),
+            "the held catalog never published"
+        );
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture.calls.load(Ordering::SeqCst),
+            0,
+            "an abandoned Run reached the downstream after its catalog published"
+        );
+    }
+
+    #[test]
+    fn tools_tab_cold_target_for_a_blocked_tool_stays_unavailable() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-blocked");
+        let fixture = cold_target(cold_registry(true, vec!["run-item".to_string()]), false);
+        let reply = run_cold_target(&fixture, None);
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            "Tool unavailable in this client's access set or blocked by gateway policy."
+        );
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture.starts.load(Ordering::SeqCst),
+            0,
+            "a switched-off tool must not start its server"
+        );
+    }
+
+    /// Replace the fixture's live router policy before the Run.
+    fn edit_cold_router(fixture: &ColdTarget, edit: impl FnOnce(&mut Router)) {
+        let mut slot = fixture.state.router.lock().unwrap();
+        edit(Arc::make_mut(&mut slot));
+    }
+
+    fn assert_cold_refused_without_start(fixture: &ColdTarget, reply: &Value) {
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            "Tool unavailable in this client's access set or blocked by gateway policy.",
+            "{reply}"
+        );
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 0, "{reply}");
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0, "{reply}");
+    }
+
+    #[test]
+    fn tools_tab_cold_target_exposes_the_default_alias() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-alias");
+        let fixture = cold_target(cold_registry(true, Vec::new()), false);
+        let reply = run_cold_target(&fixture, None);
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        // The quarantine tests below key on this alias.
+        assert_eq!(
+            fixture
+                .state
+                .router
+                .lock()
+                .unwrap()
+                .exposed_tool_name("cold", "run-item"),
+            Some("cold__run_item")
+        );
+    }
+
+    #[test]
+    fn tools_tab_target_never_starts_a_server_for_a_quarantined_tool() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-quarantine");
+        // The default alias, and the spelling a dashed client view uses.
+        for alias in ["cold__run_item", "cold-run_item", "cold__run_item_2"] {
+            let fixture = cold_target(cold_registry(true, Vec::new()), false);
+            edit_cold_router(&fixture, |router| {
+                router.requarantine(BTreeSet::from([alias.to_string()]));
+            });
+            let reply = run_cold_target(&fixture, None);
+            assert_cold_refused_without_start(&fixture, &reply);
+        }
+    }
+
+    #[test]
+    fn tools_tab_target_starts_a_server_whose_quarantine_is_another_servers() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-other-quarantine");
+        let fixture = cold_target(cold_registry(true, Vec::new()), false);
+        // `cold_api` shares the `cold` prefix; its quarantine is not this tool's.
+        edit_cold_router(&fixture, |router| {
+            router.requarantine(BTreeSet::from(["cold_api__run_item".to_string()]));
+        });
+        let reply = run_cold_target(&fixture, None);
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn cold_target_request_for(tool: &str) -> Value {
+        let mut req = cold_target_request();
+        req["params"]["arguments"]["_toolportTarget"]["tool"] = json!(tool);
+        req
+    }
+
+    #[test]
+    fn tools_tab_target_never_starts_a_server_for_a_quarantined_renamed_tool() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-renamed-quarantine");
+        let fixture = cold_target(cold_registry(true, Vec::new()), false);
+        edit_cold_router(&fixture, |router| {
+            router.set_overrides(HashMap::from([(
+                "cold".to_string(),
+                HashMap::from([(
+                    "run-item".to_string(),
+                    registry::ToolOverride {
+                        name: Some("say".into()),
+                        ..Default::default()
+                    },
+                )]),
+            )]));
+            router.requarantine(BTreeSet::from(["say".to_string()]));
+        });
+        let reply = run_cold_target(&fixture, None);
+        assert_cold_refused_without_start(&fixture, &reply);
+    }
+
+    #[test]
+    fn tools_tab_target_quarantine_matches_the_whole_tool_name() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-whole-name");
+        let quarantined = || {
+            let fixture = cold_target_tools(
+                cold_registry(true, Vec::new()),
+                false,
+                &["user", "get_user"],
+                Arc::new(|| {}),
+            );
+            edit_cold_router(&fixture, |router| {
+                router.requarantine(BTreeSet::from(["cold__get_user".to_string()]));
+            });
+            fixture
+        };
+        // `get_user` ends with `user`, but `user` is not quarantined.
+        let fixture = quarantined();
+        let reply = run_cold_request(&fixture, None, cold_target_request_for("user"));
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+
+        let fixture = quarantined();
+        let reply = run_cold_request(&fixture, None, cold_target_request_for("get_user"));
+        assert_cold_refused_without_start(&fixture, &reply);
+    }
+
+    #[test]
+    fn tools_tab_target_never_starts_a_server_while_the_catalog_fails_closed() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-fail-closed");
+        let fixture = cold_target(cold_registry(true, Vec::new()), false);
+        edit_cold_router(&fixture, Router::fail_closed_catalog);
+        let reply = run_cold_target(&fixture, None);
+        assert_cold_refused_without_start(&fixture, &reply);
+    }
+
+    #[test]
+    fn tools_tab_target_never_starts_a_server_for_a_tool_outside_the_tool_scope() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-tool-scope");
+        let fixture = cold_target(cold_registry(true, Vec::new()), false);
+        edit_cold_router(&fixture, |router| {
+            *router = router.with_tool_allow(HashMap::from([(
+                "cold".to_string(),
+                HashSet::from(["other-tool".to_string()]),
+            )]));
+        });
+        let reply = run_cold_target(&fixture, None);
+        assert_cold_refused_without_start(&fixture, &reply);
+    }
+
+    #[test]
+    fn tools_tab_target_never_starts_a_team_server_awaiting_review() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-team-review");
+        let mut reg = cold_registry(false, Vec::new());
+        reg.servers[0].source = Some("team:acme".into());
+        reg.servers[0]
+            .unknown_fields
+            .insert("teamEnableReview".into(), json!(true));
+        assert!(reg.servers[0].needs_team_enable_review());
+        assert!(reg.servers[0].check_enable_allowed(false).is_err());
+        let fixture = cold_target(reg, false);
+        let reply = run_cold_target(&fixture, None);
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            "Blocked by Toolport: cold is turned off. Change it in Toolport > Servers."
+        );
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn tools_tab_target_never_starts_a_server_missing_from_the_registry() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-unknown");
+        // The supervisor exists, but the registry no longer lists the server.
+        let fixture = cold_target(
+            Registry {
+                servers: Vec::new(),
+                ..cold_registry(true, Vec::new())
+            },
+            false,
+        );
+        let reply = run_cold_target(&fixture, None);
+        assert_cold_refused_without_start(&fixture, &reply);
+    }
+
+    /// The target form adds no reach: any MCP client could already demand-start
+    /// a cold server it can see by calling a tool by name, and neither form
+    /// starts one outside its access set.
+    #[test]
+    fn tools_tab_target_starts_only_what_a_call_by_name_already_could() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-by-name");
+        let outside = std::collections::HashSet::from(["other".to_string()]);
+        for request in [cold_target_request(), cold_by_name_request()] {
+            let fixture = cold_target(cold_registry(true, Vec::new()), false);
+            let reply = run_cold_request(&fixture, Some(&outside), request.clone());
+            assert_eq!(reply["result"]["isError"], true, "{request} {reply}");
+            assert_eq!(fixture.starts.load(Ordering::SeqCst), 0, "{request}");
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 0, "{request}");
+
+            let fixture = cold_target(cold_registry(true, Vec::new()), false);
+            let reply = run_cold_request(&fixture, None, request.clone());
+            assert_eq!(reply["result"]["isError"], false, "{request} {reply}");
+            assert_eq!(fixture.starts.load(Ordering::SeqCst), 1, "{request}");
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 1, "{request}");
+        }
+    }
+
+    #[test]
+    fn tools_tab_cold_target_turned_off_while_starting_never_runs() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-off-mid-start");
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let started_tx = Mutex::new(started_tx);
+        let release_rx = Mutex::new(release_rx);
+        let fixture = cold_target_with(
+            cold_registry(true, Vec::new()),
+            false,
+            Arc::new(move || {
+                let _ = started_tx.lock().unwrap().send(());
+                let _ = release_rx.lock().unwrap().recv();
+            }),
+        );
+        let state = &fixture.state;
+        let req = cold_target_request();
+        let stop = AtomicBool::new(false);
+        let reply = std::thread::scope(|scope| {
+            let driver = scope.spawn(|| {
+                while !stop.load(Ordering::SeqCst) {
+                    drive_reconnects(&state.host, &state.stdio_upstream, &state.profile);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+            let request = scope.spawn(|| {
+                process_request(
+                    state,
+                    &req,
+                    &SearchGuard::default(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    DiscoveryMode::Full,
+                )
+                .unwrap()
+            });
+            started_rx.recv().unwrap();
+            // The user turns the server off while it is still starting.
+            let off = cold_registry(false, Vec::new());
+            edit_cold_router(&fixture, |router| {
+                router.apply_registry_policy(registry_policy(&off, None, false, false));
+            });
+            release_tx.send(()).unwrap();
+            let reply = request.join().unwrap();
+            stop.store(true, Ordering::SeqCst);
+            driver.join().unwrap();
+            reply
+        });
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture.calls.load(Ordering::SeqCst),
+            0,
+            "a server turned off mid-start still ran the call"
+        );
     }
 
     #[test]

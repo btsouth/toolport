@@ -3670,6 +3670,94 @@ impl Router {
         self.rebuild_preserving_restored();
     }
 
+    /// Whether this router's policy would refuse `tool` on `server_id` even before
+    /// the server publishes a catalog. A demand start by server and tool name checks
+    /// this first, so a start that can only end in a refusal never happens.
+    ///
+    /// Quarantine is keyed by alias, and without a catalog the alias is not final.
+    /// The rule: refuse when a quarantined name is exactly a name this tool can be
+    /// given or answer to, which are
+    /// - its indexed or persisted policy name, when one is known,
+    /// - its override alias, both the exposed spelling and the sanitized rename,
+    /// - its default alias `<server>__<tool>`, the dashed spelling of it, and the
+    ///   length-shortened alias this view would give it,
+    /// - a collision-suffixed default alias `<server>__<tool>_<n>` (or dashed),
+    ///   since which sibling gets the suffix is only known from the catalog.
+    ///
+    /// A length-shortened alias from a different alias budget, or of a
+    /// collision-suffixed name, is not computed here. Its unshortened legacy name is
+    /// its policy name, which the rule does match; otherwise the post-catalog call
+    /// check still refuses the call.
+    pub fn refuses_before_catalog(&self, server_id: &str, tool: &str) -> bool {
+        let policy = &self.policy;
+        if !policy.allows_server(server_id) || policy.fail_closed_catalog {
+            return true;
+        }
+        if policy
+            .allow
+            .get(server_id)
+            .is_some_and(|set| !set.contains(tool))
+            || policy
+                .disabled
+                .get(server_id)
+                .is_some_and(|set| set.contains(tool))
+        {
+            return true;
+        }
+        if policy.quarantined.is_empty() {
+            return false;
+        }
+        let mut exact: Vec<String> = [&self.policy_by_original, &self.canonical_policy]
+            .into_iter()
+            .filter_map(|names| names.get(server_id).and_then(|tools| tools.get(tool)))
+            .cloned()
+            .chain(self.reserved_policy_name(server_id, tool))
+            .collect();
+        if let Some(rename) = self
+            .overrides
+            .get(server_id)
+            .and_then(|tools| tools.get(tool))
+            .and_then(|o| o.name.as_deref())
+        {
+            let legacy = sanitize_segment(rename);
+            exact.push(bounded_alias(
+                &legacy,
+                &(server_id, tool, rename),
+                None,
+                self.alias_rule,
+            ));
+            exact.push(legacy);
+        }
+        let base = format!(
+            "{}__{}",
+            sanitize_segment(server_id),
+            sanitize_segment(tool)
+        );
+        exact.push(bounded_alias(
+            &base,
+            &(server_id, tool),
+            Some(server_id),
+            self.alias_rule,
+        ));
+        let dashed = AliasRule {
+            dashed: true,
+            ..self.alias_rule
+        }
+        .spell(&base);
+        let families = [base, dashed];
+        let collision = |name: &str, family: &str| {
+            name.strip_prefix(family)
+                .and_then(|rest| rest.strip_prefix('_'))
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        };
+        policy.quarantined.iter().any(|name| {
+            exact.iter().any(|known| known == name)
+                || families
+                    .iter()
+                    .any(|family| family == name || collision(name, family))
+        })
+    }
+
     /// True when this router is hiding the whole catalog because the quarantine
     /// store could not be read and there was no prior live set to keep (SBS-871).
     pub fn catalog_fail_closed(&self) -> bool {
