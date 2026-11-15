@@ -2696,4 +2696,77 @@ mod tests {
         assert_eq!(none.error, None);
         assert_eq!(none.value, Value::Null);
     }
+
+    /// Upstream-controlled names cannot break out of the generated prelude: quotes,
+    /// backslashes, line terminators, comment closers, template openers and
+    /// backticks all reach the script as the exact strings, through `listTools`, the
+    /// stubs and `describe`.
+    #[test]
+    fn hostile_names_round_trip_through_the_prelude() {
+        let nasty = [
+            "q'uote",
+            "d\"q",
+            "back\\slash",
+            "line\nbreak",
+            "cr\rx",
+            "end*/",
+            "/*open",
+            "tmpl${x}",
+            "`tick`",
+            "ls\u{2028}",
+            "ps\u{2029}",
+            "</script>",
+            "名前",
+            "nul\u{0}",
+        ];
+        let mut catalog: Vec<String> = Vec::new();
+        for (i, part) in nasty.iter().enumerate() {
+            catalog.push(format!("s{i}__{part}"));
+            catalog.push(format!("{part}__t{i}"));
+        }
+        catalog.sort();
+        let prelude = build_servers_prelude(&catalog);
+        assert!(!prelude.contains('\u{2028}') && !prelude.contains('\u{2029}'));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let describe: DescribeBinding = Arc::new(
+            |name: &str| json!({"name": name, "signature": format!("toolport.call({}, args?: unknown): ToolResult", serde_json::to_string(name).unwrap())}),
+        );
+        let script = r#"
+            const calls = [];
+            const described = [];
+            for (const server of Object.keys(servers)) {
+                for (const tool of Object.keys(servers[server])) {
+                    const stub = servers[server][tool];
+                    calls.push(stub({}).echo);
+                    described.push(toolport.describe(stub).name);
+                }
+            }
+            return { listed: toolport.listTools(), calls: calls.sort(), described: described.sort() };
+        "#;
+        let out = run_script_with_describe(
+            script,
+            ScriptInput::Data(json!({})),
+            recording_call(log),
+            None,
+            Some(describe),
+            Limits {
+                max_calls: 1_000,
+                ..Limits::default()
+            },
+            &catalog,
+        );
+        assert_eq!(out.error, None, "prelude failed: {:?}", out.error);
+        let mut listed: Vec<String> = serde_json::from_value(out.value["listed"].clone()).unwrap();
+        listed.sort();
+        assert_eq!(listed, catalog);
+        // camelCase aliases may add calls; every call names a catalog entry.
+        let calls: Vec<String> = serde_json::from_value(out.value["calls"].clone()).unwrap();
+        assert!(calls.iter().all(|name| catalog.contains(name)), "{calls:?}");
+        for name in &catalog {
+            assert!(calls.contains(name), "{name:?} unreachable");
+        }
+        let described: Vec<String> =
+            serde_json::from_value(out.value["described"].clone()).unwrap();
+        assert!(described.iter().all(|name| catalog.contains(name)));
+    }
 }

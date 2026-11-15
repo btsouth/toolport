@@ -47591,6 +47591,7 @@ mod tests {
 
     include!("../gateway/token_budget_tests.rs");
     include!("../gateway/code_mode_signature_tests.rs");
+    include!("../gateway/code_mode_off_identity_tests.rs");
 
     #[test]
     fn discovery_surface_token_measurement() {
