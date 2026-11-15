@@ -414,7 +414,7 @@ mod tests {
             &[(m(1), "sk-original-one".into())],
         )
         .unwrap();
-        let parsed: Value = serde_json::from_str(&partial).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&partial).unwrap();
         assert_eq!(
             parsed["ten"],
             m(10),
@@ -428,7 +428,7 @@ mod tests {
             &[(m(1), m(10)), (m(10), "sk-original-ten".into())],
         )
         .unwrap();
-        let parsed: Value = serde_json::from_str(&output).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(
             parsed["one"],
             m(10),

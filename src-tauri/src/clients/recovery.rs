@@ -621,7 +621,7 @@ mod tests {
             let report = disconnect::all(true).unwrap();
             assert!(report
                 .iter()
-                .any(|r| r.client_id == "saved-locations" && r.error.is_some()));
+                .any(|r| r.path.ends_with("client-locations.json") && r.error.is_some()));
             assert!(report
                 .iter()
                 .any(|r| r.path.ends_with("original-malformed.json") && r.error.is_some()));
