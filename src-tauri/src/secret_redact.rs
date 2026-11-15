@@ -3181,6 +3181,15 @@ pub static RETIRED_PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::
 /// shown) so the user can lengthen or rotate it. Owed cleanups are listed too.
 pub fn status_notes() -> Vec<String> {
     let mut notes = Vec::new();
+    match crate::daemon_log::stderr_redaction_state() {
+        crate::daemon_log::StderrRedaction::Silenced { reason } => notes.push(format!(
+            "stderr is discarded, not written unredacted: {reason}. Diagnostics still reach gateway.log."
+        )),
+        crate::daemon_log::StderrRedaction::Unprotected { reason } => notes.push(format!(
+            "stderr is not redacted: {reason}. Restart Toolport; until then a secret a server prints to stderr may reach the terminal or the client's log."
+        )),
+        _ => {}
+    }
     if current().is_some_and(|layers| layers.0.iter().any(|m| m.is_broken())) {
         notes.push(format!(
             "secret redaction could not be prepared for the configured secrets, so logs and messages show {WITHHELD} in place of their text until it can. Remove or shorten unusually long secret values."
@@ -4208,6 +4217,22 @@ mod tests {
         );
         assert!(!security_text.contains(secret), "{security_text}");
         assert_eq!(mode, 0o400, "mode changed to {mode:o}");
+    }
+
+    #[test]
+    fn status_reports_stderr_that_is_not_relayed() {
+        let silenced = crate::daemon_log::StderrRedaction::Silenced {
+            reason: "relay pipe unavailable".to_string(),
+        };
+        crate::daemon_log::set_stderr_redaction_state_for_test(silenced);
+        let notes = status_notes().join("\n");
+        crate::daemon_log::set_stderr_redaction_state_for_test(
+            crate::daemon_log::StderrRedaction::NotInstalled,
+        );
+        assert!(
+            notes.contains("stderr is discarded") && notes.contains("relay pipe unavailable"),
+            "{notes}"
+        );
     }
 
     #[test]

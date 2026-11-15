@@ -884,6 +884,13 @@ pub enum StderrRedaction {
 static STDERR_REDACTION: Mutex<StderrRedaction> = Mutex::new(StderrRedaction::NotInstalled);
 
 /// What [`install_stderr_redaction`] achieved, for status reporting.
+#[cfg(test)]
+pub(crate) fn set_stderr_redaction_state_for_test(state: StderrRedaction) {
+    *STDERR_REDACTION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+}
+
 pub fn stderr_redaction_state() -> StderrRedaction {
     STDERR_REDACTION
         .lock()
@@ -1107,7 +1114,7 @@ mod tests {
         pause();
         eprintln!("useSecret123 end");
         // Split at a line break, across a pause.
-        eprint!("wrapped sk-Pause\n");
+        eprintln!("wrapped sk-Pause");
         pause();
         eprintln!("Secret123 tail");
         // A tail that only looked like a start is written once the stream shows
