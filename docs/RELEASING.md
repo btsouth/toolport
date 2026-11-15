@@ -166,6 +166,32 @@ installs from it), but keep them honest by copying what the tap landed.
 The **gateway container image** (`ghcr.io/btsouth/toolport-gateway`) publishes
 separately on every push to `main` via `docker-publish.yml`; no tag required.
 
+### macOS acceptance
+
+After the release and the Homebrew bump, run the macOS acceptance workflow on
+GitHub's Apple Silicon runners:
+
+```bash
+gh workflow run macos-acceptance.yml --repo btsouth/toolport            # latest release
+gh workflow run macos-acceptance.yml --repo btsouth/toolport -f tag=v2.3.6
+```
+
+It installs the dmg the way a user does (browser quarantine, Finder drag,
+Gatekeeper prompt), checks signatures, notarization and every binary's
+architecture, then drives the window through macOS accessibility: onboarding,
+every screen, a server with a keychain secret, a connection to each seeded
+client with a real tool call through each entry, Launch at login, and every
+screen at the minimum window size, a narrow window and a larger display. It
+also upgrades from the previous release by dmg and through the in-app updater,
+runs the Intel dmg on an Intel runner, installs the Homebrew cask, uninstalls
+per [uninstall.md](uninstall.md) and lists every leftover. Every check is
+pass, fail or untested with a reason. The Homebrew and in-app update legs only
+run for the latest release, since that is all the tap and the updater offer.
+The five jobs run in parallel in about ten minutes. Screenshots, logs and leftover lists are in the
+run's artifacts; the job summary lists every check and what the runner could
+not test. `-f build_ref=true` builds the current ref unsigned instead (about 20
+minutes; keychain checks are skipped because they need the signed entitlements).
+
 ## After users upgrade
 
 On each app launch Toolport **stops obsolete gateway processes** (older versioned

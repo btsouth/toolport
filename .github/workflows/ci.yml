@@ -189,6 +189,14 @@ jobs:
           node-version: 24
       - name: Test check selection and required gate
         run: node --test .github/scripts/ci-policy.test.mjs .github/scripts/gateway-build-features.test.mjs
+      - name: Test macOS acceptance helpers
+        run: |
+          python3 -B scripts/macos-acceptance/test_render_summary.py
+          python3 -B scripts/macos-acceptance/test_clients.py
+          python3 -B scripts/macos-acceptance/test_finder_targets.py
+          python3 -B scripts/macos-acceptance/test_windows_query.py
+          python3 -B scripts/macos-acceptance/test_layout_check.py
+          node --test scripts/macos-acceptance/mcp-call.test.mjs
       - name: Select changed native checks
         id: select
         env:
