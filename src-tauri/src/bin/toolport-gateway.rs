@@ -22837,7 +22837,10 @@ fn gateway_main(cli_args: Vec<String>) {
             Some(value) => match value.parse::<u16>() {
                 Ok(port) if port > 0 => port,
                 _ => {
-                    eprintln!("toolport-gateway: invalid HTTP proxy port: {value}");
+                    // Not the value: this runs before the configured
+                    // secrets are known, and it may be one.
+                    let _ = value;
+                    eprintln!("toolport-gateway: invalid HTTP proxy port");
                     conduit_lib::telemetry::exit_with(1);
                 }
             },
