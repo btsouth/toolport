@@ -27,8 +27,10 @@ vault, it retains the original backup and reports the failure; unlock the vault
 and restart Toolport to retry. If the original vault is locked or unavailable,
 restoration still recovers the config and names each missing credential in the
 result. Missing values are labeled `TOOLPORT_MISSING_CREDENTIAL_<number>`.
-Recovery data is retained; unlock the original vault and repeat disconnect to
-re-insert those credentials. Data removal refuses to discard incomplete recovery.
+Recovery data is retained. Linux recovery does not open keyring unlock prompts.
+Unlock the original vault, then run `toolport-gateway --disconnect-all` again to
+re-insert those credentials, even if the client already says it is disconnected.
+Data removal refuses to discard incomplete recovery.
 After verified restoration, historical backup payloads are deleted and only
 empty ownership metadata remains, so a later uninstall cannot claim native entries.
 Turn off **Launch at login** in Settings.

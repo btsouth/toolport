@@ -225,7 +225,7 @@ pub(super) fn encode_recovery(
                 generations.push((previous.key.clone(), previous.references.len()));
             }
             for (index, reference) in previous.references.into_iter().enumerate() {
-                if let Some(value) = crate::secrets::get_vault_secret_result(
+                if let Some(value) = crate::secrets::get_backup_secret_result(
                     &previous.account,
                     &format!("{}-credential-{index}", previous.key),
                 )
@@ -296,7 +296,7 @@ pub(super) fn encode_recovery(
         crate::secrets::set_secret(&account, &format!("{key}-credential-{index}"), value)?;
     }
     crate::secrets::set_secret(&account, &key, text)?;
-    if crate::secrets::get_vault_secret_result(&account, &key)?.as_deref() != Some(text) {
+    if crate::secrets::get_backup_secret_result(&account, &key)?.as_deref() != Some(text) {
         return Err("Could not verify vaulted client backup. Client config unchanged.".into());
     }
     serde_json::to_string(&Envelope {
@@ -316,7 +316,7 @@ pub(super) fn decode(text: &str) -> Result<String, String> {
     let Some(saved) = envelope(text) else {
         return Ok(text.into());
     };
-    match crate::secrets::get_vault_secret_result(&saved.account, &saved.key) {
+    match crate::secrets::get_backup_secret_result(&saved.account, &saved.key) {
         Ok(Some(payload)) if crate::registry::sha256_hex(&payload) == saved.hash => Ok(payload),
         _ => {
             MISSING.with(|v| *v.borrow_mut() = true);
@@ -603,7 +603,7 @@ fn vaulted_credentials(text: &str) -> Result<Vec<(Reference, String)>, String> {
             if !text.contains(key) && !credentials_visible {
                 continue;
             }
-            if let Some(value) = crate::secrets::get_vault_secret_result(&server.id, key)? {
+            if let Some(value) = crate::secrets::get_backup_secret_result(&server.id, key)? {
                 values.push((
                     Reference {
                         server: server.id.clone(),
@@ -678,7 +678,7 @@ pub(crate) fn protect_existing() -> Result<(), String> {
     for path in owned_backup_paths()? {
         let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
         let payload = match envelope(&raw) {
-            Some(saved) => crate::secrets::get_vault_secret_result(&saved.account, &saved.key)?
+            Some(saved) => crate::secrets::get_backup_secret_result(&saved.account, &saved.key)?
                 .filter(|payload| crate::registry::sha256_hex(payload) == saved.hash)
                 .ok_or("Unlock the original backup vault before importing more credentials. Client config unchanged.")?,
             None => raw.clone(),
@@ -694,6 +694,96 @@ pub(crate) fn protect_existing() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Runs in Headless Rust tests (macos-latest, core) and
+    // Headless Rust tests (windows-latest, core), ci.yml. The portable
+    // vault checks backup byte spelling on both; Windows also uses Credential
+    // Manager, and signed macOS test apps exercise the data-protection keychain.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn platform_backup_round_trip() -> Result<(), String> {
+        clear();
+        reset_missing();
+        let dir = crate::registry::conduit_dir().unwrap();
+        let path = dir.join("backups/cursor/1-mcp.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = format!("{{\r\n \"env\":{{\"API_KEY\":\"sk-native-backup-fixture\"}},\r\n \"padding\":\"{}\"\r\n}}\r\n", "preserve byte spelling ".repeat(500));
+        register(
+            "native-backup-fixture",
+            "API_KEY",
+            "sk-native-backup-fixture",
+        );
+        let encoded = encode(&path, &original);
+        clear();
+        let encoded = encoded?;
+        std::fs::write(&path, &encoded).unwrap();
+        let saved = envelope(&encoded).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = release(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(path.clone());
+        assert!(!encoded.contains("sk-native-backup-fixture"));
+        assert_eq!(read(&path).unwrap().as_bytes(), original.as_bytes());
+        release(&path)?;
+        assert!(crate::secrets::get_vault_secret_result(&saved.account, &saved.key)?.is_none());
+        for index in 0..saved.references.len() {
+            assert!(crate::secrets::get_vault_secret_result(
+                &saved.account,
+                &format!("{}-credential-{index}", saved.key)
+            )?
+            .is_none());
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn platform_encrypted_backup_vault_round_trip() {
+        crate::secrets::tests::with_isolated_vault(|| platform_backup_round_trip().unwrap());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn platform_native_backup_vault_round_trip() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            // The surrounding helper serializes environment changes and owns a
+            // temporary data directory. Never fall back to a file vault here.
+            struct RestoreEnv(Option<std::ffi::OsString>);
+            impl Drop for RestoreEnv {
+                fn drop(&mut self) {
+                    if let Some(value) = &self.0 {
+                        std::env::set_var("CONDUIT_SECRET_KEY", value);
+                    } else {
+                        std::env::remove_var("CONDUIT_SECRET_KEY");
+                    }
+                }
+            }
+            let _restore = RestoreEnv(std::env::var_os("CONDUIT_SECRET_KEY"));
+            std::env::remove_var("TOOLPORT_SECRET_KEY");
+            std::env::remove_var("CONDUIT_SECRET_KEY");
+            let result = platform_backup_round_trip();
+            #[cfg(target_os = "windows")]
+            result.expect("Credential Manager backup must round-trip, including chunked payloads");
+            #[cfg(target_os = "macos")]
+            if let Err(error) = result {
+                // Unsigned PR runners cannot access the restricted production
+                // group. Assert that refusal instead of silently skipping it.
+                assert!(
+                    error.contains("-34018"),
+                    "unexpected Keychain failure: {error}"
+                );
+                let path = crate::registry::conduit_dir()
+                    .unwrap()
+                    .join("backups/cursor/1-mcp.json");
+                assert!(
+                    !path.exists(),
+                    "unsigned refusal must not publish plaintext recovery"
+                );
+            }
+        });
+    }
+
     #[test]
     fn fresh_backups_protect_credentials_after_import_context_is_cleared() {
         crate::secrets::tests::with_isolated_vault(|| {

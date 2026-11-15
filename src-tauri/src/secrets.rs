@@ -877,6 +877,50 @@ mod platform {
         }
     }
 
+    fn read_backup_item<T>(
+        unlocked: usize,
+        locked: usize,
+        read: impl FnOnce() -> Result<T, keyring::Error>,
+    ) -> Result<Option<T>, keyring::Error> {
+        if locked > 0 || unlocked > 1 {
+            return Err(keyring::Error::NoStorageAccess(Box::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Recovery vault is locked or has ambiguous credentials",
+                ),
+            )));
+        }
+        if unlocked == 0 {
+            return Ok(None);
+        }
+        read().map(Some)
+    }
+
+    /// Recovery must not wait for a desktop unlock prompt. Search classifies
+    /// locked items without unlocking them; GetSecret also fails if an item is
+    /// locked between the search and read. Neither call requests Unlock.
+    pub fn get_backup_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
+        use dbus_secret_service::{EncryptionType, SecretService};
+        with_service(|| {
+            let failure = |error| keyring::Error::PlatformFailure(Box::new(error));
+            let service = SecretService::connect_with_max_prompt_timeout(EncryptionType::Dh, 0)
+                .map_err(failure)?;
+            let account = account(server_id, key);
+            let entries = service
+                .search_items(std::collections::HashMap::from([
+                    ("service", SERVICE),
+                    ("username", account.as_str()),
+                ]))
+                .map_err(failure)?;
+            read_backup_item(entries.unlocked.len(), entries.locked.len(), || {
+                let bytes = entries.unlocked[0].get_secret().map_err(failure)?;
+                String::from_utf8(bytes)
+                    .map_err(|error| keyring::Error::BadEncoding(error.into_bytes()))
+            })
+        })
+        .map_err(|error| error.to_string())
+    }
+
     pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
         match with_service(|| Entry::new(SERVICE, &account(server_id, key))?.delete_credential()) {
             Ok(()) => Ok(()),
@@ -888,6 +932,22 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn backup_recovery_never_reads_locked_or_ambiguous_items() {
+            for (unlocked, locked) in [(0, 1), (1, 1), (2, 0)] {
+                let result =
+                    read_backup_item(unlocked, locked, || -> Result<(), keyring::Error> {
+                        panic!("locked recovery must not read or request unlock")
+                    });
+                assert!(matches!(result, Err(keyring::Error::NoStorageAccess(_))));
+            }
+            assert_eq!(read_backup_item(0, 0, || Ok("unexpected")).unwrap(), None);
+            assert_eq!(
+                read_backup_item(1, 0, || Ok("exact payload")).unwrap(),
+                Some("exact payload")
+            );
+        }
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         fn dead_daemon() -> keyring::Error {
@@ -1361,6 +1421,28 @@ pub fn get_vault_secret_result(server_id: &str, key: &str) -> Result<Option<Stri
         return file::get_secret_result(server_id, key);
     }
     platform::get_secret_result(server_id, key)
+}
+
+/// Vault-only backup access, with no interactive unlock during Linux recovery.
+pub(crate) fn get_backup_secret_result(
+    server_id: &str,
+    key: &str,
+) -> Result<Option<String>, String> {
+    if server_id == INTERNAL_SERVER_ID {
+        return Err("reserved Toolport secret namespace".to_string());
+    }
+    let owner = crate::local_auth::owner(server_id)?;
+    if file::active() {
+        return file::get_secret_result(owner.as_str(), key);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        platform::get_backup_secret_result(owner.as_str(), key)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        platform::get_secret_result(owner.as_str(), key)
+    }
 }
 
 /// Look up a secret from the process environment for container / env-file deploys.
