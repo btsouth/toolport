@@ -278,6 +278,11 @@ struct Shape<'a> {
     absent: Vec<&'a str>,
     /// Dependencies already applied, by address.
     applied: HashSet<usize>,
+    /// Kinds this branch rules out. Object keywords (`required`, dependencies, a
+    /// key taken as absent) constrain only objects, so a branch that needs the
+    /// value to be an object excludes every other kind, and one that keeps the
+    /// non-object values excludes objects, instead of either becoming `never`.
+    exclude: Kinds,
 }
 
 /// What failing a simple `if` implies about one key.
@@ -541,6 +546,20 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// The kinds a shape still admits: every part's `type`, less what the branch
+    /// excludes. An untyped top level is an object (tool arguments always are).
+    fn shape_kinds(&mut self, shape: &Shape<'a>, depth: usize) -> Kinds {
+        self.charge(shape.parts.len());
+        let mut kinds = shape
+            .parts
+            .iter()
+            .fold(K_ALL, |kinds, part| kinds & part_kinds(part));
+        if kinds == K_ALL && depth == 0 {
+            kinds = K_OBJ;
+        }
+        kinds & !shape.exclude
+    }
+
     /// Whether `cond` holds for every value of `shape`, for none, or neither is known.
     fn settled(&mut self, cond: &'a Value, shape: &Shape<'a>, depth: usize) -> Option<bool> {
         let object = match cond {
@@ -553,13 +572,7 @@ impl<'a> Ctx<'a> {
             match key.as_str() {
                 key if is_annotation(key) && key != "$ref" => {}
                 "type" => {
-                    let mut kinds = shape
-                        .parts
-                        .iter()
-                        .fold(K_ALL, |kinds, part| kinds & part_kinds(part));
-                    if kinds == K_ALL && depth == 0 {
-                        kinds = K_OBJ;
-                    }
+                    let kinds = self.shape_kinds(shape, depth);
                     let allowed = part_kinds(object);
                     if kinds & allowed == 0 {
                         return Some(false);
@@ -567,10 +580,18 @@ impl<'a> Ctx<'a> {
                     holds &= kinds & !allowed == 0;
                 }
                 "required" => {
+                    // Vacuous for non-objects: it fails only an object missing a key.
                     let keys = value.as_array()?;
+                    if self.shape_kinds(shape, depth) & K_OBJ == 0 {
+                        continue;
+                    }
                     for key in keys.iter().filter_map(Value::as_str) {
                         if shape.absent.contains(&key) {
-                            return Some(false);
+                            if self.shape_kinds(shape, depth) & !K_OBJ == 0 {
+                                return Some(false);
+                            }
+                            holds = false;
+                            continue;
                         }
                         holds &= self.certainly_present(shape, key);
                     }
@@ -878,11 +899,19 @@ impl<'a> Ctx<'a> {
                     for sub in branch {
                         self.flatten(&mut next, sub);
                     }
-                    // The else-branch fails the condition; say what that implies.
+                    // The else-branch fails the condition; say what that implies. Both
+                    // refinements are about object keys, which every non-object passes,
+                    // so only objects reach that else-branch.
                     if two && index == last {
                         match refine_else {
-                            Some(Refinement::Present(key)) => next.extra_required.push(key),
-                            Some(Refinement::Absent(key)) => next.absent.push(key),
+                            Some(Refinement::Present(key)) => {
+                                next.extra_required.push(key);
+                                next.exclude |= K_ALL & !K_OBJ;
+                            }
+                            Some(Refinement::Absent(key)) => {
+                                next.absent.push(key);
+                                next.exclude |= K_ALL & !K_OBJ;
+                            }
                             None => {}
                         }
                     }
@@ -895,14 +924,36 @@ impl<'a> Ctx<'a> {
                 // Out of budget with a dependency undecided: claim nothing.
                 Some(_) if self.exhausted => return Ty::Unknown,
                 Some((id, key, dependency)) => {
-                    if self.certainly_present(&shape, key) {
-                        self.apply_dependency(&mut shape, id, dependency);
+                    // Dependencies constrain only objects.
+                    let kinds = self.shape_kinds(&shape, depth);
+                    if kinds & K_OBJ == 0 {
+                        shape.applied.insert(id);
                         open.push_front(shape);
+                    } else if self.certainly_present(&shape, key) {
+                        let plain =
+                            kinds & !K_OBJ == 0 || matches!(dependency, Dependency::Required(_));
+                        if plain {
+                            self.apply_dependency(&mut shape, id, dependency);
+                            open.push_front(shape);
+                        } else {
+                            // Objects have the trigger and take the dependency; every
+                            // other kind passes it untouched.
+                            self.charge(shape.parts.len());
+                            let mut object = shape.clone();
+                            object.exclude |= K_ALL & !K_OBJ;
+                            self.apply_dependency(&mut object, id, dependency);
+                            shape.applied.insert(id);
+                            shape.exclude |= K_OBJ;
+                            open.push_back(shape);
+                            open.push_back(object);
+                        }
                     } else {
-                        // Optional trigger: either absent, or present with its dependency.
+                        // Optional trigger: either absent (or not an object at all),
+                        // or an object with the trigger and its dependency.
                         self.charge(shape.parts.len());
                         let mut present = shape.clone();
                         present.extra_required.push(key);
+                        present.exclude |= K_ALL & !K_OBJ;
                         self.apply_dependency(&mut present, id, dependency);
                         shape.absent.push(key);
                         open.push_back(shape);
@@ -921,8 +972,13 @@ impl<'a> Ctx<'a> {
     /// Render one merged shape with no groups left.
     fn render_merged(&mut self, shape: Shape<'a>, depth: usize) -> Ty<'a> {
         let required = self.required_keys(&shape);
-        if shape.never || shape.absent.iter().any(|key| required.contains(key)) {
+        if shape.never {
             return Ty::Never;
+        }
+        // A key both required and taken as absent rules out objects only.
+        let mut exclude = shape.exclude;
+        if shape.absent.iter().any(|key| required.contains(key)) {
+            exclude |= K_OBJ;
         }
         let mut kinds = shape
             .parts
@@ -955,20 +1011,56 @@ impl<'a> Ctx<'a> {
             });
         }
         if let Some(literals) = literals {
-            let members = literals
-                .into_iter()
-                .filter(|value| kind_of(value) & kinds != 0)
-                .map(Ty::Lit)
-                .collect();
+            // Keep the values the shape's other constraints can still accept: the
+            // kind, an object's required and absent keys, an array's length bounds.
+            let mut array_shape: Option<Ty<'a>> = None;
+            let mut members = Vec::new();
+            for value in literals {
+                if kind_of(value) & kinds & !exclude == 0 {
+                    continue;
+                }
+                let fits = match value {
+                    Value::Object(map) => {
+                        required.iter().all(|key| map.contains_key(*key))
+                            && !shape.absent.iter().any(|key| map.contains_key(*key))
+                    }
+                    Value::Array(items) => {
+                        let rendered = match &array_shape {
+                            Some(rendered) => rendered,
+                            None => array_shape.insert(self.render_array(&shape, depth)),
+                        };
+                        match rendered {
+                            Ty::Never => false,
+                            Ty::Tuple {
+                                items: positions,
+                                required,
+                                rest,
+                            } => {
+                                items.len() >= *required
+                                    && (rest.is_some() || items.len() <= positions.len())
+                            }
+                            _ => true,
+                        }
+                    }
+                    _ => true,
+                };
+                if fits {
+                    members.push(Ty::Lit(value));
+                }
+            }
             return union(members);
         }
+        let mut untyped_nested = false;
         if kinds == K_ALL {
             let object = shape.parts.iter().any(|part| has_object_keywords(part));
             let array = shape.parts.iter().any(|part| has_array_keywords(part));
-            if !object && !array {
+            if !object && !array && exclude == 0 {
                 return Ty::Unknown;
             }
-            if depth > 0 {
+            if depth > 0 && exclude != 0 {
+                // Untyped, with some kinds ruled out: every remaining kind, below.
+                untyped_nested = true;
+            } else if depth > 0 {
                 // No `type` below the top: object or array keywords constrain only
                 // values of that kind, and every other kind is admitted. Keep the
                 // shape visible; shortening may still say `unknown`.
@@ -988,10 +1080,12 @@ impl<'a> Ctx<'a> {
                     Ty::Union(members) => Ty::Wide(members),
                     other => other,
                 };
+            } else {
+                // The top level: MCP tool arguments are always an object.
+                kinds = if object || !array { K_OBJ } else { K_ARR };
             }
-            // The top level: MCP tool arguments are always an object.
-            kinds = if object { K_OBJ } else { K_ARR };
         }
+        kinds &= !exclude;
         let mut members = Vec::new();
         for (bit, prim) in [(K_STR, "string"), (K_NUM, "number"), (K_BOOL, "boolean")] {
             if kinds & bit != 0 {
@@ -1007,7 +1101,10 @@ impl<'a> Ctx<'a> {
         if kinds & K_NULL != 0 {
             members.push(Ty::Prim("null"));
         }
-        union(members)
+        match union(members) {
+            Ty::Union(members) if untyped_nested => Ty::Wide(members),
+            other => other,
+        }
     }
 
     fn render_object(
@@ -1134,6 +1231,13 @@ impl<'a> Ctx<'a> {
                 _ => Index::Free,
             }
         };
+        // A required key no value can fill: no object matches.
+        if props
+            .iter()
+            .any(|prop| prop.required && matches!(prop.ty, Ty::Never))
+        {
+            return Ty::Never;
+        }
         Ty::Object { props, index }
     }
 

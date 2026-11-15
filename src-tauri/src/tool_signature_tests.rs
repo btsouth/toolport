@@ -185,10 +185,8 @@ fn s3_undeclared_required_keys_and_index_signatures() {
         "patternProperties": {"^x_": {"type": "integer"}},
         "additionalProperties": false
     });
-    assert_eq!(
-        ty(patterned),
-        "{other: never; x_count: number; [key: string]: number}"
-    );
+    // `other` is required, but nothing may fill it: no object matches.
+    assert_eq!(ty(patterned), "never");
     assert_eq!(
         ty(json!({"type": "object", "required": ["anything"]})),
         "{anything: unknown}"
@@ -930,6 +928,75 @@ fn r2_7_untyped_nested_schemas_admit_every_kind() {
     assert!(text.contains("req_00: unknown"), "{text}");
 }
 
+/// R3-1: object keywords (`required`, dependencies) constrain only objects. Sol's
+/// two reproductions: an untyped value, and one typed `string`, both valid as "ok".
+#[test]
+fn r3_1_object_keywords_leave_other_kinds_alone() {
+    for (inner, expected) in [
+        (
+            json!({"required": ["a"], "dependentSchemas": {"a": false}}),
+            "servers.t.x(args: {value: string | number | boolean | unknown[] | null}): ToolResult",
+        ),
+        (
+            json!({"type": "string", "required": ["a"], "dependentSchemas": {"a": false}}),
+            "servers.t.x(args: {value: string}): ToolResult",
+        ),
+    ] {
+        let schema =
+            json!({"type": "object", "required": ["value"], "properties": {"value": inner}});
+        assert!(validates(&schema, &json!({"value": "ok"})), "{schema}");
+        assert_eq!(sig(schema.clone()), expected, "{schema}");
+        let described = full_signature(&tool("t__x", schema.clone())).unwrap();
+        assert_eq!(described.signature, expected);
+        assert!(described.truncated.is_none());
+        let built = build_tool(&schema, None, SEARCH_WORK);
+        assert!(admits(&built.args, &json!({"value": "ok"}), &built.ctx, 0));
+    }
+}
+
+/// R3-1: the same rule for the other object-only facts. A key both required and
+/// absent, an else-branch about a key, and an optional dependency trigger rule out
+/// objects only; array contradictions rule out arrays only.
+#[test]
+fn r3_1_contradictions_rule_out_one_kind() {
+    let cases = [
+        // Required and, through `dependentRequired` of an absent trigger, absent.
+        json!({"type": ["string", "object"], "required": ["a"], "dependentSchemas": {"a": {"required": ["b"], "properties": {"b": false}}}}),
+        // An `if` about a key that only an object can fail.
+        json!({"type": ["number", "object"], "if": {"required": ["k"]}, "then": {"type": "number"}, "else": false}),
+        // An optional trigger whose dependency is unsatisfiable.
+        json!({"type": ["boolean", "object"], "dependentSchemas": {"a": false}}),
+        // Arrays cannot have between 3 and 1 items; strings do not care.
+        json!({"type": ["string", "array"], "minItems": 3, "maxItems": 1}),
+        json!({"minItems": 3, "maxItems": 1, "required": ["z"], "dependentSchemas": {"z": false}}),
+    ];
+    for inner in cases {
+        let schema = json!({"type": "object", "required": ["v"], "properties": {"v": inner}});
+        let validator = jsonschema::draft202012::new(&schema).unwrap();
+        let built = build_tool(&schema, None, SEARCH_WORK);
+        let text = sig(schema.clone());
+        for value in [
+            json!("s"),
+            json!(1),
+            json!(true),
+            json!(null),
+            json!({}),
+            json!({"a": 1}),
+            json!([1, 2, 3]),
+        ] {
+            let args = json!({"v": value});
+            if validator.is_valid(&args) {
+                assert!(
+                    admits(&built.args, &args, &built.ctx, 0),
+                    "{args} valid but not admitted by {text}"
+                );
+            }
+        }
+        // Only an optional key may be typed `never` (it must be left out).
+        assert!(!text.replace("?: never", "").contains("never"), "{text}");
+    }
+}
+
 /// Compile `signatures` with `tsc --strict --noEmit` when the repository's
 /// TypeScript is installed. Each signature's last line starts with its callee.
 fn tsc_strict(signatures: &[String], callees: &[&str]) {
@@ -1224,7 +1291,7 @@ fn gen(rng: &mut Rng, depth: usize, defs: usize) -> Value {
     if depth > 3 {
         return gen_leaf(rng);
     }
-    match rng.below(11) {
+    match rng.below(13) {
         0 | 1 => gen_leaf(rng),
         2 | 3 => gen_object(rng, depth, defs),
         4 => gen_array(rng, depth, defs),
@@ -1273,8 +1340,80 @@ fn gen(rng: &mut Rng, depth: usize, defs: usize) -> Value {
             json!({ "oneOf": members })
         }
         9 if defs > 0 => json!({"$ref": format!("#/$defs/{}", DEF_NAMES[rng.below(defs)])}),
+        10 | 11 => gen_mixed(rng, depth, defs),
         _ => json!({"$ref": "#/$defs/class"}),
     }
+}
+
+/// A schema whose keywords belong to another kind than its `type` (or that has no
+/// `type`): object keywords on strings and arrays, array bounds on objects, and
+/// unsatisfiable object or array constraints that other kinds pass untouched.
+fn gen_mixed(rng: &mut Rng, depth: usize, defs: usize) -> Value {
+    const TYPES: [&str; 7] = [
+        "string", "number", "boolean", "null", "array", "object", "untyped",
+    ];
+    let mut schema = Map::new();
+    match *rng.pick(&TYPES) {
+        "untyped" => {}
+        "object" if rng.chance(50) => {
+            schema.insert("type".into(), json!(["object", *rng.pick(&TYPES[..4])]));
+        }
+        kind => {
+            schema.insert("type".into(), json!(kind));
+        }
+    }
+    let k = rng.pick(&NASTY).to_string();
+    let other = rng.pick(&NASTY).to_string();
+    for _ in 0..1 + rng.below(3) {
+        match rng.below(10) {
+            0 => {
+                schema.insert("required".into(), json!([k]));
+            }
+            1 => {
+                schema.insert("dependentSchemas".into(), json!({ k.clone(): false }));
+            }
+            2 => {
+                schema.insert(
+                    "dependentSchemas".into(),
+                    json!({ k.clone(): {"required": [other], "properties": {other.clone(): false}}}),
+                );
+            }
+            3 => {
+                schema.insert("dependentRequired".into(), json!({ k.clone(): [other] }));
+            }
+            4 => {
+                schema.insert(
+                    "properties".into(),
+                    json!({ k.clone(): gen(rng, depth + 1, defs) }),
+                );
+            }
+            5 => {
+                schema.insert("if".into(), json!({"required": [k]}));
+                schema.insert("then".into(), gen_leaf(rng));
+                schema.insert("else".into(), json!(false));
+            }
+            6 => {
+                schema.insert("minItems".into(), json!(3));
+                schema.insert("maxItems".into(), json!(1));
+            }
+            7 => {
+                schema.insert("items".into(), json!(false));
+                schema.insert("minItems".into(), json!(1));
+            }
+            8 => {
+                // String, number and object bounds the renderer leaves out (wider);
+                // upper bounds, so a smallest value still meets them.
+                schema.insert("maxLength".into(), json!(40));
+                schema.insert("maximum".into(), json!(100));
+                schema.insert("maxProperties".into(), json!(6));
+            }
+            _ => {
+                schema.insert("additionalProperties".into(), json!(false));
+                schema.insert("required".into(), json!([k]));
+            }
+        }
+    }
+    Value::Object(schema)
 }
 
 fn one_of_as_any_of(value: &Value) -> Value {
@@ -1409,7 +1548,11 @@ fn sample(schema: &Value, root: &Value, rng: &mut Rng, depth: usize) -> Value {
                 depth + 1,
             );
         }
-        _ if object.contains_key("properties") && rng.chance(60) => vec!["object"],
+        _ if (object.contains_key("properties") || object.contains_key("required"))
+            && rng.chance(60) =>
+        {
+            vec!["object"]
+        }
         _ if object.contains_key("items") || object.contains_key("prefixItems") => vec!["array"],
         _ => return scalar(rng),
     };
@@ -1658,7 +1801,9 @@ fn property_minimal_values_validate_and_text_round_trips() {
                 skipped_one_of += 1;
             }
         }
-        for _ in 0..8 {
+        // Both directions: a value the validator accepts is admitted, so no
+        // position of a satisfiable schema renders as `never`.
+        for _ in 0..12 {
             let value = sample(&root, &root, &mut rng, 0);
             // Tool arguments are always an object; the top level renders as one.
             if value.is_object() && validator.is_valid(&value) {
