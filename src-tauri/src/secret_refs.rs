@@ -1150,12 +1150,12 @@ pub fn register_inline_secrets(server: &ServerEntry) {
             crate::secret_redact::register(&server.id, &e.key, value);
         }
     }
-    for arg in server
-        .args
-        .iter()
-        .filter(|a| crate::registry::arg_looks_secret(a))
-    {
-        crate::secret_redact::register(&server.id, "arg", arg);
+    // The mask also marks the value after a split flag (`--token` `value`).
+    let mask = crate::registry::secret_arg_mask(&server.args);
+    for (arg, _) in server.args.iter().zip(mask).filter(|(_, masked)| *masked) {
+        if let Some(credential) = arg_credential(arg) {
+            crate::secret_redact::register(&server.id, "arg", credential);
+        }
     }
     // Credential parts of a configured URL, never the bare URL or the username.
     if let Some(url) = server.url.as_deref().and_then(|u| url::Url::parse(u).ok()) {
@@ -1191,6 +1191,18 @@ pub fn register_inline_secrets(server: &ServerEntry) {
         }
     }
 }
+
+/// The credential in a masked argument: the value of `--flag=value`, nothing
+/// for `--flag=` (its value is the next entry), else the whole entry.
+fn arg_credential(arg: &str) -> Option<&str> {
+    match arg.split_once('=') {
+        Some((name, value)) if name.starts_with('-') && !name.contains(char::is_whitespace) => {
+            (!value.trim().is_empty()).then_some(value)
+        }
+        _ => Some(arg),
+    }
+}
+
 pub fn has_references(server: &ServerEntry) -> bool {
     server
         .env
