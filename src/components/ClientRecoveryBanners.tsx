@@ -22,7 +22,7 @@ export function ClientRecoveryBanners({
 }) {
   const { t, locale } = useI18n();
   const root = useRef<HTMLDivElement>(null);
-  const [focusTarget, setFocusTarget] = useState<string | null>(null);
+  const focusTarget = useRef<string | null>(null);
   const [rows, setRows] = useState<ClientRecovery[]>([]);
   const [error, setError] = useState("");
   const [successClient, setSuccessClient] = useState<{ id: string; name: string } | null>(
@@ -50,13 +50,13 @@ export function ClientRecoveryBanners({
   }, [locale, refreshKey, attempt]);
 
   useEffect(() => {
-    if (!busy && focusTarget) {
+    if (!busy && focusTarget.current) {
       root.current
-        ?.querySelector<HTMLElement>(`[data-recovery-focus="${focusTarget}"]`)
+        ?.querySelector<HTMLElement>(`[data-recovery-focus="${focusTarget.current}"]`)
         ?.focus();
-      setFocusTarget(null);
+      focusTarget.current = null;
     }
-  }, [busy, focusTarget]);
+  }, [busy, rows, successClient]);
 
   async function retry(row: ClientRecovery) {
     setBusy(row.id);
@@ -70,7 +70,7 @@ export function ClientRecoveryBanners({
           : previous.filter((item) => item.id !== row.id),
       );
       setRetryPending(pending ? row.id : null);
-      setFocusTarget(pending ? `retry-${row.id}` : "success");
+      focusTarget.current = pending ? `retry-${row.id}` : "success";
       if (!pending) {
         setSuccessClient({ id: row.clientId, name: row.clientName });
         onRecovered?.();
@@ -89,7 +89,7 @@ export function ClientRecoveryBanners({
       setRows((previous) =>
         previous.map((item) => (item.id === row.id ? { ...item, dismissed } : item)),
       );
-      setFocusTarget(`${dismissed ? "show" : "retry"}-${row.id}`);
+      focusTarget.current = `${dismissed ? "show" : "retry"}-${row.id}`;
     } catch (cause) {
       setError(String(cause));
       throw cause;

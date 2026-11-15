@@ -109,7 +109,8 @@ impl ClientPage {
                 .hscrollbar_policy(gtk::PolicyType::Never)
                 .vscrollbar_policy(gtk::PolicyType::Automatic)
                 .propagate_natural_height(true)
-                .max_content_height(240)
+                .min_content_height(if record.missing.len() > 5 { 208 } else { -1 })
+                .max_content_height(208)
                 .child(&message)
                 .build();
             card.append(&scroll);
@@ -303,7 +304,12 @@ mod tests {
             client_name: "Cursor".into(),
             path: "/fixture/cursor.json".into(),
             backup_path: "/fixture/original.json".into(),
-            missing: Vec::new(),
+            missing: (0..20)
+                .map(|index| crate::clients::backup_storage::Reference {
+                    server: format!("server-{index:02}"),
+                    key: format!("API_KEY_{index:02}"),
+                })
+                .collect(),
             dismissed: false,
             message: message.clone(),
             instructions: "Unlock your keyring, then choose Retry.".into(),
@@ -319,7 +325,8 @@ mod tests {
             .downcast::<gtk::ScrolledWindow>()
             .unwrap();
         assert_eq!(scroll.hscrollbar_policy(), gtk::PolicyType::Never);
-        assert_eq!(scroll.max_content_height(), 240);
+        assert_eq!(scroll.max_content_height(), 208);
+        assert_eq!(scroll.min_content_height(), 208);
         let label = scroll
             .child()
             .unwrap()
