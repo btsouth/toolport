@@ -3334,9 +3334,41 @@ pub struct Stream {
 #[derive(Debug, Default, Clone)]
 struct Held {
     text: String,
-    /// `(offset in text, separator)`, ascending; several separators at one
-    /// offset are one entry.
-    seps: Vec<(usize, String)>,
+    /// `(offset in text, separators)`, ascending; the separators at one offset
+    /// are runs of one line ending repeated, so a long run of blank lines
+    /// costs one entry.
+    seps: Vec<(usize, Runs)>,
+}
+
+/// Line endings in order, each run one ending (`\n`, `\r` or `\r\n`) and
+/// how many times it repeats.
+type Runs = Vec<(&'static str, usize)>;
+
+fn write_runs(out: &mut String, runs: &[(&'static str, usize)]) {
+    for (unit, n) in runs {
+        for _ in 0..*n {
+            out.push_str(unit);
+        }
+    }
+}
+
+/// Add one line-ending char to `runs`, keeping `\r\n` pairs as one unit.
+fn push_ending(runs: &mut Runs, c: char) {
+    match (c, runs.last_mut()) {
+        ('\n', Some(("\r", n))) => {
+            *n -= 1;
+            if *n == 0 {
+                runs.pop();
+            }
+            match runs.last_mut() {
+                Some(("\r\n", m)) => *m += 1,
+                _ => runs.push(("\r\n", 1)),
+            }
+        }
+        ('\n', Some(("\n", n))) | ('\r', Some(("\r", n))) => *n += 1,
+        ('\n', _) => runs.push(("\n", 1)),
+        _ => runs.push(("\r", 1)),
+    }
 }
 
 impl Held {
@@ -3357,9 +3389,12 @@ impl Held {
             return;
         }
         let at = self.text.len();
-        match self.seps.last_mut() {
-            Some((p, s)) if *p == at => s.push_str(sep),
-            _ => self.seps.push((at, sep.to_string())),
+        if self.seps.last().is_none_or(|(p, _)| *p != at) {
+            self.seps.push((at, Vec::new()));
+        }
+        let runs = &mut self.seps.last_mut().expect("pushed above").1;
+        for c in sep.chars() {
+            push_ending(runs, c);
         }
     }
 
@@ -3375,9 +3410,9 @@ impl Held {
     fn plain(&mut self) -> String {
         let mut out = String::with_capacity(self.text.len() + self.seps.len());
         let mut at = 0;
-        for (p, sep) in std::mem::take(&mut self.seps) {
+        for (p, runs) in std::mem::take(&mut self.seps) {
             out.push_str(&self.text[at..p]);
-            out.push_str(&sep);
+            write_runs(&mut out, &runs);
             at = p;
         }
         out.push_str(&self.text[at..]);
@@ -3400,7 +3435,7 @@ impl Held {
                     out.push_str(&self.text[*at..p]);
                 }
                 *at = p;
-                out.push_str(&seps[k].1);
+                write_runs(out, &seps[k].1);
                 k += 1;
             }
             if copy {
@@ -3425,20 +3460,20 @@ impl Held {
         out
     }
 
-    /// Bytes held: text and separators.
+    /// Bytes held: the text, and each run of line endings as its unit (a run
+    /// costs the same whatever its count).
     fn bytes(&self) -> usize {
-        self.text.len() + self.seps.iter().map(|(_, s)| s.len()).sum::<usize>()
+        self.text.len()
+            + self
+                .seps
+                .iter()
+                .flat_map(|(_, runs)| runs.iter().map(|(unit, _)| unit.len()))
+                .sum::<usize>()
     }
 
-    /// The held separators, written now; the held text (a start of a secret,
-    /// at most the longest form) stays held as one piece, so the secret is
-    /// still matched whole when the rest of it comes.
-    fn release_seps(&mut self) -> String {
-        let mut out = String::new();
-        for (_, sep) in std::mem::take(&mut self.seps) {
-            out.push_str(&sep);
-        }
-        out
+    /// Runs of line endings held.
+    fn runs(&self) -> usize {
+        self.seps.iter().map(|(_, runs)| runs.len()).sum()
     }
 
     /// Stop waiting: [`WITHHELD`] in place of the held text, then the held
@@ -3448,8 +3483,8 @@ impl Held {
         if !self.text.is_empty() {
             out.push_str(WITHHELD);
         }
-        for (_, sep) in std::mem::take(&mut self.seps) {
-            out.push_str(&sep);
+        for (_, runs) in std::mem::take(&mut self.seps) {
+            write_runs(&mut out, &runs);
         }
         self.text.clear();
         out
@@ -3460,10 +3495,15 @@ impl Held {
 /// whether a held start becomes a secret. The longest form expected is a 4 KiB
 /// private key in its longest registered spelling (JSON-escaped twice, about
 /// 4.5 KiB); two further percent levels make that at most 9 times longer,
-/// about 40 KiB. 64 KiB leaves room for it to be wrapped over lines. Past it
-/// the stream writes the held separators and keeps holding only the text
-/// (written after them); held text past it alone becomes [`WITHHELD`].
+/// about 40 KiB. 64 KiB leaves room for it to be wrapped over lines. Line
+/// endings are held as runs ([`MAX_HELD_RUNS`]), so blank lines cost nothing
+/// against it. Past either bound the stream writes [`WITHHELD`] in place of
+/// the held text, then the held line endings, and goes on.
 pub const MAX_HELD_BYTES: usize = 64 * 1024;
+
+/// Most runs of line endings a [`Stream`] holds: input that alternates kinds
+/// of line ending after a held start of a secret makes a run each time.
+pub const MAX_HELD_RUNS: usize = 256;
 
 impl Stream {
     /// A log stream: fragment windows apply, as in [`redact_text`].
@@ -3522,12 +3562,10 @@ impl Stream {
             self.exempt.as_deref(),
         );
         let mut out = self.held.take(m, cut, &spans);
-        if self.held.bytes() > MAX_HELD_BYTES {
-            if self.held.text.len() > MAX_HELD_BYTES {
-                out.push_str(&self.held.withhold());
-            } else {
-                out.push_str(&self.held.release_seps());
-            }
+        // Nothing held is written out of order: held text and the line endings
+        // after it go out together once decided, or past a bound as below.
+        if self.held.bytes() > MAX_HELD_BYTES || self.held.runs() > MAX_HELD_RUNS {
+            out.push_str(&self.held.withhold());
         }
         out
     }
