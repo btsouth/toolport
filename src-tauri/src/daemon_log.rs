@@ -164,24 +164,72 @@ pub fn install_stderr_redactor() {
     }
 }
 
+/// The relay's output side. The last complete line is held until the next one
+/// arrives (or [`PARTIAL_FLUSH_AFTER`] passes), so a secret broken across a line
+/// break is matched on both sides of it.
+struct RelayOut {
+    out: std::fs::File,
+    held: Option<String>,
+}
+
+impl RelayOut {
+    fn write(&mut self, text: &str, cut: bool) {
+        // A cut (not at a newline) may split a secret; the fragment pass also
+        // removes the piece of one left dangling at either edge.
+        let redacted = if cut {
+            crate::secret_redact::redact_fragment(text)
+        } else {
+            crate::secret_redact::redact_text(text)
+        };
+        let _ = self.out.write_all(redacted.as_bytes());
+    }
+
+    /// Pair the held line with `next`, write the held line, return `next` as
+    /// adjusted for a secret that crossed between them.
+    fn release(&mut self, next: String) -> String {
+        let Some(held) = self.held.take() else {
+            return next;
+        };
+        let body = held.trim_end_matches(['\n', '\r']);
+        let ending = &held[body.len()..];
+        match crate::secret_redact::redact_pair(body, &next) {
+            Some((a, b)) => {
+                self.write(&format!("{a}{ending}"), false);
+                b
+            }
+            None => {
+                self.write(&held, false);
+                next
+            }
+        }
+    }
+
+    fn line(&mut self, bytes: &[u8]) {
+        let next = self.release(String::from_utf8_lossy(bytes).into_owned());
+        self.held = Some(next);
+    }
+
+    fn partial(&mut self, bytes: &[u8], cut: bool) {
+        let next = self.release(String::from_utf8_lossy(bytes).into_owned());
+        self.write(&next, cut);
+    }
+
+    fn drain(&mut self) {
+        if let Some(held) = self.held.take() {
+            self.write(&held, false);
+        }
+        let _ = self.out.flush();
+    }
+}
+
 fn relay_writer(
     from_reader: std::sync::mpsc::Receiver<RelayMsg>,
-    mut out: std::fs::File,
+    out: std::fs::File,
     done: std::sync::mpsc::Sender<()>,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
     let mut pending: Vec<u8> = Vec::new();
-    let out_line = |bytes: &[u8], cut: bool, out: &mut std::fs::File| {
-        let text = String::from_utf8_lossy(bytes);
-        // A cut (not at a newline) may split a secret; the fragment pass also
-        // removes the piece of one left dangling at either edge.
-        let redacted = if cut {
-            crate::secret_redact::redact_fragment(&text)
-        } else {
-            crate::secret_redact::redact_text(&text)
-        };
-        let _ = out.write_all(redacted.as_bytes());
-    };
+    let mut out = RelayOut { out, held: None };
     loop {
         match from_reader.recv_timeout(PARTIAL_FLUSH_AFTER) {
             Ok(RelayMsg::Data(bytes)) => {
@@ -189,37 +237,37 @@ fn relay_writer(
                 if let Some(last) = pending.iter().rposition(|&b| b == b'\n') {
                     let rest = pending.split_off(last + 1);
                     for line in pending.split_inclusive(|&b| b == b'\n') {
-                        out_line(line, false, &mut out);
+                        out.line(line);
                     }
                     pending = rest;
                 }
                 if pending.len() > MAX_PENDING_BYTES {
-                    out_line(&pending, true, &mut out);
+                    out.partial(&pending, true);
                     pending.clear();
                 }
             }
             Ok(RelayMsg::Sync(ack)) => {
                 if !pending.is_empty() {
-                    out_line(&pending, true, &mut out);
+                    out.partial(&pending, true);
                     pending.clear();
                 }
-                let _ = out.flush();
+                out.drain();
                 let _ = ack.send(());
             }
             Err(RecvTimeoutError::Timeout) => {
                 if !pending.is_empty() {
-                    out_line(&pending, true, &mut out);
+                    out.partial(&pending, true);
                     pending.clear();
-                    let _ = out.flush();
                 }
+                out.drain();
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
     if !pending.is_empty() {
-        out_line(&pending, false, &mut out);
+        out.partial(&pending, false);
     }
-    let _ = out.flush();
+    out.drain();
     let _ = done.send(());
 }
 
@@ -775,8 +823,11 @@ mod tests {
         };
         let secret = secret.to_string_lossy().to_string();
         crate::secret_redact::register("relay-server", "RELAY_TOKEN", &secret);
+        crate::secret_redact::register("relay-server", "WRAP_TOKEN", "wrapsecretpartone4729318650");
         install_stderr_redactor();
         eprintln!("upstream said: invalid token {secret}");
+        // A tool that wraps long values breaks one across lines.
+        eprintln!("wrapped wrapsecretpartone\n4729318650 end");
         // A child that inherits fd 2 goes through the relay too.
         #[cfg(unix)]
         let _ = std::process::Command::new("sh")
@@ -891,6 +942,12 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("child echoed [secret:RELAY_TOKEN]"), "{text}");
+        assert!(
+            text.contains("wrapped [secret:WRAP_TOKEN]\n end")
+                && !text.contains("wrapsecretpartone")
+                && !text.contains("4729318650"),
+            "a secret broken across a line break: {text}"
+        );
         assert!(
             text.contains("native fd2 wrote [secret:RELAY_TOKEN]"),
             "native fd 2 writes (the CRT's on Windows) are relayed: {text}"

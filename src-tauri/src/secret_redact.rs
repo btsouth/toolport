@@ -66,6 +66,10 @@ pub struct Matcher {
     /// Raw-text forms, for log text and JSON string values after parsing.
     raw: Option<AhoCorasick>,
     raw_patterns: Vec<(String, Pattern)>,
+    /// Forms matched in any ASCII case: the hex of every secret, and a secret
+    /// that is itself hex or base32, which tools print in either case or mixed.
+    ci: Option<AhoCorasick>,
+    ci_patterns: Vec<Pattern>,
     /// The same forms as they appear inside a serialized JSON string, used to decide
     /// cheaply whether a JSON line needs parsing at all.
     json: Option<AhoCorasick>,
@@ -242,6 +246,27 @@ fn text_forms(value: &str) -> Vec<String> {
 /// empty username) and the [`base64_inner`] strings, which find it at any offset
 /// inside a longer base64 blob, Basic credentials with an unknown username among
 /// them.
+/// Forms of `value` matched in any ASCII case: the hex of its bytes, and the
+/// value itself when it is hex (8+ chars) or base32 (16+ chars), alphabets in
+/// which case carries no meaning.
+fn case_free_forms(value: &str) -> Vec<String> {
+    let value = value.trim();
+    let mut out = vec![value
+        .bytes()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()];
+    let body = value.trim_end_matches('=');
+    let hex = body.len() >= 8 && body.bytes().all(|b| b.is_ascii_hexdigit());
+    let base32 = body.len() >= 16
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_alphabetic() || (b'2'..=b'7').contains(&b));
+    if hex || base32 {
+        out.push(value.to_ascii_lowercase());
+    }
+    out
+}
+
 fn variants(value: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let push = |v: String, out: &mut Vec<String>| {
@@ -356,6 +381,8 @@ impl Matcher {
         let mut names: Vec<String> = Vec::new();
         let mut raw_patterns: Vec<(String, Pattern)> = Vec::new();
         let mut seen = HashSet::new();
+        let mut ci_patterns: Vec<(String, Pattern)> = Vec::new();
+        let mut ci_seen = HashSet::new();
         for (name, value) in secrets {
             let value = value.as_ref();
             if value.trim().is_empty() {
@@ -402,6 +429,18 @@ impl Matcher {
                     ));
                 }
             }
+            for form in case_free_forms(value) {
+                if ci_seen.insert(form.clone()) {
+                    ci_patterns.push((
+                        form,
+                        Pattern {
+                            name,
+                            whole_token: short,
+                            fragment: false,
+                        },
+                    ));
+                }
+            }
         }
         let raw_texts: Vec<String> = raw_patterns.iter().map(|(p, _)| p.clone()).collect();
         let json_texts: Vec<String> = raw_texts.iter().map(|p| json_escaped(p)).collect();
@@ -440,10 +479,22 @@ impl Matcher {
                 exact.entry(value.trim().to_string()).or_insert(n);
             }
         }
+        let ci_texts: Vec<String> = ci_patterns.iter().map(|(t, _)| t.clone()).collect();
+        let ci = (!ci_texts.is_empty())
+            .then(|| {
+                AhoCorasickBuilder::new()
+                    .match_kind(MatchKind::Standard)
+                    .ascii_case_insensitive(true)
+                    .build(&ci_texts)
+                    .ok()
+            })
+            .flatten();
         Self {
             names,
             raw: build(&raw_texts),
             raw_patterns,
+            ci,
+            ci_patterns: ci_patterns.into_iter().map(|(_, p)| p).collect(),
             json: build(&json_texts),
             longest_chars,
             heads,
@@ -459,6 +510,7 @@ impl Matcher {
         };
         self.raw.as_ref().map_or(0, AhoCorasick::memory_usage)
             + self.json.as_ref().map_or(0, AhoCorasick::memory_usage)
+            + self.ci.as_ref().map_or(0, AhoCorasick::memory_usage)
             + edge(&self.heads)
             + edge(&self.tails)
     }
@@ -503,6 +555,19 @@ impl Matcher {
             }
             hits.push((m.start(), m.end(), pattern.name, pattern.fragment));
         }
+        if let Some(ci) = &self.ci {
+            for m in ci.find_overlapping_iter(text) {
+                let pattern = &self.ci_patterns[m.pattern().as_usize()];
+                if pattern.whole_token {
+                    let before = text[..m.start()].chars().next_back();
+                    let after = text[m.end()..].chars().next();
+                    if before.is_some_and(is_token_char) || after.is_some_and(is_token_char) {
+                        continue;
+                    }
+                }
+                hits.push((m.start(), m.end(), pattern.name, false));
+            }
+        }
         merge(hits)
     }
 
@@ -537,6 +602,19 @@ impl Matcher {
                 }
             }
             hits.push((m.start(), m.end(), pattern.name, pattern.fragment));
+        }
+        if let Some(ci) = &self.ci {
+            for m in ci.find_overlapping_iter(bytes) {
+                let pattern = &self.ci_patterns[m.pattern().as_usize()];
+                if pattern.whole_token {
+                    let before = m.start().checked_sub(1).map(|i| bytes[i]);
+                    let after = bytes.get(m.end()).copied();
+                    if before.is_some_and(token) || after.is_some_and(token) {
+                        continue;
+                    }
+                }
+                hits.push((m.start(), m.end(), pattern.name, false));
+            }
         }
         merge(hits)
     }
@@ -684,18 +762,86 @@ impl Matcher {
                 }
                 None => false,
             },
-            Value::Array(items) => items.iter_mut().fold(false, |changed, item| {
-                self.value_with(item, fragments, exempt) | changed
-            }),
+            Value::Array(items) => {
+                let changed = items.iter_mut().fold(false, |changed, item| {
+                    self.value_with(item, fragments, exempt) | changed
+                });
+                changed | self.redact_adjacent(items.iter_mut(), exempt)
+            }
             Value::Object(map) => {
                 let mut changed = false;
                 for v in map.values_mut() {
                     changed |= self.value_with(v, fragments, exempt);
                 }
+                changed |= self.redact_adjacent(map.values_mut(), exempt);
                 changed | self.redact_keys(map, exempt)
             }
             _ => false,
         }
+    }
+
+    /// A secret split across neighbouring string values (`["sk-ab", "cd12"]`, or
+    /// consecutive fields of one object): each pair is checked joined, in whole
+    /// forms, and a span crossing the seam is replaced (the marker in the first
+    /// string, the rest of the secret dropped from the second).
+    fn redact_adjacent<'v>(
+        &self,
+        values: impl Iterator<Item = &'v mut Value>,
+        exempt: Option<&HashSet<usize>>,
+    ) -> bool {
+        let mut changed = false;
+        let mut prev: Option<&'v mut String> = None;
+        for value in values {
+            let Value::String(next) = value else {
+                prev = None;
+                continue;
+            };
+            if let Some(a) = prev.take() {
+                if let Some((na, nb)) = self.redact_pair(a, next, exempt) {
+                    *a = na;
+                    *next = nb;
+                    changed = true;
+                }
+            }
+            prev = Some(next);
+        }
+        changed
+    }
+
+    /// `a` and `b` with a secret that crosses from the end of `a` into the start
+    /// of `b` replaced: whole forms only, `None` when nothing crosses.
+    pub fn redact_pair(
+        &self,
+        a: &str,
+        b: &str,
+        exempt: Option<&HashSet<usize>>,
+    ) -> Option<(String, String)> {
+        if a.is_empty() || b.is_empty() {
+            return None;
+        }
+        let reach = self.longest_chars * 4;
+        let mut from = a.len().saturating_sub(reach);
+        while !a.is_char_boundary(from) {
+            from += 1;
+        }
+        let mut to = reach.min(b.len());
+        while !b.is_char_boundary(to) {
+            to += 1;
+        }
+        let joined = format!("{}{}", &a[from..], &b[..to]);
+        let seam = a.len() - from;
+        let (start, end, names) =
+            self.spans_with(&joined, false)
+                .into_iter()
+                .find(|(s, e, names)| {
+                    *s < seam
+                        && *e > seam
+                        && !exempt.is_some_and(|x| names.iter().all(|n| x.contains(n)))
+                })?;
+        Some((
+            format!("{}{}", &a[..from + start], self.marker(&names)),
+            b[end - seam..].to_string(),
+        ))
     }
 
     /// The secrets whose whole forms occur anywhere in `value` (strings, numbers
@@ -913,7 +1059,7 @@ impl Matcher {
         let body = line.trim_end_matches(['\n', '\r']);
         let looks_json = body.trim_start().starts_with(['{', '[']);
         if looks_json {
-            if !json.is_match(body) {
+            if !json.is_match(body) && !self.ci.as_ref().is_some_and(|a| a.is_match(body)) {
                 return Cow::Borrowed(line);
             }
             let numbers = self.redact_number_tokens(body);
@@ -967,6 +1113,7 @@ impl Matcher {
     pub fn may_contain(&self, text: &str) -> bool {
         self.raw.as_ref().is_some_and(|a| a.is_match(text))
             || self.json.as_ref().is_some_and(|a| a.is_match(text))
+            || self.ci.as_ref().is_some_and(|a| a.is_match(text))
     }
 }
 
@@ -1107,6 +1254,18 @@ impl Layers {
 
     fn may_contain(&self, text: &str) -> bool {
         self.0.iter().any(|m| m.may_contain(text))
+    }
+
+    fn redact_pair(&self, a: &str, b: &str) -> Option<(String, String)> {
+        let (mut a, mut b) = (a.to_string(), b.to_string());
+        let mut changed = false;
+        for m in &self.0 {
+            if let Some((na, nb)) = m.redact_pair(&a, &b, None) {
+                (a, b) = (na, nb);
+                changed = true;
+            }
+        }
+        changed.then_some((a, b))
     }
 
     fn value_with(&self, value: &mut Value, fragments: bool, request: Option<&Value>) -> bool {
@@ -1559,6 +1718,12 @@ pub fn redact_text(text: &str) -> Cow<'_, str> {
         Some(m) => m.redact_text(text),
         None => Cow::Borrowed(text),
     }
+}
+
+/// [`Matcher::redact_pair`] against every registered secret: consecutive lines
+/// of a stream, checked for a secret broken across the line break.
+pub fn redact_pair(a: &str, b: &str) -> Option<(String, String)> {
+    current()?.redact_pair(a, b)
 }
 
 /// [`Matcher::redact_fragment`] against every registered secret.
@@ -2020,6 +2185,54 @@ pub fn scrub_data_dir(dir: &Path) -> std::io::Result<usize> {
     drop(scrubbed);
     let _ = std::fs::remove_file(dir.join(SCRUB_PENDING_FILE));
     Ok(rewritten)
+}
+
+/// Replaced or deleted values still waiting for their log cleanup, as last
+/// counted by [`crate::secrets`].
+pub static RETIRED_PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Lines for `toolport_status` about redaction. A secret under
+/// [`SHORT_SECRET_CHARS`] characters is only matched as a whole token, so a
+/// copy of it inside a longer word would still be written; it is named (never
+/// shown) so the user can lengthen or rotate it. Owed cleanups are listed too.
+pub fn status_notes() -> Vec<String> {
+    let mut notes = Vec::new();
+    let short: Vec<String> = REGISTRY
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|map| map.get(&scope_now()))
+        .map(|reg| {
+            let mut ids: Vec<String> = reg
+                .secrets
+                .iter()
+                .filter(|(id, _, v)| {
+                    !id.starts_with("__toolport_internal__/")
+                        && v.trim().chars().count() < SHORT_SECRET_CHARS
+                })
+                .map(|(id, _, _)| id.clone())
+                .collect();
+            ids.sort();
+            ids.dedup();
+            ids
+        })
+        .unwrap_or_default();
+    if !short.is_empty() {
+        notes.push(format!(
+            "secret(s) shorter than {SHORT_SECRET_CHARS} characters are redacted only as whole words, so a copy run into other text may be logged: {} (server/key). Use a longer value where the service allows it.",
+            short.join(", ")
+        ));
+    }
+    let retired = RETIRED_PENDING.load(Ordering::Relaxed);
+    if retired > 0 {
+        notes.push(format!(
+            "{retired} replaced or deleted secret(s) are kept in the vault until the log cleanup for them succeeds; it is retried at each start."
+        ));
+    }
+    if scrub_dir_now().is_some_and(|dir| dir.join(SCRUB_PENDING_FILE).exists()) {
+        notes.push("a log cleanup for newly learned secrets has not finished yet.".to_string());
+    }
+    notes
 }
 
 /// Per scope, how many registry entries this process has scrubbed for.
@@ -2509,6 +2722,67 @@ mod tests {
         );
         let clean = r#"{"method":"notifications/progress"}"#.to_string();
         assert_eq!(redact_outgoing_json(clean.clone()), clean);
+    }
+
+    #[test]
+    fn hex_and_base32_match_in_any_case() {
+        let m = m(&[
+            ("HEX", "a1b2c3d4e5f6a7b8c9d0"),
+            ("B32", "JBSWY3DPEHPK3PXP"),
+            ("PLAIN", "Plain-Secret-Value-1"),
+        ]);
+        assert_eq!(
+            m.redact_text("id A1b2C3d4E5f6A7b8C9D0."),
+            "id [secret:HEX]."
+        );
+        assert_eq!(m.redact_text("otp jbswy3dpEHPK3pxp"), "otp [secret:B32]");
+        let hex: String = "Plain-Secret-Value-1"
+            .bytes()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let mixed: String = hex
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if i % 2 == 0 {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
+            .collect();
+        assert_eq!(
+            m.redact_text(&format!("dump {mixed}")),
+            "dump [secret:PLAIN]"
+        );
+        // Case still matters for a value that is not hex or base32.
+        assert_eq!(
+            m.redact_text("PLAIN-secret-VALUE-1x"),
+            "PLAIN-secret-VALUE-1x"
+        );
+    }
+
+    #[test]
+    fn a_secret_split_across_neighbouring_strings_is_redacted() {
+        // Each piece is one character class, so no fragment window sees it alone.
+        let secret = "abcdefghijkl1234567890";
+        let m = m(&[("SPLIT", secret)]);
+        let mut v = serde_json::json!({
+            "parts": ["key: abcdefghijkl", "1234567890 (wrapped)"],
+            "obj": {"head": "abcdefghijkl", "tail": "1234567890"}
+        });
+        assert!(m.redact_value(&mut v));
+        assert_eq!(
+            v["parts"],
+            serde_json::json!(["key: [secret:SPLIT]", " (wrapped)"])
+        );
+        assert_eq!(v["obj"]["head"], "[secret:SPLIT]");
+        assert_eq!(v["obj"]["tail"], "");
+        assert_eq!(
+            m.redact_pair("x abcdefghijkl", "1234567890 y", None),
+            Some(("x [secret:SPLIT]".to_string(), " y".to_string()))
+        );
+        assert_eq!(m.redact_pair("abcdefghijkl", "999", None), None);
     }
 
     #[test]

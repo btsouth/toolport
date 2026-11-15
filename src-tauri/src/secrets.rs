@@ -2059,6 +2059,8 @@ fn retired_load() -> Vec<(String, String, String)> {
 }
 
 fn retired_save(entries: &[(String, String, String)]) -> Result<(), String> {
+    crate::secret_redact::RETIRED_PENDING
+        .store(entries.len(), std::sync::atomic::Ordering::Relaxed);
     if entries.is_empty() {
         return match get_secret_result_raw(INTERNAL_SERVER_ID, RETIRED_KEY) {
             Ok(Some(_)) => delete_secret_raw(INTERNAL_SERVER_ID, RETIRED_KEY),
@@ -2093,6 +2095,7 @@ fn retire(server_id: &str, key: &str, value: &str) {
 pub fn retry_retired_scrubs() -> usize {
     let entries = retired_load();
     if entries.is_empty() {
+        crate::secret_redact::RETIRED_PENDING.store(0, std::sync::atomic::Ordering::Relaxed);
         return 0;
     }
     let remaining: Vec<(String, String, String)> = entries

@@ -3752,6 +3752,7 @@ fn with_status_notes(summary: String) -> String {
     if let Some(notice) = conduit_lib::telemetry::health().notice() {
         notes.push(notice);
     }
+    notes.extend(conduit_lib::secret_redact::status_notes());
     if notes.is_empty() {
         return summary;
     }
