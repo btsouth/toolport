@@ -657,3 +657,42 @@ it("shows a failed Show recovery action on the dismissed card and restores focus
   expect(screen.getByRole("button", { name: "Show recovery" })).toHaveFocus();
   expect(document.body.textContent).not.toContain("sk-unsafe-worker-details");
 });
+
+it("keeps the row working while its Discard confirmation is open, as GTK does", async () => {
+  const unreadable = errorRow({
+    description: "This recovery file is malformed. Its saved values have been kept.",
+    error: "This recovery file is malformed. Its saved values have been kept.",
+    canDiscardFile: true,
+    discardAction: "Discard recovery file",
+  });
+  api.listClientRecoveries.mockResolvedValue([unreadable]);
+  api.prepareClientRecoveryDiscard.mockResolvedValue(
+    prepared({
+      heading: "Discard the unreadable recovery file for Devin Desktop (Cascade)?",
+      lines: ["Backup file: original-2222.json"],
+      actionLabel: "Discard recovery file",
+    }),
+  );
+  render(<ClientRecoveryBanners refreshKey="busy-while-open" />);
+  const notice = await screen.findByRole("region");
+  await userEvent.click(
+    within(notice).getByRole("button", { name: "Discard recovery file" }),
+  );
+  const dialog = await screen.findByRole("dialog");
+  expect(document.querySelector("[data-recovery-busy]")).toHaveTextContent(
+    "Working on this recovery…",
+  );
+  for (const button of notice.querySelectorAll("button[data-recovery-focus]")) {
+    expect(button).toBeDisabled();
+  }
+  await userEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(document.querySelector("[data-recovery-busy]")).toBeNull());
+  expect(api.discardClientRecovery).not.toHaveBeenCalled();
+  await waitFor(() =>
+    expect(
+      within(screen.getByRole("region")).getByRole("button", {
+        name: "Discard recovery file",
+      }),
+    ).toHaveFocus(),
+  );
+});

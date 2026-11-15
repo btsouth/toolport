@@ -803,3 +803,27 @@ it("refreshes the committed disconnect even when recovery notices cannot be read
   ).toBeInTheDocument();
   expect(toastError).not.toHaveBeenCalled();
 });
+
+it("shows a refused disconnect inline with the client name, as GTK does", async () => {
+  uninstallGateway.mockRejectedValue(
+    "could not read /fixture/moved-servers.json: This recovery file is malformed.",
+  );
+  render(
+    <ClientDetail
+      client={client({ gatewayInstalled: true, entryState: "managed" })}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  await userEvent.click(screen.getByRole("button", { name: "Disconnect" }));
+  await userEvent.click(
+    within(screen.getByRole("dialog")).getByRole("button", { name: "Disconnect" }),
+  );
+  const alert = await screen.findByRole("alert");
+  expect(alert).toHaveTextContent(
+    /^.+: could not read \/fixture\/moved-servers\.json: This recovery file is malformed\.$/,
+  );
+  expect(screen.queryByText("Still connected until restart")).not.toBeInTheDocument();
+  expect(toastError).not.toHaveBeenCalled();
+});

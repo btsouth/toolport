@@ -6481,7 +6481,9 @@ API_KEY = "synthetic-first-origin"
                 .map(|e| e.unwrap().path())
                 .filter(|p| *p != record)
                 .collect();
-            clients::recovery::discard_confirmed(&row.id, &review.manifest).unwrap();
+            let done = clients::recovery::discard_confirmed(&row.id, &review.manifest).unwrap();
+            assert!(done.contains("record of the servers it moved"), "{done}");
+            assert!(!done.contains("unreadable recovery file"), "{done}");
             assert!(!record.exists());
             for other in &others {
                 assert!(other.exists(), "{}", other.display());

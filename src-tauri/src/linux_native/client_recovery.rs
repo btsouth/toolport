@@ -10,9 +10,32 @@ pub(super) struct RecoveryResult {
     pub(super) success: bool,
 }
 
+/// Paths and file names wrap like the React shell: never with a hyphen that is
+/// not in them. Pango otherwise hyphenates long words it breaks (".jso-n").
+fn no_hyphens() -> gtk::pango::AttrList {
+    let attrs = gtk::pango::AttrList::new();
+    attrs.insert(gtk::pango::AttrInt::new_insert_hyphens(false));
+    attrs
+}
+
+fn set_values_text(buffer: &gtk::TextBuffer, text: &str) {
+    buffer.set_text(text);
+    let table = buffer.tag_table();
+    let tag = table.lookup("no-hyphens").unwrap_or_else(|| {
+        let tag = gtk::TextTag::builder()
+            .name("no-hyphens")
+            .insert_hyphens(false)
+            .build();
+        table.add(&tag);
+        tag
+    });
+    buffer.apply_tag(&tag, &buffer.start_iter(), &buffer.end_iter());
+}
+
 fn selectable(value: &str) -> gtk::Label {
     gtk::Label::builder()
         .label(value)
+        .attributes(&no_hyphens())
         .xalign(0.0)
         .halign(gtk::Align::Fill)
         .hexpand(true)
@@ -194,7 +217,7 @@ fn values_view(text: &str, accessible: &'static str) -> gtk::ScrolledWindow {
     view.set_wrap_mode(gtk::WrapMode::WordChar);
     view.set_hexpand(true);
     view.set_vexpand(false);
-    view.buffer().set_text(text);
+    set_values_text(&view.buffer(), text);
     l10n::bind_accessible_label(&view, accessible);
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -326,7 +349,7 @@ fn values_list(record: &crate::clients::recovery::ClientRecovery) -> gtk::Scroll
             .ok()
             .and_then(|rows| rows.into_iter().find(|r| r.id == id))
         {
-            view.buffer().set_text(&bullets(&record.value_lines));
+            set_values_text(&view.buffer(), &bullets(&record.value_lines));
         }
     });
     scroll
@@ -382,6 +405,122 @@ fn details_disclosure(
     container.append(&toggle);
     container.append(&body);
     container
+}
+
+/// Recovery confirmations use the React layout: the heading with a close
+/// control, the content, then Cancel and the action side by side. `respond`
+/// runs once, with true only for the action; Escape and close mean Cancel.
+fn recovery_dialog(
+    app: &adw::Application,
+    parent: Option<&gtk::Window>,
+    heading: &str,
+    content: &gtk::Widget,
+    action_label: &str,
+    destructive: bool,
+    respond: impl Fn(bool) + 'static,
+) -> gtk::Window {
+    let window = gtk::Window::builder()
+        .application(app)
+        .modal(true)
+        .resizable(false)
+        .default_width(440)
+        .title(heading)
+        .build();
+    window.set_transient_for(parent);
+    window.set_widget_name("client-recovery-dialog");
+    // The heading row carries the close control, so no separate title bar.
+    window.set_titlebar(Some(&gtk::Box::new(gtk::Orientation::Horizontal, 0)));
+    let outer = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(16)
+        .margin_top(20)
+        .margin_bottom(20)
+        .margin_start(20)
+        .margin_end(20)
+        .build();
+    let top = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let title = gtk::Label::builder()
+        .label(heading)
+        .attributes(&no_hyphens())
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .xalign(0.0)
+        .hexpand(true)
+        .css_classes(["title-3"])
+        .build();
+    top.append(&title);
+    let close = gtk::Button::builder()
+        .icon_name("window-close-symbolic")
+        .valign(gtk::Align::Start)
+        .css_classes(["flat", "circular"])
+        .build();
+    close.set_widget_name("client-recovery-dialog-close");
+    l10n::bind_tooltip(&close, "Close");
+    l10n::bind_accessible_label(&close, "Close");
+    top.append(&close);
+    outer.append(&top);
+    outer.append(content);
+    outer.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    let buttons = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .build();
+    let cancel = l10n::button("Cancel");
+    cancel.set_widget_name("client-recovery-dialog-cancel");
+    let action = gtk::Button::with_label(action_label);
+    action.set_widget_name("client-recovery-dialog-action");
+    action.add_css_class(if destructive {
+        "destructive-action"
+    } else {
+        "suggested-action"
+    });
+    buttons.append(&cancel);
+    buttons.append(&action);
+    outer.append(&buttons);
+    window.set_child(Some(&outer));
+
+    // Every path closes the window first and answers once on idle after it
+    // closed: rebuilding the page inside close-request kept the dialog open.
+    let choice = std::rc::Rc::new(std::cell::Cell::new(None::<bool>));
+    for (button, chosen) in [(&cancel, false), (&close, false), (&action, true)] {
+        let window = window.downgrade();
+        let choice = choice.clone();
+        button.connect_clicked(move |_| {
+            if choice.get().is_none() {
+                choice.set(Some(chosen));
+            }
+            if let Some(window) = window.upgrade() {
+                window.close();
+            }
+        });
+    }
+    let answered = std::cell::Cell::new(false);
+    let respond = std::rc::Rc::new(respond);
+    window.connect_close_request(move |_| {
+        if !answered.replace(true) {
+            let chosen = choice.get().unwrap_or(false);
+            let respond = respond.clone();
+            gtk::glib::idle_add_local_once(move || respond(chosen));
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    // Capture phase: the dialog sees Escape before the focused widget, so one
+    // press closes it wherever focus is.
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let weak = window.downgrade();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key != gtk::gdk::Key::Escape {
+            return gtk::glib::Propagation::Proceed;
+        }
+        if let Some(window) = weak.upgrade() {
+            window.close();
+        }
+        gtk::glib::Propagation::Stop
+    });
+    window.add_controller(keys);
+    window
 }
 
 fn working_status() -> gtk::Box {
@@ -724,33 +863,25 @@ impl ClientPage {
             .app
             .active_window()
             .or_else(|| self.root.root().and_downcast::<gtk::Window>());
-        #[allow(deprecated)]
-        let dialog = adw::MessageDialog::new(
-            parent.as_ref(),
-            Some(&crate::i18n::tr("Dismiss recovery notice?")),
-            None,
-        );
-        dialog.set_application(Some(&self.app));
-        dialog.set_extra_child(Some(&recovery_label(record, |record| &record.retention)));
-        l10n::bind_dialog_heading(&dialog, "Dismiss recovery notice?");
-        dialog.add_response("cancel", &crate::i18n::tr("Cancel"));
-        l10n::bind_dialog_response(&dialog, "cancel", "Cancel");
-        dialog.add_response("dismiss", &crate::i18n::tr("Dismiss"));
-        l10n::bind_dialog_response(&dialog, "dismiss", "Dismiss");
-        dialog.set_close_response("cancel");
-        dialog.set_default_response(Some("cancel"));
         let page = self.clone();
         let id = record.id.clone();
-        dialog.connect_response(None, move |dialog, response| {
-            dialog.close();
-            if response == "dismiss" {
-                // A temporary button supplies the same busy guard as Show.
-                page.set_recovery_dismissed(&id, true, &gtk::Button::new());
-            } else {
-                focus_first_later(&page.root, vec![format!("client-recovery-dismiss:{id}")]);
-            }
-        });
-        dialog.present();
+        recovery_dialog(
+            &self.app,
+            parent.as_ref(),
+            &crate::i18n::tr("Dismiss recovery notice?"),
+            recovery_label(record, |record| &record.retention).upcast_ref(),
+            &crate::i18n::tr("Dismiss"),
+            false,
+            move |dismiss| {
+                if dismiss {
+                    // A temporary button supplies the same busy guard as Show.
+                    page.set_recovery_dismissed(&id, true, &gtk::Button::new());
+                } else {
+                    focus_first_later(&page.root, vec![format!("client-recovery-dismiss:{id}")]);
+                }
+            },
+        )
+        .present();
     }
 
     fn set_recovery_dismissed(&self, id: &str, dismissed: bool, button: &gtk::Button) {
@@ -825,9 +956,6 @@ impl ClientPage {
             .await;
             match result {
                 Ok(Ok(prepared)) => {
-                    page.end_recovery_action();
-                    page.rebuild_recoveries();
-                    page.refresh_open_detail();
                     page.confirm_discard_recovery(&record, prepared);
                 }
                 Ok(Err(error)) => page.recovery_action_error(&record.id, error, "discard"),
@@ -840,52 +968,62 @@ impl ClientPage {
         });
     }
 
+    /// The row stays busy ("Working on this recovery…", actions greyed) until
+    /// the confirmation closes, as in the React shell.
     fn confirm_discard_recovery(
         &self,
         record: &crate::clients::recovery::ClientRecovery,
         prepared: crate::clients::recovery::DiscardConfirmation,
-    ) {
+    ) -> gtk::Window {
         let parent = self
             .app
             .active_window()
             .or_else(|| self.root.root().and_downcast::<gtk::Window>());
-        #[allow(deprecated)]
-        let dialog = adw::MessageDialog::new(parent.as_ref(), Some(&prepared.heading), None);
-        dialog.set_application(Some(&self.app));
         let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
         content.append(&prose(&prepared.description));
         // One bounded list holds both the values and the exact backup files.
-        if !prepared.lines.is_empty() {
-            content.append(&values_view(
+        let list = (!prepared.lines.is_empty()).then(|| {
+            values_view(
                 &bullets(&prepared.lines),
                 "Saved values and files to delete",
-            ));
+            )
+        });
+        if let Some(list) = &list {
+            content.append(list);
         }
         if !prepared.location.is_empty() {
             content.append(&prose(&prepared.location));
         }
-        dialog.set_extra_child(Some(&content));
-        dialog.add_response("cancel", &crate::i18n::tr("Cancel"));
-        l10n::bind_dialog_response(&dialog, "cancel", "Cancel");
-        dialog.add_response("discard", &prepared.action_label);
-        dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
         let page = self.clone();
         let record = record.clone();
         let manifest = prepared.manifest;
-        dialog.connect_response(None, move |dialog, response| {
-            dialog.close();
-            if response != "discard" {
+        let dialog = recovery_dialog(
+            &self.app,
+            parent.as_ref(),
+            &prepared.heading,
+            content.upcast_ref(),
+            &prepared.action_label,
+            true,
+            move |discard| {
+                if discard {
+                    page.discard_recovery(&record, manifest.clone());
+                    return;
+                }
+                page.end_recovery_action();
+                page.rebuild_recoveries();
+                page.refresh_open_detail();
                 focus_first_later(
                     &page.root,
                     vec![format!("client-recovery-discard:{}", record.id)],
                 );
-                return;
-            }
-            page.discard_recovery(&record, manifest.clone());
-        });
+            },
+        );
         dialog.present();
+        // First focus is the list being deleted, as in React.
+        if let Some(view) = list.and_then(|list| list.child()) {
+            view.grab_focus();
+        }
+        dialog
     }
 
     fn discard_recovery(
@@ -1325,9 +1463,6 @@ mod tests {
         // must still open, show the exact prepared inventory in one bounded
         // list, and confirmed deletion must guard every other action.
         assert!(app.active_window().is_none());
-        page.recovery_feedback
-            .borrow_mut()
-            .push((record.id.clone(), "Previous Retry failure".into()));
         page.recovery_feedback.borrow_mut().push((
             "other-receipt".into(),
             "Keep another client's feedback".into(),
@@ -1344,19 +1479,65 @@ mod tests {
             location: "Recovery files to delete:\n/fixture".into(),
             action_label: "Discard these saved values".into(),
         };
-        page.confirm_discard_recovery(&record, prepared.clone());
-        let dialog = app
-            .windows()
-            .into_iter()
-            .find_map(|window| window.downcast::<adw::MessageDialog>().ok())
-            .expect("parentless Discard confirmation");
+        fn find(widget: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
+            if widget.widget_name() == name {
+                return Some(widget.clone());
+            }
+            let mut child = widget.first_child();
+            while let Some(next) = child {
+                if let Some(found) = find(&next, name) {
+                    return Some(found);
+                }
+                child = next.next_sibling();
+            }
+            None
+        }
+        // Prepare marks the row busy; it stays busy while the dialog is open
+        // and Cancel releases it, as in React.
+        page.begin_recovery_action(&record.id);
+        let dialog = page.confirm_discard_recovery(&record, prepared.clone());
+        assert!(
+            page.recovery_busy.get(),
+            "busy while the confirmation is open"
+        );
+        let root = dialog.child().unwrap();
+        find(&root, "client-recovery-dialog-cancel")
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap()
+            .emit_clicked();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while page.recovery_busy.get() && std::time::Instant::now() < deadline {
+            gtk::glib::MainContext::default().iteration(false);
+        }
+        assert!(!page.recovery_busy.get(), "Cancel releases the row");
+        assert!(!dialog.is_visible());
+        page.recovery_feedback
+            .borrow_mut()
+            .push((record.id.clone(), "Previous Retry failure".into()));
+
+        let dialog = page.confirm_discard_recovery(&record, prepared.clone());
         assert!(dialog.transient_for().is_none());
-        assert_eq!(dialog.default_response().as_deref(), Some("cancel"));
         assert_eq!(
-            dialog.heading().as_deref(),
+            dialog.title().as_deref(),
             Some("Discard these saved values?")
         );
-        let extra = dialog.extra_child().unwrap();
+        let root = dialog.child().unwrap();
+        // React's layout: a close control, then Cancel and the action side by side.
+        assert!(find(&root, "client-recovery-dialog-close").is_some());
+        let cancel = find(&root, "client-recovery-dialog-cancel").unwrap();
+        let action = find(&root, "client-recovery-dialog-action").unwrap();
+        assert_eq!(cancel.next_sibling().as_ref(), Some(&action));
+        assert_eq!(
+            cancel
+                .parent()
+                .unwrap()
+                .downcast::<gtk::Box>()
+                .unwrap()
+                .orientation(),
+            gtk::Orientation::Horizontal
+        );
+        let extra = root.first_child().unwrap().next_sibling().unwrap();
         let mut lists = Vec::new();
         let mut texts = Vec::new();
         let mut child = extra.first_child();
@@ -1365,12 +1546,22 @@ mod tests {
                 assert_eq!(scroll.max_content_height(), 240);
                 let view = scroll.child().unwrap().downcast::<gtk::TextView>().unwrap();
                 let buffer = view.buffer();
+                assert!(
+                    buffer.tag_table().lookup("no-hyphens").is_some(),
+                    "file names wrap without inserted hyphens"
+                );
                 lists.push(
                     buffer
                         .text(&buffer.start_iter(), &buffer.end_iter(), false)
                         .to_string(),
                 );
             } else if let Ok(label) = widget.clone().downcast::<gtk::Label>() {
+                assert!(
+                    label
+                        .attributes()
+                        .is_some_and(|attrs| attrs.to_str().contains("insert-hyphens false")),
+                    "paths wrap without inserted hyphens"
+                );
                 texts.push(label.text().to_string());
             }
             child = widget.next_sibling();
@@ -1384,7 +1575,15 @@ mod tests {
             !texts.iter().any(|text| text.contains("expire")),
             "Discard must not reuse the Dismiss retention promise"
         );
-        dialog.response("discard");
+        action.downcast::<gtk::Button>().unwrap().emit_clicked();
+        assert!(
+            !dialog.is_visible(),
+            "the dialog closes before Discard runs"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while page.recovery_active.borrow().is_none() && std::time::Instant::now() < deadline {
+            gtk::glib::MainContext::default().iteration(false);
+        }
         assert!(
             page.recovery_busy.get(),
             "Discard must be busy before its worker starts"

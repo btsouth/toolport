@@ -3951,14 +3951,24 @@ fn confirm_client_disconnect(client: &state::ClientView, button: gtk::Button, pa
     let Some(parent) = page.app.active_window() else {
         return;
     };
+    // The same strings as the React confirmation, including its wording for a
+    // hand-edited entry.
+    let body = if matches!(client.gateway_state, state::ClientGatewayState::Customized) {
+        crate::i18n::msg("This removes the custom toolport entry from the client's MCP config. You can reconnect anytime.")
+    } else {
+        crate::i18n::msg("This rewrites the client's MCP config to remove the gateway and puts back any servers Toolport moved out of it. You can reconnect anytime.")
+    };
+    let heading = "Disconnect Toolport from {value1}?";
+    let values = [("value1", client.name.to_string())];
+    let values: Vec<(&str, &str)> = values.iter().map(|(k, v)| (*k, v.as_str())).collect();
     #[allow(deprecated)]
-    let dialog = adw::MessageDialog::new(Some(&parent), Some(&crate::i18n::trf("Disconnect {value0}?", &[("value0", &client.name.to_string())])), Some(&crate::i18n::tr("Toolport removes only its managed gateway entry. The client's other settings and MCP servers are preserved.")));
-    l10n::bind_formatted_dialog_heading(
-        &dialog,
-        "Disconnect {value0}?",
-        &[("value0", &client.name.to_string())],
+    let dialog = adw::MessageDialog::new(
+        Some(&parent),
+        Some(&crate::i18n::trf(heading, &values)),
+        Some(&crate::i18n::tr(body)),
     );
-    l10n::bind_dialog_body(&dialog, "Toolport removes only its managed gateway entry. The client's other settings and MCP servers are preserved.");
+    l10n::bind_formatted_dialog_heading(&dialog, heading, &values);
+    l10n::bind_dialog_body(&dialog, body);
     dialog.add_response("cancel", &crate::i18n::tr("Cancel"));
     l10n::bind_dialog_response(&dialog, "cancel", "Cancel");
     dialog.add_response("disconnect", &crate::i18n::tr("Disconnect"));

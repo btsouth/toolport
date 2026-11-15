@@ -299,6 +299,13 @@ pub fn discard_confirmed(id: &str, manifest: &str) -> Result<String, String> {
     Ok(crate::i18n::trf("{client}'s saved recovery copies were deleted. The current config at {path} was not changed. Any temporary text for missing values is still there; re-enter those values in the client if needed.", &[("client", name), ("path", &receipt.notice.path)]))
 }
 
+fn is_move_record(receipt: &Receipt) -> bool {
+    receipt
+        .file
+        .file_name()
+        .is_some_and(|name| name == moved::RECORD_NAME)
+}
+
 /// Review for a receipt that cannot be parsed: exactly that one file. Its vault
 /// entries cannot be named from damaged bytes, so they are left for data removal.
 fn prepare_file_discard(receipt: &Receipt) -> Result<DiscardConfirmation, String> {
@@ -313,7 +320,7 @@ fn prepare_file_discard(receipt: &Receipt) -> Result<DiscardConfirmation, String
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    if file == moved::RECORD_NAME {
+    if is_move_record(receipt) {
         return Ok(DiscardConfirmation {
             manifest,
             heading: crate::i18n::trf("Discard the unreadable record of servers moved from {client}?", &[("client", name)]),
@@ -359,10 +366,14 @@ fn discard_file(receipt: &Receipt, manifest: &str) -> Result<String, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return Err(file_failure(name, crate::i18n::trf("Toolport could not delete a recovery file. Check its permissions and the folder's, then choose {action}:\n{path}", &[("action", &crate::i18n::format_message(DISCARD_FILE_ACTION, &[])), ("path", &receipt.file.to_string_lossy())]))),
     }
-    Ok(issue(crate::i18n::trf(
-        "{client}'s unreadable recovery file was deleted. The client config was not changed.",
-        &[("client", name)],
-    )))
+    let done = if is_move_record(receipt) {
+        crate::i18n::msg("Toolport's damaged record of the servers it moved from {client} was deleted. The servers stay in Toolport, and the client config was not changed.")
+    } else {
+        crate::i18n::msg(
+            "{client}'s unreadable recovery file was deleted. The client config was not changed.",
+        )
+    };
+    Ok(issue(crate::i18n::trf(done, &[("client", name)])))
 }
 
 /// Only typed Discard results pass unchanged. Anything else becomes a
