@@ -62,6 +62,30 @@ fn redact(text: &str, secret: &str, marker: &str, depth: usize) -> String {
     let mut key = String::new();
     while index < bytes.len() {
         let quote = bytes[index];
+        // YAML permits bare strings in block and flow mappings, including a
+        // trailing comment. Only replace a complete scalar, never a field name
+        // or a substring of another value. JSON strings are handled below.
+        if quote != b'"'
+            && quote != b'\''
+            && secret.len() >= 8
+            && secret.bytes().any(|byte| byte.is_ascii_alphabetic())
+            && bytes[index..].starts_with(secret.as_bytes())
+        {
+            let end = index + secret.len();
+            let before = index == 0
+                || bytes[index - 1].is_ascii_whitespace()
+                || b":=,[{".contains(&bytes[index - 1]);
+            let after = end == bytes.len()
+                || bytes[end].is_ascii_whitespace()
+                || b",]}#;".contains(&bytes[end]);
+            if before && after {
+                output.push_str(&text[cursor..index]);
+                output.push_str(marker);
+                cursor = end;
+                index = end;
+                continue;
+            }
+        }
         // Client JSONC/TOML/YAML comments can repeat a credential. They are
         // recovery data too, and must not retain an unquoted plaintext copy.
         let line_comment = quote == b'#' || bytes[index..].starts_with(b"//");
@@ -210,6 +234,12 @@ pub(super) fn encode(path: &Path, text: &str) -> Result<String, String> {
         let marker = format!("TOOLPORT_MISSING_CREDENTIAL_{}", references.len());
         let before = fallback.clone();
         fallback = redact(&fallback, &value, &marker, 0);
+        if value.len() >= 8
+            && value.bytes().any(|byte| byte.is_ascii_alphabetic())
+            && fallback.contains(&value)
+        {
+            return Err("Could not protect every credential occurrence in client recovery. Client config unchanged.".into());
+        }
         if before != fallback {
             references.push(reference);
             retained_values.push(value);
@@ -427,6 +457,8 @@ mod tests {
             "{ // sk-fake-comment-secret\n \"env\":{\"API_KEY\":\"sk-fake-comment-secret\"}\n}",
             "# sk-fake-comment-secret\nenv = { API_KEY = 'sk-fake-comment-secret' }\n",
             "/* sk-fake-comment-secret */ {\"env\":{\"API_KEY\":\"sk-fake-comment-secret\"}}",
+            "env:\n  API_KEY: sk-fake-comment-secret # explanation\n",
+            "env: { API_KEY: sk-fake-comment-secret, OTHER: unchanged }\n",
         ] {
             let result = redact(original, "sk-fake-comment-secret", "missing", 0);
             assert!(!result.contains("sk-fake-comment-secret"), "{result}");
