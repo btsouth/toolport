@@ -12791,7 +12791,7 @@ bad = "not-a-table"
             read_existing_toml(&content).unwrap_err(),
             {
                 let err = content.parse::<toml_edit::DocumentMut>().unwrap_err();
-                toml_error_text(err.message(), err.span(), &content)
+                diagnostics::offset("TOML", &content, err.span())
             },
         ];
         let _ = std::fs::remove_dir_all(&dir);
