@@ -540,3 +540,107 @@ fn run_script_describe_returns_complete_recursive_signatures() {
     let hit = tool_signature::signature(&tools[0]).unwrap();
     assert!(hit.ends_with("/* $Node: see toolport.describe */"), "{hit}");
 }
+
+/// A stale cache (fetched before a policy change) must not leak refused tools into
+/// search results. Search uses the same `tool_visible_to_model` predicate as
+/// describe, stubs and execution, in both Code Mode states.
+#[test]
+fn search_hides_stale_refused_tools_in_both_code_mode_states() {
+    let _data = DataDirTestEnv::new("search-stale-refused");
+    let tool = |name: &str| json!({"name": name, "description": format!("{name} record tool"), "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}}});
+    let mut drop_tool = tool("drop");
+    drop_tool["annotations"] = json!({"destructiveHint": true});
+    let upstream = vec![
+        tool("keep"),
+        tool("wipe"),
+        tool("off"),
+        tool("hidden"),
+        drop_tool.clone(),
+    ];
+    let policy = ToolPolicy {
+        quarantined: ["s__wipe".to_string()].into_iter().collect(),
+        disabled: [("s".to_string(), ["off".to_string()].into_iter().collect())]
+            .into_iter()
+            .collect(),
+        allow: [(
+            "s".to_string(),
+            ["keep", "wipe", "off", "drop"]
+                .map(String::from)
+                .into_iter()
+                .collect(),
+        )]
+        .into_iter()
+        .collect(),
+        deny_destructive: true,
+        ..Default::default()
+    };
+    let mut router = Router::with_policy(policy);
+    router.add(
+        DownstreamServer::connect("s".into(), Box::new(MockRoute { tools: upstream })).unwrap(),
+    );
+    let mut cached: Vec<Value> = ["keep", "wipe", "off", "hidden"]
+        .iter()
+        .map(|name| tool(&format!("s__{name}")))
+        .collect();
+    let mut stale_drop = drop_tool;
+    stale_drop["name"] = json!("s__drop");
+    cached.push(stale_drop);
+    let refused = ["s__wipe", "s__off", "s__hidden", "s__drop"];
+    let queries = [
+        json!({"query": "record tool", "limit": 25}),
+        json!({"query": "", "server": "s"}),
+        json!({"query": "s__wipe"}),
+        json!({"query": "s__off"}),
+        json!({"query": "s__hidden"}),
+        json!({"query": "s__drop"}),
+    ];
+    let own: std::collections::HashSet<String> = ["s".to_string()].into_iter().collect();
+    let other: std::collections::HashSet<String> = ["other".to_string()].into_iter().collect();
+    for code_mode in [false, true] {
+        let reg = Registry {
+            code_mode,
+            deny_destructive: true,
+            ..Default::default()
+        };
+        let host = dispatch_host(true);
+        let search = |arguments: &Value, allowed: Option<&std::collections::HashSet<String>>| {
+            handle_request(
+                &host,
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "toolport_search_tools", "arguments": arguments}}),
+                &reg,
+                &router,
+                &cached,
+                true,
+                None,
+                &SearchGuard::default(),
+                allowed,
+                None,
+            )
+            .unwrap()
+            .to_string()
+        };
+        for arguments in &queries {
+            for allowed in [None, Some(&own)] {
+                let text = search(arguments, allowed);
+                for name in refused {
+                    let bare = name.trim_start_matches("s__");
+                    assert!(
+                        !text.contains(name) && !text.contains(&format!("servers.s.{bare}")),
+                        "code_mode={code_mode} {arguments} leaked {name}: {text}"
+                    );
+                }
+            }
+            // A client allowed only another server sees nothing from `s`.
+            let text = search(arguments, Some(&other));
+            assert!(
+                !text.contains("s__") && !text.contains("servers.s."),
+                "code_mode={code_mode} {arguments} leaked across scope: {text}"
+            );
+        }
+        let text = search(&queries[0], None);
+        assert!(
+            text.contains("s__keep") || text.contains("servers.s.keep"),
+            "code_mode={code_mode}: {text}"
+        );
+    }
+}

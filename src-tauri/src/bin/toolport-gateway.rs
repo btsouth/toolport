@@ -4364,21 +4364,37 @@ fn mcp_app_tool_for_view(tool: &Value, router: &Router, relays: bool, servers: &
 /// [`scope_tools`] for how `route_of` is resolved and why the `server__` prefix is only a
 /// fallback.
 /// The model-facing visibility rule `toolport_search_tools` applies to every
-/// candidate: MCP Apps visibility (an app-only tool is never shown to the model) and
-/// the caller's server scope. `toolport.describe` and the `servers.*` stubs use the
-/// same function, so a script sees exactly the tools search can return.
+/// candidate: MCP Apps visibility (an app-only tool is never shown to the model), the
+/// caller's server scope, and the router's refusals (`refused`, normally
+/// [`tool_refused`]), so a stale cache entry for a tool that was since quarantined,
+/// disabled, put outside this client's allow-list or denied as destructive never
+/// reaches the model. `toolport.describe` and the `servers.*` stubs use the same
+/// function, and execution refuses the same tools, so all four agree.
 fn tool_visible_to_model(
     tool: &Value,
     allowed: Option<&std::collections::HashSet<String>>,
     route_of: &impl Fn(&str) -> Option<String>,
+    refused: &impl Fn(&Value) -> bool,
 ) -> bool {
     mcp_app_tool_is_model_visible(tool)
+        && !refused(tool)
         && tool
             .get("name")
             .and_then(Value::as_str)
             .is_some_and(|name| {
                 allowed.is_none_or(|allowed| tool_in_scope(name, allowed, route_of))
             })
+}
+
+/// Whether the router refuses a catalog entry: blocked by policy (quarantine,
+/// disabled, outside the client's tool allow-list, Strict safety), or destructive
+/// while the destructive gate is on, judged from the entry itself so a cache
+/// written before the servers connect is covered too.
+fn tool_refused(tool: &Value, router: &Router, deny_destructive: bool) -> bool {
+    let Some(name) = tool.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+    (deny_destructive && cached_tool_is_destructive(tool, name, router)) || router.is_blocked(name)
 }
 
 fn tool_in_scope(
@@ -6447,12 +6463,14 @@ fn script_catalog_tools(
     allowed: Option<&std::collections::HashSet<String>>,
     route_of: impl Fn(&str) -> Option<String>,
 ) -> Vec<String> {
-    // Search's own visibility rule. Names with no server part (an override rename)
-    // stay in: they get no `servers.*` stub, but `toolport.call` and `describe` reach
-    // them, exactly as their search signature says.
+    // Search's own visibility rule. The router's refusals ([`tool_refused`]) were
+    // applied when the catalog was taken ([`script_source`]). Names with no server
+    // part (an override rename) stay in: they get no `servers.*` stub, but
+    // `toolport.call` and `describe` reach them, exactly as their search signature
+    // says.
     let mut names: Vec<String> = cached
         .iter()
-        .filter(|tool| tool_visible_to_model(tool, allowed, &route_of))
+        .filter(|tool| tool_visible_to_model(tool, allowed, &route_of, &|_: &Value| false))
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
         .filter(|n| !codemode::is_code_mode_meta_tool(n))
         .map(str::to_string)
@@ -6463,10 +6481,10 @@ fn script_catalog_tools(
 }
 
 /// What a script may see: the catalog search would search (the cached one, or the
-/// live router's on a cold cache) without tools the router refuses, dropped the way
-/// tools/list drops them. A stale cache can still hold a tool that was disabled,
-/// quarantined or put outside this client's tool scope since; no stub or describe
-/// should offer it.
+/// live router's on a cold cache) without tools the router refuses
+/// ([`tool_refused`], the check search applies). A stale cache can still hold a tool
+/// that was disabled, quarantined or put outside this client's tool scope since; no
+/// stub or describe should offer it.
 fn script_source(cached: &dyn ToolCatalog, router: &Router, reg: &Registry) -> SharedTools {
     let base = if cached.is_empty() {
         router.shared_tools()
@@ -8117,8 +8135,10 @@ fn handle_request_with_cancel(
                         .or_else(|| owners.get(&selector.to_lowercase()).map(String::as_str))
                 });
                 let route_of = |name: &str| owner_of_exposed_tool(Some(router), &owners, name);
+                let deny_destructive = reg.deny_destructive_effective();
+                let refused = |tool: &Value| tool_refused(tool, router, deny_destructive);
                 let visible = |tool: &Value| {
-                    tool_visible_to_model(tool, allowed, &route_of)
+                    tool_visible_to_model(tool, allowed, &route_of, &refused)
                         && tool
                             .get("name")
                             .and_then(Value::as_str)
@@ -11560,15 +11580,7 @@ fn drop_blocked_from_cache(
     // router has no `blocked` entries to consult.
     let deny_destructive = reg.deny_destructive_effective();
     let mut catalog = catalog.into();
-    catalog.retain(|tool| {
-        let Some(name) = tool.get("name").and_then(Value::as_str) else {
-            return true;
-        };
-        if deny_destructive && cached_tool_is_destructive(tool, name, router) {
-            return false;
-        }
-        !router.is_blocked(name)
-    });
+    catalog.retain(|tool| !tool_refused(tool, router, deny_destructive));
     catalog
 }
 
@@ -11588,11 +11600,7 @@ fn cached_tool_is_destructive(tool: &Value, exposed: &str, router: &Router) -> b
     let definition = router.policy_definition(tool);
     let exposed = definition["name"].as_str().unwrap_or(exposed);
     match conduit_lib::codemode::split_exposed_name(exposed) {
-        Some((_, original)) => {
-            let mut probe = (*definition).clone();
-            probe["name"] = Value::String(original.to_string());
-            is_destructive(&probe)
-        }
+        Some((_, original)) => conduit_lib::router::is_destructive_as(&definition, Some(original)),
         None => is_destructive(&definition),
     }
 }

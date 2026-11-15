@@ -497,6 +497,12 @@ fn inline_node(node: &mut Value, root: &Value, active: &mut HashSet<String>) {
 /// spec's nested `annotations.destructiveHint` and a top-level fallback some
 /// servers emit. An explicit `false` hint wins over the name fallback.
 pub fn is_destructive(tool: &Value) -> bool {
+    is_destructive_as(tool, tool.get("name").and_then(Value::as_str))
+}
+
+/// [`is_destructive`] judged under `name` instead of the definition's own name, so
+/// callers checking a downstream name need not clone the definition to rename it.
+pub fn is_destructive_as(tool: &Value, name: Option<&str>) -> bool {
     if let Some(hint) = tool
         .get("annotations")
         .and_then(|a| a.get("destructiveHint"))
@@ -506,10 +512,7 @@ pub fn is_destructive(tool: &Value) -> bool {
         return hint;
     }
 
-    tool.get("name")
-        .and_then(Value::as_str)
-        .map(name_looks_destructive)
-        .unwrap_or(false)
+    name.is_some_and(name_looks_destructive)
 }
 
 /// True when `name` contains an obvious write/delete verb. Used by
