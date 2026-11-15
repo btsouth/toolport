@@ -505,7 +505,7 @@ describe("ActivityView recent calls", () => {
     expect(screen.getByText("Searched tools")).toBeInTheDocument();
     expect(screen.queryByText(/Nothing searched yet/)).not.toBeInTheDocument();
     expect(screen.queryByText(/warm catalog|dispatch 3/)).not.toBeInTheDocument();
-    expect(screen.getByText(/Unrecorded client ·/)).toHaveAttribute(
+    expect(screen.getByText("Unrecorded client").parentElement).toHaveAttribute(
       "title",
       expect.stringContaining("dispatch 3 ms"),
     );
@@ -1291,14 +1291,46 @@ it("uses one server filter and one identity, time and wait meta line", async () 
   render(<ActivityView refreshKey={0} registry={null} />);
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
   await user.click(await screen.findByRole("button", { name: /recent calls/i }));
-  expect(screen.getByText("Claude Code · 2m ago · waited 1.5 s")).toHaveAttribute(
-    "title",
-    expect.stringContaining("adapter:claude-code"),
-  );
+  const meta = screen
+    .getAllByText("Claude Code")
+    .map((name) => name.parentElement!)
+    .find((line) => line.textContent === "Claude Code · 2m ago · waited 1.5 s");
+  expect(meta).toHaveAttribute("title", expect.stringContaining("adapter:claude-code"));
   expect(screen.queryByText("adapter:claude-code")).not.toBeInTheDocument();
   await user.click(screen.getByRole("combobox"));
   expect(screen.getAllByRole("option", { name: /^team_slack$/ })).toHaveLength(1);
   expect(screen.queryByRole("option", { name: /^team-slack$/ })).not.toBeInTheDocument();
+});
+
+/** The row's detail line, whose client name and time are separate spans. */
+function detailLine(text: string) {
+  return screen.getByText(
+    (_, element) => element?.tagName === "DIV" && element.textContent === text,
+  );
+}
+
+it("keeps the time and duration visible when the client name is long", async () => {
+  const ts = Date.now() - 120000;
+  const longName = `Agent ${"with a very long reported name ".repeat(6)}`.trim();
+  getAuditLog.mockResolvedValue([
+    entry({ ts, clientName: longName, client: "adapter:long", durationMs: 850 }),
+  ]);
+  render(<ActivityView refreshKey={0} registry={null} />);
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+  const name = screen.getByText(longName);
+  // On a wide row only the name truncates; the time and duration sit beside it and
+  // never shrink. A narrow row wraps the whole line instead.
+  expect(name).toHaveClass("@xl:truncate", "@xl:min-w-0");
+  expect(name).toHaveAttribute("dir", "auto");
+  const when = name.nextElementSibling!;
+  expect(when).toHaveTextContent("· 2m ago · 850 ms");
+  expect(when).toHaveClass("@xl:shrink-0");
+  expect(when).not.toHaveClass("@xl:truncate");
+  expect(name.parentElement).toHaveAttribute(
+    "title",
+    expect.stringContaining(`${longName} · 2m ago · 850 ms`),
+  );
 });
 
 it("uses one server option for hyphenated call and approval identities", async () => {
@@ -1495,21 +1527,21 @@ it("names calls made through T3 Code and shows their thread", async () => {
   render(<ActivityView refreshKey={0} registry={null} />);
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
   await user.click(await screen.findByRole("button", { name: /recent calls/i }));
-  expect(screen.getByText("Codex via T3 Code · 2m ago · 120 ms")).toBeVisible();
+  expect(detailLine("Codex via T3 Code · 2m ago · 120 ms")).toBeVisible();
   const chip = screen.getByText("Thread 0f8e2c1a");
   expect(chip).toHaveAttribute("title", `T3 Code thread ${thread}`);
   // A control that copies the full id.
   expect(screen.getByRole("button", { name: `Copy thread id ${thread}` })).toBe(chip);
-  expect(screen.getByText("Cursor via T3 Code · 2m ago · 120 ms")).toBeVisible();
+  expect(detailLine("Cursor via T3 Code · 2m ago · 120 ms")).toBeVisible();
   // The host stays beside the client it describes; what it reported comes next.
   expect(
-    screen.getByText(
+    detailLine(
       'Claude Code (claude_personal) via T3 Code · reports "claude-code-cli" · 2m ago · 120 ms',
     ),
   ).toBeVisible();
-  expect(screen.getByText('Gemini · reports "my-agent" · 2m ago · 120 ms')).toBeVisible();
+  expect(detailLine('Gemini · reports "my-agent" · 2m ago · 120 ms')).toBeVisible();
   expect(screen.getAllByText(/^Thread /)).toHaveLength(1);
-  expect(screen.getByText("Zed · 2m ago · 120 ms")).toBeVisible();
-  expect(screen.getByText("Claude Code · 2m ago · 120 ms")).toBeVisible();
+  expect(detailLine("Zed · 2m ago · 120 ms")).toBeVisible();
+  expect(detailLine("Claude Code · 2m ago · 120 ms")).toBeVisible();
   expect(screen.queryByText(/Zed via/)).not.toBeInTheDocument();
 });
