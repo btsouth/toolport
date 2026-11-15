@@ -1089,6 +1089,19 @@ fn resolved_server_with_values(
 /// on their own ([`crate::secrets`]); this covers the values that never pass
 /// through the vault. Every stdio launch resolves through [`resolve_server`],
 /// and remote connects call this directly.
+/// The desktop shells' startup preload: inline values only, for every server.
+/// It reads no vault value, so a hidden start can never raise an unlock
+/// prompt and the app reads no credential it does not need; a vault value is
+/// registered when it is first read for real use (editing, a test, a start).
+pub fn preload_inline_secrets() {
+    let Ok(reg) = crate::registry::load_resolved() else {
+        return;
+    };
+    for server in &reg.servers {
+        register_inline_secrets(server);
+    }
+}
+
 /// Register every configured secret this process can read without prompting:
 /// inline values, vaulted env values and stored HTTP and OAuth credentials, for
 /// every server. The gateway calls this before it replays or writes any
@@ -1412,21 +1425,29 @@ mod tests {
         );
     }
 
-    /// Failure mode: the startup preload read the vault of every server,
-    /// disabled ones too, so a locked keyring could prompt for a server that
-    /// is never used.
+    /// Failure mode: the desktop shells' startup preload read the vault of
+    /// every server, so a locked keyring could raise an unlock prompt during a
+    /// hidden start, for credentials the app did not need.
     #[test]
-    fn the_preload_reads_no_disabled_server_vault() {
+    fn the_desktop_preload_reads_no_vault_value() {
         crate::secrets::tests::with_isolated_vault(|| {
             let registry = crate::registry::Registry {
                 servers: serde_json::from_value(serde_json::json!([
                     {"id":"pre-on","name":"On","enabled":true,"source":"fixture","transport":"stdio","command":"node","args":[],"inheritEnv":false,"env":[{"key":"ON_TOKEN","secret":true}]},
-                    {"id":"pre-off","name":"Off","enabled":false,"source":"fixture","transport":"stdio","command":"node","args":[],"inheritEnv":false,"env":[{"key":"OFF_TOKEN","secret":true}]}
+                    {"id":"pre-off","name":"Off","enabled":false,"source":"fixture","transport":"stdio","command":"node","args":[],"inheritEnv":false,"env":[{"key":"OFF_TOKEN","secret":true}]},
+                    {"id":"pre-inline","name":"Inline","enabled":true,"source":"fixture","transport":"stdio","command":"node","args":[],"inheritEnv":false,"env":[{"key":"INLINE_TOKEN","value":"pre-inline-value-6Tz1","secret":true}]}
                 ]))
                 .unwrap(),
                 ..Default::default()
             };
             crate::registry::save(&registry).unwrap();
+            let reads = crate::secrets::tests::reads_during(super::preload_inline_secrets);
+            assert!(reads.is_empty(), "{reads:?}");
+            assert_eq!(
+                crate::secret_redact::redact_text("got pre-inline-value-6Tz1"),
+                "got [secret:INLINE_TOKEN]"
+            );
+            // The gateway's own preload reads enabled servers' values only.
             let reads = crate::secrets::tests::reads_during(super::preload_configured_secrets);
             assert!(reads.contains(&"pre-on/ON_TOKEN".to_string()), "{reads:?}");
             assert!(
