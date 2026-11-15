@@ -1881,3 +1881,40 @@ fn lexical_check_catches_breakouts() {
         vec!["a\"b"]
     );
 }
+
+/// What work budget the two large Cloudflare fixtures need to render without
+/// exhausting it, and what each budget costs per search hit:
+/// `cargo test --release --lib -- --ignored bench_cloudflare_budget --nocapture`.
+#[test]
+#[ignore]
+fn bench_cloudflare_budget() {
+    let catalog: Vec<Value> = serde_json::from_str(include_str!(
+        "../tests/fixtures/search-eval-scale/catalog.json"
+    ))
+    .unwrap();
+    for name in [
+        "cloudflare__create_access_app",
+        "cloudflare__update_access_app",
+    ] {
+        let tool = catalog.iter().find(|t| t["name"] == name).unwrap();
+        let input = &tool["inputSchema"];
+        eprintln!("bench {name}: {} bytes", tool.to_string().len());
+        for work in [
+            10_000, 20_000, 50_000, 100_000, 200_000, 500_000, 1_000_000, 4_000_000,
+        ] {
+            let runs = 20;
+            let started = std::time::Instant::now();
+            let mut text = String::new();
+            let mut exhausted = false;
+            for _ in 0..runs {
+                let built = build_tool(input, None, work);
+                exhausted = built.ctx.exhausted;
+                text = search_signature_of(&built, name, MAX_SIGNATURE_CHARS);
+            }
+            eprintln!(
+                "bench {name} work {work}: exhausted={exhausted} {:?} per hit: {text}",
+                started.elapsed() / runs
+            );
+        }
+    }
+}
