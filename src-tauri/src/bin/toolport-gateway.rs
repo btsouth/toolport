@@ -22790,7 +22790,6 @@ fn main() {
         }
         if daemon_requested(&cli_args) {
             conduit_lib::daemon_log::install_panic_hook(dir.clone());
-            #[cfg(unix)]
             conduit_lib::daemon_log::install_stderr_redactor();
         }
     }

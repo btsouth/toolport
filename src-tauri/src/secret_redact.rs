@@ -798,11 +798,20 @@ fn held_open(path: &Path) -> bool {
 /// fits, padded with `*`), so concurrent `O_APPEND` writers and open descriptors
 /// are unaffected: nothing moves and the file is never replaced.
 fn mask_in_place(matcher: &Matcher, path: &Path) -> std::io::Result<bool> {
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    // The live daemon holds this file as its stderr handle (append access, the
+    // default read/write/delete sharing). Share all three so neither side blocks
+    // the other; same-length writes never move what the daemon appends.
+    #[cfg(windows)]
     {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        const FILE_SHARE_DELETE: u32 = 0x4;
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    }
+    let file = match options.open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
