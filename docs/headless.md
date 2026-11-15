@@ -216,6 +216,29 @@ Image defaults:
 - volume `/data`
 - runs as uid `10001`, with a readiness healthcheck on `GET /healthz`
 
+### Run from an MCP client (stdio)
+
+The [MCP registry](https://registry.modelcontextprotocol.io) listing
+(`io.github.btsouth/toolport`) starts the image as a stdio server and keeps its
+state in the named volume `toolport-gateway-data`:
+
+```bash
+docker run -i --rm --entrypoint toolport-gateway \
+  -v toolport-gateway-data:/data ghcr.io/btsouth/toolport-gateway:vX.Y.Z
+```
+
+A new volume has no servers, so the gateway starts empty. Write your
+[`registry.json`](#minimal-registryjson) into the volume once, before or after
+adding the gateway to your client:
+
+```bash
+docker run --rm -i --entrypoint sh -v toolport-gateway-data:/data \
+  ghcr.io/btsouth/toolport-gateway:vX.Y.Z -c 'cat > /data/registry.json' < registry.json
+```
+
+The gateway picks up the change without a restart. Servers that need secrets
+follow [Secrets without the OS keychain](#secrets-without-the-os-keychain).
+
 ## Secrets without the OS keychain
 
 Resolution order when a server marks `env[].secret: true`:

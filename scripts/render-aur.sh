@@ -50,7 +50,7 @@ if ! printf '%s' "$pkgrel" | grep -qE '^[1-9][0-9]*$'; then
 fi
 repo=btsouth/toolport
 url="https://github.com/$repo"
-pkgdesc='One MCP endpoint for every AI client: governance, approvals, and audit for your MCP servers'
+pkgdesc='Desktop app and local gateway that shares MCP servers with every AI client'
 deb_name="Toolport_${version}_amd64.deb"
 deb_url="$url/releases/download/v${version}/${deb_name}"
 license_url="https://raw.githubusercontent.com/$repo/v${version}/LICENSE"

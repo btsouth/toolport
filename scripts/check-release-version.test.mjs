@@ -26,6 +26,15 @@ function writeFixture(root, { version, pkgbuildVersion }) {
     }),
     "packaging/homebrew/toolport.rb": `cask "toolport" do\n  version "${version}"\nend\n`,
     "packaging/linux/native/PKGBUILD": `pkgver=${pkgbuildVersion}\n`,
+    "server.json": JSON.stringify({
+      version,
+      packages: [
+        {
+          registryType: "oci",
+          identifier: `ghcr.io/btsouth/toolport-gateway:v${version}`,
+        },
+      ],
+    }),
   };
   for (const [file, contents] of Object.entries(files)) {
     const full = path.join(root, file);
@@ -168,4 +177,42 @@ test("the CLI exits non-zero on a malformed tag and zero on an exact match", () 
     assert.equal(ok.status, 0, ok.stderr);
     assert.match(ok.stdout, /every version source matches v2\.0\.0/);
   });
+});
+
+test("server.json must carry the release version and the matching image tag", () => {
+  withFixture(
+    "v2.0.0",
+    { version: "2.0.0", pkgbuildVersion: "2.0.0" },
+    (root, parsed) => {
+      writeFileSync(
+        path.join(root, "server.json"),
+        JSON.stringify({
+          version: "1.9.0",
+          packages: [
+            {
+              registryType: "oci",
+              identifier: "ghcr.io/btsouth/toolport-gateway:v1.9.0",
+            },
+          ],
+        }),
+      );
+      assert.deepEqual(runCheck(root, parsed).mismatches, [
+        { file: "server.json", expected: "2.0.0", actual: "1.9.0" },
+        {
+          file: "server.json (OCI image tag)",
+          expected: "ghcr.io/btsouth/toolport-gateway:v2.0.0",
+          actual: "ghcr.io/btsouth/toolport-gateway:v1.9.0",
+        },
+      ]);
+
+      writeFileSync(path.join(root, "server.json"), JSON.stringify({ version: "2.0.0" }));
+      assert.deepEqual(runCheck(root, parsed).mismatches, [
+        {
+          file: "server.json (OCI image tag)",
+          expected: "ghcr.io/btsouth/toolport-gateway:v2.0.0",
+          actual: undefined,
+        },
+      ]);
+    },
+  );
 });

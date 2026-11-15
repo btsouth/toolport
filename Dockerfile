@@ -4,6 +4,8 @@
 # For a from-source local build, use: docker build -f Dockerfile.source .
 
 FROM debian:bookworm-slim
+# The MCP registry checks this label against server.json's name before listing the image.
+LABEL io.modelcontextprotocol.server.name="io.github.btsouth/toolport"
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates libssl3 libdbus-1-3 curl \
     && rm -rf /var/lib/apt/lists/*

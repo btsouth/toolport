@@ -22,7 +22,9 @@ Releases are built by CI on a version tag (`.github/workflows/release.yml`).
      to `SKIP` until the tag archive exists, then pin the real digest before
      dispatching the Arch repository workflow below)
    - `CHANGELOG.md`; move `[Unreleased]` entries into a dated section
-   - `server.json` only when publishing a matching standalone gateway package
+   - `server.json` (`version` and the `ghcr.io/btsouth/toolport-gateway:vX.Y.Z` image tag);
+     `scripts/check-release-version.mjs` and `src/test/mcp-registry-server.test.ts`
+     fail if either drifts
    - `scripts/install.ps1` / `scripts/install.sh` only if you changed them, in which
      case also move `INSTALL_SCRIPTS_REF` in the site repo's `worker/index.js`, since
      `toolport.app/install.*` redirects to a pinned commit and will otherwise keep
@@ -45,6 +47,12 @@ CI builds installers for **Windows** (NSIS), **macOS** (dmg), and **Linux**
 `toolport-agent-plugin.zip`,
 and attaches them to a **draft** release titled `Toolport vX.Y.Z` whose body is the
 changelog section. Review the draft, then click **Publish**.
+
+The **official MCP registry** lists the gateway as `io.github.btsouth/toolport`. After a
+stable tag pushes its GHCR image, the `list on MCP registry` job in `docker-publish.yml`
+checks the image's `io.modelcontextprotocol.server.name` label and publishes `server.json`
+over GitHub OIDC. Nothing waits on it; to retry, dispatch `docker-publish.yml` with
+`registry_tag=vX.Y.Z`.
 
 ## 2.0 staged rollout
 
