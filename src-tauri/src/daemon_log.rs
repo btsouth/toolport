@@ -588,7 +588,14 @@ fn redirect_stderr() -> Option<Redirect> {
         }
         // C code in this process (and `_write(2, ...)`) writes through the CRT's
         // fd 2, which still names the original file; point it at the pipe too.
-        crt_point_fd2(write);
+        // Not relayed unless both are: native writes would pass in clear.
+        if !crt_point_fd2(write) {
+            SetStdHandle(STD_ERROR_HANDLE, original);
+            CloseHandle(kept);
+            CloseHandle(read);
+            CloseHandle(write);
+            return None;
+        }
         Some(Redirect {
             reader: std::fs::File::from_raw_handle(read as _),
             original: std::fs::File::from_raw_handle(kept as _),
@@ -1080,7 +1087,11 @@ fn silence_stderr() -> std::io::Result<()> {
     // until exit, and the CRT's fd 2 gets its own duplicate.
     unsafe {
         crt_flush();
-        crt_point_fd2(null as _);
+        if !crt_point_fd2(null as _) {
+            return Err(std::io::Error::other(
+                "the C runtime's stderr could not be pointed at the null device",
+            ));
+        }
         if SetStdHandle(STD_ERROR_HANDLE, null as _) == 0 {
             return Err(std::io::Error::last_os_error());
         }
