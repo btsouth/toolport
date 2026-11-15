@@ -22,13 +22,17 @@ derivatives use apt's available library versions. If compatibility cannot be
 established, the installer chooses AppImage. Current Arch and its derivatives
 keep the signed pacman repository route.
 
-On Fedora 40+ the installer verifies the release RPM checksum and installs it
-with dnf. Other dnf distributions use RPM when installed libraries or cached
-repository metadata establish all four dependency floors; otherwise they use
-AppImage. Older Fedora and RHEL 9 use AppImage. The RPM requires GTK 4.14+,
-libadwaita 1.5+, GLib 2.80+ and glibc 2.39+. A clean openSUSE Tumbleweed solver
-check rejects the current RPM because nothing provides its `libgcc` dependency.
-openSUSE keeps the portable AppImage until a compatible RPM is packaged.
+On Fedora 40+ and current openSUSE Tumbleweed, the installer verifies the release
+RPM checksum and installs it with dnf or zypper. Other RPM distributions use RPM
+when installed libraries or cached repository metadata establish the dependency
+floors; otherwise the installer explains the unmet requirements and uses AppImage.
+The RPM requires GTK 4.14+, libadwaita 1.5+, GLib 2.80+ and glibc 2.39+.
+Older Fedora, RHEL 9 and openSUSE Leap releases below these floors use AppImage.
+The RPM uses shared library capabilities and versioned Fedora/openSUSE provider
+alternatives, so package names such as `libgcc` do not prevent zypper installation.
+The installer refreshes openSUSE metadata during installation; `--print-plan`
+remains offline. Local RPMs are checksum-verified but currently unsigned; zypper
+allows that local artifact while retaining repository signature checks.
 
 To inspect the installer's selection without network access or changes, download
 it from [the pinned installer URL](https://toolport.app/install.sh), then run

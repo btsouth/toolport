@@ -93,25 +93,41 @@ deb_supported() {
 
 rpm_supported() {
   local distro version
+  rpm_missing=""
   distro="$(os_value ID)"; version="$(os_value VERSION_ID)"
   case "$distro" in
     fedora) version_at_least "$version" 40; return ;;
+    opensuse-tumbleweed)
+      # Snapshot releases after April 2024 meet the Ubuntu 24.04 ABI floor.
+      if [[ "$version" =~ ^[0-9]{8}$ ]] && [ "$version" -ge 20240401 ]; then return 0; fi ;;
   esac
-  # Other dnf distros must expose the Fedora RPM's actual dependency names and
-  # ABI floors. Installed libraries or cached metadata are read-only evidence;
+  # Installed libraries or cached metadata are read-only evidence;
   # never refresh repositories just to print an installation plan.
-  local package floor candidate
+  local package floor candidate provider
   for package in gtk4 libadwaita glib2 glibc; do
     case "$package" in
       gtk4) floor=4.14 ;; libadwaita) floor=1.5 ;;
       glib2) floor=2.80 ;; glibc) floor=2.39 ;;
     esac
-    if command -v rpm >/dev/null 2>&1 && rpm -q --whatprovides "$package >= $floor" >/dev/null 2>&1; then
-      continue
+    provider="$package"
+    if command -v zypper >/dev/null 2>&1; then
+      case "$package" in
+        gtk4) provider=libgtk-4-1 ;; libadwaita) provider=libadwaita-1-0 ;; glib2) provider=libglib-2_0-0 ;;
+      esac
     fi
-    candidate="$(dnf -q --cacheonly repoquery --latest-limit=1 --qf '%{version}' "$package" 2>/dev/null | sort -V | tail -n1)" || return 1
-    version_at_least "$candidate" "$floor" || return 1
+    candidate="$(rpm -q --qf '%{VERSION}\n' "$provider" 2>/dev/null || true)"
+    if ! version_at_least "$candidate" "$floor"; then
+      if command -v zypper >/dev/null 2>&1; then
+        candidate="$(LC_ALL=C zypper --no-refresh --no-color info --type package "$provider" 2>/dev/null | awk '$1 == "Version" && $2 == ":" {print $3}' | sed 's/-.*//' | sort -V | tail -n1)"
+      else
+        candidate="$(dnf -q --cacheonly repoquery --latest-limit=1 --qf '%{version}' "$package" 2>/dev/null | sort -V | tail -n1)" || candidate=""
+      fi
+    fi
+    if ! version_at_least "$candidate" "$floor"; then
+      rpm_missing="${rpm_missing}${rpm_missing:+; }$package ${candidate:-not detected} (requires $floor+)"
+    fi
   done
+  [ -z "$rpm_missing" ]
 }
 
 linux_plan() {
@@ -128,12 +144,12 @@ linux_plan() {
   elif command -v pacman >/dev/null 2>&1 &&
     grep -qE '^(ID|ID_LIKE)=.*\barch\b' "$os_release" 2>/dev/null; then
     linux_package=pacman
-  elif grep -qE '^(ID|ID_LIKE)=.*\b(fedora|rhel|centos)\b' "$os_release" 2>/dev/null; then
-    if command -v dnf >/dev/null 2>&1 && rpm_supported; then
+  elif grep -qE '^(ID|ID_LIKE)=.*\b(fedora|rhel|centos|opensuse|suse)\b' "$os_release" 2>/dev/null; then
+    if { command -v dnf >/dev/null 2>&1 || command -v zypper >/dev/null 2>&1; } && rpm_supported; then
       linux_package=rpm
       return
     fi
-    linux_reason="Using AppImage on this RPM distro; the manual GTK RPM needs GTK 4.14+, libadwaita 1.5+, GLib 2.80+ and glibc 2.39+ (older Fedora/RHEL do not meet these requirements)."
+    linux_reason="Using AppImage: the GTK RPM needs GTK 4.14+, libadwaita 1.5+, GLib 2.80+ and glibc 2.39+. ${rpm_missing:-This system does not meet the detected requirements.}"
   fi
 }
 
@@ -376,6 +392,14 @@ install_linux() {
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
 
+  if command -v zypper >/dev/null 2>&1 &&
+    grep -qE '^(ID|ID_LIKE)=.*\b(opensuse|suse)\b' "${TOOLPORT_OS_RELEASE:-/etc/os-release}" 2>/dev/null; then
+    sudo=""
+    if [ "$(id -u)" -ne 0 ]; then
+      command -v sudo >/dev/null 2>&1 && sudo=sudo || err "Refreshing openSUSE package metadata needs root: re-run as root or install sudo."
+    fi
+    $sudo zypper --non-interactive refresh
+  fi
   linux_plan
   [ -z "$linux_reason" ] || say "$linux_reason"
   if [ "$linux_package" = deb ]; then
@@ -405,7 +429,13 @@ install_linux() {
     if [ "$(id -u)" -ne 0 ]; then
       command -v sudo >/dev/null 2>&1 && sudo="sudo" || err "Installing the RPM needs root: re-run as root or install sudo."
     fi
-    $sudo dnf install -y "$tmp/toolport.rpm"
+    if command -v zypper >/dev/null 2>&1; then
+      # Only this local, checksum-verified RPM is unsigned. Repository signature
+      # checks stay enabled; release RPM signing is a separate publishing task.
+      $sudo zypper --non-interactive install --allow-unsigned-rpm "$tmp/toolport.rpm"
+    else
+      $sudo dnf install -y "$tmp/toolport.rpm"
+    fi
     say "Installed. Launch Toolport from your app menu, or run: toolport"
     return
   fi

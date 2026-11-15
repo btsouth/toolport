@@ -98,12 +98,17 @@ overrides:
     depends:
       - coreutils
       - util-linux
-      - gtk4 >= 4.14
-      - libadwaita >= 1.5
-      - glib2 >= 2.80
-      - dbus-libs
-      - glibc >= 2.39
-      - libgcc
+      # Fedora and openSUSE name these libraries differently. Keep the ABI
+      # floors through rich dependencies, and require the shared ELF providers.
+      - (gtk4 >= 4.14 or libgtk-4-1 >= 4.14)
+      - (libadwaita >= 1.5 or libadwaita-1-0 >= 1.5)
+      - (glib2 >= 2.80 or libglib-2_0-0 >= 2.80)
+      - libgtk-4.so.1()(64bit)
+      - libadwaita-1.so.0()(64bit)
+      - libglib-2.0.so.0()(64bit)
+      - libdbus-1.so.3()(64bit)
+      - libc.so.6(GLIBC_2.39)(64bit)
+      - libgcc_s.so.1()(64bit)
       - hicolor-icon-theme
     suggests:
       - gnome-keyring

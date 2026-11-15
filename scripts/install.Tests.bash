@@ -500,6 +500,35 @@ chmod +x "$rpm_dir/shim/rpm" "$rpm_dir/shim/dnf"
 result="$(PATH="$rpm_dir/shim:$PATH" TOOLPORT_OS_RELEASE="$rpm_dir/os-release" bash "$INSTALL_SH" --print-plan)"
 check "compatible RPM derivative uses cached ABI evidence" "package=rpm" "$result"
 
+echo "openSUSE: shared RPM through zypper and explicit Leap fallback"
+cat > "$rpm_dir/shim/zypper" <<'ZYPPER'
+#!/bin/sh
+printf '%s\n' "$*" >> "$TOOLPORT_TEST_ZYPPER_LOG"
+case "$*" in
+  *info*libgtk-4-1) echo 'Version : 4.12.5-1.1' ;;
+  *info*libadwaita-1-0) echo 'Version : 1.4.3-1.1' ;;
+  *info*libglib-2_0-0) echo 'Version : 2.78.6-1.1' ;;
+  *info*glibc) echo 'Version : 2.38-1.1' ;;
+  '--non-interactive refresh'|*'install --allow-unsigned-rpm '*) exit 0 ;;
+  *) exit 99 ;;
+esac
+ZYPPER
+chmod +x "$rpm_dir/shim/zypper"
+export TOOLPORT_TEST_ZYPPER_LOG="$rpm_dir/zypper.log"
+printf 'ID=opensuse-tumbleweed\nVERSION_ID=20261111\n' > "$rpm_dir/os-release"
+result="$(PATH="$rpm_dir/shim:$PATH" HOME="$rpm_dir/home" TOOLPORT_OS_RELEASE="$rpm_dir/os-release" bash "$INSTALL_SH" 2>&1)"
+check "Tumbleweed RPM checksum verified" "sha256 verified: $fake_sha256" "$result"
+if grep -q -- '--non-interactive install --allow-unsigned-rpm .*toolport.rpm' "$rpm_dir/zypper.log" && ! grep -q -- '--no-gpg-checks' "$rpm_dir/zypper.log"; then pass=$((pass+1)); else fail=$((fail+1)); fi
+: > "$rpm_dir/zypper.log"
+printf 'ID=opensuse-leap\nID_LIKE="suse opensuse"\nVERSION_ID=15.6\n' > "$rpm_dir/os-release"
+result="$(PATH="$rpm_dir/shim:$PATH" TOOLPORT_OS_RELEASE="$rpm_dir/os-release" bash "$INSTALL_SH" --print-plan)"
+check "Leap portable fallback" "package=appimage" "$result"
+for unmet in 'gtk4 4.12.5 (requires 4.14+)' 'libadwaita 1.4.3 (requires 1.5+)' 'glib2 2.78.6 (requires 2.80+)' 'glibc 2.38 (requires 2.39+)'; do
+  check "Leap identifies unmet $unmet" "$unmet" "$result"
+done
+if grep -v -- '--no-refresh' "$rpm_dir/zypper.log" | grep -q .; then fail=$((fail+1)); else pass=$((pass+1)); fi
+unset TOOLPORT_TEST_ZYPPER_LOG
+
 # Cleanup is offline and honors the same XDG paths as installation.
 mkdir -p "$rpm_dir/home/.local/bin" "$rpm_dir/home/.local/share/applications" "$rpm_dir/home/.config/autostart" "$rpm_dir/home/.config/Toolport"
 touch "$rpm_dir/home/.local/bin/toolport" "$rpm_dir/home/.local/share/applications/toolport.desktop" "$rpm_dir/home/.config/autostart/Toolport.desktop" "$rpm_dir/home/.config/Toolport/http-bridge-update-resume.json"
