@@ -10718,11 +10718,12 @@ fn deliver_resource_updated(
     if targets.is_empty() {
         return;
     }
-    let msg = json!({
+    let mut msg = json!({
         "jsonrpc": "2.0",
         "method": "notifications/resources/updated",
         "params": { "uri": uri }
     });
+    conduit_lib::secret_redact::redact_outgoing(&mut msg, None);
     let mut need_stdio = false;
     let mut session_ids: Vec<String> = Vec::new();
     for sid in targets {
@@ -10950,6 +10951,7 @@ fn deliver_progress(
     };
     // Hand the client back ITS token; ours is an internal correlator.
     let mut note = note.clone();
+    conduit_lib::secret_redact::redact_outgoing(&mut note, None);
     if let Some(params) = note.get_mut("params").and_then(Value::as_object_mut) {
         params.insert("progressToken".to_string(), client_token);
         if let Some(tag) = owner
@@ -15601,6 +15603,9 @@ impl SessionState {
     /// stream; stdio writes it straight to the client. Returns false when the
     /// message could not be delivered (queue full, or a write failure).
     fn push_message(&self, json: String, request_id: Option<String>) -> bool {
+        // Notifications and server requests carry upstream text with no client
+        // request behind them.
+        let json = conduit_lib::secret_redact::redact_outgoing_json(json);
         match &self.transport {
             SessionTransportFace::Stdio(stdout) => {
                 let Ok(value) = serde_json::from_str::<Value>(&json) else {
@@ -17310,6 +17315,9 @@ fn process_request_wire(
         observed.close(observation::CloseReason::RequestComplete);
     }
     if let Some(response) = &mut response {
+        // Every server's secrets, after any per-server pass: a value one server
+        // returns is never handed to a client unless the client sent it.
+        conduit_lib::secret_redact::redact_outgoing(&mut response.envelope, req.get("params"));
         response.observation = Some(observed.clone());
         response.tools_list = method == "tools/list";
         response.listed_tools = holder

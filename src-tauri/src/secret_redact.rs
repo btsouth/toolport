@@ -1425,6 +1425,45 @@ pub fn redact_log_text(text: &str) -> Cow<'_, str> {
     }
 }
 
+/// Last pass on a message to a client (a response, notification or server
+/// request): any registered secret of any server, in whole form, becomes its
+/// marker. A secret that is in the client's own `request` (an argument it sent)
+/// is left where it is echoed back: the client already holds that value, and
+/// replacing it would corrupt results such as a file it asked to read. Fragment
+/// windows are not used here; they would rename ordinary words in content.
+/// True when changed.
+pub fn redact_outgoing(value: &mut Value, request: Option<&Value>) -> bool {
+    let Some(m) = current() else {
+        return false;
+    };
+    let mut exempt = HashSet::new();
+    if let Some(request) = request {
+        m.secrets_in(request, &mut exempt);
+    }
+    m.value_with(value, false, (!exempt.is_empty()).then_some(&exempt))
+}
+
+/// [`redact_outgoing`] for a serialized message with no client request behind
+/// it. Unchanged (and unparsed) unless it may hold a registered form.
+pub fn redact_outgoing_json(json: String) -> String {
+    let Some(m) = current() else {
+        return json;
+    };
+    if !m.may_contain(&json) {
+        return json;
+    }
+    match serde_json::from_str::<Value>(&json) {
+        Ok(mut value) => {
+            if m.value_with(&mut value, false, None) {
+                value.to_string()
+            } else {
+                json
+            }
+        }
+        Err(_) => m.redact_definition_line(&json).into_owned(),
+    }
+}
+
 /// [`Matcher::redact_definition_line`] against every registered secret.
 pub fn redact_definition_line(line: &str) -> Cow<'_, str> {
     match current() {
@@ -2134,6 +2173,35 @@ mod tests {
             upstream_identifier("defs-server", "Tools-Read"),
             "Tools-Read"
         );
+    }
+
+    #[test]
+    fn outgoing_messages_carry_no_secret_the_client_did_not_send() {
+        use serde_json::json;
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-outgoing-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        register("srv-a", "A_KEY", "outgoing-a-secret-1Qz");
+        register("srv-b", "B_KEY", "outgoing-b-secret-2Wx");
+        // Server A's result holds B's secret and A's own; the client sent A's.
+        let request = json!({"name": "a__read", "arguments": {"q": "outgoing-a-secret-1Qz"}});
+        let mut response = json!({"result": {"content": [{"type": "text",
+            "text": "got outgoing-a-secret-1Qz and outgoing-b-secret-2Wx; Tools-Read ok"}]}});
+        assert!(redact_outgoing(&mut response, Some(&request)));
+        assert_eq!(
+            response["result"]["content"][0]["text"],
+            "got outgoing-a-secret-1Qz and [secret:B_KEY]; Tools-Read ok"
+        );
+        // A notification has no request: nothing is exempt.
+        let note =
+            json!({"method": "notifications/message", "params": {"data": "outgoing-a-secret-1Qz"}});
+        let out = redact_outgoing_json(note.to_string());
+        assert!(
+            out.contains("[secret:A_KEY]") && !out.contains("outgoing-a-secret"),
+            "{out}"
+        );
+        let clean = r#"{"method":"notifications/progress"}"#.to_string();
+        assert_eq!(redact_outgoing_json(clean.clone()), clean);
     }
 
     #[test]

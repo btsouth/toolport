@@ -321,8 +321,9 @@ fn echoed_secrets_reach_the_caller_but_no_file_on_disk() {
         "advertised definition is redacted: {description}"
     );
 
-    // isError result and JSON-RPC error, for each secret. The caller gets the
-    // upstream's text exactly as it was sent.
+    // isError result and JSON-RPC error, for each secret. A configured secret
+    // the caller did not send is never handed to it: the upstream's text arrives
+    // with only the value replaced.
     for (key, secret) in [
         ("ENV_TOKEN", ENV_SECRET),
         ("VAULT_TOKEN", VAULT_SECRET),
@@ -336,9 +337,16 @@ fn echoed_secrets_reach_the_caller_but_no_file_on_disk() {
         let text = text_of(&result);
         assert!(
             text.contains(&format!(
-                "upstream rejected credential {secret} (Bearer {secret})"
-            )),
-            "caller must get the original text: {text}"
+                "upstream rejected credential [secret:{key}] (Bearer [secret:{key}])"
+            )) && !result.to_string().contains(secret),
+            "caller gets the upstream text minus the secret: {text}"
+        );
+        // The caller's own argument echoed back is left alone: it already holds
+        // the value, and a marker would corrupt what it asked for.
+        let own = gateway.call("vaulted__echo", json!({ "text": format!("mine {secret}") }));
+        assert!(
+            text_of(&own).contains(&format!("mine {secret}")),
+            "the caller's own value comes back as sent: {own}"
         );
         let rpc = gateway.call(
             "vaulted__echo",
