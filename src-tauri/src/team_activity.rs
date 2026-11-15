@@ -48,10 +48,12 @@ fn mutate(path: &Path, f: impl FnOnce(&mut Journal)) -> Result<(), String> {
     let _lock = registry::lock_at(path)?;
     let mut journal = read(path)?;
     f(&mut journal);
-    registry::atomic_write(
-        path,
-        &serde_json::to_string(&journal).map_err(|e| e.to_string())?,
-    )
+    let raw = serde_json::to_string(&journal).map_err(|e| e.to_string())?;
+    // It holds only server ids and counters today, but it is a file the secret
+    // scrub rewrites, so it gets the same redaction as every other log, under
+    // the same lock.
+    let raw = crate::secret_redact::redact_line_for(path, &raw);
+    registry::atomic_write(path, &raw)
 }
 pub fn snapshot(device: &str) -> Result<Journal, String> {
     read(&path(device)?)
@@ -131,6 +133,36 @@ pub fn record(reg: &Registry, local_id: &str, ok: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Failure mode: the journal is written without the redactor, so a
+    /// registered secret that reaches a server id or any later field is
+    /// persisted in the clear (and even then only once the scrub's lock is free).
+    #[test]
+    fn journal_writes_are_redacted_inside_the_scrub_lock() {
+        let _lock = registry::data_dir_test_lock();
+        let device = new_device_id().unwrap();
+        let dir = std::env::temp_dir().join(format!("teams-redact-{device}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = registry::DataDirOverride::set(&dir);
+        let path = path(&device).unwrap();
+        let line = serde_json::to_string(&Event {
+            server_id: "team-late-secret-J6tD1sGa".into(),
+            version: 1,
+            ok: true,
+        })
+        .unwrap();
+        let target = path.clone();
+        let text = crate::secret_redact::append_during_scrub_for_test(
+            &path,
+            ("team-activity-lock", "TOKEN", "team-late-secret-J6tD1sGa"),
+            move || append_records_at(&target, &[line]).unwrap(),
+        );
+        drop(_data);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(text.contains("\"successes\":1"), "{text}");
+        assert!(!text.contains("team-late-secret-J6tD1sGa"), "{text}");
+    }
+
     #[test]
     fn recording_never_waits_for_the_journal_lock_and_failed_batches_keep_saved_counts() {
         use crate::registry::tests::{with_atomic_failure, FailingAtomicWriteStep::*};
