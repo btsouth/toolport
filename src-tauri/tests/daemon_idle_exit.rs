@@ -326,17 +326,31 @@ fn installed_copy(dir: &Path) -> PathBuf {
 }
 
 fn spawn_daemon_from(binary: &Path, dir: &Path, grace_ms: u64) -> ChildGuard {
-    let child = Command::new(binary)
-        .arg("--daemon")
-        .env("TOOLPORT_DATA_DIR", dir)
-        .env("TOOLPORT_REGISTRY", dir.join("registry.json"))
-        .env("TOOLPORT_DAEMON_IDLE_GRACE_MS", grace_ms.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn the daemon");
-    ChildGuard(child)
+    // A copy just written can be briefly "text file busy" under `cargo test`: a
+    // test on another thread forking at that moment inherits the copy's write
+    // handle until its exec. Retry only that error, for a bounded time.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match Command::new(binary)
+            .arg("--daemon")
+            .env("TOOLPORT_DATA_DIR", dir)
+            .env("TOOLPORT_REGISTRY", dir.join("registry.json"))
+            .env("TOOLPORT_DAEMON_IDLE_GRACE_MS", grace_ms.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => return ChildGuard(child),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("spawn the daemon: {error:?}"),
+        }
+    }
 }
 
 /// "Uninstall" the copy the way each platform allows while it runs: Unix
