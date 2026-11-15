@@ -1075,5 +1075,6 @@
   "T3 Code thread {id}": "T3 Code 스레드 {id}",
   "Copy thread id {id}": "스레드 ID {id} 복사",
   "Copied thread id": "스레드 ID를 복사했습니다",
-  "{client} via T3 Code, thread {thread}": "{client}(T3 Code 경유, 스레드 {thread})"
+  "{client} via T3 Code, thread {thread}": "{client}(T3 Code 경유, 스레드 {thread})",
+  "Toolport also adds these settings to its {client} entry, each only if it is not set. A setting you delete stays deleted until you connect again.": "Toolport는 {client}의 자체 항목에도 이 설정을 추가하며, 각 설정은 지정되지 않은 경우에만 추가합니다. 삭제한 설정은 다시 연결할 때까지 삭제된 상태로 유지됩니다."
 }

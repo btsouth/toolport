@@ -712,6 +712,11 @@ mockIPC(
           backupDir: "/fixture/Toolport/backups/codex",
           revision: "fixture-review",
           items: setupItems,
+          gatewaySettings: [
+            "supports_parallel_tool_calls = true",
+            "startup_timeout_sec = 75",
+            "tool_timeout_sec = 600",
+          ],
         };
       case "migrate_client":
         if (setupVerifying) return new Promise(() => {});

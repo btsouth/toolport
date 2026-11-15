@@ -23,6 +23,8 @@ interface Props {
   allowEmpty?: boolean;
   requireCredentials?: boolean;
   details?: string;
+  /** Shown under the description, before the user confirms. */
+  notice?: ReactNode;
   error?: string;
   onOpenChange: (open: boolean) => void;
   onConfirm: (
@@ -43,6 +45,7 @@ export function ImportReviewDialog({
   allowEmpty = false,
   requireCredentials = false,
   details,
+  notice,
   error,
   onOpenChange,
   onConfirm,
@@ -61,6 +64,7 @@ export function ImportReviewDialog({
         allowEmpty={allowEmpty}
         requireCredentials={requireCredentials}
         details={details}
+        notice={notice}
         error={error}
         onOpenChange={onOpenChange}
         onConfirm={onConfirm}
@@ -78,6 +82,7 @@ function ImportReviewContent({
   allowEmpty = false,
   requireCredentials = false,
   details,
+  notice,
   error,
   onOpenChange,
   onConfirm,
@@ -135,6 +140,7 @@ function ImportReviewContent({
               "Review the commands and URLs before adding them. Leave any server unchecked to keep it as it is.",
             )}
         </p>
+        {notice}
         {details && (
           <details>
             <summary className="text-meta">{t("Details")}</summary>

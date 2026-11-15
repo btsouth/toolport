@@ -107,3 +107,41 @@ it("shows downstream tool counts and only Done on success", async () => {
   ).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Done" })).toBeVisible();
 });
+
+it("shows the Codex settings Toolport will add before connecting", async () => {
+  api.previewClientSetup.mockResolvedValue({
+    configPath: "/fixture/config.toml",
+    backupDir: "/fixture/backups",
+    revision: "reviewed",
+    items: [],
+    gatewaySettings: ["supports_parallel_tool_calls = true", "tool_timeout_sec = 600"],
+  });
+  render(
+    <ConnectReviewDialog
+      clientId="codex"
+      clientName="Codex"
+      onClose={vi.fn()}
+      onConnected={vi.fn()}
+    />,
+  );
+  const notice = await screen.findByText(/each only if it is not set/);
+  expect(notice).toBeVisible();
+  expect(notice).toHaveTextContent(
+    "A setting you delete stays deleted until you connect again.",
+  );
+  expect(screen.getByText("supports_parallel_tool_calls = true")).toBeVisible();
+  expect(screen.getByText("tool_timeout_sec = 600")).toBeVisible();
+});
+
+it("lists no settings for a client that gets none", async () => {
+  render(
+    <ConnectReviewDialog
+      clientId="fixture"
+      clientName="Fixture"
+      onClose={vi.fn()}
+      onConnected={vi.fn()}
+    />,
+  );
+  await screen.findByRole("button", { name: /one/ });
+  expect(screen.queryByText(/each only if it is not set/)).not.toBeInTheDocument();
+});

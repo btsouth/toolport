@@ -50,11 +50,64 @@ fn details_expander(title: &str) -> (gtk::Expander, gtk::Box) {
 
 // Keep all reviewed dialog fields and its confirmation callback together.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn review(
     parent: &gtk::Window,
     title: &str,
     items: Vec<SetupItem>,
     disclosure: &str,
+    confirm_label: &'static str,
+    require_credentials: bool,
+    action: impl Fn(
+            Vec<String>,
+            std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+            std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+        ) -> Result<Completion, String>
+        + Send
+        + Sync
+        + 'static,
+    finished: impl Fn() + 'static,
+    credential_page: Option<super::ServerPage>,
+) {
+    review_with_notice(
+        parent,
+        title,
+        items,
+        disclosure,
+        None,
+        confirm_label,
+        require_credentials,
+        action,
+        finished,
+        credential_page,
+    );
+}
+
+/// The sentence and TOML lines a connect review shows for the client settings
+/// Toolport adds to its own entry, or `None` when it adds none.
+pub(super) fn gateway_settings_notice(
+    client_name: &str,
+    settings: &[String],
+) -> Option<(String, String)> {
+    (!settings.is_empty()).then(|| {
+        (
+            crate::i18n::trf(
+                "Toolport also adds these settings to its {client} entry, each only if it is not set. A setting you delete stays deleted until you connect again.",
+                &[("client", client_name)],
+            ),
+            settings.join("\n"),
+        )
+    })
+}
+
+/// [`review`] with a notice shown under the lede, before the user confirms.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn review_with_notice(
+    parent: &gtk::Window,
+    title: &str,
+    items: Vec<SetupItem>,
+    disclosure: &str,
+    notice: Option<(String, String)>,
     confirm_label: &'static str,
     require_credentials: bool,
     action: impl Fn(
@@ -103,6 +156,29 @@ pub(super) fn review(
         widget
     };
     body.append(&lede);
+    if let Some((sentence, lines)) = notice {
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        card.set_widget_name("toolport-setup-gateway-settings");
+        card.add_css_class("card");
+        for (text, monospace) in [(sentence, false), (lines, true)] {
+            let label = gtk::Label::builder()
+                .label(text)
+                .xalign(0.0)
+                .wrap(true)
+                .selectable(true)
+                .margin_start(12)
+                .margin_end(12)
+                .build();
+            if monospace {
+                label.add_css_class("monospace");
+                label.set_margin_bottom(12);
+            } else {
+                label.set_margin_top(12);
+            }
+            card.append(&label);
+        }
+        body.append(&card);
+    }
     let rows = gtk::ListBox::new();
     rows.set_selection_mode(gtk::SelectionMode::None);
     rows.add_css_class("boxed-list");
@@ -693,11 +769,13 @@ pub(super) fn connect(
                         ("value1", &preview.backup_dir.to_string()),
                     ],
                 );
-                review(
+                let notice = gateway_settings_notice(&client_name, &preview.gateway_settings);
+                review_with_notice(
                     &parent,
                     &crate::i18n::tr("Review and connect"),
                     preview.items,
                     &disclosure,
+                    notice,
                     crate::i18n::msg("Connect to Toolport"),
                     true,
                     move |selected, choices, inputs| {
@@ -769,6 +847,25 @@ mod tests {
             .find(|w| w.title().as_deref() == Some("Could not review setup"))
             .unwrap()
     }
+    #[test]
+    fn connect_review_names_the_codex_settings_it_adds() {
+        let (sentence, lines) = gateway_settings_notice(
+            "Codex",
+            &[
+                "supports_parallel_tool_calls = true".into(),
+                "tool_timeout_sec = 600".into(),
+            ],
+        )
+        .unwrap();
+        assert!(sentence.contains("Codex entry, each only if it is not set"));
+        assert!(sentence.contains("A setting you delete stays deleted until you connect again."));
+        assert_eq!(
+            lines,
+            "supports_parallel_tool_calls = true\ntool_timeout_sec = 600"
+        );
+        assert!(gateway_settings_notice("Cursor", &[]).is_none());
+    }
+
     #[test]
     #[ignore = "requires isolated GTK display"]
     fn close_action_closes_review_error() {

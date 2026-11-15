@@ -213,3 +213,71 @@ fn a_shared_http_codex_entry_gets_its_absent_settings_in_place() {
     launch(current, &mut managed);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
 }
+
+#[test]
+fn an_entry_with_some_settings_and_no_record_keeps_the_rest_removed() {
+    // A data dir that was reset or restored has no record of what Toolport wrote. If
+    // the entry still carries any Toolport setting, the missing ones were removed on
+    // purpose, so nothing is added back.
+    for with_record in [false, true] {
+        let data = crate::registry::DataDirTestEnv::new("codex-settings-partial");
+        let _env_lock = env_test_lock();
+        let _client_env = isolated_client_env(&data.dir);
+        let _home = TestHome::set(&data.dir);
+        let path = codex_config(&data);
+        let current = data.dir.join("toolport-gateway");
+        let current = current.to_str().unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "[mcp_servers.toolport]\ncommand = \"{current}\"\ntool_timeout_sec = 600\n\n\
+                 [mcp_servers.toolport.env]\nTOOLPORT_CLIENT_ID = \"codex\"\n\
+                 TOOLPORT_ATTRIBUTION_ID = \"codex\"\n"
+            ),
+        )
+        .unwrap();
+        let mut managed = HashMap::new();
+        if with_record {
+            let server = read_client(&find_def("codex").unwrap()).servers.remove(0);
+            let record: ManagedEntry = serde_json::from_value(serde_json::json!({
+                "command": current,
+                "args": server.args,
+                "env": server.env_keys.iter().map(|key| (key.clone(), "codex")).collect::<HashMap<_, _>>(),
+                "updatedAt": 1
+            }))
+            .unwrap();
+            managed.insert("codex".to_string(), record);
+        }
+        let original = std::fs::read_to_string(&path).unwrap();
+        launch(current, &mut managed);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "record={with_record}"
+        );
+        if with_record {
+            assert_eq!(managed["codex"].codex_settings.len(), 3);
+        }
+    }
+}
+
+#[test]
+fn the_connect_preview_lists_the_codex_settings_it_will_add() {
+    let all = codex_gateway_settings_preview("codex", None);
+    assert_eq!(
+        all,
+        [
+            "supports_parallel_tool_calls = true",
+            "startup_timeout_sec = 75",
+            "tool_timeout_sec = 600"
+        ]
+    );
+    let text = "[mcp_servers.toolport]\ncommand = \"toolport-gateway\"\n\
+                startup_timeout_ms = 3000\ntool_timeout_sec = 90\n";
+    assert_eq!(
+        codex_gateway_settings_preview("codex@work", Some(text)),
+        ["supports_parallel_tool_calls = true"]
+    );
+    assert!(codex_gateway_settings_preview("grok", None).is_empty());
+    assert!(codex_gateway_settings_preview("claude-code", None).is_empty());
+}

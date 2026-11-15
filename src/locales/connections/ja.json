@@ -1075,5 +1075,6 @@
   "T3 Code thread {id}": "T3 Code スレッド {id}",
   "Copy thread id {id}": "スレッド ID {id} をコピー",
   "Copied thread id": "スレッド ID をコピーしました",
-  "{client} via T3 Code, thread {thread}": "{client}（T3 Code 経由、スレッド {thread}）"
+  "{client} via T3 Code, thread {thread}": "{client}（T3 Code 経由、スレッド {thread}）",
+  "Toolport also adds these settings to its {client} entry, each only if it is not set. A setting you delete stays deleted until you connect again.": "Toolport は {client} の自身のエントリにもこれらの設定を追加します。いずれも未設定の場合のみです。削除した設定は、再接続するまで削除されたままです。"
 }

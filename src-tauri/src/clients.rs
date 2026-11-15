@@ -540,16 +540,62 @@ fn codex_entry_missing_settings(
     else {
         return Vec::new();
     };
+    let present = |setting: &CodexSetting| {
+        entry.contains_key(setting.key)
+            || setting
+                .aliases
+                .iter()
+                .any(|alias| entry.contains_key(*alias))
+    };
+    // No record of what Toolport handled (an install from before it kept one, or a
+    // reset or restored data dir): if the entry carries any of these settings, the
+    // missing ones were removed on purpose. Only an entry with none of them, which is
+    // what every earlier Toolport wrote, gets them, once.
+    if handled.is_empty() && CODEX_GATEWAY_SETTINGS.iter().any(present) {
+        return Vec::new();
+    }
     codex_settings(http)
+        .filter(|setting| !handled.iter().any(|key| key == setting.key) && !present(setting))
+        .collect()
+}
+
+/// The Codex settings a connect will add to the client's Toolport entry, as the TOML
+/// lines the review shows before the user confirms. A connect writes each one only
+/// when it is not set, so a setting already in the entry is left out.
+pub(crate) fn codex_gateway_settings_preview(
+    client_id: &str,
+    config_text: Option<&str>,
+) -> Vec<String> {
+    if !is_codex_client(client_id) {
+        return Vec::new();
+    }
+    let entry = config_text
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|doc| {
+            doc.get("mcp_servers")?
+                .get(GATEWAY_ENTRY_NAME)?
+                .as_table()
+                .cloned()
+        })
+        .unwrap_or_default();
+    codex_settings(false)
         .filter(|setting| {
-            !handled.iter().any(|key| key == setting.key)
-                && !entry.contains_key(setting.key)
+            !entry.contains_key(setting.key)
                 && !setting
                     .aliases
                     .iter()
                     .any(|alias| entry.contains_key(*alias))
         })
+        .map(|setting| format!("{} = {}", setting.key, setting.value.toml()))
         .collect()
+}
+
+/// [`codex_gateway_settings_preview`] for a client's current config file.
+pub fn codex_gateway_settings_for_connect(client_id: &str) -> Vec<String> {
+    let text = find_def(client_id)
+        .and_then(|def| resolved_definition_path(&def).ok())
+        .and_then(|path| read_config_file(&path).ok());
+    codex_gateway_settings_preview(client_id, text.as_deref())
 }
 
 /// The ownership record with every Codex setting for its transport marked as handled,
@@ -13347,7 +13393,9 @@ bad = "not-a-table"
         ));
         assert!(needs("codex", current, &lacking));
         assert!(needs("codex@work", current, &lacking));
-        assert!(needs("codex", current, &partial));
+        // With no record of what Toolport wrote, an entry that keeps any of the
+        // settings had the rest removed on purpose.
+        assert!(!needs("codex", current, &partial));
         // Present values, whatever they are, are the user's and stop the repair.
         assert!(!needs("codex", current, &complete));
         // Other clients and entries that are not ours are never touched for it.

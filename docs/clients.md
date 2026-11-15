@@ -373,7 +373,13 @@ Use this when Codex has already created its home directory (`$CODEX_HOME`, or `~
    Toolport launch; a Shared HTTP entry gets the parallel and tool timeout keys, with
    its URL and other keys left as they are. Toolport remembers which keys it has
    handled for the entry, so a key you delete stays deleted. To opt out of one, delete
-   it or write your own value.
+   it or write your own value. That record lives in Toolport's data directory. If it is
+   missing (an install from before this release, or a reset or restored data
+   directory), Toolport adds the keys only when the entry has none of them, which is
+   what earlier Toolport releases wrote; if the entry already has any of them, the
+   others count as removed on purpose and stay out. An explicit **Connect to Toolport**
+   writes the defaults again for any key that is missing, and its review lists the
+   keys it will add before you confirm.
 4. Start a new Codex session so it re-reads the config. In Toolport, the Codex row changes to **connected to Toolport**; in Codex, Toolport-managed tools are served through the one `toolport` MCP server. With lazy discovery enabled, Codex gets Toolport's compact search tools instead of every downstream tool up front.
 
 Gotcha: when running Toolport from source, build the gateway first with `npm run build:gateway`. The desktop dev server does not build the separate binary that Codex spawns, so Codex will report the gateway as missing until that binary exists.

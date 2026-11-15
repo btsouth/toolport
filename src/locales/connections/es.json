@@ -1075,5 +1075,6 @@
   "T3 Code thread {id}": "Hilo de T3 Code {id}",
   "Copy thread id {id}": "Copiar el id del hilo {id}",
   "Copied thread id": "Id del hilo copiado",
-  "{client} via T3 Code, thread {thread}": "{client} vía T3 Code, hilo {thread}"
+  "{client} via T3 Code, thread {thread}": "{client} vía T3 Code, hilo {thread}",
+  "Toolport also adds these settings to its {client} entry, each only if it is not set. A setting you delete stays deleted until you connect again.": "Toolport también añade estos ajustes a su entrada de {client}, cada uno solo si no está definido. Un ajuste que elimines seguirá eliminado hasta que vuelvas a conectar."
 }

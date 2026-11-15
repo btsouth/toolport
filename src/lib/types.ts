@@ -84,6 +84,8 @@ export interface ClientSetupReview {
   backupDir: string;
   revision: string;
   items: ImportItem[];
+  /** TOML lines Toolport adds to its own entry for this client, each only when unset. */
+  gatewaySettings?: string[];
 }
 
 export interface MigrateResult {

@@ -178,6 +178,23 @@ export function ConnectReviewDialog({
         value0: review.configPath,
         value1: review.backupDir,
       })}
+      notice={
+        review.gatewaySettings?.length ? (
+          <div className="rounded-lg border p-3 text-meta">
+            <p>
+              {t(
+                "Toolport also adds these settings to its {client} entry, each only if it is not set. A setting you delete stays deleted until you connect again.",
+                { client: clientName },
+              )}
+            </p>
+            <ul className="mt-2 font-mono">
+              {review.gatewaySettings.map((line) => (
+                <li key={line}>{line}</li>
+              ))}
+            </ul>
+          </div>
+        ) : undefined
+      }
       title={t("Review and connect {value0}", { value0: clientName })}
       confirmLabel={
         busy ? t("Checking gateway...") : error ? t("Retry") : t("Connect to Toolport")

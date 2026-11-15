@@ -1075,5 +1075,6 @@
   "T3 Code thread {id}": "T3 Code-Thread {id}",
   "Copy thread id {id}": "Thread-ID {id} kopieren",
   "Copied thread id": "Thread-ID kopiert",
-  "{client} via T3 Code, thread {thread}": "{client} über T3 Code, Thread {thread}"
+  "{client} via T3 Code, thread {thread}": "{client} über T3 Code, Thread {thread}",
+  "Toolport also adds these settings to its {client} entry, each only if it is not set. A setting you delete stays deleted until you connect again.": "Toolport fügt seinem {client}-Eintrag außerdem diese Einstellungen hinzu, jeweils nur, wenn sie nicht gesetzt sind. Eine Einstellung, die Sie löschen, bleibt gelöscht, bis Sie die Verbindung erneut herstellen."
 }

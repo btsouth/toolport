@@ -1075,5 +1075,6 @@
   "T3 Code thread {id}": "T3 Code 對話 {id}",
   "Copy thread id {id}": "複製執行緒 ID {id}",
   "Copied thread id": "已複製執行緒 ID",
-  "{client} via T3 Code, thread {thread}": "{client}（透過 T3 Code，執行緒 {thread}）"
+  "{client} via T3 Code, thread {thread}": "{client}（透過 T3 Code，執行緒 {thread}）",
+  "Toolport also adds these settings to its {client} entry, each only if it is not set. A setting you delete stays deleted until you connect again.": "Toolport 也會將這些設定加入它在 {client} 中的項目，每項僅在未設定時加入。你刪除的設定會維持刪除，直到你重新連線。"
 }
