@@ -45,7 +45,7 @@
           "type": "named",
           "name": "-v",
           "value": "toolport-gateway-data:/data",
-          "description": "Volume holding registry.json, logs and gateway state"
+          "description": "Volume holding registry.json, logs and gateway state. Setup: https://github.com/btsouth/toolport/blob/main/docs/headless.md#run-from-an-mcp-client-stdio"
         }
       ]
     }
