@@ -12276,6 +12276,9 @@ fn load_tool_cache(profile: Option<&str>) -> Vec<Value> {
         if let Some(schema) = tool.get_mut("inputSchema") {
             conduit_lib::router::normalize_tool_schema(schema);
         }
+        // A cache an older build wrote may still hold a secret a server echoed
+        // into a definition; serve it the way the live catalog now is.
+        conduit_lib::secret_redact::redact_value(tool);
     }
     tools
 }

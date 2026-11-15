@@ -567,6 +567,27 @@ impl Matcher {
         Cow::Owned(self.apply(raw.as_ref(), &spans))
     }
 
+    /// The names of every secret found in the strings (and keys) of `value`.
+    fn names_in(&self, value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(s) => self.names_in_text(s, out),
+            Value::Array(items) => items.iter().for_each(|v| self.names_in(v, out)),
+            Value::Object(map) => {
+                for (k, v) in map {
+                    self.names_in_text(k, out);
+                    self.names_in(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn names_in_text(&self, text: &str, out: &mut Vec<String>) {
+        for (_, _, names) in self.spans(text) {
+            out.extend(names.into_iter().map(|n| self.names[n].clone()));
+        }
+    }
+
     /// Cheap pre-check: could `text` hold any registered form, raw or JSON-escaped?
     /// False positives are fine (short secrets ignore token boundaries here).
     pub fn may_contain(&self, text: &str) -> bool {
@@ -873,6 +894,33 @@ pub fn truncate_chars(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// Screen tool definitions a server advertised: any configured secret value in
+/// them is replaced (so neither clients, the search index nor the tool cache see
+/// it) and each affected tool is reported as `(tool name, secret names)`.
+pub fn screen_definitions(tools: &mut [Value]) -> Vec<(String, Vec<String>)> {
+    let Some(matcher) = current() else {
+        return Vec::new();
+    };
+    let mut flagged = Vec::new();
+    for tool in tools.iter_mut() {
+        let mut names = Vec::new();
+        matcher.names_in(tool, &mut names);
+        if names.is_empty() {
+            continue;
+        }
+        matcher.redact_value(tool);
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        names.sort();
+        names.dedup();
+        flagged.push((name, names));
+    }
+    flagged
+}
+
 /// Redact every string in a JSON value about to be written. True when changed.
 pub fn redact_value(value: &mut Value) -> bool {
     current().is_some_and(|m| m.redact_value(value))
@@ -938,6 +986,8 @@ pub fn persisted_log_files(dir: &Path) -> Vec<PathBuf> {
                 "security.jsonl.",
                 "gateway.log.",
                 "inspect.jsonl.",
+                // Tool catalogs, which hold upstream definition text.
+                "tool-cache",
             ]
             .iter()
             .any(|prefix| name.starts_with(prefix) && !name.ends_with(".lock"));
@@ -1053,6 +1103,12 @@ fn scrub_file_with(matcher: &Matcher, path: &Path) -> std::io::Result<bool> {
         out.push_str(&redacted);
     }
     if !changed {
+        return Ok(false);
+    }
+    // Tool catalogs are replaced whole by their writer without this lock. If one
+    // was rewritten since the read, the newer file came from a build that already
+    // redacts, so keep it rather than put back an older catalog.
+    if std::fs::read(path).map(|now| now != bytes).unwrap_or(true) {
         return Ok(false);
     }
     crate::registry::atomic_write(path, &out).map_err(std::io::Error::other)?;
@@ -1510,8 +1566,19 @@ mod tests {
         let daemon_log = dir.join("daemon.log");
         std::fs::write(&daemon_log, format!("1 pid=9 panic: {secret}\n")).unwrap();
         let mut held = crate::registry::open_append_private(&daemon_log).unwrap();
+        // A tool catalog an older build cached with an echoed secret in it.
+        let cache = dir.join("tool-cache.json");
+        std::fs::write(
+            &cache,
+            serde_json::json!({"version":4,"tools":[{"name":"t","description":format!("uses {secret}")}]})
+                .to_string(),
+        )
+        .unwrap();
         register("unit-scrub-server", "SCRUB_KEY", secret);
-        assert_eq!(scrub_data_dir(&dir).unwrap(), 3);
+        assert_eq!(scrub_data_dir(&dir).unwrap(), 4);
+        let cached: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cache).unwrap()).unwrap();
+        assert_eq!(cached["tools"][0]["description"], "uses [secret:SCRUB_KEY]");
         std::io::Write::write_all(&mut held, b"after scrub\n").unwrap();
         let daemon_text = std::fs::read_to_string(&daemon_log).unwrap();
         assert!(!daemon_text.contains(secret), "{daemon_text}");

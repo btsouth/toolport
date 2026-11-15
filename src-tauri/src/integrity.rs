@@ -4408,6 +4408,27 @@ fn is_zero_width(c: char) -> bool {
     matches!(c, '\u{200B}'..='\u{200F}' | '\u{2060}' | '\u{FEFF}')
 }
 
+/// A server put the value of a configured secret (its own or another server's)
+/// into a tool definition, model-visible text. The definition is advertised with
+/// the value replaced; this records that it happened, naming the server, the
+/// tool and which secrets (by name), so the user can review that server.
+pub fn record_secret_in_definition(server: &str, tool: &str, secrets: &[String]) -> bool {
+    record_event(&json!({
+        "ts": epoch_millis(),
+        "type": "tool_poison_flag",
+        "server": server,
+        "tool": tool,
+        "change": "secret_echo",
+        "signatures": ["configured-secret-in-definition"],
+        "score": 1.0,
+        "severity": SEV_HIGH,
+        "evidence": format!(
+            "The definition contained the value of {}; it is shown to clients with the value replaced.",
+            secrets.join(", ")
+        ),
+    }))
+}
+
 fn poison_event(
     server: &str,
     tool: &str,

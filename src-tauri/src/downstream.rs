@@ -220,6 +220,21 @@ pub(crate) fn header_param_specs(tool: &Value) -> Result<Vec<HeaderParamSpec>, S
     Ok(specs)
 }
 
+/// A definition that carries a configured secret's value is advertised with the
+/// value replaced, before anything (clients, search, the tool cache, integrity
+/// pins) sees it, and the server and tool are reported as a security event.
+fn screen_definitions_for_secrets(server_id: &str, tools: &mut [Value]) {
+    for (tool, secrets) in crate::secret_redact::screen_definitions(tools) {
+        let message = format!(
+            "toolport: server '{server_id}' put a configured secret ({}) in the definition of tool '{tool}'; it is advertised with the value replaced",
+            secrets.join(", ")
+        );
+        eprintln!("{message}");
+        crate::gatewaylog::append(&message);
+        crate::integrity::record_secret_in_definition(server_id, &tool, &secrets);
+    }
+}
+
 fn filter_modern_http_tools(server_id: &str, tools: Vec<Value>) -> Vec<Value> {
     tools
         .into_iter()
@@ -8867,11 +8882,12 @@ impl DownstreamServer {
             .into());
         }
         let modern_http = matches!(era, Era::Modern { .. }) && transport.supports_request_headers();
-        let tools = if modern_http {
+        let mut tools = if modern_http {
             filter_modern_http_tools(&id, listed.items)
         } else {
             listed.items
         };
+        screen_definitions_for_secrets(&id, &mut tools);
 
         // MCP Apps is advertised only for capability-aware catalog fetches.
         // Restore Toolport's ordinary per-request metadata before any live call
@@ -9065,11 +9081,12 @@ impl DownstreamServer {
         }
         let refreshed = match listed {
             Ok(listed) if listed.warning.is_none() => {
-                let new_tools = if self.modern_http {
+                let mut new_tools = if self.modern_http {
                     filter_modern_http_tools(&self.id, listed.items)
                 } else {
                     listed.items
                 };
+                screen_definitions_for_secrets(&self.id, &mut new_tools);
                 apply_catalog_refresh(
                     &mut self.tools,
                     new_tools,

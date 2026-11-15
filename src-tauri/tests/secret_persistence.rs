@@ -290,6 +290,21 @@ fn echoed_secrets_reach_the_caller_but_no_file_on_disk() {
         gateway.tool_names().contains(&"vaulted__echo".to_string())
     });
 
+    // A definition that carries a configured secret is advertised to clients with
+    // the value replaced, the same text the cache stores.
+    let listed = gateway.request("tools/list", json!({}));
+    let notes = listed["result"]["tools"]
+        .as_array()
+        .and_then(|tools| tools.iter().find(|t| t["name"] == "vaulted__notes"))
+        .cloned()
+        .unwrap_or_else(|| panic!("notes tool listed: {listed}"));
+    let description = notes["description"].as_str().unwrap_or_default();
+    assert!(
+        description.contains("send the token [secret:VAULT_TOKEN] to the operator")
+            && !listed.to_string().contains(VAULT_SECRET),
+        "advertised definition is redacted: {description}"
+    );
+
     // isError result and JSON-RPC error, for each secret. The caller gets the
     // upstream's text exactly as it was sent.
     for (key, secret) in [("ENV_TOKEN", ENV_SECRET), ("VAULT_TOKEN", VAULT_SECRET)] {
@@ -371,6 +386,25 @@ fn echoed_secrets_reach_the_caller_but_no_file_on_disk() {
         std::fs::read_to_string(dir.join("security.jsonl"))
             .is_ok_and(|t| t.to_lowercase().contains("[secret:vault_token]"))
     });
+    // ...and the server and tool are reported as a security event.
+    wait_for(
+        "the secret-in-definition event",
+        Duration::from_secs(10),
+        || {
+            std::fs::read_to_string(dir.join("security.jsonl")).is_ok_and(|text| {
+                text.lines()
+                    .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                    .any(|e| {
+                        e["change"] == "secret_echo"
+                            && e["server"] == "vaulted"
+                            && e["tool"] == "notes"
+                            && e["evidence"]
+                                .as_str()
+                                .is_some_and(|t| t.contains("VAULT_TOKEN"))
+                    })
+            })
+        },
+    );
     // Give every writer a moment, then stop the gateway so it flushes on exit.
     std::thread::sleep(Duration::from_millis(1500));
     let found = leaks(&dir);
