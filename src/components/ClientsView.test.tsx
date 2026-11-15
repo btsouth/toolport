@@ -4,7 +4,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DetectedClient, McpServer } from "@/lib/types";
 import { ClientsView } from "./ClientsView";
 import { getClientSessions } from "@/lib/api";
-vi.mock("@/lib/api", () => ({ getClientSessions: vi.fn() }));
+vi.mock("@/lib/api", () => ({
+  getClientSessions: vi.fn(),
+  listClientRecoveries: vi.fn().mockResolvedValue([]),
+  retryClientRecovery: vi.fn(),
+  dismissClientRecovery: vi.fn(),
+}));
 beforeEach(() => vi.mocked(getClientSessions).mockResolvedValue([]));
 
 function client(overrides: Partial<DetectedClient> = {}): DetectedClient {

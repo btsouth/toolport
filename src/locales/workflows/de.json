@@ -407,5 +407,17 @@
   "Filter by agent": "Nach Agent filtern",
   "All agents": "Alle Agenten",
   "All detected agents": "Alle erkannten Agenten",
-  "{state} via {path}": "{state} über {path}"
+  "{state} via {path}": "{state} über {path}",
+  "Client config recovery": "Client-Konfiguration wiederherstellen",
+  "Dismiss recovery notice?": "Wiederherstellungshinweis ausblenden?",
+  "Show recovery": "Wiederherstellung anzeigen",
+  "Recovery notice dismissed": "Wiederherstellungshinweis ausgeblendet",
+  "Dismiss notice": "Hinweis ausblenden",
+  "{client} config is fully restored. The missing values are back.": "Die Konfiguration von {client} ist vollständig wiederhergestellt. Die fehlenden Werte sind wieder vorhanden.",
+  "Toolport still could not read the missing values. Unlock your keyring, then choose Retry.": "Toolport konnte die fehlenden Werte weiterhin nicht lesen. Entsperre deinen Schlüsselbund und wähle „Erneut versuchen“.",
+  "The recovery stopped unexpectedly. Choose Retry to try again.": "Die Wiederherstellung wurde unerwartet beendet. Wähle „Erneut versuchen“, um es noch einmal zu versuchen.",
+  "{key} for {server}": "{key} für {server}",
+  "{client} is disconnected and its original config is back, except values Toolport could not read because your keyring is locked or unavailable: {values}. The config has placeholders for those values for now.": "{client} ist getrennt und die ursprüngliche Konfiguration ist wiederhergestellt, bis auf Werte, die Toolport nicht lesen konnte, weil dein Schlüsselbund gesperrt oder nicht verfügbar ist: {values}. Die Konfiguration enthält dafür vorerst Platzhalter.",
+  "Unlock your keyring, then choose Retry to put the values back. From a terminal, run toolport-gateway --disconnect-all again.": "Entsperre deinen Schlüsselbund und wähle „Erneut versuchen“, um die Werte wieder einzusetzen. Führe im Terminal toolport-gateway --disconnect-all erneut aus.",
+  "{client} recovery backup is kept at {path} until recovery succeeds or you remove Toolport data. It does not expire automatically.": "Die Wiederherstellungssicherung von {client} bleibt unter {path} gespeichert, bis die Wiederherstellung gelingt oder du die Toolport-Daten entfernst. Sie läuft nicht automatisch ab."
 }

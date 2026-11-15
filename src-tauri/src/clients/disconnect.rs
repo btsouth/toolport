@@ -148,6 +148,7 @@ pub(super) fn restore_path(
     backup_storage::reset_missing();
     let (revision, used_move_record) = restore::run(id, path, format, || {
         mutation::disconnecting();
+        restore::prepare_disconnect(id, path)?;
         backup_file(id, path)?;
         if !restore::apply(id, format, path)? {
             restore::check_legacy_gateway(format, path, managed)?;
@@ -189,7 +190,7 @@ pub(super) fn restore_path(
             recovery_path: None,
         },
     )?;
-    warnings.extend(backup_storage::warnings());
+    warnings.extend(recovery::warnings(id));
     Ok(warnings)
 }
 

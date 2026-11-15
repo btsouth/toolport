@@ -44,6 +44,7 @@ mod mutation;
 #[cfg(test)]
 mod paths_tests;
 mod relocate;
+pub mod recovery;
 mod restore;
 mod toml_preservation;
 #[cfg(test)]
@@ -5773,7 +5774,11 @@ fn backup_file_named(
     };
     crate::registry::atomic_write(
         &dest,
-        &backup_storage::encode(&dest, &read_config_file(path)?)?,
+        &backup_storage::encode_recovery(
+            &dest,
+            &read_config_file(path)?,
+            mutation::is_disconnecting(),
+        )?,
     )?;
     prune_backups(&dir, backup_name);
     Ok(Some(dest))
@@ -9300,7 +9305,7 @@ pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
     }
     let mut outcome = mutation::run(client_id, &path, def.format, || {
         let mut outcome = revision_outcome(client_id, uninstall_gateway_inner(client_id))?;
-        outcome.warnings.extend(backup_storage::warnings());
+        outcome.warnings.extend(recovery::warnings(client_id));
         outcome
             .warnings
             .extend(disconnect_warnings(def.format, &path)?);
@@ -9315,6 +9320,7 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
     mutation::disconnecting();
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
+    restore::prepare_disconnect(client_id, &path)?;
     let backup = backup_file(client_id, &path)?;
     let mut restored_names = moved::missing_names(client_id, def.format, &path)?;
     if restore::apply(client_id, def.format, &path)? {

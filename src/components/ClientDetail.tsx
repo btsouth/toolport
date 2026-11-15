@@ -13,8 +13,6 @@ import {
   TriangleAlert,
   X,
 } from "lucide-react";
-import { toast } from "sonner";
-import { toastError } from "@/lib/toast";
 import {
   importServers,
   previewImportServers,
@@ -23,6 +21,7 @@ import {
   setClientDiscovery,
   uninstallGateway,
   removeClientLocation,
+  listClientRecoveries,
 } from "@/lib/api";
 import {
   importableServers,
@@ -51,6 +50,7 @@ import { ConnectReviewDialog } from "@/components/ConnectReviewDialog";
 import { GatewaySettingsNotice } from "@/components/GatewaySettingsNotice";
 import { ImportReviewDialog } from "@/components/ImportReviewDialog";
 import { clientRestartHint, clientRestartHintAfterRemoval } from "@/lib/clientConnect";
+import { ClientRecoveryBanners } from "@/components/ClientRecoveryBanners";
 import { clientDiscovery } from "@/lib/clientDiscovery";
 
 interface Props {
@@ -144,17 +144,23 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
    *
    * Both need a restart, for opposite reasons, and the connect wording ("so it loads
    * Toolport") reads as a failed disconnect on the removal path. */
-  function noteRestartNeeded(kind: "applied" | "removed") {
+  function showFeedback(title: string, text = "") {
+    setRestartNotice({ clientId: client.id, title, text });
+  }
+
+  function noteRestartNeeded(kind: "applied" | "removed", warnings: string[] = []) {
     setRestartNotice({
       clientId: client.id,
       title:
         kind === "applied"
           ? translate("Not live yet")
           : translate("Still connected until restart"),
-      text:
+      text: [
         kind === "applied"
           ? clientRestartHint(client.name)
           : clientRestartHintAfterRemoval(client.name),
+        ...warnings,
+      ].join(" "),
     });
   }
 
@@ -172,7 +178,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     try {
       const next = await setClientDiscovery(client.id, mode || null);
       onRegistryChange(next);
-      toast.success(
+      showFeedback(
         mode
           ? translate('{value0} discovery set to "{value1}".', {
               value0: client.name,
@@ -181,7 +187,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           : translate("{value0} now uses Auto discovery.", { value0: client.name }),
       );
     } catch (e) {
-      toastError(`${e}`);
+      showFeedback(String(e));
     } finally {
       setBusy(false);
     }
@@ -235,23 +241,18 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       const outcome = await installGateway(client.id, profile || undefined, false);
       // Rescope rewrites the client's MCP config the same way Connect does; without a
       // restart hint the change is invisible until the next cold start (SOU-317).
-      toast.success(
+      noteRestartNeeded("applied", [
         profile
           ? translate('{value0} access set to "{value1}".', {
               value0: client.name,
               value1: accessLabel(profile),
             })
           : translate("{value0} now uses the default access.", { value0: client.name }),
-        {
-          description: [clientRestartHint(client.name), ...(outcome.warnings ?? [])].join(
-            " ",
-          ),
-        },
-      );
-      noteRestartNeeded("applied");
+        ...(outcome.warnings ?? []),
+      ]);
       onChanged();
     } catch (e) {
-      toastError(`${e}`);
+      showFeedback(String(e));
     } finally {
       setBusy(false);
     }
@@ -262,23 +263,18 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     setBusy(true);
     try {
       const outcome = await installGateway(client.id, profile || undefined, true);
-      toast.success(
+      noteRestartNeeded("applied", [
         legacyBearer
           ? translate("Migrated {value0} to stdio", { value0: client.name })
           : translate("Reset {value0} to the default Toolport gateway", {
               value0: client.name,
             }),
-        {
-          description: [clientRestartHint(client.name), ...(outcome.warnings ?? [])].join(
-            " ",
-          ),
-        },
-      );
-      noteRestartNeeded("applied");
+        ...(outcome.warnings ?? []),
+      ]);
       setResetOpen(false);
       onChanged();
     } catch (e) {
-      toastError(`${e}`);
+      showFeedback(String(e));
       // Rethrow so ConfirmDialog stays open for retry (SOU-406 / CodeRabbit).
       throw e;
     } finally {
@@ -323,7 +319,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         );
       setBulkImportServers(items as ImportItem[]);
     } catch (error) {
-      toastError(String(error));
+      showFeedback(String(error));
     }
   }
 
@@ -344,12 +340,12 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           ? await importServers(selected, choices)
           : await importServers(selected);
       onRegistryChange(next);
-      toast.success(
+      showFeedback(
         translate("Imported selected servers. Check their status under Servers."),
       );
       setBulkImportServers(null);
     } catch (error) {
-      toastError(String(error));
+      showFeedback(String(error));
     } finally {
       setBusy(false);
     }
@@ -361,36 +357,44 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       if (installed) {
         const outcome = await uninstallGateway(client.id);
         const restored = outcome.restored?.length ?? 0;
-        toast.success(
-          restored > 0
-            ? translate(
-                restored === 1
-                  ? msg("Disconnected Toolport from {client} and put back {count} server")
-                  : msg(
-                      "Disconnected Toolport from {client} and put back {count} servers",
-                    ),
-                { client: client.name, count: restored },
-              )
-            : translate("Disconnected Toolport from {value0}", { value0: client.name }),
-          {
-            description: [
-              clientRestartHintAfterRemoval(client.name),
-              ...(outcome.warnings ?? []),
-            ].join(" "),
-          },
-        );
-        noteRestartNeeded("removed");
+        // Recovery owns its own persistent notice. Do not also announce it in
+        // an ordinary success notice or in a transient toast.
+        const pending = await listClientRecoveries();
+        if (pending.some((row) => row.clientId === client.id)) {
+          setRestartNotice(null);
+        } else {
+          noteRestartNeeded("removed", [
+            restored > 0
+              ? translate(
+                  restored === 1
+                    ? msg(
+                        "Disconnected Toolport from {client} and put back {count} server",
+                      )
+                    : msg(
+                        "Disconnected Toolport from {client} and put back {count} servers",
+                      ),
+                  { client: client.name, count: restored },
+                )
+              : translate("Disconnected Toolport from {value0}", { value0: client.name }),
+            ...(outcome.warnings ?? []),
+          ]);
+        }
       }
       onChanged();
     } catch (e) {
-      toastError(`${e}`);
+      showFeedback(String(e));
     } finally {
       setBusy(false);
     }
   }
 
   return (
-    <div className="flex flex-col gap-5">
+    <div className="flex min-w-0 flex-col gap-5">
+      <ClientRecoveryBanners
+        clientId={client.id}
+        refreshKey={client}
+        onRecovered={onChanged}
+      />
       {/* Connection: the one thing that actually matters in a client. */}
       {/* The title keeps at least 240px; when the actions don't fit beside it they wrap below. */}
       <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3">
@@ -629,7 +633,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       {showRestartNotice && (
         <div
           role="status"
-          className="flex items-start gap-2 toolport-alert border-info bg-info/8 px-3 py-2 text-sm text-info"
+          className="flex select-text items-start gap-2 toolport-alert border-info bg-info/8 px-3 py-2 text-sm text-info"
         >
           <RefreshCw className="mt-0.5 size-4 shrink-0" />
           <div className="min-w-0 flex-1">

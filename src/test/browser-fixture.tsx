@@ -1021,6 +1021,12 @@ mockIPC(
         if (index >= 0) fixtureLocations.splice(index, 1);
         return null;
       }
+      case "list_client_recoveries":
+        return [];
+      case "retry_client_recovery":
+        return null;
+      case "dismiss_client_recovery":
+        return null;
       case "detect_clients":
         return [
           ...fixtureLocations,

@@ -613,6 +613,27 @@ fn revoke_client_http_token_with(
     Ok(())
 }
 
+#[tauri::command]
+async fn list_client_recoveries() -> Result<Vec<clients::recovery::ClientRecovery>, String> {
+    tauri::async_runtime::spawn_blocking(clients::recovery::list)
+        .await
+        .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+async fn retry_client_recovery(
+    id: String,
+) -> Result<Option<clients::recovery::ClientRecovery>, String> {
+    tauri::async_runtime::spawn_blocking(move || clients::recovery::retry(&id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+async fn dismiss_client_recovery(id: String, dismissed: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || clients::recovery::dismiss(&id, dismissed))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Remove the Toolport gateway from a client.
 ///
 /// Runs on the blocking pool for the same reason as [`install_gateway`]
@@ -4430,6 +4451,9 @@ pub fn run() {
         .manage(RestartAdvice::default())
         .invoke_handler(crate::activity_revision_ipc::handler(tauri::generate_handler![
             detect_clients,
+            list_client_recoveries,
+            retry_client_recovery,
+            dismiss_client_recovery,
             client_location_types,
             add_client_location,
             remove_client_location,

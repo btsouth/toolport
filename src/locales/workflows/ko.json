@@ -407,5 +407,17 @@
   "Filter by agent": "에이전트로 필터",
   "All agents": "모든 에이전트",
   "All detected agents": "감지된 모든 에이전트",
-  "{state} via {path}": "{path} 경유 {state}"
+  "{state} via {path}": "{path} 경유 {state}",
+  "Client config recovery": "클라이언트 설정 복구",
+  "Dismiss recovery notice?": "복구 알림을 숨길까요?",
+  "Show recovery": "복구 표시",
+  "Recovery notice dismissed": "복구 알림 숨김",
+  "Dismiss notice": "알림 숨기기",
+  "{client} config is fully restored. The missing values are back.": "{client} 설정이 완전히 복원되었습니다. 누락된 값도 돌아왔습니다.",
+  "Toolport still could not read the missing values. Unlock your keyring, then choose Retry.": "Toolport가 아직 누락된 값을 읽지 못했습니다. 키링 잠금을 해제한 뒤 다시 시도를 선택하세요.",
+  "The recovery stopped unexpectedly. Choose Retry to try again.": "복구가 예기치 않게 중단되었습니다. 다시 시도를 선택해 재시도하세요.",
+  "{key} for {server}": "{server}의 {key}",
+  "{client} is disconnected and its original config is back, except values Toolport could not read because your keyring is locked or unavailable: {values}. The config has placeholders for those values for now.": "{client}의 연결이 해제되고 원래 설정이 복원되었습니다. 다만 키링이 잠겨 있거나 사용할 수 없어 Toolport가 읽지 못한 값이 있습니다: {values}. 현재 설정의 해당 위치에는 임시 값이 들어 있습니다.",
+  "Unlock your keyring, then choose Retry to put the values back. From a terminal, run toolport-gateway --disconnect-all again.": "키링 잠금을 해제한 뒤 다시 시도를 선택하면 값을 복원할 수 있습니다. 터미널에서는 toolport-gateway --disconnect-all을 다시 실행하세요.",
+  "{client} recovery backup is kept at {path} until recovery succeeds or you remove Toolport data. It does not expire automatically.": "{client} 복구 백업은 복구가 성공하거나 Toolport 데이터를 삭제할 때까지 {path}에 보관됩니다. 자동으로 만료되지 않습니다."
 }

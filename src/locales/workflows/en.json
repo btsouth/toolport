@@ -407,5 +407,17 @@
   "Filter by agent": "Filter by agent",
   "All agents": "All agents",
   "All detected agents": "All detected agents",
-  "{state} via {path}": "{state} via {path}"
+  "{state} via {path}": "{state} via {path}",
+  "Client config recovery": "Client config recovery",
+  "Dismiss recovery notice?": "Dismiss recovery notice?",
+  "Show recovery": "Show recovery",
+  "Recovery notice dismissed": "Recovery notice dismissed",
+  "Dismiss notice": "Dismiss notice",
+  "{client} config is fully restored. The missing values are back.": "{client} config is fully restored. The missing values are back.",
+  "Toolport still could not read the missing values. Unlock your keyring, then choose Retry.": "Toolport still could not read the missing values. Unlock your keyring, then choose Retry.",
+  "The recovery stopped unexpectedly. Choose Retry to try again.": "The recovery stopped unexpectedly. Choose Retry to try again.",
+  "{key} for {server}": "{key} for {server}",
+  "{client} is disconnected and its original config is back, except values Toolport could not read because your keyring is locked or unavailable: {values}. The config has placeholders for those values for now.": "{client} is disconnected and its original config is back, except values Toolport could not read because your keyring is locked or unavailable: {values}. The config has placeholders for those values for now.",
+  "Unlock your keyring, then choose Retry to put the values back. From a terminal, run toolport-gateway --disconnect-all again.": "Unlock your keyring, then choose Retry to put the values back. From a terminal, run toolport-gateway --disconnect-all again.",
+  "{client} recovery backup is kept at {path} until recovery succeeds or you remove Toolport data. It does not expire automatically.": "{client} recovery backup is kept at {path} until recovery succeeds or you remove Toolport data. It does not expire automatically."
 }

@@ -29,6 +29,8 @@ struct Snapshot {
     vault_recovery: Option<String>,
     #[serde(skip)]
     recovered_vault: bool,
+    #[serde(default)]
+    recovery_dismissed: bool,
 }
 
 /// Read only valid writer provenance when a forgotten location has no store row.
@@ -132,6 +134,12 @@ fn load(client_id: &str, path: &Path) -> Result<Option<Snapshot>, String> {
         );
     }
     Ok(Some(record))
+}
+
+// Prime missing-value context before rotating the current config on a retry.
+// The current file can already contain placeholders and credential field names.
+pub(super) fn prepare_disconnect(client_id: &str, path: &Path) -> Result<(), String> {
+    load(client_id, path).map(|_| ())
 }
 
 pub(super) struct Receipt {
@@ -247,6 +255,7 @@ pub(super) fn remember(
                 disconnect_before: None,
                 vault_recovery: None,
                 recovered_vault: false,
+                recovery_dismissed: false,
             }
         }
     };
@@ -1271,6 +1280,129 @@ mod tests {
             }
         });
     }
+    #[test]
+    fn pending_notices_are_vault_free_path_specific_and_keep_dismissal() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let registry = serde_json::from_value(serde_json::json!({"version":3,"profiles":[],"servers":[{"id":"native","name":"Native","transport":"stdio","env":[{"key":"API_KEY","secret":true}]}]})).unwrap();
+            crate::registry::save(&registry).unwrap();
+            crate::secrets::set_secret("native", "API_KEY", "sk-recovery-notice-fixture").unwrap();
+            let original = "{\r\n  \"mcpServers\":{\"native\":{\"command\":\"echo\",\"env\":{\"API_KEY\":\"sk-recovery-notice-fixture\"}}}\r\n}\r\n";
+            let paths = [
+                data.join("historical-a.json"),
+                data.join("historical-b.json"),
+            ];
+            for path in &paths {
+                std::fs::write(path, original).unwrap();
+                backup_storage::register("native", "API_KEY", "sk-recovery-notice-fixture");
+                mutation::run("cursor", path, Format::JsonMcpServers, || {
+                    backup_file("cursor", path)?;
+                    write_format(Format::JsonMcpServers, path, &[entry()], true)
+                })
+                .unwrap();
+                backup_storage::clear();
+            }
+            std::env::set_var("TOOLPORT_SECRET_KEY", "locked-recovery-notices");
+            for path in &paths {
+                disconnect("cursor", path, Format::JsonMcpServers).unwrap();
+            }
+            let cli = recovery::warnings("cursor");
+            backup_storage::reset_missing();
+            assert_eq!(
+                backup_storage::upgrade_legacy().unwrap(),
+                0,
+                "pending placeholders are not legacy secrets"
+            );
+            let pending = recovery::list().unwrap();
+            assert_eq!(pending.len(), 2);
+            assert_eq!(
+                cli,
+                vec![format!(
+                    "{} {}",
+                    pending[0].message, pending[0].instructions
+                )],
+                "CLI and both shell DTOs share exact prose"
+            );
+            assert!(
+                !backup_storage::missing(),
+                "listing must not decode the vault"
+            );
+            assert!(backup_storage::warnings().is_empty());
+            assert!(pending[0].message.contains("Cursor"));
+            assert!(pending[0].message.contains("API_KEY for native"));
+            assert!(!pending[0].message.contains("TOOLPORT_MISSING"));
+            let first = &pending[0];
+            let config_before = std::fs::read(&first.path).unwrap();
+            let receipt_before: Value =
+                serde_json::from_slice(&std::fs::read(&first.backup_path).unwrap()).unwrap();
+            recovery::dismiss(&first.id, true).unwrap();
+            assert_eq!(std::fs::read(&first.path).unwrap(), config_before);
+            let mut receipt_after: Value =
+                serde_json::from_slice(&std::fs::read(&first.backup_path).unwrap()).unwrap();
+            receipt_after
+                .as_object_mut()
+                .unwrap()
+                .remove("recoveryDismissed");
+            let mut receipt_before = receipt_before;
+            receipt_before
+                .as_object_mut()
+                .unwrap()
+                .remove("recoveryDismissed");
+            assert_eq!(
+                receipt_before, receipt_after,
+                "dismiss only changes notice metadata"
+            );
+            assert!(
+                recovery::list()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r.id == first.id)
+                    .unwrap()
+                    .dismissed
+            );
+            assert!(
+                !backup_storage::missing(),
+                "dismiss/show must not decode the vault"
+            );
+            let still_locked = recovery::retry(&first.id).unwrap().unwrap();
+            assert!(
+                still_locked.dismissed,
+                "retry must retain knowing dismissal"
+            );
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            assert!(
+                recovery::list()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r.id == first.id)
+                    .unwrap()
+                    .dismissed,
+                "unlock/reopen does not consume recovery or reset dismissal"
+            );
+            recovery::dismiss(&first.id, false).unwrap();
+            let second_before = std::fs::read(&pending[1].path).unwrap();
+            assert!(recovery::retry(&first.id).unwrap().is_none());
+            assert_eq!(std::fs::read(&first.path).unwrap(), original.as_bytes());
+            assert_eq!(
+                std::fs::read(&pending[1].path).unwrap(),
+                second_before,
+                "retry must not touch another historical config"
+            );
+            assert_eq!(recovery::list().unwrap().len(), 1);
+            // Native edits made while recovery is pending must survive retry.
+            let edited = std::fs::read_to_string(&pending[1].path).unwrap().replacen(
+                "{",
+                "{\n  \"userSetting\": 42,",
+                1,
+            );
+            std::fs::write(&pending[1].path, &edited).unwrap();
+            recovery::retry(&pending[1].id).unwrap();
+            assert!(std::fs::read_to_string(&pending[1].path)
+                .unwrap()
+                .contains("\"userSetting\": 42"));
+        });
+    }
+
     #[test]
     fn every_writer_import_connect_move_disconnect_restores_exact_bytes() {
         let _lock = crate::registry::data_dir_test_lock();

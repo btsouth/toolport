@@ -407,5 +407,17 @@
   "Filter by agent": "Filtrar por agente",
   "All agents": "Todos os agentes",
   "All detected agents": "Todos os agentes detectados",
-  "{state} via {path}": "{state} via {path}"
+  "{state} via {path}": "{state} via {path}",
+  "Client config recovery": "Recuperação da configuração do cliente",
+  "Dismiss recovery notice?": "Ocultar o aviso de recuperação?",
+  "Show recovery": "Mostrar recuperação",
+  "Recovery notice dismissed": "Aviso de recuperação ocultado",
+  "Dismiss notice": "Ocultar aviso",
+  "{client} config is fully restored. The missing values are back.": "A configuração de {client} foi totalmente restaurada. Os valores que faltavam estão de volta.",
+  "Toolport still could not read the missing values. Unlock your keyring, then choose Retry.": "O Toolport ainda não conseguiu ler os valores que faltam. Desbloqueie seu chaveiro e escolha Tentar novamente.",
+  "The recovery stopped unexpectedly. Choose Retry to try again.": "A recuperação parou inesperadamente. Escolha Tentar novamente para repetir.",
+  "{key} for {server}": "{key} para {server}",
+  "{client} is disconnected and its original config is back, except values Toolport could not read because your keyring is locked or unavailable: {values}. The config has placeholders for those values for now.": "{client} está desconectado e sua configuração original foi restaurada, exceto pelos valores que o Toolport não conseguiu ler porque seu chaveiro está bloqueado ou indisponível: {values}. Por enquanto, a configuração contém marcadores de posição nesses locais.",
+  "Unlock your keyring, then choose Retry to put the values back. From a terminal, run toolport-gateway --disconnect-all again.": "Desbloqueie seu chaveiro e escolha Tentar novamente para repor os valores. Em um terminal, execute toolport-gateway --disconnect-all novamente.",
+  "{client} recovery backup is kept at {path} until recovery succeeds or you remove Toolport data. It does not expire automatically.": "O backup de recuperação de {client} fica em {path} até a recuperação ser concluída ou você remover os dados do Toolport. Ele não expira automaticamente."
 }

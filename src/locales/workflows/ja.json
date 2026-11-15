@@ -407,5 +407,17 @@
   "Filter by agent": "エージェントで絞り込む",
   "All agents": "すべてのエージェント",
   "All detected agents": "検出されたすべてのエージェント",
-  "{state} via {path}": "{path} 経由で{state}"
+  "{state} via {path}": "{path} 経由で{state}",
+  "Client config recovery": "クライアント設定の復元",
+  "Dismiss recovery notice?": "復元の通知を非表示にしますか？",
+  "Show recovery": "復元を表示",
+  "Recovery notice dismissed": "復元の通知を非表示にしました",
+  "Dismiss notice": "通知を非表示",
+  "{client} config is fully restored. The missing values are back.": "{client} の設定は完全に復元されました。不足していた値も元に戻りました。",
+  "Toolport still could not read the missing values. Unlock your keyring, then choose Retry.": "Toolport はまだ不足している値を読み取れませんでした。キーリングのロックを解除してから「再試行」を選んでください。",
+  "The recovery stopped unexpectedly. Choose Retry to try again.": "復元が予期せず停止しました。「再試行」を選んでやり直してください。",
+  "{key} for {server}": "{server} の {key}",
+  "{client} is disconnected and its original config is back, except values Toolport could not read because your keyring is locked or unavailable: {values}. The config has placeholders for those values for now.": "{client} は切断され、元の設定が復元されました。ただし、キーリングがロックされているか利用できないため、Toolport が読み取れなかった値があります: {values}。設定内の該当箇所には現在、仮の値が入っています。",
+  "Unlock your keyring, then choose Retry to put the values back. From a terminal, run toolport-gateway --disconnect-all again.": "キーリングのロックを解除してから「再試行」を選ぶと、値を元に戻せます。ターミナルでは toolport-gateway --disconnect-all をもう一度実行してください。",
+  "{client} recovery backup is kept at {path} until recovery succeeds or you remove Toolport data. It does not expire automatically.": "{client} の復元用バックアップは、復元が成功するか Toolport のデータを削除するまで {path} に保存されます。自動的に期限切れになることはありません。"
 }

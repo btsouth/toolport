@@ -4,8 +4,8 @@ use super::*;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct Reference {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Reference {
     pub server: String,
     pub key: String,
 }
@@ -42,6 +42,8 @@ struct Envelope {
     references: Vec<Reference>,
     #[serde(default)]
     reference_markers: Vec<usize>,
+    #[serde(default)]
+    recovery_dismissed: Option<bool>,
 }
 fn envelope(text: &str) -> Option<Envelope> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
@@ -308,8 +310,60 @@ pub(super) fn encode_recovery(
         fallback,
         references,
         reference_markers,
+        recovery_dismissed: None,
     })
     .map_err(|e| e.to_string())
+}
+
+// Notice operations inspect only public fallback metadata. They must never
+// contact a vault (even an unlocked one) or change a client config.
+pub(super) fn raw_metadata(text: &str) -> Result<(serde_json::Value, Vec<Reference>), String> {
+    let mut text = text.to_owned();
+    let mut refs = Vec::new();
+    let mut dismissed = None;
+    for _ in 0..8 {
+        if let Some(saved) = envelope(&text) {
+            dismissed = dismissed.or(saved.recovery_dismissed);
+            refs.extend(saved.references);
+            text = saved.fallback;
+            continue;
+        }
+        let mut value: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        dismissed = dismissed.or(value["recoveryDismissed"].as_bool());
+        if let Some(recovery) = value["vaultRecovery"].as_str() {
+            if let Some(saved) = envelope(recovery) {
+                refs.extend(saved.references);
+            }
+        }
+        value["recoveryDismissed"] = dismissed.unwrap_or(false).into();
+        refs.sort_by(|a, b| (&a.server, &a.key).cmp(&(&b.server, &b.key)));
+        refs.dedup_by(|a, b| a.server == b.server && a.key == b.key);
+        return Ok((value, refs));
+    }
+    Err("Client recovery metadata is nested too deeply".into())
+}
+fn merge_dismissal(payload: String, dismissed: Option<bool>) -> Result<String, String> {
+    let Some(dismissed) = dismissed else {
+        return Ok(payload);
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&payload) else {
+        return Ok(payload);
+    };
+    if value.get("originalHash").is_none() {
+        return Ok(payload);
+    }
+    value["recoveryDismissed"] = dismissed.into();
+    serde_json::to_string(&value).map_err(|e| e.to_string())
+}
+pub(super) fn set_dismissed(path: &Path, dismissed: bool) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut value: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    value["recoveryDismissed"] = dismissed.into();
+    crate::registry::atomic_write(
+        path,
+        &serde_json::to_string(&value).map_err(|e| e.to_string())?,
+    )
 }
 
 pub(super) fn decode(text: &str) -> Result<String, String> {
@@ -317,16 +371,19 @@ pub(super) fn decode(text: &str) -> Result<String, String> {
         return Ok(text.into());
     };
     match crate::secrets::get_backup_secret_result(&saved.account, &saved.key) {
-        Ok(Some(payload)) if crate::registry::sha256_hex(&payload) == saved.hash => Ok(payload),
+        Ok(Some(payload)) if crate::registry::sha256_hex(&payload) == saved.hash => {
+            merge_dismissal(payload, saved.recovery_dismissed)
+        }
         _ => {
             MISSING.with(|v| *v.borrow_mut() = true);
-            for (index, reference) in saved.references.iter().enumerate() {
-                let index = saved.reference_markers.get(index).copied().unwrap_or(index);
-                let warning = format!("Client config recovery: could not re-insert {}:{}; left TOOLPORT_MISSING_CREDENTIAL_{index}. Unlock the original vault and retry. Recovery backup retained.", reference.server, reference.key);
+            for reference in &saved.references {
+                let warning = crate::i18n::trf(
+                    "{key} for {server}",
+                    &[("key", &reference.key), ("server", &reference.server)],
+                );
                 WARNINGS.with(|v| {
                     let mut v = v.borrow_mut();
                     if !v.contains(&warning) {
-                        eprintln!("{warning}");
                         v.push(warning);
                     }
                 });
@@ -350,7 +407,7 @@ pub(super) fn decode(text: &str) -> Result<String, String> {
                     fallback = serde_json::to_string(&record).map_err(|e| e.to_string())?;
                 }
             }
-            Ok(fallback)
+            merge_dismissal(fallback, saved.recovery_dismissed)
         }
     }
 }
@@ -466,6 +523,9 @@ fn legacy_credentials(text: &str, client: &str) -> Vec<(Reference, String)> {
     use serde_json::Value;
     fn add(values: &mut Vec<(Reference, String)>, source: &str, key: &str, value: &str) {
         if crate::import_credentials::provided(value)
+            && !value
+                .strip_prefix("TOOLPORT_MISSING_CREDENTIAL_")
+                .is_some_and(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()))
             && !values.iter().any(|(reference, saved)| {
                 reference.server == source && reference.key == key && saved == value
             })
@@ -820,8 +880,8 @@ mod tests {
                 original.replace("sk-shared-fixture", "TOOLPORT_MISSING_CREDENTIAL_0")
             );
             let warnings = warnings().join("\n");
-            assert!(warnings.contains("a:API_KEY"));
-            assert!(warnings.contains("b:API_KEY"));
+            assert!(warnings.contains("API_KEY for a"));
+            assert!(warnings.contains("API_KEY for b"));
             assert!(!warnings.contains("CREDENTIAL_1"));
             reset_missing();
         });

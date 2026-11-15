@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ClientDetail } from "./ClientDetail";
-import { importServers, previewImportServers } from "@/lib/api";
+import { importServers, previewImportServers, listClientRecoveries } from "@/lib/api";
 import type { DetectedClient, Registry } from "@/lib/types";
 
 const installGateway = vi.fn();
@@ -14,6 +14,9 @@ const toastSuccess = vi.fn();
 const toastError = vi.fn();
 
 vi.mock("@/lib/api", () => ({
+  listClientRecoveries: vi.fn().mockResolvedValue([]),
+  retryClientRecovery: vi.fn(),
+  dismissClientRecovery: vi.fn(),
   installGateway: (...a: unknown[]) => installGateway(...a),
   uninstallGateway: (...a: unknown[]) => uninstallGateway(...a),
   migrateClient: (...a: unknown[]) => migrateClient(...a),
@@ -80,6 +83,7 @@ function emptyRegistry(): Registry {
 }
 
 beforeEach(() => {
+  vi.mocked(listClientRecoveries).mockResolvedValue([]);
   vi.mocked(importServers).mockReset();
   vi.mocked(previewImportServers).mockReset().mockResolvedValue([]);
   installGateway.mockReset();
@@ -116,6 +120,8 @@ it("imports the reviewed definition when another client has the same server name
   await userEvent.click(screen.getByRole("button", { name: /^Import 1 server$/ }));
   await waitFor(() => expect(importServers).toHaveBeenCalledWith(["reviewed-client"]));
   expect(previewImportServers).toHaveBeenCalledWith("claude-desktop");
+  expect(screen.getByRole("status")).toHaveTextContent("Imported selected servers");
+  expect(toastSuccess).not.toHaveBeenCalled();
 });
 
 it("uses bulk review storage choices and leaves unsupported servers unchecked", async () => {
@@ -741,4 +747,29 @@ it("requires disconnect before forgetting a connected location", () => {
     />,
   );
   expect(screen.getByRole("button", { name: "Remove location" })).toBeDisabled();
+});
+
+it("shows disconnect and restart feedback once inline without a duplicate toast", async () => {
+  uninstallGateway.mockResolvedValue({
+    path: "/fixture/config",
+    restored: ["calendar"],
+    warnings: [],
+  });
+  render(
+    <ClientDetail
+      client={client({ gatewayInstalled: true, entryState: "managed" })}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  await userEvent.click(screen.getByRole("button", { name: "Disconnect" }));
+  await userEvent.click(
+    within(screen.getByRole("dialog")).getByRole("button", { name: "Disconnect" }),
+  );
+  const notice = await screen.findByRole("status");
+  expect(notice).toHaveTextContent("Still connected until restart");
+  expect(notice).toHaveTextContent("put back 1 server");
+  expect(toastSuccess).not.toHaveBeenCalled();
+  expect(toastError).not.toHaveBeenCalled();
 });

@@ -490,6 +490,7 @@ pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
             move || p.refresh(),
         ));
     }
+    page.append_recoveries(&body, Some(&client.id));
     if let Some((id, notice)) = page.detail_notice.borrow().as_ref() {
         if id == &client.id {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);

@@ -683,6 +683,32 @@ export function installGateway(
   });
 }
 
+export interface ClientRecovery {
+  id: string;
+  clientId: string;
+  clientName: string;
+  path: string;
+  backupPath: string;
+  missing: { server: string; key: string }[];
+  dismissed: boolean;
+  message: string;
+  instructions: string;
+  retention: string;
+  details: string;
+}
+
+export function listClientRecoveries(): Promise<ClientRecovery[]> {
+  return invoke<ClientRecovery[]>("list_client_recoveries");
+}
+
+export function retryClientRecovery(id: string): Promise<ClientRecovery | null> {
+  return invoke<ClientRecovery | null>("retry_client_recovery", { id });
+}
+
+export function dismissClientRecovery(id: string, dismissed: boolean): Promise<void> {
+  return invoke<void>("dismiss_client_recovery", { id, dismissed });
+}
+
 /** Remove the Toolport gateway from a client's config. */
 export function uninstallGateway(clientId: string): Promise<WriteOutcome> {
   return invoke<WriteOutcome>("uninstall_gateway", { clientId });

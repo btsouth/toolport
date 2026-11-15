@@ -407,5 +407,17 @@
   "Filter by agent": "Filtrer par agent",
   "All agents": "Tous les agents",
   "All detected agents": "Tous les agents détectés",
-  "{state} via {path}": "{state} via {path}"
+  "{state} via {path}": "{state} via {path}",
+  "Client config recovery": "Récupération de la configuration du client",
+  "Dismiss recovery notice?": "Masquer l’avis de récupération ?",
+  "Show recovery": "Afficher la récupération",
+  "Recovery notice dismissed": "Avis de récupération masqué",
+  "Dismiss notice": "Masquer l’avis",
+  "{client} config is fully restored. The missing values are back.": "La configuration de {client} est entièrement restaurée. Les valeurs manquantes sont de nouveau présentes.",
+  "Toolport still could not read the missing values. Unlock your keyring, then choose Retry.": "Toolport ne peut toujours pas lire les valeurs manquantes. Déverrouillez votre trousseau, puis choisissez Réessayer.",
+  "The recovery stopped unexpectedly. Choose Retry to try again.": "La récupération s’est arrêtée de façon inattendue. Choisissez Réessayer pour recommencer.",
+  "{key} for {server}": "{key} pour {server}",
+  "{client} is disconnected and its original config is back, except values Toolport could not read because your keyring is locked or unavailable: {values}. The config has placeholders for those values for now.": "{client} est déconnecté et sa configuration d’origine est restaurée, sauf les valeurs que Toolport n’a pas pu lire parce que votre trousseau est verrouillé ou indisponible : {values}. La configuration contient provisoirement des valeurs de remplacement à ces endroits.",
+  "Unlock your keyring, then choose Retry to put the values back. From a terminal, run toolport-gateway --disconnect-all again.": "Déverrouillez votre trousseau, puis choisissez Réessayer pour remettre les valeurs. Dans un terminal, exécutez à nouveau toolport-gateway --disconnect-all.",
+  "{client} recovery backup is kept at {path} until recovery succeeds or you remove Toolport data. It does not expire automatically.": "La sauvegarde de récupération de {client} est conservée dans {path} jusqu’à la réussite de la récupération ou la suppression des données Toolport. Elle n’expire pas automatiquement."
 }

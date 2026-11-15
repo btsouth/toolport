@@ -5,6 +5,7 @@
 
 mod branding;
 mod catalog;
+mod client_recovery;
 mod client_rows;
 mod details;
 mod health;
@@ -2643,6 +2644,10 @@ struct ClientPage {
     details: details::DetailHost,
     detail_clients: std::rc::Rc<std::cell::RefCell<Vec<state::ClientView>>>,
     detail_notice: std::rc::Rc<std::cell::RefCell<Option<(String, String)>>>,
+    recoveries: std::rc::Rc<std::cell::RefCell<Vec<crate::clients::recovery::ClientRecovery>>>,
+    recovery_feedback: std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>,
+    recovery_success: std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>,
+    recovery_box: gtk::Box,
     credential_page: ServerPage,
     app: adw::Application,
     root: gtk::Box,
@@ -2696,9 +2701,13 @@ impl ClientPage {
             .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
+            .selectable(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
             .css_classes(["toolport-feedback"])
             .build();
         l10n::bind_text(&feedback, "Open Clients to scan this machine.");
+        let recovery_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        page.append(&recovery_box);
         page.append(&feedback);
 
         // Full width, like every other list page; the row groups line up with Servers.
@@ -2713,6 +2722,10 @@ impl ClientPage {
             details,
             detail_clients: Default::default(),
             detail_notice: Default::default(),
+            recoveries: Default::default(),
+            recovery_feedback: Default::default(),
+            recovery_success: Default::default(),
+            recovery_box,
             credential_page,
             app: app.clone(),
             root,
@@ -2954,6 +2967,7 @@ impl ClientPage {
 
     fn render(&self, snapshot: state::ClientSnapshot) {
         self.loaded.set(true);
+        self.reload_recoveries();
         *self.profiles.borrow_mut() = snapshot.profiles;
         let sessions = snapshot.sessions;
         let clients = snapshot.clients;
@@ -3215,9 +3229,6 @@ impl ClientPage {
         if self.loaded.get() {
             // A failed rescan must not blow away a working list, matching React.
             let message = crate::i18n::trf("Couldn't refresh: {value1}", &[("value1", cause)]);
-            if show_toast(&self.list, &message) {
-                return;
-            }
             self.show_error(&message);
             return;
         }
@@ -3239,8 +3250,10 @@ impl ClientPage {
     }
 
     fn show_error(&self, error: &str) {
-        if self.details.selected.borrow().is_some() {
-            show_toast(&self.root, error);
+        let selected = self.details.selected.borrow().clone();
+        if let Some(id) = selected {
+            *self.detail_notice.borrow_mut() = Some((id, error.into()));
+            self.refresh_open_detail();
         }
         self.pending_confirmation.borrow_mut().take();
         self.cancel_feedback_timer();
@@ -3259,28 +3272,20 @@ impl ClientPage {
     }
 
     fn show_confirmation(&self, message: &str) {
-        if show_toast(&self.list, message) {
-            self.cancel_feedback_timer();
-            self.feedback.set_visible(false);
-            return;
+        let selected = self.details.selected.borrow().clone();
+        if let Some(id) = selected {
+            *self.detail_notice.borrow_mut() = Some((id, message.into()));
+            self.refresh_open_detail();
         }
         self.cancel_feedback_timer();
         self.feedback.set_label(message);
         self.feedback.remove_css_class("error");
         self.feedback.add_css_class("success");
         self.feedback.set_visible(true);
-        let feedback = self.feedback.clone();
-        let feedback_timer = self.feedback_timer.clone();
-        let timer =
-            gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(4), move || {
-                feedback.set_visible(false);
-                feedback.set_label("");
-                feedback_timer.borrow_mut().take();
-            });
-        *self.feedback_timer.borrow_mut() = Some(timer);
     }
 
     fn refresh_with_confirmation(&self, message: String) {
+        self.recovery_success.borrow_mut().clear();
         if let Some(id) = self.details.selected.borrow().clone() {
             *self.detail_notice.borrow_mut() = Some((id, message.clone()));
         }
@@ -3934,12 +3939,25 @@ fn run_client_mutation(
                         ],
                     )
                 };
-                page.refresh_with_confirmation(
-                    std::iter::once(message)
-                        .chain(result.outcome.warnings)
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                );
+                if !connect
+                    && crate::clients::recovery::list().is_ok_and(|records| {
+                        records
+                            .iter()
+                            .any(|record| record.client_name == client_name)
+                    })
+                {
+                    page.detail_notice.borrow_mut().take();
+                    page.pending_confirmation.borrow_mut().take();
+                    page.feedback.set_visible(false);
+                    page.refresh();
+                } else {
+                    page.refresh_with_confirmation(
+                        std::iter::once(message)
+                            .chain(result.outcome.warnings)
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                }
             }
             Ok(Err(error)) => page.show_error(&format!("{client_name}: {error}")),
             Err(_) => page.show_error(&crate::i18n::trf(

@@ -96,6 +96,11 @@ let saves: Promise<void> = Promise.resolve();
 const listeners = new Set<() => void>();
 const cache = new Map<Locale, Promise<Messages>>();
 
+/** Wait for the selected UI language to reach the shared native message catalog. */
+export async function awaitLanguagePersistence(): Promise<void> {
+  await saves;
+}
+
 function notify() {
   for (const listener of listeners) listener();
 }

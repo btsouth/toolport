@@ -407,5 +407,17 @@
   "Filter by agent": "按智能体筛选",
   "All agents": "所有智能体",
   "All detected agents": "所有检测到的智能体",
-  "{state} via {path}": "{state}，来自 {path}"
+  "{state} via {path}": "{state}，来自 {path}",
+  "Client config recovery": "恢复客户端配置",
+  "Dismiss recovery notice?": "隐藏恢复提示？",
+  "Show recovery": "显示恢复",
+  "Recovery notice dismissed": "已隐藏恢复提示",
+  "Dismiss notice": "隐藏提示",
+  "{client} config is fully restored. The missing values are back.": "{client} 的配置已完全恢复。缺失的值也已还原。",
+  "Toolport still could not read the missing values. Unlock your keyring, then choose Retry.": "Toolport 仍无法读取缺失的值。请解锁密钥环，然后选择“重试”。",
+  "The recovery stopped unexpectedly. Choose Retry to try again.": "恢复意外停止。请选择“重试”以再次尝试。",
+  "{key} for {server}": "{server} 的 {key}",
+  "{client} is disconnected and its original config is back, except values Toolport could not read because your keyring is locked or unavailable: {values}. The config has placeholders for those values for now.": "{client} 已断开连接，原始配置已恢复，但由于密钥环被锁定或不可用，Toolport 无法读取以下值：{values}。配置中的这些位置暂时填入了占位值。",
+  "Unlock your keyring, then choose Retry to put the values back. From a terminal, run toolport-gateway --disconnect-all again.": "请解锁密钥环，然后选择“重试”以还原这些值。在终端中，请再次运行 toolport-gateway --disconnect-all。",
+  "{client} recovery backup is kept at {path} until recovery succeeds or you remove Toolport data. It does not expire automatically.": "{client} 的恢复备份保存在 {path}，直到恢复成功或你删除 Toolport 数据。它不会自动过期。"
 }
