@@ -421,6 +421,7 @@
   "Enter the URL of your self-hosted instance. For example:{value1}{value2}": "輸入您的自託管例項的 URL。例如：{value1}{value2}",
   "Enter the value for this machine": "輸入該機器的值",
   "Enter value": "輸入值",
+  "Enter {value0} or deselect {value1}": "輸入{value0}或取消選擇{value1}",
   "ENV_NAME": "ENV_NAME",
   "Environment variables": "環境變數",
   "Ephemeral, local, opt-in. While live inspection is on, Toolport keeps the last 50 tool calls' arguments and results here so you can inspect them. This buffer is separate from the audit log, never leaves your machine, and clears when you turn inspection off or restart the gateway.": "僅在啟用即時檢查時，本機儲存最近50次工具呼叫的引數和結果。緩衝區獨立於審核記錄，不離開本機，關閉檢查或重新啟動閘道時清空。",
@@ -1075,5 +1076,6 @@
   "T3 Code thread {id}": "T3 Code 對話 {id}",
   "Copy thread id {id}": "複製執行緒 ID {id}",
   "Copied thread id": "已複製執行緒 ID",
-  "{client} via T3 Code, thread {thread}": "{client}（透過 T3 Code，執行緒 {thread}）"
+  "{client} via T3 Code, thread {thread}": "{client}（透過 T3 Code，執行緒 {thread}）",
+  "Toolport also adds these settings to its {client} entry, each only if it is not set. A setting you delete stays deleted until you connect again.": "Toolport 也會將這些設定加入它在 {client} 中的項目，每項僅在未設定時加入。你刪除的設定會維持刪除，直到你重新連線。"
 }

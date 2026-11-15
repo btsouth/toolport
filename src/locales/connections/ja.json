@@ -421,6 +421,7 @@
   "Enter the URL of your self-hosted instance. For example:{value1}{value2}": "セルフホスト インスタンスの URL を入力します。例:{value1}{value2}",
   "Enter the value for this machine": "このマシンの値を入力してください",
   "Enter value": "値を入力してください",
+  "Enter {value0} or deselect {value1}": "{value0} を入力するか、{value1} の選択を解除してください",
   "ENV_NAME": "ENV_NAME",
   "Environment variables": "環境変数",
   "Ephemeral, local, opt-in. While live inspection is on, Toolport keeps the last 50 tool calls' arguments and results here so you can inspect them. This buffer is separate from the audit log, never leaves your machine, and clears when you turn inspection off or restart the gateway.": "有効にした間だけ直近50回のツール呼び出しの引数と結果をローカルに保持します。監査ログとは別で、端末外には送信せず、検査の無効化またはゲートウェイの再起動で消去します。",
@@ -1075,5 +1076,6 @@
   "T3 Code thread {id}": "T3 Code スレッド {id}",
   "Copy thread id {id}": "スレッド ID {id} をコピー",
   "Copied thread id": "スレッド ID をコピーしました",
-  "{client} via T3 Code, thread {thread}": "{client}（T3 Code 経由、スレッド {thread}）"
+  "{client} via T3 Code, thread {thread}": "{client}（T3 Code 経由、スレッド {thread}）",
+  "Toolport also adds these settings to its {client} entry, each only if it is not set. A setting you delete stays deleted until you connect again.": "Toolport は、{client} の設定にある Toolport 自身のエントリに、これらの設定も追加します。各設定は未設定の場合にのみ追加されます。削除した設定は、再接続するまで削除されたままです。"
 }

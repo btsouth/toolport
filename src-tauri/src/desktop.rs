@@ -746,6 +746,17 @@ async fn preview_client_setup(
     .map_err(|_| "Client review stopped".to_string())?
 }
 
+/// The client settings a connect or reset adds to Toolport's entry, as the TOML
+/// lines the confirmation lists. Empty when it adds none.
+#[tauri::command]
+async fn preview_gateway_settings(client_id: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        clients::codex_gateway_settings_for_connect(&client_id)
+    })
+    .await
+    .map_err(|_| "Client review stopped".to_string())
+}
+
 /// Migrate a client to Toolport: import its directly-configured servers into the
 /// registry, then rewrite the client's config to contain only the Toolport
 /// gateway (optionally scoped to `profile`). The client is left managing nothing
@@ -4451,6 +4462,7 @@ pub fn run() {
             remove_toolport_data,
             migrate_client,
             preview_client_setup,
+            preview_gateway_settings,
             set_secret,
             set_secret_reference,
             test_secret_reference,

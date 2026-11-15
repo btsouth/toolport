@@ -332,6 +332,8 @@ fn tool_list(cfg: &Config, grown: bool) -> Value {
     if cfg.concurrent {
         tools.push(json!({ "name": "sleep", "description": "Wait ms milliseconds, then reply.",
                 "inputSchema": { "type": "object", "properties": { "ms": { "type": "number" } } } }));
+        tools.push(json!({ "name": "hold", "description": "Wait until the test opens the named gate, then reply.",
+                "inputSchema": { "type": "object", "properties": { "gate": { "type": "string" } } } }));
     }
     if grown {
         tools.push(json!({ "name": "greet", "description": "Greet someone by name.",
@@ -727,6 +729,10 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
                         None => format!("slept {ms} ms"),
                     }
                 }
+                "hold" => format!(
+                    "released {}",
+                    args.get("gate").and_then(|g| g.as_str()).unwrap_or("")
+                ),
                 "greet" => {
                     let who = args.get("name").and_then(|t| t.as_str()).unwrap_or("there");
                     format!("hello {who}")
@@ -949,6 +955,27 @@ fn sleep_ms(req: &Value) -> Option<u64> {
     Some(req["params"]["arguments"]["ms"].as_u64().unwrap_or(0))
 }
 
+/// The gate a `hold` call waits on: a file named `gate-<name>` beside the transcript,
+/// which the test creates to let that call answer.
+fn hold_gate(cfg: &Config, req: &Value) -> Option<std::path::PathBuf> {
+    if req.get("method").and_then(Value::as_str) != Some("tools/call")
+        || req["params"]["name"].as_str() != Some("hold")
+    {
+        return None;
+    }
+    let gate = req["params"]["arguments"]["gate"].as_str().unwrap_or("");
+    let dir = cfg
+        .transcript
+        .as_deref()
+        .and_then(|path| {
+            std::path::Path::new(path)
+                .parent()
+                .map(std::path::Path::to_path_buf)
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    Some(dir.join(format!("gate-{gate}")))
+}
+
 /// `MOCK_MCP_CONCURRENT=1`: one thread per request, responses in completion order.
 fn serve_concurrent(cfg: Config, state: State) {
     use std::sync::{Arc, Condvar, Mutex};
@@ -997,6 +1024,12 @@ fn serve_concurrent(cfg: Config, state: State) {
                     }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+            if let Some(gate) = hold_gate(&cfg, &req) {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                while !gate.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
             }
             let mut pre = Vec::new();
             let (resp, grew) = {

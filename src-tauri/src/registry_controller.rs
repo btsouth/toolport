@@ -1352,7 +1352,14 @@ pub fn connect_client_stdio_with(
 ) -> Result<ClientMutationResult, String> {
     refuse_customized_client(client_gateway_state(managed, client_id), force)?;
     let _lock = acquire_auth_lock(&format!("client-config:{client_id}"))?;
-    let outcome = clients::install_gateway(client_id, profile)?;
+    // Only an explicit reset (force) writes every Codex default again; an access
+    // change keeps the settings the user removed.
+    let keep = (!force).then(|| {
+        managed
+            .get(client_id)
+            .map_or(&[][..], |record| record.codex_settings.as_slice())
+    });
+    let outcome = clients::install_gateway_for(client_id, profile, keep)?;
     finish_client_stdio_mutation(client_id, outcome, write_registry)
 }
 
@@ -1935,6 +1942,9 @@ pub struct ClientSetupReview {
     pub backup_dir: String,
     pub revision: String,
     pub items: Vec<SetupItem>,
+    /// Client settings the connect adds to Toolport's own entry, as TOML lines, each
+    /// only when it is not set. Empty for clients that get none.
+    pub gateway_settings: Vec<String>,
 }
 
 pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String> {
@@ -2020,6 +2030,7 @@ pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String
         config_path: client.config_path,
         revision,
         items,
+        gateway_settings: clients::codex_gateway_settings_for_connect(client_id),
         backup_dir: clients::backup_dir(client_id)
             .ok_or("Could not resolve backup directory")?
             .display()

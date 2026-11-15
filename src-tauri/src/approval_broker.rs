@@ -991,6 +991,32 @@ pub fn localized_approval_notification(view: &PendingView) -> (String, String) {
     }
 }
 
+/// A notification body as freedesktop markup that shows `text` literally.
+///
+/// The spec makes the body markup, so client and tool text is escaped. Some
+/// servers (Omarchy's shell among them) decode entities again before drawing,
+/// which would turn an escaped `&lt;b&gt;` back into bold. A word joiner after
+/// each escaped `&` and `<` keeps a second decode from rebuilding a tag or an
+/// entity, and draws as nothing everywhere else.
+#[cfg_attr(
+    not(any(feature = "gtk-desktop", all(feature = "desktop", target_os = "linux"))),
+    allow(dead_code)
+)]
+pub(crate) fn notification_body_markup(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;\u{2060}"),
+            '<' => out.push_str("&lt;\u{2060}"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 /// Notify the human that a call is held: an OS notification plus
 /// taskbar attention on the main window. Best-effort and non-blocking - if either fails (permission
 /// off, no window) the in-app overlay is still the source of truth. We flash rather than
@@ -1081,7 +1107,7 @@ fn notify_until_resolved_at_destination(
                         id,
                         "toolport",
                         title,
-                        gio::glib::markup_escape_text(body).as_str(),
+                        notification_body_markup(body).as_str(),
                         Vec::<String>::new(),
                         hints,
                         expiry,
@@ -1145,6 +1171,38 @@ fn notify_until_resolved_at_destination(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn notification_body_shows_client_markup_as_text() {
+        let label = "Bot <b>x</b> & Tom &amp; Jerry \"q\"";
+        let body = super::notification_body_markup(label);
+        // Spec servers parse the body as markup once: the text comes back exactly,
+        // with only invisible word joiners added.
+        let parsed = body
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&");
+        assert_eq!(parsed.replace('\u{2060}', ""), label);
+        assert!(!body.contains('<') && !body.contains('>'));
+        // A server that decodes entities again (up to three times, as Omarchy's
+        // shell does) must still not find a tag or an entity to rebuild.
+        let mut decoded = body.clone();
+        for _ in 0..3 {
+            decoded = decoded
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&apos;", "'")
+                .replace("&amp;", "&");
+        }
+        assert!(
+            !decoded.contains("<b>") && !decoded.contains("</b>"),
+            "{decoded}"
+        );
+        assert!(decoded.contains("&\u{2060}amp;"), "{decoded}");
+    }
+
     use super::*;
 
     #[test]

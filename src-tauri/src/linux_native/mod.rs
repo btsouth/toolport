@@ -3782,6 +3782,12 @@ fn client_reset_label(client: &state::ClientView) -> &'static str {
     }
 }
 
+/// The settings notice a reset confirmation shows, or `None` when a reset adds none.
+fn client_reset_settings_card(client_name: &str, settings: &[String]) -> Option<gtk::Box> {
+    setup::gateway_settings_notice(client_name, settings)
+        .map(|(sentence, lines)| setup::gateway_settings_card(&sentence, &lines))
+}
+
 fn confirm_client_reset(client: &state::ClientView, button: gtk::Button, page: ClientPage) {
     let Some(parent) = page.app.active_window() else {
         return;
@@ -3798,6 +3804,14 @@ fn confirm_client_reset(client: &state::ClientView, button: gtk::Button, page: C
         &[("value1", &client.name.to_string())],
     );
     l10n::bind_dialog_body(&dialog, "Toolport backs up the config before replacing its gateway entry with the standard stdio command. Customized commands, arguments and headers will be replaced; review those changes before confirming. Other client settings and MCP servers are preserved. Restart the client afterward.");
+    // A reset writes the same missing client settings a connect does, so the
+    // confirmation lists them the way the connect review does.
+    if let Some(card) = client_reset_settings_card(
+        &client.name,
+        &crate::clients::codex_gateway_settings_for_connect(&client.id),
+    ) {
+        dialog.set_extra_child(Some(&card));
+    }
     dialog.add_response("cancel", &crate::i18n::tr("Cancel"));
     l10n::bind_dialog_response(&dialog, "cancel", "Cancel");
     dialog.add_response("reset", &crate::i18n::lookup(client_reset_label(client)));
@@ -6849,14 +6863,22 @@ fn activity_detail(activity: &state::ActivityView) -> String {
     }
     detail.join(" · ")
 }
+/// The detail line's tooltip: the full line first, which ellipsizes at narrow
+/// widths, then the raw client id and the call's diagnostics, as React's does.
 fn activity_detail_tooltip(activity: &state::ActivityView) -> String {
+    let client = if activity_client_name(activity) == "Unrecorded client" {
+        Some(unrecorded_client_tooltip())
+    } else {
+        activity
+            .client_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(|id| crate::i18n::trf("Client: {value}", &[("value", id)]))
+    };
     format!(
-        "{}{}{}{}",
-        if activity_client_name(activity) == "Unrecorded client" {
-            unrecorded_client_tooltip()
-        } else {
-            activity.client_id.as_deref().unwrap_or_default().to_owned()
-        },
+        "{}{}{}{}{}",
+        activity_detail(activity),
+        client.map(|line| format!("\n{line}")).unwrap_or_default(),
         activity
             .run_id
             .as_ref()
@@ -14555,7 +14577,12 @@ mod tests {
             );
             assert_eq!(
                 activity_detail.tooltip_text().as_deref(),
-                Some("\nRun: 0123456789abcdef0123456789abcdef\nWarm catalog\nDispatch: 3 ms")
+                Some(
+                    format!(
+                    "{detail}\nRun: 0123456789abcdef0123456789abcdef\nWarm catalog\nDispatch: 3 ms"
+                )
+                    .as_str()
+                )
             );
             let session_row = recent.child().unwrap().first_child().unwrap();
             let session_name = session_row
@@ -14657,18 +14684,25 @@ mod tests {
         use client_rows::{client_row, profile_group, ProfileProduct, RowStyle};
         let parts = |row: &gtk::Box, with_logo: bool| {
             let line = row.first_child().unwrap();
+            let lead = line.first_child().unwrap();
             let copy = if with_logo {
-                line.first_child().unwrap().next_sibling().unwrap()
+                lead.first_child().unwrap().next_sibling().unwrap()
             } else {
-                line.first_child().unwrap()
+                lead.first_child().unwrap()
             };
-            let title = copy.first_child().unwrap();
-            let detail = title
+            // The name sits in a title box inside the button that opens details.
+            let open = copy.first_child().unwrap();
+            let title = open.first_child().unwrap();
+            let detail = open
                 .next_sibling()
                 .unwrap()
                 .downcast::<gtk::Label>()
                 .unwrap();
-            (title, detail, copy.next_sibling())
+            (
+                title,
+                detail,
+                lead.next_sibling().filter(|controls| controls.is_visible()),
+            )
         };
         for state in [
             state::ClientGatewayState::Disconnected,
@@ -14712,6 +14746,12 @@ mod tests {
                 }
                 let height = row.measure(gtk::Orientation::Vertical, 880).1;
                 assert!(height < 90, "{style:?} rows stay one line: {height}");
+                // Narrow windows put the controls under the text rather than
+                // past the window edge, as React's rows do.
+                let (min, _, _, _) = row.measure(gtk::Orientation::Horizontal, -1);
+                assert!(min <= 300, "{state:?} row fits a narrow window: {min}");
+                let narrow = row.measure(gtk::Orientation::Vertical, 300).1;
+                assert!(narrow > height, "{state:?} controls wrap at 300: {narrow}");
             }
         }
 
@@ -16952,6 +16992,47 @@ mod p10c_r1_presentation_tests {
         row.client_label = None;
         assert_eq!(activity_client_segments(&row), ["Claude Code"]);
     }
+
+    #[test]
+    fn activity_tooltip_carries_the_full_caller_text() {
+        let mut row = state::ActivityView {
+            internal: false,
+            timestamp_ms: 0,
+            server: "team_slack".into(),
+            tool: "delete".into(),
+            client: Some("Codex".into()),
+            client_id: Some("adapter:codex".into()),
+            client_label: Some("Name 2.1.290 with a long build tag".into()),
+            host: None,
+            host_thread: None,
+            cold: Some(false),
+            dispatch_ms: None,
+            failure_kind: None,
+            run_id: None,
+            approval_decision: None,
+            ok: true,
+            held: false,
+            duration_ms: Some(12),
+            error: None,
+            pii_replaced: None,
+            pii_incomplete: false,
+        };
+        let tooltip = activity_detail_tooltip(&row);
+        let mut lines = tooltip.lines();
+        assert_eq!(lines.next(), Some(activity_detail(&row).as_str()));
+        assert!(activity_detail(&row)
+            .starts_with("Codex · reports \"Name 2.1.290 with a long build tag\" · "));
+        assert_eq!(lines.next(), Some("Client: adapter:codex"));
+        assert_eq!(lines.next(), Some("Warm catalog"));
+        assert_eq!(lines.next(), None);
+
+        row.client = None;
+        row.client_label = None;
+        row.client_id = None;
+        let tooltip = activity_detail_tooltip(&row);
+        assert!(tooltip.starts_with("Unrecorded client · "), "{tooltip}");
+        assert!(tooltip.contains("\nOlder Toolport versions did not record callers"));
+    }
 }
 
 fn secret_reference_controls(
@@ -17096,4 +17177,44 @@ fn secret_reference_fields(
         });
     });
     (choice, container, reference)
+}
+
+#[cfg(test)]
+mod client_hints_ui_tests {
+    use super::*;
+
+    fn labels(widget: &gtk::Widget) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+            out.push(label.text().to_string());
+        }
+        let mut child = widget.first_child();
+        while let Some(next) = child {
+            out.extend(labels(&next));
+            child = next.next_sibling();
+        }
+        out
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn reset_confirmation_lists_the_settings_it_adds() {
+        adw::init().unwrap();
+        let card = client_reset_settings_card(
+            "Codex",
+            &[
+                "startup_timeout_sec = 75".into(),
+                "tool_timeout_sec = 600".into(),
+            ],
+        )
+        .expect("a reset that adds settings lists them");
+        let text = labels(card.upcast_ref());
+        assert!(text
+            .iter()
+            .any(|t| t.contains("its Codex entry, each only if it is not set")));
+        assert!(text
+            .iter()
+            .any(|t| t == "startup_timeout_sec = 75\ntool_timeout_sec = 600"));
+        assert!(client_reset_settings_card("Cursor", &[]).is_none());
+    }
 }

@@ -11,8 +11,9 @@ fn fast_http_call_and_cancellation_do_not_wait_for_a_twenty_second_call() {
     let mock = http_support::HttpMock::new();
     let router = mock.router();
     let cancellations = CancelRegistry::new();
-    assert!(cancellations.begin_client_request("slow".into()));
-    let cancel = cancellations.context("slow".into());
+    let cancel = cancellations
+        .begin_client_request("slow".into())
+        .expect("begins");
     let slow = {
         let router = Arc::clone(&router);
         std::thread::spawn(move || {
@@ -430,8 +431,9 @@ fn cancelling_a_suspended_http_call_refuses_the_owned_server_request() {
         .request_with_cancel("echo", json!({"owner":"cancel-owner"}), None)
         .unwrap();
     let cancellations = CancelRegistry::new();
-    assert!(cancellations.begin_client_request("cancel".into()));
-    let cancel = cancellations.context("cancel".into());
+    let cancel = cancellations
+        .begin_client_request("cancel".into())
+        .expect("begins");
     assert!(cancellations.cancel("cancel", None));
     assert!(handle
         .request_with_cancel(

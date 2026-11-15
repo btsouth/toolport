@@ -421,6 +421,7 @@
   "Enter the URL of your self-hosted instance. For example:{value1}{value2}": "자체 호스팅 인스턴스의 URL을 입력하세요. 예:{value1}{value2}",
   "Enter the value for this machine": "이 기기에서 사용할 값 입력",
   "Enter value": "값을 입력하세요",
+  "Enter {value0} or deselect {value1}": "{value0} 값을 입력하거나 {value1} 선택을 해제하세요",
   "ENV_NAME": "ENV_NAME",
   "Environment variables": "환경변수",
   "Ephemeral, local, opt-in. While live inspection is on, Toolport keeps the last 50 tool calls' arguments and results here so you can inspect them. This buffer is separate from the audit log, never leaves your machine, and clears when you turn inspection off or restart the gateway.": "실시간 검사를 켠 동안 최근 50회 호출의 인수와 결과를 로컬에 보관합니다. 감사 로그와 별개이며 기기 밖으로 전송되지 않고 검사를 끄거나 게이트웨이를 재시작하면 지워집니다.",
@@ -1075,5 +1076,6 @@
   "T3 Code thread {id}": "T3 Code 스레드 {id}",
   "Copy thread id {id}": "스레드 ID {id} 복사",
   "Copied thread id": "스레드 ID를 복사했습니다",
-  "{client} via T3 Code, thread {thread}": "{client}(T3 Code 경유, 스레드 {thread})"
+  "{client} via T3 Code, thread {thread}": "{client}(T3 Code 경유, 스레드 {thread})",
+  "Toolport also adds these settings to its {client} entry, each only if it is not set. A setting you delete stays deleted until you connect again.": "Toolport는 {client} 설정에 있는 Toolport 항목에 이 설정들도 추가하며, 각 설정은 지정되지 않은 경우에만 추가합니다. 삭제한 설정은 다시 연결할 때까지 삭제된 상태로 유지됩니다."
 }

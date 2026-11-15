@@ -38,3 +38,23 @@ it("marks reported-only callers and explains legacy rows", () => {
   );
   expect(clientIdentityTooltip({ clientLabel: "inbox" })).toBeUndefined();
 });
+
+it("names an unlabelled modern request by its connection, never by another request", () => {
+  // A modern request without clientInfo carries no label. On a known adapter the
+  // row reads as that client; on an unknown connection it reads "Unknown client".
+  expect(trustedClientName({ client: "adapter:codex", clientName: "Codex" })).toBe(
+    "Codex",
+  );
+  expect(activityClientName({ client: "adapter:codex", clientName: "Codex" })).toBe(
+    "Codex",
+  );
+  expect(
+    trustedClientName({ client: "adapter:other", clientName: "Unknown client" }),
+  ).toBe("Unknown client");
+  expect(
+    activityClientName({ client: "adapter:other", clientName: "Unknown client" }),
+  ).toBe("Unknown client");
+  expect(
+    clientIdentityTooltip({ client: "adapter:other", clientName: "Unknown client" }),
+  ).toBeUndefined();
+});

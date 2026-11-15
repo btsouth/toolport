@@ -800,8 +800,11 @@ function CallRow({ e }: { e: AuditEntry }) {
         ? { label: msg("Succeeded"), variant: "success" }
         : { label: msg("Failed"), variant: "destructive" };
   const duration = approvalOutcome ? e.heldMs : e.durationMs;
-  const meta = [
-    ...activityClientSegments(e, (name) => hostedClientName(name, e)),
+  // The client name truncates on its own so the time and duration stay visible.
+  const clientName = activityClientSegments(e, (name) => hostedClientName(name, e)).join(
+    " · ",
+  );
+  const when = [
     fmtAgo(e.ts),
     ...(e.failureKind ? [e.failureKind.replace(/_/g, " ")] : []),
     ...(duration == null
@@ -812,6 +815,7 @@ function CallRow({ e }: { e: AuditEntry }) {
             : fmtMs(duration),
         ]),
   ].join(" · ");
+  const meta = [clientName, when].filter(Boolean).join(" · ");
   const hasDetail = !approvalOutcome && !e.ok && (!!e.error || !!e.runId);
   return (
     <div
@@ -864,7 +868,7 @@ function CallRow({ e }: { e: AuditEntry }) {
               )}
             </div>
             <div
-              className="mt-1 break-words text-meta text-muted-foreground @xl:truncate"
+              className="mt-1 break-words text-meta text-muted-foreground @xl:flex @xl:min-w-0 @xl:overflow-hidden @xl:whitespace-nowrap"
               title={[
                 meta,
                 clientIdentityTooltip(e),
@@ -878,9 +882,13 @@ function CallRow({ e }: { e: AuditEntry }) {
               ]
                 .filter(Boolean)
                 .join(" · ")}
-              dir="auto"
             >
-              {meta}
+              <span className="@xl:min-w-0 @xl:truncate" dir="auto">
+                {clientName}
+              </span>
+              <span className="@xl:shrink-0 @xl:whitespace-pre">
+                {clientName ? ` · ${when}` : when}
+              </span>
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2 @xl:shrink-0 @xl:flex-nowrap">

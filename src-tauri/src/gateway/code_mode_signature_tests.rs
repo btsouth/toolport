@@ -99,6 +99,8 @@ fn split_search(text: &str) -> (&str, Value) {
 /// Blocking requirement: with Code Mode off, search output and tools/list are the
 /// exact bytes `main` produced before signatures existed. The digests were captured
 /// from origin/main (49614543f) with this same test body.
+/// The tools/list digests were updated once for this branch's `anthropic/alwaysLoad`
+/// on Toolport's meta-tools; the search digest is unchanged.
 #[test]
 fn code_mode_off_search_and_tools_list_are_byte_for_byte_unchanged() {
     let _data = DataDirTestEnv::new("code-mode-off-search-unchanged");
@@ -119,8 +121,8 @@ fn code_mode_off_search_and_tools_list_are_byte_for_byte_unchanged() {
         [sha256_hex(&searches), sha256_hex(&lazy), sha256_hex(&full)],
         [
             "8f4f9904eebf070a0810daea357b04056513f3ddf4e89fb442aff22b3b9761fa".to_string(),
-            "8c8e04fc38b5f24e49b6c0c53169da9718129f2a42b65d074f988a1b701d8741".to_string(),
-            "2230a54cc8268f9b40b16ecde95f134ecdd44b67bf397ac2b82456dd0d3d8c4f".to_string(),
+            "c1014053103ee9f76fa161ff9a60654e984f4717c0bb94518c2cfab5dc488052".to_string(),
+            "f68ebfb55064ce074f03ada89d30f0cbaf712f77df1fabc96b2a0c1f884e4db3".to_string(),
         ],
         "Code Mode off output changed"
     );

@@ -99,7 +99,7 @@ impl ApprovalNotification {
             self.shown.get(),
             "toolport",
             title,
-            glib::markup_escape_text(body).as_str(),
+            crate::approval_broker::notification_body_markup(body).as_str(),
             vec!["default".to_string(), crate::i18n::tr("Review")],
             hints,
             -1i32,

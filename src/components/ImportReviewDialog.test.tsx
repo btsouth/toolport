@@ -90,6 +90,29 @@ describe("ImportReviewDialog", () => {
     expect(screen.getByRole("button", { name: "Connect" })).toBeEnabled();
   });
 
+  it("gives disclosures and server cards the same hover and focus ring as buttons", () => {
+    renderDialog({
+      items: [
+        {
+          ...items()[0],
+          name: "Calendar",
+          credentials: [{ key: "PAT", secret: true, present: false, required: true }],
+        },
+      ],
+      details: "Config: /fixture/config",
+      requireCredentials: true,
+    });
+    const toggles = [
+      screen.getByText("Details"),
+      screen.getByText("Calendar credentials and settings"),
+      screen.getByRole("button", { name: /Calendar/ }),
+    ];
+    for (const toggle of toggles) {
+      expect(toggle).toHaveClass("focus-visible:ring-3", "focus-visible:ring-ring/50");
+      expect(toggle.className).toMatch(/(^|\s)hover:bg-muted/);
+    }
+  });
+
   it("permits optional missing values and add flows", async () => {
     renderDialog({
       items: [

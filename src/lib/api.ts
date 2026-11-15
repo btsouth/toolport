@@ -1086,6 +1086,11 @@ export function previewClientSetup(
   return invoke("preview_client_setup", { clientId });
 }
 
+/** The client settings a connect or reset adds to Toolport's entry, as TOML lines. */
+export function previewGatewaySettings(clientId: string): Promise<string[]> {
+  return invoke("preview_gateway_settings", { clientId });
+}
+
 export function addSnippetServers(
   text: string,
   selected: string[],

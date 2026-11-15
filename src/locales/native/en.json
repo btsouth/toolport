@@ -320,7 +320,6 @@
   "Enter a value first.": "Enter a value first.",
   "Enter both a variable name and a secret value.": "Enter both a variable name and a secret value.",
   "Enter the sync service URL and manual code": "Enter the sync service URL and manual code",
-  "Enter {value0} or deselect {value1}": "Enter {value0} or deselect {value1}",
   "Enter {value0}. This value is used only for the selected server. It is saved only if connection succeeds.": "Enter {value0}. This value is used only for the selected server. It is saved only if connection succeeds.",
   "Environment / credential keys": "Environment / credential keys",
   "Every device keeps syncing for {count} more days": "Every device keeps syncing for {count} more days",

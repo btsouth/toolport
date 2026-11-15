@@ -219,6 +219,9 @@ pub(super) fn status_badge(client: &state::ClientView) -> gtk::Label {
     badge
 }
 
+/// The width a row's logo and text keep before its controls wrap below them.
+const ROW_MIN_TEXT: i32 = 220;
+
 /// One client: name and a one-line detail on the left, its controls on the right.
 pub(super) fn client_row(
     client: &state::ClientView,
@@ -231,13 +234,14 @@ pub(super) fn client_row(
     if style == RowStyle::Profile {
         card.add_css_class("toolport-client-profile");
     }
-    let line = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    card.append(&line);
-    if style != RowStyle::Profile {
+    // The logo and text; the controls join them on one line in a HeaderWrap.
+    let lead = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    let logo = (style != RowStyle::Profile).then(|| {
         let icon = branding::client_logo(&client.id);
         icon.set_valign(gtk::Align::Center);
-        line.append(&icon);
-    }
+        lead.append(&icon);
+        icon.upcast::<gtk::Widget>()
+    });
     let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
     copy.set_hexpand(true);
     copy.set_valign(gtk::Align::Center);
@@ -307,7 +311,7 @@ pub(super) fn client_row(
         l10n::bind_tooltip_with(&detail, move || client_detail(&client, style).1);
     }
     copy.append(&detail);
-    line.append(&copy);
+    lead.append(&copy);
 
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     controls.add_css_class("toolport-client-controls");
@@ -361,9 +365,10 @@ pub(super) fn client_row(
     {
         controls.append(&remove_location_button(client, page.clone()));
     }
-    if controls.first_child().is_some() {
-        line.append(&controls);
-    }
+    controls.set_visible(controls.first_child().is_some());
+    // Narrow windows move the controls under the text instead of cutting them off.
+    let line = super::page_header::HeaderWrap::row(&lead, &controls, ROW_MIN_TEXT, logo.as_ref());
+    card.prepend(&line);
     if client.legacy_bearer_argv {
         let warning = l10n::label("This older HTTP connection exposes a bearer credential in process arguments. Review migration to stdio; it stays unchanged until you confirm.");
         warning.set_wrap(true);

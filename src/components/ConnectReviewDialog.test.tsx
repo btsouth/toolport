@@ -1,5 +1,6 @@
 import { beforeEach, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
+import { useState } from "react";
 import userEvent from "@testing-library/user-event";
 import { ConnectReviewDialog } from "./ConnectReviewDialog";
 const api = vi.hoisted(() => ({ previewClientSetup: vi.fn(), migrateClient: vi.fn() }));
@@ -106,4 +107,120 @@ it("shows downstream tool counts and only Done on success", async () => {
     screen.queryByRole("button", { name: "Open Credentials" }),
   ).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Done" })).toBeVisible();
+});
+
+it("shows the Codex settings Toolport will add before connecting", async () => {
+  api.previewClientSetup.mockResolvedValue({
+    configPath: "/fixture/config.toml",
+    backupDir: "/fixture/backups",
+    revision: "reviewed",
+    items: [],
+    gatewaySettings: ["supports_parallel_tool_calls = true", "tool_timeout_sec = 600"],
+  });
+  render(
+    <ConnectReviewDialog
+      clientId="codex"
+      clientName="Codex"
+      onClose={vi.fn()}
+      onConnected={vi.fn()}
+    />,
+  );
+  const notice = await screen.findByText(/each only if it is not set/);
+  expect(notice).toBeVisible();
+  expect(notice).toHaveTextContent(
+    "A setting you delete stays deleted until you connect again.",
+  );
+  expect(screen.getByText("supports_parallel_tool_calls = true")).toBeVisible();
+  expect(screen.getByText("tool_timeout_sec = 600")).toBeVisible();
+  // A setting line has few spaces; it must break anywhere rather than run out of
+  // the notice at narrow widths.
+  expect(screen.getByText("tool_timeout_sec = 600").closest("ul")).toHaveClass(
+    "wrap-anywhere",
+  );
+});
+
+it("lists no settings for a client that gets none", async () => {
+  render(
+    <ConnectReviewDialog
+      clientId="fixture"
+      clientName="Fixture"
+      onClose={vi.fn()}
+      onConnected={vi.fn()}
+    />,
+  );
+  await screen.findByRole("button", { name: /one/ });
+  expect(screen.queryByText(/each only if it is not set/)).not.toBeInTheDocument();
+});
+
+function Opener({ onConnected = vi.fn() }: { onConnected?: () => void }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button type="button" onClick={() => setOpen(true)}>
+        Connect Fixture
+      </button>
+      {open && (
+        <ConnectReviewDialog
+          clientId="fixture"
+          clientName="Fixture"
+          onClose={() => setOpen(false)}
+          onConnected={onConnected}
+        />
+      )}
+    </>
+  );
+}
+
+it("opens on Cancel and returns focus to the opener after Escape or Cancel", async () => {
+  render(<Opener />);
+  const opener = screen.getByRole("button", { name: "Connect Fixture" });
+  await userEvent.click(opener);
+  await screen.findByRole("button", { name: /one/ });
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus(),
+  );
+  await userEvent.keyboard("{Escape}");
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  await waitFor(() => expect(opener).toHaveFocus());
+
+  await userEvent.click(opener);
+  await screen.findByRole("button", { name: /one/ });
+  await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  await waitFor(() => expect(opener).toHaveFocus());
+});
+
+it("returns focus to the opener after Done", async () => {
+  api.migrateClient.mockResolvedValue({
+    registry: { servers: [] },
+    outcome: { path: "/fixture/config", backup: null },
+    tools: [],
+    servers: [],
+  });
+  render(<Opener />);
+  const opener = screen.getByRole("button", { name: "Connect Fixture" });
+  await userEvent.click(opener);
+  await screen.findByRole("button", { name: /one/ });
+  await userEvent.click(screen.getByRole("button", { name: "Connect to Toolport" }));
+  await userEvent.click(await screen.findByRole("button", { name: "Done" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  await waitFor(() => expect(opener).toHaveFocus());
+});
+
+it("keeps focus in the dialog and turns Close off while the check runs", async () => {
+  api.migrateClient.mockReturnValue(new Promise(() => {}));
+  render(<Opener />);
+  await userEvent.click(screen.getByRole("button", { name: "Connect Fixture" }));
+  await screen.findByRole("button", { name: /one/ });
+  const connect = screen.getByRole("button", { name: "Connect to Toolport" });
+  await userEvent.click(connect);
+  expect(
+    await screen.findByRole("button", { name: "Checking gateway..." }),
+  ).toBeDisabled();
+  const dialog = screen.getByRole("dialog");
+  expect(dialog).toHaveFocus();
+  expect(screen.getByRole("button", { name: "Close" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
+  await userEvent.keyboard("{Escape}");
+  expect(screen.getByRole("dialog")).toBeInTheDocument();
 });

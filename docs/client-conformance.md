@@ -64,6 +64,100 @@ The fixture replay covers small structured results, oversized structured results
 and cursor retrieval through the real adapter and daemon. It does not claim
 acceptance by an authenticated Claude Code or other client application.
 
+## Client hints in tools/list
+
+Toolport adds two vendor-prefixed `_meta` keys that Claude Code reads
+([MCP docs](https://code.claude.com/docs/en/mcp)). Other clients ignore them, so they
+are sent to every client.
+
+- `anthropic/alwaysLoad: true` on `toolport_search_tools`, `toolport_call_tool`,
+  `toolport_fetch_result` and, with Code Mode on, `toolport_run_script`. Claude Code
+  (v2.1.285+) defers MCP tool schemas behind its own tool search; with this key the
+  model can search, call and page a trimmed result without first searching Claude's
+  index for Toolport's tools. `toolport_status` and `help_<server>` stay deferred. The
+  key adds 38 bytes per marked tool.
+- `anthropic/maxResultSizeChars` when Toolport lets results through that are larger
+  than Claude Code's 50,000-character file threshold: a `TOOLPORT_RESULT_BUDGET` or
+  per-server result budget above 50,000 bytes, or `0` (never shape). The value is the
+  byte budget, capped at Claude's 500,000 ceiling. Claude counts UTF-16 characters of
+  the text, and UTF-16 never has more units than UTF-8 has bytes, so text within the
+  byte budget is never saved to a file. `toolport_call_tool` gets the largest budget
+  among the servers the client may reach, `toolport_fetch_result` and
+  `toolport_run_script` the global budget, and a directly listed tool its server's
+  budget unless the server set the key itself. With default budgets nothing is added.
+  A result budget change rebuilds the router and sends `tools/list_changed`.
+
+  Each meta-tool's text stays within the budget it advertises. A
+  `toolport_fetch_result` page stops when the whole reply, serialized, would pass the
+  budget in bytes (text counted as it encodes, envelope and footer included), even
+  when a caller asks for a longer `len`. A projection larger than the budget comes
+  back shaped like any other large result, with a cursor to page the projected JSON
+  (projections exist to cut a result down, so they follow the same budget). Script
+  results and failures are shaped with the global budget, and a successful
+  `toolport_call_tool` result gets no Toolport text after shaping. The budget counts
+  text as the result encodes it, so heavily escaped text (backslashes, quotes,
+  control characters) is shaped like any other text. A page cut by the budget says
+  so in its footer, and a shaped projection says its text is a fragment, not
+  complete JSON. Error replies quote at most a short preview of the cursor or
+  projection they were given. A result with non-text blocks (images, audio, resource
+  links) keeps every one of them in place and in order; only its text is cut, to the
+  room the kept blocks and envelope leave, and the full text stays fetchable through
+  the cursor. A result passes through whole only when its kept blocks and envelope
+  alone cannot fit the budget; it is then not budget-bound, and Claude's own file
+  fallback applies above the advertised size.
+
+  A cursor stays fetchable for 15 minutes after it was issued or last fetched, so a
+  model paging a large result keeps it while it reads, but never more than 2 hours
+  after it was issued. The most recent results (up to 64, and 64 MiB) are held in
+  memory; a result too large for that, or pushed out by newer ones, moves to a file
+  under `result-spill/` in the data directory for the rest of its time. Each file is
+  readable only by the current user (0600 on Unix, an owner-only ACL on Windows) and
+  sealed with a key the gateway holds only in memory, so it is unreadable once that
+  gateway exits. Each gateway holds a lock file in its spill directory, and a starting
+  gateway removes only directories whose lock is free. Files go when their result
+  expires, when the gateway exits normally, and, for gateways that crashed or were
+  killed, when the next gateway starts. A file that fails to delete still counts
+  against the disk cap until a retry removes it. Only a result past the 512 MiB disk
+  cap gets no cursor, and its reply says it was too large and asks for a narrower
+  call. A result that cannot be written to disk stays in memory, so a cursor already
+  handed out is not lost; memory may then grow to twice the limits above, and past
+  that a new result gets no cursor and its reply says it could not be stored. If the
+  gateway cannot generate its sealing key, nothing is written to disk. Both cases are
+  noted in `toolport_status`.
+
+Drift fingerprints and the listed-catalog digest do not cover `_meta`, so these keys
+never cause drift warnings or extra list notifications.
+
+Modern (`2026-07-28`) clients send no `initialize`, so Toolport reads the client's name
+and version from `params._meta["io.modelcontextprotocol/clientInfo"]` on each request,
+on stdio, through the stdio adapter and daemon, and on HTTP. A caller that sends
+several identities over one connection gets each request labelled as itself. A modern
+request without the key has no label, never another request's: Approvals and Activity
+name it by its connection, such as "Codex", or "Unknown client" when the connection
+has no trusted name. A handshake-era request without one uses the label its
+connection's `initialize` reported. Approvals and Activity show labels the same way
+as a legacy client's `clientInfo`.
+
+A request the client cancels gets no reply and no further progress, on the plain
+stdio loop, over HTTP and through the stdio adapter alike, in both protocol eras: the
+handshake-era spec says a receiver should not answer a cancelled request, and the
+`2026-07-28` stdio transport forbids further messages for it. Over HTTP the cancelled
+request's POST ends with an empty `202`. A cancellation that arrives after the reply
+changes nothing. A cancelled call that is waiting on an approval prompt withdraws the
+prompt. Cancellation belongs to the request, not its id: a client that reuses a
+cancelled request's id before that call finishes gets the new request's reply and
+never the old one's, and can cancel the new request too. A dropped HTTP connection
+cancels only the request it carried. Through the stdio adapter, a request cancelled
+before the adapter sent it is never sent; one cancelled while it is being sent is
+cancelled at the gateway even if the cancellation gets there first, so a cancelled
+tool call does not run. `initialize` cannot be cancelled, as MCP requires, so a
+cancellation for it is ignored and its reply still arrives.
+
+Codex config keys Toolport writes for its own entry are listed in
+[docs/clients.md](clients.md#codex-setup-walkthrough). Every Toolport meta-tool input
+schema stays under Codex's default 5,000-byte `tool_input_schema_max_bytes`, so Codex
+keeps their parameter descriptions; a gateway test enforces it.
+
 ## Tool name budgets
 
 Client profiles in `clients.rs` declare combined name budgets. Cursor has a

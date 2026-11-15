@@ -421,6 +421,7 @@
   "Enter the URL of your self-hosted instance. For example:{value1}{value2}": "Saisissez l'URL de votre instance auto-hébergée. Par exemple :{value1}{value2}",
   "Enter the value for this machine": "Entrez la valeur pour cette machine",
   "Enter value": "Entrez la valeur",
+  "Enter {value0} or deselect {value1}": "Entrez {value0} ou désélectionnez {value1}",
   "ENV_NAME": "ENV_NAME",
   "Environment variables": "Variables d'environnement",
   "Ephemeral, local, opt-in. While live inspection is on, Toolport keeps the last 50 tool calls' arguments and results here so you can inspect them. This buffer is separate from the audit log, never leaves your machine, and clears when you turn inspection off or restart the gateway.": "Temporaire, local et sur activation volontaire. Lorsque l'inspection en direct est active, Toolport conserve ici les arguments et résultats des 50 derniers appels d'outils pour consultation. Ce tampon est distinct du journal d'audit, ne quitte jamais votre machine et s'efface lorsque vous désactivez l'inspection ou redémarrez la passerelle.",
@@ -1075,5 +1076,6 @@
   "T3 Code thread {id}": "Fil T3 Code {id}",
   "Copy thread id {id}": "Copier l'identifiant du fil {id}",
   "Copied thread id": "Identifiant du fil copié",
-  "{client} via T3 Code, thread {thread}": "{client} via T3 Code, fil {thread}"
+  "{client} via T3 Code, thread {thread}": "{client} via T3 Code, fil {thread}",
+  "Toolport also adds these settings to its {client} entry, each only if it is not set. A setting you delete stays deleted until you connect again.": "Toolport ajoute aussi ces réglages à son entrée {client}, chacun seulement s'il n'est pas défini. Un réglage que vous supprimez reste supprimé jusqu'à votre prochaine connexion."
 }

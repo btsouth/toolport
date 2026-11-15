@@ -19,6 +19,7 @@ import {
   importServers,
   previewImportServers,
   installGateway,
+  previewGatewaySettings,
   setClientDiscovery,
   uninstallGateway,
   removeClientLocation,
@@ -47,6 +48,7 @@ import {
 } from "@/components/ui/select";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ConnectReviewDialog } from "@/components/ConnectReviewDialog";
+import { GatewaySettingsNotice } from "@/components/GatewaySettingsNotice";
 import { ImportReviewDialog } from "@/components/ImportReviewDialog";
 import { clientRestartHint, clientRestartHintAfterRemoval } from "@/lib/clientConnect";
 import { clientDiscovery } from "@/lib/clientDiscovery";
@@ -77,6 +79,33 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   const [profile, setProfile] = useState("");
   const [migrateOpen, setMigrateOpen] = useState(false);
   const [resetOpen, setResetOpen] = useState(false);
+  // Each opening of the reset confirmation reads the settings it would add, so the
+  // confirmation lists them as the connect review does.
+  const [resetRequest, setResetRequest] = useState(0);
+  const [resetSettings, setResetSettings] = useState<{
+    request: number;
+    lines: string[];
+  } | null>(null);
+  const resetSettingsReady = resetSettings?.request === resetRequest;
+  function changeResetOpen(open: boolean) {
+    if (open && !resetOpen) setResetRequest((request) => request + 1);
+    setResetOpen(open);
+  }
+  useEffect(() => {
+    if (!resetRequest) return;
+    let active = true;
+    previewGatewaySettings(client.id)
+      .then((lines) => {
+        if (active) setResetSettings({ request: resetRequest, lines });
+      })
+      .catch(() => {
+        // Never block the reset on the list; the reset itself reports errors.
+        if (active) setResetSettings({ request: resetRequest, lines: [] });
+      });
+    return () => {
+      active = false;
+    };
+  }, [resetRequest, client.id]);
   const installed = client.gatewayInstalled;
   const customized = client.entryState === "customized";
   const legacyBearer = client.servers.some(hasLegacyBearerArgv);
@@ -198,7 +227,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   async function applyScope() {
     if (customized) {
       // Must not silently overwrite a hand-edited entry (SOU-406).
-      setResetOpen(true);
+      changeResetOpen(true);
       return;
     }
     setBusy(true);
@@ -503,7 +532,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           {(customized || legacyBearer) && (
             <ConfirmDialog
               open={resetOpen}
-              onOpenChange={setResetOpen}
+              onOpenChange={changeResetOpen}
               trigger={
                 <Button size="sm" variant="default" disabled={busy || !!client.error}>
                   <Check className="size-4" />
@@ -520,14 +549,27 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                     })
               }
               description={
-                legacyBearer
-                  ? translate(
-                      "Toolport backs up the config before replacing the older HTTP connection with its standard stdio command. Other MCP servers stay in place. Any customized Toolport command, arguments and headers will be replaced; review those changes before confirming. Restart the client afterward.",
-                    )
-                  : translate(
-                      "This overwrites the hand-edited toolport entry with the standard stdio gateway command. Your other MCP servers are left alone.",
-                    )
+                <>
+                  <p>
+                    {legacyBearer
+                      ? translate(
+                          "Toolport backs up the config before replacing the older HTTP connection with its standard stdio command. Other MCP servers stay in place. Any customized Toolport command, arguments and headers will be replaced; review those changes before confirming. Restart the client afterward.",
+                        )
+                      : translate(
+                          "This overwrites the hand-edited toolport entry with the standard stdio gateway command. Your other MCP servers are left alone.",
+                        )}
+                  </p>
+                  {resetSettingsReady && (
+                    <div className="mt-3 text-popover-foreground">
+                      <GatewaySettingsNotice
+                        clientName={client.name}
+                        lines={resetSettings.lines}
+                      />
+                    </div>
+                  )}
+                </>
               }
+              confirmDisabled={!resetSettingsReady}
               confirmLabel={
                 legacyBearer
                   ? translate(msg("Migrate to stdio"))

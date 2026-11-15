@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::downstream::{CancelContext, CancelRegistry};
@@ -12,13 +12,13 @@ pub struct HostCalls(Arc<Mutex<State>>);
 struct State {
     registry: CancelRegistry,
     next: u64,
-    active: HashSet<String>,
+    active: HashMap<u64, CancelContext>,
     stopped: bool,
 }
 
 pub struct HostCall {
     owner: HostCalls,
-    id: String,
+    id: u64,
     pub context: CancelContext,
 }
 
@@ -28,16 +28,20 @@ impl HostCalls {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let id = state.next.to_string();
+        let id = state.next;
         state.next += 1;
-        state.registry.begin_client_request(id.clone());
-        state.active.insert(id.clone());
+        // Ids are never reused and the registry is never closed, so this begins.
+        let context = state
+            .registry
+            .begin_client_request(id.to_string())
+            .expect("a fresh host call id begins");
         if state.stopped {
-            state.registry.cancel(&id, Some("code mode worker stopped"));
+            context.cancel(Some("code mode worker stopped"));
         }
+        state.active.insert(id, context.clone());
         HostCall {
             owner: self.clone(),
-            context: state.registry.context(id.clone()),
+            context,
             id,
         }
     }
@@ -48,8 +52,8 @@ impl HostCalls {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.stopped = true;
-        for id in &state.active {
-            state.registry.cancel(id, Some("code mode worker stopped"));
+        for context in state.active.values() {
+            context.cancel(Some("code mode worker stopped"));
         }
     }
 }
@@ -62,7 +66,7 @@ impl Drop for HostCall {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.active.remove(&self.id);
-        state.registry.finish_client_request(&self.id);
+        self.context.finish();
     }
 }
 

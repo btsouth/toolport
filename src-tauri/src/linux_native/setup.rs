@@ -66,6 +66,87 @@ pub(super) fn review(
         + Sync
         + 'static,
     finished: impl Fn() + 'static,
+    credential_page: Option<super::ServerPage>,
+) {
+    review_with_notice(
+        parent,
+        title,
+        items,
+        disclosure,
+        None,
+        confirm_label,
+        require_credentials,
+        action,
+        finished,
+        credential_page,
+    );
+}
+
+/// The sentence and TOML lines a connect review shows for the client settings
+/// Toolport adds to its own entry, or `None` when it adds none.
+pub(super) fn gateway_settings_notice(
+    client_name: &str,
+    settings: &[String],
+) -> Option<(String, String)> {
+    (!settings.is_empty()).then(|| {
+        (
+            crate::i18n::trf(
+                "Toolport also adds these settings to its {client} entry, each only if it is not set. A setting you delete stays deleted until you connect again.",
+                &[("client", client_name)],
+            ),
+            settings.join("\n"),
+        )
+    })
+}
+
+/// The card that shows the gateway settings notice. Its text stays selectable
+/// by mouse but is not a Tab stop, so tabbing never selects the whole sentence.
+pub(super) fn gateway_settings_card(sentence: &str, lines: &str) -> gtk::Box {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    card.set_widget_name("toolport-setup-gateway-settings");
+    card.add_css_class("card");
+    for (text, monospace) in [(sentence, false), (lines, true)] {
+        let label = gtk::Label::builder()
+            .label(text)
+            .xalign(0.0)
+            .wrap(true)
+            .selectable(true)
+            .focusable(false)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+        if monospace {
+            // A long setting has no spaces to break at; let it break anywhere.
+            label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+            label.add_css_class("monospace");
+            label.set_margin_bottom(12);
+        } else {
+            label.set_margin_top(12);
+        }
+        card.append(&label);
+    }
+    card
+}
+
+/// [`review`] with a notice shown under the lede, before the user confirms.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn review_with_notice(
+    parent: &gtk::Window,
+    title: &str,
+    items: Vec<SetupItem>,
+    disclosure: &str,
+    notice: Option<(String, String)>,
+    confirm_label: &'static str,
+    require_credentials: bool,
+    action: impl Fn(
+            Vec<String>,
+            std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+            std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+        ) -> Result<Completion, String>
+        + Send
+        + Sync
+        + 'static,
+    finished: impl Fn() + 'static,
     _credential_page: Option<super::ServerPage>,
 ) {
     let dialog = adw::Window::builder()
@@ -103,6 +184,10 @@ pub(super) fn review(
         widget
     };
     body.append(&lede);
+    let notice = notice.map(|(sentence, lines)| gateway_settings_card(&sentence, &lines));
+    if let Some(card) = &notice {
+        body.append(card);
+    }
     let rows = gtk::ListBox::new();
     rows.set_selection_mode(gtk::SelectionMode::None);
     rows.add_css_class("boxed-list");
@@ -509,7 +594,7 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
         );
         let credential_choices = credential_choices.clone();
         let refresh_confirm = refresh_confirm.clone();
-        let (feedback, button, cancel, body, rows, details, lede) = (
+        let (feedback, button, cancel, body, rows, details, lede, notice) = (
             feedback.clone(),
             button.clone(),
             cancel.clone(),
@@ -517,6 +602,7 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
             rows.clone(),
             details.clone(),
             lede.clone(),
+            notice.clone(),
         );
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || action(chosen, choices, inputs)).await;
@@ -551,6 +637,11 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                     rows.set_visible(false);
                     details.set_visible(false);
                     lede.set_visible(false);
+                    // The notice describes what connecting will do; the result
+                    // page says what happened, as React's does.
+                    if let Some(notice) = &notice {
+                        notice.set_visible(false);
+                    }
                     feedback.set_visible(false);
                     let status = adw::StatusPage::builder()
                         .icon_name("emblem-ok-symbolic")
@@ -693,11 +784,13 @@ pub(super) fn connect(
                         ("value1", &preview.backup_dir.to_string()),
                     ],
                 );
-                review(
+                let notice = gateway_settings_notice(&client_name, &preview.gateway_settings);
+                review_with_notice(
                     &parent,
                     &crate::i18n::tr("Review and connect"),
                     preview.items,
                     &disclosure,
+                    notice,
                     crate::i18n::msg("Connect to Toolport"),
                     true,
                     move |selected, choices, inputs| {
@@ -769,6 +862,99 @@ mod tests {
             .find(|w| w.title().as_deref() == Some("Could not review setup"))
             .unwrap()
     }
+    #[test]
+    fn connect_review_names_the_codex_settings_it_adds() {
+        let (sentence, lines) = gateway_settings_notice(
+            "Codex",
+            &[
+                "supports_parallel_tool_calls = true".into(),
+                "tool_timeout_sec = 600".into(),
+            ],
+        )
+        .unwrap();
+        assert!(sentence.contains("Codex entry, each only if it is not set"));
+        assert!(sentence.contains("A setting you delete stays deleted until you connect again."));
+        assert_eq!(
+            lines,
+            "supports_parallel_tool_calls = true\ntool_timeout_sec = 600"
+        );
+        assert!(gateway_settings_notice("Cursor", &[]).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn gateway_settings_notice_is_selectable_but_not_a_tab_stop() {
+        adw::init().unwrap();
+        let long = format!("tool_timeout_sec = {}", "9".repeat(190));
+        let card = gateway_settings_card("Toolport also adds these settings.", &long);
+        let labels = descendants(card.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .collect::<Vec<_>>();
+        assert_eq!(labels.len(), 2);
+        for label in &labels {
+            assert!(label.is_selectable(), "{} stays selectable", label.text());
+            assert!(!label.is_focusable(), "{} is not a Tab stop", label.text());
+        }
+        let lines = labels
+            .iter()
+            .find(|l| l.has_css_class("monospace"))
+            .unwrap();
+        assert!(lines.wraps());
+        assert_eq!(lines.wrap_mode(), gtk::pango::WrapMode::WordChar);
+        let (min, _, _, _) = card.measure(gtk::Orientation::Horizontal, -1);
+        assert!(
+            min < 400,
+            "a long setting line must not widen the notice: {min}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn connected_page_drops_the_gateway_settings_notice() {
+        adw::init().unwrap();
+        let parent = gtk::Window::new();
+        review_with_notice(
+            &parent,
+            "Notice success fixture",
+            Vec::new(),
+            "Fixture",
+            gateway_settings_notice("Codex", &["tool_timeout_sec = 600".into()]),
+            "Connect",
+            true,
+            |_, _, _| Ok("Codex connected. Restart it to load Toolport.".into()),
+            || {},
+            None,
+        );
+        let window = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .find(|w| w.title().as_deref() == Some("Notice success fixture"))
+            .unwrap();
+        let notice = || {
+            descendants(window.upcast_ref())
+                .into_iter()
+                .find(|w| w.widget_name() == "toolport-setup-gateway-settings")
+                .unwrap()
+        };
+        assert!(notice().is_visible(), "the review shows the notice");
+        let connect = descendants(window.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .find(|b| b.label().as_deref() == Some("Connect"))
+            .unwrap();
+        connect.emit_clicked();
+        let context = gtk::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while connect.label().as_deref() != Some("Done") && std::time::Instant::now() < deadline {
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+        assert_eq!(connect.label().as_deref(), Some("Done"));
+        assert!(!notice().is_visible(), "the connected page has no notice");
+        window.close();
+    }
+
     #[test]
     #[ignore = "requires isolated GTK display"]
     fn close_action_closes_review_error() {

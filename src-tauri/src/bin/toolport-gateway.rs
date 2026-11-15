@@ -1473,7 +1473,8 @@ fn search_tool_def() -> Value {
             },
             "required": ["query"],
             "additionalProperties": false
-        }
+        },
+        "_meta": { CLAUDE_ALWAYS_LOAD_META: true }
     })
 }
 
@@ -1500,7 +1501,8 @@ fn call_tool_def() -> Value {
             },
             "required": ["name"],
             "additionalProperties": false
-        }
+        },
+        "_meta": { CLAUDE_ALWAYS_LOAD_META: true }
     })
 }
 
@@ -1579,7 +1581,8 @@ fn run_script_tool_def() -> Value {
             },
             "required": ["script"],
             "additionalProperties": false
-        }
+        },
+        "_meta": { CLAUDE_ALWAYS_LOAD_META: true }
     })
 }
 
@@ -1598,8 +1601,123 @@ fn fetch_result_tool_def() -> Value {
             },
             "required": ["cursor"],
             "additionalProperties": false
-        }
+        },
+        "_meta": { CLAUDE_ALWAYS_LOAD_META: true }
     })
+}
+
+/// Claude Code defers MCP tool schemas behind its own tool search and loads a tool
+/// upfront when its `tools/list` entry sets this `_meta` key to `true`
+/// (code.claude.com/docs/en/mcp, v2.1.285+). Search, call, fetch-result and
+/// run-script carry it: in Lazy mode the model needs search and call before it can
+/// reach anything else, and a trimmed result names toolport_fetch_result, which must be
+/// callable without another lookup. Status and help_<server> stay deferred. The key is
+/// vendor-prefixed, so other clients ignore it.
+const CLAUDE_ALWAYS_LOAD_META: &str = "anthropic/alwaysLoad";
+
+/// Claude Code saves a text result longer than this many characters to a file unless
+/// the tool's `tools/list` entry raises the threshold with this `_meta` key, up to
+/// [`CLAUDE_RESULT_CHARS_CEILING`].
+const CLAUDE_RESULT_SIZE_META: &str = "anthropic/maxResultSizeChars";
+const CLAUDE_RESULT_CHARS_DEFAULT: usize = 50_000;
+const CLAUDE_RESULT_CHARS_CEILING: usize = 500_000;
+
+/// The `anthropic/maxResultSizeChars` value for a shaping budget, or `None` when Claude
+/// Code's default already covers every result the budget lets through. The budget counts
+/// serialized bytes and Claude counts text characters; bytes bound characters from
+/// above, so advertising the byte budget is safe. `0` never shapes, so it gets the
+/// ceiling.
+fn claude_result_size_hint(budget: usize) -> Option<usize> {
+    match budget {
+        0 => Some(CLAUDE_RESULT_CHARS_CEILING),
+        budget if budget > CLAUDE_RESULT_CHARS_DEFAULT => {
+            Some(budget.min(CLAUDE_RESULT_CHARS_CEILING))
+        }
+        _ => None,
+    }
+}
+
+/// Shaping budgets for one `tools/list` view, used to raise Claude Code's result
+/// threshold where Toolport lets larger results through than Claude's default.
+struct ResultSizeHints {
+    /// `TOOLPORT_RESULT_BUDGET`, or the default. Fetch-result pages and script
+    /// results are shaped with it.
+    global: usize,
+    /// Per-server `resultBudgets`, keyed like `defend_and_shape` reads them.
+    servers: HashMap<String, usize>,
+    /// The largest budget among the servers this view may call, which bounds every
+    /// `toolport_call_tool` result.
+    call: usize,
+}
+
+impl ResultSizeHints {
+    fn new(reg: &Registry, allowed: Option<&HashSet<String>>) -> Self {
+        let (global, _warning) = shaping::budget();
+        let servers: HashMap<String, usize> = reg
+            .result_budgets
+            .iter()
+            .map(|(server, &budget)| (server.clone(), budget as usize))
+            .collect();
+        // 0 means never shape, which is larger than any byte budget. Counting a
+        // configured server the router does not serve right now only raises the
+        // threshold; results stay capped by their real budget either way.
+        let larger = |a: usize, b: usize| if a == 0 || b == 0 { 0 } else { a.max(b) };
+        let call = reg
+            .servers
+            .iter()
+            .filter(|server| {
+                !clients::is_gateway_server(server)
+                    && allowed.is_none_or(|scope| server_in_allowed_scope(&server.id, scope))
+            })
+            .filter_map(|server| servers.get(&sanitize_segment(&server.id)).copied())
+            .fold(global, larger);
+        Self {
+            global,
+            servers,
+            call,
+        }
+    }
+
+    /// Add `anthropic/maxResultSizeChars` to one listed tool when its results can exceed
+    /// Claude Code's default. An upstream tool that already set the key keeps its value.
+    fn apply(&self, tool: &mut Value, router: &Router) {
+        let Some(name) = tool.get("name").and_then(Value::as_str) else {
+            return;
+        };
+        let budget = match name {
+            "toolport_call_tool" => self.call,
+            "toolport_fetch_result" | "toolport_run_script" => self.global,
+            "toolport_status" | "toolport_search_tools" => return,
+            _ => match router.route_of(name) {
+                Some((server, _)) => self
+                    .servers
+                    .get(&sanitize_segment(server))
+                    .copied()
+                    .unwrap_or(self.global),
+                None => return,
+            },
+        };
+        let Some(chars) = claude_result_size_hint(budget) else {
+            return;
+        };
+        let Some(map) = tool.as_object_mut() else {
+            return;
+        };
+        if let Some(meta) = map
+            .entry("_meta")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+        {
+            meta.entry(CLAUDE_RESULT_SIZE_META)
+                .or_insert_with(|| json!(chars));
+        }
+    }
+
+    fn apply_all(&self, tools: &mut [Value], router: &Router) {
+        for tool in tools {
+            self.apply(tool, router);
+        }
+    }
 }
 
 /// The fixed 2.0 agent-facing floor: the meta-tools every connection advertises,
@@ -1627,8 +1745,10 @@ fn floor_tool_defs_with_code_mode(code_mode: bool) -> Vec<Value> {
 /// The byte guard complements the exact `o200k_base` gate in token_budget_regression;
 /// bytes alone cannot establish a token budget for JSON or non-ASCII text.
 /// The default floor goal is at most 550 o200k_base tokens, including 10% headroom.
+/// Raised from 2,400 for Claude Code's `anthropic/alwaysLoad` on search, call and
+/// fetch-result: 2,376 -> 2,490 bytes with Code Mode off.
 #[cfg(test)]
-const META_TOOL_FLOOR_BYTE_BUDGET: usize = 2_400;
+const META_TOOL_FLOOR_BYTE_BUDGET: usize = 2_520;
 
 /// The floor, named in the error a client gets when it calls a meta-tool that 2.0
 /// removed. Kept as one string so every refusal reads the same.
@@ -1714,10 +1834,10 @@ impl DiscoveryMode {
 /// The code-mode flag a registry load seeds (WS2-5).
 ///
 /// A successful load copies `registry.code_mode`, which is the value a host's flag starts
-/// from (see [`HostState::code_mode_enabled`]). A load failure must fail closed (`false`):
-/// [`Registry::default`] has `code_mode: true`, so seeding from the error fallback would
-/// silently re-enable code mode after a corrupt registry. The watcher already fails safe by
-/// not touching the flag when a reload fails.
+/// from (see [`HostState::code_mode_enabled`]). A load failure must fail closed (`false`)
+/// rather than seed from the [`Registry::default`] fallback, so a corrupt registry can
+/// never turn code mode on. The watcher already fails safe by not touching the flag
+/// when a reload fails.
 fn seed_code_mode_after_registry_load(loaded: Result<&Registry, ()>) -> bool {
     match loaded {
         Ok(reg) => reg.code_mode,
@@ -7824,12 +7944,15 @@ fn build_tool_surfaces(
         })
         .collect();
     let relays_apps = key.relays_apps;
+    let hints = ResultSizeHints::new(reg, allowed);
     let neutralized = |tool: &Value| {
         let mut tool = tool.clone();
         neutralize_listed_tool(&mut tool);
+        hints.apply(&mut tool, router);
         tool
     };
-    let floor = full_tool_floor(key.code_mode, key.full_fallback);
+    let mut floor = full_tool_floor(key.code_mode, key.full_fallback);
+    hints.apply_all(&mut floor, router);
     let full_tools = || {
         floor.iter().cloned().chain(
             scoped
@@ -7853,13 +7976,14 @@ fn build_tool_surfaces(
         summary: Arc::new(savings::SurfaceSummary::from_tools(full_tools())),
         key: key.clone(),
     });
-    let floor = grouped_tool_defs_from_tools(
+    let mut floor = grouped_tool_defs_from_tools(
         key.code_mode,
         scoped
             .iter()
             .copied()
             .filter(|_| mode == DiscoveryMode::Grouped),
     );
+    hints.apply_all(&mut floor, router);
     let apps = scoped
         .iter()
         .copied()
@@ -7928,7 +8052,7 @@ fn tool_surface_with_code_mode(
             owner_of_exposed_tool(Some(router), &owners, name)
         })
     };
-    match mode {
+    let mut tools = match mode {
         DiscoveryMode::Full => {
             let mut tools = full_tool_floor(code_mode, false);
             if !relays_mcp_app_html_to_active_client(router, allowed) {
@@ -7952,7 +8076,9 @@ fn tool_surface_with_code_mode(
             tools.extend(app_tools);
             tools
         }
-    }
+    };
+    ResultSizeHints::new(reg, allowed).apply_all(&mut tools, router);
+    tools
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8074,13 +8200,16 @@ fn handle_request_with_cancel(
             } else {
                 drop_blocked_from_cache(cached.shared(), router, reg)
             };
+            let hints = ResultSizeHints::new(reg, allowed);
             let mut tools = tool_surface(host, reg, router, &catalog, allowed, mode);
             if mode == DiscoveryMode::Full && full_discovery_fallback(client) {
                 tools.splice(2..2, [search_tool_def(), call_tool_def()]);
+                hints.apply_all(&mut tools[2..4], router);
             }
             let mut full = tool_surface(host, reg, router, &catalog, allowed, DiscoveryMode::Full);
             if full_discovery_fallback(client) {
                 full.splice(2..2, [search_tool_def(), call_tool_def()]);
+                hints.apply_all(&mut full[2..4], router);
             }
             let full_floor =
                 full_tool_floor(host.code_mode_enabled(), full_discovery_fallback(client)).len();
@@ -8186,15 +8315,20 @@ fn handle_request_with_cancel(
                 let len = arguments.get("len").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let projection = arguments.get("projection").and_then(|v| v.as_str());
                 // Pass the calling client so a client can only fetch results it stashed
-                // (the stash is process-global in HTTP mode).
+                // (the stash is process-global in HTTP mode). The reply fits the global
+                // budget, which is what this tool's maxResultSizeChars hint advertises.
                 // A paged tool definition is served only while search would still
                 // return that tool to this caller.
+                let (budget, warning) = shaping::budget();
+                if let Some(msg) = warning {
+                    eprintln!("{msg}");
+                }
                 let visible =
                     |name: &str| discovery_tool_visible(name, cached, router, reg, allowed);
                 return Some(success(
                     id,
-                    shaping::fetch_result_visible(
-                        cursor, offset, len, client, projection, &visible,
+                    shaping::fetch_result_for_model_visible(
+                        cursor, offset, len, client, projection, budget, &visible,
                     ),
                 ));
             }
@@ -10500,7 +10634,18 @@ struct ProgressRoute {
     /// own unique token downstream and translates back here, the same way it
     /// namespaces tool names.
     client_token: Value,
+    /// The request instance that asked for it. Its progress is delivered only while
+    /// that instance is live, so a cancelled call's late progress never reaches the
+    /// client, which may already have reused the token for its next request.
+    owner: Option<downstream::CancelContext>,
 }
+
+/// A stdio progress message and the request instance it belongs to.
+type StdioProgress = (Value, Option<downstream::CancelContext>);
+
+/// `_meta` key that tells the stdio adapter which of its requests a progress
+/// message belongs to. The adapter removes it before the client sees the message.
+const ADAPTER_REQUEST_META: &str = conduit_lib::stdio_adapter::ADAPTER_REQUEST_META;
 
 /// Depth of the stdio progress hand-off queue. Bounded so a client that stops
 /// reading costs dropped notifications rather than a stalled drain thread.
@@ -10569,6 +10714,7 @@ fn register_progress(
             session: session.to_string(),
             producer: producer.to_string(),
             client_token,
+            owner: APPROVAL_CANCEL.with(|current| current.borrow().clone()),
         },
     );
     Some((
@@ -10630,14 +10776,16 @@ fn deliver_progress(
     let Some(key) = token.as_str().map(str::to_string) else {
         return;
     };
-    let (session, client_token) = {
+    let (session, client_token, owner) = {
         let table = routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match table.active.get(&key) {
-            Some(route) if route.producer == producer => {
-                (route.session.clone(), route.client_token.clone())
-            }
+            Some(route) if route.producer == producer => (
+                route.session.clone(),
+                route.client_token.clone(),
+                route.owner.clone(),
+            ),
             Some(route) => {
                 eprintln!(
                     "toolport: progress for token from '{producer}' dropped \
@@ -10655,6 +10803,15 @@ fn deliver_progress(
     let mut note = note.clone();
     if let Some(params) = note.get_mut("params").and_then(Value::as_object_mut) {
         params.insert("progressToken".to_string(), client_token);
+        if let Some(tag) = owner
+            .as_ref()
+            .and_then(downstream::CancelContext::adapter_tag)
+        {
+            let meta = params.entry("_meta").or_insert_with(|| json!({}));
+            if let Some(meta) = meta.as_object_mut() {
+                meta.insert(ADAPTER_REQUEST_META.to_string(), json!(tag));
+            }
+        }
     }
     let note = &note;
     if session == RESOURCE_SUB_STDIO {
@@ -10672,7 +10829,7 @@ fn deliver_progress(
             eprintln!("toolport: stdio progress for a session with no stdio face; dropped");
             return;
         };
-        if sender.try_send(note.clone()).is_err() {
+        if sender.try_send((note.clone(), owner)).is_err() {
             eprintln!("toolport: stdio progress queue full or closed; progress dropped");
         }
         return;
@@ -10689,8 +10846,17 @@ fn deliver_progress(
     if target.is_expired() || target.closed.load(Ordering::SeqCst) {
         return;
     }
-    if !target.push_message(json, None) {
-        eprintln!("toolport: MCP session outbound queue full; progress dropped");
+    let push = || {
+        if !target.push_message(json, None) {
+            eprintln!("toolport: MCP session outbound queue full; progress dropped");
+        }
+    };
+    // Queued only while its request is live, as one step against its cancellation.
+    match &owner {
+        Some(owner) => {
+            owner.speak_with(push);
+        }
+        None => push(),
     }
 }
 
@@ -14871,7 +15037,7 @@ struct SessionState {
     /// closes over a connection instead of over whichever stdout started the
     /// process. Unused (and never created) for an HTTP face or a client that never
     /// asks for progress.
-    stdio_progress: OnceLock<std::sync::mpsc::SyncSender<Value>>,
+    stdio_progress: OnceLock<std::sync::mpsc::SyncSender<StdioProgress>>,
     /// Whether this stdio peer has spoken past `initialize`. Connection-local by
     /// decision: as a process global it silently assumed one stdio client per host,
     /// and a second connection would have inherited the first one's handshake and
@@ -14899,7 +15065,7 @@ struct SessionState {
     /// client-chosen, so two stdio clients on one host would collide. One client
     /// cancelling its id 7 could cancel another's id 7.
     cancellations: downstream::CancelRegistry,
-    owner_cancel_guard: Mutex<Option<downstream::CancelGuard>>,
+    owner_cancel_guard: Mutex<Option<downstream::CloseGuard>>,
     /// How many requests this connection is running on workers, against a cap, so a
     /// client cannot spawn unbounded workers. Per connection for the same reason as
     /// the registry: it is this peer's concurrency, not the host's.
@@ -15038,19 +15204,31 @@ impl SessionState {
     /// This session's progress hand-off, or `None` when it has no stdio face.
     /// Created on first use, so a client that never asks for progress pays for
     /// neither the queue nor the writer thread.
-    fn stdio_progress_sender(&self) -> Option<&std::sync::mpsc::SyncSender<Value>> {
+    fn stdio_progress_sender(&self) -> Option<&std::sync::mpsc::SyncSender<StdioProgress>> {
         let stdout = match &self.transport {
             SessionTransportFace::Stdio(stdout) => Arc::clone(stdout),
             SessionTransportFace::Http => return None,
         };
         Some(self.stdio_progress.get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<Value>(PROGRESS_STDIO_QUEUE);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<StdioProgress>(PROGRESS_STDIO_QUEUE);
             std::thread::spawn(move || {
-                for note in rx {
-                    let mut out = stdout
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if write_json_line(&mut *out, &note).is_err() {
+                for (note, owner) in rx {
+                    let mut failed = false;
+                    let mut write = || {
+                        let mut out = stdout
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        failed = write_json_line(&mut *out, &note).is_err();
+                    };
+                    // Written only while its request is live, as one step against
+                    // that request's cancellation.
+                    match &owner {
+                        Some(owner) => {
+                            owner.speak_with(write);
+                        }
+                        None => write(),
+                    }
+                    if failed {
                         // The stdio client is gone; nothing further will be readable.
                         break;
                     }
@@ -15064,7 +15242,7 @@ impl SessionState {
     /// what the writer thread would have written. Real sessions create the queue
     /// lazily, on first use.
     #[cfg(test)]
-    fn set_stdio_progress(&self, sender: std::sync::mpsc::SyncSender<Value>) {
+    fn set_stdio_progress(&self, sender: std::sync::mpsc::SyncSender<StdioProgress>) {
         let _ = self.stdio_progress.set(sender);
     }
 
@@ -15343,7 +15521,7 @@ impl SessionState {
 struct McpSseReader {
     session: Arc<SessionState>,
     cleanup: Option<(GatewayState, String)>,
-    cancel_guard: Option<downstream::CancelGuard>,
+    cancel_guard: Option<downstream::CloseGuard>,
     buf: Vec<u8>,
     pos: usize,
     tools_changed: bool,
@@ -15502,14 +15680,11 @@ fn mint_mcp_session(
     let session = Arc::new(session);
     if let Some(lifetime) = lifetime {
         let weak = Arc::downgrade(&session);
-        let guard = lifetime
-            .cancellations
-            .context(sid.clone())
-            .on_cancel(Arc::new(move |_| {
-                if let Some(session) = weak.upgrade() {
-                    session.close();
-                }
-            }));
+        let guard = lifetime.cancellations.on_close(Arc::new(move |_| {
+            if let Some(session) = weak.upgrade() {
+                session.close();
+            }
+        }));
         *session
             .owner_cancel_guard
             .lock()
@@ -16912,7 +17087,14 @@ fn process_request_wire(
             "sessionless_request",
         )
     };
-    let _context = observation::ContextGuard::enter(observed.context());
+    // The session keeps the label it started with; a request that names its own
+    // client (a multiplexing caller's later identity) is attributed to that name, and
+    // a modern request that names none is unlabelled rather than the session's.
+    let mut context = observed.context();
+    if label.is_some() || upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION) {
+        context.client_label = label.clone();
+    }
+    let _context = observation::ContextGuard::enter(context);
     let internal = match (method, req["params"]["name"].as_str()) {
         ("server/discover", _) => Some("describe"),
         ("tools/call", Some("toolport_search_tools")) => Some("search"),
@@ -16983,6 +17165,46 @@ fn process_request_wire(
     response
 }
 
+/// The display label for one request. A request that names its client (a legacy
+/// `initialize`'s `clientInfo`, or a modern request's `_meta` clientInfo) is labelled
+/// as itself, so a caller that multiplexes identities over one connection gets each
+/// request labelled correctly. A modern request without clientInfo is unlabelled: it
+/// never borrows another request's name. Only handshake-era requests fall back to the
+/// label their connection's `initialize` set.
+fn request_client_label(state: &GatewayState, req: &Value) -> Option<String> {
+    if let Some(label) = approval::client_info_label(req.get("params")) {
+        return Some(label);
+    }
+    if upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION) {
+        return None;
+    }
+    if state.http {
+        active_mcp_session()
+            .and_then(|sid| {
+                state
+                    .mcp_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&sid)
+                    .cloned()
+            })
+            .and_then(|session| {
+                session
+                    .client_label
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            })
+    } else {
+        state
+            .stdio_upstream
+            .client_label
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 // Carry transport, profile, cancellation and client identity across dispatch.
 #[allow(clippy::too_many_arguments)]
 fn process_request_wire_inner(
@@ -17050,31 +17272,7 @@ fn process_request_wire_inner(
         std::thread::spawn(move || refresh_client_root(&st));
     }
 
-    let session_label = if state.http {
-        active_mcp_session()
-            .and_then(|sid| {
-                state
-                    .mcp_sessions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(&sid)
-                    .cloned()
-            })
-            .and_then(|session| {
-                session
-                    .client_label
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone()
-            })
-    } else {
-        state
-            .stdio_upstream
-            .client_label
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    };
+    let session_label = request_client_label(state, req);
     let _label = ClientLabelGuard::enter(session_label);
 
     let wait = match method {
@@ -17711,11 +17909,14 @@ fn write_stdio_response_then(
     true
 }
 
-fn handle_stdio_request(state: GatewayState, req: Value, request_key: String) {
+fn handle_stdio_request(
+    state: GatewayState,
+    req: Value,
+    cancel_context: downstream::CancelContext,
+) {
     // The connection's own registry, so a cancel carries the reason to the worker
-    // that is running this request and nothing else.
-    let cancel_registry = state.stdio_upstream.cancellations();
-    let cancel_context = cancel_registry.context(request_key.clone());
+    // that is running this request instance and nothing else.
+    let request_key = cancel_context.request_key();
     // The guards are the stdio session's own: one connection, one search streak (P1.2).
     let guards = state.stdio_upstream.guards();
     // A panic in a handler must not kill the gateway: catch it, log it, and
@@ -17729,7 +17930,7 @@ fn handle_stdio_request(state: GatewayState, req: Value, request_key: String) {
             None,
             None,
             None,
-            Some(cancel_context),
+            Some(cancel_context.clone()),
             None,
             None,
             state.discovery_mode(),
@@ -17741,27 +17942,35 @@ fn handle_stdio_request(state: GatewayState, req: Value, request_key: String) {
         Some(error(id, -32603, "internal error").into())
     });
 
-    if cancel_registry.is_cancelled(&request_key) {
+    let Some(resp) = response else {
+        cancel_context.finish();
+        return;
+    };
+    // The peer has an answer on the wire now, so anything the catalog
+    // withheld may follow it. Every id-bearing request counts, not just
+    // `initialize`: whatever the client opened with, its own reply has to be
+    // the first thing it reads. This is the second of the two conditions in
+    // `stdio_may_speak`; the peer's post-handshake message is the other, and
+    // either one may land last.
+    //
+    // The reply is claimed and written as one step against a cancellation, so a
+    // request the client cancelled first gets nothing, and one it cancels while the
+    // reply is being written is answered.
+    let mut written = false;
+    let claimed = cancel_context.reply_with(|| {
+        written = write_stdio_response_then(&state.stdio_upstream, &resp, || resp.record_listed());
+    });
+    cancel_context.finish();
+    if !claimed {
         glog(&format!(
             "suppressing response for cancelled request {request_key}"
         ));
-        cancel_registry.finish_client_request(&request_key);
         return;
     }
-    cancel_registry.finish_client_request(&request_key);
-
-    if let Some(resp) = response {
-        // The peer has an answer on the wire now, so anything the catalog
-        // withheld may follow it. Every id-bearing request counts, not just
-        // `initialize`: whatever the client opened with, its own reply has to be
-        // the first thing it reads. This is the second of the two conditions in
-        // `stdio_may_speak`; the peer's post-handshake message is the other, and
-        // either one may land last.
-        if write_stdio_response_then(&state.stdio_upstream, &resp, || resp.record_listed()) {
-            resp.delivered();
-            state.stdio_upstream.mark_stdio_responded();
-            drain_stdio_deferred(&state.stdio_upstream);
-        }
+    if written {
+        resp.delivered();
+        state.stdio_upstream.mark_stdio_responded();
+        drain_stdio_deferred(&state.stdio_upstream);
     }
 }
 
@@ -18173,7 +18382,7 @@ struct McpHttpRequestHeaders<'a> {
 
 struct McpListen {
     session: Arc<SessionState>,
-    cancel_guard: Option<downstream::CancelGuard>,
+    cancel_guard: Option<downstream::CloseGuard>,
     cleanup: Option<(GatewayState, String)>,
 }
 
@@ -18813,43 +19022,59 @@ fn handle_mcp_http(
             // A cancellation POST on another connection cannot target this call.
             let cancellations =
                 http_call_cancellations(state, session_id.as_deref(), session_owner);
+            // The stdio adapter numbers each request, so its cancellation names the
+            // instance it means even when it arrives before that request does.
+            let adapter_request = HTTP_ADAPTER_REQUEST.with(std::cell::Cell::get);
             if let Some(id) = cancellation_request_id(&req) {
-                cancellations.cancel(&id, cancellation_reason(&req));
+                match adapter_request {
+                    Some(tag) => {
+                        cancellations.cancel_instance(&id, tag, cancellation_reason(&req));
+                    }
+                    None => {
+                        cancellations.cancel(&id, cancellation_reason(&req));
+                    }
+                }
                 return HttpOut::new(202, "text/plain", String::new());
             }
-            let request_key = request_id_key(&req);
-            if let Some(key) = &request_key {
-                if !cancellations.begin_client_request(key.clone()) {
-                    return mcp_rpc_response(
-                        200,
-                        error(req["id"].clone(), -32600, "duplicate or closed request id")
-                            .to_string(),
-                        session_id.as_deref(),
-                        prefer_sse,
-                    );
-                }
-            }
-            let _request_end = HttpRequestEnd {
-                cancellations: cancellations.clone(),
-                key: request_key.clone(),
+            let cancel = match request_id_key(&req) {
+                Some(key) => match cancellations.begin_instance(key, adapter_request) {
+                    Some(context) => Some(context),
+                    None => {
+                        return mcp_rpc_response(
+                            200,
+                            error(req["id"].clone(), -32600, "duplicate or closed request id")
+                                .to_string(),
+                            session_id.as_deref(),
+                            prefer_sse,
+                        );
+                    }
+                },
+                None => None,
             };
-            let cancel = request_key.map(|key| cancellations.context(key));
+            let _request_end = HttpRequestEnd {
+                cancel: cancel.clone(),
+            };
+            // A dropped socket cancels this instance through its own handle, never
+            // whatever later reuses its id.
             let _connection_cancel = HTTP_CONNECTION_CANCEL.with(|current| {
-                current.borrow().as_ref().map(|connection| {
-                    let owned = cancellations.clone();
-                    let key = cancel.clone();
-                    connection
-                        .context("connection".into())
-                        .on_cancel(Arc::new(move |_| {
-                            if let Some(context) = &key {
-                                owned.cancel(
-                                    &context.request_key(),
-                                    Some("HTTP caller disconnected"),
-                                );
-                            }
+                current
+                    .borrow()
+                    .as_ref()
+                    .zip(cancel.clone())
+                    .map(|(connection, own)| {
+                        connection.on_close(Arc::new(move |_| {
+                            own.cancel(Some("HTTP caller disconnected"));
                         }))
-                })
+                    })
             });
+            // Cancelled before it began (the adapter's cancellation overtook it):
+            // nothing runs and nothing is answered.
+            if cancel
+                .as_ref()
+                .is_some_and(downstream::CancelContext::is_cancelled)
+            {
+                return http_no_reply(session_id.as_deref());
+            }
 
             // A legacy MCP session owns its own search guard (P1.2). A request
             // with no session record keeps the listener-level guard passed in,
@@ -18891,11 +19116,17 @@ fn handle_mcp_http(
                 allowed,
                 session_owner.and_then(|owner| owner.profile.as_deref()),
                 connection_profile,
-                cancel,
+                cancel.clone(),
                 client,
                 client_name,
                 discovery,
             );
+            // Claim the reply: a request the client cancelled first gets none.
+            if let Some(cancel) = &cancel {
+                if !cancel.reply_with(|| ()) {
+                    return http_no_reply(session_id.as_deref());
+                }
+            }
             match resp {
                 Some(resp) => {
                     let status = if is_modern {
@@ -19079,13 +19310,11 @@ fn handle_http_with_headers(
             sessions.insert(key.clone(), session.clone());
         }
         let weak = Arc::downgrade(&session);
-        let guard = connection
-            .context("connection".into())
-            .on_cancel(Arc::new(move |_| {
-                if let Some(session) = weak.upgrade() {
-                    session.close();
-                }
-            }));
+        let guard = connection.on_close(Arc::new(move |_| {
+            if let Some(session) = weak.upgrade() {
+                session.close();
+            }
+        }));
         session.push_message(
             json!({"jsonrpc":"2.0","method":"notifications/toolport/connected"}).to_string(),
             None,
@@ -19745,6 +19974,28 @@ thread_local! {
     /// daemon bearer. Display only.
     static HTTP_ADAPTER_HOST: std::cell::RefCell<Option<conduit_lib::host_attribution::Host>> = const { std::cell::RefCell::new(None) };
     static HTTP_CONNECTION_CANCEL: std::cell::RefCell<Option<downstream::CancelRegistry>> = const { std::cell::RefCell::new(None) };
+    /// The stdio adapter's number for the request being handled (`Toolport-Adapter-Request`).
+    static HTTP_ADAPTER_REQUEST: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+/// Restores the previous adapter request number when dropped.
+struct AdapterRequestScope(Option<u64>);
+impl AdapterRequestScope {
+    fn enter(tag: Option<u64>) -> Self {
+        Self(HTTP_ADAPTER_REQUEST.with(|current| current.replace(tag)))
+    }
+}
+impl Drop for AdapterRequestScope {
+    fn drop(&mut self) {
+        HTTP_ADAPTER_REQUEST.with(|current| current.set(self.0));
+    }
+}
+/// The answer to a request the client cancelled: an empty acceptance, no message.
+fn http_no_reply(session_id: Option<&str>) -> HttpOut {
+    let out = HttpOut::new(202, "text/plain", String::new());
+    match session_id {
+        Some(sid) => out.with_header("Mcp-Session-Id", sid),
+        None => out,
+    }
 }
 struct HttpConnectionScope(Option<downstream::CancelRegistry>, Option<String>);
 impl Drop for HttpConnectionScope {
@@ -19784,13 +20035,12 @@ impl Drop for AdapterHostScope {
     }
 }
 struct HttpRequestEnd {
-    cancellations: downstream::CancelRegistry,
-    key: Option<String>,
+    cancel: Option<downstream::CancelContext>,
 }
 impl Drop for HttpRequestEnd {
     fn drop(&mut self) {
-        if let Some(key) = &self.key {
-            self.cancellations.finish_client_request(key);
+        if let Some(cancel) = &self.cancel {
+            cancel.finish();
         }
     }
 }
@@ -20007,7 +20257,6 @@ fn proxy_deadline_http_connection(
         Err(_) => return,
     };
     let cancellations = downstream::CancelRegistry::new();
-    cancellations.begin_client_request("connection".into());
     http_connection_cancellations()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -21730,6 +21979,21 @@ fn handle_connection(
                 let previous_instance =
                     HTTP_ADAPTER_INSTANCE.with(|current| current.replace(instance));
                 let _connection_scope = HttpConnectionScope(previous, previous_instance);
+                let _adapter_request = AdapterRequestScope::enter(
+                    private_daemon_bearer
+                        .then(|| {
+                            request
+                                .headers()
+                                .iter()
+                                .find(|header| {
+                                    header
+                                        .field
+                                        .equiv(conduit_lib::stdio_adapter::ADAPTER_REQUEST_HEADER)
+                                })
+                                .and_then(|header| header.value.as_str().parse::<u64>().ok())
+                        })
+                        .flatten(),
+                );
                 let attribution = if private_daemon_bearer && valid_adapter_claim {
                     let id = request
                         .headers()
@@ -22336,6 +22600,10 @@ fn main() {
     }
     // Persist org rate-limit counters across restarts (SOU-340). Safe if dir missing;
     // counters then stay process-local until the first successful bind.
+    // Sealed result spills of gateways that exited without cleaning up. Their keys
+    // died with them, so the files are unreadable; reclaim the disk now rather than
+    // at this run's first spill.
+    std::thread::spawn(conduit_lib::shaping::remove_stale_spills);
     if let Some(dir) = registry::conduit_dir() {
         conduit_lib::rate_limits::bind_data_dir(&dir);
         // Share downstream 429 backoff windows across gateway processes
@@ -22789,6 +23057,8 @@ fn main() {
 
     if let Some(port) = http_port_opt {
         serve_http(state, port);
+        // Land queued telemetry and remove this process's result spills.
+        conduit_lib::telemetry::shutdown();
         return;
     }
 
@@ -22861,7 +23131,8 @@ fn main() {
             );
             continue;
         };
-        if !cancel_registry.begin_client_request(request_key.clone()) {
+        // The instance's handle comes from the same step that registers it.
+        let Some(cancel_context) = cancel_registry.begin_client_request(request_key.clone()) else {
             gtrace(&format!(
                 "rejected duplicate in-flight request id {request_key}"
             ));
@@ -22871,11 +23142,10 @@ fn main() {
                 break;
             }
             continue;
-        }
-
+        };
         let state = state.clone();
         let job = move || {
-            handle_stdio_request(state, req, request_key);
+            handle_stdio_request(state, req, cancel_context);
         };
         if let Some(handle) = spawn_or_run_stdio_inflight(&stdio_inflight, job) {
             stdio_workers.push(handle);
@@ -36365,8 +36635,10 @@ mod tests {
         let gate = OpenGate::new();
         let cancellations = downstream::CancelRegistry::new();
         let request_id = "resource-sub-waiter".to_string();
-        assert!(cancellations.begin_client_request(request_id.clone()));
-        let cancel = cancellations.context(request_id.clone());
+        let ctx_request_id = cancellations
+            .begin_client_request(request_id.clone())
+            .expect("begins");
+        let cancel = ctx_request_id.clone();
         let cancel_registry = cancellations.clone();
         let cancel_id = request_id.clone();
         let canceller = std::thread::spawn(move || {
@@ -36392,8 +36664,10 @@ mod tests {
         let gate = OpenGate::new();
         let cancellations = downstream::CancelRegistry::new();
         let request_id = "resource-sub-already-cancelled".to_string();
-        assert!(cancellations.begin_client_request(request_id.clone()));
-        let cancel = cancellations.context(request_id.clone());
+        let ctx_request_id = cancellations
+            .begin_client_request(request_id.clone())
+            .expect("begins");
+        let cancel = ctx_request_id.clone();
         assert!(cancellations.cancel(&request_id, Some("client went away")));
 
         let err = gate
@@ -36412,8 +36686,10 @@ mod tests {
         let gate = OpenGate::new();
         let cancellations = downstream::CancelRegistry::new();
         let request_id = "resource-sub-finish-cancel-race".to_string();
-        assert!(cancellations.begin_client_request(request_id.clone()));
-        let cancel = cancellations.context(request_id.clone());
+        let ctx_request_id = cancellations
+            .begin_client_request(request_id.clone())
+            .expect("begins");
+        let cancel = ctx_request_id.clone();
         gate.finish(Ok(()));
         assert!(cancellations.cancel(&request_id, Some("client went away")));
 
@@ -36462,8 +36738,10 @@ mod tests {
 
         let cancellations = downstream::CancelRegistry::new();
         let request_id = "cancelled-listen-request".to_string();
-        assert!(cancellations.begin_client_request(request_id.clone()));
-        let cancel = cancellations.context(request_id.clone());
+        let ctx_request_id = cancellations
+            .begin_client_request(request_id.clone())
+            .expect("begins");
+        let cancel = ctx_request_id.clone();
         let cancel_registry = cancellations.clone();
         let cancel_id = request_id.clone();
         let canceller = std::thread::spawn(move || {
@@ -36666,7 +36944,8 @@ mod tests {
     /// test can assert what the session's writer thread would have written to
     /// stdout. The session normally creates that queue lazily on first use; the
     /// test seam injects one up front.
-    fn stdio_session_with_progress() -> (Arc<SessionState>, std::sync::mpsc::Receiver<Value>) {
+    fn stdio_session_with_progress() -> (Arc<SessionState>, std::sync::mpsc::Receiver<StdioProgress>)
+    {
         let session = Arc::new(SessionState::new_stdio(Arc::new(Mutex::new(
             std::io::stdout(),
         ))));
@@ -38573,7 +38852,7 @@ mod tests {
             &progress_note(&wire),
         );
 
-        let delivered = stdio_rx
+        let (delivered, _owner) = stdio_rx
             .try_recv()
             .expect("the stdio client's progress must be queued");
         // Translated back to the client's own token, same as the HTTP path.
@@ -38601,7 +38880,7 @@ mod tests {
             .stdio_progress_sender()
             .expect("a stdio session owns a progress hand-off");
         for _ in 0..PROGRESS_STDIO_QUEUE {
-            let _ = sender.try_send(json!({}));
+            let _ = sender.try_send((json!({}), None));
         }
         deliver_progress(
             &stdio,
@@ -40039,12 +40318,12 @@ mod tests {
                     .get(request.remote_addr().unwrap())
                     .unwrap()
                     .clone();
-                assert!(registry.begin_client_request("1".into()));
+                let ctx_1 = registry.begin_client_request("1".into()).expect("begins");
                 let seen = f2.clone();
-                guards.push(registry.context("1".into()).on_cancel(Arc::new(move |_| {
+                guards.push(ctx_1.clone().on_cancel(Arc::new(move |_| {
                     seen.fetch_add(1, Ordering::SeqCst);
                 })));
-                registry.finish_client_request("1");
+                ctx_1.finish();
                 respond_http(
                     request,
                     tiny_http::Response::from_string(
@@ -40113,11 +40392,11 @@ mod tests {
             .unwrap()
             .insert(key, session.clone());
         let calls = session.cancellations();
-        assert!(calls.begin_client_request("held".into()));
+        let ctx_held = calls.begin_client_request("held".into()).expect("begins");
         let free = Arc::new(AtomicBool::new(false));
         let observed = free.clone();
         let sessions = state.mcp_sessions.clone();
-        let _hook = calls.context("held".into()).on_cancel(Arc::new(move |_| {
+        let _hook = ctx_held.clone().on_cancel(Arc::new(move |_| {
             observed.store(sessions.try_lock().is_ok(), Ordering::SeqCst);
         }));
         let _scope = HttpConnectionScope(
@@ -40174,12 +40453,12 @@ mod tests {
             let _scope = p08_connection_scope(first);
             http_call_cancellations(&state, None, Some(&owner))
         };
-        assert!(a.begin_client_request("1".into()));
+        let _ctx_1 = a.begin_client_request("1".into()).expect("begins");
         let b = {
             let _scope = p08_connection_scope(second);
             http_call_cancellations(&state, None, Some(&owner))
         };
-        assert!(b.begin_client_request("1".into()));
+        let _ctx_1 = b.begin_client_request("1".into()).expect("begins");
         a.close();
         assert!(!b.is_cancelled("1"));
     }
@@ -40195,7 +40474,7 @@ mod tests {
             let _scope = p08_connection_scope(first);
             http_call_cancellations(&state, None, Some(&owner))
         };
-        assert!(a.begin_client_request("1".into()));
+        let _ctx_1 = a.begin_client_request("1".into()).expect("begins");
         let _scope = p08_connection_scope(downstream::CancelRegistry::new());
         let out = handle_mcp_http(
             &state,
@@ -40228,14 +40507,16 @@ mod tests {
         };
         let cancelled = Arc::new(AtomicUsize::new(0));
         let mut hooks = Vec::new();
+        let mut contexts = HashMap::new();
         for key in ["active", "retained"] {
-            assert!(registry.begin_client_request(key.into()));
+            let context = registry.begin_client_request(key.into()).expect("begins");
             let seen = cancelled.clone();
-            hooks.push(registry.context(key.into()).on_cancel(Arc::new(move |_| {
+            hooks.push(context.on_cancel(Arc::new(move |_| {
                 seen.fetch_add(1, Ordering::SeqCst);
             })));
+            contexts.insert(key, context);
         }
-        registry.finish_client_request("retained");
+        contexts["retained"].finish();
         for id in 0..100 {
             let _scope = p08_connection_scope(downstream::CancelRegistry::new());
             let other = test_caller(&format!("client:other-{id}"), None);
@@ -40256,7 +40537,9 @@ mod tests {
         let state = http_state(false);
         let owner = test_caller("adapter:p08-long-lived", None).session_owner;
         let connection = downstream::CancelRegistry::new();
-        assert!(connection.begin_client_request("connection".into()));
+        let _ctx_connection = connection
+            .begin_client_request("connection".into())
+            .expect("begins");
         let _scope = HttpConnectionScope(
             HTTP_CONNECTION_CANCEL.with(|current| current.replace(Some(connection.clone()))),
             HTTP_ADAPTER_INSTANCE.with(|current| current.replace(Some("p08-ttl".into()))),
@@ -40275,7 +40558,10 @@ mod tests {
         );
         assert_eq!(out.status, 200);
         let lifetime = adapter_lifetime(&state, Some(&owner)).unwrap();
-        assert!(lifetime.cancellations.begin_client_request("held".into()));
+        let _ctx_held = lifetime
+            .cancellations
+            .begin_client_request("held".into())
+            .expect("begins");
         *lifetime.last_seen.lock().unwrap() =
             Instant::now() - MCP_SESSION_TTL - Duration::from_secs(1);
         mint_mcp_session(&state, Some(&owner)).unwrap_or_else(|_| panic!("session capacity"));
@@ -40307,7 +40593,8 @@ mod tests {
         let replacement = Arc::new(replacement);
         assert!(replacement
             .cancellations
-            .begin_client_request("held".into()));
+            .begin_client_request("held".into())
+            .is_some());
         state
             .mcp_sessions
             .lock()
@@ -40431,7 +40718,7 @@ mod tests {
                 }
             });
             let registry = downstream::CancelRegistry::new();
-            assert!(registry.begin_client_request("1".into()));
+            let ctx_1 = registry.begin_client_request("1".into()).expect("begins");
             let decision = request_human_decision_with_cancel(
                 approval::ApprovalRequest {
                     token: String::new(),
@@ -40449,7 +40736,7 @@ mod tests {
                     url_elicitation: None,
                     pii_release: None,
                 },
-                Some(&registry.context("1".into())),
+                Some(&ctx_1.clone()),
             );
             // On the old denial path the second connection never happens.
             if decision == approval::ApprovalDecision::Denied && reply.is_empty() {
@@ -40539,7 +40826,8 @@ mod tests {
         assert_eq!(deleted.status, 204);
         closed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let out = call.join().unwrap();
-        assert!(out.body.contains("isError"), "{}", out.body);
+        // The session's end cancelled the call, so its POST gets no message.
+        assert_eq!((out.status, out.body.as_str()), (202, ""));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         late_allow_tx.send(()).unwrap();
         let other = handle_http(
@@ -40615,12 +40903,10 @@ mod tests {
                 .unwrap()
                 .clone();
             let (released_tx, released_rx) = std::sync::mpsc::channel();
-            let _guard = registry
-                .context("connection".into())
-                .on_cancel(Arc::new(move |_| {
-                    closed_tx.send(()).unwrap();
-                    released_tx.send(()).unwrap();
-                }));
+            let _guard = registry.on_close(Arc::new(move |_| {
+                closed_tx.send(()).unwrap();
+                released_tx.send(()).unwrap();
+            }));
             parked_tx.send(()).unwrap();
             released_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             let _ = request.respond(tiny_http::Response::from_string("x"));
@@ -40739,8 +41025,10 @@ mod tests {
     fn p10c_modern_approval_records_owner_close_once() {
         let _env = DataDirTestEnv::new("p10c-modern-withdrawal");
         let registry = downstream::CancelRegistry::new();
-        assert!(registry.begin_client_request("modern-approval".into()));
-        let _cancel = ApprovalCancelGuard::enter(Some(registry.context("modern-approval".into())));
+        let ctx_modern_approval = registry
+            .begin_client_request("modern-approval".into())
+            .expect("begins");
+        let _cancel = ApprovalCancelGuard::enter(Some(ctx_modern_approval.clone()));
         let hash = audit::args_hash(&json!({}));
         let token = start_modern_hitl(
             "s__work",
@@ -40754,7 +41042,7 @@ mod tests {
             MrtrRequest::default(),
         )
         .unwrap();
-        registry.finish_client_request("modern-approval");
+        ctx_modern_approval.finish();
         registry.close();
         assert!(matches!(
             poll_modern_hitl(
@@ -40878,7 +41166,10 @@ mod tests {
             .get(&second)
             .unwrap()
             .clone();
-        assert!(session.cancellations.begin_client_request("new".into()));
+        let _ctx_new = session
+            .cancellations
+            .begin_client_request("new".into())
+            .expect("begins");
         lifetime.close();
         assert!(session.cancellations.is_cancelled("new"));
     }
@@ -40887,17 +41178,28 @@ mod tests {
     fn p08_closing_a_session_cancels_all_and_rejects_late_requests() {
         let session = SessionState::new_http(None);
         let other = SessionState::new_http(None);
+        let mut contexts = Vec::new();
         for id in ["blocked", "approval"] {
-            assert!(session.cancellations.begin_client_request(id.into()));
-            assert!(other.cancellations.begin_client_request(id.into()));
+            let mine = session
+                .cancellations
+                .begin_client_request(id.into())
+                .expect("begins");
+            let theirs = other
+                .cancellations
+                .begin_client_request(id.into())
+                .expect("begins");
+            contexts.push((mine, theirs));
         }
         session.close();
         session.close();
-        for id in ["blocked", "approval"] {
-            assert!(session.cancellations.context(id.into()).is_cancelled());
-            assert!(!other.cancellations.context(id.into()).is_cancelled());
+        for (mine, theirs) in &contexts {
+            assert!(mine.is_cancelled());
+            assert!(!theirs.is_cancelled());
         }
-        assert!(!session.cancellations.begin_client_request("late".into()));
+        assert!(session
+            .cancellations
+            .begin_client_request("late".into())
+            .is_none());
     }
 
     #[test]
@@ -40909,18 +41211,21 @@ mod tests {
         let other_registry = other.cancellations();
         let id = "1".to_string();
 
+        let asking_context = asking_registry.begin_client_request(id.clone());
         assert!(
-            asking_registry.begin_client_request(id.clone()),
+            asking_context.is_some(),
             "a fresh connection accepts its first request id"
         );
+        let other_context = other_registry.begin_client_request(id.clone());
         assert!(
-            other_registry.begin_client_request(id.clone()),
+            other_context.is_some(),
             "the same id on another connection is that connection's own request, not a duplicate"
         );
 
         // Cancel through the asking connection's context, which is how the dispatch
         // observes it, then check both registries.
-        let asking_context = asking_registry.context(id.clone());
+        let asking_context = asking_context.unwrap();
+        let other_context = other_context.unwrap();
         assert!(
             asking_registry.cancel(&id, Some("user")),
             "the owning connection cancels its own in-flight request"
@@ -40930,7 +41235,7 @@ mod tests {
             "the connection that cancelled sees it"
         );
         assert!(
-            !other_registry.context(id.clone()).is_cancelled(),
+            !other_context.is_cancelled(),
             "one connection cancelling its id must not cancel another's"
         );
 
@@ -46616,6 +46921,524 @@ mod tests {
         }
         let catalog = Arc::new(CatalogSnapshot::new(router.shared_tools()));
         (reg, Arc::new(router), catalog)
+    }
+
+    fn listed_view(
+        host: &HostState,
+        reg: &Registry,
+        router: &Arc<Router>,
+        snapshot: &Arc<CatalogSnapshot>,
+        allowed: Option<&HashSet<String>>,
+        mode: DiscoveryMode,
+    ) -> Vec<Value> {
+        let exposed = cached_tool_surfaces(host, reg, router, snapshot, allowed, None, mode).1;
+        serde_json::from_str(exposed.json.get()).unwrap()
+    }
+
+    fn listed_named<'a>(tools: &'a [Value], name: &str) -> &'a Value {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} not listed: {tools:?}"))
+    }
+
+    #[test]
+    fn claude_always_load_marks_the_working_meta_tools_in_every_mode() {
+        let _env = DataDirTestEnv::new("claude-always-load");
+        let (reg, router, snapshot) = tool_surface_fixture();
+        let working = [
+            "toolport_search_tools",
+            "toolport_call_tool",
+            "toolport_fetch_result",
+            "toolport_run_script",
+        ];
+        for code_mode in [false, true] {
+            let host = dispatch_host(code_mode);
+            for mode in [
+                DiscoveryMode::Lazy,
+                DiscoveryMode::Grouped,
+                DiscoveryMode::Full,
+            ] {
+                let tools = listed_view(&host, &reg, &router, &snapshot, None, mode);
+                for tool in &tools {
+                    let name = tool["name"].as_str().unwrap();
+                    assert_eq!(
+                        tool["_meta"][CLAUDE_ALWAYS_LOAD_META] == true,
+                        working.contains(&name),
+                        "{mode:?} code_mode={code_mode}: {tool}"
+                    );
+                }
+                assert_eq!(
+                    tools.iter().any(|t| t["name"] == "toolport_run_script"),
+                    code_mode
+                );
+            }
+        }
+        // The direct dispatch path and the full-discovery fallback agree.
+        let host = dispatch_host(true);
+        let direct = tool_surface(
+            &host,
+            &reg,
+            &router,
+            &snapshot.tools,
+            None,
+            DiscoveryMode::Lazy,
+        );
+        assert_eq!(
+            direct
+                .iter()
+                .filter(|t| t["_meta"][CLAUDE_ALWAYS_LOAD_META] == true)
+                .count(),
+            4
+        );
+        // Drift fingerprints never cover _meta, so the key cannot raise a drift warning.
+        let mut bare = search_tool_def();
+        bare.as_object_mut().unwrap().remove("_meta");
+        assert_eq!(
+            integrity::fingerprint(&search_tool_def()),
+            integrity::fingerprint(&bare)
+        );
+    }
+
+    #[test]
+    fn claude_always_load_bytes_per_tools_list() {
+        let bpe = tiktoken_rs::o200k_base().unwrap();
+        let strip = |mut tools: Vec<Value>| {
+            for tool in &mut tools {
+                tool.as_object_mut().unwrap().remove("_meta");
+            }
+            serde_json::to_string(&tools).unwrap()
+        };
+        for code_mode in [false, true] {
+            let tools = floor_tool_defs_with_code_mode(code_mode);
+            let with = serde_json::to_string(&tools).unwrap();
+            let without = strip(tools);
+            let per_tool = r#","_meta":{"anthropic/alwaysLoad":true}"#.len();
+            assert_eq!(
+                with.len() - without.len(),
+                per_tool * if code_mode { 4 } else { 3 }
+            );
+            println!(
+                "CLAUDE_META code_mode={code_mode} bytes {} -> {} tokens {} -> {}",
+                without.len(),
+                with.len(),
+                bpe.encode_ordinary(&without).len(),
+                bpe.encode_ordinary(&with).len()
+            );
+        }
+    }
+
+    #[test]
+    fn meta_tool_input_schemas_fit_codex_schema_limit() {
+        // Codex drops parameter descriptions from an input schema over
+        // `tool_input_schema_max_bytes` (default 5000 bytes).
+        const CODEX_DEFAULT_SCHEMA_MAX_BYTES: usize = 5_000;
+        let mut tools = floor_tool_defs_with_code_mode(true);
+        tools.push(help_tool_def("synthetic00", 618));
+        for tool in tools {
+            let bytes = serde_json::to_vec(&tool["inputSchema"]).unwrap().len();
+            println!(
+                "META_SCHEMA_BYTES {} {bytes}",
+                tool["name"].as_str().unwrap()
+            );
+            assert!(
+                bytes <= CODEX_DEFAULT_SCHEMA_MAX_BYTES,
+                "{} input schema is {bytes} bytes",
+                tool["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn claude_result_size_hint_follows_the_shaping_budget() {
+        assert_eq!(claude_result_size_hint(shaping::DEFAULT_BUDGET_BYTES), None);
+        assert_eq!(claude_result_size_hint(2048), None);
+        assert_eq!(claude_result_size_hint(CLAUDE_RESULT_CHARS_DEFAULT), None);
+        assert_eq!(claude_result_size_hint(50_001), Some(50_001));
+        assert_eq!(claude_result_size_hint(200_000), Some(200_000));
+        assert_eq!(
+            claude_result_size_hint(900_000),
+            Some(CLAUDE_RESULT_CHARS_CEILING)
+        );
+        assert_eq!(
+            claude_result_size_hint(0),
+            Some(CLAUDE_RESULT_CHARS_CEILING)
+        );
+
+        // A raised global budget covers fetch-result and scripts too.
+        let router = Router::new();
+        let hints = ResultSizeHints {
+            global: 120_000,
+            servers: HashMap::new(),
+            call: 120_000,
+        };
+        let mut tools = floor_tool_defs_with_code_mode(true);
+        hints.apply_all(&mut tools, &router);
+        for tool in &tools {
+            let expected = match tool["name"].as_str().unwrap() {
+                "toolport_call_tool" | "toolport_fetch_result" | "toolport_run_script" => {
+                    json!(120_000)
+                }
+                _ => Value::Null,
+            };
+            assert_eq!(tool["_meta"][CLAUDE_RESULT_SIZE_META], expected, "{tool}");
+        }
+    }
+
+    #[test]
+    fn raised_server_budgets_advertise_claude_result_size() {
+        let _env = DataDirTestEnv::new("claude-result-size");
+        let (base, router, snapshot) = tool_surface_fixture();
+        // One host for every case: the surface cache must not serve a stale budget.
+        let host = dispatch_host(false);
+        let size = |tool: &Value| tool["_meta"][CLAUDE_RESULT_SIZE_META].as_u64();
+
+        // Default budgets: nothing is added anywhere.
+        for mode in [DiscoveryMode::Lazy, DiscoveryMode::Full] {
+            let tools = listed_view(&host, &base, &router, &snapshot, None, mode);
+            assert!(tools.iter().all(|t| size(t).is_none()), "{tools:?}");
+        }
+
+        for (budget, expected) in [(200_000, 200_000), (0, 500_000), (900_000, 500_000)] {
+            let mut reg = base.clone();
+            reg.result_budgets.insert("alpha".into(), budget);
+            let full = listed_view(&host, &reg, &router, &snapshot, None, DiscoveryMode::Full);
+            assert_eq!(size(listed_named(&full, "alpha__read")), Some(expected));
+            assert_eq!(size(listed_named(&full, "beta__read")), None);
+            // Fetch-result pages use the global budget, which did not change.
+            assert_eq!(size(listed_named(&full, "toolport_fetch_result")), None);
+            let lazy = listed_view(&host, &reg, &router, &snapshot, None, DiscoveryMode::Lazy);
+            assert_eq!(
+                size(listed_named(&lazy, "toolport_call_tool")),
+                Some(expected)
+            );
+            assert_eq!(size(listed_named(&lazy, "toolport_search_tools")), None);
+            assert_eq!(size(listed_named(&lazy, "toolport_status")), None);
+            // A client scoped away from alpha cannot reach its larger results.
+            let beta_only = HashSet::from(["beta".to_string()]);
+            let scoped = listed_view(
+                &host,
+                &reg,
+                &router,
+                &snapshot,
+                Some(&beta_only),
+                DiscoveryMode::Lazy,
+            );
+            assert_eq!(size(listed_named(&scoped, "toolport_call_tool")), None);
+        }
+
+        // An upstream tool that set its own value keeps it.
+        let mut reg = base.clone();
+        reg.result_budgets.insert("alpha".into(), 300_000);
+        let hints = ResultSizeHints::new(&reg, None);
+        let mut own =
+            json!({"name":"alpha__read", "_meta":{CLAUDE_RESULT_SIZE_META: 1234, "x": 1}});
+        hints.apply(&mut own, &router);
+        assert_eq!(own["_meta"], json!({CLAUDE_RESULT_SIZE_META: 1234, "x": 1}));
+        let mut other_meta = json!({"name":"alpha__read", "_meta":{"x": 1}});
+        hints.apply(&mut other_meta, &router);
+        assert_eq!(
+            other_meta["_meta"],
+            json!({CLAUDE_RESULT_SIZE_META: 300_000, "x": 1})
+        );
+    }
+
+    /// Characters as Claude Code counts them: UTF-16 code units over the text blocks.
+    fn claude_text_chars(result: &Value) -> usize {
+        let blocks = result["content"].as_array().cloned().unwrap_or_default();
+        let texts: Vec<&str> = blocks.iter().filter_map(|b| b["text"].as_str()).collect();
+        texts
+            .iter()
+            .map(|t| t.encode_utf16().count())
+            .sum::<usize>()
+            + texts.len().saturating_sub(1)
+    }
+
+    #[test]
+    fn meta_tool_outputs_fit_their_advertised_result_size() {
+        let _env = DataDirTestEnv::new("meta-tool-output-hints");
+        let previous = std::env::var("TOOLPORT_RESULT_BUDGET").ok();
+        std::env::set_var("TOOLPORT_RESULT_BUDGET", "100000");
+        let host = dispatch_host(true);
+        let mut reg = Registry::default();
+        reg.servers.push(stub_server("s", "s"));
+        reg.result_budgets.insert("s".into(), 150_000);
+        // Astral characters count twice in UTF-16, the worst case for a char-sized page.
+        let body = "a😀".repeat(200_000);
+        let router = Arc::new(paging_router(body.clone()));
+        let hints = ResultSizeHints::new(&reg, None);
+        let mut floor = floor_tool_defs_with_code_mode(true);
+        hints.apply_all(&mut floor, &router);
+        let hint = |name: &str| {
+            listed_named(&floor, name)["_meta"][CLAUDE_RESULT_SIZE_META]
+                .as_u64()
+                .unwrap_or(CLAUDE_RESULT_CHARS_DEFAULT as u64) as usize
+        };
+        let call_on = |router: &Router, name: &str, arguments: Value| {
+            let req = json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            });
+            handle_request(
+                &host,
+                &req,
+                &reg,
+                router,
+                &[],
+                true,
+                None,
+                &SearchGuard::default(),
+                None,
+                None,
+            )
+            .unwrap()["result"]
+                .clone()
+        };
+        let call = |name: &str, arguments: Value| call_on(&router, name, arguments);
+        let mut outputs = Vec::new();
+
+        // toolport_call_tool: the largest per-server budget in scope.
+        let called = call("toolport_call_tool", json!({ "name": "s__big" }));
+        outputs.push(("toolport_call_tool", "call", called));
+        // Text whose JSON encoding is much longer than the text itself (escaped
+        // backslashes, quotes and control characters) is still the body, not an
+        // oversized envelope, so it is shaped too.
+        for escaped in ["\\".repeat(300_000), "\\\"\u{1}é".repeat(60_000)] {
+            let router = paging_router(escaped);
+            let called = call_on(&router, "toolport_call_tool", json!({ "name": "s__big" }));
+            outputs.push(("toolport_call_tool", "escaped", called));
+        }
+
+        // toolport_fetch_result: a default page and a structured projection.
+        let structured = json!({ "rows": vec!["r😀".repeat(50); 6_000] });
+        let cursor = shaping::stash_payload(body.clone(), Some(structured), None).unwrap();
+        for offset in [0, 1, 150_000] {
+            let page = call(
+                "toolport_fetch_result",
+                json!({ "cursor": cursor, "offset": offset }),
+            );
+            outputs.push(("toolport_fetch_result", "page", page));
+        }
+        let long_len = call(
+            "toolport_fetch_result",
+            json!({ "cursor": cursor, "offset": 0, "len": 10_000_000 }),
+        );
+        outputs.push(("toolport_fetch_result", "len", long_len));
+        let projection = call(
+            "toolport_fetch_result",
+            json!({ "cursor": cursor, "projection": "rows" }),
+        );
+        outputs.push(("toolport_fetch_result", "projection", projection));
+        let escaped = json!({ "s": "\\".repeat(60_000), "q": "\"\u{1}".repeat(30_000) });
+        let escaped_cursor = shaping::stash_payload(body.clone(), Some(escaped), None).unwrap();
+        for path in ["s", "q"] {
+            let projection = call(
+                "toolport_fetch_result",
+                json!({ "cursor": escaped_cursor, "projection": path }),
+            );
+            outputs.push(("toolport_fetch_result", "escaped projection", projection));
+        }
+        // Error replies echo a short preview of what they were given, never all of it.
+        let huge = "x".repeat(100_001);
+        let echoes = [
+            call("toolport_fetch_result", json!({ "cursor": huge })),
+            call(
+                "toolport_fetch_result",
+                json!({ "cursor": cursor, "projection": huge }),
+            ),
+        ];
+
+        // toolport_run_script: a large aggregate and a large failure.
+        for script in [
+            "return 'b😀'.repeat(300000);",
+            "toolport.call('s__big', {}); throw new Error('E😀'.repeat(300000));",
+        ] {
+            let result = run_script_dispatch(
+                &reg,
+                Some(&router),
+                &[],
+                None,
+                None,
+                None,
+                None,
+                &json!({ "script": script }),
+                None,
+            );
+            outputs.push(("toolport_run_script", "script", result));
+        }
+
+        match previous {
+            Some(value) => std::env::set_var("TOOLPORT_RESULT_BUDGET", value),
+            None => std::env::remove_var("TOOLPORT_RESULT_BUDGET"),
+        }
+        assert_eq!(hint("toolport_call_tool"), 150_000);
+        assert_eq!(hint("toolport_fetch_result"), 100_000);
+        assert_eq!(hint("toolport_run_script"), 100_000);
+        for echo in echoes {
+            assert!(
+                claude_text_chars(&echo) < 400,
+                "{}",
+                &echo.to_string()[..400]
+            );
+        }
+        for (tool, case, output) in outputs {
+            let chars = claude_text_chars(&output);
+            assert!(
+                chars > 50_000,
+                "{tool} {case} must be a large output: {chars}"
+            );
+            assert!(
+                chars <= hint(tool),
+                "{tool} {case}: {chars} chars over the advertised {}",
+                hint(tool)
+            );
+        }
+    }
+
+    fn stdio_state() -> GatewayState {
+        let mut state = http_state(false);
+        let mut host = Arc::try_unwrap(state.host).ok().expect("a fresh host");
+        host.http = false;
+        state.host = Arc::new(host);
+        state
+    }
+
+    #[test]
+    fn a_modern_stdio_client_is_named_on_its_approval() {
+        let _env = DataDirTestEnv::new("modern-client-label-approval");
+        session_tables().hitl().clear();
+        let state = stdio_state();
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .set_safety_level(registry::SafetyLevel::Ask);
+        let router = routed_router("s", "delete");
+        *state.cached_tools.lock().unwrap() =
+            Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+        swap_router(&state, router);
+        let request = |id: i64, name: Option<&str>| {
+            let mut meta = json!({
+                "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
+            });
+            if let Some(name) = name {
+                meta["io.modelcontextprotocol/clientInfo"] =
+                    json!({ "name": name, "version": "2.1.290" });
+            }
+            json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": "s__delete", "arguments": { "id": id }, "_meta": meta }
+            })
+        };
+        let call = |req: &Value| {
+            process_request(
+                &state,
+                req,
+                &SearchGuard::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                DiscoveryMode::Full,
+            )
+            .unwrap()
+        };
+        let reply = call(&request(1, Some("Claude Code")));
+        assert_eq!(reply["result"]["resultType"], "input_required", "{reply}");
+        // A multiplexing caller names a different client on a later request. That
+        // request is labelled with its own name. The same caller then sends a modern
+        // request with no clientInfo: it is unlabelled, never named after an earlier
+        // request's client. Only an initialize sets a connection's fallback label.
+        let second = call(&request(2, Some("Someone Else")));
+        let third = call(&request(3, None));
+        assert_eq!(
+            state.stdio_upstream.client_label.lock().unwrap().as_deref(),
+            None
+        );
+        for reply in [&reply, &second, &third] {
+            let token = reply["result"]["requestState"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let pending = session_tables()
+                .hitl()
+                .with(&token, |approval| approval.abandoned_audit.take())
+                .flatten()
+                .expect("the approval keeps its audit record");
+            pending.finish("withdrawn", 0);
+        }
+        let rows = audit::read_all().unwrap();
+        // Each approval writes more than one row; every row of one call carries the
+        // label of the request that made it.
+        let labels: HashMap<String, HashSet<String>> = rows
+            .iter()
+            .filter(|row| row["kind"] == "approval")
+            .fold(HashMap::new(), |mut labels, row| {
+                labels
+                    .entry(row["argsHash"].as_str().unwrap().to_string())
+                    .or_default()
+                    .insert(row["clientLabel"].as_str().unwrap_or("").to_string());
+                labels
+            });
+        let mut per_call: Vec<Vec<String>> = labels
+            .into_values()
+            .map(|set| set.into_iter().collect())
+            .collect();
+        per_call.sort();
+        assert_eq!(
+            per_call,
+            [
+                vec![String::new()],
+                vec!["Claude Code 2.1.290".to_string()],
+                vec!["Someone Else 2.1.290".to_string()]
+            ],
+            "{rows:?}"
+        );
+        session_tables().hitl().clear();
+    }
+
+    #[test]
+    fn only_handshake_era_requests_fall_back_to_the_initialize_label() {
+        let _env = DataDirTestEnv::new("handshake-era-label-fallback");
+        let state = stdio_state();
+        let legacy_init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-06-18","capabilities":{},
+            "clientInfo":{"name":"Codex","version":"1"}}});
+        let _ = process_request(
+            &state,
+            &legacy_init,
+            &SearchGuard::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            DiscoveryMode::Full,
+        );
+        let legacy = json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}});
+        assert_eq!(
+            request_client_label(&state, &legacy).as_deref(),
+            Some("Codex 1")
+        );
+        let modern = |info: Value| {
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":{
+                "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientInfo": info}}})
+        };
+        assert_eq!(
+            request_client_label(&state, &modern(json!({"name":"B","version":"2"}))).as_deref(),
+            Some("B 2")
+        );
+        let mut bare = modern(Value::Null);
+        bare["params"]["_meta"]
+            .as_object_mut()
+            .unwrap()
+            .remove("io.modelcontextprotocol/clientInfo");
+        assert_eq!(request_client_label(&state, &bare), None);
     }
 
     #[test]

@@ -528,6 +528,9 @@ export class RpcClient {
     this.profile = profile;
     this.id = 100;
     this.pending = new Map();
+    // IDs this client cancelled. MCP receivers do not answer a cancelled request,
+    // so any later response for one of them is a conformance failure.
+    this.cancelled = new Set();
     this.notifications = [];
     this.waiters = [];
     this.stderr = "";
@@ -583,6 +586,10 @@ export class RpcClient {
       return;
     }
     if (Object.hasOwn(message, "id")) {
+      assert(
+        !this.cancelled.has(message.id),
+        `${this.profile.id}: response after cancelling ${message.id}`,
+      );
       const entry = this.pending.get(message.id);
       assert(entry, `unexpected response ID ${message.id}`);
       this.pending.delete(message.id);
@@ -661,6 +668,21 @@ export class RpcClient {
     return this.profile.id === "grok" ? name.replaceAll("__", "-") : name;
   }
 
+  /** Cancel an open request the way a client does: settle it locally, notify. */
+  cancel(id, reason) {
+    const entry = this.pending.get(id);
+    if (entry) {
+      this.pending.delete(id);
+      clearTimeout(entry.timer);
+      entry.resolve({ cancelled: true });
+    }
+    this.cancelled.add(id);
+    this.send({
+      jsonrpc: "2.0",
+      method: "notifications/cancelled",
+      params: { requestId: id, reason },
+    });
+  }
   call(name, args = {}, lazy = false, id) {
     return this.request(
       "tools/call",

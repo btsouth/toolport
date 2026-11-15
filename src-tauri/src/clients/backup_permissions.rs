@@ -1,4 +1,5 @@
-//! Private recovery directories also protect atomic-write temps on Windows.
+//! Private recovery directories also protect atomic-write temps on Windows. Result
+//! spills (`shaping`) use the same owner-only directory ACL.
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, GENERIC_ALL};
@@ -12,7 +13,7 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-pub(super) fn secure(dir: &Path) -> Result<(), String> {
+pub(crate) fn secure(dir: &Path) -> Result<(), String> {
     // Use extended paths for long backup directories, while retaining v1's
     // ordinary path on filesystems that cannot canonicalize.
     let dir = if dir.as_os_str().encode_wide().count() >= 248 {

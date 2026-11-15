@@ -1,5 +1,5 @@
 import { useI18n, Trans } from "@/lib/i18n";
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Check, Loader2, ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -23,7 +23,11 @@ interface Props {
   allowEmpty?: boolean;
   requireCredentials?: boolean;
   details?: string;
+  /** Shown under the description, before the user confirms. */
+  notice?: ReactNode;
   error?: string;
+  /** Where focus goes when the dialog closes; Radix defaults to its trigger. */
+  onCloseAutoFocus?: (event: Event) => void;
   onOpenChange: (open: boolean) => void;
   onConfirm: (
     keys: string[],
@@ -31,6 +35,10 @@ interface Props {
     credentialInputs?: Record<string, Record<string, string>>,
   ) => void;
 }
+
+/** A disclosure toggle with the same hover and focus ring as the dialog's buttons. */
+export const disclosureSummary =
+  "w-fit cursor-pointer rounded-md -mx-1 px-1 transition-colors outline-none hover:bg-muted hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50";
 
 /** Review and choose detected client servers before adding them to Toolport. */
 export function ImportReviewDialog({
@@ -43,7 +51,9 @@ export function ImportReviewDialog({
   allowEmpty = false,
   requireCredentials = false,
   details,
+  notice,
   error,
+  onCloseAutoFocus,
   onOpenChange,
   onConfirm,
 }: Props) {
@@ -61,7 +71,9 @@ export function ImportReviewDialog({
         allowEmpty={allowEmpty}
         requireCredentials={requireCredentials}
         details={details}
+        notice={notice}
         error={error}
+        onCloseAutoFocus={onCloseAutoFocus}
         onOpenChange={onOpenChange}
         onConfirm={onConfirm}
       />
@@ -78,11 +90,24 @@ function ImportReviewContent({
   allowEmpty = false,
   requireCredentials = false,
   details,
+  notice,
   error,
+  onCloseAutoFocus,
   onOpenChange,
   onConfirm,
 }: Omit<Props, "open">) {
   const { t } = useI18n();
+  const contentRef = useRef<HTMLDivElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  // Starting a check disables the focused button; keep focus in the dialog
+  // instead of letting it fall to the page behind.
+  useEffect(() => {
+    const content = contentRef.current;
+    if (!busy || !content) return;
+    const active = document.activeElement;
+    if (!active || !content.contains(active) || active.matches(":disabled"))
+      content.focus();
+  }, [busy]);
   const keyedItems = items.map((item, index) => ({
     item,
     key: item.key ?? `${item.name}-${index}`,
@@ -118,13 +143,29 @@ function ImportReviewContent({
                   !env.present &&
                   !credentialInputs[item.name]?.[env.key]?.trim(),
               )
-              .map((env) => `Enter ${env.key} or deselect ${item.name}`)
+              .map((env) =>
+                t("Enter {value0} or deselect {value1}", {
+                  value0: env.key,
+                  value1: item.name,
+                }),
+              )
           : [],
       )
     : [];
 
   return (
-    <DialogContent className="sm:max-w-lg">
+    <DialogContent
+      ref={contentRef}
+      className="sm:max-w-lg"
+      closeDisabled={busy}
+      // Open on Cancel, as the GTK review does, so Enter never confirms or toggles
+      // a disclosure by accident.
+      onOpenAutoFocus={(event) => {
+        event.preventDefault();
+        cancelRef.current?.focus();
+      }}
+      onCloseAutoFocus={onCloseAutoFocus}
+    >
       <DialogHeader>
         <DialogTitle>{title ?? t("Review servers to import")}</DialogTitle>
       </DialogHeader>
@@ -135,9 +176,10 @@ function ImportReviewContent({
               "Review the commands and URLs before adding them. Leave any server unchecked to keep it as it is.",
             )}
         </p>
+        {notice}
         {details && (
           <details>
-            <summary className="text-meta">{t("Details")}</summary>
+            <summary className={`text-meta ${disclosureSummary}`}>{t("Details")}</summary>
             <p className="mt-2 whitespace-pre-wrap break-all text-meta text-muted-foreground">
               {details}
             </p>
@@ -158,7 +200,7 @@ function ImportReviewContent({
                   aria-pressed={isSelected}
                   disabled={busy || !!item.unsupported}
                   data-failed={!!error?.includes(item.name)}
-                  className={`w-full rounded-md text-left transition-colors ${
+                  className={`w-full rounded-md text-left transition-colors outline-none hover:bg-muted/60 focus-visible:ring-3 focus-visible:ring-ring/50 disabled:hover:bg-transparent ${
                     error?.includes(item.name)
                       ? "ring-1 ring-warning"
                       : isSelected
@@ -214,7 +256,7 @@ function ImportReviewContent({
                 </button>
                 {!!item.credentials?.length && (
                   <details className="px-3 pb-3 text-meta">
-                    <summary className="cursor-pointer">
+                    <summary className={disclosureSummary}>
                       {item.name} {t("credentials and settings")}
                     </summary>
                     <div className="flex flex-col gap-2 pt-2">
@@ -337,7 +379,12 @@ function ImportReviewContent({
         </p>
       ))}
       <DialogFooter className="justify-between">
-        <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={busy}>
+        <Button
+          ref={cancelRef}
+          variant="ghost"
+          onClick={() => onOpenChange(false)}
+          disabled={busy}
+        >
           {t("Cancel")}
         </Button>
         <Button

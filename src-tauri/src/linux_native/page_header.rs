@@ -24,6 +24,11 @@ mod imp {
     pub struct HeaderWrap {
         pub(super) title: RefCell<Option<gtk::Widget>>,
         pub(super) actions: RefCell<Option<gtk::Widget>>,
+        /// When set, the actions stay on the title's line while the title keeps
+        /// at least this width, instead of only when it fits at natural width.
+        pub(super) min_title: std::cell::Cell<i32>,
+        /// When set, wrapped actions start after this widget, as under a logo.
+        pub(super) indent_from: RefCell<Option<gtk::Widget>>,
     }
 
     #[glib::object_subclass]
@@ -68,17 +73,23 @@ mod imp {
             };
             let (title_min, title_nat, _, _) = title.measure(gtk::Orientation::Horizontal, -1);
             let (actions_min, actions_nat) = action_width(&actions);
+            let indent = self.indent();
             if orientation == gtk::Orientation::Horizontal {
                 let gap = if actions_nat > 0 { COLUMN_GAP } else { 0 };
+                let wrapped_min = if actions_nat > 0 {
+                    indent + actions_min
+                } else {
+                    0
+                };
                 return (
-                    title_min.max(actions_min),
-                    title_nat + gap + actions_nat,
+                    title_min.max(wrapped_min),
+                    title_nat.max(self.min_title.get()) + gap + actions_nat,
                     -1,
                     -1,
                 );
             }
             let (_, actions_height) = action_height(&actions, -1);
-            if for_size < 0 || fits_one_row(title_nat, actions_nat, for_size) {
+            if for_size < 0 || self.fits(title_min, title_nat, actions_nat, for_size) {
                 let title_width = if for_size < 0 {
                     -1
                 } else {
@@ -88,7 +99,8 @@ mod imp {
                 return (min.max(actions_height), nat.max(actions_height), -1, -1);
             }
             let (min, nat, _, _) = title.measure(gtk::Orientation::Vertical, for_size);
-            let (_, actions_height) = action_height(&actions, for_size.min(actions_nat));
+            let actions_width = (for_size - indent).min(actions_nat).max(actions_min);
+            let (_, actions_height) = action_height(&actions, actions_width);
             (
                 min + ROW_GAP + actions_height,
                 nat + ROW_GAP + actions_height,
@@ -105,7 +117,7 @@ mod imp {
             };
             let (title_min, title_nat, _, _) = title.measure(gtk::Orientation::Horizontal, -1);
             let (actions_min, actions_nat) = action_width(&actions);
-            if fits_one_row(title_nat, actions_nat, width) {
+            if self.fits(title_min, title_nat, actions_nat, width) {
                 let title_width = (width - row_gap(actions_nat) - actions_nat).max(title_min);
                 title.size_allocate(&gtk::Allocation::new(0, 0, title_width, height), -1);
                 if actions_nat > 0 {
@@ -118,12 +130,37 @@ mod imp {
             }
             let (_, title_height, _, _) = title.measure(gtk::Orientation::Vertical, width);
             title.size_allocate(&gtk::Allocation::new(0, 0, width, title_height), -1);
-            let actions_width = width.min(actions_nat).max(actions_min);
+            let indent = self.indent();
+            let actions_width = (width - indent).min(actions_nat).max(actions_min);
             let top = title_height + ROW_GAP;
             actions.size_allocate(
-                &gtk::Allocation::new(0, top, actions_width, (height - top).max(0)),
+                &gtk::Allocation::new(indent, top, actions_width, (height - top).max(0)),
                 -1,
             );
+        }
+    }
+
+    impl HeaderWrap {
+        fn fits(&self, title_min: i32, title_nat: i32, actions_nat: i32, width: i32) -> bool {
+            match self.min_title.get() {
+                0 => fits_one_row(title_nat, actions_nat, width),
+                min => fits_one_row(title_min.max(min), actions_nat, width),
+            }
+        }
+
+        fn indent(&self) -> i32 {
+            self.indent_from
+                .borrow()
+                .as_ref()
+                .filter(|widget| widget.should_layout())
+                .map_or(0, |widget| {
+                    let (_, nat, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
+                    let spacing = widget
+                        .parent()
+                        .and_then(|parent| parent.downcast::<gtk::Box>().ok())
+                        .map_or(0, |parent| parent.spacing());
+                    nat + spacing
+                })
         }
     }
 
@@ -169,6 +206,159 @@ impl HeaderWrap {
         wrap.imp().actions.replace(Some(actions.clone().upcast()));
         wrap
     }
+
+    /// A list row: the actions share the line while the text keeps `min_title`
+    /// pixels, and otherwise move under the text, starting after `indent_from`
+    /// (the row's logo), as React's rows do at narrow widths.
+    pub(super) fn row(
+        title: &impl IsA<gtk::Widget>,
+        actions: &impl IsA<gtk::Widget>,
+        min_title: i32,
+        indent_from: Option<&gtk::Widget>,
+    ) -> Self {
+        let wrap = Self::new(title, actions);
+        wrap.imp().min_title.set(min_title);
+        wrap.imp().indent_from.replace(indent_from.cloned());
+        wrap
+    }
+}
+
+mod flow_imp {
+    use super::*;
+
+    #[derive(Default)]
+    pub struct ActionFlow;
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for ActionFlow {
+        const NAME: &'static str = "ToolportActionFlow";
+        type Type = super::ActionFlow;
+        type ParentType = gtk::Widget;
+    }
+
+    impl ObjectImpl for ActionFlow {
+        fn dispose(&self) {
+            while let Some(child) = self.obj().first_child() {
+                child.unparent();
+            }
+        }
+    }
+
+    impl WidgetImpl for ActionFlow {
+        fn request_mode(&self) -> gtk::SizeRequestMode {
+            gtk::SizeRequestMode::HeightForWidth
+        }
+
+        fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
+            let children = self.children();
+            if orientation == gtk::Orientation::Horizontal {
+                let min = children.iter().map(|(_, min, _)| *min).max().unwrap_or(0);
+                let nat = children.iter().map(|(_, _, nat)| *nat).sum::<i32>()
+                    + super::ACTION_SPACING * (children.len() as i32 - 1).max(0);
+                return (min, nat, -1, -1);
+            }
+            let lines = lines(&children, for_size);
+            let height = lines.iter().map(|line| line.height).sum::<i32>()
+                + super::ACTION_SPACING * (lines.len() as i32 - 1).max(0);
+            (height, height, -1, -1)
+        }
+
+        fn size_allocate(&self, width: i32, _height: i32, _baseline: i32) {
+            let children = self.children();
+            let mut top = 0;
+            for line in lines(&children, width) {
+                let mut left = 0;
+                for (child, child_width, child_height) in line.items {
+                    child.size_allocate(
+                        &gtk::Allocation::new(
+                            left,
+                            top + (line.height - child_height) / 2,
+                            child_width,
+                            child_height,
+                        ),
+                        -1,
+                    );
+                    left += child_width + super::ACTION_SPACING;
+                }
+                top += line.height + super::ACTION_SPACING;
+            }
+        }
+    }
+
+    impl ActionFlow {
+        /// The visible children with their minimum and natural widths.
+        fn children(&self) -> Vec<(gtk::Widget, i32, i32)> {
+            let mut out = Vec::new();
+            let mut child = self.obj().first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                if widget.should_layout() {
+                    let (min, nat, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
+                    out.push((widget, min, nat));
+                }
+            }
+            out
+        }
+    }
+
+    pub(super) struct Line {
+        pub(super) items: Vec<(gtk::Widget, i32, i32)>,
+        pub(super) height: i32,
+    }
+
+    /// Children at natural width, left to right, starting a new line when the
+    /// next one would pass `width` (any width when `width` is negative).
+    fn lines(children: &[(gtk::Widget, i32, i32)], width: i32) -> Vec<Line> {
+        let mut out: Vec<Line> = Vec::new();
+        let mut used = 0;
+        for (widget, min, nat) in children {
+            let child_width = if width < 0 {
+                *nat
+            } else {
+                (*nat).min(width).max(*min)
+            };
+            let start_new = match out.last() {
+                None => true,
+                Some(_) => width >= 0 && used + super::ACTION_SPACING + child_width > width,
+            };
+            if start_new {
+                out.push(Line {
+                    items: Vec::new(),
+                    height: 0,
+                });
+                used = 0;
+            } else {
+                used += super::ACTION_SPACING;
+            }
+            let (_, height, _, _) = widget.measure(gtk::Orientation::Vertical, child_width);
+            let line = out.last_mut().expect("a line was just ensured");
+            line.items.push((widget.clone(), child_width, height));
+            line.height = line.height.max(height);
+            used += child_width;
+        }
+        out
+    }
+}
+
+/// Space between page actions, across and between lines.
+const ACTION_SPACING: i32 = 8;
+
+glib::wrapper! {
+    /// The page actions, left to right at natural width, wrapping onto more lines
+    /// when the header is too narrow for them, the way React's header wraps.
+    pub struct ActionFlow(ObjectSubclass<flow_imp::ActionFlow>)
+        @extends gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+impl ActionFlow {
+    pub(super) fn new() -> Self {
+        glib::Object::new()
+    }
+
+    pub(super) fn append(&self, widget: &impl IsA<gtk::Widget>) {
+        widget.insert_before(self, None::<&gtk::Widget>);
+    }
 }
 
 /// Whether the title and the actions both fit on one line at natural width.
@@ -182,7 +372,7 @@ pub(super) struct PageHeader {
     pub(super) root: gtk::WindowHandle,
     pub(super) title: gtk::Label,
     pub(super) subtitle: gtk::Label,
-    actions: gtk::Box,
+    actions: ActionFlow,
     leading: gtk::Box,
 }
 
@@ -217,7 +407,7 @@ impl PageHeader {
         heading.append(&leading);
         heading.append(&text);
 
-        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let actions = ActionFlow::new();
         actions.set_valign(gtk::Align::Center);
         actions.add_css_class("toolport-page-actions");
         let wrap = HeaderWrap::new(&heading, &actions);
@@ -343,6 +533,21 @@ mod tests {
         let (_, wide, _, _) = wrap.measure(gtk::Orientation::Vertical, 1100);
         let (_, narrow, _, _) = wrap.measure(gtk::Orientation::Vertical, 420);
         assert!(narrow > wide, "actions should wrap below the title");
+        // Too narrow for both actions on one line, they wrap onto a second one
+        // instead of running past the window edge.
+        let (min, nat, _, _) = header.actions.measure(gtk::Orientation::Horizontal, -1);
+        assert!(
+            min < nat,
+            "actions can be narrower than one line: {min} {nat}"
+        );
+        let (_, one_line, _, _) = header.actions.measure(gtk::Orientation::Vertical, nat);
+        let (_, two_lines, _, _) = header.actions.measure(gtk::Orientation::Vertical, min);
+        assert!(two_lines > one_line, "actions wrap: {two_lines} {one_line}");
+        let (wrap_min, _, _, _) = wrap.measure(gtk::Orientation::Horizontal, -1);
+        assert!(
+            wrap_min < nat,
+            "the header fits narrower than its actions' one line"
+        );
         header.set_title("Catalog");
         header.set_subtitle("Add MCP servers from the registry");
         let back = header.set_back("Servers", "Back to servers");

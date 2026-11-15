@@ -16,7 +16,7 @@ use serde::Serialize;
 use crate::registry::{ManagedEntry, ServerEntry};
 
 #[cfg(windows)]
-mod backup_permissions;
+pub(crate) mod backup_permissions;
 mod claude_profiles;
 pub use claude_profiles::ClaudeProfile;
 mod disconnect;
@@ -49,6 +49,8 @@ mod toml_preservation;
 mod typed_entries_tests;
 pub(crate) use restore::after_capture_conflict as record_config_capture_conflict;
 pub(crate) use restore::after_rollback as record_config_rollback;
+#[cfg(test)]
+mod codex_settings_tests;
 pub(crate) mod nanobot;
 pub(crate) mod openclaw;
 mod openhands;
@@ -386,6 +388,305 @@ pub fn client_alias_rule(id: Option<&str>, registered_key: &str) -> crate::route
 /// on the pre-rename identity so OS installs/updates keep working. See
 /// [`LEGACY_GATEWAY_ENTRY_NAME`] for the entry-name migration path.
 pub const GATEWAY_ENTRY_NAME: &str = "toolport";
+
+/// Settings Toolport writes into its own Codex entry, each only when the user has not
+/// set it (or an alias Codex reads for it). A value the user wrote, either way, stays.
+/// Grok shares Codex's TOML format but gets none of these.
+///
+/// Codex defaults, read from openai/codex `codex-rs/codex-mcp/src/rmcp_client.rs` on
+/// 2026-11-15: startup 30 s (10 s before rust-v0.118.0, #16080) and tool calls 300 s
+/// (60 s before rust-v0.105.0, then 120 s until rust-v0.141.0, #28234). Codex's config
+/// reference still says 10 s and 60 s. Older Codex builds keep the old defaults.
+///
+/// - `supports_parallel_tool_calls = true`: Codex runs a server's calls one at a time
+///   by default. The stdio adapter dispatches each request on its own worker and the
+///   daemon serves each on its own thread, with server-to-client requests and approval
+///   prompts matched by id, so overlapping calls are safe. Applies to the shared HTTP
+///   entry too, which reaches the same daemon dispatch.
+/// - `startup_timeout_sec = 75`: Codex waits 30 s (10 s on older builds) for initialize
+///   and the first tool list. A cold adapter can spend up to 20 s on daemon election
+///   (`daemon::ELECTION_TIMEOUT`), 10 s waiting for the daemon (`daemon::READY_TIMEOUT`),
+///   30 s on a private gateway when the daemon is wedged
+///   (`PRIVATE_GATEWAY_READY_TIMEOUT`), then 8 s holding the first full list for
+///   Codex's servers (`cold_full_list_wait_ms`): 68 s, plus margin. `startup_timeout_ms`
+///   counts as set because Codex prefers the `_sec` key over it. Not written for the
+///   shared HTTP entry: the app already serves it, so only the 8 s list wait applies.
+/// - `tool_timeout_sec = 600`: Codex fails a call after 300 s (60 s on older builds).
+///   Through Toolport a call can wait 120 s for a human approval
+///   (`approval::DEFAULT_TIMEOUT_SECS`) and then run its own downstream call, an upstream
+///   elicitation can wait 120 s (`UPSTREAM_INTERACTIVE_TIMEOUT`), a script runs up to its
+///   60 s wall clock plus the calls it makes, and a server's `requestTimeoutMs` may be
+///   longer still. The adapter fails any one request at 600 s (`REQUEST_TIMEOUT` in
+///   `stdio_adapter.rs`), so a longer Codex limit could never help and a shorter one can
+///   cut off a call Toolport would finish. Applies to the shared HTTP entry too.
+const CODEX_GATEWAY_SETTINGS: &[CodexSetting] = &[
+    CodexSetting {
+        key: "supports_parallel_tool_calls",
+        aliases: &[],
+        value: CodexValue::Bool(true),
+        http: true,
+    },
+    CodexSetting {
+        key: "startup_timeout_sec",
+        aliases: &["startup_timeout_ms"],
+        value: CodexValue::Seconds(75),
+        http: false,
+    },
+    CodexSetting {
+        key: "tool_timeout_sec",
+        aliases: &[],
+        value: CodexValue::Seconds(600),
+        http: true,
+    },
+];
+
+struct CodexSetting {
+    key: &'static str,
+    /// Other keys Codex reads for the same setting; any of them counts as set.
+    aliases: &'static [&'static str],
+    value: CodexValue,
+    /// Whether the setting is written for the shared HTTP (`url`) entry.
+    http: bool,
+}
+
+#[derive(Clone, Copy)]
+enum CodexValue {
+    Bool(bool),
+    Seconds(i64),
+}
+
+impl CodexValue {
+    fn json(self) -> serde_json::Value {
+        match self {
+            CodexValue::Bool(value) => value.into(),
+            CodexValue::Seconds(value) => value.into(),
+        }
+    }
+
+    fn toml(self) -> toml_edit::Value {
+        match self {
+            CodexValue::Bool(value) => value.into(),
+            CodexValue::Seconds(value) => value.into(),
+        }
+    }
+}
+
+/// Codex, including a Codex home added as a location (`codex@<key>`).
+fn is_codex_client(client_id: &str) -> bool {
+    client_id == "codex" || client_id.starts_with("codex@")
+}
+
+/// The Codex settings for a stdio (`http == false`) or shared HTTP entry.
+fn codex_settings(http: bool) -> impl Iterator<Item = &'static CodexSetting> {
+    CODEX_GATEWAY_SETTINGS
+        .iter()
+        .filter(move |setting| !http || setting.http)
+}
+
+/// Every Codex setting key for the transport, which is what the ownership record holds
+/// once Toolport has handled the entry.
+fn codex_setting_keys(http: bool) -> Vec<String> {
+    codex_settings(http)
+        .map(|setting| setting.key.to_string())
+        .collect()
+}
+
+/// Client-specific keys a fresh gateway entry carries beyond command, args and env.
+fn gateway_entry_client_fields(client_id: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    if is_codex_client(client_id) {
+        for setting in codex_settings(false) {
+            fields.insert(setting.key.to_string(), setting.value.json());
+        }
+    }
+    fields
+}
+
+/// The Codex settings a gateway entry asks for, with the keys that count as already set.
+fn codex_settings_for(
+    entry: &ServerEntry,
+) -> impl Iterator<Item = (&'static str, &'static [&'static str], toml_edit::Value)> + '_ {
+    CODEX_GATEWAY_SETTINGS.iter().filter_map(move |setting| {
+        let value = match entry.unknown_fields.get(setting.key)? {
+            serde_json::Value::Bool(value) => toml_edit::Value::from(*value),
+            serde_json::Value::Number(value) => toml_edit::Value::from(value.as_i64()?),
+            _ => return None,
+        };
+        Some((setting.key, setting.aliases, value))
+    })
+}
+
+/// The Codex settings a gateway entry in `config_text` lacks and Toolport has not
+/// handled before (`handled`, from the ownership record). A key the user deleted after
+/// Toolport wrote it is handled, so it is never added back. Unparseable text or a
+/// missing entry lacks nothing, so this never forces a rewrite on its own.
+fn codex_entry_missing_settings(
+    client_id: &str,
+    entry_name: &str,
+    config_text: Option<&str>,
+    handled: &[String],
+    http: bool,
+) -> Vec<&'static CodexSetting> {
+    if !is_codex_client(client_id) {
+        return Vec::new();
+    }
+    let Some(doc) = config_text.and_then(|text| text.parse::<toml::Table>().ok()) else {
+        return Vec::new();
+    };
+    let Some(entry) = doc
+        .get("mcp_servers")
+        .and_then(|servers| servers.get(entry_name))
+        .and_then(toml::Value::as_table)
+    else {
+        return Vec::new();
+    };
+    let present = |setting: &CodexSetting| {
+        entry.contains_key(setting.key)
+            || setting
+                .aliases
+                .iter()
+                .any(|alias| entry.contains_key(*alias))
+    };
+    // No record of what Toolport handled (an install from before it kept one, or a
+    // reset or restored data dir): if the entry carries any of these settings, the
+    // missing ones were removed on purpose. Only an entry with none of them, which is
+    // what every earlier Toolport wrote, gets them, once.
+    if handled.is_empty() && CODEX_GATEWAY_SETTINGS.iter().any(present) {
+        return Vec::new();
+    }
+    codex_settings(http)
+        .filter(|setting| !handled.iter().any(|key| key == setting.key) && !present(setting))
+        .collect()
+}
+
+/// The Codex settings a connect will add to the client's Toolport entry, as the TOML
+/// lines the review shows before the user confirms. A connect writes each one only
+/// when it is not set, so a setting already in the entry is left out.
+pub(crate) fn codex_gateway_settings_preview(
+    client_id: &str,
+    config_text: Option<&str>,
+) -> Vec<String> {
+    if !is_codex_client(client_id) {
+        return Vec::new();
+    }
+    let entry = config_text
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|doc| {
+            doc.get("mcp_servers")?
+                .get(GATEWAY_ENTRY_NAME)?
+                .as_table()
+                .cloned()
+        })
+        .unwrap_or_default();
+    codex_settings(false)
+        .filter(|setting| {
+            !entry.contains_key(setting.key)
+                && !setting
+                    .aliases
+                    .iter()
+                    .any(|alias| entry.contains_key(*alias))
+        })
+        .map(|setting| format!("{} = {}", setting.key, setting.value.toml()))
+        .collect()
+}
+
+/// [`codex_gateway_settings_preview`] for a client's current config file.
+pub fn codex_gateway_settings_for_connect(client_id: &str) -> Vec<String> {
+    let text = find_def(client_id)
+        .and_then(|def| resolved_definition_path(&def).ok())
+        .and_then(|path| read_config_file(&path).ok());
+    codex_gateway_settings_preview(client_id, text.as_deref())
+}
+
+/// The ownership record with every Codex setting for its transport marked as handled,
+/// or `None` when it already is (or the client is not Codex).
+fn codex_settings_marked(client_id: &str, record: &ManagedEntry) -> Option<ManagedEntry> {
+    if !is_codex_client(client_id) {
+        return None;
+    }
+    let keys = codex_setting_keys(record.transport == "sharedHttp");
+    if keys.iter().all(|key| record.codex_settings.contains(key)) {
+        return None;
+    }
+    let mut marked = record.clone();
+    for key in keys {
+        if !marked.codex_settings.contains(&key) {
+            marked.codex_settings.push(key);
+        }
+    }
+    Some(marked)
+}
+
+/// [`gateway_entry_needs_rewrite`], plus a Codex entry that lacks one of
+/// [`CODEX_GATEWAY_SETTINGS`] Toolport has not handled yet. The provenance gate applies
+/// to both.
+fn client_gateway_entry_needs_rewrite(
+    client_id: &str,
+    entry_name: &str,
+    stored_command: &str,
+    current: &str,
+    config_text: Option<&str>,
+    handled: &[String],
+) -> bool {
+    gateway_entry_needs_rewrite(entry_name, stored_command, current, config_text)
+        || (command_is_gateway_binary(stored_command)
+            && !codex_entry_missing_settings(client_id, entry_name, config_text, handled, false)
+                .is_empty())
+}
+
+/// Add the Codex settings a Toolport-managed shared HTTP entry lacks, preserving the
+/// transport and everything else in the entry. Returns the updated ownership record
+/// when anything changed (the file, or only the record's handled list).
+fn repair_codex_http_settings(
+    client: &DetectedClient,
+    record: &ManagedEntry,
+) -> Result<Option<ManagedEntry>, String> {
+    if !is_codex_client(&client.id) || !client.config_exists || client.error.is_some() {
+        return Ok(None);
+    }
+    let Some(entry) = gateway_entry_for_client(&client.id, &client.servers) else {
+        return Ok(None);
+    };
+    if entry_state_for(Some(entry), Some(record)) != GatewayEntryState::Managed {
+        return Ok(None);
+    }
+    let def = find_def(&client.id).ok_or("Unknown client")?;
+    let path = resolved_definition_path(&def)?;
+    let entry_name = entry.name.clone();
+    let missing = codex_entry_missing_settings(
+        &client.id,
+        &entry_name,
+        read_config_file(&path).ok().as_deref(),
+        &record.codex_settings,
+        true,
+    );
+    if missing.is_empty() {
+        return Ok(codex_settings_marked(&client.id, record));
+    }
+    mutation::run(&client.id, &path, def.format, || {
+        let fresh = read_client(&def);
+        if entry_state_for(
+            gateway_entry_for_client(&client.id, &fresh.servers),
+            Some(record),
+        ) != GatewayEntryState::Managed
+        {
+            return Err("Client gateway changed during repair; leaving it untouched".into());
+        }
+        backup_file(&client.id, &path)?;
+        let mut doc = load_toml_document(&path)?;
+        for setting in &missing {
+            toml_preservation::insert_if_absent(
+                &mut doc,
+                &entry_name,
+                setting.key,
+                setting.aliases,
+                setting.value.toml(),
+            );
+        }
+        atomic_write(&path, &doc.to_string())
+    })?;
+    Ok(codex_settings_marked(&client.id, record))
+}
 
 /// The name Toolport wrote before the SOU-318 rename. Existing installs still have
 /// their entry named this; [`gateway_identity_matches`] keeps recognizing it so we
@@ -8368,6 +8669,7 @@ fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, 
     if let Some(p) = profile.map(str::trim).filter(|p| !p.is_empty()) {
         env.push(env_var(crate::brand::PROFILE, p));
     }
+    let unknown_fields = gateway_entry_client_fields(client_id);
     Ok(ServerEntry {
         enabled: false,
         inherit_env: false,
@@ -8386,7 +8688,7 @@ fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, 
         request_timeout_ms: None,
         initialize_timeout_ms: None,
         launch: None,
-        unknown_fields: serde_json::Map::new(),
+        unknown_fields,
     })
 }
 
@@ -8720,6 +9022,9 @@ fn edit_toml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), Str
         let before = doc.clone();
         let was_missing = toml_preservation::raw_entry(&before, GATEWAY_ENTRY_NAME).is_none();
         toml_preservation::update_entry(&mut doc, GATEWAY_ENTRY_NAME, entry);
+        for (key, aliases, value) in codex_settings_for(entry) {
+            toml_preservation::insert_if_absent(&mut doc, GATEWAY_ENTRY_NAME, key, aliases, value);
+        }
         if was_missing {
             if let Some((_, item)) = toml_preservation::raw_entry(&doc, GATEWAY_ENTRY_NAME) {
                 if item.is_table() {
@@ -8800,7 +9105,12 @@ fn install_or_remove_inner(
     let lenient = config_is_whole_app_state(client_id);
     // Build the snapshot before writing so the ownership record matches the bytes
     // we put on disk (SOU-406). Strip secrets for the registry record.
-    let managed = entry.map(ManagedEntry::from_gateway_entry);
+    let mut managed = entry.map(ManagedEntry::from_gateway_entry);
+    // Every Codex setting is now written or was already set (or handled before), so
+    // a later startup repair leaves the entry's settings as the user keeps them.
+    if let Some(record) = managed.as_mut().filter(|_| is_codex_client(client_id)) {
+        record.codex_settings = codex_setting_keys(false);
+    }
     edit_format(def.format, &path, entry, lenient)?;
     Ok(WriteOutcome {
         path: path.display().to_string(),
@@ -8885,6 +9195,71 @@ pub fn install_gateway(client_id: &str, profile: Option<&str>) -> Result<WriteOu
         .warnings
         .extend(relocate::after_connect(client_id, &entry));
     Ok(outcome)
+}
+
+/// [`install_gateway`] for a rewrite that is not an explicit Connect or Reset (an
+/// access change): `keep` is the ownership record's handled Codex settings.
+pub fn install_gateway_for(
+    client_id: &str,
+    profile: Option<&str>,
+    keep: Option<&[String]>,
+) -> Result<WriteOutcome, String> {
+    let mut entry = gateway_entry(profile, client_id)?;
+    if let Some(handled) = keep {
+        let def = find_def(client_id).ok_or("Unknown client")?;
+        let path = resolved_definition_path(&def)?;
+        let entry_name = gateway_entry_for_client(client_id, &read_client(&def).servers)
+            .map_or_else(
+                || GATEWAY_ENTRY_NAME.to_string(),
+                |server| server.name.clone(),
+            );
+        let text = read_config_file(&path).ok();
+        keep_only_missing_codex_settings(
+            client_id,
+            &entry_name,
+            text.as_deref(),
+            handled,
+            &mut entry,
+        );
+    }
+    install_or_remove(client_id, Some(&entry))
+}
+
+/// Limit the Codex defaults in a rebuilt gateway `entry` to the ones a rewrite that is
+/// not an explicit Connect may add: every default for an entry that does not exist yet,
+/// otherwise only [`codex_entry_missing_settings`] (never a key Toolport handled, and
+/// nothing when an entry without a record keeps some settings). Other fields are kept.
+fn keep_only_missing_codex_settings(
+    client_id: &str,
+    entry_name: &str,
+    config_text: Option<&str>,
+    handled: &[String],
+    entry: &mut ServerEntry,
+) {
+    if !is_codex_client(client_id) {
+        return;
+    }
+    let exists = config_text
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .is_some_and(|doc| {
+            doc.get("mcp_servers")
+                .and_then(|servers| servers.get(entry_name))
+                .is_some()
+        });
+    if !exists {
+        return;
+    }
+    let missing: Vec<&str> =
+        codex_entry_missing_settings(client_id, entry_name, config_text, handled, false)
+            .iter()
+            .map(|setting| setting.key)
+            .collect();
+    entry.unknown_fields.retain(|key, _| {
+        !CODEX_GATEWAY_SETTINGS
+            .iter()
+            .any(|setting| setting.key == key)
+            || missing.contains(&key.as_str())
+    });
 }
 
 /// Remove Toolport's gateway entry from a client's config, first putting back
@@ -9522,11 +9897,25 @@ fn repoint_stale_gateways_in(
 ) -> RepointOutcome {
     let mut outcome = RepointOutcome::default();
     for client in clients {
-        // Existing remote entries are retained until an explicit reconnect.
-        if managed
+        // Existing remote entries are retained until an explicit reconnect; only
+        // Codex's absent settings are added to them, in place.
+        if let Some(record) = managed
             .get(&client.id)
-            .is_some_and(|entry| entry.transport == "sharedHttp")
+            .filter(|entry| entry.transport == "sharedHttp")
         {
+            match repair_codex_http_settings(&client, record) {
+                Ok(Some(updated)) => outcome.repointed.push((client.id.clone(), updated)),
+                Ok(None) => {}
+                Err(error) => {
+                    let msg = format!(
+                        "toolport: could not add Codex settings to {}'s shared HTTP entry: {error}",
+                        client.id
+                    );
+                    eprintln!("{msg}");
+                    crate::gatewaylog::append(&msg);
+                    outcome.failed.push((client.id.clone(), error));
+                }
+            }
             continue;
         }
         if !client.config_exists || client.error.is_some() {
@@ -9595,14 +9984,32 @@ fn repoint_stale_gateways_in(
             })
             .count()
             > 1;
+        let handled = managed
+            .get(&client.id)
+            .map_or(&[][..], |record| record.codex_settings.as_slice());
         if !duplicate_gateways
             && !location_identity_changed
-            && !gateway_entry_needs_rewrite(entry_name, stored, current, config_text.as_deref())
+            && !client_gateway_entry_needs_rewrite(
+                &client.id,
+                entry_name,
+                stored,
+                current,
+                config_text.as_deref(),
+                handled,
+            )
             && entry
                 .env_keys
                 .iter()
                 .any(|key| key == crate::brand::CLIENT_ID || key == crate::brand::ATTRIBUTION_ID)
         {
+            // Nothing to write. Codex settings the user already set still count as
+            // handled, so deleting one later does not bring it back.
+            if let Some(marked) = managed
+                .get(&client.id)
+                .and_then(|record| codex_settings_marked(&client.id, record))
+            {
+                outcome.repointed.push((client.id.clone(), marked));
+            }
             continue;
         }
         let rewrite = find_def(&client.id)
@@ -9631,11 +10038,13 @@ fn repoint_stale_gateways_in(
                         )?;
                     }
                     if !duplicate_gateways
-                        && !gateway_entry_needs_rewrite(
+                        && !client_gateway_entry_needs_rewrite(
+                            &client.id,
                             entry_name,
                             stored,
                             current,
                             config_text.as_deref(),
+                            handled,
                         )
                     {
                         backfill_gateway_identity(&def, &path, entry_name, &client.id)?;
@@ -9665,6 +10074,9 @@ fn repoint_stale_gateways_in(
                                 .env
                                 .insert(crate::brand::CLIENT_ID.into(), client.id.clone());
                         }
+                        if let Some(marked) = codex_settings_marked(&client.id, &managed) {
+                            managed = marked;
+                        }
 
                         Ok(WriteOutcome {
                             path: path.display().to_string(),
@@ -9680,6 +10092,16 @@ fn repoint_stale_gateways_in(
                         let mut entry =
                             repair_gateway_entry(def.format, &path, entry_name, &client.id)?;
                         entry.command = Some(current.to_string());
+                        // A repair is not a Connect: it adds only the Codex settings a
+                        // launch would add, so a handled key stays as the user left it
+                        // and an entry without a record keeps its removals.
+                        keep_only_missing_codex_settings(
+                            &client.id,
+                            entry_name,
+                            read_config_file(&path).ok().as_deref(),
+                            handled,
+                            &mut entry,
+                        );
                         install_or_remove(&client.id, Some(&entry))
                     }
                 })
@@ -11279,6 +11701,13 @@ mod tests {
             "inbox 1 (reported)"
         );
         assert_eq!(display_caller_name(None, None), "Unrecorded client");
+        // An unlabelled modern request reads as its connection's client, or as
+        // "Unknown client" when the connection has no trusted name.
+        assert_eq!(display_caller_name(Some("Codex"), None), "Codex");
+        assert_eq!(
+            display_caller_name(Some("Unknown client"), None),
+            "Unknown client"
+        );
         let reg = crate::registry::Registry::default();
         assert_eq!(
             resolve_launch_profile(&reg, Some("inbox"), &None),
@@ -12447,6 +12876,7 @@ bad = "not-a-table"
                 transport: "sharedHttp".into(),
                 url: Some("http://127.0.0.1:8765/mcp".into()),
                 updated_at: 1,
+                codex_settings: Vec::new(),
                 unknown_fields: Default::default(),
             };
             // Even an old ownership record must not authorize a startup conversion.
@@ -12598,6 +13028,7 @@ bad = "not-a-table"
             transport: "stdio".into(),
             url: None,
             updated_at: 1,
+            codex_settings: Vec::new(),
             unknown_fields: Default::default(),
         };
         let matching = McpServer {
@@ -12662,6 +13093,7 @@ bad = "not-a-table"
             transport: "stdio".to_string(),
             url: None,
             updated_at: 0,
+            codex_settings: Vec::new(),
             unknown_fields: Default::default(),
         }
     }
@@ -12918,6 +13350,137 @@ bad = "not-a-table"
             .get(crate::brand::PROFILE_LEGACY)
             .is_none());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn codex_gateway_entry_adds_its_settings_only_when_absent() {
+        let data = crate::registry::DataDirTestEnv::new("codex-gateway-settings");
+        assert!(gateway_entry_client_fields("grok").is_empty());
+        assert!(gateway_entry_client_fields("claude-code").is_empty());
+        assert_eq!(
+            gateway_entry_client_fields("codex@work"),
+            gateway_entry_client_fields("codex")
+        );
+        let mut codex = sample_gateway(None, "codex");
+        codex.unknown_fields = gateway_entry_client_fields("codex");
+        let entry_of = |path: &Path, name: &str| -> toml::Value {
+            let doc: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            doc["mcp_servers"][name].clone()
+        };
+
+        // Fresh install: every setting is written, unrelated settings stay.
+        let fresh = data.dir.join("fresh.toml");
+        std::fs::write(&fresh, "model = \"gpt-5\"\n").unwrap();
+        edit_toml_gateway(&fresh, Some(&codex)).unwrap();
+        let written = entry_of(&fresh, GATEWAY_ENTRY_NAME);
+        assert_eq!(
+            written["supports_parallel_tool_calls"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(written["startup_timeout_sec"].as_integer(), Some(75));
+        assert_eq!(written["tool_timeout_sec"].as_integer(), Some(600));
+        assert_eq!(written["command"].as_str(), Some("toolport-gateway"));
+        let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&fresh).unwrap()).unwrap();
+        assert_eq!(doc["model"].as_str(), Some("gpt-5"));
+        // A second write changes nothing.
+        let first = std::fs::read_to_string(&fresh).unwrap();
+        edit_toml_gateway(&fresh, Some(&codex)).unwrap();
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), first);
+
+        // Values the user set, either way, survive a rewrite, and so do their other
+        // keys on our entry and on other servers. `startup_timeout_ms` counts as a
+        // startup timeout because Codex would let `_sec` override it.
+        for user_value in [false, true] {
+            let path = data.dir.join(format!("existing-{user_value}.toml"));
+            let text = format!(
+                "[mcp_servers.toolport]\ncommand = \"toolport-gateway\"\n\
+                 supports_parallel_tool_calls = {user_value} # mine\n\
+                 startup_timeout_ms = 5000\ntool_timeout_sec = 90\n\
+                 enabled_tools = [\"a\"]\n\n\
+                 [mcp_servers.other]\ncommand = \"npx\"\n"
+            );
+            std::fs::write(&path, &text).unwrap();
+            edit_toml_gateway(&path, Some(&codex)).unwrap();
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert!(after.contains(&format!(
+                "supports_parallel_tool_calls = {user_value} # mine"
+            )));
+            let ours = entry_of(&path, GATEWAY_ENTRY_NAME);
+            assert_eq!(
+                ours["supports_parallel_tool_calls"].as_bool(),
+                Some(user_value)
+            );
+            assert_eq!(ours["tool_timeout_sec"].as_integer(), Some(90));
+            assert_eq!(ours["startup_timeout_ms"].as_integer(), Some(5000));
+            assert!(ours.get("startup_timeout_sec").is_none());
+            assert_eq!(ours["enabled_tools"][0].as_str(), Some("a"));
+            let other = entry_of(&path, "other");
+            assert_eq!(other.as_table().unwrap().len(), 1, "{after}");
+        }
+
+        // Grok shares the TOML format but never gets the Codex settings.
+        let grok = data.dir.join("grok.toml");
+        std::fs::write(&grok, "").unwrap();
+        edit_toml_gateway(&grok, Some(&sample_gateway(None, "grok"))).unwrap();
+        let grok_entry = entry_of(&grok, GATEWAY_ENTRY_NAME);
+        for setting in CODEX_GATEWAY_SETTINGS {
+            assert!(
+                grok_entry.get(setting.key).is_none(),
+                "grok got {}",
+                setting.key
+            );
+        }
+    }
+
+    #[test]
+    fn existing_codex_installs_are_repaired_once_for_their_settings() {
+        let current = "/opt/toolport/toolport-gateway";
+        let head = "[mcp_servers.toolport]\ncommand = \"/opt/toolport/toolport-gateway\"\n";
+        let lacking = format!("{head}env = {{ TOOLPORT_CLIENT_ID = \"codex\" }}\n");
+        let complete = format!(
+            "{head}supports_parallel_tool_calls = false\nstartup_timeout_ms = 3000\n\
+             tool_timeout_sec = 30\n"
+        );
+        let partial = format!("{head}supports_parallel_tool_calls = true\n");
+        let needs = |client: &str, stored: &str, text: &str| {
+            client_gateway_entry_needs_rewrite(
+                client,
+                GATEWAY_ENTRY_NAME,
+                stored,
+                current,
+                Some(text),
+                &[],
+            )
+        };
+        // Keys Toolport handled before never trigger a repair again.
+        let all_handled = codex_setting_keys(false);
+        assert!(!client_gateway_entry_needs_rewrite(
+            "codex",
+            GATEWAY_ENTRY_NAME,
+            current,
+            current,
+            Some(&lacking),
+            &all_handled,
+        ));
+        assert!(needs("codex", current, &lacking));
+        assert!(needs("codex@work", current, &lacking));
+        // With no record of what Toolport wrote, an entry that keeps any of the
+        // settings had the rest removed on purpose.
+        assert!(!needs("codex", current, &partial));
+        // Present values, whatever they are, are the user's and stop the repair.
+        assert!(!needs("codex", current, &complete));
+        // Other clients and entries that are not ours are never touched for it.
+        assert!(!needs("grok", current, &lacking));
+        assert!(!needs("codex", "npx", &lacking));
+        assert!(!needs("codex", current, "not toml ["));
+        assert!(!client_gateway_entry_needs_rewrite(
+            "codex",
+            GATEWAY_ENTRY_NAME,
+            current,
+            current,
+            None,
+            &[],
+        ));
     }
 
     #[test]
