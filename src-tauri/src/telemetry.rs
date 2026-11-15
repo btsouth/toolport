@@ -274,6 +274,7 @@ pub fn retire_dir_for_test(dir: &Path, budget: Duration) -> bool {
 /// stuck in filesystem IO. The OS ends it when the process exits. Every orderly exit
 /// runs this, so it also removes this process's sealed result spills.
 pub fn shutdown() {
+    crate::secret_redact::flush_pending_scrub(Duration::from_secs(2));
     crate::shaping::release_spills();
     if WRITER
         .get()

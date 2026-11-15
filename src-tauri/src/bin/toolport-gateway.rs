@@ -22787,6 +22787,16 @@ fn main() {
     // at this run's first spill.
     std::thread::spawn(conduit_lib::shaping::remove_stale_spills);
     if let Some(dir) = registry::conduit_dir() {
+        // Every configured secret (and any value retired while a log could
+        // still hold it) is known to the redactor before this process replays
+        // or writes diagnostic text.
+        conduit_lib::secret_refs::preload_configured_secrets();
+        let retired = conduit_lib::secrets::retry_retired_scrubs();
+        if retired > 0 {
+            glog(&format!(
+                "{retired} replaced or deleted secret(s) still wait for their log cleanup; kept in the vault until it succeeds"
+            ));
+        }
         conduit_lib::rate_limits::bind_data_dir(&dir);
         // Share downstream 429 backoff windows across gateway processes
         // (issue #874) until the host daemon lands. Missing state = no backoff.

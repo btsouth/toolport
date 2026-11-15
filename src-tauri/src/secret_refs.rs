@@ -1089,6 +1089,44 @@ fn resolved_server_with_values(
 /// on their own ([`crate::secrets`]); this covers the values that never pass
 /// through the vault. Every stdio launch resolves through [`resolve_server`],
 /// and remote connects call this directly.
+/// Register every configured secret this process can read without prompting:
+/// inline values, vaulted env values and stored HTTP and OAuth credentials, for
+/// every server. The gateway calls this before it replays or writes any
+/// diagnostic text, so nothing reaches a sink before the redactor knows the
+/// values. References to external managers (which can prompt) are resolved
+/// at launch as before; text from them can only appear after that launch.
+pub fn preload_configured_secrets() {
+    let Ok(reg) = crate::registry::load_resolved() else {
+        return;
+    };
+    for server in &reg.servers {
+        register_inline_secrets(server);
+        let vaulted = |secret: bool, value: &Option<String>, fields| {
+            secret && value.is_none() && matches!(source(fields), Ok(None))
+        };
+        for e in &server.env {
+            if vaulted(e.secret, &e.value, &e.unknown_fields) {
+                let _ = crate::secrets::get_secret_result(&server.id, &e.key);
+            }
+        }
+        for i in server.launch.iter().flat_map(|l| &l.inputs) {
+            if vaulted(i.secret, &i.value, &i.unknown_fields) {
+                let _ = crate::secrets::get_secret_result(&server.id, &i.key);
+            }
+        }
+        if server.url.is_some() {
+            for key in [
+                crate::secrets::HTTP_AUTH_KEY,
+                crate::secrets::CLIENT_SECRET_KEY,
+                crate::remote::OAUTH_STATE_KEY,
+                crate::remote::CC_STATE_KEY,
+            ] {
+                let _ = crate::secrets::get_secret_result(&server.id, key);
+            }
+        }
+    }
+}
+
 pub fn register_inline_secrets(server: &ServerEntry) {
     for e in &server.env {
         let Some(value) = &e.value else { continue };

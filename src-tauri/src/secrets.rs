@@ -2027,9 +2027,90 @@ fn scrub_previous(server_id: &str, key: &str, replacement: Option<&str>) {
     };
     if let Ok(Some(old)) = stored {
         if Some(old.as_str()) != replacement {
-            crate::secret_redact::scrub_value_now(server_id, key, &old);
+            if let Err(error) = crate::secret_redact::scrub_value_now(server_id, key, &old) {
+                // A log may still hold it: keep the value in the vault, under
+                // Toolport's own namespace, until a later scrub succeeds.
+                eprintln!("toolport: {error}; keeping the old value for a later cleanup");
+                retire(server_id, key, &old);
+            }
         }
     }
+}
+
+/// Values replaced or deleted while a log may still hold them, as a JSON list of
+/// `{server, key, value}` in the vault (never on disk in the clear).
+const RETIRED_KEY: &str = "retired-secret-values";
+
+fn retired_load() -> Vec<(String, String, String)> {
+    let Ok(Some(raw)) = get_secret_result_raw(INTERNAL_SERVER_ID, RETIRED_KEY) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<serde_json::Value>>(&raw)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| {
+            Some((
+                v.get("server")?.as_str()?.to_string(),
+                v.get("key")?.as_str()?.to_string(),
+                v.get("value")?.as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn retired_save(entries: &[(String, String, String)]) -> Result<(), String> {
+    if entries.is_empty() {
+        return match get_secret_result_raw(INTERNAL_SERVER_ID, RETIRED_KEY) {
+            Ok(Some(_)) => delete_secret_raw(INTERNAL_SERVER_ID, RETIRED_KEY),
+            _ => Ok(()),
+        };
+    }
+    let list: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(server, key, value)| serde_json::json!({"server": server, "key": key, "value": value}))
+        .collect();
+    set_secret_raw(
+        INTERNAL_SERVER_ID,
+        RETIRED_KEY,
+        &serde_json::Value::Array(list).to_string(),
+    )
+}
+
+fn retire(server_id: &str, key: &str, value: &str) {
+    let mut entries = retired_load();
+    let entry = (server_id.to_string(), key.to_string(), value.to_string());
+    if !entries.contains(&entry) {
+        entries.push(entry);
+    }
+    if let Err(error) = retired_save(&entries) {
+        eprintln!("toolport: could not keep a retired secret for cleanup: {error}");
+    }
+}
+
+/// Register every retired value and retry its cleanup; entries whose scrub now
+/// succeeds are dropped from the vault. Returns how many still wait. Called at
+/// gateway start, so a value is redacted again before anything is written.
+pub fn retry_retired_scrubs() -> usize {
+    let entries = retired_load();
+    if entries.is_empty() {
+        return 0;
+    }
+    let remaining: Vec<(String, String, String)> = entries
+        .into_iter()
+        .filter(|(server, key, value)| {
+            crate::secret_redact::scrub_value_now(server, key, value).is_err()
+        })
+        .collect();
+    let left = remaining.len();
+    if let Err(error) = retired_save(&remaining) {
+        eprintln!("toolport: could not update retired secrets: {error}");
+    }
+    left
+}
+
+/// How many retired values still wait for their log cleanup (for status).
+pub fn retired_scrubs_pending() -> usize {
+    retired_load().len()
 }
 
 fn delete_secret_raw(server_id: &str, key: &str) -> Result<(), String> {

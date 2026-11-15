@@ -38,8 +38,15 @@ pub const SHORT_SECRET_CHARS: usize = 6;
 /// How long the background builder waits after a registration for more to
 /// arrive, so a burst (every server's secrets at startup) costs one main build.
 const MAIN_BUILD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(25);
-/// Records which secrets (by `server/key`, never value) the scrub has covered.
+/// Records which secrets (by `server/key`, never value) a scrub has covered. A
+/// record only: an id can come back with a new value, and nothing derived from
+/// a value is kept on disk to tell them apart, so every process rescrubs for
+/// everything it knows on its first pass.
 const SCRUB_MARKER: &str = "secret-scrub-v1.json";
+/// Present while a scrub is owed: written when one is queued, removed when a
+/// pass completes. A process that ended first leaves it for the next one (and
+/// for status) to find.
+pub const SCRUB_PENDING_FILE: &str = "secret-scrub-pending";
 /// How long a scrub waits for another process's scrub of the same directory.
 /// Long enough for a multi-megabyte audit log on a slow disk.
 const SCRUB_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -1952,11 +1959,18 @@ pub fn scrub_data_dir(dir: &Path) -> std::io::Result<usize> {
         return Ok(0);
     }
     let marker = dir.join(SCRUB_MARKER);
-    // One scrub per data directory at a time, across every process. The marker is
-    // read, the logs rewritten and the marker updated under this one lock, so a
-    // second process waits, then finds the work recorded and skips it.
+    // One scrub per data directory at a time, across every process. Within one
+    // process each value is scrubbed for once; another process (which may know
+    // a different value under the same id) scrubs for everything it knows.
     let _scrub = crate::registry::lock_at_for(&dir.join("secret-scrub"), SCRUB_LOCK_WAIT)
         .map_err(std::io::Error::other)?;
+    let scope = scope_of(dir);
+    let from = SCRUBBED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&scope)
+        .copied()
+        .unwrap_or(0);
     let done: HashSet<String> = std::fs::read_to_string(&marker)
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
@@ -1968,25 +1982,22 @@ pub fn scrub_data_dir(dir: &Path) -> std::io::Result<usize> {
             })
         })
         .unwrap_or_default();
-    let pending = {
+    let (pending, known) = {
         let guard = REGISTRY
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(reg) = guard.as_ref().and_then(|map| map.get(&scope_of(dir))) else {
+        let Some(reg) = guard.as_ref().and_then(|map| map.get(&scope)) else {
             return Ok(0);
         };
-        let pending: Vec<(String, String, String)> = reg
-            .secrets
-            .iter()
-            .filter(|(id, _, _)| !done.contains(id))
-            .cloned()
-            .collect();
-        pending
+        let pending: Vec<(String, String, String)> =
+            reg.secrets.get(from..).unwrap_or_default().to_vec();
+        (pending, reg.secrets.len())
     };
     if pending.is_empty() {
+        let _ = std::fs::remove_file(dir.join(SCRUB_PENDING_FILE));
         return Ok(0);
     }
-    let Some(matcher) = complete_in(&scope_of(dir)) else {
+    let Some(matcher) = complete_in(&scope) else {
         return Ok(0);
     };
     let mut rewritten = 0;
@@ -2001,21 +2012,33 @@ pub fn scrub_data_dir(dir: &Path) -> std::io::Result<usize> {
     ids.dedup();
     let body = serde_json::json!({ "v": 1, "scrubbed": ids }).to_string();
     crate::registry::atomic_write(&marker, &body).map_err(std::io::Error::other)?;
+    let mut scrubbed = SCRUBBED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let covered = scrubbed.entry(scope).or_insert(0);
+    *covered = (*covered).max(known);
+    drop(scrubbed);
+    let _ = std::fs::remove_file(dir.join(SCRUB_PENDING_FILE));
     Ok(rewritten)
 }
+
+/// Per scope, how many registry entries this process has scrubbed for.
+static SCRUBBED: std::sync::LazyLock<Mutex<std::collections::HashMap<Scope, usize>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// Scrub every log for one value right now, whatever the marker says: called just
 /// before Toolport replaces or deletes a stored secret, the last moment the old
 /// value is known. The value stays registered, so this process keeps redacting it.
 /// Synchronous (a read of each log, a rewrite only on a hit) and serialized with
-/// every other scrub of the directory.
-pub fn scrub_value_now(owner: &str, key: &str, value: &str) {
+/// every other scrub of the directory. An error means a log may still hold the
+/// value; the caller keeps it recoverable until a later scrub succeeds.
+pub fn scrub_value_now(owner: &str, key: &str, value: &str) -> Result<(), String> {
     register(owner, key, value);
     let Some(dir) = scrub_dir_now() else {
-        return;
+        return Ok(());
     };
     if !persisted_log_files(&dir).iter().any(|path| path.is_file()) {
-        return;
+        return Ok(());
     }
     let id = format!("{owner}/{key}");
     let pairs: Vec<(String, String)> = REGISTRY
@@ -2046,8 +2069,32 @@ pub fn scrub_value_now(owner: &str, key: &str, value: &str) {
             }
             Ok(())
         });
-    if let Err(error) = result {
-        eprintln!("toolport: scrub before retiring secret '{key}' failed: {error}");
+    result.map_err(|error| format!("scrub before retiring secret '{key}' failed: {error}"))
+}
+
+/// Run a queued background scrub now, within `budget`, before the process
+/// exits: a scrub owed for a value this process learned would otherwise wait
+/// for the next process that happens to learn it too.
+pub fn flush_pending_scrub(budget: std::time::Duration) {
+    let dir = SCRUB_PENDING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let Some(dir) = dir else {
+        return;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("toolport-secret-scrub-exit".into())
+        .spawn(move || {
+            if let Err(error) = scrub_data_dir(&dir) {
+                eprintln!("toolport: secret scrub of old logs failed: {error}");
+            }
+            let _ = tx.send(());
+        });
+    if spawned.is_ok() {
+        // Past the budget the durable pending marker stays for the next start.
+        let _ = rx.recv_timeout(budget);
     }
 }
 
@@ -2100,6 +2147,11 @@ fn schedule_scrub(_id: &str) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if pending.is_some() {
         return; // a scrub is already queued and will see this secret too
+    }
+    // Durable until a pass completes, so an exit before then is visible to the
+    // next process and to status. Only where there are logs to scrub.
+    if persisted_log_files(&dir).iter().any(|path| path.is_file()) {
+        let _ = std::fs::write(dir.join(SCRUB_PENDING_FILE), b"");
     }
     *pending = Some(dir);
     drop(pending);
@@ -2582,6 +2634,121 @@ mod tests {
         let marker = std::fs::read_to_string(dir.join(SCRUB_MARKER)).unwrap();
         assert_eq!(marker.matches("race-server/RACE_KEY").count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_retirement_scrub_keeps_the_value_until_cleanup_succeeds() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let dir = crate::registry::conduit_dir().unwrap();
+            let old = "retired-secret-old-7Jc4Qa";
+            crate::secrets::set_secret("retire-srv", "RETIRE_KEY", old).unwrap();
+            // A log the scrub cannot read: the cleanup fails.
+            std::fs::create_dir_all(dir.join("audit.jsonl")).unwrap();
+            std::fs::write(dir.join("gateway.log"), "unrelated\n").unwrap();
+            crate::secrets::delete_secret("retire-srv", "RETIRE_KEY").unwrap();
+            assert_eq!(crate::secrets::get_secret("retire-srv", "RETIRE_KEY"), None);
+            assert_eq!(
+                crate::secrets::retired_scrubs_pending(),
+                1,
+                "kept for cleanup"
+            );
+            // A later start: the log is readable again and holds the old value.
+            std::fs::remove_dir_all(dir.join("audit.jsonl")).unwrap();
+            std::fs::write(
+                dir.join("audit.jsonl"),
+                format!("{{\"error\":\"saw {old}\"}}\n"),
+            )
+            .unwrap();
+            assert_eq!(crate::secrets::retry_retired_scrubs(), 0);
+            let audit = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+            assert!(
+                !audit.contains(old) && audit.contains("[secret:RETIRE_KEY]"),
+                "{audit}"
+            );
+            assert_eq!(
+                crate::secrets::retired_scrubs_pending(),
+                0,
+                "dropped once clean"
+            );
+        });
+    }
+
+    #[test]
+    fn a_recorded_id_does_not_skip_a_value_this_process_knows() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-scrub-rerun-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        // Another process scrubbed this id, for the value it knew then.
+        std::fs::write(
+            dir.join(SCRUB_MARKER),
+            r#"{"v":1,"scrubbed":["rerun-srv/RERUN_KEY"]}"#,
+        )
+        .unwrap();
+        let value = "rerun-new-value-5Tg8Lm";
+        std::fs::write(dir.join("gateway.log"), format!("saw {value}\n")).unwrap();
+        register("rerun-srv", "RERUN_KEY", value);
+        assert_eq!(scrub_data_dir(&dir).unwrap(), 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("gateway.log")).unwrap(),
+            "saw [secret:RERUN_KEY]\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_queued_scrub_is_durable_and_drained_on_exit() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-scrub-exit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        let value = "exit-drained-value-2Pw9Xs";
+        std::fs::write(dir.join("gateway.log"), format!("saw {value}\n")).unwrap();
+        SCRUB_ENABLED.store(true, Ordering::Release);
+        register("exit-srv", "EXIT_KEY", value);
+        SCRUB_ENABLED.store(false, Ordering::Release);
+        assert!(
+            dir.join(SCRUB_PENDING_FILE).exists(),
+            "owed scrub is on disk"
+        );
+        flush_pending_scrub(std::time::Duration::from_secs(10));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("gateway.log")).unwrap(),
+            "saw [secret:EXIT_KEY]\n"
+        );
+        assert!(!dir.join(SCRUB_PENDING_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn configured_secrets_are_known_before_any_launch() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let server: crate::registry::ServerEntry = serde_json::from_value(serde_json::json!({
+                "id": "preload-srv",
+                "name": "preload-srv",
+                "transport": "stdio",
+                "command": "true",
+                "args": [],
+                "env": [{"key": "INLINE_PRELOAD", "secret": true, "value": "preload-inline-6Vb3Nk"}],
+                "source": "manual",
+                "disabledTools": []
+            }))
+            .unwrap();
+            let mut reg = crate::registry::Registry::default();
+            reg.servers.push(server);
+            crate::registry::save(&reg).unwrap();
+            assert_eq!(
+                redact_text("x preload-inline-6Vb3Nk"),
+                "x preload-inline-6Vb3Nk"
+            );
+            crate::secret_refs::preload_configured_secrets();
+            assert_eq!(
+                redact_text("x preload-inline-6Vb3Nk"),
+                "x [secret:INLINE_PRELOAD]"
+            );
+        });
     }
 
     #[test]

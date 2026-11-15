@@ -193,7 +193,7 @@ pub fn clear_oauth_state(server_id: &str) -> Result<(), String> {
 
 // ── Client-credentials flow (SBS-524) ──────────────────────────────────────
 
-const CC_STATE_KEY: &str = "__oauth_cc_state__";
+pub(crate) const CC_STATE_KEY: &str = "__oauth_cc_state__";
 
 /// What a later reacquisition needs, resolved once at connect time.
 ///
