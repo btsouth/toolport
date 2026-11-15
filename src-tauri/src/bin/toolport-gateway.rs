@@ -4440,6 +4440,38 @@ fn discovery_tool_visible(
     visible
 }
 
+/// Whether a running script may still see `name` under the live router: this
+/// connection's adapter scope still holds, the live policy still admits the tool
+/// (the recheck every dispatch makes), and search would still return it.
+fn script_live_visible(
+    name: &str,
+    catalog: &dyn ToolCatalog,
+    reg: &Registry,
+    allowed: Option<&std::collections::HashSet<String>>,
+    router: &Router,
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
+    resolver: Option<LiveRouterResolver>,
+) -> bool {
+    let _view = LiveRouterResolverGuard::enter(resolver);
+    if recheck_live_policy(router, live_router, DispatchTarget::Tool(name)).is_err() {
+        return false;
+    }
+    let live = live_router.map(|slot| {
+        Arc::clone(
+            &slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    });
+    discovery_tool_visible(
+        name,
+        catalog,
+        live.as_deref().unwrap_or(router),
+        reg,
+        allowed,
+    )
+}
+
 /// Whether the router refuses a catalog entry: blocked by policy (quarantine,
 /// disabled, outside the client's tool allow-list, Strict safety), or destructive
 /// while the destructive gate is on, judged from the entry itself so a cache
@@ -6551,11 +6583,18 @@ fn script_source(cached: &dyn ToolCatalog, router: &Router, reg: &Registry) -> S
 /// `toolport.describe` over the same scoped names the `servers.*` stubs come from.
 /// The schema gets the neutralisation every listed `inputSchema` gets. The signature
 /// is complete; `truncated` is true only when a guard was reached, with the reason.
-fn script_describe_binding(tools: SharedTools, catalog: &[String]) -> codemode::DescribeBinding {
+/// A check of the live router a running script's callbacks apply on top of the
+/// catalog captured at script start ([`script_live_visible`]).
+type ScriptLiveCheck = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+fn script_describe_binding(
+    tools: SharedTools,
+    catalog: &[String],
+    live: Option<ScriptLiveCheck>,
+) -> codemode::DescribeBinding {
     let in_scope: HashSet<String> = catalog.iter().cloned().collect();
     Arc::new(move |name: &str| {
-        let Some(tool) = in_scope
-            .contains(name)
+        let Some(tool) = (in_scope.contains(name) && live.as_ref().is_none_or(|live| live(name)))
             .then(|| {
                 tools
                     .iter()
@@ -6659,7 +6698,7 @@ fn validate_script(
     let fetch: codemode::FetchBinding =
         Arc::new(|_args: codemode::FetchArgs| json!({ "content": [], "isError": false }));
 
-    let describe = script_describe_binding(cached.shared(), &catalog);
+    let describe = script_describe_binding(cached.shared(), &catalog, None);
     let outcome = run_code_mode_isolated(
         script,
         input,
@@ -6989,11 +7028,35 @@ fn execute_script_dispatch(
         owner_of_exposed_tool(Some(router_arc.as_ref()), &owners, name)
     });
 
+    // A script can wait on calls, and policy can change meanwhile. Its fetch and
+    // describe callbacks keep the catalog and scope captured here and also ask the
+    // live router, as each `toolport.call` does.
+    let live_check: ScriptLiveCheck = {
+        let source = source.clone();
+        let reg = reg.clone();
+        let allowed = allowed.cloned();
+        let router = Arc::clone(router_arc);
+        let live = live_router.cloned();
+        let resolver = active_live_router_resolver();
+        Arc::new(move |name: &str| {
+            script_live_visible(
+                name,
+                &source,
+                &reg,
+                allowed.as_ref(),
+                &router,
+                live.as_ref(),
+                resolver.clone(),
+            )
+        })
+    };
+
     // Cursor handoff for any already-shaped result (prior turn, or external cursor in
     // data). A paged tool definition is served only while the script could still
     // see that tool: `catalog` is search's own visibility rule over this catalog.
     let client_for_fetch = client.map(str::to_string);
     let fetch_visible: HashSet<String> = catalog.iter().cloned().collect();
+    let fetch_live = Arc::clone(&live_check);
     let fetch: codemode::FetchBinding = Arc::new(move |args: codemode::FetchArgs| {
         shaping::fetch_result_visible(
             &args.cursor,
@@ -7001,11 +7064,11 @@ fn execute_script_dispatch(
             args.len,
             client_for_fetch.as_deref(),
             args.projection.as_deref(),
-            &|name| fetch_visible.contains(name),
+            &|name| fetch_visible.contains(name) && fetch_live(name),
         )
     });
 
-    let describe = script_describe_binding(source, &catalog);
+    let describe = script_describe_binding(source, &catalog, Some(live_check));
     let outcome = run_code_mode_isolated(
         script,
         input,

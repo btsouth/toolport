@@ -1098,3 +1098,146 @@ fn status_counts_agree_with_search() {
     }
     assert!(searched.contains("s__keep"), "{searched}");
 }
+
+/// Calling `wait` publishes `next` to the live router slot, as a reconcile does
+/// while a script waits on a call.
+struct PublishOnCall {
+    tools: Vec<Value>,
+    slot: Arc<Mutex<Arc<Router>>>,
+    next: Arc<Router>,
+}
+
+impl conduit_lib::downstream::Transport for PublishOnCall {
+    fn request(
+        &mut self,
+        method: &str,
+        _params: Value,
+    ) -> Result<Value, conduit_lib::downstream::TransportError> {
+        match method {
+            "initialize" => Ok(json!({ "protocolVersion": "2025-06-18" })),
+            "tools/list" => Ok(json!({ "tools": self.tools })),
+            "tools/call" => {
+                *self
+                    .slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&self.next);
+                Ok(json!({"content": [{"type": "text", "text": "waited"}], "isError": false}))
+            }
+            other => Err(conduit_lib::downstream::TransportError::Fatal(format!(
+                "unexpected {other}"
+            ))),
+        }
+    }
+    fn notify(
+        &mut self,
+        _method: &str,
+        _params: Value,
+    ) -> Result<(), conduit_lib::downstream::TransportError> {
+        Ok(())
+    }
+}
+
+/// R4-1: a script that waits on a call while `s__configure` is quarantined can no
+/// longer fetch its paged definition or describe it, though both were visible when
+/// the script started. Checked in both Code Mode states.
+#[test]
+fn script_callbacks_see_policy_published_mid_script() {
+    let _data = DataDirTestEnv::new("script-callbacks-live-policy");
+    let options: serde_json::Map<String, Value> = (0..300)
+        .map(|i| {
+            (
+                format!("option_{i:03}"),
+                json!({"type": "string", "description": format!("Option number {i}.")}),
+            )
+        })
+        .collect();
+    let upstream = vec![
+        json!({"name": "configure", "description": "Configure every option.", "inputSchema": {"type": "object", "properties": options}}),
+        json!({"name": "wait", "description": "Wait for something.", "inputSchema": {"type": "object"}}),
+    ];
+    let cached: Vec<Value> = upstream
+        .iter()
+        .map(|tool| {
+            let mut tool = tool.clone();
+            tool["name"] = json!(format!("s__{}", tool["name"].as_str().unwrap()));
+            tool
+        })
+        .collect();
+    let cursor_re = regex::Regex::new(r#""cursor":"(r[0-9]+)""#).unwrap();
+    for code_mode in [false, true] {
+        let reg = Registry {
+            code_mode,
+            ..Default::default()
+        };
+        let mut quarantined = Router::with_policy(ToolPolicy {
+            quarantined: ["s__configure".to_string()].into_iter().collect(),
+            ..Default::default()
+        });
+        quarantined.add(
+            DownstreamServer::connect(
+                "s".into(),
+                Box::new(MockRoute {
+                    tools: upstream.clone(),
+                }),
+            )
+            .unwrap(),
+        );
+        let quarantined = Arc::new(quarantined);
+        let slot: Arc<Mutex<Arc<Router>>> = Arc::new(Mutex::new(Arc::new(Router::new())));
+        let mut open = Router::with_policy(ToolPolicy::default());
+        open.add(
+            DownstreamServer::connect(
+                "s".into(),
+                Box::new(PublishOnCall {
+                    tools: upstream.clone(),
+                    slot: Arc::clone(&slot),
+                    next: Arc::clone(&quarantined),
+                }),
+            )
+            .unwrap(),
+        );
+        let open = Arc::new(open);
+        *slot.lock().unwrap() = Arc::clone(&open);
+        let host = dispatch_host(true);
+        let found = handle_request(
+            &host,
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "toolport_search_tools", "arguments": {"query": "s__configure"}}}),
+            &reg,
+            &open,
+            &cached,
+            true,
+            None,
+            &SearchGuard::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let text = found["result"]["content"][0]["text"].as_str().unwrap();
+        let cursor = cursor_re.captures(text).unwrap()[1].to_string();
+        let script = format!(
+            "var before = toolport.describe('s__configure') !== null; \
+             toolport.call('s__wait', {{}}); \
+             var page = toolport.fetchResult({{cursor: '{cursor}', offset: 100}}).content[0].text; \
+             return {{before: before, refused: page.indexOf('no longer available') >= 0, \
+                     leaked: page.indexOf('option_') >= 0, \
+                     described: toolport.describe('s__configure') !== null}};"
+        );
+        let result = run_script_dispatch(
+            &reg,
+            Some(&open),
+            &cached,
+            None,
+            None,
+            None,
+            None,
+            &json!({"script": script}),
+            Some(&slot),
+        );
+        let value = &result["structuredContent"]["result"];
+        assert_eq!(
+            value,
+            &json!({"before": true, "refused": true, "leaked": false, "described": false}),
+            "code_mode={code_mode}: {result}"
+        );
+    }
+}
