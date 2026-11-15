@@ -313,7 +313,9 @@ export function ShareDialog({ trigger, onImported }: Props) {
         return;
       }
       toast.success(t("Imported shared setup"), {
-        description: t("Add any API keys each server needs, then enable them."),
+        description: t(
+          "Imported servers stay off. Turn each one on in Servers when you're ready.",
+        ),
       });
       onOpenChange(false);
     } catch (e) {

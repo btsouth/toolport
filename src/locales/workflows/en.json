@@ -40,7 +40,7 @@
   "Account": "Account",
   "Account status unavailable. Retry sync.": "Account status unavailable. Retry sync.",
   "Add a working personal server in Servers first.": "Add a working personal server in Servers first.",
-  "Add any API keys each server needs, then enable them.": "Add any API keys each server needs, then enable them.",
+  "Imported servers stay off. Turn each one on in Servers when you're ready.": "Imported servers stay off. Turn each one on in Servers when you're ready.",
   "Added": "Added",
   "admin": "admin",
   "After:": "After:",

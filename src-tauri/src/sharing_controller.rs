@@ -154,13 +154,13 @@ fn url_needs_own_credentials(url: &str) -> bool {
         || url.contains("<redacted>")
 }
 
-pub(crate) fn apply_import(registry: &mut Registry, json: &str) -> Result<usize, String> {
+pub fn apply_import(registry: &mut Registry, json: &str) -> Result<usize, String> {
     apply_import_selected(registry, json, None)
 }
 
 /// Like [`apply_import`], importing only the servers whose names are in
 /// `selected` (case-insensitive). `None` keeps every new server.
-pub(crate) fn apply_import_selected(
+pub fn apply_import_selected(
     registry: &mut Registry,
     json: &str,
     selected: Option<&[String]>,
@@ -209,9 +209,10 @@ pub(crate) fn apply_import_selected(
         server.unknown_fields.remove("memberSecretRefs");
         server.source = Some("shared".to_string());
         crate::secret_refs::validate_server(&server).map_err(|e| e.to_string())?;
-        if crate::secret_refs::has_references(&server) {
-            server.enabled = false;
-        }
+        // A setup is an untrusted launch proposal. Importing it must never
+        // start a local command or contact a remote server; enabling is a
+        // separate decision, regardless of whether credentials are needed.
+        server.enabled = false;
         to_add.push(server);
     }
     let added = to_add.len();
@@ -417,6 +418,42 @@ mod controller_tests {
         env["servers"][0]["name"] = serde_json::json!("Environment attack");
         env["servers"][0]["headerKeys"][0]["source"]["ref"] = serde_json::json!("env:BW_SESSION");
         assert!(apply_import(&mut reg, &env.to_string()).is_err());
+    }
+    #[test]
+    fn shared_setups_never_enable_imported_commands_or_remote_connections() {
+        let document = serde_json::json!({"kind":"conduit-setup","version":1,"servers":[
+            {"name":"Imported local","enabled":true,"transport":"stdio","command":"fixture-command","args":[],"env":[]},
+            {"name":"Imported HTTP","enabled":true,"transport":"http","url":"https://example.invalid/mcp","env":[]},
+            {"name":"Imported SSE","enabled":true,"transport":"sse","url":"https://example.invalid/events","env":[]}
+        ]}).to_string();
+        for selected in [false, true] {
+            let mut registry = Registry {
+                version: 3,
+                ..Registry::default()
+            };
+            let existing_id = registry.add_server(serde_json::from_value(serde_json::json!({
+                "name":"Keep running", "enabled":true,"transport":"stdio","command":"existing-command"
+            })).unwrap());
+            let names = ["Imported local", "Imported HTTP", "Imported SSE"].map(str::to_string);
+            let added = if selected {
+                apply_import_selected(&mut registry, &document, Some(&names)).unwrap()
+            } else {
+                apply_import(&mut registry, &document).unwrap()
+            };
+            assert_eq!(added, 3);
+            assert!(
+                registry.server_enabled(&existing_id),
+                "existing server stays enabled"
+            );
+            for server in registry
+                .servers
+                .iter()
+                .filter(|server| server.id != existing_id)
+            {
+                assert!(!server.enabled, "{} must import disabled", server.name);
+                assert!(!registry.server_enabled(&server.id));
+            }
+        }
     }
     #[test]
     fn import_warnings_flag_shell_commands_and_private_addresses() {

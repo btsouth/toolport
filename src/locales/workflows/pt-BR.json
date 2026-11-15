@@ -40,7 +40,7 @@
   "Account": "Conta",
   "Account status unavailable. Retry sync.": "Status da conta indisponível. Tente sincronizar novamente.",
   "Add a working personal server in Servers first.": "Adicione primeiro um servidor pessoal funcional em Servidores.",
-  "Add any API keys each server needs, then enable them.": "Adicione as chaves de API de que cada servidor precisa e então ative os servidores.",
+  "Imported servers stay off. Turn each one on in Servers when you're ready.": "Os servidores importados ficam desligados. Ative cada um em Servidores quando quiser.",
   "Added": "Adicionados",
   "admin": "administrador",
   "After:": "Depois:",

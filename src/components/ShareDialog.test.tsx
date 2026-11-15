@@ -340,6 +340,32 @@ describe("ShareDialog share links", () => {
     expect(screen.getByLabelText("Paste a shared setup")).toHaveValue("");
   });
 
+  it("tells the user imported servers stay off and where to turn them on", async () => {
+    mocks.previewImport.mockResolvedValue([
+      {
+        name: "Reviewed server",
+        transport: "stdio" as const,
+        command: "npx",
+        args: [],
+        url: null,
+        isNew: true,
+      },
+    ]);
+    render(<ShareDialog trigger={<button>Share</button>} onImported={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Share" }));
+    fireEvent.change(screen.getByLabelText("Paste a shared setup"), {
+      target: { value: '{"name":"a","servers":[]}' },
+    });
+    await userEvent.click(screen.getByRole("button", { name: /review and import/i }));
+    await userEvent.click(await screen.findByRole("button", { name: "Import 1 server" }));
+    await waitFor(() =>
+      expect(mocks.success).toHaveBeenCalledWith("Imported shared setup", {
+        description:
+          "Imported servers stay off. Turn each one on in Servers when you're ready.",
+      }),
+    );
+  });
+
   it("does not let an older import completion close a newer review", async () => {
     const item = {
       name: "Reviewed server",
