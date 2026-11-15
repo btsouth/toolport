@@ -88,7 +88,8 @@ are sent to every client.
   A result budget change rebuilds the router and sends `tools/list_changed`.
 
   Each meta-tool's text stays within the budget it advertises. A
-  `toolport_fetch_result` page stops at the budget in bytes, footer included, even
+  `toolport_fetch_result` page stops when the whole reply, serialized, would pass the
+  budget in bytes (text counted as it encodes, envelope and footer included), even
   when a caller asks for a longer `len`. A projection larger than the budget comes
   back shaped like any other large result, with a cursor to page the projected JSON
   (projections exist to cut a result down, so they follow the same budget). Script
@@ -98,11 +99,20 @@ are sent to every client.
   control characters) is shaped like any other text. A page cut by the budget says
   so in its footer, and a shaped projection says its text is a fragment, not
   complete JSON. Error replies quote at most a short preview of the cursor or
-  projection they were given. Two kinds of
-  result are passed through whole because shaping would drop data: results with
-  non-text blocks (images, audio, resource links) and results whose envelope outweighs
-  their text. Those are not budget-bound, and Claude's own file fallback applies to
-  them above the advertised size.
+  projection they were given. A result with non-text blocks (images, audio, resource
+  links) keeps every one of them in place and in order; only its text is cut, to the
+  room the kept blocks and envelope leave, and the full text stays fetchable through
+  the cursor. A result passes through whole only when its kept blocks and envelope
+  alone cannot fit the budget; it is then not budget-bound, and Claude's own file
+  fallback applies above the advertised size.
+
+  A cursor stays fetchable for 15 minutes. The most recent results (up to 64, and
+  64 MiB) are held in memory; a result too large for that, or pushed out by newer
+  ones, moves to a file under `result-spill/` in the data directory for the rest of
+  its time. Each file is written 0600 and sealed with a key the gateway holds only in
+  memory, so it is unreadable once that gateway exits. Files go when their result
+  expires and, for exited gateways, when the next gateway starts. Only a result past
+  the 512 MiB disk cap gets no cursor, and its reply asks for a narrower call.
 
 Drift fingerprints and the listed-catalog digest do not cover `_meta`, so these keys
 never cause drift warnings or extra list notifications.

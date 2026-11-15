@@ -1,8 +1,9 @@
 //! Result-shaping: keep oversized tool results from blowing the model's context
 //! within a byte budget. Retained bodies can be paged with `toolport_fetch_result`
-//! until expiry or eviction. Very large entries retain only text when that fits;
-//! structured projections are then unavailable. If even text exceeds the cache
-//! cap, the truncated reply asks for a narrower call and offers no cursor.
+//! until they expire. Memory holds the recent ones; an entry too large for memory,
+//! or pushed out by newer ones, moves to an encrypted file in the data dir and stays
+//! fetchable there for the rest of its time. Only a result too large for the disk
+//! cap too gets no cursor, and the truncated reply then asks for a narrower call.
 //!
 //! This is the "other half" of the token story: lazy discovery trims tool
 //! DEFINITION bloat; this trims tool RESULT bloat (a 10k-row response that would
@@ -13,7 +14,7 @@ use crate::session_store::SessionStore;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Results whose serialized size exceeds this get shaped. Generous on purpose, so
 /// only genuinely large results are touched. Override with `TOOLPORT_RESULT_BUDGET`
@@ -95,6 +96,7 @@ fn sweep(store: &mut SessionStore<Cached>) {
     if store.reap_expired() > 0 && before >= 1024 * 1024 {
         TRIM_PENDING.store(true, Ordering::Relaxed);
     }
+    spill::reap_expired();
 }
 
 /// Called by every gateway runtime's background maintenance tick. Reads never
@@ -165,21 +167,19 @@ fn evict_to_fit(store: &mut SessionStore<Cached>, new_entry_size: usize) {
         && (store.len() >= MAX_CACHE_ENTRIES
             || store.weight(|c| c.size) + new_entry_size > MAX_CACHE_BYTES)
     {
-        if !store.remove_oldest() {
+        // An entry pushed out of memory moves to disk for the rest of its time.
+        let Some((cursor, entry, stored)) = store.pop_oldest() else {
             break;
-        }
+        };
+        spill::keep(&cursor, entry, stored);
         TRIM_PENDING.store(true, Ordering::Relaxed);
     }
 }
 
-fn retain_in(store: &mut SessionStore<Cached>, cursor: &str, mut entry: Cached) -> bool {
-    if entry.size > MAX_CACHE_BYTES && entry.structured.is_some() {
-        entry.structured = None;
-        entry.projections_unavailable = true;
-        entry.size = retained_size(&entry.body, None);
-    }
+fn retain_in(store: &mut SessionStore<Cached>, cursor: &str, entry: Cached) -> bool {
     if entry.size > MAX_CACHE_BYTES {
-        return false;
+        // Too large to hold in memory: keep it, structured part included, on disk.
+        return spill::keep(cursor, entry, Instant::now());
     }
     sweep(store);
     evict_to_fit(store, entry.size);
@@ -449,71 +449,28 @@ fn shape_inner(
         return false;
     }
 
-    // Only shape text-representable results. Pass through non-text blocks and
-    // results dominated by envelope fields that the text body cannot capture.
-    let (body, source_bytes) = extract_body(result);
-    if !is_text_representable(result) || source_bytes < size / 2 {
+    let (body, _) = extract_body(result);
+    if body.is_empty() {
+        // Nothing textual to cut: a result of only non-text blocks passes whole.
         return false;
     }
     let structured = result.get("structuredContent").cloned();
-
     let total = body.chars().count();
-    // Envelope fields carried across (see below) are part of the shaped result, so
-    // they have to come out of the budget too. Without this, preserving a large
-    // `_meta` could push a "shaped" result back over the limit and `true` would no
-    // longer mean "fits" (#511 review).
-    let preserved_bytes: usize = result
-        .as_object()
-        .map(|obj| {
-            obj.iter()
-                .filter(|(key, _)| {
-                    !matches!(key.as_str(), "content" | "structuredContent" | "isError")
-                })
-                .map(|(key, value)| key.len() + value_size(value) + 4)
-                .sum()
-        })
-        .unwrap_or(0);
-    // If the preserved envelope alone meets the budget, no head size makes the
-    // shaped result fit. Leave it unshaped, as with the other cases where shaping
-    // cannot honour its contract.
-    if preserved_bytes >= budget {
-        return false;
-    }
-    // Reserve room for the marker, then show as much of the body head as fits the
-    // BYTE budget (not a char count, or multi-byte text would blow past it).
-    //
-    // No lower floor here. A `.max(256)` floor is what let a large envelope push
-    // a "shaped" result back over the budget while still returning `true`: the
-    // floor won whenever `budget - reserve - preserved` fell below it. The final
-    // fit-check below is what actually enforces the contract; this is only the
-    // starting estimate.
-    // The protected prefix is given in raw bytes; measure it the way the head is.
-    let mut prefix_end = min_head_bytes.min(body.len());
-    while !body.is_char_boundary(prefix_end) {
-        prefix_end -= 1;
-    }
-    let min_head_bytes = json_string_len(&body[..prefix_end]) - 2;
-    let mut head_byte_limit = budget
-        .saturating_sub(512 + preserved_bytes)
-        .max(min_head_bytes);
-    let head = head_within_encoded_bytes(&body, head_byte_limit).to_string();
     let is_error = result
         .get("isError")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let slots = layout(result, &body);
 
     let cursor = next_cursor();
-    let new_entry_size = retained_size(&body, structured.as_ref());
-
+    let cached_body = body.clone();
+    let new_entry_size = retained_size(&cached_body, structured.as_ref());
     let body_bytes = body.len();
     let retained = retain(
         &cursor,
         Cached {
-            server: result
-                .pointer("/_meta/app.toolport~1provenance/server")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            body,
+            server: server.clone(),
+            body: cached_body,
             structured,
             projections_unavailable: false,
             size: new_entry_size,
@@ -522,34 +479,64 @@ fn shape_inner(
             realm,
         },
     );
-
-    // Build the shaped result for a given head, then measure it. The marker's own
-    // length varies with the head length it reports, and the preserved envelope is
-    // whatever the server sent, so the only reliable way to honour the budget is
-    // to measure the finished value rather than predict it.
-    let build = |head: &str| -> Value {
-        let head_chars = head.chars().count();
-        let marker = if retained {
+    let marker = |head_chars: usize| -> String {
+        if retained {
             format!(
-            "\n\n[Toolport shaped this result: ~{} KB exceeds {} KB budget. Showing first {} of {} \
-             characters. Continue with toolport_fetch_result {{\"cursor\":\"{}\",\"offset\":{}}}. \
-             If the cursor expired, re-run the original tool call.]",
-            size / 1024,
-            budget / 1024,
-            head_chars,
-            total,
-            cursor,
-            head_chars
-        )
+                "\n\n[Toolport shaped this result: ~{} KB exceeds {} KB budget. Showing first {} of {} \
+                 characters. Continue with toolport_fetch_result {{\"cursor\":\"{}\",\"offset\":{}}}. \
+                 If the cursor expired, re-run the original tool call.]",
+                size / 1024,
+                budget / 1024,
+                head_chars,
+                total,
+                cursor,
+                head_chars
+            )
         } else {
             not_retained_notice(body_bytes)
-        };
-        // Shaping deliberately rewrites `content` and stashes `structuredContent`
-        // in the cache when admitted. Every other top-level
-        // field belongs to the downstream server, not to us: `_meta`, and whatever
-        // a future revision or extension adds. Carry them across so shaping stays a
-        // truncation of the body rather than a rewrite of the envelope (SOU-444).
-        let mut shaped = text_result(format!("{head}{marker}"), is_error);
+        }
+    };
+    let decline = || {
+        cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&cursor);
+        spill::forget(&cursor);
+        false
+    };
+
+    // Shaping rewrites the text and stashes `structuredContent`. Everything else is
+    // carried across as the server sent it: non-text blocks in their places, `_meta`
+    // and any other top-level field. `shown` is the body byte where the visible text
+    // stops; text slots that start at or after it are left out (their text is in the
+    // cache), and the marker follows the last shown text.
+    let build = |shown: usize, marker: &str| -> Value {
+        let last_text = slots
+            .iter()
+            .rposition(
+                |slot| matches!(slot, Slot::Text { start, .. } if *start < shown || *start == 0),
+            )
+            .unwrap_or(0);
+        let mut content = Vec::new();
+        for (index, slot) in slots.iter().enumerate() {
+            match slot {
+                Slot::Keep(block) => content.push(block.clone()),
+                Slot::Text { start, end, extra } => {
+                    if index > last_text {
+                        continue;
+                    }
+                    let mut text = body[*start..(*end).min(shown).max(*start)].to_string();
+                    if index == last_text {
+                        text.push_str(marker);
+                    }
+                    let mut block = extra.clone();
+                    block.insert("type".into(), json!("text"));
+                    block.insert("text".into(), Value::String(text));
+                    content.push(Value::Object(block));
+                }
+            }
+        }
+        let mut shaped = json!({ "content": content, "isError": is_error });
         if let (Some(src), Some(dst)) = (result.as_object(), shaped.as_object_mut()) {
             for (key, value) in src {
                 if matches!(key.as_str(), "content" | "structuredContent" | "isError") {
@@ -564,33 +551,71 @@ fn shape_inner(
         shaped
     };
 
-    let mut head = head;
-    let mut shaped = build(&head);
-    // Shrink until it fits. Each pass subtracts the exact overage, so this
-    // converges immediately in practice; the bound is a guard, not a search.
-    for _ in 0..8 {
-        let shaped_size = serde_json::to_string(&shaped).map(|s| s.len()).unwrap_or(0);
-        if shaped_size <= budget || head.is_empty() {
-            break;
+    // Fit by calculation, not by trial. A probe with every text slot present but
+    // emptied measures the envelope, the non-text blocks and each text block's shell.
+    // Showing text slots 0..=k (the last one cut) then costs the probe, minus the
+    // shells of the slots after k, plus the encoded text shown, plus the marker. The
+    // marker is measured at its widest (head = total), so the real one never costs
+    // more.
+    let widest = marker(total);
+    let marker_cost = json_string_len(&widest) - 2;
+    // usize::MAX shows every slot, empty ones included, so blocks line up with slots.
+    let mut emptied = build(usize::MAX, "");
+    if let Some(blocks) = emptied["content"].as_array_mut() {
+        for (block, slot) in blocks.iter_mut().zip(slots.iter()) {
+            if matches!(slot, Slot::Text { .. }) {
+                block["text"] = json!("");
+            }
         }
-        let overage = shaped_size - budget;
-        head_byte_limit = head_byte_limit
-            .saturating_sub(overage.max(1))
-            .max(min_head_bytes);
-        head = head_within_encoded_bytes(&head, head_byte_limit).to_string();
-        shaped = build(&head);
     }
-
-    // An empty head that still overflows means the marker and envelope alone
-    // exceed the budget, so no truncation can honour the contract. Returning
-    // `true` there would be the same false claim the head floor used to make.
-    // Remove any admitted entry when we decline to shape.
-    if serde_json::to_string(&shaped).map(|s| s.len()).unwrap_or(0) > budget {
-        cache()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&cursor);
-        return false;
+    let empty_size = value_size(&emptied);
+    // Bytes each text slot's text adds, and each slot's empty shell plus its comma.
+    let texts: Vec<(usize, usize, usize, usize)> = slots
+        .iter()
+        .zip(emptied["content"].as_array().into_iter().flatten())
+        .filter_map(|(slot, block)| match slot {
+            Slot::Text { start, end, .. } => Some((
+                *start,
+                *end,
+                json_string_len(&body[*start..*end]) - 2,
+                value_size(block) + 1,
+            )),
+            Slot::Keep(_) => None,
+        })
+        .collect();
+    let mut later_shells: usize = texts.iter().map(|text| text.3).sum();
+    let mut earlier_text = 0;
+    let mut shown = 0;
+    for (index, (start, end, cost, shell)) in texts.iter().enumerate() {
+        later_shells -= shell;
+        let fixed = empty_size - later_shells + earlier_text + marker_cost;
+        let Some(room) = budget.checked_sub(fixed) else {
+            // Even with this slot empty the envelope, kept blocks and marker do not
+            // fit. Showing less text cannot help, so leave the result whole.
+            if index == 0 {
+                return decline();
+            }
+            break;
+        };
+        if *cost <= room && index + 1 < texts.len() {
+            earlier_text += cost;
+            shown = *end;
+            continue;
+        }
+        shown = start + head_within_encoded_bytes(&body[*start..*end], room).len();
+        break;
+    }
+    // The protected prefix must be visible, or the result is left whole.
+    if shown < min_head_bytes.min(body.len()) {
+        return decline();
+    }
+    let head_chars = body[..shown].chars().count();
+    let shaped = build(shown, &marker(head_chars));
+    // The calculation is exact; this guard only keeps `true` meaning "fits" if a
+    // future change to the layout breaks it.
+    if value_size(&shaped) > budget {
+        debug_assert!(false, "shaping calculation overshot the budget");
+        return decline();
     }
 
     *result = shaped;
@@ -598,6 +623,62 @@ fn shape_inner(
         TRIM_PENDING.store(true, Ordering::Relaxed);
     }
     true
+}
+
+/// One place in a shaped result's content: a non-text block kept as sent, or a text
+/// block showing `body[start..end]` (with its own extra fields, such as annotations).
+enum Slot {
+    Keep(Value),
+    Text {
+        start: usize,
+        end: usize,
+        extra: serde_json::Map<String, Value>,
+    },
+}
+
+/// Where each block's text sits in [`extract_body`]'s body. An all-text result
+/// becomes one text slot over the whole body, as it always has. A result with non-text
+/// blocks keeps every block in its place, with one text slot per text block, and
+/// typed content not repeated in the text as a final text slot.
+fn layout(result: &Value, body: &str) -> Vec<Slot> {
+    if is_text_representable(result) {
+        return vec![Slot::Text {
+            start: 0,
+            end: body.len(),
+            extra: serde_json::Map::new(),
+        }];
+    }
+    let mut slots = Vec::new();
+    let mut at = 0;
+    for block in result["content"].as_array().into_iter().flatten() {
+        match block.get("text").and_then(Value::as_str) {
+            Some(text) => {
+                // extract_body puts a newline before a text block once it has text.
+                if at > 0 {
+                    at += 1;
+                }
+                let mut extra = block.as_object().cloned().unwrap_or_default();
+                extra.remove("type");
+                extra.remove("text");
+                slots.push(Slot::Text {
+                    start: at,
+                    end: at + text.len(),
+                    extra,
+                });
+                at += text.len();
+            }
+            None => slots.push(Slot::Keep(block.clone())),
+        }
+    }
+    if at < body.len() {
+        let start = if at > 0 { at + 1 } else { at };
+        slots.push(Slot::Text {
+            start,
+            end: body.len(),
+            extra: serde_json::Map::new(),
+        });
+    }
+    slots
 }
 
 fn not_retained_notice(body_bytes: usize) -> String {
@@ -634,10 +715,6 @@ pub fn stash_payload(
     );
     retained.then_some(cursor)
 }
-
-/// Room a model-facing page keeps under the budget for its footer, which is at most
-/// about 250 bytes with five 20-digit numbers.
-const PAGE_FOOTER_RESERVE_BYTES: usize = 320;
 
 /// Return the next slice of a cached shaped result, by cursor + character offset.
 /// `len` of 0 means "use the current budget" (the whole rest when it is 0). This is
@@ -737,6 +814,19 @@ pub fn fetch_result_for_model_visible(
     result
 }
 
+/// The same answer for a missing, expired or foreign cursor, so a scoped client
+/// cannot probe which cursors exist.
+fn unknown_cursor(cursor: &str) -> Value {
+    text_result(
+        format!(
+            "[Toolport: cursor \"{}\" is unknown or expired. Re-run the original tool call \
+             to get a fresh result.]",
+            preview(cursor)
+        ),
+        true,
+    )
+}
+
 fn fetch_result_bounded(
     cursor: &str,
     offset: usize,
@@ -746,16 +836,6 @@ fn fetch_result_bounded(
     model_budget: Option<usize>,
     visible: &dyn Fn(&str) -> bool,
 ) -> Value {
-    let unknown = || {
-        text_result(
-            format!(
-                "[Toolport: cursor \"{}\" is unknown or expired. Re-run the original \
-                 tool call to get a fresh result.]",
-                preview(cursor)
-            ),
-            true,
-        )
-    };
     // Scope: a cached result is readable only by the client that stashed it. Owner
     // must be a stable principal (e.g. client:{id}), never a shared display label
     // (SOU-324). A mismatch returns the SAME "unknown or expired" answer as a
@@ -768,7 +848,9 @@ fn fetch_result_bounded(
         sweep(&mut store);
         match store.get(cursor) {
             Some(c) if owned(c) => c.describes.clone(),
-            _ => return unknown(),
+            Some(_) => return unknown_cursor(cursor),
+            // What went to disk is never a discovery result (see `spill::keep`).
+            None => Vec::new(),
         }
     };
     // The visibility check runs unlocked (see above).
@@ -790,9 +872,17 @@ fn fetch_result_bounded(
         );
     }
     let store = cache().lock().unwrap_or_else(|e| e.into_inner());
+    let spilled;
     let c = match store.get(cursor) {
         Some(c) if owned(c) && c.describes == describes => c,
-        _ => return unknown(),
+        None if describes.is_empty() => match spill::load(cursor, requester) {
+            Some(entry) => {
+                spilled = entry;
+                &spilled
+            }
+            None => return unknown_cursor(cursor),
+        },
+        _ => return unknown_cursor(cursor),
     };
     if let Some(path) = projection {
         let structured = match &c.structured {
@@ -851,10 +941,21 @@ fn fetch_result_bounded(
         }
         (len, _) => len,
     };
-    // A model-facing page also stops before its text and footer pass the budget.
-    let max_page_bytes = model_budget
-        .filter(|&budget| budget > 0)
-        .map(|budget| budget.saturating_sub(PAGE_FOOTER_RESERVE_BYTES).max(1));
+    // A model-facing page stops before the whole reply, serialized, passes the budget:
+    // its text is charged as it encodes, and the envelope and the widest footer this
+    // page could carry come off the top.
+    let max_page_bytes = model_budget.filter(|&budget| budget > 0).map(|budget| {
+        let widest = format!(
+            "\n\n[Toolport: characters {total}..{total} of {total}. This page stopped at the \
+             result budget. {total} remain, call toolport_fetch_result with offset={total} \
+             for the next slice.]"
+        );
+        let mut envelope = text_result(widest, false);
+        if let Some(server) = &c.server {
+            crate::integrity::label_untrusted_result(server, &mut envelope);
+        }
+        budget.saturating_sub(value_size(&envelope)).max(1)
+    });
     // saturating_add: a client-supplied `len` near usize::MAX must not overflow
     // `offset + len`. On debug that panics; on release it wraps to `end < offset`,
     // and the byte-mapping below then slices `body[start_byte..end_byte]` with
@@ -869,12 +970,15 @@ fn fetch_result_bounded(
     let mut start_byte = c.body.len();
     let mut end_byte = c.body.len();
     let mut cut_by_budget = false;
+    let mut page_bytes = 0;
     for (char_idx, (byte_idx, ch)) in c.body.char_indices().enumerate() {
         if char_idx == offset {
             start_byte = byte_idx;
         }
-        let over_bytes = char_idx > offset
-            && max_page_bytes.is_some_and(|max| byte_idx + ch.len_utf8() - start_byte > max);
+        if char_idx >= offset {
+            page_bytes += json_char_len(ch);
+        }
+        let over_bytes = char_idx > offset && max_page_bytes.is_some_and(|max| page_bytes > max);
         if char_idx == end || over_bytes {
             cut_by_budget = over_bytes && char_idx < end;
             end = char_idx;
@@ -903,6 +1007,296 @@ fn fetch_result_bounded(
         crate::integrity::label_untrusted_result(server, &mut result);
     }
     result
+}
+
+/// Results that left memory: too large for it, or pushed out by newer ones. Each is
+/// one file under `result-spill/<pid>` in the data dir, written 0600 through
+/// `atomic_write` and sealed with XChaCha20-Poly1305 under a key this process holds
+/// only in memory. A file is unreadable once its process is gone, and nothing in it
+/// is changed, so paging offsets stay exact. Files are removed when their entry
+/// expires (the same 15 minutes as memory), when the disk cap pushes them out, and at
+/// the next start of any gateway for directories whose process has exited.
+mod spill {
+    use super::{Cached, CACHE_TTL};
+    use base64::Engine;
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    /// Disk held by one gateway process's spilled results.
+    pub(super) const MAX_SPILL_BYTES: usize = 512 * 1024 * 1024;
+
+    #[cfg(test)]
+    thread_local! {
+        static CAP_FOR_TESTS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Lower the disk cap on this test thread, so the "too large even for disk" path
+    /// runs without writing half a gigabyte.
+    #[cfg(test)]
+    pub(super) fn set_cap_for_tests(cap: Option<usize>) {
+        CAP_FOR_TESTS.with(|cell| cell.set(cap));
+    }
+
+    fn max_spill_bytes() -> usize {
+        #[cfg(test)]
+        if let Some(cap) = CAP_FOR_TESTS.with(std::cell::Cell::get) {
+            return cap;
+        }
+        MAX_SPILL_BYTES
+    }
+    const NONCE_LEN: usize = 24;
+
+    struct Spilled {
+        path: PathBuf,
+        server: Option<String>,
+        owner: Option<String>,
+        projections_unavailable: bool,
+        bytes: usize,
+        stored: Instant,
+    }
+
+    struct State {
+        dir: Option<PathBuf>,
+        cipher: XChaCha20Poly1305,
+        entries: HashMap<String, Spilled>,
+    }
+
+    fn state() -> &'static Mutex<State> {
+        static S: OnceLock<Mutex<State>> = OnceLock::new();
+        S.get_or_init(|| {
+            let mut key = [0u8; 32];
+            let _ = getrandom::getrandom(&mut key);
+            let dir = spill_root().map(|root| {
+                remove_stale(&root);
+                root.join(std::process::id().to_string())
+            });
+            Mutex::new(State {
+                dir,
+                cipher: XChaCha20Poly1305::new((&key).into()),
+                entries: HashMap::new(),
+            })
+        })
+    }
+
+    fn spill_root() -> Option<PathBuf> {
+        if cfg!(test) {
+            // Unit tests never write into a real data dir.
+            return Some(std::env::temp_dir().join("toolport-result-spill-tests"));
+        }
+        crate::registry::conduit_dir().map(|data| data.join("result-spill"))
+    }
+
+    /// At start: remove the spill directories of gateways that have exited (their key
+    /// died with them), and any file older than the TTL, which no gateway still
+    /// serves. On Windows, where a pid check is not available here, the age rule
+    /// alone clears them.
+    fn remove_stale(root: &std::path::Path) {
+        let Ok(dirs) = std::fs::read_dir(root) else {
+            return;
+        };
+        for dir in dirs.flatten() {
+            let pid = dir
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok());
+            if pid.is_none_or(|pid| !process_alive(pid)) {
+                let _ = std::fs::remove_dir_all(dir.path());
+                continue;
+            }
+            for file in std::fs::read_dir(dir.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let expired = file
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_none_or(|age| age >= CACHE_TTL);
+                if expired {
+                    let _ = std::fs::remove_file(file.path());
+                }
+            }
+        }
+    }
+
+    fn process_alive(pid: u32) -> bool {
+        if pid == std::process::id() {
+            // A reused pid from an earlier run: its files are not ours to read.
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            // SAFETY: signal 0 only checks that the process exists.
+            unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+
+    /// Keep `entry` on disk under `cursor` until `stored + CACHE_TTL`. Returns false
+    /// when it cannot be kept (no data dir, past the disk cap, or a failed write).
+    pub(super) fn keep(cursor: &str, entry: Cached, stored: Instant) -> bool {
+        // A discovery result stays in memory, where its visibility is checked on
+        // every fetch and `forget_discovery` drops it; pushed out, it is dropped
+        // and search makes a fresh one.
+        if stored.elapsed() >= CACHE_TTL || !entry.describes.is_empty() {
+            return false;
+        }
+        let plain = json!({ "body": entry.body, "structured": entry.structured }).to_string();
+        // Base64 of the sealed text is a third larger; check before sealing.
+        if plain.len() / 3 * 4 > max_spill_bytes() {
+            return false;
+        }
+        let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(dir) = state.dir.clone() else {
+            return false;
+        };
+        let mut nonce = [0u8; NONCE_LEN];
+        if getrandom::getrandom(&mut nonce).is_err() {
+            return false;
+        }
+        let Ok(sealed) = state
+            .cipher
+            .encrypt(XNonce::from_slice(&nonce), plain.as_bytes())
+        else {
+            return false;
+        };
+        let mut bytes = nonce.to_vec();
+        bytes.extend_from_slice(&sealed);
+        let text = base64::engine::general_purpose::STANDARD.encode(bytes);
+        if text.len() > max_spill_bytes() {
+            return false;
+        }
+        reap(&mut state);
+        while state.entries.values().map(|s| s.bytes).sum::<usize>() + text.len()
+            > max_spill_bytes()
+        {
+            let Some(oldest) = state
+                .entries
+                .iter()
+                .min_by_key(|(_, s)| s.stored)
+                .map(|(cursor, _)| cursor.clone())
+            else {
+                break;
+            };
+            if let Some(gone) = state.entries.remove(&oldest) {
+                let _ = std::fs::remove_file(gone.path);
+            }
+        }
+        if create_private_dir(&dir).is_err() {
+            return false;
+        }
+        let path = dir.join(format!("{cursor}.sealed"));
+        if crate::registry::atomic_write(&path, &text).is_err() {
+            return false;
+        }
+        state.entries.insert(
+            cursor.to_string(),
+            Spilled {
+                path,
+                server: entry.server,
+                owner: entry.owner,
+                projections_unavailable: entry.projections_unavailable,
+                bytes: text.len(),
+                stored,
+            },
+        );
+        true
+    }
+
+    fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [dir, dir.parent().unwrap_or(dir)] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The spilled entry for `cursor`, if it is still live and belongs to `requester`.
+    pub(super) fn load(cursor: &str, requester: Option<&str>) -> Option<Cached> {
+        let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
+        reap(&mut state);
+        let spilled = state.entries.get(cursor)?;
+        if spilled.owner.as_deref() != requester {
+            return None;
+        }
+        let text = std::fs::read_to_string(&spilled.path).ok()?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(text)
+            .ok()?;
+        if bytes.len() < NONCE_LEN {
+            return None;
+        }
+        let (nonce, sealed) = bytes.split_at(NONCE_LEN);
+        let plain = state
+            .cipher
+            .decrypt(XNonce::from_slice(nonce), sealed)
+            .ok()?;
+        let value: Value = serde_json::from_slice(&plain).ok()?;
+        let structured = value.get("structured").filter(|v| !v.is_null()).cloned();
+        Some(Cached {
+            server: spilled.server.clone(),
+            body: value.get("body")?.as_str()?.to_string(),
+            size: 0,
+            structured,
+            projections_unavailable: spilled.projections_unavailable,
+            owner: spilled.owner.clone(),
+            describes: Vec::new(),
+            realm: 0,
+        })
+    }
+
+    fn reap(state: &mut State) {
+        state.entries.retain(|_, spilled| {
+            let live = spilled.stored.elapsed() < CACHE_TTL;
+            if !live {
+                let _ = std::fs::remove_file(&spilled.path);
+            }
+            live
+        });
+    }
+
+    /// Drop a spilled entry and its file (a shape that was declined after storing).
+    pub(super) fn forget(cursor: &str) {
+        let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(gone) = state.entries.remove(cursor) {
+            let _ = std::fs::remove_file(gone.path);
+        }
+    }
+
+    pub(super) fn reap_expired() {
+        let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
+        reap(&mut state);
+    }
+
+    #[cfg(test)]
+    pub(super) fn root_for_tests() -> PathBuf {
+        spill_root().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(super) fn remove_stale_for_tests(root: &std::path::Path) {
+        remove_stale(root);
+    }
+
+    #[cfg(test)]
+    pub(super) fn spilled_path(cursor: &str) -> Option<PathBuf> {
+        let state = state().lock().unwrap_or_else(|e| e.into_inner());
+        state.entries.get(cursor).map(|s| s.path.clone())
+    }
 }
 
 #[cfg(test)]
@@ -1460,35 +1854,60 @@ mod tests {
         assert!(store.get("incoming").is_some());
     }
 
+    // An object whose recorded size passes the memory cap without filling it: `json!`
+    // would copy the string and lose its capacity, so build the value directly.
+    fn big_object(extra: &[(&str, Value)]) -> Value {
+        let mut object = serde_json::Map::new();
+        object.insert(
+            "big".into(),
+            Value::String(String::with_capacity(MAX_CACHE_BYTES)),
+        );
+        for (key, value) in extra {
+            object.insert((*key).into(), value.clone());
+        }
+        Value::Object(object)
+    }
+
     #[test]
-    fn cache_rejects_over_cap_entries_without_evicting_live_results() {
+    fn over_cap_entries_go_to_disk_without_evicting_live_results() {
         let mut store = SessionStore::new(CACHE_TTL, MAX_CACHE_ENTRIES);
         store.insert("live", cached_entry(1024));
-        assert!(!retain_in(
+        assert!(retain_in(
             &mut store,
             "oversize",
             cached_entry(MAX_CACHE_BYTES + 1)
         ));
         assert!(store.get("oversize").is_none());
+        assert!(spill::spilled_path("oversize").is_some());
         assert!(store.get("live").is_some());
         assert!(retain_in(
             &mut store,
             "at-cap",
             cached_entry(MAX_CACHE_BYTES)
         ));
+        // The live entry made room and moved to disk; it was not dropped.
         assert!(store.get("live").is_none());
+        assert!(spill::spilled_path("live").is_some());
         assert_eq!(store.weight(|c| c.size), MAX_CACHE_BYTES);
+        for cursor in ["oversize", "live"] {
+            spill::forget(cursor);
+        }
     }
 
     #[test]
-    fn over_cap_payload_reports_no_cursor() {
-        assert!(stash_payload(String::with_capacity(MAX_CACHE_BYTES), None, None).is_none());
+    fn a_payload_past_the_disk_cap_reports_no_cursor() {
+        spill::set_cap_for_tests(Some(1_024));
+        let big = "z".repeat(4_096);
+        let structured = big_object(&[]);
+        assert!(stash_payload(big, Some(structured), None).is_none());
+        spill::set_cap_for_tests(None);
     }
 
     #[test]
-    fn over_cap_stash_retains_text_without_structured_projections() {
-        let structured = Value::String(String::with_capacity(MAX_CACHE_BYTES));
+    fn an_over_cap_stash_keeps_its_text_and_projections_on_disk() {
+        let structured = big_object(&[("small", json!(7))]);
         let cursor = stash_payload("retained text".into(), Some(structured), None).unwrap();
+        assert!(spill::spilled_path(&cursor).is_some());
         assert_eq!(
             fetch_result(&cursor, 0, 100, None, None),
             text_result(
@@ -1496,17 +1915,23 @@ mod tests {
                 false
             )
         );
-        assert_eq!(fetch_result(&cursor, 0, 100, None, Some("")), text_result("[Toolport: projections aren't available for this very large result. Page the text or narrow the call.]".into(), true));
+        assert_eq!(
+            fetch_result(&cursor, 0, 100, None, Some("small")),
+            text_result("7".into(), false)
+        );
+        spill::forget(&cursor);
     }
 
     #[test]
-    fn over_cap_shaping_reports_unavailable_paging_without_a_cursor() {
+    fn shaping_past_the_disk_cap_reports_unavailable_paging_without_a_cursor() {
+        spill::set_cap_for_tests(Some(1_024));
         let mut result = json!({
             "content": [{"type": "text", "text": "x".repeat(MAX_CACHE_BYTES)}],
             "isError": false,
             "_meta": {"fixture": true},
         });
         assert!(shape_result(&mut result, 2048, None));
+        spill::set_cap_for_tests(None);
         assert!(value_size(&result) <= 2048);
         assert_eq!(result["isError"], false);
         assert_eq!(result["_meta"]["fixture"], true);
@@ -1519,12 +1944,11 @@ mod tests {
     }
 
     #[test]
-    fn over_cap_tree_retains_text_pages_but_refuses_projections() {
+    fn an_over_cap_tree_pages_and_projects_from_disk() {
         let structured =
             json!({"rows": (0..100_000).map(|i| json!({"id": i, "ok": true})).collect::<Vec<_>>()});
         let text = structured.to_string();
         assert!(retained_size(&text, Some(&structured)) > MAX_CACHE_BYTES);
-        assert!(retained_size(&text, None) < MAX_CACHE_BYTES);
         let mut result = json!({"structuredContent": structured});
         assert!(shape_result(&mut result, 2048, Some("alice")));
         let cursor = cursor_of(&result);
@@ -1541,15 +1965,20 @@ mod tests {
             )
         );
         let projection = fetch_result(&cursor, 0, 100, Some("alice"), Some("rows.0"));
-        assert_eq!(projection, text_result("[Toolport: projections aren't available for this very large result. Page the text or narrow the call.]".into(), true));
+        assert_eq!(
+            projection,
+            text_result("{\"id\":0,\"ok\":true}".into(), false)
+        );
         assert_eq!(
             fetch_result(&cursor, 0, 100, Some("bob"), Some("rows.0"))["isError"],
             true
         );
-        let store = cache().lock().unwrap_or_else(|e| e.into_inner());
-        let entry = store.get(&cursor).unwrap();
-        assert!(entry.structured.is_none());
-        assert!(entry.size <= MAX_CACHE_BYTES);
+        assert!(cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&cursor)
+            .is_none());
+        spill::forget(&cursor);
     }
 
     #[test]
@@ -1557,7 +1986,16 @@ mod tests {
         let mut result = big_text_result(10_000);
         assert!(shape_result(&mut result, 2048, None));
         let cursor = cursor_of(&result);
-        let expected = text_result(format!("{}\n\n[Toolport shaped this result: ~9 KB exceeds 2 KB budget. Showing first 1536 of 10000 characters. Continue with toolport_fetch_result {{\"cursor\":\"{}\",\"offset\":1536}}. If the cursor expired, re-run the original tool call.]", "x".repeat(1536), cursor), false);
+        // The head fills the budget as far as the widest marker allows.
+        let head = result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .take_while(|c| *c == 'x')
+            .count();
+        assert!(head > 1536, "head {head}");
+        assert!(serde_json::to_vec(&result).unwrap().len() <= 2048);
+        let expected = text_result(format!("{}\n\n[Toolport shaped this result: ~9 KB exceeds 2 KB budget. Showing first {head} of 10000 characters. Continue with toolport_fetch_result {{\"cursor\":\"{}\",\"offset\":{head}}}. If the cursor expired, re-run the original tool call.]", "x".repeat(head), cursor), false);
         assert_eq!(
             serde_json::to_vec(&result).unwrap(),
             serde_json::to_vec(&expected).unwrap()
@@ -1733,14 +2171,14 @@ mod tests {
     }
 
     #[test]
-    fn a_result_dominated_by_its_envelope_is_still_left_whole() {
-        // A small body under a large _meta: shaping cannot help, so it declines.
+    fn a_result_is_left_whole_only_when_its_envelope_alone_cannot_fit() {
+        // A small body under a _meta larger than the budget: no head size fits.
         let mut result = text_result("short".into(), false);
         result["_meta"] = json!({ "blob": "m".repeat(5_000) });
         let before = result.clone();
         assert!(!shape_result(&mut result, 2_000, None));
         assert_eq!(result, before);
-        // A non-text block is never dropped by shaping.
+        // A non-text block larger than the budget is never dropped, so it passes whole.
         let mut image = json!({ "content": [
             { "type": "image", "data": "i".repeat(5_000), "mimeType": "image/png" },
             { "type": "text", "text": "t".repeat(5_000) }
@@ -1748,6 +2186,234 @@ mod tests {
         let before = image.clone();
         assert!(!shape_result(&mut image, 2_000, None));
         assert_eq!(image, before);
+        // An envelope that outweighs the text but fits: the text is shaped around it.
+        let mut heavy = text_result("t".repeat(1_200), false);
+        heavy["_meta"] = json!({ "blob": "m".repeat(1_300) });
+        assert!(shape_result(&mut heavy, 2_000, None));
+        assert_eq!(heavy["_meta"]["blob"].as_str().unwrap().len(), 1_300);
+        assert!(serde_json::to_string(&heavy).unwrap().len() <= 2_000);
+    }
+
+    #[test]
+    fn a_small_image_does_not_exempt_large_text_from_shaping() {
+        let text = "x".repeat(1_000_000);
+        let mut result = json!({ "content": [
+            { "type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png" },
+            { "type": "text", "text": text }
+        ] });
+        assert!(shape_result(&mut result, 150_000, None));
+        assert!(serde_json::to_string(&result).unwrap().len() <= 150_000);
+        let blocks = result["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["data"], "iVBORw0KGgo=");
+        let shown = blocks[1]["text"].as_str().unwrap();
+        let cursor = shown
+            .split("\"cursor\":\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let full = fetch_result(cursor, 0, usize::MAX, None, None);
+        assert!(full["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(&text));
+    }
+
+    #[test]
+    fn mixed_results_are_shaped_in_order_within_the_budget() {
+        let mut seed: u64 = 0x0dd5_eed5_0000_0042;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize
+        };
+        const PALETTE: [char; 6] = ['a', '\\', '"', '\n', '\u{1}', '😀'];
+        for case in 0..80 {
+            let budget = [3_000, 12_000, 40_000][case % 3];
+            let mut blocks = Vec::new();
+            let mut texts = Vec::new();
+            let mut images = Vec::new();
+            for slot in 0..(2 + next() % 5) {
+                if next() % 3 == 0 {
+                    let data = format!("img{case}-{slot}-{}", "A".repeat(next() % 300));
+                    images.push(data.clone());
+                    blocks.push(json!({ "type": "image", "data": data, "mimeType": "image/png" }));
+                } else {
+                    let len = next() % (budget * 2);
+                    let text: String = (0..len).map(|_| PALETTE[next() % 6]).collect();
+                    texts.push(text.clone());
+                    blocks.push(json!({ "type": "text", "text": text }));
+                }
+            }
+            let mut result = json!({ "content": blocks, "isError": false });
+            let before = result.clone();
+            let size = serde_json::to_string(&result).unwrap().len();
+            let shaped = shape_result(&mut result, budget, None);
+            if size <= budget || texts.iter().all(String::is_empty) {
+                assert!(!shaped, "case {case}");
+                assert_eq!(result, before, "case {case}");
+                continue;
+            }
+            assert!(shaped, "case {case}: {size} bytes at {budget}");
+            assert!(
+                serde_json::to_string(&result).unwrap().len() <= budget,
+                "case {case} over budget"
+            );
+            let out = result["content"].as_array().unwrap();
+            // Every non-text block survives, in its original order.
+            let kept: Vec<String> = out
+                .iter()
+                .filter(|b| b["type"] == "image")
+                .map(|b| b["data"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(kept, images, "case {case}");
+            // Text blocks before an image stay before it: the shown text, read in
+            // order, is a prefix of the original text joined in order.
+            let joined = texts.join("\n");
+            let mut shown = String::new();
+            let mut cursor = None;
+            for block in out.iter().filter(|b| b["type"] == "text") {
+                let text = block["text"].as_str().unwrap();
+                let (body, marker) = match text.find("\n\n[Toolport shaped this result") {
+                    Some(at) => (&text[..at], Some(&text[at..])),
+                    None => (text, None),
+                };
+                if !shown.is_empty() {
+                    shown.push('\n');
+                }
+                shown.push_str(body);
+                if let Some(marker) = marker {
+                    cursor = marker
+                        .split("\"cursor\":\"")
+                        .nth(1)
+                        .map(|rest| rest.split('"').next().unwrap().to_string());
+                }
+            }
+            assert!(
+                joined.starts_with(&shown),
+                "case {case}: shown text is not a prefix"
+            );
+            let cursor = cursor.expect("a shaped mixed result carries a cursor");
+            let full = fetch_result(&cursor, 0, usize::MAX, None, None);
+            assert!(
+                full["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&joined),
+                "case {case}: the cursor does not hold the whole text"
+            );
+        }
+    }
+
+    #[test]
+    fn results_pushed_out_of_memory_stay_fetchable_from_a_sealed_file() {
+        let secret = "spill-plaintext-marker ".repeat(400);
+        let mut first = text_result(secret.clone(), false);
+        first["structuredContent"] = json!({ "rows": [secret.clone()] });
+        assert!(shape_result(&mut first, 2_000, Some("spill-owner")));
+        let text = first["content"][0]["text"].as_str().unwrap().to_string();
+        let cursor = text
+            .split("\"cursor\":\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        // Push it out of memory with newer results.
+        for _ in 0..(MAX_CACHE_ENTRIES + 4) {
+            let mut r = big_text_result(5_000);
+            shape_result(&mut r, 1_024, Some("spill-other"));
+        }
+        assert!(
+            cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(cursor)
+                .is_none(),
+            "still in memory"
+        );
+        let path = spill::spilled_path(cursor).expect("moved to disk");
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !stored.contains("spill-plaintext-marker"),
+            "plaintext on disk"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        // Pages and projections read it back exactly, for its owner only.
+        let page = fetch_result(cursor, 0, usize::MAX, Some("spill-owner"), None);
+        assert!(page["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(&secret));
+        let rows = fetch_result(cursor, 0, 0, Some("spill-owner"), Some("rows.0"));
+        assert_eq!(
+            rows["content"][0]["text"],
+            json!(serde_json::to_string(&secret).unwrap())
+        );
+        let foreign = fetch_result(cursor, 0, 0, Some("spill-other"), None);
+        assert_eq!(foreign["isError"], true);
+        spill::forget(cursor);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn startup_removes_spills_of_exited_gateways_and_expired_files() {
+        let root = spill::root_for_tests().join("startup-case");
+        let dead = root.join("4294967294");
+        let named = root.join("not-a-pid");
+        let live = root.join(std::process::id().to_string());
+        for dir in [&dead, &named, &live] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("r1.sealed"), "x").unwrap();
+        }
+        spill::remove_stale_for_tests(&root);
+        assert!(!dead.exists() && !named.exists());
+        // This process's pid from an earlier run is not ours either.
+        assert!(!live.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pages_of_dense_escapes_fit_the_budget_and_cover_every_character_once() {
+        let body: String = "\u{1}\"\\a\u{7}é😀\n".repeat(4_000);
+        for budget in [1_000, 4_000, 20_000] {
+            let cursor = stash_payload(body.clone(), None, None).unwrap();
+            let mut offset = 0;
+            let mut read = String::new();
+            loop {
+                let page = fetch_result_for_model(&cursor, offset, 0, None, None, budget);
+                let bytes = serde_json::to_string(&page).unwrap().len();
+                assert!(
+                    bytes <= budget,
+                    "{bytes} bytes over {budget} at offset {offset}"
+                );
+                let text = page["content"][0]["text"].as_str().unwrap();
+                let at = text.rfind("\n\n[Toolport: ").unwrap();
+                read.push_str(&text[..at]);
+                match text[at..].split("offset=").nth(1) {
+                    Some(rest) => {
+                        let next: usize = rest
+                            .chars()
+                            .take_while(char::is_ascii_digit)
+                            .collect::<String>()
+                            .parse()
+                            .unwrap();
+                        assert!(next > offset);
+                        offset = next;
+                    }
+                    None => break,
+                }
+            }
+            assert_eq!(read, body, "budget {budget}");
+        }
     }
 
     #[test]

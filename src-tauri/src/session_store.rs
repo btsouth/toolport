@@ -159,6 +159,18 @@ impl<V> SessionStore<V> {
 
     /// Drop the oldest entry by insertion order, returning whether one was removed.
     /// Paired with [`weight`](Self::weight) so a caller can evict to a budget.
+    /// Remove the least recently inserted entry and return it with its key and the
+    /// time it was stored, so a caller can keep it elsewhere for its remaining TTL.
+    pub fn pop_oldest(&mut self) -> Option<(String, V, Instant)> {
+        let key = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.seq)
+            .map(|(key, _)| key.clone())?;
+        let entry = self.entries.remove(&key)?;
+        Some((key, entry.value, entry.last_seen))
+    }
+
     pub fn remove_oldest(&mut self) -> bool {
         let oldest = self
             .entries
