@@ -146,6 +146,18 @@ fn expand(raw: &str, home: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(raw))
 }
 
+/// Whether `path` is inside `home` by its text: absolute, no `.` or `..`, and below
+/// `home`. A UNC, device or verbatim path never starts with an ordinary home folder.
+pub(super) fn lexically_inside(path: &Path, home: &Path) -> bool {
+    use std::path::Component;
+    path.is_absolute()
+        && path != home
+        && path.starts_with(home)
+        && path
+            .components()
+            .all(|part| !matches!(part, Component::ParentDir | Component::CurDir))
+}
+
 /// A cheap token that changes when T3 Code's settings change, for the Clients page to
 /// notice an edit while it is open. `None` when there is no settings file.
 pub fn revision() -> Option<String> {
@@ -492,8 +504,9 @@ fn config_of(config: &RawValue) -> Option<RawConfig> {
     serde_json::from_str(config.get()).ok()
 }
 
-/// The instance, or `None` when Toolport cannot tell which config it reads: its config is
-/// not an object of the expected shape, or its home folder is hidden or relative.
+/// The instance, or `None` when Toolport cannot tell which config it reads or must not
+/// look at it: its config is not an object of the expected shape, or its home folder is
+/// hidden, relative or not plainly inside the user's home.
 fn instance_of(id: &str, provider: Provider, raw: RawInstance, home: &Path) -> Option<Instance> {
     let display_name = raw
         .display_name
@@ -565,6 +578,15 @@ fn instance_of(id: &str, provider: Provider, raw: RawInstance, home: &Path) -> O
         // T3 Code's Cursor and Kiro use the user's own default MCP config.
         Provider::Cursor | Provider::Kiro => None,
     };
+    // Checked by its text alone, before anything touches the file system: a network or
+    // device path, `..`, or a folder outside the user's home is never opened, resolved or
+    // listed.
+    if config_path
+        .as_deref()
+        .is_some_and(|path| !lexically_inside(path, home))
+    {
+        return None;
+    }
     Some(Instance {
         id: id.into(),
         provider,
@@ -686,14 +708,24 @@ pub(super) fn path_is_safe(config: &Path) -> bool {
 /// not already list. Homes whose folder does not exist yet are left out until it does.
 pub(super) fn automatic(known: &[locations::ClientLocation]) -> Vec<locations::ClientLocation> {
     let mut rows: Vec<locations::ClientLocation> = Vec::new();
+    let Some(home) = home() else {
+        return rows;
+    };
+    let Ok(real_home) = std::fs::canonicalize(&home) else {
+        return rows;
+    };
     for instance in instances() {
         let Some(path) = instance.config_path.as_ref() else {
             continue;
         };
-        let Some(folder) = path
-            .parent()
-            .and_then(|folder| std::fs::canonicalize(folder).ok())
-        else {
+        // No link below home is followed: the folder must resolve to where its text
+        // says. Home itself may be a link (for example `/home` to `/var/home`).
+        let Some(folder) = path.parent().and_then(|folder| {
+            let expected = real_home.join(folder.strip_prefix(&home).ok()?);
+            std::fs::canonicalize(folder)
+                .ok()
+                .filter(|real| *real == expected)
+        }) else {
             continue;
         };
         let Some(file) = path.file_name() else {

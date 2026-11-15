@@ -816,7 +816,11 @@ pub(super) fn lookup(id: &str) -> Option<ClientLocation> {
         return Some(row);
     }
     if super::t3code::is_location_id(id) {
-        return super::t3code::automatic(&[])
+        // As the page lists it: a T3 Code home a profile or Codex row already covers is
+        // not a second way to reach that file.
+        return home()
+            .map(|home| automatic(&home))
+            .unwrap_or_default()
             .into_iter()
             .find(|row| row.id == id);
     }

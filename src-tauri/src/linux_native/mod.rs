@@ -2123,7 +2123,7 @@ impl T3SettingsWatch {
 /// While Clients is visible, rescan quietly when T3 Code's settings change: an instance
 /// added, renamed or turned off moves the row badges. One `stat` when the
 /// page is shown and when the window gets focus, then every five seconds only while T3
-/// Code's settings exist. Nothing runs while the page is hidden.
+/// Code's settings exist and the window is active. Nothing runs while the page is hidden.
 fn watch_t3_code_settings(page: &ClientPage) {
     use std::{cell::RefCell, rc::Rc};
     let watch = Rc::new(RefCell::new(T3SettingsWatch::default()));
@@ -2148,11 +2148,18 @@ fn watch_t3_code_settings(page: &ClientPage) {
             if !check() || !root.is_mapped() || timer.borrow().is_some() {
                 return;
             }
-            let (check, slot) = (check.clone(), timer.clone());
+            let (check, slot, root) = (check.clone(), timer.clone(), root.clone());
             *timer.borrow_mut() = Some(gtk::glib::timeout_add_local(
                 std::time::Duration::from_secs(5),
                 move || {
-                    if check() {
+                    // As in React: no checks while the window is in the background or
+                    // the page is hidden; focus starts them again.
+                    let active = root.is_mapped()
+                        && root
+                            .root()
+                            .and_downcast::<gtk::Window>()
+                            .is_some_and(|window| window.is_active());
+                    if active && check() {
                         gtk::glib::ControlFlow::Continue
                     } else {
                         slot.borrow_mut().take();

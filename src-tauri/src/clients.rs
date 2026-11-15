@@ -4962,23 +4962,16 @@ pub fn detect_clients() -> Vec<DetectedClient> {
 
 /// One client by id, as [`detect_clients`] reads it, including a location the Clients page
 /// lists without saving it yet: a launcher home or a T3 Code home. Connect saves those.
+/// The same definitions as the page's scan, so a duplicate or invalid location is never
+/// a second way to manage a file the page shows under another row.
 pub fn detect_client(client_id: &str) -> Option<DetectedClient> {
-    let def = find_def(client_id)?;
-    if let Some(row) = &def.location {
-        // The same rules as the page's scan: a valid location, and never a second way
-        // to manage a file a main client row already owns.
-        if locations::validate(row).is_err() && !locations::t3_home_folder_is_gone(row) {
-            return None;
-        }
-        let id = row.id.clone();
-        let mut definitions = defs();
-        definitions.push(def);
-        return unique_config_definitions(definitions)
-            .into_iter()
-            .find(|def| def.location.as_ref().is_some_and(|row| row.id == id))
-            .map(|def| read_client(&def));
+    if let Some(def) = defs().into_iter().find(|def| def.id == client_id) {
+        return Some(read_client(&def));
     }
-    Some(read_client(&def))
+    machine_defs(true)
+        .into_iter()
+        .find(|def| def.client_id() == client_id)
+        .map(|def| read_client(&def))
 }
 
 /// Skills needs every detected profile even before Clients has been opened. Keep

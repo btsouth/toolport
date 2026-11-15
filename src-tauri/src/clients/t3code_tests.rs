@@ -12,7 +12,7 @@ const SECRETS: [&str; 7] = [
 
 /// The shape T3 Code writes today (keys from a real file; every value invented).
 fn fixture(home: &Path) -> String {
-    let h = home.display();
+    let h = json_path(home);
     format!(
         r#"{{
   "favorites": [],
@@ -98,6 +98,20 @@ fn fixture(home: &Path) -> String {
     )
 }
 
+/// A path as T3 Code's settings may hold it: forward slashes, so it needs no JSON escape.
+fn json_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
+/// An absolute home on every OS; forward slashes keep it valid inside JSON text.
+fn fixture_home() -> PathBuf {
+    PathBuf::from(if cfg!(windows) {
+        "C:/home/fixture"
+    } else {
+        "/home/fixture"
+    })
+}
+
 fn instances_of(reading: Reading) -> Vec<Instance> {
     match reading {
         Reading::Instances(instances) => instances,
@@ -114,7 +128,7 @@ fn by_id<'a>(instances: &'a [Instance], id: &str) -> &'a Instance {
 
 #[test]
 fn reads_only_allow_listed_fields_and_maps_each_provider() {
-    let home = PathBuf::from("/home/fixture");
+    let home = fixture_home();
     let instances = instances_of(parse(fixture(&home).into_bytes(), &home));
     let ids: Vec<&str> = instances.iter().map(|i| i.id.as_str()).collect();
     // Drivers Toolport cannot connect are not matched to rows. A home hidden behind a
@@ -519,7 +533,7 @@ fn t3_homes_without_launchers_become_locations_once() {
     std::fs::create_dir_all(home.join(".t3/commandcode/codex")).unwrap();
     std::fs::create_dir_all(home.join(".claude2")).unwrap();
     std::fs::write(home.join(".claude2/.claude.json"), "{}").unwrap();
-    let h = home.display();
+    let h = json_path(&home);
     std::fs::write(
         home.join(".t3/userdata/settings.json"),
         format!(
@@ -696,6 +710,132 @@ fn a_saved_t3_home_whose_folder_is_gone_reads_as_not_installed() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A network, device or traversal path is dropped by its text, so nothing ever opens,
+/// resolves or mounts it (an SMB share on Windows, autofs `/net` on Linux).
+#[test]
+fn hostile_paths_are_dropped_before_any_file_system_call() {
+    let home = fixture_home();
+    let mut hostile = vec![
+        "/net/host/share",
+        "/dev/null",
+        "/proc/self",
+        "/home/other",
+        "~/ok/../../other",
+        "/home/fixture-other/x",
+    ];
+    if cfg!(windows) {
+        hostile.extend([
+            r"\\\\host\\share\\x",
+            r"\\\\?\\UNC\\host\\share",
+            r"\\\\.\\pipe\\x",
+        ]);
+    }
+    let instances: Vec<String> = hostile
+        .iter()
+        .enumerate()
+        .map(|(n, path)| {
+            format!(r#""h{n}": {{"driver": "codex", "config": {{"homePath": "{path}"}}}}"#)
+        })
+        .chain([
+            r#""env": {"driver": "claudeAgent", "environment": [{"name": "CLAUDE_CONFIG_DIR", "value": "/net/host/c"}]}"#.into(),
+            r#""xdg": {"driver": "opencode", "environment": [{"name": "XDG_CONFIG_HOME", "value": "/net/host/o"}]}"#.into(),
+            r#""ok": {"driver": "codex", "config": {"homePath": "~/ok"}}"#.into(),
+        ])
+        .collect();
+    let text = format!(r#"{{"providerInstances": {{{}}}}}"#, instances.join(","));
+    let found = instances_of(parse(text.into_bytes(), &home));
+    // The defaults T3 Code adds for absent drivers have no folder of their own.
+    let ids: Vec<&str> = found
+        .iter()
+        .filter(|i| {
+            i.config_path.is_some() || i.id.starts_with('h') || i.id == "env" || i.id == "xdg"
+        })
+        .map(|i| i.id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["ok"], "{found:?}");
+    assert!(lexically_inside(&home.join("ok/.codex/config.toml"), &home));
+}
+
+/// A link below home is not followed into a row, even to a folder inside home.
+#[cfg(unix)]
+#[test]
+fn a_link_below_home_does_not_become_a_row() {
+    let _lock = crate::registry::data_dir_test_lock();
+    let root = std::env::temp_dir().join(format!(
+        "toolport-t3-link-{}-{}",
+        std::process::id(),
+        epoch_millis()
+    ));
+    let home = root.join("home");
+    std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+    std::fs::create_dir_all(home.join("real-claude")).unwrap();
+    std::os::unix::fs::symlink(home.join("real-claude"), home.join("link")).unwrap();
+    std::fs::write(
+        home.join(".t3/userdata/settings.json"),
+        r#"{"providerInstances": {
+            "linked": {"driver": "claudeAgent", "config": {"homePath": "~/link"}}}}"#,
+    )
+    .unwrap();
+    let _data = crate::registry::DataDirOverride::set(root.join("data"));
+    let _home = TestHome::set(&home);
+    assert!(automatic(&[]).is_empty());
+    // The folder itself, named plainly, is a row.
+    std::fs::write(
+        home.join(".t3/userdata/settings.json"),
+        r#"{"providerInstances": {
+            "plain": {"driver": "claudeAgent", "config": {"homePath": "~/real-claude"}}}}"#,
+    )
+    .unwrap();
+    let real = std::fs::canonicalize(&home).unwrap();
+    let rows: Vec<_> = automatic(&[])
+        .into_iter()
+        .map(|row| row.config_path)
+        .collect();
+    assert_eq!(rows, vec![real.join("real-claude/.claude.json")]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Connect looks a client up by id; it must find exactly what the page lists, so a T3
+/// Code home the page folds into a profile row is never a second way to that file.
+#[test]
+fn detect_client_finds_only_what_the_page_lists() {
+    let _lock = crate::registry::data_dir_test_lock();
+    let root = std::env::temp_dir().join(format!(
+        "toolport-t3-detect-{}-{}",
+        std::process::id(),
+        epoch_millis()
+    ));
+    let home = root.join("home");
+    std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+    std::fs::create_dir_all(home.join(".claude_personal")).unwrap();
+    std::fs::write(home.join(".claude_personal/.claude.json"), "{}").unwrap();
+    std::fs::write(
+        home.join(".t3/userdata/settings.json"),
+        r#"{"providerInstances": {"p": {"driver": "claudeAgent",
+            "config": {"homePath": "~/.claude_personal"}}}}"#,
+    )
+    .unwrap();
+    let _data = crate::registry::DataDirOverride::set(root.join("data"));
+    let _home = TestHome::set(&home);
+    let real = std::fs::canonicalize(&home).unwrap();
+    let t3_id = location_id("claude-code", &real.join(".claude_personal/.claude.json"));
+    let listed: Vec<String> = machine_defs(true)
+        .iter()
+        .map(|def| def.client_id().to_string())
+        .collect();
+    assert!(listed.iter().any(|id| id == "claude-code@claude_personal"));
+    assert!(!listed.contains(&t3_id), "the profile row covers it");
+    for id in [t3_id.as_str(), "claude-code@claude_personal", "claude-code"] {
+        assert_eq!(
+            detect_client(id).is_some(),
+            listed.iter().any(|listed| listed == id),
+            "{id}"
+        );
+    }
+    assert!(crate::registry_controller::preview_client_setup(&t3_id).is_err());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn hostile_settings_cannot_reach_outside_home_or_t3_codes_folder() {
     let root = std::env::temp_dir().join(format!(
@@ -713,7 +853,7 @@ fn hostile_settings_cannot_reach_outside_home_or_t3_codes_folder() {
     let _lock = crate::registry::data_dir_test_lock();
     let _data = crate::registry::DataDirOverride::set(root.join("data"));
     let _home = TestHome::set(&home);
-    let o = outside.display();
+    let o = json_path(&outside);
     let write = |text: &str| {
         let path = home.join(".t3/userdata/settings.json");
         let _ = std::fs::remove_file(&path);
