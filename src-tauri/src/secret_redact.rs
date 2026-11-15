@@ -57,6 +57,9 @@ const SCRUB_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120)
 #[derive(Clone)]
 struct Pattern {
     name: usize,
+    /// Index into [`Matcher::values`]: the registered value this form spells,
+    /// the identity a request-scoped exemption is keyed on.
+    value: usize,
     whole_token: bool,
     /// A [`fragment_windows`] window, not a whole value or encoding of one.
     fragment: bool,
@@ -66,6 +69,8 @@ struct Pattern {
 /// are unit-testable without touching the process-global registry.
 pub struct Matcher {
     names: Vec<String>,
+    /// Every registered value, by the index its patterns carry.
+    values: Vec<String>,
     /// Raw-text forms, for log text and JSON string values after parsing.
     raw: Option<AhoCorasick>,
     raw_patterns: Vec<(String, Pattern)>,
@@ -73,9 +78,6 @@ pub struct Matcher {
     /// that is itself hex or base32, which tools print in either case or mixed.
     ci: Option<AhoCorasick>,
     ci_patterns: Vec<Pattern>,
-    /// The same forms as they appear inside a serialized JSON string, used to decide
-    /// cheaply whether a JSON line needs parsing at all.
-    json: Option<AhoCorasick>,
     /// Longest raw pattern in chars, used to bound how much text a truncation site
     /// must scan.
     longest_chars: usize,
@@ -86,7 +88,7 @@ pub struct Matcher {
     tails: Option<(AhoCorasick, Vec<Vec<usize>>)>,
     /// Every registered value as written (and trimmed), for whole-value checks of
     /// JSON numbers and identifiers.
-    exact: HashMap<String, usize>,
+    exact: HashMap<String, (usize, usize)>,
     /// Every whole form, sorted (raw), and every case-free form lowercased and
     /// sorted: what [`Matcher::hold_from`] checks a stream's tail against.
     prefixes: Vec<String>,
@@ -104,8 +106,11 @@ pub struct Matcher {
     extra: Option<Arc<Matcher>>,
 }
 
-/// `(start, end, name, fragment)`: one automaton hit.
-type Hit = (usize, usize, usize, bool);
+/// `(start, end, name, fragment, value)`: one automaton hit.
+type Hit = (usize, usize, usize, bool, usize);
+
+/// A merged replacement: `(start, end, names)`.
+type Span = (usize, usize, Vec<usize>);
 
 /// Index `keys` (one per pattern) into an automaton over the distinct keys and,
 /// per distinct key, the patterns that have it.
@@ -243,8 +248,16 @@ fn fragment_windows(value: &str, t: &Thresholds) -> Vec<String> {
     if chars.len() < t.fragment_min_secret_chars || is_container(value) {
         return Vec::new();
     }
+    let width = t.fragment_chars.max(1);
+    // A JWT's header (and the start of its payload) is the same in every token
+    // an issuer signs, so a window there would redact other tokens and every
+    // log that quotes one. Only windows that reach the signature are used:
+    // the signature is what makes a piece of a token usable, and it differs
+    // per token. The whole token is still matched in every form.
+    let from = jwt_signature_start(value).map_or(0, |sig| sig.saturating_sub(width - 1));
     chars
-        .windows(t.fragment_chars.max(1))
+        .windows(width)
+        .skip(from)
         .filter(|window| {
             let lower = window.iter().any(|c| c.is_lowercase());
             let upper = window.iter().any(|c| c.is_uppercase());
@@ -265,6 +278,19 @@ fn fragment_windows(value: &str, t: &Thresholds) -> Vec<String> {
         })
         .map(|window| window.iter().collect())
         .collect()
+}
+
+/// The char index where a JWT's signature starts (`header.payload.signature`,
+/// base64url, the header a JSON object), or `None` when `value` is not one.
+fn jwt_signature_start(value: &str) -> Option<usize> {
+    let parts: Vec<&str> = value.split('.').collect();
+    let base64url = |p: &str| {
+        !p.is_empty()
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    (parts.len() == 3 && parts[0].starts_with("eyJ") && parts.iter().all(|p| base64url(p)))
+        .then(|| parts[0].len() + parts[1].len() + 2)
 }
 
 fn is_container(value: &str) -> bool {
@@ -477,6 +503,7 @@ impl Matcher {
     ) -> Self {
         let edge_chars = t.edge_chars;
         let mut names: Vec<String> = Vec::new();
+        let mut values: Vec<String> = Vec::new();
         let mut raw_patterns: Vec<(String, Pattern)> = Vec::new();
         let mut seen = HashSet::new();
         let mut ci_patterns: Vec<(String, Pattern)> = Vec::new();
@@ -494,6 +521,8 @@ impl Matcher {
                     names.len() - 1
                 }
             };
+            let vid = values.len();
+            values.push(value.to_string());
             // A short secret keeps the whole-token rule in every encoding: its hex or
             // base64 is long enough to look specific but is still only a few bytes.
             let short = value.chars().count() < SHORT_SECRET_CHARS;
@@ -504,6 +533,7 @@ impl Matcher {
                         variant,
                         Pattern {
                             name,
+                            value: vid,
                             whole_token,
                             fragment: false,
                         },
@@ -521,6 +551,7 @@ impl Matcher {
                         window,
                         Pattern {
                             name,
+                            value: vid,
                             whole_token: false,
                             fragment: true,
                         },
@@ -533,6 +564,7 @@ impl Matcher {
                         form,
                         Pattern {
                             name,
+                            value: vid,
                             whole_token: short,
                             fragment: false,
                         },
@@ -542,7 +574,6 @@ impl Matcher {
         }
         BUILD_FAILED.with(|f| f.set(false));
         let raw_texts: Vec<String> = raw_patterns.iter().map(|(p, _)| p.clone()).collect();
-        let json_texts: Vec<String> = raw_texts.iter().map(|p| json_escaped(p)).collect();
         let longest_chars = raw_texts
             .iter()
             .map(|p| p.chars().count())
@@ -567,6 +598,7 @@ impl Matcher {
                 .collect(),
         );
         let mut exact = std::collections::HashMap::new();
+        let mut vid = 0;
         for (name, value) in secrets {
             let value = value.as_ref();
             if value.trim().is_empty() {
@@ -574,9 +606,10 @@ impl Matcher {
             }
             let marker = marker_name(name.as_ref());
             if let Some(n) = names.iter().position(|m| *m == marker) {
-                exact.entry(value.to_string()).or_insert(n);
-                exact.entry(value.trim().to_string()).or_insert(n);
+                exact.entry(value.to_string()).or_insert((n, vid));
+                exact.entry(value.trim().to_string()).or_insert((n, vid));
             }
+            vid += 1;
         }
         let ci_texts: Vec<String> = ci_patterns.iter().map(|(t, _)| t.clone()).collect();
         let ci = (!ci_texts.is_empty())
@@ -608,15 +641,14 @@ impl Matcher {
             .max()
             .unwrap_or(0);
         let raw = build(&raw_texts);
-        let json = build(&json_texts);
         let broken = BUILD_FAILED.with(|f| f.replace(false));
         Self {
             names,
+            values,
             raw,
             raw_patterns,
             ci,
             ci_patterns: ci_patterns.into_iter().map(|(_, p)| p).collect(),
-            json,
             broken,
             longest_chars,
             heads,
@@ -648,12 +680,21 @@ impl Matcher {
         self.names.len()
     }
 
-    /// `extra`'s hits for `f`, with names shifted after this matcher's.
+    /// The registered value of value index `v` (this matcher's, then `extra`'s).
+    fn value(&self, v: usize) -> &str {
+        match (v.checked_sub(self.values.len()), &self.extra) {
+            (Some(i), Some(extra)) => extra.values[i].as_str(),
+            _ => self.values[v].as_str(),
+        }
+    }
+
+    /// `extra`'s hits for `f`, with names and values shifted after this matcher's.
     fn extra_hits(&self, f: impl Fn(&Matcher) -> Vec<Hit>) -> Vec<Hit> {
         let base = self.base();
+        let vbase = self.values.len();
         self.extra.as_ref().map_or_else(Vec::new, |m| {
             f(m).into_iter()
-                .map(|(s, e, n, frag)| (s, e, n + base, frag))
+                .map(|(s, e, n, frag, v)| (s, e, n + base, frag, v + vbase))
                 .collect()
         })
     }
@@ -664,12 +705,13 @@ impl Matcher {
         })
     }
 
-    fn exact_get(&self, text: &str) -> Option<usize> {
+    /// `(name, value)` of the registered value `text` is exactly.
+    fn exact_entry(&self, text: &str) -> Option<(usize, usize)> {
         self.exact.get(text).copied().or_else(|| {
-            let base = self.base();
+            let (base, vbase) = (self.base(), self.values.len());
             self.extra
                 .as_ref()
-                .and_then(|m| m.exact.get(text).map(|n| n + base))
+                .and_then(|m| m.exact.get(text).map(|(n, v)| (n + base, v + vbase)))
         })
     }
 
@@ -683,7 +725,6 @@ impl Matcher {
             e.as_ref().map_or(0, |(ac, _)| ac.memory_usage())
         };
         self.raw.as_ref().map_or(0, AhoCorasick::memory_usage)
-            + self.json.as_ref().map_or(0, AhoCorasick::memory_usage)
             + self.ci.as_ref().map_or(0, AhoCorasick::memory_usage)
             + edge(&self.heads)
             + edge(&self.tails)
@@ -720,32 +761,94 @@ impl Matcher {
     }
 
     /// Merged `(start, end, names)` spans of every secret occurrence in `text`.
-    fn spans(&self, text: &str) -> Vec<(usize, usize, Vec<usize>)> {
+    fn spans(&self, text: &str) -> Vec<Span> {
         self.spans_with(text, true)
     }
 
     /// [`Self::spans`], optionally without fragment windows (whole forms only).
+    fn spans_with(&self, text: &str, fragments: bool) -> Vec<Span> {
+        self.piece_spans(text, &[], fragments, None)
+    }
+
+    /// The one search every sink uses. `text` is a logical text made of pieces
+    /// (string leaves of one value, lines of a stream, messages of one progress
+    /// stream) that start at `starts` (empty: one piece). The separators between
+    /// pieces (other JSON, line endings) are not in it, so a secret written
+    /// across pieces is found like one written whole.
     ///
-    /// Text with an encoding introducer (`\`, `%`, `&`) is also searched in its
-    /// decoded form ([`crate::secret_normalize`]: JSON escapes, percent encoding
-    /// and HTML entities, mixed per character and nested once), and each hit
-    /// there is mapped back to the source span it was decoded from, so a secret
-    /// spelled `sk-&#65;%42\u0043` is replaced where it is written.
-    fn spans_with(&self, text: &str, fragments: bool) -> Vec<(usize, usize, Vec<usize>)> {
+    /// Text with an encoding introducer (`\`, `%`, `&`) is searched at every
+    /// decoding level ([`crate::secret_normalize::levels`]: JSON escapes,
+    /// percent and form encoding and HTML entities, mixed per character, up to
+    /// [`crate::secret_normalize::MAX_LEVELS`] deep), and each hit at a level is
+    /// mapped back to the source span it was decoded from, so a secret spelled
+    /// `sk-&#65;%42\u0043`, or a percent-encoded value encoded once more, is
+    /// replaced where it is written and everything else is left as it is.
+    ///
+    /// A fragment window that crosses a piece boundary is dropped: windows are
+    /// for a piece of a secret inside one text, and joining unrelated leaves
+    /// would make new ones. Whole forms may cross any number of boundaries.
+    ///
+    /// With `exempt`, a span made only of whole forms of values in it (the
+    /// values a client sent) is left as it is; see [`Self::values_in`].
+    fn piece_spans(
+        &self,
+        text: &str,
+        starts: &[usize],
+        fragments: bool,
+        exempt: Option<&HashSet<String>>,
+    ) -> Vec<Span> {
         if self.is_broken() {
             return withheld_span(text.len());
         }
         let mut hits = self.plain_hits(text, fragments);
-        if crate::secret_normalize::has_encoding(text) {
-            let n = crate::secret_normalize::normalize(text);
-            if n.text != text {
-                for (s, e, name, fragment) in self.plain_hits(&n.text, fragments) {
-                    let (s, e) = crate::secret_normalize::source_range(&n, s, e);
-                    hits.push((s, e, name, fragment));
-                }
+        for level in crate::secret_normalize::levels(text) {
+            for (s, e, name, fragment, value) in self.plain_hits(&level.text, fragments) {
+                let (s, e) = crate::secret_normalize::source_range(&level, s, e);
+                hits.push((s, e, name, fragment, value));
             }
         }
-        merge(hits)
+        if starts.len() > 1 {
+            hits.retain(|h| !h.3 || !crosses(starts, h.0, h.1));
+        }
+        self.merge_exempt(hits, exempt)
+    }
+
+    /// [`merge`], leaving out every span made only of whole forms of `exempt`
+    /// values: never one that also holds another secret, or only a fragment.
+    fn merge_exempt(&self, hits: Vec<Hit>, exempt: Option<&HashSet<String>>) -> Vec<Span> {
+        let Some(exempt) = exempt.filter(|x| !x.is_empty()) else {
+            return merge(hits);
+        };
+        let mut sorted = hits;
+        sorted.sort_by_key(|h| (h.0, std::cmp::Reverse(h.1)));
+        let mut out: Vec<Hit> = Vec::with_capacity(sorted.len());
+        let mut group: Vec<Hit> = Vec::new();
+        let mut end = 0;
+        let flush = |group: &mut Vec<Hit>, out: &mut Vec<Hit>| {
+            // The span is exactly one whole form of a value the client sent
+            // (what it holds inside, such as a shorter secret, is part of it).
+            let (gs, ge) = (
+                group.iter().map(|h| h.0).min().unwrap_or(0),
+                group.iter().map(|h| h.1).max().unwrap_or(0),
+            );
+            let exempted = group
+                .iter()
+                .any(|h| !h.3 && h.0 == gs && h.1 == ge && exempt.contains(self.value(h.4)));
+            if !exempted {
+                out.append(group);
+            } else {
+                group.clear();
+            }
+        };
+        for h in sorted {
+            if !group.is_empty() && h.0 >= end {
+                flush(&mut group, &mut out);
+            }
+            end = if group.is_empty() { h.1 } else { end.max(h.1) };
+            group.push(h);
+        }
+        flush(&mut group, &mut out);
+        merge(out)
     }
 
     fn plain_hits(&self, text: &str, fragments: bool) -> Vec<Hit> {
@@ -771,7 +874,13 @@ impl Matcher {
                     continue;
                 }
             }
-            hits.push((m.start(), m.end(), pattern.name, pattern.fragment));
+            hits.push((
+                m.start(),
+                m.end(),
+                pattern.name,
+                pattern.fragment,
+                pattern.value,
+            ));
         }
         if let Some(ci) = &self.ci {
             for m in ci.find_overlapping_iter(text) {
@@ -783,7 +892,7 @@ impl Matcher {
                         continue;
                     }
                 }
-                hits.push((m.start(), m.end(), pattern.name, false));
+                hits.push((m.start(), m.end(), pattern.name, false, pattern.value));
             }
         }
         hits
@@ -804,23 +913,23 @@ impl Matcher {
     /// [`Self::spans`] over raw file bytes, which may not be valid UTF-8. A byte
     /// outside ASCII counts as a token character for the short-secret rule, the
     /// conservative choice for a whole-token check.
-    fn byte_spans(&self, bytes: &[u8]) -> Vec<(usize, usize, Vec<usize>)> {
+    fn byte_spans(&self, bytes: &[u8], starts: &[usize]) -> Vec<Span> {
         if self.is_broken() {
             return withheld_span(bytes.len());
         }
         let mut hits = self.own_byte_hits(bytes);
         hits.extend(self.extra_hits(|m| m.own_byte_hits(bytes)));
-        // Encoded spellings, as in `spans_with`, wherever the bytes are text.
+        // Encoded spellings, as in `piece_spans`, wherever the bytes are text.
         if let Ok(text) = std::str::from_utf8(bytes) {
-            if crate::secret_normalize::has_encoding(text) {
-                let n = crate::secret_normalize::normalize(text);
-                if n.text != text {
-                    for (s, e, name, fragment) in self.plain_hits(&n.text, true) {
-                        let (s, e) = crate::secret_normalize::source_range(&n, s, e);
-                        hits.push((s, e, name, fragment));
-                    }
+            for level in crate::secret_normalize::levels(text) {
+                for (s, e, name, fragment, value) in self.plain_hits(&level.text, true) {
+                    let (s, e) = crate::secret_normalize::source_range(&level, s, e);
+                    hits.push((s, e, name, fragment, value));
                 }
             }
+        }
+        if starts.len() > 1 {
+            hits.retain(|h| !h.3 || !crosses(starts, h.0, h.1));
         }
         merge(hits)
     }
@@ -840,7 +949,13 @@ impl Matcher {
                     continue;
                 }
             }
-            hits.push((m.start(), m.end(), pattern.name, pattern.fragment));
+            hits.push((
+                m.start(),
+                m.end(),
+                pattern.name,
+                pattern.fragment,
+                pattern.value,
+            ));
         }
         if let Some(ci) = &self.ci {
             for m in ci.find_overlapping_iter(bytes) {
@@ -852,49 +967,105 @@ impl Matcher {
                         continue;
                     }
                 }
-                hits.push((m.start(), m.end(), pattern.name, false));
+                hits.push((m.start(), m.end(), pattern.name, false, pattern.value));
             }
         }
         hits
     }
 
     /// Where a stream may be cut: the start of the earliest tail of `text` that is
-    /// a proper prefix of a whole form (raw, or case-free in any case), moved back
-    /// before any complete form that would straddle the cut. Text before it can
-    /// be redacted and written now; the rest is held until the stream continues,
+    /// a proper prefix of a whole form (raw, or case-free in any case) at any
+    /// decoding level, or an encoded sequence still being written, moved back
+    /// before any span that would straddle the cut. Text before it can be
+    /// redacted and written now; the rest is held until the stream continues,
     /// so no piece of a secret is written before the stream shows whether the
     /// rest follows. `text.len()` when nothing needs holding.
+    ///
+    /// The held tail is exactly the matcher's live prefix: what the automaton
+    /// would still be in the middle of matching, so it is never longer than the
+    /// longest form (in its encoded spelling) and separators between pieces do
+    /// not end it.
     pub fn hold_from(&self, text: &str) -> usize {
+        self.hold_with(text, &[], true)
+    }
+
+    fn hold_with(&self, text: &str, starts: &[usize], fragments: bool) -> usize {
+        self.hold_and_spans(text, starts, fragments, None).0
+    }
+
+    /// [`Self::hold_from`] for a text of pieces, with the spans of
+    /// [`Self::piece_spans`] found on the way: everything a stream needs from
+    /// one search.
+    fn hold_and_spans(
+        &self,
+        text: &str,
+        starts: &[usize],
+        fragments: bool,
+        exempt: Option<&HashSet<String>>,
+    ) -> (usize, Vec<Span>) {
         if self.is_broken() {
             // Everything is withheld anyway; holding would only grow buffers.
-            return text.len();
+            return (text.len(), withheld_span(text.len()));
         }
         let mut cut = self.plain_hold(text);
-        // An encoded sequence still being written, and the start of a secret in
-        // its decoded spelling, are held the same way.
+        let mut hits = self.plain_hits(text, fragments);
         if crate::secret_normalize::has_encoding(text) {
-            if let Some(at) = crate::secret_normalize::incomplete_suffix_start(text) {
-                cut = cut.min(at);
-            }
-            let n = crate::secret_normalize::normalize(text);
-            if n.text != text {
-                let at = self.plain_hold(&n.text);
-                if at < n.text.len() {
-                    cut = cut.min(crate::secret_normalize::source_range(&n, at, n.text.len()).0);
+            for level in crate::secret_normalize::levels(text) {
+                let len = level.text.len();
+                let at = self.plain_hold(&level.text);
+                if at < len {
+                    cut = cut.min(crate::secret_normalize::source_range(&level, at, len).0);
+                }
+                for (s, e, name, fragment, value) in self.plain_hits(&level.text, fragments) {
+                    let (s, e) = crate::secret_normalize::source_range(&level, s, e);
+                    hits.push((s, e, name, fragment, value));
                 }
             }
-        }
-        if cut == text.len() {
-            return cut;
-        }
-        // A complete form crossing the cut would be written in part.
-        let spans = self.spans_with(text, false);
-        loop {
-            match spans.iter().find(|(s, e, _)| *s < cut && cut < *e) {
-                Some((s, _, _)) => cut = *s,
-                None => return cut,
+            // An encoded sequence still being written may decode to anything,
+            // so it is held, and so is a live prefix that ends just before it
+            // (the sequence may continue it).
+            if let Some(at) = crate::secret_normalize::incomplete_suffix_start(text) {
+                cut = cut.min(at).min(self.decided_hold(&text[..at]));
             }
         }
+        if starts.len() > 1 {
+            hits.retain(|h| !h.3 || !crosses(starts, h.0, h.1));
+        }
+        let spans = self.merge_exempt(hits, exempt);
+        // A span crossing the cut would be written in part.
+        while let Some((s, _, _)) = spans.iter().find(|(s, e, _)| *s < cut && cut < *e) {
+            cut = *s;
+        }
+        (cut, spans)
+    }
+
+    /// The live-prefix cut of `text` at every decoding level.
+    fn decided_hold(&self, text: &str) -> usize {
+        let mut cut = self.plain_hold(text);
+        for level in crate::secret_normalize::levels(text) {
+            let len = level.text.len();
+            let at = self.plain_hold(&level.text);
+            if at < len {
+                cut = cut.min(crate::secret_normalize::source_range(&level, at, len).0);
+            }
+        }
+        cut
+    }
+
+    /// Dangling edges ([`Self::own_edges`]) of `text` for every matcher, at
+    /// every decoding level, in source offsets.
+    fn edges(&self, text: &str) -> Vec<Hit> {
+        let mut hits = self.own_edges(text);
+        hits.extend(self.extra_hits(|m| m.own_edges(text)));
+        for level in crate::secret_normalize::levels(text) {
+            let mut more = self.own_edges(&level.text);
+            more.extend(self.extra_hits(|m| m.own_edges(&level.text)));
+            for (s, e, name, fragment, value) in more {
+                let (s, e) = crate::secret_normalize::source_range(&level, s, e);
+                hits.push((s, e, name, fragment, value));
+            }
+        }
+        hits
     }
 
     fn plain_hold(&self, text: &str) -> usize {
@@ -965,7 +1136,7 @@ impl Matcher {
                 spans.push((start, end, vec![n]));
             }
         };
-        for (start, end, name, _) in self
+        for (start, end, name, _, _) in self
             .own_edges(text)
             .into_iter()
             .chain(self.extra_hits(|m| m.own_edges(text)))
@@ -977,7 +1148,7 @@ impl Matcher {
         }
         let hits = spans
             .into_iter()
-            .flat_map(|(s, e, names)| names.into_iter().map(move |n| (s, e, n, false)))
+            .flat_map(|(s, e, names)| names.into_iter().map(move |n| (s, e, n, false, 0)))
             .collect();
         let spans = merge(hits);
         Cow::Owned(self.apply(text, &spans))
@@ -1003,11 +1174,11 @@ impl Matcher {
                 owners[m.pattern().as_usize()].iter().find_map(|&p| {
                     let (pattern, meta) = &self.raw_patterns[p];
                     (pattern.len() > rest.len() && pattern.starts_with(rest))
-                        .then_some((start, meta.name))
+                        .then_some((start, meta.name, meta.value))
                 })
             });
-            if let Some((start, name)) = found {
-                out.push((start, text.len(), name, false));
+            if let Some((start, name, value)) = found {
+                out.push((start, text.len(), name, false, value));
             }
         }
         if let Some((ac, owners)) = &self.tails {
@@ -1025,12 +1196,12 @@ impl Matcher {
                     owners[m.pattern().as_usize()].iter().find_map(|&p| {
                         let (pattern, meta) = &self.raw_patterns[p];
                         (pattern.len() > head.len() && pattern.ends_with(head))
-                            .then_some((end, meta.name))
+                            .then_some((end, meta.name, meta.value))
                     })
                 })
-                .max_by_key(|(end, _)| *end);
-            if let Some((end, name)) = found {
-                out.push((0, end, name, false));
+                .max_by_key(|(end, _, _)| *end);
+            if let Some((end, name, value)) = found {
+                out.push((0, end, name, false, value));
             }
         }
         out
@@ -1059,68 +1230,53 @@ impl Matcher {
     }
 
     /// Text with secrets replaced, or `None` when nothing matched. `fragments`
-    /// includes [`fragment_windows`] hits; a span whose secrets are all in
-    /// `exempt` is left as it is.
+    /// includes [`fragment_windows`] hits; a span made only of whole forms of
+    /// `exempt` values is left as it is.
     fn text_with(
         &self,
         text: &str,
         fragments: bool,
         exempt: Option<&HashSet<String>>,
     ) -> Option<String> {
-        let mut spans = self.spans_with(text, fragments);
-        if let Some(exempt) = exempt {
-            // Exempt only where the exact value the client sent appears whole:
-            // never a different secret that contains it or is contained in it.
-            spans.retain(|(s, e, _)| !exempt.contains(&text[*s..*e]));
-        }
+        let spans = self.piece_spans(text, &[], fragments, exempt);
         (!spans.is_empty()).then(|| self.apply(text, &spans))
     }
 
-    /// [`Self::redact_value`] with the [`Self::text_with`] options: first the
-    /// secrets that cross from one text leaf into the next, then each leaf.
+    /// [`Self::redact_value`] with the [`Self::text_with`] options: the string
+    /// leaves are searched as pieces of one text ([`Self::redact_across_leaves`]),
+    /// then numbers and object keys one by one.
     fn value_with(
         &self,
         value: &mut Value,
         fragments: bool,
         exempt: Option<&HashSet<String>>,
     ) -> bool {
-        let across = self.redact_across_leaves(value, exempt);
-        self.leaves_with(value, fragments, exempt) | across
+        let leaves = self.redact_across_leaves(value, fragments, exempt);
+        self.scalars_with(value, exempt) | leaves
     }
 
-    fn leaves_with(
-        &self,
-        value: &mut Value,
-        fragments: bool,
-        exempt: Option<&HashSet<String>>,
-    ) -> bool {
+    /// Numbers that spell a registered value, and object keys holding one.
+    fn scalars_with(&self, value: &mut Value, exempt: Option<&HashSet<String>>) -> bool {
         match value {
-            Value::String(s) => match self.text_with(s, fragments, exempt) {
-                Some(new) => {
-                    *s = new;
-                    true
-                }
-                None => false,
-            },
             // A number whose text is a registered value (a numeric PIN or account
             // number) becomes the marker string. Booleans and null carry no value.
             Value::Number(n) => match self
-                .number_secret(n)
-                .filter(|_| !exempt.is_some_and(|e| e.contains(&n.to_string())))
+                .number_entry(n)
+                .filter(|(_, v)| !exempt.is_some_and(|x| x.contains(self.value(*v))))
             {
-                Some(name) => {
+                Some((name, _)) => {
                     *value = Value::String(self.marker(&[name]));
                     true
                 }
                 None => false,
             },
             Value::Array(items) => items.iter_mut().fold(false, |changed, item| {
-                self.leaves_with(item, fragments, exempt) | changed
+                self.scalars_with(item, exempt) | changed
             }),
             Value::Object(map) => {
                 let mut changed = false;
                 for v in map.values_mut() {
-                    changed |= self.leaves_with(v, fragments, exempt);
+                    changed |= self.scalars_with(v, exempt);
                 }
                 changed | self.redact_keys(map, exempt)
             }
@@ -1128,85 +1284,115 @@ impl Matcher {
         }
     }
 
-    /// A secret split across the text leaves of one value, whatever the nesting
-    /// (`[{"text":"sk-ab"},{"text":"cd12"}]`). Leaves are taken in document
-    /// order, and object keys are in sorted order in a parsed value, so other
-    /// fields can sit between two pieces (`"type":"text"` in every MCP content
-    /// item). Two streams are searched: all string leaves, and the leaves under
-    /// each key name (array elements share one name). A whole form that crosses
-    /// a leaf boundary in either puts its marker where it starts and is removed
-    /// from every later leaf of that stream it reaches. Numbers, booleans and
-    /// null are not text and are skipped.
-    fn redact_across_leaves(&self, value: &mut Value, exempt: Option<&HashSet<String>>) -> bool {
-        fn collect<'v>(value: &'v mut Value, class: &str, out: &mut Vec<(String, &'v mut String)>) {
-            match value {
-                Value::String(s) => out.push((class.to_string(), s)),
-                Value::Array(items) => items.iter_mut().for_each(|v| collect(v, "[]", out)),
-                Value::Object(map) => map.iter_mut().for_each(|(k, v)| collect(v, k, out)),
-                _ => {}
-            }
-        }
+    /// Every string leaf of one value, whatever the nesting, searched as the
+    /// pieces of one logical text ([`Self::piece_spans`]), so a secret split
+    /// over any number of leaves of any sizes (`["sk-","AbC","123","xyZ"]`) is
+    /// found like one written whole. Leaves are taken in document order, and
+    /// object keys are in sorted order in a parsed value, so other fields can
+    /// sit between two pieces (`"type":"text"` in every MCP content item): the
+    /// leaves under each key name (array elements share one name) are also
+    /// searched as their own text whenever another leaf sits between two of
+    /// them. A span puts its marker where it starts and removes the rest of
+    /// itself from every later leaf it reaches. Numbers, booleans and null are
+    /// not text and are skipped.
+    fn redact_across_leaves(
+        &self,
+        value: &mut Value,
+        fragments: bool,
+        exempt: Option<&HashSet<String>>,
+    ) -> bool {
         let mut leaves = Vec::new();
-        collect(value, "", &mut leaves);
-        if leaves.iter().filter(|(_, l)| !l.is_empty()).count() < 2 {
+        collect_leaves(value, "", &mut leaves);
+        self.redact_leaf_streams(&mut leaves, fragments, exempt)
+    }
+
+    /// [`Self::redact_across_leaves`] over leaves already collected with their
+    /// class (nearest key name, `[]` for array elements).
+    fn redact_leaf_streams(
+        &self,
+        leaves: &mut [(String, &mut String)],
+        fragments: bool,
+        exempt: Option<&HashSet<String>>,
+    ) -> bool {
+        self.leaf_streams_found(leaves, fragments, exempt, &mut Vec::new())
+    }
+
+    /// [`Self::redact_leaf_streams`], adding the names it replaced to `found`.
+    fn leaf_streams_found(
+        &self,
+        leaves: &mut [(String, &mut String)],
+        fragments: bool,
+        exempt: Option<&HashSet<String>>,
+        found: &mut Vec<usize>,
+    ) -> bool {
+        if leaves.iter().all(|(_, l)| l.is_empty()) {
             return false;
         }
-        let mut streams: Vec<Vec<usize>> = vec![(0..leaves.len()).collect()];
+        let all: Vec<usize> = (0..leaves.len()).collect();
+        let mut changed = self.redact_members(leaves, &all, fragments, exempt, false, found);
         let mut classes: Vec<&str> = leaves.iter().map(|(c, _)| c.as_str()).collect();
         classes.sort_unstable();
         classes.dedup();
-        if classes.len() > 1 {
-            for class in classes {
-                let members: Vec<usize> = (0..leaves.len())
-                    .filter(|&i| leaves[i].0 == class && !leaves[i].1.is_empty())
-                    .collect();
-                if members.len() > 1 {
-                    streams.push(members);
-                }
-            }
+        if classes.len() < 2 {
+            return changed;
         }
-        let mut changed = false;
-        for stream in streams {
-            let mut texts: Vec<&mut String> = Vec::with_capacity(stream.len());
-            // Disjoint indices into `leaves`, borrowed mutably together.
-            let mut rest: &mut [(String, &mut String)] = &mut leaves;
-            let mut base = 0;
-            for i in stream {
-                let (_, tail) = std::mem::take(&mut rest).split_at_mut(i - base);
-                let (one, tail) = tail.split_first_mut().expect("index in range");
-                texts.push(&mut *one.1);
-                rest = tail;
-                base = i + 1;
+        let classes: Vec<String> = classes.into_iter().map(str::to_string).collect();
+        let nonempty: Vec<usize> = (0..leaves.len())
+            .filter(|&i| !leaves[i].1.is_empty())
+            .collect();
+        for class in classes {
+            let members: Vec<usize> = nonempty
+                .iter()
+                .copied()
+                .filter(|&i| leaves[i].0 == class)
+                .collect();
+            // Members next to each other in document order were already one
+            // text in the stream of all leaves.
+            let apart = members.windows(2).any(|w| {
+                let (a, b) = (
+                    nonempty.binary_search(&w[0]).unwrap_or(0),
+                    nonempty.binary_search(&w[1]).unwrap_or(0),
+                );
+                b != a + 1
+            });
+            if apart {
+                changed |= self.redact_members(leaves, &members, false, exempt, true, found);
             }
-            changed |= self.redact_stream(&mut texts, exempt);
         }
         changed
     }
 
-    /// One stream of [`Self::redact_across_leaves`].
-    fn redact_stream(&self, leaves: &mut [&mut String], exempt: Option<&HashSet<String>>) -> bool {
-        let mut joined = String::with_capacity(leaves.iter().map(|l| l.len()).sum());
-        let mut starts = Vec::with_capacity(leaves.len());
-        for leaf in leaves.iter() {
+    /// One stream of [`Self::redact_leaf_streams`]: the leaves at `members`
+    /// joined and searched as pieces; with `crossing`, only spans that cross a
+    /// boundary are applied (the rest were found by the stream of all leaves).
+    fn redact_members(
+        &self,
+        leaves: &mut [(String, &mut String)],
+        members: &[usize],
+        fragments: bool,
+        exempt: Option<&HashSet<String>>,
+        crossing: bool,
+        found: &mut Vec<usize>,
+    ) -> bool {
+        let mut joined = String::with_capacity(members.iter().map(|&i| leaves[i].1.len()).sum());
+        let mut starts = Vec::with_capacity(members.len());
+        for &i in members {
             starts.push(joined.len());
-            joined.push_str(leaf);
+            joined.push_str(leaves[i].1);
         }
-        // The last leaf that starts at or before `at` (an empty leaf yields to the
-        // one after it).
-        let leaf_of = |at: usize| starts.partition_point(|&s| s <= at) - 1;
-        let spans: Vec<_> = self
-            .spans_with(&joined, false)
-            .into_iter()
-            .filter(|(s, e, _)| {
-                leaf_of(*s) != leaf_of(*e - 1)
-                    && !exempt.is_some_and(|x| x.contains(&joined[*s..*e]))
-            })
-            .collect();
+        let mut spans = self.piece_spans(&joined, &starts, fragments, exempt);
+        if crossing {
+            spans.retain(|(s, e, _)| crosses(&starts, *s, *e));
+        }
         if spans.is_empty() {
             return false;
         }
-        for (i, leaf) in leaves.iter_mut().enumerate() {
-            let (ls, le) = (starts[i], starts[i] + leaf.len());
+        for (_, _, names) in &spans {
+            found.extend(names);
+        }
+        for (k, &i) in members.iter().enumerate() {
+            let leaf = &mut leaves[i].1;
+            let (ls, le) = (starts[k], starts[k] + leaf.len());
             let mut out = String::new();
             let mut at = ls;
             let mut touched = false;
@@ -1226,96 +1412,95 @@ impl Matcher {
         true
     }
 
-    /// `a` and `b` with a secret that crosses from the end of `a` into the start
-    /// of `b` replaced: whole forms only, `None` when nothing crosses.
-    pub fn redact_pair(
-        &self,
-        a: &str,
-        b: &str,
-        exempt: Option<&HashSet<String>>,
-    ) -> Option<(String, String)> {
-        if a.is_empty() || b.is_empty() {
-            return None;
-        }
-        let reach = self.longest() * 4;
-        let mut from = a.len().saturating_sub(reach);
-        while !a.is_char_boundary(from) {
-            from += 1;
-        }
-        let mut to = reach.min(b.len());
-        while !b.is_char_boundary(to) {
-            to += 1;
-        }
-        let joined = format!("{}{}", &a[from..], &b[..to]);
-        let seam = a.len() - from;
-        let (start, end, names) =
-            self.spans_with(&joined, false)
-                .into_iter()
-                .find(|(s, e, _)| {
-                    *s < seam && *e > seam && !exempt.is_some_and(|x| x.contains(&joined[*s..*e]))
-                })?;
-        Some((
-            format!("{}{}", &a[..from + start], self.marker(&names)),
-            b[end - seam..].to_string(),
-        ))
-    }
-
-    /// The registered values that occur whole, exactly as registered, in the
-    /// strings, numbers and keys of `value` (a client's request): the identity
-    /// of an exemption is the value itself, never its display name, so two
-    /// secrets under one key name never exempt each other.
+    /// The registered values a client's request holds (its strings, searched
+    /// as pieces at every decoding level as [`Self::redact_across_leaves`]
+    /// does, its numbers and keys): every value one of whose whole forms is in
+    /// it, in any spelling. The identity of an exemption is the registered
+    /// value, never its display name or the spelling the client used, so two
+    /// secrets under one key name never exempt each other, a request that
+    /// sends a value encoded exempts it, and an echo of it in another spelling
+    /// is exempt too.
     fn values_in(&self, value: &Value, out: &mut HashSet<String>) {
-        let text = |t: &str, out: &mut HashSet<String>| {
-            for (s, e, _) in self.spans_with(t, false) {
-                if self.exact_get(&t[s..e]).is_some() {
-                    out.insert(t[s..e].to_string());
+        let mut leaves: Vec<(String, String)> = Vec::new();
+        fn strings(value: &Value, class: &str, out: &mut Vec<(String, String)>) {
+            match value {
+                Value::String(s) => out.push((class.to_string(), s.clone())),
+                Value::Array(items) => items.iter().for_each(|v| strings(v, "[]", out)),
+                Value::Object(map) => map.iter().for_each(|(k, v)| {
+                    out.push(("\u{0}key".to_string(), k.clone()));
+                    strings(v, k, out)
+                }),
+                _ => {}
+            }
+        }
+        strings(value, "", &mut leaves);
+        let mut search = |members: Vec<&str>| {
+            let mut joined = String::new();
+            let mut starts = Vec::new();
+            for m in members {
+                starts.push(joined.len());
+                joined.push_str(m);
+            }
+            let mut hits = self.plain_hits(&joined, false);
+            for level in crate::secret_normalize::levels(&joined) {
+                for (s, e, n, f, v) in self.plain_hits(&level.text, false) {
+                    let (s, e) = crate::secret_normalize::source_range(&level, s, e);
+                    hits.push((s, e, n, f, v));
                 }
+            }
+            // Only a value that is a whole span: never one inside a longer
+            // secret the client sent.
+            hits.sort_by_key(|h| (h.0, std::cmp::Reverse(h.1)));
+            let mut i = 0;
+            while i < hits.len() {
+                let (gs, mut ge) = (hits[i].0, hits[i].1);
+                let mut j = i + 1;
+                while j < hits.len() && hits[j].0 < ge {
+                    ge = ge.max(hits[j].1);
+                    j += 1;
+                }
+                for h in &hits[i..j] {
+                    if h.0 == gs && h.1 == ge {
+                        out.insert(self.value(h.4).to_string());
+                    }
+                }
+                i = j;
             }
         };
-        match value {
-            Value::String(s) => text(s, out),
-            Value::Number(n) => {
-                if self.exact_get(&n.to_string()).is_some() {
-                    out.insert(n.to_string());
-                }
+        search(leaves.iter().map(|(_, s)| s.as_str()).collect());
+        let mut classes: Vec<&str> = leaves.iter().map(|(c, _)| c.as_str()).collect();
+        classes.sort_unstable();
+        classes.dedup();
+        if classes.len() > 1 {
+            for class in classes {
+                search(
+                    leaves
+                        .iter()
+                        .filter(|(c, _)| c == class)
+                        .map(|(_, s)| s.as_str())
+                        .collect(),
+                );
             }
-            Value::Array(items) => items.iter().for_each(|v| self.values_in(v, out)),
-            Value::Object(map) => {
-                for (k, v) in map {
-                    text(k, out);
-                    self.values_in(v, out);
-                }
-            }
-            _ => {}
         }
-    }
-
-    /// The secrets whose whole forms occur anywhere in `value` (strings, numbers
-    /// and keys), by index.
-    fn secrets_in(&self, value: &Value, out: &mut HashSet<usize>) {
-        let text = |t: &str, out: &mut HashSet<usize>| {
-            for (_, _, names) in self.spans_with(t, false) {
-                out.extend(names);
-            }
-        };
-        match value {
-            Value::String(s) => text(s, out),
-            Value::Number(n) => out.extend(self.number_secret(n)),
-            Value::Array(items) => items.iter().for_each(|v| self.secrets_in(v, out)),
-            Value::Object(map) => {
-                for (k, v) in map {
-                    text(k, out);
-                    self.secrets_in(v, out);
+        fn numbers(m: &Matcher, value: &Value, out: &mut HashSet<String>) {
+            match value {
+                Value::Number(n) => {
+                    if let Some((_, v)) = m.exact_entry(&n.to_string()) {
+                        out.insert(m.value(v).to_string());
+                    }
                 }
+                Value::Array(items) => items.iter().for_each(|v| numbers(m, v, out)),
+                Value::Object(map) => map.values().for_each(|v| numbers(m, v, out)),
+                _ => {}
             }
-            _ => {}
         }
+        numbers(self, value, out);
     }
 
     /// An identifier (a tool or prompt name, a resource URI or template, an
     /// argument name) with whole secret forms replaced by aliased markers
-    /// (`[secret:NAME~3f9a0c12]`), recorded in `ids` so a call can name the
-    /// original. `None` when it holds no secret.
+    /// (`[secret:NAME~3f9a0c12d4e5b6a7]`), recorded in `ids` so a call can name
+    /// the original. `None` when it holds no secret.
     fn screen_identifier(&self, text: &str, part: Part, ids: &mut IdBuilder) -> Option<String> {
         let spans = self.spans_with(text, false);
         if spans.is_empty() {
@@ -1326,9 +1511,11 @@ impl Matcher {
         let mut pieces = Vec::new();
         for (i, (start, end, names)) in spans.iter().enumerate() {
             out.push_str(&text[at..*start]);
+            ids.found
+                .extend(names.iter().map(|&n| self.name(n).to_string()));
             let listed = self.marker(names);
             let base = &listed[..listed.len() - 1];
-            let marker = ids.alias(part, text, i, base);
+            let marker = ids.alias(part, text, i, base)?;
             pieces.push((marker.clone(), text[*start..*end].to_string()));
             out.push_str(&marker);
             at = *end;
@@ -1338,10 +1525,14 @@ impl Matcher {
         Some(out)
     }
 
-    /// Text that is not an identifier (a description, a title, a default value):
+    /// Text that is not an identifier, alone (an object key outside a schema):
     /// whole forms become plain markers and nothing is recorded.
-    fn screen_plain(&self, text: &str) -> Option<String> {
+    fn screen_plain(&self, text: &str, ids: &mut IdBuilder) -> Option<String> {
         let spans = self.spans_with(text, false);
+        for (_, _, names) in &spans {
+            ids.found
+                .extend(names.iter().map(|&n| self.name(n).to_string()));
+        }
         (!spans.is_empty()).then(|| self.apply(text, &spans))
     }
 
@@ -1349,75 +1540,80 @@ impl Matcher {
     /// whole forms only. Fragment windows are for error text; in a definition they
     /// would rename ordinary identifiers (`Tools-Read` is a piece of
     /// `sk-Tools-ReadSecret123`), change pins and break calls. Identifier fields
-    /// get stable aliases ([`Self::screen_identifier`]); every other string gets
-    /// plain markers.
-    fn screen_definition(&self, item: &mut Value, ids: &mut IdBuilder) -> bool {
-        let Value::Object(map) = item else {
-            return self.screen_in(item, Role::Text, ids);
-        };
+    /// get stable aliases ([`Self::screen_identifier`]), one at a time. Every
+    /// other string (descriptions, titles, schema text) is searched as the
+    /// pieces of one text, exactly as a result is ([`Self::redact_leaf_streams`]),
+    /// so a secret split over several of them is found, and gets plain markers.
+    fn screen_definition(&self, item: &mut Value, ids: &mut IdBuilder) {
         let catalog = ids.catalog;
-        let mut changed = false;
-        for (key, v) in map.iter_mut() {
-            let role = match (catalog, key.as_str()) {
-                (Catalog::Tool | Catalog::Prompt, "name") => Role::Name,
-                (Catalog::Resource, "uri") | (Catalog::Template, "uriTemplate") => Role::Name,
-                (Catalog::Tool, "inputSchema") => Role::Schema,
-                (Catalog::Prompt, "arguments") => Role::PromptArguments,
-                _ => Role::Text,
-            };
-            changed |= self.screen_in(v, role, ids);
+        let role_of = |key: &str| match (catalog, key) {
+            (Catalog::Tool | Catalog::Prompt, "name") => Role::Name,
+            (Catalog::Resource, "uri") | (Catalog::Template, "uriTemplate") => Role::Name,
+            (Catalog::Tool, "inputSchema") => Role::Schema,
+            (Catalog::Prompt, "arguments") => Role::PromptArguments,
+            _ => Role::Text,
+        };
+        // Text first, while every leaf is still where the server put it.
+        let mut texts = Vec::new();
+        match &mut *item {
+            Value::Object(map) => {
+                for (key, v) in map.iter_mut() {
+                    text_leaves(v, role_of(key), key, &mut texts);
+                }
+            }
+            other => text_leaves(other, Role::Text, "", &mut texts),
         }
-        changed | self.screen_keys(map, Role::Text, ids)
+        let mut found = Vec::new();
+        self.leaf_streams_found(&mut texts, false, None, &mut found);
+        drop(texts);
+        ids.found
+            .extend(found.into_iter().map(|n| self.name(n).to_string()));
+        match item {
+            Value::Object(map) => {
+                for (key, v) in map.iter_mut() {
+                    self.screen_in(v, role_of(key), ids);
+                }
+                self.screen_keys(map, Role::Text, ids);
+            }
+            other => {
+                self.screen_in(other, Role::Text, ids);
+            }
+        }
     }
 
-    fn screen_in(&self, value: &mut Value, role: Role, ids: &mut IdBuilder) -> bool {
+    /// Identifiers, numbers and object keys of a definition (its other strings
+    /// are screened as one text by [`Self::screen_definition`]).
+    fn screen_in(&self, value: &mut Value, role: Role, ids: &mut IdBuilder) {
         match value {
             Value::String(s) => {
                 let new = match role {
                     Role::Name => self.screen_identifier(s, Part::Name, ids),
                     Role::Argument => self.screen_identifier(s, Part::Argument, ids),
-                    _ => self.screen_plain(s),
+                    _ => None,
                 };
-                match new {
-                    Some(new) => {
-                        *s = new;
-                        true
-                    }
-                    None => false,
+                if let Some(new) = new {
+                    *s = new;
                 }
             }
-            Value::Number(n) => match self.number_secret(n) {
-                Some(name) => {
+            Value::Number(n) => {
+                if let Some(name) = self.number_secret(n) {
+                    ids.found.push(self.name(name).to_string());
                     *value = Value::String(self.marker(&[name]));
-                    true
                 }
-                None => false,
-            },
+            }
             Value::Array(items) => {
-                let inner = match role {
-                    // `required: ["arg", ...]` names arguments.
-                    Role::Required => Role::Argument,
-                    Role::PromptArguments => Role::PromptArgument,
-                    other => other,
-                };
-                items.iter_mut().fold(false, |changed, item| {
-                    self.screen_in(item, inner, ids) | changed
-                })
+                let inner = inner_role(role, None);
+                for item in items.iter_mut() {
+                    self.screen_in(item, inner, ids);
+                }
             }
             Value::Object(map) => {
-                let mut changed = false;
                 for (key, v) in map.iter_mut() {
-                    let inner = match role {
-                        Role::Schema if key == "required" => Role::Required,
-                        Role::Schema => Role::Schema,
-                        Role::PromptArgument if key == "name" => Role::Argument,
-                        _ => Role::Text,
-                    };
-                    changed |= self.screen_in(v, inner, ids);
+                    self.screen_in(v, inner_role(role, Some(key)), ids);
                 }
-                changed | self.screen_keys(map, role, ids)
+                self.screen_keys(map, role, ids);
             }
-            _ => false,
+            _ => {}
         }
     }
 
@@ -1428,19 +1624,18 @@ impl Matcher {
         map: &mut serde_json::Map<String, Value>,
         role: Role,
         ids: &mut IdBuilder,
-    ) -> bool {
+    ) {
         let renamed: Vec<(String, String)> = map
             .keys()
             .filter_map(|key| {
                 let new = if role == Role::Schema {
                     self.screen_identifier(key, Part::Argument, ids)
                 } else {
-                    self.screen_plain(key)
+                    self.screen_plain(key, ids)
                 };
                 new.map(|new| (key.clone(), new))
             })
             .collect();
-        let changed = !renamed.is_empty();
         for (old, new) in renamed {
             let Some(v) = map.remove(&old) else { continue };
             let mut key = new.clone();
@@ -1451,22 +1646,26 @@ impl Matcher {
             }
             map.insert(key, v);
         }
-        changed
     }
 
     /// The secret a JSON number spells, by its text or, for an integral value
     /// written another way (`482193.0`, `4.82193e5`), by its integer text.
     fn number_secret(&self, n: &serde_json::Number) -> Option<usize> {
+        self.number_entry(n).map(|(name, _)| name)
+    }
+
+    /// [`Self::number_secret`] as `(name, value)`.
+    fn number_entry(&self, n: &serde_json::Number) -> Option<(usize, usize)> {
         if !self.has_exact() {
             return None;
         }
         let text = n.to_string();
-        if let Some(name) = self.numeric_secret(&text) {
-            return Some(name);
+        if let Some(hit) = self.numeric_entry(&text) {
+            return Some(hit);
         }
         let f = n.as_f64()?;
         (f.fract() == 0.0 && f.abs() < 9.0e15)
-            .then(|| self.numeric_secret(&format!("{}", f as i64)))
+            .then(|| self.numeric_entry(&format!("{}", f as i64)))
             .flatten()
     }
 
@@ -1475,8 +1674,12 @@ impl Matcher {
     /// would turn ordinary numbers into strings and change the types a model
     /// reads; those are named in status instead, and still redacted in text.
     fn numeric_secret(&self, text: &str) -> Option<usize> {
+        self.numeric_entry(text).map(|(name, _)| name)
+    }
+
+    fn numeric_entry(&self, text: &str) -> Option<(usize, usize)> {
         (text.bytes().filter(u8::is_ascii_digit).count() >= MIN_NUMERIC_SECRET_DIGITS)
-            .then(|| self.exact_get(text))
+            .then(|| self.exact_entry(text))
             .flatten()
     }
 
@@ -1586,86 +1789,394 @@ impl Matcher {
             return Cow::Borrowed(line);
         }
         let body = line.trim_end_matches(['\n', '\r']);
-        if self.is_broken() {
-            return Cow::Owned(format!("{WITHHELD}{}", &line[body.len()..]));
-        }
-        let looks_json = body.trim_start().starts_with(['{', '[']);
-        if looks_json {
-            if !self.may_contain(body) {
-                return Cow::Borrowed(line);
-            }
-            let numbers = self.redact_number_tokens(body);
-            let source = numbers.as_deref().unwrap_or(body);
-            if let Ok(mut value) = serde_json::from_str::<Value>(source) {
-                if !self.value_with(&mut value, fragments, None) && numbers.is_none() {
-                    return Cow::Borrowed(line);
+        let ending = &line[body.len()..];
+        if body.trim_start().starts_with(['{', '[']) {
+            if let Some(tokens) = json_tokens(body) {
+                if self.is_broken() {
+                    return Cow::Owned(format!("{}{ending}", withheld_json(body, &tokens)));
                 }
-                let mut out = value.to_string();
-                out.push_str(&line[body.len()..]);
-                return Cow::Owned(out);
+                match self.json_edits(body, &tokens, fragments) {
+                    None => {
+                        // An object key holds a secret: renaming keys needs the
+                        // parsed object, to keep two of them apart.
+                        if let Ok(mut value) = serde_json::from_str::<Value>(body) {
+                            if let Some(n) = self.redact_number_tokens(body) {
+                                if let Ok(v) = serde_json::from_str::<Value>(&n) {
+                                    value = v;
+                                }
+                            }
+                            self.value_with(&mut value, fragments, None);
+                            return Cow::Owned(format!("{value}{ending}"));
+                        }
+                    }
+                    Some(edits) if edits.is_empty() => return Cow::Borrowed(line),
+                    Some(edits) => {
+                        return Cow::Owned(format!("{}{ending}", apply_edits(body, edits)));
+                    }
+                }
             }
         }
-        // Text, or a torn JSON line. JSON escapes can hide a value from the raw
-        // automaton, so try both forms.
-        let raw = match self.text_with(line, fragments, None) {
+        if self.is_broken() {
+            return Cow::Owned(format!("{WITHHELD}{ending}"));
+        }
+        // Text, or a torn JSON line: one text, searched at every decoding level
+        // (a JSON escape is one).
+        match self.text_with(line, fragments, None) {
             Some(new) => Cow::Owned(new),
             None => Cow::Borrowed(line),
-        };
-        let text = raw.as_ref();
-        let mut hits = self.own_json_hits(text, fragments);
-        hits.extend(self.extra_hits(|m| m.own_json_hits(text, fragments)));
-        let spans = merge(hits);
-        if spans.is_empty() {
-            return raw;
         }
-        Cow::Owned(self.apply(raw.as_ref(), &spans))
     }
 
-    /// Hits of the JSON-escaped forms, for text that is not valid JSON.
-    fn own_json_hits(&self, text: &str, fragments: bool) -> Vec<Hit> {
-        let Some(ac) = &self.json else {
-            return Vec::new();
-        };
-        let mut hits = Vec::new();
-        for m in ac.find_overlapping_iter(text) {
-            let pattern = &self.raw_patterns[m.pattern().as_usize()].1;
-            if pattern.fragment && !fragments {
-                continue;
-            }
-            if pattern.whole_token {
-                let before = text[..m.start()].chars().next_back();
-                let after = text[m.end()..].chars().next();
-                if before.is_some_and(is_token_char) || after.is_some_and(is_token_char) {
-                    continue;
+    /// The edits that redact a serialized JSON text in place: its string
+    /// values searched as the pieces of one text (and per key name, as
+    /// [`Self::redact_leaf_streams`] does for a parsed value), each in its
+    /// escaped spelling, which the first decoding level unescapes; its number
+    /// tokens by their source text. `None` when an object key holds a secret.
+    /// Every byte outside an edit is kept, so the line keeps its format.
+    fn json_edits(
+        &self,
+        body: &str,
+        t: &JsonTokens<'_>,
+        fragments: bool,
+    ) -> Option<Vec<(usize, usize, String)>> {
+        let mut edits: Vec<(usize, usize, String)> = Vec::new();
+        if self.has_exact() {
+            for &(s, e) in &t.numbers {
+                let token = &body[s..e];
+                let name = self.numeric_secret(token).or_else(|| {
+                    serde_json::from_str::<serde_json::Number>(token)
+                        .ok()
+                        .and_then(|n| self.number_secret(&n))
+                });
+                if let Some(name) = name {
+                    let marker = serde_json::to_string(&self.marker(&[name])).ok()?;
+                    edits.push((s, e, marker));
                 }
             }
-            hits.push((m.start(), m.end(), pattern.name, pattern.fragment));
         }
-        hits
+        if !t.keys.is_empty() {
+            let ranges: Vec<(usize, usize)> = t.keys.clone();
+            let (joined, starts) = join_ranges(body, &ranges);
+            if self
+                .piece_spans(&joined, &starts, false, None)
+                .iter()
+                .any(|(s, e, _)| !crosses(&starts, *s, *e))
+            {
+                return None;
+            }
+        }
+        if t.values.is_empty() {
+            return Some(edits);
+        }
+        let ranges: Vec<(usize, usize)> = t.values.iter().map(|(s, e, _)| (*s, *e)).collect();
+        let all: Vec<usize> = (0..ranges.len()).collect();
+        self.json_stream_edits(body, &ranges, &all, fragments, false, &mut edits);
+        let mut classes: Vec<&str> = t.values.iter().map(|(_, _, c)| *c).collect();
+        classes.sort_unstable();
+        classes.dedup();
+        if classes.len() > 1 {
+            let nonempty: Vec<usize> = (0..ranges.len())
+                .filter(|&i| ranges[i].0 < ranges[i].1)
+                .collect();
+            for class in classes {
+                let members: Vec<usize> = nonempty
+                    .iter()
+                    .copied()
+                    .filter(|&i| t.values[i].2 == class)
+                    .collect();
+                let apart = members.windows(2).any(|w| {
+                    let a = nonempty.binary_search(&w[0]).unwrap_or(0);
+                    let b = nonempty.binary_search(&w[1]).unwrap_or(0);
+                    b != a + 1
+                });
+                if apart {
+                    self.json_stream_edits(body, &ranges, &members, false, true, &mut edits);
+                }
+            }
+        }
+        Some(edits)
     }
 
-    /// Cheap pre-check: could `text` hold any registered form, raw or JSON-escaped?
-    /// False positives are fine (short secrets ignore token boundaries here).
-    /// The fast reject: false only when no form, plain or encoded, can be in
-    /// `text`. Text with an encoding introducer is also checked decoded.
+    /// One stream of [`Self::json_edits`]: the value contents at `members`.
+    fn json_stream_edits(
+        &self,
+        body: &str,
+        ranges: &[(usize, usize)],
+        members: &[usize],
+        fragments: bool,
+        crossing: bool,
+        edits: &mut Vec<(usize, usize, String)>,
+    ) {
+        let picked: Vec<(usize, usize)> = members.iter().map(|&i| ranges[i]).collect();
+        let (joined, starts) = join_ranges(body, &picked);
+        let mut spans = self.piece_spans(&joined, &starts, fragments, None);
+        if crossing {
+            spans.retain(|(s, e, _)| crosses(&starts, *s, *e));
+        }
+        for (s, e, names) in spans {
+            let marker = json_escaped(&self.marker(&names));
+            for (k, &(ps, pe)) in picked.iter().enumerate() {
+                let (ls, le) = (starts[k], starts[k] + (pe - ps));
+                if s >= le || e <= ls || (ls == le) {
+                    continue;
+                }
+                let content = &body[ps..pe];
+                let (a, b) = escape_bounds(content, s.max(ls) - ls, e.min(le) - ls);
+                let text = if s >= ls {
+                    marker.clone()
+                } else {
+                    String::new()
+                };
+                edits.push((ps + a, ps + b, text));
+            }
+        }
+    }
+
+    /// The fast reject for one text: false only when no form, plain or
+    /// encoded at any level, can be in `text`. Not sound for a value split over
+    /// several texts; callers with pieces search them joined instead.
     pub fn may_contain(&self, text: &str) -> bool {
         self.is_broken()
             || self.may_contain_plain(text)
-            || (crate::secret_normalize::has_encoding(text) && {
-                let n = crate::secret_normalize::normalize(text);
-                n.text != text && self.may_contain_plain(&n.text)
-            })
+            || crate::secret_normalize::levels(text)
+                .iter()
+                .any(|level| self.may_contain_plain(&level.text))
     }
 
     fn may_contain_plain(&self, text: &str) -> bool {
         self.raw.as_ref().is_some_and(|a| a.is_match(text))
-            || self.json.as_ref().is_some_and(|a| a.is_match(text))
             || self.ci.as_ref().is_some_and(|a| a.is_match(text))
             || self
                 .extra
                 .as_ref()
                 .is_some_and(|m| m.may_contain_plain(text))
     }
+}
+
+/// The string, key and number tokens of one serialized JSON text.
+struct JsonTokens<'a> {
+    /// `(start, end, class)`: the content between the quotes of each string
+    /// value, with its class (the key it is under, `[]` in an array).
+    values: Vec<(usize, usize, &'a str)>,
+    keys: Vec<(usize, usize)>,
+    numbers: Vec<(usize, usize)>,
+}
+
+/// [`JsonTokens`] of `body`, or `None` when its brackets or strings do not
+/// close (a torn line), which is then redacted as text.
+fn json_tokens(body: &str) -> Option<JsonTokens<'_>> {
+    let b = body.as_bytes();
+    let mut out = JsonTokens {
+        values: Vec::new(),
+        keys: Vec::new(),
+        numbers: Vec::new(),
+    };
+    // (is an object, its current key)
+    let mut stack: Vec<(bool, &str)> = Vec::new();
+    let mut expect_key = false;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'{' => {
+                stack.push((true, ""));
+                expect_key = true;
+                i += 1;
+            }
+            b'[' => {
+                stack.push((false, "[]"));
+                expect_key = false;
+                i += 1;
+            }
+            b'}' | b']' => {
+                let (object, _) = stack.pop()?;
+                if object != (b[i] == b'}') {
+                    return None;
+                }
+                expect_key = false;
+                i += 1;
+            }
+            b',' => {
+                expect_key = matches!(stack.last(), Some((true, _)));
+                i += 1;
+            }
+            b'"' => {
+                let start = i + 1;
+                let mut j = start;
+                loop {
+                    j += memchr::memchr2(b'"', b'\\', &b[j..])?;
+                    if b[j] == b'\\' {
+                        j += 2;
+                        if j > b.len() {
+                            return None;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                if expect_key {
+                    out.keys.push((start, j));
+                    stack.last_mut()?.1 = &body[start..j];
+                    expect_key = false;
+                } else {
+                    let class = stack.last().map_or("", |(_, k)| *k);
+                    out.values.push((start, j, class));
+                }
+                i = j + 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                while i < b.len() && matches!(b[i], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+                {
+                    i += 1;
+                }
+                out.numbers.push((start, i));
+            }
+            _ => i += 1,
+        }
+    }
+    stack.is_empty().then_some(out)
+}
+
+/// `ranges` of `body` joined, with each one's start in the joined text.
+fn join_ranges(body: &str, ranges: &[(usize, usize)]) -> (String, Vec<usize>) {
+    let mut joined = String::with_capacity(ranges.iter().map(|(s, e)| e - s).sum());
+    let mut starts = Vec::with_capacity(ranges.len());
+    for &(s, e) in ranges {
+        starts.push(joined.len());
+        joined.push_str(&body[s..e]);
+    }
+    (joined, starts)
+}
+
+/// `s..e` of a JSON string's escaped content widened so it never splits an
+/// escape sequence (`\n`, `\u00e9`): an edit then always leaves valid JSON.
+fn escape_bounds(content: &str, mut s: usize, mut e: usize) -> (usize, usize) {
+    let b = content.as_bytes();
+    let mut i = 0;
+    while i < b.len() && i < e {
+        if b[i] == b'\\' {
+            let len = if b.get(i + 1) == Some(&b'u') { 6 } else { 2 };
+            let end = (i + len).min(b.len());
+            if i < s && s < end {
+                s = i;
+            }
+            if i < e && e < end {
+                e = end;
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    (s, e)
+}
+
+/// `body` with `edits` (`(start, end, replacement)`, possibly overlapping)
+/// applied; overlapping edits become one, keeping each replacement.
+fn apply_edits(body: &str, mut edits: Vec<(usize, usize, String)>) -> String {
+    edits.sort_by_key(|(s, e, _)| (*s, std::cmp::Reverse(*e)));
+    let mut merged: Vec<(usize, usize, String)> = Vec::new();
+    for (s, e, text) in edits {
+        match merged.last_mut() {
+            Some(last) if s < last.1 => {
+                last.1 = last.1.max(e);
+                if !text.is_empty() && !last.2.contains(&text) {
+                    last.2.push_str(&text);
+                }
+            }
+            _ => merged.push((s, e, text)),
+        }
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut at = 0;
+    for (s, e, text) in merged {
+        out.push_str(&body[at..s]);
+        out.push_str(&text);
+        at = e;
+    }
+    out.push_str(&body[at..]);
+    out
+}
+
+/// A serialized JSON text with nothing of its content left, for a matcher
+/// that could not be built: every string value is [`WITHHELD`], every number
+/// `null`, and a key is kept only if it is a plain identifier
+/// (`[A-Za-z0-9_]{1,32}`), so the line stays valid JSON with its structure.
+fn withheld_json(body: &str, t: &JsonTokens<'_>) -> String {
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for &(s, e, _) in &t.values {
+        edits.push((s, e, WITHHELD.to_string()));
+    }
+    for &(s, e) in &t.numbers {
+        edits.push((s, e, "null".to_string()));
+    }
+    for &(s, e) in &t.keys {
+        let key = &body[s..e];
+        let plain = (1..=32).contains(&key.len())
+            && key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
+        if !plain {
+            edits.push((s, e, "withheld".to_string()));
+        }
+    }
+    apply_edits(body, edits)
+}
+
+/// The role of a definition's child under `key` (`None`: an array element).
+fn inner_role(role: Role, key: Option<&str>) -> Role {
+    match (role, key) {
+        // `required: ["arg", ...]` names arguments.
+        (Role::Required, None) => Role::Argument,
+        (Role::PromptArguments, None) => Role::PromptArgument,
+        (other, None) => other,
+        (Role::Schema, Some("required")) => Role::Required,
+        (Role::Schema, Some(_)) => Role::Schema,
+        (Role::PromptArgument, Some("name")) => Role::Argument,
+        (_, Some(_)) => Role::Text,
+    }
+}
+
+/// The string leaves of a definition that are not identifiers, with their
+/// class as in [`collect_leaves`].
+fn text_leaves<'v>(
+    value: &'v mut Value,
+    role: Role,
+    class: &str,
+    out: &mut Vec<(String, &'v mut String)>,
+) {
+    match value {
+        Value::String(s) => {
+            if !matches!(role, Role::Name | Role::Argument) {
+                out.push((class.to_string(), s));
+            }
+        }
+        Value::Array(items) => {
+            let inner = inner_role(role, None);
+            items
+                .iter_mut()
+                .for_each(|v| text_leaves(v, inner, "[]", out));
+        }
+        Value::Object(map) => map
+            .iter_mut()
+            .for_each(|(k, v)| text_leaves(v, inner_role(role, Some(k)), k, out)),
+        _ => {}
+    }
+}
+
+/// The string leaves of `value` in document order, each with its class: the
+/// nearest object key, `[]` for an array element, `""` at the top.
+fn collect_leaves<'v>(value: &'v mut Value, class: &str, out: &mut Vec<(String, &'v mut String)>) {
+    match value {
+        Value::String(s) => out.push((class.to_string(), s)),
+        Value::Array(items) => items.iter_mut().for_each(|v| collect_leaves(v, "[]", out)),
+        Value::Object(map) => map.iter_mut().for_each(|(k, v)| collect_leaves(v, k, out)),
+        _ => {}
+    }
+}
+
+/// Whether `s..e` crosses one of the piece `starts` (strictly inside it).
+fn crosses(starts: &[usize], s: usize, e: usize) -> bool {
+    let i = starts.partition_point(|&p| p <= s);
+    starts.get(i).is_some_and(|&p| p < e)
 }
 
 /// One span over all of a text, with no names: [`Matcher::marker`] writes
@@ -1681,10 +2192,10 @@ fn withheld_span(len: usize) -> Vec<(usize, usize, Vec<usize>)> {
 /// Merge overlapping hits into spans. A span is named after the whole-value
 /// matches inside it; only a span found purely by fragment windows lists the
 /// secrets those windows came from.
-fn merge(mut hits: Vec<(usize, usize, usize, bool)>) -> Vec<(usize, usize, Vec<usize>)> {
-    hits.sort_by_key(|(s, e, _, _)| (*s, std::cmp::Reverse(*e)));
+fn merge(mut hits: Vec<Hit>) -> Vec<Span> {
+    hits.sort_by_key(|h| (h.0, std::cmp::Reverse(h.1)));
     let mut spans: Vec<(usize, usize, Vec<usize>, Vec<usize>)> = Vec::new();
-    for (s, e, n, fragment) in hits {
+    for (s, e, n, fragment, _) in hits {
         let names = |last: &mut (usize, usize, Vec<usize>, Vec<usize>)| {
             let list = if fragment { &mut last.3 } else { &mut last.2 };
             if !list.contains(&n) {
@@ -1816,28 +2327,9 @@ impl Layers {
         out
     }
 
-    fn may_contain(&self, text: &str) -> bool {
-        self.0.iter().any(|m| m.may_contain(text))
-    }
-
-    fn hold_from(&self, text: &str) -> usize {
-        self.0
-            .iter()
-            .map(|m| m.hold_from(text))
-            .min()
-            .unwrap_or(text.len())
-    }
-
-    fn redact_pair(&self, a: &str, b: &str) -> Option<(String, String)> {
-        let (mut a, mut b) = (a.to_string(), b.to_string());
-        let mut changed = false;
-        for m in &self.0 {
-            if let Some((na, nb)) = m.redact_pair(&a, &b, None) {
-                (a, b) = (na, nb);
-                changed = true;
-            }
-        }
-        changed.then_some((a, b))
+    /// The matcher (the registry always serves exactly one).
+    fn main(&self) -> &Matcher {
+        &self.0[0]
     }
 
     fn value_with(&self, value: &mut Value, fragments: bool, request: Option<&Value>) -> bool {
@@ -1853,20 +2345,32 @@ impl Layers {
     }
 
     /// Screen one definition; the names of the secrets it held (none: untouched).
-    fn screen(&self, item: &mut Value, ids: &mut IdBuilder) -> Vec<String> {
-        let mut names = Vec::new();
+    /// Screen one definition; the names of the secrets it held (none:
+    /// untouched), or `None` when one of its identifiers could not be given an
+    /// alias of its own and the item must not be advertised.
+    fn screen(&self, item: &mut Value, ids: &mut IdBuilder) -> Option<Vec<String>> {
+        ids.found.clear();
+        ids.refused = false;
+        ids.pending.clear();
         for m in &self.0 {
-            let mut found = HashSet::new();
-            m.secrets_in(item, &mut found);
-            if found.is_empty() {
-                continue;
-            }
-            names.extend(found.into_iter().map(|n| m.name(n).to_string()));
             m.screen_definition(item, ids);
         }
+        if ids.refused {
+            ids.pending.clear();
+            return None;
+        }
+        for (part, advertised, original, pieces) in std::mem::take(&mut ids.pending) {
+            let table = match part {
+                Part::Name => &mut ids.ids.names,
+                Part::Argument => &mut ids.ids.arguments,
+            };
+            table.insert(advertised, original);
+            ids.ids.pieces.extend(pieces);
+        }
+        let mut names = std::mem::take(&mut ids.found);
         names.sort();
         names.dedup();
-        names
+        Some(names)
     }
 }
 
@@ -1938,12 +2442,40 @@ fn current_in(scope: &Scope) -> Option<Layers> {
     if !ACTIVE.load(Ordering::Relaxed) {
         return None;
     }
+    #[cfg(any(test, feature = "test-support"))]
+    if FORCED_UNAVAILABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(scope)
+    {
+        let mut broken = Matcher::new(&[("TEST", "forced-unavailable-value")]);
+        broken.broken = true;
+        return Some(Layers(vec![Arc::new(broken)]));
+    }
     REGISTRY
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()?
         .get(scope)?
         .layers()
+}
+
+/// Scopes whose matcher reads as one that could not be built.
+#[cfg(any(test, feature = "test-support"))]
+static FORCED_UNAVAILABLE: Mutex<Vec<Scope>> = Mutex::new(Vec::new());
+
+/// Test hook: in this test's scope, secret redaction behaves as if its
+/// matcher could not be built (fail closed), until turned off.
+#[cfg(any(test, feature = "test-support"))]
+pub fn force_unavailable_for_test(on: bool) {
+    let scope = scope_now();
+    let mut list = FORCED_UNAVAILABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    list.retain(|s| *s != scope);
+    if on {
+        list.push(scope);
+    }
 }
 
 fn current() -> Option<Layers> {
@@ -2312,12 +2844,6 @@ pub fn redact_text(text: &str) -> Cow<'_, str> {
     }
 }
 
-/// [`Matcher::redact_pair`] against every registered secret: consecutive lines
-/// of a stream, checked for a secret broken across the line break.
-pub fn redact_pair(a: &str, b: &str) -> Option<(String, String)> {
-    current()?.redact_pair(a, b)
-}
-
 /// [`Matcher::redact_fragment`] against every registered secret.
 pub fn redact_fragment(text: &str) -> Cow<'_, str> {
     match current() {
@@ -2327,24 +2853,16 @@ pub fn redact_fragment(text: &str) -> Cow<'_, str> {
 }
 
 /// Text that is an excerpt of a longer stream (the kept tail of a child's
-/// stderr): a secret a tool wrapped across a line break is matched across it,
-/// and a piece of one cut off at either end of the excerpt is removed.
+/// stderr): its lines are the pieces of one text ([`Stream::lines`]), so a
+/// secret a tool wrapped over any number of lines is matched across them, and
+/// a piece of one cut off at either end of the excerpt is removed.
 pub fn redact_excerpt(text: &str) -> String {
     let Some(m) = current() else {
         return text.to_string();
     };
-    let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_string).collect();
-    for i in 1..lines.len() {
-        let (before, after) = lines.split_at_mut(i);
-        let (prev, next) = (&mut before[i - 1], &mut after[0]);
-        let body = prev.trim_end_matches(['\n', '\r']);
-        let ending = prev[body.len()..].to_string();
-        if let Some((a, b)) = m.redact_pair(body, next) {
-            *prev = format!("{a}{ending}");
-            *next = b;
-        }
-    }
-    m.redact_fragment(&lines.concat()).into_owned()
+    let mut stream = Stream::lines();
+    stream.held.push(text, true);
+    stream.finish_with(m.main())
 }
 
 /// Redact, then keep at most `max_chars`. See [`Matcher::truncate_chars`].
@@ -2422,6 +2940,11 @@ struct IdBuilder {
     ids: CatalogIds,
     /// Each alias marker handed out, with the identifier and span it stands for.
     owners: HashMap<String, (Part, String, usize)>,
+    /// For the item being screened: the secret names found, whether an alias
+    /// was refused, and the identifiers to record once it is accepted.
+    found: Vec<String>,
+    refused: bool,
+    pending: Vec<(Part, String, String, Vec<(String, String)>)>,
 }
 
 impl IdBuilder {
@@ -2432,15 +2955,20 @@ impl IdBuilder {
             key: None,
             ids: CatalogIds::default(),
             owners: HashMap::new(),
+            found: Vec::new(),
+            refused: false,
+            pending: Vec::new(),
         }
     }
 
-    /// `base` (`[secret:NAME`) closed with an alias suffix: a keyed hash of the
-    /// server, catalog, part, whole original identifier and span position, so the
-    /// same original gets the same alias on every run, different originals never
-    /// share one, and the suffix says nothing about the secret. Lengthened on
-    /// the rare clash within this catalog.
-    fn alias(&mut self, part: Part, original: &str, index: usize, base: &str) -> String {
+    /// `base` (`[secret:NAME`) closed with an alias suffix: the first
+    /// [`ALIAS_HEX_DIGITS`] hex digits of a keyed hash of the server, catalog,
+    /// part, whole original identifier and span position, so the same original
+    /// gets the same alias on every run and the suffix says nothing about the
+    /// secret. An alias never changes meaning: when a different identifier in
+    /// this catalog already holds the same alias (a 64-bit collision), this one
+    /// gets none, and the item is not advertised (`None`).
+    fn alias(&mut self, part: Part, original: &str, index: usize, base: &str) -> Option<String> {
         use hmac::{Hmac, Mac};
         let key = *self.key.get_or_insert_with(alias_key);
         let mut mac =
@@ -2461,19 +2989,21 @@ impl IdBuilder {
         }
         let digest = mac.finalize().into_bytes();
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-        let mut digits = 8;
-        loop {
-            let marker = format!("{base}~{}]", &hex[..digits]);
-            let owner = (part, original.to_string(), index);
-            // One identifier listed twice (a key and in `required`) is the same
-            // owner and gets the same alias.
-            let clash = self.owners.get(&marker).is_some_and(|o| *o != owner);
-            if !clash || digits == hex.len() {
-                self.owners.insert(marker.clone(), owner);
-                return marker;
-            }
-            digits += 8;
+        #[cfg(test)]
+        let hex: String = match ALIAS_HEX_FOR_TEST.with(|h| h.borrow().clone()) {
+            Some(forced) => forced,
+            None => hex,
+        };
+        let marker = format!("{base}~{}]", &hex[..ALIAS_HEX_DIGITS.min(hex.len())]);
+        let owner = (part, original.to_string(), index);
+        // One identifier listed twice (a key and in `required`) is the same
+        // owner and gets the same alias.
+        if self.owners.get(&marker).is_some_and(|o| *o != owner) {
+            self.refused = true;
+            return None;
         }
+        self.owners.insert(marker.clone(), owner);
+        Some(marker)
     }
 
     fn record(
@@ -2483,13 +3013,20 @@ impl IdBuilder {
         original: &str,
         pieces: Vec<(String, String)>,
     ) {
-        let table = match part {
-            Part::Name => &mut self.ids.names,
-            Part::Argument => &mut self.ids.arguments,
-        };
-        table.insert(advertised.to_string(), original.to_string());
-        self.ids.pieces.extend(pieces);
+        self.pending
+            .push((part, advertised.to_string(), original.to_string(), pieces));
     }
+}
+
+/// Hex digits in an identifier alias suffix (64 bits).
+const ALIAS_HEX_DIGITS: usize = 16;
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: every alias hash on this thread is this hex, so two
+    /// identifiers collide.
+    static ALIAS_HEX_FOR_TEST: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The key for [`IdBuilder::alias`]: the installation's persisted task handle
@@ -2527,6 +3064,9 @@ static IDENTITIES: Mutex<Option<HashMap<(String, Catalog), CatalogIds>>> = Mutex
 #[must_use = "commit the identifiers when the screened catalog is stored"]
 pub struct Screened {
     pub flagged: Vec<(String, Vec<String>)>,
+    /// Items left out because an identifier alias collided (the name as
+    /// advertised so far, possibly already holding markers).
+    pub refused: Vec<String>,
     server: String,
     catalog: Catalog,
     ids: CatalogIds,
@@ -2556,25 +3096,35 @@ impl Screened {
 /// `(advertised name, secret names)`. Identifiers get stable aliases and stay
 /// callable through [`upstream_identifier`] and [`upstream_arguments`] once the
 /// result is committed. Definitions with no secret are left byte for byte.
-pub fn screen_definitions(server_id: &str, catalog: Catalog, items: &mut [Value]) -> Screened {
+pub fn screen_definitions(server_id: &str, catalog: Catalog, items: &mut Vec<Value>) -> Screened {
     let mut ids = IdBuilder::new(server_id, catalog);
     let mut flagged = Vec::new();
+    let mut refused = Vec::new();
     if let Some(matcher) = current() {
-        for item in items.iter_mut() {
-            let names = matcher.screen(item, &mut ids);
-            if names.is_empty() {
-                continue;
-            }
-            let name = ["name", "uri", "uriTemplate"]
+        let item_name = |item: &Value| {
+            ["name", "uri", "uriTemplate"]
                 .iter()
                 .find_map(|k| item.get(*k).and_then(Value::as_str))
                 .unwrap_or("")
-                .to_string();
-            flagged.push((name, names));
-        }
+                .to_string()
+        };
+        items.retain_mut(|item| match matcher.screen(item, &mut ids) {
+            None => {
+                // Its name may still hold the secret its alias was refused for.
+                refused.push(matcher.redact_text(&item_name(item)).into_owned());
+                false
+            }
+            Some(names) => {
+                if !names.is_empty() {
+                    flagged.push((item_name(item), names));
+                }
+                true
+            }
+        });
     }
     Screened {
         flagged,
+        refused,
         server: server_id.to_string(),
         catalog,
         ids: ids.ids,
@@ -2670,28 +3220,122 @@ fn recorded_originals(server_id: &str) -> Vec<String> {
         .collect()
 }
 
-/// [`Matcher::hold_from`] with the current secrets.
-pub fn hold_from(text: &str) -> usize {
-    match current() {
-        Some(m) => m.hold_from(text),
-        None => text.len(),
-    }
-}
-
-/// Redaction for text written in chunks (a relayed stream, a child's stderr,
-/// the messages of one progress stream): [`Self::push`] returns the part that
-/// is safe to write now and holds the tail that may be the start of a secret,
-/// until the next chunk shows whether the rest follows (the held text is then
-/// matched together with it) or [`Self::finish`] ends the stream.
-#[derive(Debug)]
+/// Redaction for text written in pieces (a relayed stream, a child's stderr,
+/// the messages of one progress stream, the text lines of a log): every piece
+/// is matched as part of one logical text, the separators between pieces (line
+/// endings, in [`Self::lines`] mode) are transparent to the matcher, and
+/// [`Self::push`] returns the part that is safe to write now. What it holds is
+/// exactly the matcher's live prefix ([`Matcher::hold_from`]): a tail that may
+/// still become a secret, at any decoding level, however many pieces it spans.
+/// It is never longer than the longest form, so there is nothing else to
+/// bound, and no pair or line logic: a secret wrapped over any number of short
+/// lines is one span.
+///
+/// [`Self::finish`] ends the stream. The held tail is then written as it is if
+/// it is shorter than [`SHORT_SECRET_CHARS`] (the shortest dangling piece
+/// [`Matcher::redact_fragment`] would remove anyway); a longer one goes through
+/// the same dangling-edge rule, so the start of a secret cut off by the end of
+/// the stream is removed and anything else is kept.
+#[derive(Debug, Default)]
 pub struct Stream {
-    held: String,
+    held: Held,
     fragments: bool,
+    lines: bool,
+    exempt: Option<Arc<HashSet<String>>>,
 }
 
-impl Default for Stream {
-    fn default() -> Self {
-        Self::new()
+/// The logical text a [`Stream`] has not written yet, with the separators that
+/// sit between its pieces.
+#[derive(Debug, Default, Clone)]
+struct Held {
+    text: String,
+    /// `(offset in text, separator)`, ascending; several separators at one
+    /// offset are one entry.
+    seps: Vec<(usize, String)>,
+}
+
+impl Held {
+    fn push(&mut self, chunk: &str, lines: bool) {
+        if !lines {
+            self.text.push_str(chunk);
+            return;
+        }
+        for part in chunk.split_inclusive(['\n', '\r']) {
+            let body = part.trim_end_matches(['\n', '\r']);
+            self.text.push_str(body);
+            self.sep(&part[body.len()..]);
+        }
+    }
+
+    fn sep(&mut self, sep: &str) {
+        if sep.is_empty() {
+            return;
+        }
+        let at = self.text.len();
+        match self.seps.last_mut() {
+            Some((p, s)) if *p == at => s.push_str(sep),
+            _ => self.seps.push((at, sep.to_string())),
+        }
+    }
+
+    /// Piece starts: the start, and every separator.
+    fn starts(&self) -> Vec<usize> {
+        let mut out = Vec::with_capacity(self.seps.len() + 1);
+        out.push(0);
+        out.extend(self.seps.iter().map(|(p, _)| *p).filter(|&p| p > 0));
+        out
+    }
+
+    /// Everything held, as written.
+    fn plain(&mut self) -> String {
+        let mut out = String::with_capacity(self.text.len() + self.seps.len());
+        let mut at = 0;
+        for (p, sep) in std::mem::take(&mut self.seps) {
+            out.push_str(&self.text[at..p]);
+            out.push_str(&sep);
+            at = p;
+        }
+        out.push_str(&self.text[at..]);
+        self.text.clear();
+        out
+    }
+
+    /// Write `text[..cut]` with `spans` (those starting before `cut`, which end
+    /// at or before it) replaced and the separators up to `cut` put back; keep
+    /// the rest.
+    fn take(&mut self, m: &Matcher, cut: usize, spans: &[Span]) -> String {
+        let mut out = String::with_capacity(cut + 16);
+        let mut at = 0;
+        let mut k = 0;
+        let seps = std::mem::take(&mut self.seps);
+        let mut advance = |out: &mut String, at: &mut usize, to: usize, copy: bool| {
+            while k < seps.len() && seps[k].0 <= to {
+                let p = seps[k].0.max(*at);
+                if copy {
+                    out.push_str(&self.text[*at..p]);
+                }
+                *at = p;
+                out.push_str(&seps[k].1);
+                k += 1;
+            }
+            if copy {
+                out.push_str(&self.text[*at..to]);
+            }
+            *at = to;
+        };
+        for (s, e, names) in spans.iter().filter(|(s, _, _)| *s < cut) {
+            advance(&mut out, &mut at, *s, true);
+            out.push_str(&m.marker(names));
+            advance(&mut out, &mut at, (*e).min(cut), false);
+        }
+        advance(&mut out, &mut at, cut, true);
+        let rest: Vec<(usize, String)> = seps[k..]
+            .iter()
+            .map(|(p, s)| (p - cut, s.clone()))
+            .collect();
+        self.text.drain(..cut);
+        self.seps = rest;
+        out
     }
 }
 
@@ -2699,48 +3343,105 @@ impl Stream {
     /// A log stream: fragment windows apply, as in [`redact_text`].
     pub fn new() -> Self {
         Self {
-            held: String::new(),
             fragments: true,
+            ..Self::default()
+        }
+    }
+
+    /// A stream of text whose line endings separate pieces (a child's stderr,
+    /// the text lines of a log): they are written where they were, and a secret
+    /// wrapped over lines is matched across them.
+    pub fn lines() -> Self {
+        Self {
+            fragments: true,
+            lines: true,
+            ..Self::default()
         }
     }
 
     /// A stream of message text bound for a client: whole forms only, as in
     /// [`redact_outgoing`], so ordinary words in content are never renamed.
     pub fn whole() -> Self {
+        Self::default()
+    }
+
+    /// [`Self::whole`] for messages answering one request: a secret the client
+    /// sent in it ([`exempt_values`]) is left where it is echoed.
+    pub fn whole_for(exempt: Option<Arc<HashSet<String>>>) -> Self {
         Self {
-            held: String::new(),
-            fragments: false,
+            exempt,
+            ..Self::default()
         }
     }
 
     /// `chunk` appended to the held tail; the redacted part to write now.
     pub fn push(&mut self, chunk: &str) -> String {
-        self.held.push_str(chunk);
-        let cut = hold_from(&self.held);
-        let rest = self.held.split_off(cut);
-        let ready = std::mem::replace(&mut self.held, rest);
-        let Some(m) = current() else {
-            return ready;
-        };
-        if self.fragments {
-            m.redact_text(&ready).into_owned()
-        } else {
-            m.fold(&ready, |m, t| m.text_with(t, false, None))
-                .into_owned()
+        match current() {
+            Some(m) => self.push_with(m.main(), chunk),
+            None => {
+                // No secret is registered: nothing can be live.
+                self.held.push(chunk, self.lines);
+                self.held.plain()
+            }
         }
+    }
+
+    pub(crate) fn push_with(&mut self, m: &Matcher, chunk: &str) -> String {
+        self.held.push(chunk, self.lines);
+        let starts = self.held.starts();
+        let (cut, spans) = m.hold_and_spans(
+            &self.held.text,
+            &starts,
+            self.fragments,
+            self.exempt.as_deref(),
+        );
+        self.held.take(m, cut, &spans)
     }
 
     /// Whether a tail is being held.
     pub fn is_holding(&self) -> bool {
-        !self.held.is_empty()
+        !self.held.text.is_empty() || !self.held.seps.is_empty()
     }
 
     /// The end of the stream: the held tail, redacted, including a piece of a
     /// secret left dangling at its end.
     pub fn finish(&mut self) -> String {
-        let held = std::mem::take(&mut self.held);
-        redact_fragment(&held).into_owned()
+        match current() {
+            Some(m) => self.finish_with(m.main()),
+            None => self.push(""),
+        }
     }
+
+    pub(crate) fn finish_with(&mut self, m: &Matcher) -> String {
+        let starts = self.held.starts();
+        let text = &self.held.text;
+        let mut spans = m.piece_spans(text, &starts, self.fragments, self.exempt.as_deref());
+        if !m.is_broken() && text.chars().count() >= SHORT_SECRET_CHARS {
+            let mut hits: Vec<Hit> = spans
+                .drain(..)
+                .flat_map(|(s, e, names)| names.into_iter().map(move |n| (s, e, n, false, 0)))
+                .collect();
+            let exempt = self.exempt.as_deref();
+            hits.extend(
+                m.edges(text)
+                    .into_iter()
+                    .filter(|h| !exempt.is_some_and(|x| x.contains(m.value(h.4)))),
+            );
+            spans = merge(hits);
+        }
+        let len = text.len();
+        self.held.take(m, len, &spans)
+    }
+}
+
+/// The registered values a client's `request` holds, in any spelling (see
+/// [`Matcher::values_in`]): what [`Stream::whole_for`] exempts.
+pub fn exempt_values(request: Option<&Value>) -> Option<Arc<HashSet<String>>> {
+    let request = request?;
+    let m = current()?;
+    let mut out = HashSet::new();
+    m.main().values_in(request, &mut out);
+    (!out.is_empty()).then(|| Arc::new(out))
 }
 
 /// A server URL for text that leaves the machine or the app (a team push, copied
@@ -2776,7 +3477,60 @@ pub fn redact_outgoing(value: &mut Value, request: Option<&Value>) -> bool {
     let Some(m) = current() else {
         return false;
     };
+    if m.main().is_broken() && value.get("jsonrpc").is_some() {
+        *value = withheld_message(value);
+        return true;
+    }
     m.value_with(value, false, request)
+}
+
+/// [`redact_outgoing`] with the exemption already computed
+/// ([`exempt_values`]), for messages that answer a request seen earlier (its
+/// progress notifications).
+pub fn redact_outgoing_exempt(value: &mut Value, exempt: Option<&HashSet<String>>) -> bool {
+    let Some(m) = current() else {
+        return false;
+    };
+    if m.main().is_broken() && value.get("jsonrpc").is_some() {
+        *value = withheld_message(value);
+        return true;
+    }
+    m.main().value_with(value, false, exempt)
+}
+
+/// What a client gets in place of any message while the matcher cannot be
+/// built: a response keeps its `jsonrpc` and `id` and carries a fixed error;
+/// anything else (a notification, a server request) becomes a fixed log
+/// notification. Nothing of the original content is in either, and both are
+/// valid protocol messages.
+fn withheld_message(value: &Value) -> Value {
+    match (value.get("id"), value.get("method")) {
+        (Some(id), None) => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id.clone(),
+            "error": { "code": -32603, "message": WITHHELD_RESPONSE },
+        }),
+        _ => serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": { "level": "error", "logger": "toolport", "data": WITHHELD_RESPONSE },
+        }),
+    }
+}
+
+/// The error a client gets for every response while secret redaction is
+/// unavailable.
+pub const WITHHELD_RESPONSE: &str = "Toolport withheld this response: secret redaction is unavailable. Call toolport_status for the reason.";
+
+/// Why secret redaction cannot run (its matcher could not be built), or `None`
+/// when it works. Says nothing about any value.
+pub fn unavailable_reason() -> Option<String> {
+    current().filter(|m| m.main().is_broken()).map(|m| {
+        format!(
+            "Secret redaction is unavailable: the matcher for {} registered secret values could not be built, so Toolport withholds every response, notification and log line instead of sending them unredacted. Restart Toolport; if it persists, remove recently added secrets or report the problem.",
+            m.main().values.len() + m.main().extra.as_ref().map_or(0, |x| x.values.len())
+        )
+    })
 }
 
 /// [`redact_outgoing`], returning how many times each secret was replaced
@@ -2842,18 +3596,16 @@ pub fn redact_outgoing_json(json: String) -> String {
     let Some(m) = current() else {
         return json;
     };
-    if !m.may_contain(&json) {
-        return json;
-    }
-    match serde_json::from_str::<Value>(&json) {
-        Ok(mut value) => {
-            if m.value_with(&mut value, false, None) {
-                value.to_string()
-            } else {
-                json
-            }
+    if m.main().is_broken() {
+        if let Ok(value) = serde_json::from_str::<Value>(&json) {
+            return withheld_message(&value).to_string();
         }
-        Err(_) => m.redact_definition_line(&json).into_owned(),
+    }
+    // Edited in place, string values searched as pieces of one text: whole
+    // forms only, as in [`redact_outgoing`].
+    match m.main().redact_definition_line(&json) {
+        Cow::Borrowed(_) => json,
+        Cow::Owned(out) => out,
     }
 }
 
@@ -2981,28 +3733,83 @@ fn mask_in_place(matcher: &Matcher, dir: &Path, path: &Path) -> std::io::Result<
     mask_locked(matcher, dir, path)
 }
 
-/// [`mask_in_place`] for a caller that already holds the file's lock.
+/// [`mask_in_place`] for a caller that already holds the file's lock. The
+/// file's text is searched as the pieces of one text, as the rewrite does: the
+/// string values of each JSON line, and each other line without its ending, so
+/// a value split over strings or wrapped over lines is masked where each piece
+/// is. A file with other hard links is never changed ([`multi_link`]).
 fn mask_locked(matcher: &Matcher, dir: &Path, path: &Path) -> std::io::Result<bool> {
     let file = match crate::scrub_io::open_inside(dir, path)? {
         Ok(file) => file,
         Err(skip) => return skipped(path, skip),
     };
+    if crate::scrub_io::link_count(&file)? > 1 {
+        return multi_link(path);
+    }
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut &file, &mut bytes)?;
     drop(file);
-    let spans = matcher.byte_spans(&bytes);
-    if spans.is_empty() {
-        return Ok(false);
-    }
-    // One journaled pass per distinct marker, each range masked with it.
-    let mut groups: Vec<(String, Vec<(u64, u64)>)> = Vec::new();
-    for (start, end, names) in &spans {
-        let marker = matcher.marker(names);
-        let range = (*start as u64, (end - start) as u64);
-        match groups.iter_mut().find(|(m, _)| *m == marker) {
-            Some((_, ranges)) => ranges.push(range),
-            None => groups.push((marker, vec![range])),
+    // (offset in the file, length) of each piece, in order: string values and
+    // text lines are one text; keys and numbers another.
+    let mut pieces: Vec<(usize, usize)> = Vec::new();
+    let mut others: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    for line in bytes.split_inclusive(|&b| b == b'\n') {
+        let body_len = line
+            .iter()
+            .rposition(|&b| b != b'\n' && b != b'\r')
+            .map_or(0, |i| i + 1);
+        let body = &line[..body_len];
+        let tokens = std::str::from_utf8(body)
+            .ok()
+            .filter(|t| t.trim_start().starts_with(['{', '[']))
+            .and_then(json_tokens);
+        match tokens {
+            Some(t) => {
+                for (s, e, _) in t.values {
+                    pieces.push((at + s, e - s));
+                }
+                for (s, e) in t.keys.into_iter().chain(t.numbers) {
+                    others.push((at + s, e - s));
+                }
+            }
+            None => pieces.push((at, body_len)),
         }
+        at += line.len();
+    }
+    // One journaled pass per distinct marker, each range masked with it; a
+    // span over several pieces is masked in each of them.
+    let mut groups: Vec<(String, Vec<(u64, u64)>)> = Vec::new();
+    for pieces in [pieces, others] {
+        let mut logical = Vec::with_capacity(bytes.len());
+        let mut starts = Vec::with_capacity(pieces.len());
+        for &(s, len) in &pieces {
+            starts.push(logical.len());
+            logical.extend_from_slice(&bytes[s..s + len]);
+        }
+        let spans = matcher.byte_spans(&logical, &starts);
+        for (start, end, names) in &spans {
+            let marker = matcher.marker(names);
+            let first = starts.partition_point(|&p| p <= *start) - 1;
+            for k in first..starts.len() {
+                let (ls, len) = (starts[k], pieces[k].1);
+                if ls >= *end {
+                    break;
+                }
+                let (s, e) = ((*start).max(ls), (*end).min(ls + len));
+                if s >= e {
+                    continue;
+                }
+                let range = ((pieces[k].0 + s - ls) as u64, (e - s) as u64);
+                match groups.iter_mut().find(|(m, _)| *m == marker) {
+                    Some((_, ranges)) => ranges.push(range),
+                    None => groups.push((marker.clone(), vec![range])),
+                }
+            }
+        }
+    }
+    if groups.is_empty() {
+        return Ok(false);
     }
     let mut masked = false;
     for (marker, ranges) in groups {
@@ -3018,6 +3825,39 @@ fn mask_locked(matcher: &Matcher, dir: &Path, path: &Path) -> std::io::Result<bo
     Ok(masked)
 }
 
+/// Per scope, the files the last scrub could not clean, with the reason
+/// (file names only, never content).
+static SCRUB_BLOCKED: std::sync::LazyLock<Mutex<HashMap<Scope, Vec<String>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn blocked(path: &Path, note: String) -> std::io::Error {
+    let mut all = SCRUB_BLOCKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let list = all
+        .entry(scope_of(path.parent().unwrap_or(path)))
+        .or_default();
+    if !list.contains(&note) {
+        list.push(note.clone());
+    }
+    std::io::Error::other(note)
+}
+
+/// A file with more than one hard link is never changed: a rewrite would leave
+/// the old content under the other names, and masking it in place would change
+/// a file outside the data directory that shares it. The cleanup counts as
+/// unfinished, so a retired value stays in the vault, and status names the
+/// file and why.
+fn multi_link(path: &Path) -> std::io::Result<bool> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    Err(blocked(path, format!(
+        "{name} has other hard links, so the secret scrub left it unchanged; remove the other links to it (or the file) and the cleanup finishes on the next start"
+    )))
+}
+
 /// A file the scrub would not touch: a link, a reparse point, something that is
 /// not a regular file, or one outside the data directory. Named (never its
 /// content) so the skip is visible.
@@ -3031,9 +3871,12 @@ fn skipped(path: &Path, skip: crate::scrub_io::Skip) -> std::io::Result<bool> {
         .unwrap_or_default();
     // Not a clean result: whatever the link or entry points at may hold a copy,
     // so a retired value stays recoverable and status keeps saying so.
-    Err(std::io::Error::other(format!(
-        "secret scrub skipped {name} ({skip:?}): not a regular file inside the data directory"
-    )))
+    Err(blocked(
+        path,
+        format!(
+            "secret scrub skipped {name} ({skip:?}): not a regular file inside the data directory"
+        ),
+    ))
 }
 
 fn scrub_file_with(matcher: &Matcher, path: &Path) -> std::io::Result<bool> {
@@ -3051,29 +3894,40 @@ fn scrub_file_with(matcher: &Matcher, path: &Path) -> std::io::Result<bool> {
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.starts_with("tool-cache") || n.starts_with("quarantine"));
     // One streaming read decides whether a rewrite is needed at all, so an
-    // unchanged log costs a read and no write.
-    let mut hit = false;
+    // unchanged log costs a read and no write. It runs the same redaction the
+    // rewrite does, so a value split over strings or lines is seen too.
+    let mut probe = ScrubLines::new(matcher, catalog);
+    let mut diff = crate::scrub_io::Diff::default();
+    let mut out = Vec::new();
     let read = crate::scrub_io::for_each_line(dir, path, &mut |_, bytes| {
-        hit = hit || matcher.may_contain(&String::from_utf8_lossy(bytes));
+        if diff.diverged() {
+            return;
+        }
+        diff.input(bytes);
+        out.clear();
+        probe.feed(Some(bytes), &mut out);
+        diff.output(&out);
     })?;
     if let Err(skip) = read {
         return skipped(path, skip);
     }
-    if !hit {
+    out.clear();
+    probe.feed(None, &mut out);
+    diff.output(&out);
+    if !diff.changed() {
         return Ok(false);
     }
-    let mut redact = scrub_line(matcher, catalog);
+    let mut redact = ScrubLines::new(matcher, catalog);
     // Streamed into a temp file that is never more permissive than the original
     // and keeps its owner; published by rename only if the file did not change
-    // meanwhile. A file with other hard links is masked in place instead, so no
-    // other name keeps the old content.
+    // meanwhile. A file with other hard links is left as it is.
     let mut skip = None;
-    let rewritten = crate::scrub_io::rewrite_lines(
+    let rewritten = crate::scrub_io::rewrite_stream(
         dir,
         path,
-        &mut redact,
+        &mut |line, out| redact.feed(line, out),
         &mut |s| skip = Some(s),
-        &mut || mask_locked(matcher, dir, path),
+        &mut || multi_link(path),
     )?;
     match skip {
         Some(s) => skipped(path, s),
@@ -3085,6 +3939,10 @@ fn scrub_file_with(matcher: &Matcher, path: &Path) -> std::io::Result<bool> {
 /// first error (including a file the scrub had to skip) is returned after the
 /// rest are done, so the caller does not record the directory as clean.
 fn scrub_each(matcher: &Matcher, dir: &Path, mut changed: impl FnMut(bool)) -> std::io::Result<()> {
+    SCRUB_BLOCKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&scope_of(dir));
     let mut first_error = None;
     for path in persisted_log_files(dir) {
         match scrub_file_with(matcher, &path) {
@@ -3097,18 +3955,54 @@ fn scrub_each(matcher: &Matcher, dir: &Path, mut changed: impl FnMut(bool)) -> s
     first_error.map_or(Ok(()), Err)
 }
 
-/// The per-line redaction for [`scrub_file_with`], with the signature
-/// [`crate::scrub_io::rewrite_lines`] takes.
-fn scrub_line(
-    matcher: &Matcher,
+/// The redaction of one log file for [`scrub_file_with`]: each JSON line is
+/// one record, redacted as [`Matcher::redact_line`] does (string values as
+/// pieces of one text, edited in place); the other lines between them are one
+/// [`Stream::lines`] text, so a value a writer wrapped over lines is found. A
+/// tool catalog is screened like a live one (whole forms only), so a cached
+/// identifier never differs from the advertised one.
+struct ScrubLines<'m> {
+    m: &'m Matcher,
     catalog: bool,
-) -> impl for<'l> FnMut(&'l str) -> Cow<'l, str> + '_ {
-    move |line| {
-        if catalog {
-            matcher.redact_definition_line(line)
-        } else {
-            matcher.redact_line(line)
+    text: Stream,
+}
+
+impl<'m> ScrubLines<'m> {
+    fn new(m: &'m Matcher, catalog: bool) -> Self {
+        let mut text = Stream::lines();
+        text.fragments = !catalog;
+        Self { m, catalog, text }
+    }
+
+    fn feed(&mut self, line: Option<&[u8]>, out: &mut Vec<u8>) {
+        let Some(bytes) = line else {
+            out.extend_from_slice(self.text.finish_with(self.m).as_bytes());
+            return;
+        };
+        let Ok(line) = std::str::from_utf8(bytes) else {
+            // Not text: the stream ends here, and the line is redacted as
+            // well as it can be read (kept byte for byte when nothing matched).
+            out.extend_from_slice(self.text.finish_with(self.m).as_bytes());
+            let lossy = String::from_utf8_lossy(bytes);
+            match self.m.redact_line(&lossy) {
+                Cow::Borrowed(_) => out.extend_from_slice(bytes),
+                Cow::Owned(new) => out.extend_from_slice(new.as_bytes()),
+            }
+            return;
+        };
+        let body = line.trim_end_matches(['\n', '\r']);
+        let json = body.trim_start().starts_with(['{', '[']) && json_tokens(body).is_some();
+        if !json {
+            out.extend_from_slice(self.text.push_with(self.m, line).as_bytes());
+            return;
         }
+        out.extend_from_slice(self.text.finish_with(self.m).as_bytes());
+        let redacted = if self.catalog {
+            self.m.redact_definition_line(line)
+        } else {
+            self.m.redact_line(line)
+        };
+        out.extend_from_slice(redacted.as_bytes());
     }
 }
 
@@ -3249,6 +4143,13 @@ pub fn status_notes() -> Vec<String> {
         notes.push(format!(
             "{retired} replaced or deleted secret(s) are kept in the vault until the log cleanup for them succeeds; it is retried at each start."
         ));
+    }
+    if let Some(list) = SCRUB_BLOCKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&scope_now())
+    {
+        notes.extend(list.iter().cloned());
     }
     if scrub_dir_now().is_some_and(|dir| dir.join(SCRUB_PENDING_FILE).exists()) {
         notes.push("a log cleanup for newly learned secrets has not finished yet.".to_string());
@@ -3710,7 +4611,8 @@ mod tests {
         assert_eq!(flagged.len(), 1, "{flagged:?}");
         let name = tools[1]["name"].as_str().unwrap().to_string();
         assert!(
-            name.starts_with("[secret:NAMED~") && name.len() == "[secret:NAMED~12345678]".len(),
+            name.starts_with("[secret:NAMED~")
+                && name.len() == "[secret:NAMED~1234567890abcdef]".len(),
             "{name}"
         );
         assert_eq!(
@@ -3926,11 +4828,15 @@ mod tests {
         );
         assert_eq!(v["obj"]["head"], "[secret:SPLIT]");
         assert_eq!(v["obj"]["tail"], "");
-        assert_eq!(
-            m.redact_pair("x abcdefghijkl", "1234567890 y", None),
-            Some(("x [secret:SPLIT]".to_string(), " y".to_string()))
-        );
-        assert_eq!(m.redact_pair("abcdefghijkl", "999", None), None);
+        let mut s = Stream::lines();
+        let mut out = s.push_with(&m, "x abcdefghijkl\n");
+        out.push_str(&s.push_with(&m, "1234567890 y\n"));
+        out.push_str(&s.finish_with(&m));
+        assert_eq!(out, "x [secret:SPLIT]\n y\n");
+        let mut s = Stream::lines();
+        let mut out = s.push_with(&m, "abcdefghijkl\n999");
+        out.push_str(&s.finish_with(&m));
+        assert_eq!(out, "abcdefghijkl\n999");
     }
 
     #[test]
@@ -4207,6 +5113,12 @@ mod tests {
             .is_symlink();
         let copy = std::fs::read_to_string(&other_name).unwrap();
         let audit_text = std::fs::read_to_string(&audit).unwrap();
+        let notes = SCRUB_BLOCKED
+            .lock()
+            .unwrap()
+            .get(&scope_of(&dir))
+            .cloned()
+            .unwrap_or_default();
         let mode = std::fs::metadata(&security).unwrap().permissions().mode() & 0o777;
         let security_text = std::fs::read_to_string(&security).unwrap();
         let _ = std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o600));
@@ -4221,10 +5133,16 @@ mod tests {
             "a file outside was rewritten"
         );
         assert!(link_kept, "the link was replaced");
-        assert!(!audit_text.contains(secret), "{audit_text}");
+        // A file with another hard link is never changed: that would change the
+        // file outside too. The cleanup stays unfinished and status says why.
+        let original = format!("{{\"error\":\"{secret}\"}}\n");
+        assert_eq!(audit_text, original, "a multi-link file was changed");
+        assert_eq!(copy, original, "a file outside was changed through a link");
         assert!(
-            !copy.contains(secret),
-            "the other hard link kept the secret: {copy}"
+            notes
+                .iter()
+                .any(|n| n.starts_with("audit.jsonl has other hard links")),
+            "{notes:?}"
         );
         assert!(!security_text.contains(secret), "{security_text}");
         assert_eq!(mode, 0o400, "mode changed to {mode:o}");
@@ -4773,6 +5691,432 @@ mod tests {
         let again = scrub_data_dir(&dir).unwrap();
         if covered == Some(before) && known() == before {
             assert_eq!(again, 0);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_value_split_over_many_strings_is_found_in_lines_results_definitions_and_scrubs() {
+        use serde_json::json;
+        let secret = "sk-AbC123xyZ";
+        let m = m(&[("KEY", secret)]);
+        // A log line: edited in place, still valid JSON, every other byte kept.
+        let line = r#"{"parts": ["sk-","AbC","123","xyZ"], "n": 1}"#;
+        let with_ending = format!("{line}\n");
+        let out = m.redact_line(&with_ending);
+        assert_eq!(
+            out,
+            "{\"parts\": [\"[secret:KEY]\",\"\",\"\",\"\"], \"n\": 1}\n"
+        );
+        assert!(serde_json::from_str::<Value>(out.trim_end()).is_ok());
+        assert!(
+            !m.redact_definition_line(line).contains("AbC"),
+            "catalog line"
+        );
+        assert!(!redact_outgoing_json_with(&m, line).contains("AbC"));
+        // A result, whole forms only: pieces under one key with other fields
+        // between them.
+        let mut v = json!({"content": [
+            {"type": "text", "text": "sk-"}, {"type": "text", "text": "AbC"},
+            {"type": "text", "text": "123"}, {"type": "text", "text": "xyZ tail"}
+        ]});
+        assert!(m.value_with(&mut v, false, None));
+        assert_eq!(v["content"][0]["text"], "[secret:KEY]");
+        assert_eq!(v["content"][3]["text"], " tail");
+        // A definition: its descriptions are one text, like a result.
+        let mut ids = IdBuilder::new("split-srv", Catalog::Tool);
+        let mut tool = json!({"name": "t", "inputSchema": {"type": "object", "properties": {
+            "a": {"description": "use sk-"}, "b": {"description": "AbC"},
+            "c": {"description": "123xyZ now"}
+        }}});
+        m.screen_definition(&mut tool, &mut ids);
+        assert_eq!(ids.found, vec!["KEY".to_string()]);
+        let props = &tool["inputSchema"]["properties"];
+        assert_eq!(props["a"]["description"], "use [secret:KEY]");
+        assert_eq!(props["c"]["description"], " now");
+        // A file scrub: JSON leaves, and a value wrapped over text lines.
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-split-scrub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit = dir.join("audit.jsonl");
+        std::fs::write(&audit, format!("{line}\n{{\"ok\":\"plain\"}}\n")).unwrap();
+        let log = dir.join("gateway.log");
+        std::fs::write(&log, "start\nkey sk-\nAbC\n123xyZ end\nlast\n").unwrap();
+        let changed = (scrub_file_with(&m, &audit), scrub_file_with(&m, &log));
+        let (audit_text, log_text) = (
+            std::fs::read_to_string(&audit).unwrap(),
+            std::fs::read_to_string(&log).unwrap(),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(changed, (Ok(true), Ok(true))), "{changed:?}");
+        assert_eq!(
+            audit_text,
+            "{\"parts\": [\"[secret:KEY]\",\"\",\"\",\"\"], \"n\": 1}\n{\"ok\":\"plain\"}\n"
+        );
+        assert_eq!(log_text, "start\nkey [secret:KEY]\n\n end\nlast\n");
+    }
+
+    fn redact_outgoing_json_with(m: &Matcher, json: &str) -> String {
+        m.redact_definition_line(json).into_owned()
+    }
+
+    #[test]
+    fn every_decoding_level_is_searched_and_unmatched_bytes_are_kept() {
+        let m = m(&[("PCT", "ab%41cd!"), ("FORM", "abc def")]);
+        // The first decoding of the echo is the value as registered.
+        assert_eq!(m.redact_text("x ab%2541cd! y"), "x [secret:PCT] y");
+        // Bytes around a hit are left as written, encoded or not.
+        assert_eq!(
+            m.redact_text("%2541 then ab%2541cd! then %41"),
+            "%2541 then [secret:PCT] then %41"
+        );
+        assert_eq!(m.redact_text("q=%61bc+def&r=1"), "q=[secret:FORM]&r=1");
+        // Inside a JSON string inside a JSON string in a log line, encoded
+        // twice: four levels.
+        let inner = serde_json::json!({"k": "ab%2541cd!"}).to_string();
+        let line = serde_json::json!({"text": inner, "n": "keep%2541"}).to_string();
+        let out = m.redact_line(&line);
+        assert!(!out.contains("2541cd"), "{out}");
+        assert!(out.contains("keep%2541"), "{out}");
+        assert!(serde_json::from_str::<Value>(&out).is_ok(), "{out}");
+    }
+
+    #[test]
+    fn a_secret_wrapped_over_many_short_lines_or_chunks_is_one_span() {
+        let secret = "sk-AbC123xyZ";
+        let m = m(&[("KEY", secret)]);
+        let run = |chunks: &[&str]| {
+            let mut s = Stream::lines();
+            let mut out = String::new();
+            for c in chunks {
+                out.push_str(&s.push_with(&m, c));
+            }
+            out + &s.finish_with(&m)
+        };
+        assert_eq!(run(&["sk-\n", "AbC\n", "123xyZ\n"]), "[secret:KEY]\n\n\n");
+        assert_eq!(
+            run(&["a s", "k-A", "b", "C1\r\n2", "3x", "yZ b\n"]),
+            "a [secret:KEY]\r\n b\n"
+        );
+        let text = "err: sk-AbC123xyZ done\n";
+        let chars: Vec<String> = text.chars().map(String::from).collect();
+        let pieces: Vec<&str> = chars.iter().map(String::as_str).collect();
+        assert_eq!(run(&pieces), "err: [secret:KEY] done\n");
+        // The excerpt of a child's stderr uses the same stream.
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-wrap-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        register("wrap-srv", "KEY", secret);
+        assert_eq!(
+            redact_excerpt("a sk-\nAbC\n123xyZ b\n"),
+            "a [secret:KEY]\n\n b\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_end_of_a_stream_keeps_a_short_tail_and_removes_a_cut_secret() {
+        let m = m(&[("KEY", "sk-AbC123xyZ")]);
+        let end = |text: &str| {
+            let mut s = Stream::lines();
+            let out = s.push_with(&m, text);
+            out + &s.finish_with(&m)
+        };
+        // Shorter than any piece the dangling-edge rule removes: kept.
+        assert_eq!(end("ends with sk-"), "ends with sk-");
+        // A longer start of the secret is removed.
+        assert_eq!(end("ends with sk-AbC12"), "ends with [secret:KEY]");
+        assert_eq!(end("ordinary words\n"), "ordinary words\n");
+    }
+
+    #[test]
+    fn the_exemption_is_the_registered_value_in_any_spelling() {
+        use serde_json::json;
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-exempt-id-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        register("srv-x", "TOKEN", "Exempt-Secret-42x");
+        register("srv-y", "TOKEN", "Other-Secret-77q");
+        // The client sent its value encoded: an echo of it is its own.
+        let request = json!({"arguments": {"q": "Exempt%2DSecret%2D42x"}});
+        let mut response =
+            json!({"text": "got Exempt-Secret-42x, Exempt%2DSecret%2D42x and Other-Secret-77q"});
+        redact_outgoing(&mut response, Some(&request));
+        assert_eq!(
+            response["text"],
+            "got Exempt-Secret-42x, Exempt%2DSecret%2D42x and [secret:TOKEN]"
+        );
+        // It sent the value as written: an encoded echo is exempt too.
+        let request = json!({"arguments": {"q": "Exempt-Secret-42x"}});
+        let mut response = json!({"text": "as Exempt%2DSecret%2D42x"});
+        assert!(!redact_outgoing(&mut response, Some(&request)));
+        // A progress stream of that request keeps it the same way.
+        let mut s = Stream::whole_for(exempt_values(Some(&request)));
+        let out = s.push("echo Exempt-Secret-42x and Other-Secret-77q.") + &s.finish();
+        assert_eq!(out, "echo Exempt-Secret-42x and [secret:TOKEN].");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn aliases_have_sixteen_hex_digits_and_a_colliding_one_is_never_advertised() {
+        use serde_json::json;
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-alias16-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        register("alias16", "NAMED", "collide-secret-77Q");
+        let tools = || {
+            vec![
+                json!({"name": "a-collide-secret-77Q"}),
+                json!({"name": "b-collide-secret-77Q"}),
+            ]
+        };
+        let mut items = tools();
+        let screened = screen_definitions("alias16", Catalog::Tool, &mut items);
+        assert_eq!(items.len(), 2);
+        for item in &items {
+            let name = item["name"].as_str().unwrap();
+            let suffix = name.split('~').nth(1).unwrap().trim_end_matches(']');
+            assert_eq!(suffix.len(), 16, "{name}");
+            assert!(suffix.bytes().all(|b| b.is_ascii_hexdigit()), "{name}");
+        }
+        assert!(screened.refused.is_empty());
+        // Two identifiers whose aliases collide: the second is not advertised,
+        // and the first keeps its alias.
+        ALIAS_HEX_FOR_TEST.with(|h| *h.borrow_mut() = Some("0".repeat(64)));
+        let mut items = tools();
+        let screened = screen_definitions("alias16", Catalog::Tool, &mut items);
+        ALIAS_HEX_FOR_TEST.with(|h| *h.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0]["name"], "a-[secret:NAMED~0000000000000000]");
+        assert_eq!(screened.refused.len(), 1);
+        assert!(
+            !screened.refused[0].contains("collide-secret"),
+            "{:?}",
+            screened.refused
+        );
+        screened.commit();
+    }
+
+    #[test]
+    fn without_a_matcher_logs_and_messages_keep_their_structure() {
+        use serde_json::json;
+        FAIL_BUILDS.with(|f| f.set(true));
+        let m = m(&[("KEY", "sk-UnbuiltSecret77")]);
+        FAIL_BUILDS.with(|f| f.set(false));
+        let line = r#"{"error":"sk-UnbuiltSecret77 rejected","code":5,"weird key!":"x"}"#;
+        let out = m.redact_line(line);
+        let v: Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(
+            v,
+            json!({"error": WITHHELD, "code": null, "withheld": WITHHELD})
+        );
+        let response = json!({"jsonrpc": "2.0", "id": 7, "result": {"text": "sk-UnbuiltSecret77"}});
+        assert_eq!(
+            withheld_message(&response),
+            json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32603, "message": WITHHELD_RESPONSE}})
+        );
+        let note = json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": {"message": "sk-UnbuiltSecret77"}});
+        let out = withheld_message(&note).to_string();
+        assert!(
+            out.contains("notifications/message") && !out.contains("Unbuilt"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_jwt_is_matched_by_signature_side_pieces_never_by_its_header() {
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        let m = m(&[("JWT", jwt)]);
+        // Another token from the same issuer shares the header: untouched.
+        let other =
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJvdGhlciJ9.c2lnbmF0dXJlLW9mLWFub3RoZXI";
+        assert_eq!(m.redact_text(other), other);
+        // The token itself, and a piece of its signature, are replaced.
+        assert_eq!(
+            m.redact_text(&format!("Bearer {jwt}")),
+            "Bearer [secret:JWT]"
+        );
+        assert_eq!(
+            m.redact_text("tail: wpMeJf36POk6yJV end"),
+            "tail: [secret:JWT] end"
+        );
+    }
+
+    /// One random secret, split into 1 to 6 pieces at random points, each piece
+    /// encoded at 0 to 2 levels on its own and set in random innocent text,
+    /// through all three sinks: a file scrub (pieces in the string values of a
+    /// JSON line, and wrapped over text lines), an outgoing result (pieces in
+    /// text leaves under one key, other fields between them) and the stderr
+    /// stream (pieces on lines, written in random chunks). No sink may emit a
+    /// form of the secret that decodes back to it, and the innocent text must
+    /// come back byte for byte.
+    ///
+    /// Out of reach by design: a piece encoded in base64 or hex on its own (only
+    /// the whole value has those forms), a split across a key and a value or
+    /// across two JSON records, a split between leaves under different key
+    /// names with other text leaves between them, more than four decoding
+    /// levels, and a case change of one piece of a value that is not hex or
+    /// base32.
+    #[test]
+    fn a_split_and_encoded_secret_never_leaves_any_sink_and_innocent_text_is_kept() {
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789-_";
+        const WORDS: &[&str] = &[
+            "alpha", "beta", "gamma", "delta", "note", "value", "result", "path", "ok", "line",
+        ];
+        let encode = |c: char, level: u64, form: u64| -> String {
+            let once = |text: &str, form: u64| -> String {
+                text.chars()
+                    .map(|c| match form {
+                        0 => format!("%{:02X}", c as u32),
+                        1 => format!("\\u{:04x}", c as u32),
+                        _ => format!("&#{};", c as u32),
+                    })
+                    .collect()
+            };
+            match level {
+                0 => c.to_string(),
+                1 => once(&c.to_string(), form),
+                _ => once(&once(&c.to_string(), form), (form + 1) % 3),
+            }
+        };
+        let decodes_to = |out: &str, secret: &str| {
+            out.contains(secret)
+                || crate::secret_normalize::levels(out)
+                    .iter()
+                    .any(|l| l.text.contains(secret))
+        };
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-soundness-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for case in 0..500 {
+            let len = 12 + next(13) as usize;
+            let secret: String = (0..len)
+                .map(|_| ALPHABET[next(ALPHABET.len() as u64) as usize] as char)
+                .collect();
+            let m = Matcher::new(&[("S", secret.as_str())]);
+            let n = 1 + next(6) as usize;
+            let mut cuts: Vec<usize> = (0..n - 1)
+                .map(|_| 1 + next(len as u64 - 1) as usize)
+                .collect();
+            cuts.sort_unstable();
+            cuts.dedup();
+            let mut bounds = vec![0];
+            bounds.extend(cuts);
+            bounds.push(len);
+            let chars: Vec<char> = secret.chars().collect();
+            let pieces: Vec<String> = bounds
+                .windows(2)
+                .map(|w| {
+                    let level = next(3);
+                    let form = next(3);
+                    chars[w[0]..w[1]]
+                        .iter()
+                        .map(|&c| encode(c, level, form))
+                        .collect()
+                })
+                .collect();
+            let word = |next: &mut dyn FnMut(u64) -> u64| WORDS[next(WORDS.len() as u64) as usize];
+            let before = format!("{} {} ", word(&mut next), word(&mut next));
+            let after = format!(" {} {}", word(&mut next), word(&mut next));
+            let ctx = format!("case {case} secret {secret} pieces {pieces:?}");
+
+            // Outgoing result: pieces in "text" leaves, with "type" between.
+            let mut texts: Vec<String> = pieces.clone();
+            texts[0] = format!("{before}{}", texts[0]);
+            let last = texts.len() - 1;
+            texts[last] = format!("{}{after}", texts[last]);
+            let content: Vec<Value> = texts
+                .iter()
+                .map(|t| serde_json::json!({"type": "text", "text": t}))
+                .collect();
+            let mut result = serde_json::json!({"content": content, "note": "innocent words"});
+            m.value_with(&mut result, false, None);
+            let joined: String = result["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["text"].as_str().unwrap().to_string())
+                .collect();
+            assert!(!decodes_to(&joined, &secret), "result: {joined} {ctx}");
+            assert!(
+                joined.starts_with(&before) && joined.ends_with(&after),
+                "result: {joined} {ctx}"
+            );
+            assert_eq!(result["note"], "innocent words");
+
+            // Stderr stream: one piece per line, written in random chunks.
+            let stderr = format!("{before}{}{after}\nnext line\n", pieces.join("\n"));
+            let mut stream = Stream::lines();
+            let mut out = String::new();
+            let bytes = stderr.as_bytes();
+            let mut at = 0;
+            while at < bytes.len() {
+                let mut to = (at + 1 + next(9) as usize).min(bytes.len());
+                while !stderr.is_char_boundary(to) {
+                    to += 1;
+                }
+                out.push_str(&stream.push_with(&m, &stderr[at..to]));
+                at = to;
+            }
+            out.push_str(&stream.finish_with(&m));
+            let flat = out.replace('\n', "");
+            assert!(!decodes_to(&flat, &secret), "stderr: {out:?} {ctx}");
+            assert!(
+                out.starts_with(&before) && out.ends_with(&format!("{after}\nnext line\n")),
+                "stderr: {out:?} {ctx}"
+            );
+            assert_eq!(
+                out.matches('\n').count(),
+                stderr.matches('\n').count(),
+                "{ctx}"
+            );
+
+            // File scrub: the pieces as string values of a JSON line, and the
+            // same text wrapped over the lines of a text log.
+            let values: Vec<Value> = texts.iter().map(|t| Value::String(t.clone())).collect();
+            let line = serde_json::json!({"parts": values, "id": case}).to_string();
+            let audit = dir.join("audit.jsonl");
+            std::fs::write(&audit, format!("{line}\n{{\"plain\":\"innocent\"}}\n")).unwrap();
+            let log = dir.join("gateway.log");
+            std::fs::write(&log, &stderr).unwrap();
+            scrub_file_with(&m, &audit).unwrap();
+            scrub_file_with(&m, &log).unwrap();
+            let audit_text = std::fs::read_to_string(&audit).unwrap();
+            let log_text = std::fs::read_to_string(&log).unwrap();
+            let first = audit_text.lines().next().unwrap();
+            let parsed: Value =
+                serde_json::from_str(first).unwrap_or_else(|e| panic!("{e}: {first} {ctx}"));
+            let joined: String = parsed["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_str().unwrap().to_string())
+                .collect();
+            assert!(!decodes_to(&joined, &secret), "scrub json: {first} {ctx}");
+            assert!(
+                joined.starts_with(&before) && joined.ends_with(&after),
+                "scrub json: {first} {ctx}"
+            );
+            assert!(audit_text.ends_with("{\"plain\":\"innocent\"}\n"), "{ctx}");
+            assert!(
+                !decodes_to(&log_text.replace('\n', ""), &secret),
+                "scrub log: {log_text:?} {ctx}"
+            );
+            assert!(
+                log_text.starts_with(&before)
+                    && log_text.ends_with(&format!("{after}\nnext line\n")),
+                "scrub log: {log_text:?} {ctx}"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

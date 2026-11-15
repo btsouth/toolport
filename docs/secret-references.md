@@ -81,41 +81,59 @@ OAuth debug log) and in every message sent to a client: responses, notifications
 progress and server requests. It matches the value as written and trimmed, in
 upper and lower case, NFC and NFKC, percent and form encoding, hex (in any case),
 JSON escaped once or twice, base64 in four alphabets, base64 inside a longer
-blob, and PEM lines. It also decodes text that uses JSON `\u` escapes, percent
-encoding or HTML entities (numeric or named, with or without `;`), mixed
-character by character and nested one level, and replaces the encoded text
-where it is written. A value that is itself hex or base32 matches in any case.
+blob, and PEM lines. It also decodes text that uses JSON escapes, percent or
+form encoding or HTML entities (numeric or named, with or without `;`), mixed
+character by character, and searches every decoded level up to four deep (for
+example a value percent-encoded twice inside a JSON string inside a log line).
+A match at any level replaces the encoded text where it is written and leaves
+everything around it as it was. A value that is itself hex or base32 matches in
+any case. A JWT is matched whole, and by pieces only on its signature side: its
+header is the same in every token an issuer signs.
 An object key that is a registered value is replaced too, and so is a JSON
 number that is a numeric secret of 6 or more digits. In error text and stderr,
 an 8-character piece of a secret (12 characters or longer) is redacted as well,
 and so is the piece of one at the edge of a cut.
 
 Each Activity row for a tool call records which secrets the result carried, by
-name and count (`secretsReplaced`), never the values.
+name and count (`secretsReplacedInResult`), never the values. It counts the
+replacements in the result sent to the client only.
 
-Text written in pieces is checked as one stream. The gateway's stderr, a
-server's stderr tail in an error, and the progress messages of one call hold
-back any ending that could be the start of a secret until the next piece shows
-whether the rest follows. A secret split across the text fields of one message
-is matched however the fields are nested.
+Text written in pieces is matched as one text, so a secret split over any
+number of pieces of any size is found. The pieces are the string fields of one
+message, a log line or a definition (however they are nested), the lines and
+chunks of a stderr stream, the lines of a server's stderr tail in an error, the
+text lines of a log being cleaned up, and the progress messages of one call.
+What sits between the pieces (other JSON, line endings) is kept where it was.
+A stream holds back only the ending that could still become a secret, at any
+decoding level, which is never longer than the longest registered form. At the
+end of a stream a held ending shorter than 6 characters is written as it is;
+a longer one that is the start of a secret is replaced. A progress message
+that ends that way is held whole and merged into the next one, or delivered
+when its call ends, before the response.
 
 If the redactor cannot be built for the configured secrets, Toolport does not
-fall back to writing text as is: logs and messages show
-`[withheld: secret redaction unavailable]` in place of their text, and
-`toolport_status` says why.
+fall back to writing text as is. Every response a client gets is a valid JSON-RPC
+error with its `id`, notifications become a fixed log message, log lines keep
+their JSON structure with `[withheld: secret redaction unavailable]` in place of
+every value, and a `toolport_status` call answers with what is wrong.
 
 Some things are deliberately left alone:
 
-- A value the client sent in its own request is returned as the server sent it.
-  The client already holds it, and replacing it would change what it asked for,
-  such as a file it read.
+- A value the client sent in its own request is returned as the server sent it,
+  in a response or in that call's progress. The client already holds it, and
+  replacing it would change what it asked for, such as a file it read. This is
+  keyed on the registered value, not on how it was spelled: a value the client
+  sent encoded is its own too, and another secret under the same name is not.
 - Tool, prompt and resource definitions are matched by whole value only, so an
   ordinary name that shares a few characters with a secret is never renamed. A
   name or argument name that holds a secret is advertised with a marker that
-  carries a short keyed hash, such as `[secret:API_KEY~3f9a0c12]`. The hash is
-  the same on every start for the same name, so integrity pins, quarantine and
-  Activity (which all use the advertised name) stay stable, and two different
-  names never share one. Calls still reach the server under its real name.
+  carries 16 hex digits of a keyed hash, such as
+  `[secret:API_KEY~3f9a0c12d4e5b6a7]`. The hash is the same on every start for
+  the same name, so integrity pins, quarantine and Activity (which all use the
+  advertised name) stay stable. Two different names never share one: if two
+  ever hashed alike, the second item is not advertised and the gateway log says
+  so. Calls still reach the server under its real name. Descriptions and other
+  text in a definition are matched as one text, like a result.
 - The registry and client config backups hold inline values the way you typed
   them. They are your configuration, not logs.
 
@@ -126,13 +144,14 @@ Known limits:
   server and key, never the value) so you can use a longer one. A numeric
   secret under 6 digits is not replaced where it appears as a JSON number,
   because ports and counts would be replaced too; status names those as well.
-- Streams are checked within one stream only: one stderr, one server's tail,
-  the progress messages of one call. A secret split across two different calls,
-  servers or log records, mixed with other text at the break, or transformed
-  in a way not listed above (encrypted, compressed, reversed) is not matched.
-  The held ending of a progress stream is dropped when its call ends; it is at
-  most the start of a registered value. Output a hard kill cuts off while it
-  is held is lost rather than written unredacted.
+- Pieces are matched within one text only: one message, one log record, one
+  stderr, one server's tail, the progress of one call. A secret split across
+  two different calls, servers or log records, across an object key and a
+  value, between fields under different keys with other text fields between
+  them, mixed with other text at the break, encoded more than four levels deep,
+  or transformed in a way not listed above (a piece on its own in base64 or
+  hex, encrypted, compressed, reversed) is not matched. Output a hard kill cuts
+  off while it is held is lost rather than written unredacted.
 - Every Toolport process (each gateway role and both apps) passes its stderr
   through the redactor, so a client's own log of the gateway's stderr gets the
   same markers. That log is outside Toolport's files, so a copy written before
@@ -142,6 +161,8 @@ Known limits:
 When a stored secret is replaced or deleted, Toolport first scrubs its data
 directory for the old value. If that cleanup fails, the old value stays in the
 vault (never on disk) until a later start finishes it, and `toolport_status`
-says so. Each process also scrubs, once, for every value it knows, so copies an
+says so. A log file that has other hard links is never changed (that would
+change the other file too): the cleanup stays unfinished and status names the
+file and why. Each process also scrubs, once, for every value it knows, so copies an
 older build wrote are rewritten. A scrub that is queued when the process exits
 runs first, or is left marked for the next start.

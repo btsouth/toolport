@@ -5937,7 +5937,11 @@ fn execute_call(
     //
     // Identity already comes from `exec_router` via the SOU-478 rebind above
     // (SOU-474 originally fixed only this progress path).
-    let (_progress_route, relay_owned) = prepare_progress(client_meta, server_id);
+    let (_progress_route, relay_owned) = prepare_progress(
+        client_meta,
+        Some(&json!({ "arguments": client_arguments })),
+        server_id,
+    );
     let client_meta = relay_owned.as_ref().or(client_meta);
 
     // Resolve pseudonyms LAST, immediately before the call leaves the machine, so
@@ -9081,7 +9085,7 @@ fn handle_request_with_cancel(
             let client_meta = params.and_then(|p| p.get("_meta")).cloned();
             let mrtr = MrtrRequest::from_params(params);
             let (_progress_route, relay_owned) = match router.resource_server(uri) {
-                Some(owner) => prepare_progress(client_meta.as_ref(), owner),
+                Some(owner) => prepare_progress(client_meta.as_ref(), params, owner),
                 None => (None, None),
             };
             let client_meta = relay_owned.or(client_meta);
@@ -9237,7 +9241,7 @@ fn handle_request_with_cancel(
             let client_meta = params.and_then(|p| p.get("_meta")).cloned();
             let mrtr = MrtrRequest::from_params(params);
             let (_progress_route, relay_owned) = match router.prompt_server(name) {
-                Some(owner) => prepare_progress(client_meta.as_ref(), owner),
+                Some(owner) => prepare_progress(client_meta.as_ref(), params, owner),
                 None => (None, None),
             };
             let client_meta = relay_owned.or(client_meta);
@@ -10815,12 +10819,18 @@ struct ProgressRoute {
     /// own unique token downstream and translates back here, the same way it
     /// namespaces tool names.
     client_token: Value,
-    /// The progress messages of this call are one stream: a message that ends
-    /// with what may be the start of a secret has that tail held and matched
-    /// with the next message, so a secret split across two notifications is
-    /// never delivered in pieces. What is still held when the call ends is
-    /// dropped (it is at most the start of a registered form).
+    /// The progress messages of this call are one stream: a secret split over
+    /// any number of notifications is matched whole. A notification whose
+    /// message ends in what may be the start of a secret is held whole and
+    /// merged into the next one (progress is cumulative, so the later values
+    /// stand for both); one still held when the call ends is delivered then,
+    /// before the response, with the end-of-stream rule applied.
     messages: conduit_lib::secret_redact::Stream,
+    /// The registered values the client sent in the request (any spelling):
+    /// echoed in its progress, they are its own and are left as they are.
+    exempt: Option<Arc<std::collections::HashSet<String>>>,
+    /// A notification held as above, with the message text written so far.
+    held: Option<(Value, String)>,
     /// The request instance that asked for it. Its progress is delivered only while
     /// that instance is live, so a cancelled call's late progress never reaches the
     /// client, which may already have reused the token for its next request.
@@ -10848,6 +10858,10 @@ const PROGRESS_STDIO_QUEUE: usize = 256;
 #[derive(Default)]
 struct ProgressRoutes {
     active: HashMap<String, ProgressRoute>,
+    /// Delivers a finished notification to a session: set by
+    /// [`make_progress_sink`], used for a notification still held when its call
+    /// ends.
+    deliver: Option<Arc<dyn Fn(&str, &Value, Option<&downstream::CancelContext>) + Send + Sync>>,
     /// Minting counter for our own progress tokens: monotonic, so a token is never
     /// reused while an earlier call is still in flight. It lives on the table
     /// rather than in a process global because a token is only ever resolved
@@ -10867,11 +10881,46 @@ struct ProgressRegistration {
 
 impl Drop for ProgressRegistration {
     fn drop(&mut self) {
-        self.table
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .active
-            .remove(&self.key);
+        let (route, deliver) = {
+            let mut table = self
+                .table
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (table.active.remove(&self.key), table.deliver.clone())
+        };
+        // The call is over: a held notification is delivered now, with what
+        // its stream still held written under the end-of-stream rule.
+        let Some(mut route) = route else { return };
+        let Some((mut note, mut text)) = route.held.take() else {
+            return;
+        };
+        text.push_str(&route.messages.finish());
+        if let Some(message) = note.pointer_mut("/params/message") {
+            *message = Value::String(text);
+        }
+        finish_progress_note(&mut note, &route);
+        if let Some(deliver) = deliver {
+            deliver(&route.session, &note, route.owner.as_ref());
+        }
+    }
+}
+
+/// The last pass on a progress notification of `route`: every secret not in
+/// the client's own request is replaced, and the client's token restored.
+fn finish_progress_note(note: &mut Value, route: &ProgressRoute) {
+    conduit_lib::secret_redact::redact_outgoing_exempt(note, route.exempt.as_deref());
+    if let Some(params) = note.get_mut("params").and_then(Value::as_object_mut) {
+        params.insert("progressToken".to_string(), route.client_token.clone());
+        if let Some(tag) = route
+            .owner
+            .as_ref()
+            .and_then(downstream::CancelContext::adapter_tag)
+        {
+            let meta = params.entry("_meta").or_insert_with(|| json!({}));
+            if let Some(meta) = meta.as_object_mut() {
+                meta.insert(ADAPTER_REQUEST_META.to_string(), json!(tag));
+            }
+        }
     }
 }
 
@@ -10883,10 +10932,12 @@ impl Drop for ProgressRegistration {
 fn register_progress(
     table: &Arc<Mutex<ProgressRoutes>>,
     client_meta: Option<&Value>,
+    request: Option<&Value>,
     producer: &str,
     session: &str,
 ) -> Option<(ProgressRegistration, String)> {
     let client_token = client_meta?.get("progressToken")?.clone();
+    let exempt = conduit_lib::secret_redact::exempt_values(request);
     // Mint our own token rather than reusing the client's. Two clients picking
     // the same value (integers are common) would otherwise share a table entry,
     // so the counter lives on the table itself rather than in a global.
@@ -10901,7 +10952,9 @@ fn register_progress(
             session: session.to_string(),
             producer: producer.to_string(),
             client_token,
-            messages: conduit_lib::secret_redact::Stream::whole(),
+            messages: conduit_lib::secret_redact::Stream::whole_for(exempt.clone()),
+            exempt,
+            held: None,
             owner: APPROVAL_CANCEL.with(|current| current.borrow().clone()),
         },
     );
@@ -10922,6 +10975,7 @@ fn register_progress(
 /// rather than being repeated.
 fn prepare_progress(
     client_meta: Option<&Value>,
+    request: Option<&Value>,
     producer: &str,
 ) -> (Option<ProgressRegistration>, Option<Value>) {
     let Some(meta) = client_meta else {
@@ -10932,7 +10986,7 @@ fn prepare_progress(
     }
     match progress_target() {
         Some(session) => {
-            match register_progress(progress_routes(), client_meta, producer, &session) {
+            match register_progress(progress_routes(), client_meta, request, producer, &session) {
                 Some((registration, token)) => {
                     let mut relayed = meta.clone();
                     if let Some(obj) = relayed.as_object_mut() {
@@ -10965,27 +11019,27 @@ fn deliver_progress(
         return;
     };
     let mut note = note.clone();
-    let (session, client_token, owner) = {
+    let (session, owner) = {
         let mut table = routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match table.active.get_mut(&key) {
             Some(route) if route.producer == producer => {
-                if let Some(message) = note
-                    .get_mut("params")
-                    .and_then(|p| p.get_mut("message"))
-                    .and_then(|m| match m {
-                        Value::String(text) => Some(text),
-                        _ => None,
-                    })
-                {
-                    *message = route.messages.push(message);
+                if let Some(Value::String(message)) = note.pointer_mut("/params/message") {
+                    let ready = route.messages.push(message);
+                    let mut text = route.held.take().map(|(_, t)| t).unwrap_or_default();
+                    text.push_str(&ready);
+                    if route.messages.is_holding() {
+                        // Its end may be the start of a secret: held whole,
+                        // merged into the next notification or delivered when
+                        // the call ends.
+                        route.held = Some((note, text));
+                        return;
+                    }
+                    *message = text;
                 }
-                (
-                    route.session.clone(),
-                    route.client_token.clone(),
-                    route.owner.clone(),
-                )
+                finish_progress_note(&mut note, route);
+                (route.session.clone(), route.owner.clone())
             }
             Some(route) => {
                 eprintln!(
@@ -11000,21 +11054,17 @@ fn deliver_progress(
             None => return,
         }
     };
-    // Hand the client back ITS token; ours is an internal correlator.
-    conduit_lib::secret_redact::redact_outgoing(&mut note, None);
-    if let Some(params) = note.get_mut("params").and_then(Value::as_object_mut) {
-        params.insert("progressToken".to_string(), client_token);
-        if let Some(tag) = owner
-            .as_ref()
-            .and_then(downstream::CancelContext::adapter_tag)
-        {
-            let meta = params.entry("_meta").or_insert_with(|| json!({}));
-            if let Some(meta) = meta.as_object_mut() {
-                meta.insert(ADAPTER_REQUEST_META.to_string(), json!(tag));
-            }
-        }
-    }
-    let note = &note;
+    deliver_progress_to(stdio, mcp_sessions, &session, &note, owner.as_ref());
+}
+
+/// Hand one finished progress notification to the client session `session`.
+fn deliver_progress_to(
+    stdio: &Arc<SessionState>,
+    mcp_sessions: &McpSessions,
+    session: &str,
+    note: &Value,
+    owner: Option<&downstream::CancelContext>,
+) {
     if session == RESOURCE_SUB_STDIO {
         // Hand off rather than write here. This runs on the downstream drain
         // thread, BEFORE that thread forwards response lines to the request loop.
@@ -11030,7 +11080,7 @@ fn deliver_progress(
             eprintln!("toolport: stdio progress for a session with no stdio face; dropped");
             return;
         };
-        if sender.try_send((note.clone(), owner)).is_err() {
+        if sender.try_send((note.clone(), owner.cloned())).is_err() {
             eprintln!("toolport: stdio progress queue full or closed; progress dropped");
         }
         return;
@@ -11041,19 +11091,19 @@ fn deliver_progress(
     let sessions = mcp_sessions
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(target) = sessions.get(&session) else {
+    let Some(target) = sessions.get(session) else {
         return;
     };
     if target.is_expired() || target.closed.load(Ordering::SeqCst) {
         return;
     }
     let push = || {
-        if !target.push_message(json, None) {
+        if !target.push_redacted(json, None) {
             eprintln!("toolport: MCP session outbound queue full; progress dropped");
         }
     };
     // Queued only while its request is live, as one step against its cancellation.
-    match &owner {
+    match owner {
         Some(owner) => {
             owner.speak_with(push);
         }
@@ -11075,6 +11125,15 @@ fn make_progress_sink(
     mcp_sessions: McpSessions,
     routes: Arc<Mutex<ProgressRoutes>>,
 ) -> ProgressDispatch {
+    {
+        let (stdio, mcp_sessions) = (Arc::clone(&stdio), mcp_sessions.clone());
+        routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .deliver = Some(Arc::new(move |session: &str, note: &Value, owner: Option<&downstream::CancelContext>| {
+            deliver_progress_to(&stdio, &mcp_sessions, session, note, owner);
+        }));
+    }
     Arc::new(move |producer: String, note: Value| {
         deliver_progress(&stdio, &mcp_sessions, &routes, &producer, &note);
     })
@@ -15668,6 +15727,13 @@ impl SessionState {
         // Notifications and server requests carry upstream text with no client
         // request behind them.
         let json = conduit_lib::secret_redact::redact_outgoing_json(json);
+        self.push_redacted(json, request_id)
+    }
+
+    /// [`Self::push_message`] for a message already given its last redaction
+    /// pass with the request it answers (a call's progress, which keeps the
+    /// client's own values), so that pass is not undone by one without it.
+    fn push_redacted(&self, json: String, request_id: Option<String>) -> bool {
         match &self.transport {
             SessionTransportFace::Stdio(stdout) => {
                 let Ok(value) = serde_json::from_str::<Value>(&json) else {
@@ -17379,7 +17445,29 @@ fn process_request_wire(
     if let Some(response) = &mut response {
         // Every server's secrets, after any per-server pass: a value one server
         // returns is never handed to a client unless the client sent it.
-        conduit_lib::secret_redact::redact_outgoing(&mut response.envelope, req.get("params"));
+        match conduit_lib::secret_redact::unavailable_reason() {
+            // Fail closed, but keep the protocol: a status call still says what
+            // is wrong, with fixed text that holds no upstream content.
+            Some(reason)
+                if method == "tools/call"
+                    && req.pointer("/params/name").and_then(Value::as_str)
+                        == Some("toolport_status")
+                    && response.envelope.get("id").is_some() =>
+            {
+                let id = response.envelope["id"].clone();
+                response.envelope = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "content": [{ "type": "text", "text": reason }], "isError": true },
+                });
+            }
+            _ => {
+                conduit_lib::secret_redact::redact_outgoing(
+                    &mut response.envelope,
+                    req.get("params"),
+                );
+            }
+        }
         response.observation = Some(observed.clone());
         response.tools_list = method == "tools/list";
         response.listed_tools = holder
@@ -38956,7 +39044,7 @@ mod tests {
         );
 
         let meta = json!({ "progressToken": "must-not-route" });
-        let (registration, relayed) = prepare_progress(Some(&meta), "alpha");
+        let (registration, relayed) = prepare_progress(Some(&meta), None, "alpha");
         assert!(registration.is_none());
         assert!(relayed
             .expect("metadata is relayed without progress")
@@ -38984,7 +39072,7 @@ mod tests {
             "no session and no stdio: nowhere to deliver"
         );
 
-        let (registration, relayed) = prepare_progress(Some(&meta), "alpha");
+        let (registration, relayed) = prepare_progress(Some(&meta), None, "alpha");
         assert!(registration.is_none(), "nothing to register against");
         let relayed = relayed.expect("_meta is still relayed, minus the token");
         assert!(
@@ -39013,7 +39101,7 @@ mod tests {
         );
 
         let meta = json!({ "progressToken": 7 });
-        let (registration, relayed) = prepare_progress(Some(&meta), "alpha");
+        let (registration, relayed) = prepare_progress(Some(&meta), None, "alpha");
         assert!(
             registration.is_some(),
             "a deliverable token gets a live route"
@@ -39044,6 +39132,7 @@ mod tests {
         let (_registration, wire_token) = register_progress(
             &routes,
             Some(&json!({ "progressToken": "tok-1" })),
+            None,
             "alpha",
             &s1,
         )
@@ -39087,6 +39176,7 @@ mod tests {
         let (_registration, wire) = register_progress(
             &routes,
             Some(&json!({ "progressToken": "tok-split" })),
+            None,
             "alpha",
             &s1,
         )
@@ -39111,16 +39201,119 @@ mod tests {
             );
         }
         let got = drain_session(&state, &s1);
-        assert_eq!(got.len(), 2, "{got:?}");
+        // The first ends in what may be the start of the secret: it is held
+        // whole and merged into the second, so progress stays increasing.
+        assert_eq!(got.len(), 1, "{got:?}");
         let joined = got.join("\n");
         for piece in ["sk-Progr", "essSecret456", "Secret456"] {
             assert!(!joined.contains(piece), "{piece} delivered: {joined}");
         }
-        assert!(got[0].contains("\"uploading with \""), "{}", got[0]);
         assert!(
-            got[1].contains("\"[secret:PROGRESS_KEY] accepted\""),
+            got[0].contains("\"uploading with [secret:PROGRESS_KEY] accepted\""),
             "{}",
-            got[1]
+            got[0]
+        );
+        assert!(got[0].contains("\"progress\":1"), "{}", got[0]);
+    }
+
+    #[test]
+    fn progress_keeps_the_clients_own_secret_and_delivers_a_held_note_when_the_call_ends() {
+        let _data = DataDirTestEnv::new("progress-exempt-held");
+        conduit_lib::secret_redact::register("alpha", "OWN", "sk-OwnProgress789");
+        conduit_lib::secret_redact::register("alpha", "OTHER", "sk-OtherProg321");
+        let state = http_state(false);
+        let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
+        let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+        let (stdio, _stdio_rx) = stdio_session_with_progress();
+        {
+            let (stdio, sessions) = (Arc::clone(&stdio), state.mcp_sessions.clone());
+            routes.lock().unwrap().deliver = Some(Arc::new(move |session: &str, note: &Value, owner: Option<&downstream::CancelContext>| {
+                deliver_progress_to(&stdio, &sessions, session, note, owner);
+            }));
+        }
+        let request = json!({ "arguments": { "key": "sk-OwnProgress789" } });
+        let note = |wire: &str, progress: u64, message: &str| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {"progressToken": wire, "progress": progress, "message": message}
+            })
+        };
+        for (tail, expected) in [
+            ("almost sk-Ot", "\"almost sk-Ot\""),
+            ("almost sk-OtherP", "\"almost [secret:OTHER]\""),
+        ] {
+            let (registration, wire) = register_progress(
+                &routes,
+                Some(&json!({ "progressToken": "tok-own" })),
+                Some(&request),
+                "alpha",
+                &s1,
+            )
+            .unwrap();
+            for (i, message) in ["echo sk-OwnProgress789 ok", tail].iter().enumerate() {
+                deliver_progress(
+                    &stdio,
+                    &state.mcp_sessions,
+                    &routes,
+                    "alpha",
+                    &note(&wire, i as u64, message),
+                );
+            }
+            let got = drain_session(&state, &s1);
+            assert_eq!(got.len(), 1, "{got:?}");
+            // The client sent this value: its echo is its own.
+            assert!(
+                got[0].contains("\"echo sk-OwnProgress789 ok\""),
+                "{}",
+                got[0]
+            );
+            // The call ends: the held note is delivered, under the end rule.
+            drop(registration);
+            let got = drain_session(&state, &s1);
+            assert_eq!(got.len(), 1, "{got:?}");
+            assert!(got[0].contains(expected), "{}", got[0]);
+            assert!(got[0].contains("tok-own"), "{}", got[0]);
+        }
+    }
+
+    #[test]
+    fn without_secret_redaction_clients_get_valid_replies_and_status_says_why() {
+        let _data = DataDirTestEnv::new("redaction-unavailable");
+        conduit_lib::secret_redact::register("alpha", "KEY", "sk-UnavailableSecret12");
+        conduit_lib::secret_redact::force_unavailable_for_test(true);
+        let state = http_state(false);
+        let call = |req: Value| {
+            process_request_wire(
+                &state,
+                &req,
+                &SearchGuard::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                DiscoveryMode::Full,
+            )
+            .expect("a reply")
+            .into_value()
+        };
+        let status = call(
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"toolport_status","arguments":{}}}),
+        );
+        let list = call(json!({"jsonrpc":"2.0","id":4,"method":"tools/list"}));
+        conduit_lib::secret_redact::force_unavailable_for_test(false);
+        assert_eq!(status["jsonrpc"], "2.0");
+        assert_eq!(status["id"], 3);
+        let text = status["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("Secret redaction is unavailable"),
+            "{text}"
+        );
+        assert_eq!(
+            list,
+            json!({"jsonrpc":"2.0","id":4,"error":{"code":-32603,"message":conduit_lib::secret_redact::WITHHELD_RESPONSE}})
         );
     }
 
@@ -39140,10 +39333,22 @@ mod tests {
         let (stdio, _stdio_rx) = stdio_session_with_progress();
 
         // Same client token, same downstream server, two different clients.
-        let (_r1, wire1) =
-            register_progress(&routes, Some(&json!({ "progressToken": 1 })), "alpha", &s1).unwrap();
-        let (_r2, wire2) =
-            register_progress(&routes, Some(&json!({ "progressToken": 1 })), "alpha", &s2).unwrap();
+        let (_r1, wire1) = register_progress(
+            &routes,
+            Some(&json!({ "progressToken": 1 })),
+            None,
+            "alpha",
+            &s1,
+        )
+        .unwrap();
+        let (_r2, wire2) = register_progress(
+            &routes,
+            Some(&json!({ "progressToken": 1 })),
+            None,
+            "alpha",
+            &s2,
+        )
+        .unwrap();
         assert_ne!(wire1, wire2, "each call gets its own downstream token");
         assert_eq!(
             routes.lock().unwrap().active.len(),
@@ -39177,6 +39382,7 @@ mod tests {
         let (registration, wire_token) = register_progress(
             &routes,
             Some(&json!({ "progressToken": "tok-1" })),
+            None,
             "alpha",
             &s1,
         )
@@ -39254,6 +39460,7 @@ mod tests {
         let (_reg, wire) = register_progress(
             &routes,
             Some(&json!({ "progressToken": "tok-1" })),
+            None,
             "alpha",
             RESOURCE_SUB_STDIO,
         )
@@ -39356,10 +39563,11 @@ mod tests {
         // leave no state behind.
         let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
         let (_stdio, _stdio_rx) = stdio_session_with_progress();
-        assert!(register_progress(&routes, None, "alpha", "stdio").is_none());
+        assert!(register_progress(&routes, None, None, "alpha", "stdio").is_none());
         assert!(register_progress(
             &routes,
             Some(&json!({ "traceparent": "x" })),
+            None,
             "alpha",
             "stdio"
         )
@@ -50318,9 +50526,12 @@ mod tests {
         let second = Arc::new(Mutex::new(ProgressRoutes::default()));
         let meta = json!({ "progressToken": 7 });
 
-        let (first_a, token_a) = register_progress(&first, Some(&meta), "alpha", "s1").unwrap();
-        let (first_b, token_b) = register_progress(&first, Some(&meta), "alpha", "s2").unwrap();
-        let (_second_a, token_c) = register_progress(&second, Some(&meta), "alpha", "s3").unwrap();
+        let (first_a, token_a) =
+            register_progress(&first, Some(&meta), None, "alpha", "s1").unwrap();
+        let (first_b, token_b) =
+            register_progress(&first, Some(&meta), None, "alpha", "s2").unwrap();
+        let (_second_a, token_c) =
+            register_progress(&second, Some(&meta), None, "alpha", "s3").unwrap();
 
         assert_ne!(token_a, token_b, "one table must never mint a token twice");
         assert_eq!(token_a, "tp-1");

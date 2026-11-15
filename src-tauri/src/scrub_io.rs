@@ -44,6 +44,75 @@ pub fn rewrite_lines(
     skipped: &mut dyn FnMut(Skip),
     on_multi_link: &mut dyn FnMut() -> std::io::Result<bool>,
 ) -> std::io::Result<bool> {
+    rewrite_stream(
+        dir,
+        path,
+        &mut |line, out| {
+            if let Some(line) = line {
+                match redact(&String::from_utf8_lossy(line)) {
+                    Cow::Borrowed(_) => out.extend_from_slice(line),
+                    Cow::Owned(new) => out.extend_from_slice(new.as_bytes()),
+                }
+            }
+        },
+        skipped,
+        on_multi_link,
+    )
+}
+
+/// How many directory entries name the open file `file` (hard links).
+pub fn link_count(file: &File) -> std::io::Result<u64> {
+    Ok(sys::ident(file)?.links)
+}
+
+/// Whether a stream's output differs from its input, compared as both are
+/// produced (the output may lag behind, holding text back).
+#[derive(Default)]
+pub struct Diff {
+    pending: Vec<u8>,
+    changed: bool,
+}
+
+impl Diff {
+    pub fn input(&mut self, bytes: &[u8]) {
+        if !self.changed {
+            self.pending.extend_from_slice(bytes);
+        }
+    }
+
+    pub fn output(&mut self, bytes: &[u8]) {
+        if self.changed {
+            return;
+        }
+        if self.pending.starts_with(bytes) {
+            self.pending.drain(..bytes.len());
+        } else {
+            self.changed = true;
+            self.pending = Vec::new();
+        }
+    }
+
+    /// Whether the output already differs from the input so far.
+    pub fn diverged(&self) -> bool {
+        self.changed
+    }
+
+    /// At the end of both: whether they differ.
+    pub fn changed(&self) -> bool {
+        self.changed || !self.pending.is_empty()
+    }
+}
+
+/// [`rewrite_lines`] for a stateful redactor: `redact` gets each line (with
+/// its `\n`) and appends whatever output is ready, which may lag behind and
+/// may span lines, then gets `None` at the end to write the rest.
+pub fn rewrite_stream(
+    dir: &Path,
+    path: &Path,
+    redact: &mut dyn FnMut(Option<&[u8]>, &mut Vec<u8>),
+    skipped: &mut dyn FnMut(Skip),
+    on_multi_link: &mut dyn FnMut() -> std::io::Result<bool>,
+) -> std::io::Result<bool> {
     let loc = match locate(dir, path)? {
         Ok(loc) => loc,
         Err(skip) => {
@@ -78,29 +147,32 @@ pub fn rewrite_lines(
     };
     let tmp = sys::create_temp_like(&tmp_path, &source)?;
 
-    let mut changed = false;
+    let mut diff = Diff::default();
     {
         let mut reader = BufReader::with_capacity(64 * 1024, &source);
         let mut writer = BufWriter::with_capacity(64 * 1024, &tmp);
         let mut line = Vec::new();
+        let mut out = Vec::new();
         loop {
             line.clear();
-            if reader.read_until(b'\n', &mut line)? == 0 {
-                break;
+            let read = reader.read_until(b'\n', &mut line)?;
+            out.clear();
+            if read == 0 {
+                redact(None, &mut out);
+            } else {
+                diff.input(&line);
+                redact(Some(&line), &mut out);
             }
-            let text = String::from_utf8_lossy(&line);
-            match redact(&text) {
-                Cow::Borrowed(_) => writer.write_all(&line)?,
-                Cow::Owned(out) => {
-                    changed = true;
-                    writer.write_all(out.as_bytes())?;
-                }
+            diff.output(&out);
+            writer.write_all(&out)?;
+            if read == 0 {
+                break;
             }
         }
         writer.flush()?;
     }
     drop(source);
-    if !changed {
+    if !diff.changed() {
         drop(tmp);
         return Ok(false);
     }

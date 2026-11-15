@@ -175,9 +175,10 @@ pub fn record_routed_call(
         entry["clientLabel"] = json!(label);
     }
     // Which configured secrets the result carried, by name and count: the values
-    // themselves never reach the log.
+    // themselves never reach the log. Named for what it counts: replacements in
+    // the result sent to the client, not in logs or other output.
     if let Some(replaced) = secrets_replaced.filter(|m| !m.is_empty()) {
-        entry["secretsReplaced"] = json!(replaced);
+        entry["secretsReplacedInResult"] = json!(replaced);
     }
     if let Err(error) = crate::team_activity::record(reg, server_id, ok) {
         eprintln!("Toolport: Teams activity could not be persisted: {error}");
@@ -1279,9 +1280,9 @@ mod tests {
         let rows = read_recent(10).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         let read = rows.iter().find(|r| r["tool"] == "read").unwrap();
-        assert_eq!(read["secretsReplaced"], json!({"API_KEY": 2}));
+        assert_eq!(read["secretsReplacedInResult"], json!({"API_KEY": 2}));
         let plain = rows.iter().find(|r| r["tool"] == "plain").unwrap();
-        assert!(plain.get("secretsReplaced").is_none(), "{plain}");
+        assert!(plain.get("secretsReplacedInResult").is_none(), "{plain}");
     }
 
     #[test]

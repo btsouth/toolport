@@ -232,9 +232,17 @@ pub(crate) fn header_param_specs(tool: &Value) -> Result<Vec<HeaderParamSpec>, S
 fn screen_definitions_for_secrets(
     server_id: &str,
     catalog: crate::secret_redact::Catalog,
-    items: &mut [Value],
+    items: &mut Vec<Value>,
 ) -> crate::secret_redact::Screened {
     let screened = crate::secret_redact::screen_definitions(server_id, catalog, items);
+    for item in &screened.refused {
+        let message = format!(
+            "toolport: server '{server_id}' put a configured secret in the {} identifier '{item}', and its alias collided with another; the item is not advertised",
+            catalog.as_str()
+        );
+        eprintln!("{message}");
+        crate::gatewaylog::append(&message);
+    }
     for (tool, secrets) in &screened.flagged {
         let message = format!(
             "toolport: server '{server_id}' put a configured secret ({}) in the definition of {} '{tool}'; it is advertised with the value replaced",

@@ -81,11 +81,10 @@ pub fn append(dir: &Path, line: &str) {
 /// The relay threads that carry this process's stderr into `daemon.log`.
 static STDERR_RELAY: Mutex<Option<Relay>> = Mutex::new(None);
 
-/// How long an unterminated line waits for its newline before it is written
-/// anyway, so a partial write is never held past a crash for long.
+/// A pause long enough for the old timed flush of an unterminated line (kept
+/// for tests: text is now written as soon as it cannot be part of a secret).
+#[cfg(test)]
 const PARTIAL_FLUSH_AFTER: std::time::Duration = std::time::Duration::from_millis(200);
-/// Longest unterminated run kept back waiting for a newline.
-const MAX_PENDING_BYTES: usize = 64 * 1024;
 const RELAY_THREADS: [&str; 2] = ["toolport-stderr-read", "toolport-stderr-redact"];
 
 enum RelayMsg {
@@ -114,11 +113,12 @@ struct Relay {
 /// disk unredacted. Stderr becomes a pipe (fd 2 on Unix; on Windows both the
 /// process's standard error handle, which Rust reads on every write and hands to
 /// children, and the C runtime's fd 2). One thread reads it; another replaces
-/// resolved secret values and writes to the original destination, a line at a
-/// time. An unterminated line is written after [`PARTIAL_FLUSH_AFTER`] or past
-/// [`MAX_PENDING_BYTES`], with a secret cut at its end removed too, and the panic
+/// resolved secret values and writes to the original destination as one
+/// stream ([`RelayOut`]): text is written as soon as it cannot be part of a
+/// secret, and only the matcher's live prefix (at most the longest registered
+/// form) is held until the stream shows whether the rest follows. The panic
 /// hook, termination signals, console close events and explicit exits drain the
-/// relay first. A failed write is dropped, never propagated, so stderr itself
+/// relay first, which writes a held tail under the end-of-stream rule. A failed write is dropped, never propagated, so stderr itself
 /// can never fail.
 pub fn install_stderr_redactor() {
     use std::io::Read as _;
@@ -178,99 +178,58 @@ pub fn install_stderr_redactor() {
     }
 }
 
-/// The relay's output side. The last complete line is held until the next one
-/// arrives (or [`PARTIAL_FLUSH_AFTER`] passes), so a secret broken across a line
-/// break is matched on both sides of it.
+/// The relay's output side: everything read is one [`Stream::lines`] stream,
+/// so a secret wrapped over any number of lines or written in any number of
+/// chunks is matched whole, and only the matcher's live prefix is ever held.
+///
+/// [`Stream::lines`]: crate::secret_redact::Stream::lines
 struct RelayOut {
     out: std::fs::File,
-    held: Option<String>,
+    stream: crate::secret_redact::Stream,
+    /// The bytes of a character not complete yet.
+    partial_char: Vec<u8>,
 }
 
 impl RelayOut {
-    fn write(&mut self, text: &str, cut: bool) {
-        // A cut (not at a newline) may split a secret; the fragment pass also
-        // removes the piece of one left dangling at either edge.
-        let redacted = if cut {
-            crate::secret_redact::redact_fragment(text)
-        } else {
-            crate::secret_redact::redact_text(text)
-        };
-        let _ = self.out.write_all(redacted.as_bytes());
-    }
-
-    /// Pair the held line with `next`, write the held line, return `next` as
-    /// adjusted for a secret that crossed between them.
-    fn release(&mut self, next: String) -> String {
-        let Some(held) = self.held.take() else {
-            return next;
-        };
-        let body = held.trim_end_matches(['\n', '\r']);
-        let ending = &held[body.len()..];
-        match crate::secret_redact::redact_pair(body, &next) {
-            Some((a, b)) => {
-                self.write(&format!("{a}{ending}"), false);
-                b
-            }
-            None => {
-                self.write(&held, false);
-                next
-            }
+    fn new(out: std::fs::File) -> Self {
+        Self {
+            out,
+            stream: crate::secret_redact::Stream::lines(),
+            partial_char: Vec::new(),
         }
     }
 
-    fn line(&mut self, bytes: &[u8]) {
-        let next = self.release(String::from_utf8_lossy(bytes).into_owned());
-        self.held = Some(next);
-    }
-
-    fn partial(&mut self, bytes: &[u8], cut: bool) {
-        let next = self.release(String::from_utf8_lossy(bytes).into_owned());
-        self.write(&next, cut);
-    }
-
-    fn drain(&mut self) {
-        if let Some(held) = self.held.take() {
-            self.write(&held, false);
-        }
-        let _ = self.out.flush();
-    }
-
-    /// [`Self::drain`] on a timer: a held line whose end may be the start of a
-    /// secret broken across the line break stays held until the next line.
-    fn drain_settled(&mut self) {
-        let open = self.held.as_deref().is_some_and(|held| {
-            let body = held.trim_end_matches(['\n', '\r']);
-            crate::secret_redact::hold_from(body) < body.len()
-        });
-        if !open {
-            self.drain();
-        } else {
-            let _ = self.out.flush();
-        }
-    }
-
-    /// Write the part of an unterminated line that cannot be the start of a
-    /// secret, and keep the rest in `pending` for the next chunk.
-    fn partial_settled(&mut self, pending: &mut Vec<u8>) {
-        let valid = match std::str::from_utf8(pending) {
+    fn data(&mut self, bytes: &[u8]) {
+        self.partial_char.extend_from_slice(bytes);
+        let valid = match std::str::from_utf8(&self.partial_char) {
             Ok(text) => text.len(),
             // An unfinished character at the end waits for its last bytes.
             Err(e) if e.error_len().is_none() => e.valid_up_to(),
             Err(_) => {
-                // Not text: no secret can be matched across it, write it all.
-                self.partial(pending, true);
-                pending.clear();
+                let text = String::from_utf8_lossy(&self.partial_char).into_owned();
+                self.partial_char.clear();
+                let ready = self.stream.push(&text);
+                let _ = self.out.write_all(ready.as_bytes());
                 return;
             }
         };
-        let text = std::str::from_utf8(&pending[..valid]).expect("checked above");
-        let cut = crate::secret_redact::hold_from(text);
-        if cut == 0 {
-            return;
+        let text = std::str::from_utf8(&self.partial_char[..valid]).expect("checked above");
+        let ready = self.stream.push(text);
+        self.partial_char.drain(..valid);
+        let _ = self.out.write_all(ready.as_bytes());
+    }
+
+    /// The end of what was written so far (a sync or the end of the pipe).
+    fn drain(&mut self) {
+        if !self.partial_char.is_empty() {
+            let text = String::from_utf8_lossy(&self.partial_char).into_owned();
+            self.partial_char.clear();
+            let ready = self.stream.push(&text);
+            let _ = self.out.write_all(ready.as_bytes());
         }
-        let rest = pending.split_off(cut);
-        let ready = std::mem::replace(pending, rest);
-        self.partial(&ready, false);
+        let rest = self.stream.finish();
+        let _ = self.out.write_all(rest.as_bytes());
+        let _ = self.out.flush();
     }
 }
 
@@ -279,49 +238,18 @@ fn relay_writer(
     out: std::fs::File,
     done: std::sync::mpsc::Sender<()>,
 ) {
-    use std::sync::mpsc::RecvTimeoutError;
-    let mut pending: Vec<u8> = Vec::new();
-    let mut out = RelayOut { out, held: None };
-    loop {
-        match from_reader.recv_timeout(PARTIAL_FLUSH_AFTER) {
-            Ok(RelayMsg::Data(bytes)) => {
-                pending.extend_from_slice(&bytes);
-                if let Some(last) = pending.iter().rposition(|&b| b == b'\n') {
-                    let rest = pending.split_off(last + 1);
-                    for line in pending.split_inclusive(|&b| b == b'\n') {
-                        out.line(line);
-                    }
-                    pending = rest;
-                }
-                if pending.len() > MAX_PENDING_BYTES {
-                    out.partial_settled(&mut pending);
-                }
+    let mut out = RelayOut::new(out);
+    for msg in from_reader {
+        match msg {
+            RelayMsg::Data(bytes) => {
+                out.data(&bytes);
+                let _ = out.out.flush();
             }
-            Ok(RelayMsg::Sync(ack)) => {
-                if !pending.is_empty() {
-                    out.partial(&pending, true);
-                    pending.clear();
-                }
+            RelayMsg::Sync(ack) => {
                 out.drain();
                 let _ = ack.send(());
             }
-            // A pause: write what cannot be the start of a secret, hold the rest
-            // until the stream continues or the process ends (a sync).
-            Err(RecvTimeoutError::Timeout) => {
-                if !pending.is_empty() {
-                    out.partial_settled(&mut pending);
-                }
-                if pending.is_empty() {
-                    out.drain_settled();
-                } else {
-                    let _ = out.out.flush();
-                }
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
         }
-    }
-    if !pending.is_empty() {
-        out.partial(&pending, false);
     }
     out.drain();
     let _ = done.send(());

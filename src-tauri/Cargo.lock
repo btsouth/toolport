@@ -974,6 +974,7 @@ dependencies = [
  "ksni",
  "libadwaita",
  "libc",
+ "memchr",
  "rayon",
  "regex",
  "security-framework 3.7.0",

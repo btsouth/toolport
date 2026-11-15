@@ -149,20 +149,68 @@ pub fn incomplete_suffix_start(text: &str) -> Option<usize> {
     if !has_encoding(tail) {
         return None;
     }
-    let source = units_of(tail, window);
-    let first_level = undecided_start(&source);
-    // Decode what level one has decided, then look for an undecided level-two
-    // sequence that reaches the end of it (and so may continue into the
-    // undecided part).
-    let decided = first_level.unwrap_or(source.len());
+    // At each level, the decided part is decoded into the next level and
+    // searched there for an undecided sequence reaching its end (which may
+    // continue into what this level has not decided yet).
+    let mut units = units_of(tail, window);
+    let mut earliest: Option<usize> = None;
     let mut buf = Vec::new();
-    let mut first = Vec::with_capacity(decided);
-    decode_level(&source[..decided], &mut first, &mut buf);
-    let second_level = undecided_start(&first).map(|i| first[i].s);
-    match (first_level.map(|i| source[i].s), second_level) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
+    for _ in 0..=MAX_LEVELS {
+        let undecided = undecided_start(&units);
+        if let Some(i) = undecided {
+            let at = units[i].s;
+            earliest = Some(earliest.map_or(at, |e| e.min(at)));
+        }
+        let decided = undecided.unwrap_or(units.len());
+        if !units[..decided].iter().any(|u| is_introducer(u.c)) {
+            break;
+        }
+        let mut next = Vec::with_capacity(decided);
+        decode_level(&units[..decided], &mut next, &mut buf);
+        units = next;
     }
+    earliest
+}
+
+/// How many levels [`levels`] decodes at most: two levels of encoding (JSON
+/// escapes, percent or HTML entities, in any mix) plus two JSON string
+/// unwraps, which is what a secret inside MCP text content that itself carries
+/// serialized JSON, read from a serialized log line, needs. Every decoding is
+/// one level here whatever its kind, so any mix of four is covered.
+pub const MAX_LEVELS: usize = 4;
+
+/// Every decoded view of `text`, one per level (level 1 first), each with spans
+/// back to `text`. A level is only produced when decoding changed something;
+/// text with no introducer has none.
+pub fn levels(text: &str) -> Vec<Normalized> {
+    let mut out = Vec::new();
+    if !has_encoding(text) {
+        return out;
+    }
+    let mut units = units_of(text, 0);
+    let mut buf = Vec::new();
+    for _ in 0..MAX_LEVELS {
+        if !units.iter().any(|u| is_introducer(u.c)) {
+            break;
+        }
+        let mut next = Vec::with_capacity(units.len());
+        decode_level(&units, &mut next, &mut buf);
+        if next.len() == units.len() && next.iter().zip(&units).all(|(a, b)| a.c == b.c) {
+            break;
+        }
+        let mut text_out = String::with_capacity(next.len());
+        let mut spans = Vec::with_capacity(next.len());
+        for u in &next {
+            text_out.push(u.c);
+            spans.push((u.s, u.e));
+        }
+        out.push(Normalized {
+            text: text_out,
+            spans,
+        });
+        units = next;
+    }
+    out
 }
 
 fn units_of(text: &str, base: usize) -> Vec<Unit> {
