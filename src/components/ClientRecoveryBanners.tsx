@@ -279,7 +279,7 @@ export function ClientRecoveryBanners({
               <p className="mt-3 whitespace-pre-wrap break-words text-muted-foreground [overflow-wrap:anywhere]">
                 {row.retention}
               </p>
-              {row.error && row.error !== row.description && (
+              {!messages[row.id] && row.error && row.error !== row.description && (
                 <p role="alert" className="mt-3 whitespace-pre-wrap break-words">
                   {row.error}
                 </p>

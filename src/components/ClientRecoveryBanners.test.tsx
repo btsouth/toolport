@@ -247,6 +247,23 @@ it("shows a failed Discard once on its own banner and retains Retry", async () =
   ).toHaveLength(1);
   expect(screen.getByRole("button", { name: "Retry" })).toHaveFocus();
 });
+it("replaces the saved diagnostic with the latest Retry error, matching GTK", async () => {
+  api.listClientRecoveries.mockResolvedValue([
+    recovery({ error: "Previous config diagnostic" }),
+  ]);
+  api.retryClientRecovery.mockRejectedValue("Current safe Retry diagnostic");
+  render(<ClientRecoveryBanners refreshKey="retry-diagnostic" />);
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Previous config diagnostic",
+  );
+  await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+  expect(await screen.findByRole("status")).toHaveTextContent(
+    "Current safe Retry diagnostic",
+  );
+  expect(screen.queryByText("Previous config diagnostic")).not.toBeInTheDocument();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
 it("keeps good recoveries beside a per-record error and can refresh that row", async () => {
   const bad = recovery({
     id: "bad",
