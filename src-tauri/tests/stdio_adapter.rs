@@ -200,6 +200,18 @@ fn kill_daemon(dir: &std::path::Path) {
         };
         if let Some(pid) = value["pid"].as_u64() {
             let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+            // Until it is gone its listener can still accept a connection.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline
+                && Command::new("kill")
+                    .arg("-0")
+                    .arg(pid.to_string())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
     }
 }
@@ -294,26 +306,29 @@ fn the_adapter_recovers_after_the_daemon_dies() {
     // Kill the daemon out from under the adapter.
     kill_daemon(&harness.dir);
 
-    // The call that hits the dead daemon fails with an error, and is not replayed.
+    // Nothing reached the dead daemon (its port refuses the connection), so the
+    // call re-rendezvouses, replays the handshake and is sent to the new daemon.
+    // A call the daemon dies during is never replayed; see
+    // one_gateway_conformance's installer mid-call case.
     harness.send(serde_json::json!({
         "jsonrpc": "2.0",
         "id": 3,
         "method": "tools/list"
     }));
-    let failed = loop {
+    let resent = loop {
         let message = harness.next_response();
         if message["id"] == 3 {
             break message;
         }
     };
     assert!(
-        failed.get("error").is_some(),
-        "the call against a dead daemon should have failed: {failed}\n{}",
+        resent["result"]["tools"].is_array(),
+        "the call after the daemon died was not sent to a new one: {resent}\n{}",
         harness.diagnostics()
     );
 
-    // The next request re-rendezvouses, replays the handshake, and succeeds. The
-    // replayed initialize answer is not forwarded, so only id 4 is expected back.
+    // Later requests use the recovered session. The replayed initialize answer
+    // is not forwarded, so only id 4 is expected back.
     harness.send(serde_json::json!({
         "jsonrpc": "2.0",
         "id": 4,

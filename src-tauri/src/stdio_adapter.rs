@@ -448,13 +448,19 @@ enum ExchangeError {
     /// The daemon refused the session id before dispatching the request, so the
     /// request did not run.
     SessionRefused(String),
+    /// The connection to the daemon could not be opened, so nothing was sent.
+    /// The daemon was stopped (an installer, a crash) before the adapter's
+    /// liveness check noticed; the request can go to its replacement.
+    NotDelivered(String),
     Failed(String),
 }
 
 impl ExchangeError {
     fn into_message(self) -> String {
         match self {
-            Self::SessionRefused(detail) | Self::Failed(detail) => detail,
+            Self::SessionRefused(detail) | Self::NotDelivered(detail) | Self::Failed(detail) => {
+                detail
+            }
         }
     }
 }
@@ -942,12 +948,32 @@ impl Session {
                 return Err(ExchangeError::Failed(detail));
             }
             Err(error) => {
-                // The daemon is gone or unreachable. The next request re-rendezvouses;
-                // the call that hit this may have run, so it is never retried.
+                // The daemon is gone or unreachable. The next request re-rendezvouses.
+                // A call that reached the daemon may have run, so it is never
+                // retried; one whose connection never opened was not sent at all.
                 self.apply_post_state(forward, &descriptor, &sent_session, || {
                     self.stale.fetch_max(DAEMON_LOST, Ordering::SeqCst);
                 });
-                return Err(ExchangeError::Failed(error.to_string()));
+                let undelivered = matches!(
+                    &error,
+                    crate::http_client::Error::Transport(transport)
+                        if crate::http_client::connect_error(transport).is_some()
+                );
+                let timed_out = matches!(
+                    &error,
+                    crate::http_client::Error::Transport(ureq::Error::Timeout(_))
+                );
+                return Err(if undelivered {
+                    ExchangeError::NotDelivered(error.to_string())
+                } else if timed_out {
+                    ExchangeError::Failed(error.to_string())
+                } else {
+                    // Usually an installer or the user stopping the daemon.
+                    ExchangeError::Failed(format!(
+                        "the Toolport gateway stopped while handling this request ({error}). \
+                         It may have run, so it was not retried; the next request reconnects"
+                    ))
+                });
             }
         };
         if let Some(session) = response
@@ -1198,8 +1224,9 @@ impl Session {
 
     /// POST one client message. A request the daemon refused before dispatch,
     /// because its session was rescoped or expired, is sent once more on the
-    /// reopened session; a second refusal, and every other failure, goes back to
-    /// the client unretried.
+    /// reopened session, and one whose connection never opened is sent once to
+    /// the daemon found (or started) again; a second refusal, and every other
+    /// failure, goes back to the client unretried.
     fn exchange(&self, body: &str) -> Result<(), String> {
         match self.exchange_once(body) {
             Err(ExchangeError::SessionRefused(_)) if resendable_after_refusal(body) => {
@@ -1207,9 +1234,12 @@ impl Session {
                     ExchangeError::SessionRefused(detail) => {
                         format!("the host daemon refused the reopened session too: {detail}")
                     }
-                    ExchangeError::Failed(detail) => detail,
+                    ExchangeError::NotDelivered(detail) | ExchangeError::Failed(detail) => detail,
                 })
             }
+            Err(ExchangeError::NotDelivered(_)) => self
+                .exchange_once(body)
+                .map_err(ExchangeError::into_message),
             result => result.map_err(ExchangeError::into_message),
         }
     }

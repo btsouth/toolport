@@ -6188,3 +6188,207 @@ fn an_upgrade_mid_call_finishes_the_call_and_the_next_client_runs_the_new_binary
         );
     }
 }
+
+/// Start the shared daemon from `exe` the way the desktop HTTP service or an
+/// older client config does: a `--daemon` process running from the install
+/// directory. Returns its pid once it advertises itself.
+fn start_daemon_from(dir: &Path, exe: &Path) -> u32 {
+    let mut child = Command::new(exe)
+        .arg("--daemon")
+        .env("TOOLPORT_DATA_DIR", dir)
+        .env("TOOLPORT_REGISTRY", dir.join("registry.json"))
+        .env("TOOLPORT_DAEMON_IDLE_GRACE_MS", "600000")
+        .env_remove("TOOLPORT_GATEWAY_TOPOLOGY")
+        .env_remove("CONDUIT_GATEWAY_TOPOLOGY")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the daemon");
+    let pid = child.id();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    wait_until(
+        || daemon_pid(dir) == Some(pid),
+        "the daemon to advertise itself",
+        Duration::from_secs(30),
+    );
+    pid
+}
+
+/// Stop a process the way the Windows installer's preflight does
+/// (TerminateProcess), with no chance to clean up.
+fn terminate(pid: u32) {
+    #[cfg(unix)]
+    let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    #[cfg(windows)]
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .status();
+}
+
+/// A client whose daemon a Windows installer stops in the middle of a call.
+/// Clients launch the published copy of the gateway in the data directory, so
+/// the installer leaves their adapters alone; a daemon running from the install
+/// directory (started by the desktop HTTP service or an older client config) is
+/// stopped by `--installer-preflight` once it does not leave by itself. The call
+/// in flight fails with a clear error, and the next call from the same adapter
+/// process works on a daemon it starts again, without the client restarting.
+/// Other platforms defer a busy daemon instead of stopping it, so there the
+/// test checks the deferral and then stops the daemon the way Windows does.
+#[test]
+fn an_installer_stopping_the_daemon_mid_call_fails_that_call_and_the_client_recovers() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("installer-mid-call");
+    let transcript = dir.join("mock.jsonl");
+    let mut server = mock_server_entry("mock", &transcript, None);
+    server.env.push(EnvVar {
+        key: "MOCK_MCP_CONCURRENT".to_string(),
+        value: Some("1".to_string()),
+        secret: false,
+        unknown_fields: Default::default(),
+    });
+    write_registry(&dir, vec![server], vec![]);
+    let installed = installed_gateway(&dir);
+    let install_dir = installed.parent().unwrap().to_path_buf();
+    let published_dir = dir.join("bin");
+    std::fs::create_dir_all(&published_dir).unwrap();
+    let published = published_dir.join(installed.file_name().unwrap());
+    std::fs::copy(env!("CARGO_BIN_EXE_toolport-gateway"), &published).unwrap();
+
+    let old_daemon = start_daemon_from(&dir, &installed);
+    let options = AdapterOptions {
+        exe: Some(&published),
+        grace_ms: Some(600_000),
+        ..AdapterOptions::default()
+    };
+    let mut client = spawn_adapter(&dir, &options);
+    client.initialize("installer-client");
+    let sleep = client.wait_for_tool("__sleep", Duration::from_secs(30));
+    let echo = client.wait_for_tool("__echo", Duration::from_secs(30));
+    assert_eq!(
+        daemon_pid(&dir),
+        Some(old_daemon),
+        "the adapter did not join the running daemon"
+    );
+
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 9101, "method": "tools/call",
+        "params": { "name": sleep, "arguments": { "ms": 30000 } }
+    }));
+    std::thread::sleep(Duration::from_millis(1000));
+
+    // NSIS order: the incoming gateway's preflight runs from the plugins
+    // directory first, then setup replaces the installed files.
+    let plugins = dir.join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    let preflight = plugins.join(installed.file_name().unwrap());
+    std::fs::copy(env!("CARGO_BIN_EXE_toolport-gateway"), &preflight).unwrap();
+    let outcome = Command::new(&preflight)
+        .arg("--installer-preflight")
+        .arg(&install_dir)
+        .env("TOOLPORT_DATA_DIR", &dir)
+        .env("TOOLPORT_REGISTRY", dir.join("registry.json"))
+        .output()
+        .expect("run the installer preflight");
+    let preflight_report = format!(
+        "exit {:?}\nstdout: {}\nstderr: {}",
+        outcome.status.code(),
+        String::from_utf8_lossy(&outcome.stdout),
+        String::from_utf8_lossy(&outcome.stderr)
+    );
+    #[cfg(windows)]
+    {
+        assert!(outcome.status.success(), "preflight: {preflight_report}");
+        wait_for_pid_exit(old_daemon, Duration::from_secs(20), &dir);
+    }
+    #[cfg(not(windows))]
+    {
+        assert!(
+            !outcome.status.success(),
+            "a busy daemon must defer the install here: {preflight_report}"
+        );
+        assert!(
+            pid_alive(u64::from(old_daemon)),
+            "the deferral stopped the daemon"
+        );
+        terminate(old_daemon);
+        wait_for_pid_exit(old_daemon, Duration::from_secs(20), &dir);
+    }
+    let retired = install_dir.join("toolport-gateway.old");
+    std::fs::rename(&installed, &retired).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_toolport-gateway"), &installed).unwrap();
+
+    let reply = client.response_to(9101);
+    eprintln!("client saw for the interrupted call: {reply}");
+    let message = reply["error"]["message"].as_str().unwrap_or_default();
+    assert_eq!(reply["error"]["code"], -32603, "{reply}");
+    // The transport detail in the parentheses is the platform's own wording
+    // (Linux: "io: Peer disconnected").
+    assert!(
+        message.starts_with(
+            "host daemon request failed: the Toolport gateway stopped while handling this request ("
+        ) && message.ends_with(
+            "). It may have run, so it was not retried; the next request reconnects"
+        ),
+        "unexpected error for the interrupted call: {reply}\n{}",
+        client.diagnostics()
+    );
+
+    // The same adapter process: the next call starts a daemon again and works.
+    assert_eq!(
+        text_of(&client.call_tool(&echo, json!({ "text": "after the installer" }))),
+        "after the installer",
+        "{}",
+        client.diagnostics()
+    );
+    let new_daemon = daemon_pid(&dir).expect("a new daemon descriptor");
+    assert_ne!(new_daemon, old_daemon);
+}
+
+/// The daemon stops between two calls (an installer, a crash, Task Manager) and
+/// the client calls before the adapter's liveness check has noticed. Nothing
+/// reached the daemon, so the adapter starts it again and sends the call there
+/// instead of failing it.
+#[test]
+fn a_call_after_the_daemon_stopped_reconnects_instead_of_failing() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("call-after-stop");
+    let transcript = dir.join("mock.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("mock", &transcript, None)],
+        vec![],
+    );
+    let options = AdapterOptions {
+        grace_ms: Some(600_000),
+        ..AdapterOptions::default()
+    };
+    let mut client = spawn_adapter(&dir, &options);
+    client.initialize("call-after-stop");
+    let echo = client.wait_for_tool("__echo", Duration::from_secs(30));
+    assert_eq!(
+        text_of(&client.call_tool(&echo, json!({ "text": "before" }))),
+        "before"
+    );
+    let old_daemon = daemon_pid(&dir).expect("a daemon descriptor");
+    terminate(old_daemon);
+    wait_for_pid_exit(old_daemon, Duration::from_secs(20), &dir);
+
+    let reply = client.request(
+        "tools/call",
+        json!({ "name": echo, "arguments": { "text": "after" } }),
+    );
+    assert!(
+        reply.get("result").is_some(),
+        "the call after the daemon stopped failed: {reply}\n{}",
+        client.diagnostics()
+    );
+    assert_eq!(text_of(&reply["result"]), "after");
+    assert_ne!(daemon_pid(&dir), Some(old_daemon));
+}
