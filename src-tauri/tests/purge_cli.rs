@@ -798,6 +798,11 @@ fn in_process_client_discovery_requires_test_root() {
     conduit_lib::clients::detect_clients();
 }
 
+// A confirmed removal inventories the OS credential store. On Linux the
+// fixture has no session bus, so it never reaches a keyring; on macOS and
+// Windows it would query the runner's real Keychain or Credential Manager.
+// Opening the report file is covered on every platform by the purge unit tests.
+#[cfg(target_os = "linux")]
 #[test]
 fn confirmed_removal_persists_the_console_report_in_the_users_home() {
     let env = conduit_lib::registry::DataDirTestEnv::new("purge_cli_report");
