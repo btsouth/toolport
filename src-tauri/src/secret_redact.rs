@@ -614,10 +614,30 @@ impl Matcher {
     }
 
     /// [`Self::spans`], optionally without fragment windows (whole forms only).
+    ///
+    /// Text with an encoding introducer (`\`, `%`, `&`) is also searched in its
+    /// decoded form ([`crate::secret_normalize`]: JSON escapes, percent encoding
+    /// and HTML entities, mixed per character and nested once), and each hit
+    /// there is mapped back to the source span it was decoded from, so a secret
+    /// spelled `sk-&#65;%42\u0043` is replaced where it is written.
     fn spans_with(&self, text: &str, fragments: bool) -> Vec<(usize, usize, Vec<usize>)> {
+        let mut hits = self.plain_hits(text, fragments);
+        if crate::secret_normalize::has_encoding(text) {
+            let n = crate::secret_normalize::normalize(text);
+            if n.text != text {
+                for (s, e, name, fragment) in self.plain_hits(&n.text, fragments) {
+                    let (s, e) = crate::secret_normalize::source_range(&n, s, e);
+                    hits.push((s, e, name, fragment));
+                }
+            }
+        }
+        merge(hits)
+    }
+
+    fn plain_hits(&self, text: &str, fragments: bool) -> Vec<Hit> {
         let mut hits = self.own_hits(text, fragments);
         hits.extend(self.extra_hits(|m| m.own_hits(text, fragments)));
-        merge(hits)
+        hits
     }
 
     fn own_hits(&self, text: &str, fragments: bool) -> Vec<Hit> {
@@ -673,6 +693,18 @@ impl Matcher {
     fn byte_spans(&self, bytes: &[u8]) -> Vec<(usize, usize, Vec<usize>)> {
         let mut hits = self.own_byte_hits(bytes);
         hits.extend(self.extra_hits(|m| m.own_byte_hits(bytes)));
+        // Encoded spellings, as in `spans_with`, wherever the bytes are text.
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            if crate::secret_normalize::has_encoding(text) {
+                let n = crate::secret_normalize::normalize(text);
+                if n.text != text {
+                    for (s, e, name, fragment) in self.plain_hits(&n.text, true) {
+                        let (s, e) = crate::secret_normalize::source_range(&n, s, e);
+                        hits.push((s, e, name, fragment));
+                    }
+                }
+            }
+        }
         merge(hits)
     }
 
@@ -716,9 +748,20 @@ impl Matcher {
     /// so no piece of a secret is written before the stream shows whether the
     /// rest follows. `text.len()` when nothing needs holding.
     pub fn hold_from(&self, text: &str) -> usize {
-        let mut cut = self.own_hold(text);
-        if let Some(extra) = &self.extra {
-            cut = cut.min(extra.own_hold(text));
+        let mut cut = self.plain_hold(text);
+        // An encoded sequence still being written, and the start of a secret in
+        // its decoded spelling, are held the same way.
+        if crate::secret_normalize::has_encoding(text) {
+            if let Some(at) = crate::secret_normalize::incomplete_suffix_start(text) {
+                cut = cut.min(at);
+            }
+            let n = crate::secret_normalize::normalize(text);
+            if n.text != text {
+                let at = self.plain_hold(&n.text);
+                if at < n.text.len() {
+                    cut = cut.min(crate::secret_normalize::source_range(&n, at, n.text.len()).0);
+                }
+            }
         }
         if cut == text.len() {
             return cut;
@@ -731,6 +774,13 @@ impl Matcher {
                 None => return cut,
             }
         }
+    }
+
+    fn plain_hold(&self, text: &str) -> usize {
+        let cut = self.own_hold(text);
+        self.extra
+            .as_ref()
+            .map_or(cut, |m| cut.min(m.own_hold(text)))
     }
 
     fn own_hold(&self, text: &str) -> usize {
@@ -1465,11 +1515,24 @@ impl Matcher {
 
     /// Cheap pre-check: could `text` hold any registered form, raw or JSON-escaped?
     /// False positives are fine (short secrets ignore token boundaries here).
+    /// The fast reject: false only when no form, plain or encoded, can be in
+    /// `text`. Text with an encoding introducer is also checked decoded.
     pub fn may_contain(&self, text: &str) -> bool {
+        self.may_contain_plain(text)
+            || (crate::secret_normalize::has_encoding(text) && {
+                let n = crate::secret_normalize::normalize(text);
+                n.text != text && self.may_contain_plain(&n.text)
+            })
+    }
+
+    fn may_contain_plain(&self, text: &str) -> bool {
         self.raw.as_ref().is_some_and(|a| a.is_match(text))
             || self.json.as_ref().is_some_and(|a| a.is_match(text))
             || self.ci.as_ref().is_some_and(|a| a.is_match(text))
-            || self.extra.as_ref().is_some_and(|m| m.may_contain(text))
+            || self
+                .extra
+                .as_ref()
+                .is_some_and(|m| m.may_contain_plain(text))
     }
 }
 
@@ -3609,6 +3672,126 @@ mod tests {
         let mut v = serde_json::json!([{"text": "sk-Zebra"}, {"text": "Other"}]);
         m.redact_value(&mut v);
         assert_eq!(v[1]["text"], "Other");
+    }
+
+    #[test]
+    fn encoded_spellings_of_a_secret_are_replaced_where_they_are_written() {
+        let m = m(&[("ENC", "sk-EncodedSecret42")]);
+        let spellings = [
+            r"sk-EncodedSecret42",
+            r"sk-EncodedSecret42",
+            "%73%6B-Encoded%53ecret42",
+            "%73%6b%2dEncodedSecret%34%32",
+            "sk&#45;Encoded&#x53;ecret42",
+            "sk&#45Encoded&#X53;ecret42",
+            "&#115;&#107;-EncodedSecret42",
+            "%26%23115%3Bk-EncodedSecret42",
+            "&#37;73k-EncodedSecret42",
+            "sk-&amp;#69;ncodedSecret42",
+            r"sk-\\u0045ncodedSecret42",
+            r"%5Cu0073k-EncodedSecret42",
+            r"sk-&#69;%6EcodedSecret42",
+        ];
+        for spelling in spellings {
+            let line = format!("before {spelling} after");
+            assert!(m.may_contain(&line), "fast reject passed {line}");
+            assert_eq!(
+                m.redact_text(&line),
+                "before [secret:ENC] after",
+                "{spelling}"
+            );
+            let json = serde_json::json!({ "text": line }).to_string();
+            assert_eq!(
+                m.redact_line(&json),
+                serde_json::json!({ "text": "before [secret:ENC] after" }).to_string(),
+                "{spelling}"
+            );
+        }
+        // The existing encodings still apply.
+        let b64 = base64::engine::general_purpose::STANDARD.encode("sk-EncodedSecret42");
+        assert_eq!(m.redact_text(&format!("x {b64} y")), "x [secret:ENC] y");
+        let hex: String = "sk-EncodedSecret42"
+            .bytes()
+            .map(|b| format!("{b:02X}"))
+            .collect();
+        assert_eq!(m.redact_text(&format!("x {hex} y")), "x [secret:ENC] y");
+        // Encoded text without the secret is untouched.
+        for plain in ["a &amp; b %20 \\u0041 &#65; 100%", "&lt;tag&gt; %E2%82%AC"] {
+            assert_eq!(m.redact_text(plain), plain);
+        }
+    }
+
+    /// Random per-character spellings: every output, decoded, is free of the
+    /// secret, and secret-free text comes back byte for byte.
+    #[test]
+    fn randomly_encoded_secrets_never_survive_and_plain_text_is_untouched() {
+        let secret = "sk-Mixed9Secret-Value7";
+        let m = m(&[("MIX", secret)]);
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let hex = |b: u8, upper: bool| {
+            if upper {
+                format!("{b:02X}")
+            } else {
+                format!("{b:02x}")
+            }
+        };
+        for case in 0..2000 {
+            let chars: Vec<char> = secret.chars().collect();
+            let mut pieces: Vec<String> = Vec::new();
+            for &c in &chars {
+                let b = c as u8;
+                let upper = next(2) == 0;
+                let piece = match next(10) {
+                    0 | 1 => c.to_string(),
+                    2 => format!("\\u{}", hex(0, upper) + &hex(b, upper)),
+                    3 => format!("%{}", hex(b, upper)),
+                    4 => format!("&#{b};"),
+                    5 => format!("&#{}{};", if upper { "X" } else { "x" }, hex(b, upper)),
+                    6 => format!("&#{b}"),
+                    // Nested once, both ways.
+                    7 => format!("%26%23{b}%3B"),
+                    8 => format!("&#37;{}", hex(b, upper)),
+                    _ => format!("%5Cu00{}", hex(b, upper)),
+                };
+                pieces.push(piece);
+            }
+            // `&#83` without `;` must not run into a following digit.
+            for i in 0..pieces.len().saturating_sub(1) {
+                let open = pieces[i].starts_with("&#")
+                    && !pieces[i].ends_with(';')
+                    && !pieces[i].starts_with("&#x")
+                    && !pieces[i].starts_with("&#X");
+                if open && pieces[i + 1].starts_with(|c: char| c.is_ascii_digit()) {
+                    pieces[i].push(';');
+                }
+            }
+            let encoded = pieces.concat();
+            let line = format!("case {case}: {encoded} end");
+            assert!(m.may_contain(&line), "{line}");
+            let out = m.redact_text(&line).into_owned();
+            let decoded = crate::secret_normalize::normalize(&out).text;
+            assert!(
+                !out.contains(secret) && !decoded.contains(secret),
+                "{line} -> {out}"
+            );
+            assert!(
+                out.starts_with(&format!("case {case}: ")) && out.ends_with(" end"),
+                "{out}"
+            );
+            // Secret-free text with the same introducers.
+            let alphabet: Vec<char> = "abc019;#&%\\uxX -_".chars().collect();
+            let plain: String = (0..40)
+                .map(|_| alphabet[next(alphabet.len() as u64) as usize])
+                .collect();
+            assert_eq!(m.redact_text(&plain), plain.as_str());
+            assert_eq!(m.redact_line(&plain), plain.as_str());
+        }
     }
 
     #[test]

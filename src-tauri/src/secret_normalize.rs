@@ -194,7 +194,7 @@ fn hex_at(u: &[Unit], i: usize) -> Option<u32> {
 fn hex4(u: &[Unit], i: usize) -> Option<u32> {
     let mut v = 0;
     for k in 0..4 {
-        v = v << 4 | hex_at(u, i + k)?;
+        v = (v << 4) | hex_at(u, i + k)?;
     }
     Some(v)
 }
@@ -276,7 +276,7 @@ fn percent_run(u: &[Unit], out: &mut Vec<Unit>, buf: &mut Vec<u8>) -> usize {
     let mut j = 0;
     while char_at(u, j) == Some('%') {
         match (hex_at(u, j + 1), hex_at(u, j + 2)) {
-            (Some(h), Some(l)) => buf.push((h << 4 | l) as u8),
+            (Some(h), Some(l)) => buf.push(((h << 4) | l) as u8),
             _ => break,
         }
         j += 3;
@@ -370,8 +370,8 @@ fn is_undecided(s: &[Unit]) -> bool {
             Some('u') => match hex4(s, 2) {
                 // A complete high surrogate waits for its low half.
                 Some(v) if (0xD800..0xDC00).contains(&v) && s.len() < 12 => {
-                    char_at(s, 6).map_or(true, |c| c == '\\')
-                        && char_at(s, 7).map_or(true, |c| c == 'u')
+                    char_at(s, 6).is_none_or(|c| c == '\\')
+                        && char_at(s, 7).is_none_or(|c| c == 'u')
                         && all(8, is_hex)
                 }
                 _ => false,
@@ -396,7 +396,9 @@ fn is_undecided(s: &[Unit]) -> bool {
                     && name.iter().all(|u| u.c.is_ascii_alphabetic())
                     && ENTITIES.iter().any(|(n, _)| {
                         n.len() >= name.len()
-                            && n.chars().zip(name).all(|(a, u)| a == u.c.to_ascii_lowercase())
+                            && n.chars()
+                                .zip(name)
+                                .all(|(a, u)| a == u.c.to_ascii_lowercase())
                     })
             }
         },
@@ -412,8 +414,8 @@ fn percent_undecided(s: &[Unit]) -> bool {
     let mut j = 0;
     while n < 4 && j + 3 <= s.len() && s[j].c == '%' {
         match (hex_at(s, j + 1), hex_at(s, j + 2)) {
-            (Some(h), Some(l)) => bytes[n] = (h << 4 | l) as u8,
-            _ => return false,
+            (Some(h), Some(l)) => bytes[n] = ((h << 4) | l) as u8,
+            _ => break,
         }
         n += 1;
         j += 3;
@@ -421,7 +423,7 @@ fn percent_undecided(s: &[Unit]) -> bool {
     let partial = &s[j..];
     let partial_ok = match partial.len() {
         0 => true,
-        1 | 2 => partial[0].c == '%' && partial.get(1).map_or(true, |u| u.c.is_ascii_hexdigit()),
+        1 | 2 => partial[0].c == '%' && partial.get(1).is_none_or(|u| u.c.is_ascii_hexdigit()),
         _ => false,
     };
     if !partial_ok {
@@ -451,7 +453,11 @@ mod tests {
         assert_eq!(n.text.chars().count(), n.spans.len());
         let mut prev = 0;
         for &(s, e) in &n.spans {
-            assert!(prev <= s && s < e && e <= src.len(), "{src:?}: {:?}", n.spans);
+            assert!(
+                prev <= s && s < e && e <= src.len(),
+                "{src:?}: {:?}",
+                n.spans
+            );
             assert!(src.is_char_boundary(s) && src.is_char_boundary(e));
             prev = e;
         }
@@ -463,7 +469,10 @@ mod tests {
             assert!(!has_encoding(s));
             let n = normalize(s);
             assert_eq!(n.text, s);
-            let ident: Vec<_> = s.char_indices().map(|(i, c)| (i, i + c.len_utf8())).collect();
+            let ident: Vec<_> = s
+                .char_indices()
+                .map(|(i, c)| (i, i + c.len_utf8()))
+                .collect();
             assert_eq!(n.spans, ident);
         }
         assert!(has_encoding("a\\b") && has_encoding("50%") && has_encoding("a&b"));
@@ -472,7 +481,12 @@ mod tests {
     #[test]
     fn json_escapes() {
         assert_eq!(text("\\u0041\\u00e9\\u00E9"), "Aéé");
-        assert_eq!(text("\\n\\r\\t\\b\\f\\/\\\\\\\""), "\n\r\t\u{8}\u{c}/\\\"");
+        assert_eq!(
+            text("\\n\\r\\t\\b\\f\\/\\\"x\\\\"),
+            "\n\r\t\u{8}\u{c}/\"x\\"
+        );
+        // `\\` decodes to `\`, which level two may combine with what follows.
+        assert_eq!(text("\\\\\\\""), "\"");
         assert_eq!(text("\\x\\u12\\uZZZZ\\"), "\\x\\u12\\uZZZZ\\");
         let n = normalize("a\\u0042c");
         assert_eq!(n.spans, vec![(0, 1), (1, 7), (7, 8)]);
@@ -517,7 +531,10 @@ mod tests {
         );
         assert_eq!(text("&newline;&tab;&tilde;"), "\n\t\u{2dc}");
         assert_eq!(text("&ampx &ltb"), "&x <b");
-        assert_eq!(text("&foo; &#; &#x; &#99999999; &#x110000; &#xD800; &"), "&foo; &#; &#x; &#99999999; &#x110000; &#xD800; &");
+        assert_eq!(
+            text("&foo; &#; &#x; &#99999999; &#x110000; &#xD800; &"),
+            "&foo; &#; &#x; &#99999999; &#x110000; &#xD800; &"
+        );
         let n = normalize("&#66;x&lt");
         assert_eq!(n.spans, vec![(0, 5), (5, 6), (6, 9)]);
     }
@@ -526,7 +543,10 @@ mod tests {
     fn mixed_literal_and_encoded() {
         let n = normalize("s%6B-A&#66;C");
         assert_eq!(n.text, "sk-ABC");
-        assert_eq!(n.spans, vec![(0, 1), (1, 4), (4, 5), (5, 6), (6, 11), (11, 12)]);
+        assert_eq!(
+            n.spans,
+            vec![(0, 1), (1, 4), (4, 5), (5, 6), (6, 11), (11, 12)]
+        );
         assert_eq!(text("s\\u006B%2DA&#x42C"), "sk-A\u{42c}");
         assert_eq!(text("s\\u006B%2DA&#x42;C"), "sk-ABC");
     }
@@ -638,7 +658,13 @@ mod tests {
         };
         digits
             .chars()
-            .map(|c| if rng.below(2) == 0 { c.to_ascii_uppercase() } else { c })
+            .map(|c| {
+                if rng.below(2) == 0 {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
             .collect()
     }
 
@@ -676,7 +702,7 @@ mod tests {
                 .collect();
             for i in 0..pieces.len() {
                 let next = pieces.get(i + 1).and_then(|p| p.0.chars().next());
-                let safe = next.map_or(true, |c| !c.is_ascii_hexdigit() && c != ';');
+                let safe = next.is_none_or(|c| !c.is_ascii_hexdigit() && c != ';');
                 if pieces[i].1 && safe && rng.below(2) == 0 {
                     pieces[i].0.pop();
                 }
@@ -694,10 +720,16 @@ mod tests {
             if !original.is_empty() {
                 assert_eq!(source_range(&n, 0, n.text.len()), (0, encoded.len()));
             }
-            assert_eq!(incomplete_suffix_start(&encoded).is_some(), {
-                // Only an entity left without `;` at the very end is undecided.
-                pieces.last().is_some_and(|(p, _)| p.starts_with('&') && !p.ends_with(';'))
-            }, "{encoded:?}");
+            assert_eq!(
+                incomplete_suffix_start(&encoded).is_some(),
+                {
+                    // Only an entity left without `;` at the very end is undecided.
+                    pieces
+                        .last()
+                        .is_some_and(|(p, _)| p.starts_with('&') && !p.ends_with(';'))
+                },
+                "{encoded:?}"
+            );
         }
     }
 }
