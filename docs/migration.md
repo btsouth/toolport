@@ -97,7 +97,7 @@ Review them in the client if you want the old rules or hooks removed.
 ## Package notes
 
 - **Arch and Omarchy:** the signed pacman repository serves 2.x, so
-  `sudo pacman -Syu` updates you. AUR users can use `toolport-bin`.
+  `sudo pacman -Syu` updates you.
 - **Debian and Ubuntu:** the GTK `.deb` uses the same `toolport` package name as
   1.x. Install it with `sudo apt install ./<file>.deb`. The installer selects
   GTK for Ubuntu 24.04+ and Debian 13+, and AppImage for older systems or when compatibility cannot

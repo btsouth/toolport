@@ -376,7 +376,6 @@ test("PR package fixtures exercise the pacman archive checker", () => {
     "usr/share/toolport/agent-plugin/toolport-agent-plugin.zip",
     "usr/share/toolport/toolport-preview-rollback.sh",
     "usr/share/licenses/toolport/LICENSE",
-    "usr/share/licenses/toolport-bin/LICENSE",
   ];
   const pack = () => execFileSync("tar", ["-cf", archive, "-C", payload, "."]);
   const check = () =>

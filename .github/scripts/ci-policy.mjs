@@ -61,7 +61,6 @@ export function needsLinuxPackages(event, files) {
           "scripts/package-removal-fixture.py",
           "scripts/test-nsis-hooks.sh",
           "scripts/install-nfpm.sh",
-          "scripts/render-aur.sh",
           "scripts/ci-apt-install.sh",
           "scripts/toolport-preview-rollback.sh",
           "src/test/linux-packaging.test.ts",

@@ -28,7 +28,7 @@
 //! through [`strip_bundled_env`] first.
 //!
 //! Gated on `APPDIR`, which only an AppImage sets, so this is a no-op for the
-//! `.deb`, the AUR package, and a dev build.
+//! `.deb`, the pacman package, and a dev build.
 //!
 //! Deliberately NOT an `env_clear()`: an MCP server legitimately needs the
 //! user's `PATH`, `HOME`, proxy variables, and whatever its own `env` block
@@ -306,7 +306,7 @@ mod tests {
         assert!(!env_of(&cmd).iter().any(|(k, _)| k == "XDG_DATA_DIRS"));
     }
 
-    /// The .deb, the AUR package and a dev build must be untouched. They never
+    /// The .deb, the pacman package and a dev build must be untouched. They never
     /// set APPDIR, so the guard in `strip_bundled_env` is what protects them.
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]

@@ -63,7 +63,7 @@ Keep 1.24.x available and provide security fixes for three months after 2.0.0.
 This is release policy, not an automatic workflow delay. The Tauri endpoint is
 `releases/latest/download/latest.json`; making 2.0.0 Latest with that asset
 immediately offers it to Windows, macOS and AppImage users. Publishing also
-triggers winget, the Homebrew tap follows Latest, and stable tags can update AUR.
+triggers winget, and the Homebrew tap follows Latest.
 Keep 2.0 out of Latest and hold those channel jobs during the manual-install
 period; defer the Arch repository's publishing dispatch too. Do not publish a
 normal Latest release and assume these channels will wait.
@@ -126,9 +126,8 @@ Linux system packages now ship the GTK shell as `.deb` and `.rpm`, built once on
 Ubuntu 24.04 and tested before upload to the draft. The Tauri AppImage remains the
 fallback for Ubuntu 22.04, Debian 12 and older RPM distributions, and keeps its
 in-app updater. GTK debs require Ubuntu 24.04+ or Debian 13+; RPMs require
-GTK 4.14+, libadwaita 1.5+, GLib 2.80+ and glibc 2.39+. Stable releases also
-update AUR `toolport-bin` by repackaging the GTK deb, so existing AUR users can
-upgrade with their helper. The native pacman package remains an alternative. See
+GTK 4.14+, libadwaita 1.5+, GLib 2.80+ and glibc 2.39+. Arch and Omarchy users
+install the native package from the Toolport pacman repository. See
 [`docs/linux-packages.md`](linux-packages.md) for build and upgrade checks.
 
 Publishing is also when the **Homebrew tap** is bumped, and that is now

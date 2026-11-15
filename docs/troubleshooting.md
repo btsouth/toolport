@@ -62,8 +62,8 @@
   `EGL_PLATFORM=surfaceless ./Toolport_*.AppImage`, and turn on 3D acceleration
   if you are in a VM.
 
-- **Arch + proprietary NVIDIA: `toolport-bin` exits at startup, but the AppImage
-  works.** This one runs the other way round, and it is a system-stack problem,
+- **Arch + proprietary NVIDIA: a package built against system WebKitGTK exits at
+  startup, but the AppImage works.** This one runs the other way round, and it is a system-stack problem,
   not a Toolport one: the native package links your system GTK/WebKitGTK, and on
   NVIDIA that combination exits immediately with
 
