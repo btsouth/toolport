@@ -50,7 +50,7 @@ fn codex_settings_come_once_and_a_deleted_key_stays_deleted() {
     std::fs::write(
         &path,
         format!(
-            "model = \"gpt-5\"\n\n[mcp_servers.toolport]\ncommand = \"{current}\"\n\
+            "model = \"gpt-5\"\n\n[mcp_servers.toolport]\ncommand = '{current}'\n\
              enabled_tools = [\"a\"] # mine\n\n\
              [mcp_servers.toolport.env]\nTOOLPORT_CLIENT_ID = \"codex\"\n\
              TOOLPORT_ATTRIBUTION_ID = \"codex\"\n"
@@ -129,7 +129,7 @@ fn settings_the_user_set_before_count_as_handled() {
     std::fs::write(
         &path,
         format!(
-            "[mcp_servers.toolport]\ncommand = \"{current}\"\n\
+            "[mcp_servers.toolport]\ncommand = '{current}'\n\
              supports_parallel_tool_calls = false\nstartup_timeout_ms = 3000\n\
              tool_timeout_sec = 90\n\n\
              [mcp_servers.toolport.env]\nTOOLPORT_CLIENT_ID = \"codex\"\n\
@@ -230,7 +230,7 @@ fn an_entry_with_some_settings_and_no_record_keeps_the_rest_removed() {
         std::fs::write(
             &path,
             format!(
-                "[mcp_servers.toolport]\ncommand = \"{current}\"\ntool_timeout_sec = 600\n\n\
+                "[mcp_servers.toolport]\ncommand = '{current}'\ntool_timeout_sec = 600\n\n\
                  [mcp_servers.toolport.env]\nTOOLPORT_CLIENT_ID = \"codex\"\n\
                  TOOLPORT_ATTRIBUTION_ID = \"codex\"\n"
             ),
@@ -275,15 +275,14 @@ fn a_stale_command_repair_keeps_the_no_record_safeguard() {
         let path = codex_config(&data);
         let current = data.dir.join("toolport-gateway");
         let current = current.to_str().unwrap();
-        let stale_dir = data.dir.join("old-release");
-        std::fs::create_dir_all(&stale_dir).unwrap();
-        let stale = stale_dir.join("toolport-gateway");
-        std::fs::write(&stale, "old fixture").unwrap();
+        // An older release's gateway, since removed. A gateway that still exists at
+        // another path is current on Windows, so the stale one must be gone.
+        let stale = data.dir.join("old-release").join("toolport-gateway");
         let stale = stale.to_str().unwrap();
         std::fs::write(
             &path,
             format!(
-                "[mcp_servers.toolport]\ncommand = \"{stale}\"\ntool_timeout_sec = 90\n\n\
+                "[mcp_servers.toolport]\ncommand = '{stale}'\ntool_timeout_sec = 90\n\n\
                  [mcp_servers.toolport.env]\nTOOLPORT_CLIENT_ID = \"codex\"\n\
                  TOOLPORT_ATTRIBUTION_ID = \"codex\"\n"
             ),
