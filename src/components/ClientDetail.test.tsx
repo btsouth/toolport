@@ -7,6 +7,7 @@ import {
   previewImportServers,
   listClientRecoveries,
   retryClientRecovery,
+  type ClientRecovery,
 } from "@/lib/api";
 import type { DetectedClient, Registry } from "@/lib/types";
 
@@ -777,6 +778,56 @@ it("shows disconnect and restart feedback once inline without a duplicate toast"
   expect(notice).toHaveTextContent("put back 1 server");
   expect(toastSuccess).not.toHaveBeenCalled();
   expect(toastError).not.toHaveBeenCalled();
+});
+
+it("keeps a keychain warning next to the recovery notice after disconnect", async () => {
+  const recovery = "Cursor needs a missing value restored.";
+  uninstallGateway.mockResolvedValue({
+    path: "/fixture/config",
+    restored: [],
+    warnings: [
+      `${recovery}\n\nChoose Retry.`,
+      "config restored; could not remove the revoked keychain token: locked",
+    ],
+  });
+  render(
+    <ClientDetail
+      client={client({ gatewayInstalled: true, entryState: "managed" })}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  await waitFor(() => expect(listClientRecoveries).toHaveBeenCalled());
+  const row: ClientRecovery = {
+    id: "cursor-recovery",
+    clientId: client().id,
+    clientName: client().name,
+    path: "/fixture/config",
+    backupPath: "/fixture/backup",
+    missing: [],
+    dismissed: false,
+    message: recovery,
+    description: "",
+    valueLines: [],
+    discardValues: [],
+    error: null,
+    canDiscard: false,
+    canRetry: true,
+    discardStarted: false,
+    discardAction: "Discard these saved values",
+    cleanup: false,
+    instructions: "Choose Retry.",
+    retention: "",
+    details: "",
+  };
+  vi.mocked(listClientRecoveries).mockResolvedValue([row]);
+  await userEvent.click(screen.getByRole("button", { name: "Disconnect" }));
+  await userEvent.click(
+    within(screen.getByRole("dialog")).getByRole("button", { name: "Disconnect" }),
+  );
+  const notice = await screen.findByText(/could not remove the revoked keychain token/);
+  expect(notice).not.toHaveTextContent(recovery);
 });
 
 it("refreshes the committed disconnect even when recovery notices cannot be read", async () => {

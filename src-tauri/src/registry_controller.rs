@@ -2556,14 +2556,39 @@ fn finish_http_disconnect(
     result: &mut ClientMutationResult,
     revoke: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    let warnings = clients::finish_uninstall_with_warnings(client_id, &result.outcome)?;
+    let outcome = &result.outcome;
+    let finish = || clients::finish_uninstall_with_warnings(client_id, outcome);
+    let mut warnings = Vec::new();
+    let finished = finish_http_cleanup(&mut warnings, finish, revoke);
     result.outcome.warnings.extend(warnings);
-    if let Err(error) = revoke() {
-        result.outcome.warnings.push(format!(
-            "config restored; could not remove the revoked keychain token: {error}"
-        ));
+    finished
+}
+
+/// Both cleanup steps run after the registry write, even when one fails: the
+/// bearer row is already gone, so a retried Disconnect takes the stdio branch
+/// and would never retry the keychain delete. Both results are reported.
+fn finish_http_cleanup(
+    warnings: &mut Vec<String>,
+    finish: impl FnOnce() -> Result<Vec<String>, String>,
+    revoke: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let finished = finish();
+    let revoked = revoke().map_err(|error| {
+        format!("config restored; could not remove the revoked keychain token: {error}")
+    });
+    match (finished, revoked) {
+        (Ok(more), Ok(())) => {
+            warnings.extend(more);
+            Ok(())
+        }
+        (Ok(more), Err(keychain)) => {
+            warnings.extend(more);
+            warnings.push(keychain);
+            Ok(())
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(keychain)) => Err(format!("{error}\n\n{keychain}")),
     }
-    Ok(())
 }
 
 pub(crate) fn registry_for_disconnect() -> Result<Registry, String> {
@@ -3451,6 +3476,48 @@ pub fn test_secret_reference(
 
 #[cfg(test)]
 mod tests {
+    /// A failed recovery cleanup still lets the keychain delete run, and both
+    /// failures are reported (one shared helper for GTK and React).
+    #[test]
+    fn http_disconnect_cleanup_runs_both_steps_and_reports_both() {
+        let revoked = std::cell::Cell::new(false);
+        let mut warnings = Vec::new();
+        let err = finish_http_cleanup(
+            &mut warnings,
+            || Err("recovery cleanup failed".into()),
+            || {
+                revoked.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            revoked.get(),
+            "the keychain delete must run after a cleanup failure"
+        );
+        assert_eq!(err, "recovery cleanup failed");
+
+        let err = finish_http_cleanup(
+            &mut warnings,
+            || Err("recovery cleanup failed".into()),
+            || Err("keychain locked".into()),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("recovery cleanup failed") && err.contains("keychain locked"),
+            "{err}"
+        );
+
+        let mut warnings = Vec::new();
+        finish_http_cleanup(
+            &mut warnings,
+            || Ok(vec!["recovery warning".into()]),
+            || Err("keychain locked".into()),
+        )
+        .unwrap();
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[1].contains("keychain locked"));
+    }
 
     /// A filesystem-safe label for a scratch path. `thread::current().name()` is
     /// the test's full path (`registry_controller::tests::foo`), and `:` is not a

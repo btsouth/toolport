@@ -376,9 +376,15 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         onChanged();
         const restored = outcome.restored?.length ?? 0;
         // Recovery owns its own persistent notice. Do not also announce it in
-        // an ordinary success notice or in a transient toast.
-        const pending = await listClientRecoveries();
-        if (pending.some((row) => row.clientId === client.id)) {
+        // an ordinary success notice or in a transient toast, but keep any
+        // other warning, such as a keychain token that could not be removed.
+        const pending = (await listClientRecoveries()).filter(
+          (row) => row.clientId === client.id,
+        );
+        const warnings = (outcome.warnings ?? []).filter(
+          (warning) => !pending.some((row) => warning.startsWith(row.message)),
+        );
+        if (pending.length && !warnings.length) {
           setRestartNotice(null);
         } else {
           noteRestartNeeded("removed", [
@@ -394,7 +400,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                   { client: client.name, count: restored },
                 )
               : translate("Disconnected Toolport from {value0}", { value0: client.name }),
-            ...(outcome.warnings ?? []),
+            ...warnings,
           ]);
         }
       }
