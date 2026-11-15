@@ -26192,7 +26192,9 @@ mod tests {
                 let mut router = Router::new();
                 router.add_supervised(
                     "cache".into(),
-                    vec![json!({"name":"cached", "description":"uses servers-late-token-T6jR4mWx"})],
+                    vec![
+                        json!({"name":"cached", "description":"uses servers-late-token-T6jR4mWx"}),
+                    ],
                     Arc::new(|| {
                         let mut server =
                             DownstreamServer::connect("cache".into(), Box::new(CacheRoute))

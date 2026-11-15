@@ -5525,7 +5525,8 @@ mod tests {
             ("tool_poison_flag", "sec-late-token-F4hZ7cUw"),
             ("tool_drift", "sec-drift-token-K9mE2rTb"),
         ] {
-            let event = json!({"type": kind, "server": "srv", "tool": "srv__t", "detail": secret, "ts": 1});
+            let event =
+                json!({"type": kind, "server": "srv", "tool": "srv__t", "detail": secret, "ts": 1});
             let text = crate::secret_redact::append_during_scrub_for_test(
                 &path,
                 ("security-lock", kind, secret),

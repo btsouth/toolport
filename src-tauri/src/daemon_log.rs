@@ -73,9 +73,8 @@ pub fn stderr_file(dir: &Path) -> Option<std::fs::File> {
 pub fn append(dir: &Path, line: &str) {
     if let Some((_lock, mut file)) = open_for_append(dir) {
         let line = crate::secret_redact::redact_log_text(line);
-        let _ = file.write_all(
-            format!("{} pid={} {line}\n", now_ms(), std::process::id()).as_bytes(),
-        );
+        let _ =
+            file.write_all(format!("{} pid={} {line}\n", now_ms(), std::process::id()).as_bytes());
     }
 }
 
