@@ -757,6 +757,15 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
     dialog.present();
 }
 
+/// The client's name for the connect review, found the way the review itself finds the
+/// client: a row the page lists without saving it yet (a T3 Code home, a launcher home)
+/// included. React shows the same name.
+fn review_client_name(client_id: &str) -> String {
+    crate::clients::detect_client(client_id)
+        .map(|client| client.name)
+        .unwrap_or_else(|| crate::i18n::tr("Client"))
+}
+
 pub(super) fn connect(
     parent: &gtk::Window,
     client_id: String,
@@ -768,16 +777,16 @@ pub(super) fn connect(
     let parent = parent.clone();
     gtk::glib::spawn_future_local(async move {
         let id = client_id.clone();
-        let preview =
-            gtk::gio::spawn_blocking(move || crate::registry_controller::preview_client_setup(&id))
-                .await;
+        let preview = gtk::gio::spawn_blocking(move || {
+            (
+                crate::registry_controller::preview_client_setup(&id),
+                review_client_name(&id),
+            )
+        })
+        .await
+        .map(|(preview, name)| preview.map(|preview| (preview, name)));
         match preview {
-            Ok(Ok(preview)) => {
-                let client_name = crate::clients::detect_clients()
-                    .into_iter()
-                    .find(|client| client.id == client_id)
-                    .map(|client| client.name)
-                    .unwrap_or_else(|| crate::i18n::tr("Client"));
+            Ok(Ok((preview, client_name))) => {
                 let disclosure = crate::i18n::trf(
                     if force {
                         crate::i18n::msg("Config: {value0}\nBackup directory: {value1}\nSelected entries move after gateway verification. Unchecked entries and plugin servers stay in place. This replaces the customized Toolport entry.")
@@ -851,6 +860,38 @@ pub(super) fn connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A T3 Code home the page lists before it is saved is named in the connect review as
+    /// it is on the page, not "Client".
+    #[test]
+    fn the_connect_review_names_an_unsaved_t3_code_home() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let root = std::env::temp_dir().join(format!(
+            "toolport-gtk-review-name-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+        std::fs::create_dir_all(home.join(".t3/cx/codex")).unwrap();
+        std::fs::write(
+            home.join(".t3/userdata/settings.json"),
+            r#"{"providerInstances": {"cx": {"driver": "codex", "config": {"homePath": "~/.t3/cx/codex"}}}}"#,
+        )
+        .unwrap();
+        let _data = crate::registry::DataDirOverride::set(root.join("data"));
+        let _home = crate::clients::TestHome::set(&home);
+        let row = crate::clients::detect_clients_for_skills()
+            .into_iter()
+            .find(|client| client.id.starts_with("codex@t3-"))
+            .expect("the T3 Code home is listed");
+        assert_eq!(review_client_name(&row.id), row.name);
+        assert_ne!(row.name, crate::i18n::tr("Client"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
     fn descendants(widget: &gtk::Widget) -> Vec<gtk::Widget> {
         let mut out = vec![widget.clone()];
         let mut child = widget.first_child();
