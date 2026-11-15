@@ -1562,6 +1562,40 @@ impl CancelRegistry {
         true
     }
 
+    /// The connection closed. Unlike a client cancellation, this also retires what an
+    /// answered instance still holds (a suspended downstream request keeps its hook
+    /// past the reply), since nothing can resume it now. An answered instance stays
+    /// answered; its hooks run once, here. Hooks run outside both locks.
+    fn close_slot(&self, slot: &Slot, reason: Option<String>) {
+        let Some(speech) = self
+            .lock()
+            .instances
+            .get(slot)
+            .map(|instance| Arc::clone(&instance.speech))
+        else {
+            return;
+        };
+        let hooks = {
+            let _speaking = speech
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self.lock();
+            let Some(instance) = state.instances.get_mut(slot) else {
+                return;
+            };
+            if instance.cancelled.is_some() {
+                return;
+            }
+            if !instance.answered {
+                instance.cancelled = Some(reason.clone());
+            }
+            instance.hooks.values().cloned().collect::<Vec<_>>()
+        };
+        for hook in hooks {
+            hook(reason.clone());
+        }
+    }
+
     /// Run `callback` once when this connection closes.
     pub fn on_close(&self, callback: CancelCallback) -> CloseGuard {
         let (key, closed) = {
@@ -1607,7 +1641,7 @@ impl CancelRegistry {
             (slots, hooks)
         };
         for slot in slots {
-            self.cancel_slot(&slot, reason.clone());
+            self.close_slot(&slot, reason.clone());
         }
         for hook in close_hooks {
             hook(reason.clone());
@@ -12696,6 +12730,38 @@ mod tests {
             assert!(a.is_cancelled());
         }
 
+        // Sol round 5: closing the connection retires an answered request's retained
+        // work, which a client cancellation after the answer does not.
+        #[test]
+        fn closing_retires_a_hook_an_answered_request_still_holds() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let registry = CancelRegistry::new();
+            let context = registry.begin_client_request("1".into()).expect("begins");
+            let fired = Arc::new(AtomicUsize::new(0));
+            let seen = fired.clone();
+            let retained = context.on_cancel(Arc::new(move |_| {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }));
+            assert!(context.reply_with(|| {}));
+            context.finish();
+            assert!(
+                !registry.cancel("1", None),
+                "an answered request ignores a cancel"
+            );
+            assert_eq!(fired.load(Ordering::SeqCst), 0);
+            registry.close();
+            assert_eq!(
+                fired.load(Ordering::SeqCst),
+                1,
+                "connection close failed to retire an answered request's retained resource"
+            );
+            registry.close();
+            assert!(!context.cancel(None));
+            assert_eq!(fired.load(Ordering::SeqCst), 1);
+            drop(retained);
+            assert!(registry.is_empty());
+        }
+
         /// One step of the cancellation model.
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         enum Step {
@@ -12705,8 +12771,13 @@ mod tests {
             Progress(usize),
             Reply(usize),
             Finish(usize),
+            /// The suspended work that kept A's hook past its reply resumes or expires.
+            Release(usize),
             ClientCancel,
             Disconnect,
+            /// The request registry closes: a session's DELETE or expiry, or an
+            /// adapter lifetime ending. On stdio, `Disconnect` is that close.
+            CloseSession,
         }
 
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12788,6 +12859,33 @@ mod tests {
             let mut watch: Option<CloseGuard> = None;
             let mut client_cancelled_a = false;
             let mut disconnected = false;
+            let mut registry_closed = false;
+            // An answered instance whose retained hook the close had to run.
+            let mut retired_after_reply = [false; 2];
+            let mut close_registry =
+                |hooks: &[Option<CancelGuard>; 2],
+                 contexts: &[Option<CancelContext>; 2],
+                 log: &Arc<Mutex<Vec<Seen>>>| {
+                    registry_closed = true;
+                    let held = [0, 1]
+                        .map(|x| hooks[x].is_some() && upstream[x].load(Ordering::SeqCst) == 0);
+                    for x in 0..2 {
+                        retired_after_reply[x] =
+                            held[x] && log.lock().unwrap().contains(&Seen::Reply(x));
+                    }
+                    registry.close();
+                    // Every hook still held runs exactly once, answered or not.
+                    for x in 0..2 {
+                        if held[x] {
+                            assert_eq!(
+                                upstream[x].load(Ordering::SeqCst),
+                                1,
+                                "{order:?}: closing did not retire {x}'s held hook"
+                            );
+                        }
+                    }
+                    let _ = contexts;
+                };
             for step in order {
                 match *step {
                     Step::Begin(x) => match registry.begin_client_request(key.to_string()) {
@@ -12833,7 +12931,11 @@ mod tests {
                             let other_active =
                                 contexts[other].as_ref().map(CancelContext::is_active);
                             context.finish();
-                            hooks[x] = None;
+                            // A keeps its hook past the reply, as suspended
+                            // downstream work does, until `Release`.
+                            if x != 0 {
+                                hooks[x] = None;
+                            }
                             if x == 0 {
                                 watch = None;
                             }
@@ -12845,6 +12947,7 @@ mod tests {
                         }
                         finished[x] = true;
                     }
+                    Step::Release(x) => hooks[x] = None,
                     Step::ClientCancel => {
                         client_cancelled_a = registry.cancel(key, Some("user"));
                     }
@@ -12852,11 +12955,13 @@ mod tests {
                         disconnected = true;
                         match path {
                             Path::Http => connection.close(),
-                            Path::Stdio => registry.close(),
+                            Path::Stdio => close_registry(&hooks, &contexts, &log),
                         }
                     }
+                    Step::CloseSession => close_registry(&hooks, &contexts, &log),
                 }
             }
+            drop(close_registry);
             let log = log.lock().unwrap().clone();
             let count = |seen: Seen| log.iter().filter(|entry| **entry == seen).count();
             for x in 0..2 {
@@ -12870,17 +12975,23 @@ mod tests {
                     assert_eq!(count(Seen::Reply(x)), 0, "{order:?}");
                     continue;
                 }
-                // Cancelled or answered, never both, and answered once.
+                // Cancelled or answered, never both, and answered once. An answered
+                // instance's hook runs only when the close retired its held work.
                 let replies = count(Seen::Reply(x));
+                assert!(replies <= 1, "{order:?}: {x} replied {replies} times");
+                let expected = if replies == 0 {
+                    1
+                } else {
+                    usize::from(retired_after_reply[x])
+                };
                 assert_eq!(
-                    replies + cancels,
-                    1,
+                    cancels, expected,
                     "{order:?}: {x} replied {replies} times, cancelled {cancels} times"
                 );
             }
-            // Only the right instance is cancelled: B by nothing on the HTTP path, and on
-            // stdio only by the connection closing.
-            let b_may_be_cancelled = path == Path::Stdio && disconnected;
+            // Only the right instance is cancelled: B by nothing but the registry
+            // closing.
+            let b_may_be_cancelled = registry_closed;
             if !b_may_be_cancelled {
                 assert_eq!(
                     upstream[1].load(Ordering::SeqCst),
@@ -12890,7 +13001,7 @@ mod tests {
             }
             if upstream[0].load(Ordering::SeqCst) == 1 {
                 assert!(
-                    client_cancelled_a || disconnected,
+                    client_cancelled_a || disconnected || registry_closed,
                     "{order:?}: A cancelled by nobody"
                 );
             }
@@ -12908,7 +13019,7 @@ mod tests {
                 );
             }
             // A request refused as a duplicate means the other was live.
-            if refused[1] && !(path == Path::Stdio && disconnected) {
+            if refused[1] && !registry_closed {
                 assert!(
                     !client_cancelled_a,
                     "{order:?}: B refused although A was cancelled"
@@ -12929,12 +13040,16 @@ mod tests {
                 if watch {
                     steps.push(Step::WatchConnection(x));
                 }
-                steps.extend([
-                    Step::Hook(x),
-                    Step::Progress(x),
-                    Step::Reply(x),
-                    Step::Finish(x),
-                ]);
+                steps.push(Step::Hook(x));
+                // B's progress on HTTP adds runs without new orders that matter:
+                // nothing cancels B before the registry closes.
+                if x == 0 || path == Path::Stdio {
+                    steps.push(Step::Progress(x));
+                }
+                steps.extend([Step::Reply(x), Step::Finish(x)]);
+                if x == 0 {
+                    steps.push(Step::Release(x));
+                }
                 steps
             };
             match path {
@@ -12955,6 +13070,10 @@ mod tests {
                     },
                     Program {
                         steps: vec![Step::Disconnect],
+                        after: None,
+                    },
+                    Program {
+                        steps: vec![Step::CloseSession],
                         after: None,
                     },
                 ],
@@ -12981,8 +13100,9 @@ mod tests {
             }
         }
 
-        /// Every interleaving of begin, cancel, reuse, progress, reply, disconnect and
-        /// finish for two instances of one id, on the HTTP path and the stdio loop, for
+        /// Every interleaving of begin, cancel, reuse, progress, reply, disconnect,
+        /// finish, the registry closing and retained work being released, for two
+        /// instances of one id, on the HTTP path and the stdio loop, for
         /// a numeric and a string id. Both protocol eras use this same registry (a
         /// session's or an adapter lifetime's), so the era does not change these runs.
         #[test]
