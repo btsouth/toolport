@@ -809,8 +809,19 @@ impl Matcher {
         (!spans.is_empty()).then(|| self.apply(text, &spans))
     }
 
-    /// [`Self::redact_value`] with the [`Self::text_with`] options.
+    /// [`Self::redact_value`] with the [`Self::text_with`] options: first the
+    /// secrets that cross from one text leaf into the next, then each leaf.
     fn value_with(
+        &self,
+        value: &mut Value,
+        fragments: bool,
+        exempt: Option<&HashSet<String>>,
+    ) -> bool {
+        let across = self.redact_across_leaves(value, exempt);
+        self.leaves_with(value, fragments, exempt) | across
+    }
+
+    fn leaves_with(
         &self,
         value: &mut Value,
         fragments: bool,
@@ -836,50 +847,116 @@ impl Matcher {
                 }
                 None => false,
             },
-            Value::Array(items) => {
-                let changed = items.iter_mut().fold(false, |changed, item| {
-                    self.value_with(item, fragments, exempt) | changed
-                });
-                changed | self.redact_adjacent(items.iter_mut(), exempt)
-            }
+            Value::Array(items) => items.iter_mut().fold(false, |changed, item| {
+                self.leaves_with(item, fragments, exempt) | changed
+            }),
             Value::Object(map) => {
                 let mut changed = false;
                 for v in map.values_mut() {
-                    changed |= self.value_with(v, fragments, exempt);
+                    changed |= self.leaves_with(v, fragments, exempt);
                 }
-                changed |= self.redact_adjacent(map.values_mut(), exempt);
                 changed | self.redact_keys(map, exempt)
             }
             _ => false,
         }
     }
 
-    /// A secret split across neighbouring string values (`["sk-ab", "cd12"]`, or
-    /// consecutive fields of one object): each pair is checked joined, in whole
-    /// forms, and a span crossing the seam is replaced (the marker in the first
-    /// string, the rest of the secret dropped from the second).
-    fn redact_adjacent<'v>(
-        &self,
-        values: impl Iterator<Item = &'v mut Value>,
-        exempt: Option<&HashSet<String>>,
-    ) -> bool {
-        let mut changed = false;
-        let mut prev: Option<&'v mut String> = None;
-        for value in values {
-            let Value::String(next) = value else {
-                prev = None;
-                continue;
-            };
-            if let Some(a) = prev.take() {
-                if let Some((na, nb)) = self.redact_pair(a, next, exempt) {
-                    *a = na;
-                    *next = nb;
-                    changed = true;
+    /// A secret split across the text leaves of one value, whatever the nesting
+    /// (`[{"text":"sk-ab"},{"text":"cd12"}]`). Leaves are taken in document
+    /// order, and object keys are in sorted order in a parsed value, so other
+    /// fields can sit between two pieces (`"type":"text"` in every MCP content
+    /// item). Two streams are searched: all string leaves, and the leaves under
+    /// each key name (array elements share one name). A whole form that crosses
+    /// a leaf boundary in either puts its marker where it starts and is removed
+    /// from every later leaf of that stream it reaches. Numbers, booleans and
+    /// null are not text and are skipped.
+    fn redact_across_leaves(&self, value: &mut Value, exempt: Option<&HashSet<String>>) -> bool {
+        fn collect<'v>(value: &'v mut Value, class: &str, out: &mut Vec<(String, &'v mut String)>) {
+            match value {
+                Value::String(s) => out.push((class.to_string(), s)),
+                Value::Array(items) => items.iter_mut().for_each(|v| collect(v, "[]", out)),
+                Value::Object(map) => map.iter_mut().for_each(|(k, v)| collect(v, k, out)),
+                _ => {}
+            }
+        }
+        let mut leaves = Vec::new();
+        collect(value, "", &mut leaves);
+        if leaves.iter().filter(|(_, l)| !l.is_empty()).count() < 2 {
+            return false;
+        }
+        let mut streams: Vec<Vec<usize>> = vec![(0..leaves.len()).collect()];
+        let mut classes: Vec<&str> = leaves.iter().map(|(c, _)| c.as_str()).collect();
+        classes.sort_unstable();
+        classes.dedup();
+        if classes.len() > 1 {
+            for class in classes {
+                let members: Vec<usize> = (0..leaves.len())
+                    .filter(|&i| leaves[i].0 == class && !leaves[i].1.is_empty())
+                    .collect();
+                if members.len() > 1 {
+                    streams.push(members);
                 }
             }
-            prev = Some(next);
+        }
+        let mut changed = false;
+        for stream in streams {
+            let mut texts: Vec<&mut String> = Vec::with_capacity(stream.len());
+            // Disjoint indices into `leaves`, borrowed mutably together.
+            let mut rest: &mut [(String, &mut String)] = &mut leaves;
+            let mut base = 0;
+            for i in stream {
+                let (_, tail) = std::mem::take(&mut rest).split_at_mut(i - base);
+                let (one, tail) = tail.split_first_mut().expect("index in range");
+                texts.push(&mut *one.1);
+                rest = tail;
+                base = i + 1;
+            }
+            changed |= self.redact_stream(&mut texts, exempt);
         }
         changed
+    }
+
+    /// One stream of [`Self::redact_across_leaves`].
+    fn redact_stream(&self, leaves: &mut [&mut String], exempt: Option<&HashSet<String>>) -> bool {
+        let mut joined = String::with_capacity(leaves.iter().map(|l| l.len()).sum());
+        let mut starts = Vec::with_capacity(leaves.len());
+        for leaf in leaves.iter() {
+            starts.push(joined.len());
+            joined.push_str(leaf);
+        }
+        // The last leaf that starts at or before `at` (an empty leaf yields to the
+        // one after it).
+        let leaf_of = |at: usize| starts.partition_point(|&s| s <= at) - 1;
+        let spans: Vec<_> = self
+            .spans_with(&joined, false)
+            .into_iter()
+            .filter(|(s, e, _)| {
+                leaf_of(*s) != leaf_of(*e - 1)
+                    && !exempt.is_some_and(|x| x.contains(&joined[*s..*e]))
+            })
+            .collect();
+        if spans.is_empty() {
+            return false;
+        }
+        for (i, leaf) in leaves.iter_mut().enumerate() {
+            let (ls, le) = (starts[i], starts[i] + leaf.len());
+            let mut out = String::new();
+            let mut at = ls;
+            let mut touched = false;
+            for (s, e, names) in spans.iter().filter(|(s, e, _)| *s < le && *e > ls) {
+                touched = true;
+                if *s >= ls {
+                    out.push_str(&joined[at..*s]);
+                    out.push_str(&self.marker(names));
+                }
+                at = (*e).min(le);
+            }
+            if touched {
+                out.push_str(&joined[at..le]);
+                **leaf = out;
+            }
+        }
+        true
     }
 
     /// `a` and `b` with a secret that crosses from the end of `a` into the start
@@ -2927,6 +3004,39 @@ mod tests {
             Some(("x [secret:SPLIT]".to_string(), " y".to_string()))
         );
         assert_eq!(m.redact_pair("abcdefghijkl", "999", None), None);
+    }
+
+    #[test]
+    fn a_secret_split_across_text_leaves_at_any_nesting_is_redacted() {
+        let m = m(&[("KEY", "sk-ZebraSecret987")]);
+        let mut v = serde_json::json!([{"text": "sk-Zebra"}, {"text": "Secret987"}]);
+        assert!(m.redact_value(&mut v));
+        assert_eq!(
+            v,
+            serde_json::json!([{"text": "[secret:KEY]"}, {"text": ""}])
+        );
+        // Three pieces at different depths with a number between them, and text
+        // around the secret kept in place.
+        let mut v = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "token sk-Ze"},
+                {"n": 4, "inner": {"text": "braSec"}},
+                {"text": "ret987 done"}
+            ]
+        });
+        assert!(m.redact_value(&mut v));
+        let leaves: Vec<&str> = vec![
+            v["content"][0]["text"].as_str().unwrap(),
+            v["content"][1]["inner"]["text"].as_str().unwrap(),
+            v["content"][2]["text"].as_str().unwrap(),
+        ];
+        assert_eq!(leaves, vec!["token [secret:KEY]", "", " done"]);
+        assert_eq!(v["content"][0]["type"], "text");
+        assert_eq!(v["content"][1]["n"], 4);
+        // An unrelated neighbour is never consumed.
+        let mut v = serde_json::json!([{"text": "sk-Zebra"}, {"text": "Other"}]);
+        m.redact_value(&mut v);
+        assert_eq!(v[1]["text"], "Other");
     }
 
     #[test]
