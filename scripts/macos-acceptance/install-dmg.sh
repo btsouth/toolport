@@ -55,15 +55,16 @@ finder_drag_install() {
   {
     tmo 60 osascript -e 'on run argv' -e 'tell application "Finder"' -e 'activate' -e 'close every window' \
       -e 'set w to make new Finder window to (POSIX file (item 1 of argv) as alias)' \
-      -e 'set current view of w to icon view' -e 'set bounds of w to {40, 80, 760, 560}' -e 'end tell' -e 'end run' "$MNT"
+      -e 'set current view of w to icon view' -e 'set bounds of w to {40, 80, 480, 500}' \
+      -e 'set r to make new Finder window to (POSIX file "/" as alias)' \
+      -e 'set current view of r to icon view' -e 'set bounds of r to {520, 80, 1000, 500}' -e 'end tell' -e 'end run' "$MNT"
     sleep 2
     fpid="$(pgrep -x Finder | head -1)"
     "$TPUI_BIN" find "$fpid" "Toolport" | tee "$EVIDENCE/logs/finder-items-$ASSET.txt"
     "$TPUI_BIN" find "$fpid" "Applications" | tee -a "$EVIDENCE/logs/finder-items-$ASSET.txt"
   } >"$dlog" 2>&1
   shot "finder-drag-before-$ASSET" >/dev/null || true
-  # Icon: an image or text element labelled Toolport inside the window's
-  # content area. Target: the sidebar's Applications row.
+  # Drag the app's icon onto the Applications folder icon in the root window.
   read -r src dst < <(python3 - "$EVIDENCE/logs/finder-items-$ASSET.txt" <<'PY'
 import re, sys
 icon = target = None
@@ -73,9 +74,10 @@ for line in open(sys.argv[1]):
         continue
     role, label, x, y, w, h = m.group(1), m.group(2), *map(int, m.groups()[2:])
     cx, cy = x + w // 2, y + h // 2
-    if role in ("AXImage", "AXTextField", "AXCell", "AXGroup") and label.lower().startswith("toolport") and x > 200 and icon is None:
+    # The dmg window is on the left, the disk's root window on the right.
+    if role == "AXImage" and label.lower().startswith("toolport") and 40 <= x < 480 and icon is None:
         icon = (cx, cy)
-    if label == "Applications" and role in ("AXRow", "AXCell", "AXStaticText", "AXOutlineRow") and x < 260 and target is None:
+    if role == "AXImage" and label.split(" | ")[0] == "Applications" and x >= 520 and target is None:
         target = (cx, cy)
 if icon and target:
     print("%d,%d %d,%d" % (icon + target))

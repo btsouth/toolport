@@ -47,6 +47,7 @@ jobs:
       - name: Install the Apple Silicon dmg
         run: bash scripts/macos-acceptance/install-dmg.sh "$TAG" Toolport_aarch64-apple-darwin.dmg
       - name: Check the installed bundle
+        if: ${{ !cancelled() }}
         run: bash scripts/macos-acceptance/bundle-checks.sh /Applications/Toolport.app arm64 "Apple Silicon"
       - name: Check the Intel dmg
         if: ${{ !cancelled() }}
@@ -54,6 +55,7 @@ jobs:
           bash scripts/macos-acceptance/install-dmg.sh "$TAG" Toolport_x86_64-apple-darwin.dmg --no-install
           bash scripts/macos-acceptance/bundle-checks.sh "$RUNNER_TEMP/inspect/Toolport_x86_64-apple-darwin.dmg/Toolport.app" x86_64 Intel
       - name: First launch
+        if: ${{ !cancelled() }}
         timeout-minutes: 8
         run: bash scripts/macos-acceptance/first-run.sh new
       - name: Set up through the window (servers, keychain, clients, tool calls)
@@ -100,9 +102,11 @@ jobs:
           test -n "$PREVIOUS_TAG" || { echo "::error::no published release before $TAG"; exit 1; }
           bash scripts/macos-acceptance/install-dmg.sh "$PREVIOUS_TAG" Toolport_aarch64-apple-darwin.dmg
       - name: First launch of the previous release
+        if: ${{ !cancelled() }}
         timeout-minutes: 8
         run: bash scripts/macos-acceptance/first-run.sh previous
       - name: Set up the previous release through the window
+        if: ${{ !cancelled() }}
         timeout-minutes: 20
         run: bash scripts/macos-acceptance/ui-setup.sh previous "$CLIENT_MANIFEST"
       - name: Upgrade to the release under test
@@ -131,14 +135,14 @@ jobs:
   homebrew:
     name: Homebrew cask
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
       - name: Resolve the release under test
         run: bash scripts/macos-acceptance/resolve-release.sh "$TAG_INPUT" | sed 's/^tag=/TAG=/; s/^previous=/PREVIOUS_TAG=/' >>"$GITHUB_ENV"
-      - name: Prepare the runner
+      - name: Prepare the runner and seed client configs
         run: bash scripts/macos-acceptance/prepare.sh
       - name: Install with Homebrew
         run: bash scripts/macos-acceptance/homebrew.sh install "$TAG"
@@ -149,6 +153,10 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 8
         run: bash scripts/macos-acceptance/first-run.sh brew
+      - name: Set up through the window
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: bash scripts/macos-acceptance/ui-setup.sh brew "$CLIENT_MANIFEST"
       - name: Uninstall with Homebrew (zap)
         if: ${{ !cancelled() }}
         timeout-minutes: 8
