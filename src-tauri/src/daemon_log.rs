@@ -95,7 +95,7 @@ enum RelayMsg {
 
 struct Relay {
     done: std::sync::mpsc::Receiver<()>,
-    to_writer: std::sync::mpsc::Sender<RelayMsg>,
+    to_writer: std::sync::mpsc::SyncSender<RelayMsg>,
     /// True while the reader holds bytes it has read but not yet handed on.
     busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The pipe's read end, to ask how many bytes are still unread.
@@ -134,7 +134,10 @@ pub fn install_stderr_redactor() {
         return;
     };
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let (to_writer, from_reader) = std::sync::mpsc::channel::<RelayMsg>();
+    // Bounded: when stderr's destination stops reading, the writer blocks, the
+    // queue fills, the reader stops reading and the pipe fills, so writers are
+    // slowed the way they were before the relay existed.
+    let (to_writer, from_reader) = std::sync::mpsc::sync_channel::<RelayMsg>(RELAY_QUEUE_CHUNKS);
     let busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let read_raw = redirect.read_raw;
     let (mut reader, original) = (redirect.reader, redirect.original);
@@ -239,17 +242,7 @@ fn relay_writer(
     done: std::sync::mpsc::Sender<()>,
 ) {
     let mut out = RelayOut::new(out);
-    let mut first = true;
     for msg in from_reader {
-        // The relay writes through a duplicate of the original stderr, so the
-        // two share one file offset. A Rust write begun on the original before
-        // the swap may still be running; where the system does not serialize
-        // writes that share an offset (macOS), the relay's first write could
-        // land at the same offset and one would overwrite the other. Such a
-        // write holds Rust's stderr lock until it returns: wait for it once.
-        if std::mem::take(&mut first) {
-            drop(std::io::stderr().lock());
-        }
         match msg {
             RelayMsg::Data(bytes) => {
                 out.data(&bytes);
@@ -299,11 +292,30 @@ pub fn sync_stderr_relay(budget: std::time::Duration) {
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
+    // The queue is bounded: a writer stuck on its destination must not hold
+    // a sync (a panic, a signal, an exit) past its budget.
     let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-    if to_writer.send(RelayMsg::Sync(ack_tx)).is_ok() {
-        let _ = ack_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+    let mut msg = RelayMsg::Sync(ack_tx);
+    loop {
+        match to_writer.try_send(msg) {
+            Ok(()) => {
+                let _ = ack_rx
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+                return;
+            }
+            Err(std::sync::mpsc::TrySendError::Full(back))
+                if std::time::Instant::now() < deadline =>
+            {
+                msg = back;
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(_) => return,
+        }
     }
 }
+
+/// Chunks (each at most one 8 KiB read) the relay queues for its writer.
+const RELAY_QUEUE_CHUNKS: usize = 64;
 
 /// How long the pipe must look drained (and the reader idle) before a sync
 /// request is queued behind what it read.
@@ -933,25 +945,25 @@ pub fn install_stderr_redaction() -> StderrRedaction {
 /// the original file or whole in the pipe. Bytes written before the swap are
 /// already in the original file; the relay writes only bytes written after it,
 /// through a duplicate of the same open file (same offset), so a thread's later
-/// lines always follow its earlier ones. Its first write waits for any Rust
-/// write still running on the original ([`relay_writer`]): not every system
-/// serializes writes that share an offset. Rust's stderr is unbuffered, so no
-/// bytes wait in-process across the switch. No lock a writer holds is taken
-/// here, so a registration on a thread that holds stderr cannot deadlock; nor
-/// can one on the relay's own threads, which take neither lock held here (their
-/// sync uses `try_lock`) and so cannot block the start they would wait for.
+/// lines always follow its earlier ones. Rust's stderr is unbuffered, so no
+/// bytes wait in-process across the switch.
 ///
+/// The swap holds Rust's stderr lock, so no Rust write is running on the
+/// original when it happens. The relay shares the original's file offset, and
+/// not every system serializes writes that share one (macOS does not): a write
+/// still running there could overwrite the relay's first, or be overwritten.
 /// On Windows, Rust fetches the standard error handle on every write, and
 /// pointing the C runtime's fd 2 at the pipe closes the handle fd 2 wrapped
-/// (usually that same handle) and clears the standard handle for a moment. A
-/// Rust write in that window would be dropped, so the swap holds Rust's stderr
-/// lock and every Rust write falls wholly before or after it; the C runtime's
-/// own writes take its fd lock, which `_dup2` holds too. The stderr lock is
-/// reentrant and always taken before ours, so a registering thread that already
-/// holds it proceeds, and two registering threads take the locks in one order.
+/// (usually that same handle) and clears the standard handle for a moment; the
+/// lock keeps every Rust write wholly before or after it, and the C runtime's
+/// own writes take its fd lock, which `_dup2` holds too. The lock is waited
+/// for only while a write runs on the original, which never waits on the
+/// relay. It is reentrant and always taken before ours, so a registering
+/// thread that already holds it proceeds, and two registering threads take the
+/// locks in one order. The relay's own threads take neither lock (their sync
+/// uses `try_lock`), so they cannot block the start they would wait for.
 fn start_relay() {
     use std::sync::atomic::Ordering;
-    #[cfg(windows)]
     let _writers = std::io::stderr().lock();
     let mut state = STDERR_REDACTION
         .lock()
@@ -1537,7 +1549,7 @@ mod tests {
     }
 
     /// Child half of the in-flight-write test: a thread holds Rust's stderr
-    /// lock (as a write does while it runs) across the switch.
+    /// lock (as a write does while it runs) while another registers a secret.
     #[cfg(unix)]
     #[test]
     fn stderr_inflight_write_child() {
@@ -1555,29 +1567,27 @@ mod tests {
             drop(lock);
         });
         held_rx.recv().unwrap();
-        crate::secret_redact::register("inflight-server", "INFLIGHT_TOKEN", &secret);
-        // Into the pipe, without the lock: the relay has it to write.
-        let line = b"relayed while held\n";
+        let registrant = std::thread::spawn(move || {
+            crate::secret_redact::register("inflight-server", "INFLIGHT_TOKEN", &secret);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        println!("swapped-while-held={}", stderr_identity().2);
+        go_tx.send(()).unwrap();
+        holder.join().unwrap();
+        registrant.join().unwrap();
+        println!("swapped-after={}", stderr_identity().2);
+        let line = b"relayed after release\n";
         // SAFETY: writes a live buffer to fd 2.
         unsafe {
             libc::write(2, line.as_ptr().cast(), line.len());
         }
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let err = std::env::var("TOOLPORT_STDERR_INFLIGHT_FILE").unwrap();
-        let early = std::fs::read_to_string(err).unwrap();
-        println!(
-            "written-while-held={}",
-            early.contains("relayed while held")
-        );
-        go_tx.send(()).unwrap();
-        holder.join().unwrap();
         flush_stderr_relay(std::time::Duration::from_secs(5));
     }
 
-    /// Failure mode: the relay writes to the original stderr while a write
-    /// begun before the switch is still running on it. They share one offset,
-    /// and where writes on it are not serialized (macOS) one overwrites the
-    /// other: lines written right after the switch were lost.
+    /// Failure mode: stderr is swapped while a Rust write is still running on
+    /// the original. The relay shares its offset, and where writes on it are
+    /// not serialized (macOS) one overwrites the other: lines written right
+    /// after the switch were lost.
     #[cfg(unix)]
     #[test]
     fn the_relay_waits_for_a_write_running_on_the_original_stderr() {
@@ -1595,7 +1605,6 @@ mod tests {
                 "TOOLPORT_STDERR_INFLIGHT_CHILD",
                 "inflight-canary-7Qz2-SECRET",
             )
-            .env("TOOLPORT_STDERR_INFLIGHT_FILE", &err)
             .stderr(file)
             .output()
             .unwrap();
@@ -1603,8 +1612,9 @@ mod tests {
         let text = std::fs::read_to_string(&err).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(output.status.success(), "{stdout}\n{text}");
-        assert!(stdout.contains("written-while-held=false"), "{stdout}");
-        assert!(text.contains("relayed while held\n"), "{text}");
+        assert!(stdout.contains("swapped-while-held=false"), "{stdout}");
+        assert!(stdout.contains("swapped-after=true"), "{stdout}");
+        assert!(text.contains("relayed after release\n"), "{text}");
     }
 
     /// Failure mode: every process that wants redaction starts the relay (two
