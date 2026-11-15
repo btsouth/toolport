@@ -14684,18 +14684,25 @@ mod tests {
         use client_rows::{client_row, profile_group, ProfileProduct, RowStyle};
         let parts = |row: &gtk::Box, with_logo: bool| {
             let line = row.first_child().unwrap();
+            let lead = line.first_child().unwrap();
             let copy = if with_logo {
-                line.first_child().unwrap().next_sibling().unwrap()
+                lead.first_child().unwrap().next_sibling().unwrap()
             } else {
-                line.first_child().unwrap()
+                lead.first_child().unwrap()
             };
-            let title = copy.first_child().unwrap();
-            let detail = title
+            // The name sits in a title box inside the button that opens details.
+            let open = copy.first_child().unwrap();
+            let title = open.first_child().unwrap();
+            let detail = open
                 .next_sibling()
                 .unwrap()
                 .downcast::<gtk::Label>()
                 .unwrap();
-            (title, detail, copy.next_sibling())
+            (
+                title,
+                detail,
+                lead.next_sibling().filter(|controls| controls.is_visible()),
+            )
         };
         for state in [
             state::ClientGatewayState::Disconnected,
@@ -14739,6 +14746,12 @@ mod tests {
                 }
                 let height = row.measure(gtk::Orientation::Vertical, 880).1;
                 assert!(height < 90, "{style:?} rows stay one line: {height}");
+                // Narrow windows put the controls under the text rather than
+                // past the window edge, as React's rows do.
+                let (min, _, _, _) = row.measure(gtk::Orientation::Horizontal, -1);
+                assert!(min <= 300, "{state:?} row fits a narrow window: {min}");
+                let narrow = row.measure(gtk::Orientation::Vertical, 300).1;
+                assert!(narrow > height, "{state:?} controls wrap at 300: {narrow}");
             }
         }
 
