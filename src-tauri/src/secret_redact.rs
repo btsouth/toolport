@@ -1607,20 +1607,26 @@ fn cover(scope: &Scope, index: usize) {
         // Searched together with the main matcher it was read with, which covers
         // everything before the delta's first value.
         let built = Arc::new(Matcher::new_with(&pairs, &whole_only).over(main));
-        let mut guard = REGISTRY
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(reg) = guard.as_mut().and_then(|map| map.get_mut(scope)) else {
-            return;
-        };
         // The delta started at `main_len` as read, and `main_len` only grows,
-        // so it and the main matcher cover everything below `end`.
-        if end > reg.delta_end {
-            let retired = reg.delta.replace(built);
-            reg.delta_end = end;
-            drop(guard);
-            drop(retired);
-        }
+        // so it and the main matcher cover everything below `end`. A wider one
+        // another thread installed meanwhile wins; the next pass sees it. The
+        // write lock is released before that pass reads, and before a replaced
+        // matcher is freed.
+        let retired = {
+            let mut guard = REGISTRY
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(reg) = guard.as_mut().and_then(|map| map.get_mut(scope)) else {
+                return;
+            };
+            if end > reg.delta_end {
+                reg.delta_end = end;
+                reg.delta.replace(built)
+            } else {
+                Some(built)
+            }
+        };
+        drop(retired);
     }
 }
 
@@ -2867,6 +2873,44 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_registrations_never_deadlock_and_all_are_covered() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-concurrent-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        let scope = scope_now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        for t in 0..8 {
+            let (tx, scope) = (tx.clone(), scope.clone());
+            std::thread::spawn(move || {
+                for i in 0..25 {
+                    let value = format!("concurrent-{t}-{i}-Qx7v9Lm2");
+                    add(
+                        &scope,
+                        &format!("conc-srv/K{t}_{i}"),
+                        &format!("K{t}_{i}"),
+                        &value,
+                    );
+                    let text = format!("saw {value}");
+                    let covered = current_in(&scope)
+                        .is_some_and(|m| !m.redact_text(&text).contains("Qx7v9Lm2"));
+                    let _ = tx.send(covered);
+                }
+            });
+        }
+        drop(tx);
+        let results: Vec<bool> = (0..200)
+            .map(|_| {
+                rx.recv_timeout(std::time::Duration::from_secs(60))
+                    .expect("no deadlock")
+            })
+            .collect();
+        assert!(
+            results.iter().all(|&c| c),
+            "each value is redacted once add returns"
+        );
+    }
+
+    #[test]
     fn a_value_registered_after_the_main_build_merges_with_it() {
         let _lock = crate::registry::data_dir_test_lock();
         let dir = std::env::temp_dir().join(format!("tp-layers-{}", std::process::id()));
@@ -3243,8 +3287,23 @@ mod tests {
         // The marker holds names, never the value, and makes the next start a no-op.
         let marker = std::fs::read_to_string(dir.join(SCRUB_MARKER)).unwrap();
         assert!(marker.contains("unit-scrub-server/SCRUB_KEY") && !marker.contains(secret));
+        // A second pass in the same process scrubs only for values learned since.
+        // (Tests elsewhere that store a keychain value without the data-dir lock
+        // can register into this directory meanwhile; then a pass is owed.)
+        let known = || {
+            REGISTRY
+                .read()
+                .unwrap()
+                .as_ref()
+                .and_then(|m| m.get(&scope_of(&dir)))
+                .map_or(0, |r| r.secrets.len())
+        };
+        let before = known();
         std::fs::write(&audit, format!("{leaked}\n")).unwrap();
-        assert_eq!(scrub_data_dir(&dir).unwrap(), 0);
+        let again = scrub_data_dir(&dir).unwrap();
+        if known() == before {
+            assert_eq!(again, 0);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
