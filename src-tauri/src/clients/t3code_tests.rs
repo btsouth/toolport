@@ -1050,3 +1050,35 @@ fn a_swap_between_the_check_and_the_open_is_not_read() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A Codex home T3 Code names, connected through its own row, gets the same Codex
+/// settings as the main Codex config, and the main config is not touched.
+#[test]
+fn a_t3_codex_home_gets_the_codex_settings_when_connected() {
+    let data = crate::registry::DataDirTestEnv::new("t3-codex-settings");
+    let _env_lock = env_test_lock();
+    let _client_env = isolated_client_env(&data.dir);
+    let _home = TestHome::set(&data.dir);
+    std::fs::write(data.dir.join("toolport-gateway"), "fixture").unwrap();
+    let home = data.dir.clone();
+    std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+    std::fs::create_dir_all(home.join(".t3/cx/codex")).unwrap();
+    std::fs::write(home.join(".t3/cx/codex/config.toml"), "model = \"gpt-5\"\n").unwrap();
+    std::fs::write(
+        home.join(".t3/userdata/settings.json"),
+        r#"{"providerInstances": {"cx": {"driver": "codex", "config": {"homePath": "~/.t3/cx/codex"}}}}"#,
+    )
+    .unwrap();
+    let row = automatic(&[])
+        .pop()
+        .expect("the T3 Code Codex home is a row");
+    assert!(row.id.starts_with("codex@t3-"), "{}", row.id);
+    install_gateway_for(&row.id, None, None).unwrap();
+    let text = std::fs::read_to_string(&row.config_path).unwrap();
+    let doc: toml::Table = toml::from_str(&text).unwrap();
+    let entry = doc["mcp_servers"]["toolport"].as_table().unwrap();
+    assert_eq!(entry["supports_parallel_tool_calls"].as_bool(), Some(true));
+    assert_eq!(entry["startup_timeout_sec"].as_integer(), Some(75));
+    assert_eq!(entry["tool_timeout_sec"].as_integer(), Some(600));
+    assert!(!home.join(".codex/config.toml").exists());
+}
