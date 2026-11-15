@@ -148,14 +148,40 @@ fn expand(raw: &str, home: &Path) -> Option<PathBuf> {
 
 /// Whether `path` is inside `home` by its text: absolute, no `.` or `..`, and below
 /// `home`. A UNC, device or verbatim path never starts with an ordinary home folder.
+/// Windows compares names without regard to case, as Windows does.
 pub(super) fn lexically_inside(path: &Path, home: &Path) -> bool {
+    inside_by_text(path, home, cfg!(windows))
+}
+
+/// [`lexically_inside`] with the case rule given, so both rules run in tests on any OS.
+pub(super) fn inside_by_text(path: &Path, home: &Path, ignore_case: bool) -> bool {
     use std::path::Component;
-    path.is_absolute()
-        && path != home
-        && path.starts_with(home)
-        && path
+    if !path.is_absolute()
+        || path
             .components()
-            .all(|part| !matches!(part, Component::ParentDir | Component::CurDir))
+            .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+    {
+        return false;
+    }
+    let mut parts = path.components();
+    home.components().all(|want| {
+        parts
+            .next()
+            .is_some_and(|part| same_name(part.as_os_str(), want.as_os_str(), ignore_case))
+    }) && parts.next().is_some()
+}
+
+/// Two path texts name the same place, by the platform's case rule.
+pub(super) fn same_text(a: &Path, b: &Path) -> bool {
+    a.components().count() == b.components().count()
+        && a.components()
+            .zip(b.components())
+            .all(|(a, b)| same_name(a.as_os_str(), b.as_os_str(), cfg!(windows)))
+}
+
+fn same_name(a: &std::ffi::OsStr, b: &std::ffi::OsStr, ignore_case: bool) -> bool {
+    a == b
+        || (ignore_case && a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase())
 }
 
 /// A cheap token that changes when T3 Code's settings change, for the Clients page to
@@ -704,8 +730,8 @@ pub(super) fn path_is_safe(config: &Path) -> bool {
         }
 }
 
-/// Locations for T3 Code homes that are not a client's main config and that `known` does
-/// not already list. Homes whose folder does not exist yet are left out until it does.
+/// Locations for T3 Code's Claude Code and Codex homes that are not a client's main
+/// config and that `known` does not already list. Homes whose folder does not exist yet are left out until it does.
 pub(super) fn automatic(known: &[locations::ClientLocation]) -> Vec<locations::ClientLocation> {
     let mut rows: Vec<locations::ClientLocation> = Vec::new();
     let Some(home) = home() else {
@@ -715,16 +741,26 @@ pub(super) fn automatic(known: &[locations::ClientLocation]) -> Vec<locations::C
         return rows;
     };
     for instance in instances() {
+        // Only Claude Code and Codex homes become rows; other providers' homes only
+        // label rows that already exist.
+        if !matches!(instance.provider, Provider::ClaudeCode | Provider::Codex) {
+            continue;
+        }
         let Some(path) = instance.config_path.as_ref() else {
             continue;
         };
         // No link below home is followed: the folder must resolve to where its text
         // says. Home itself may be a link (for example `/home` to `/var/home`).
         let Some(folder) = path.parent().and_then(|folder| {
-            let expected = real_home.join(folder.strip_prefix(&home).ok()?);
+            // `instance_of` checked that the folder is below home by its text.
+            let below: PathBuf = folder
+                .components()
+                .skip(home.components().count())
+                .collect();
+            let expected = real_home.join(below);
             std::fs::canonicalize(folder)
                 .ok()
-                .filter(|real| *real == expected)
+                .filter(|real| same_text(real, &expected))
         }) else {
             continue;
         };

@@ -348,7 +348,7 @@ fn default_instances_stand_in_only_when_absent() {
 
 #[test]
 fn malformed_or_odd_files_fall_back_without_breaking() {
-    let home = PathBuf::from("/h");
+    let home = fixture_home();
     for text in [
         "",
         "not json",
@@ -754,6 +754,100 @@ fn hostile_paths_are_dropped_before_any_file_system_call() {
         .collect();
     assert_eq!(ids, vec!["ok"], "{found:?}");
     assert!(lexically_inside(&home.join("ok/.codex/config.toml"), &home));
+}
+
+/// Windows names are the same whatever their case, and its paths may use either slash.
+/// The rule runs here on every OS; the Windows-shaped paths below run on Windows.
+#[test]
+fn a_home_matches_by_the_platforms_case_rule() {
+    let home = fixture_home();
+    let text = json_path(&home);
+    let mixed = PathBuf::from(format!("{}/.Codex-Work/config.toml", text.to_uppercase()));
+    assert!(inside_by_text(&mixed, &home, true));
+    assert!(!inside_by_text(&mixed, &home, false));
+    assert!(inside_by_text(
+        &home.join(".codex-work/config.toml"),
+        &home,
+        false
+    ));
+    // By whole names, not by text: a sibling that starts the same is outside.
+    assert!(!inside_by_text(
+        Path::new(&format!("{text}2/x")),
+        &home,
+        true
+    ));
+    assert!(!inside_by_text(&home.join("../other/x"), &home, true));
+    assert!(!inside_by_text(&home, &home, true));
+    #[cfg(windows)]
+    {
+        let home = Path::new(r"C:\Users\Name");
+        for good in [
+            r"C:\Users\Name\.codex-work\config.toml",
+            r"C:/Users/Name/.codex-work/config.toml",
+            r"c:\users\name\.codex-work\config.toml",
+        ] {
+            assert!(lexically_inside(Path::new(good), home), "{good}");
+        }
+        for bad in [
+            r"\\host\share\Users\Name\x",
+            r"\\?\UNC\host\share\x",
+            r"\\.\pipe\x",
+            r"D:\Users\Name\x",
+            r"C:\Users\Name2\x",
+            r"C:\Users\Name\..\Other\x",
+            r"Users\Name\x",
+        ] {
+            assert!(!lexically_inside(Path::new(bad), home), "{bad}");
+        }
+        // As T3 Code writes it, in either form, the home is kept.
+        let text = r#"{"providerInstances": {
+            "a": {"driver": "codex", "config": {"homePath": "C:\\Users\\Name\\.codex-work"}},
+            "b": {"driver": "codex", "config": {"homePath": "c:/users/name/.codex-b"}},
+            "c": {"driver": "codex", "config": {"homePath": "~/.codex-c"}}}}"#;
+        let found = instances_of(parse(text.as_bytes().to_vec(), home));
+        for id in ["a", "b", "c"] {
+            assert!(by_id(&found, id).config_path.is_some(), "{id}");
+        }
+    }
+}
+
+/// Only Claude Code and Codex homes become rows. An OpenCode, Grok or Pi home T3 Code
+/// names, even a plain existing folder inside home, gets none.
+#[test]
+fn only_claude_code_and_codex_homes_become_rows() {
+    let _lock = crate::registry::data_dir_test_lock();
+    let root = std::env::temp_dir().join(format!(
+        "toolport-t3-kinds-{}-{}",
+        std::process::id(),
+        epoch_millis()
+    ));
+    let home = root.join("home");
+    std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+    for folder in ["oc/opencode", "grok", "pi", "cc"] {
+        std::fs::create_dir_all(home.join(".t3/x").join(folder)).unwrap();
+    }
+    std::fs::write(
+        home.join(".t3/userdata/settings.json"),
+        r#"{"providerInstances": {
+            "oc": {"driver": "opencode", "environment": [{"name": "XDG_CONFIG_HOME", "value": "~/.t3/x/oc"}]},
+            "grok": {"driver": "grok", "environment": [{"name": "GROK_HOME", "value": "~/.t3/x/grok"}]},
+            "pi": {"driver": "pi", "environment": [{"name": "PI_CODING_AGENT_DIR", "value": "~/.t3/x/pi"}]},
+            "cc": {"driver": "claudeAgent", "config": {"homePath": "~/.t3/x/cc"}}}}"#,
+    )
+    .unwrap();
+    let _data = crate::registry::DataDirOverride::set(root.join("data"));
+    let _home = TestHome::set(&home);
+    // The three are read as instances, so the test is not passing by accident.
+    let found = instances();
+    for id in ["oc", "grok", "pi"] {
+        assert!(by_id(&found, id).config_path.is_some(), "{id}");
+    }
+    let types: Vec<String> = automatic(&[])
+        .into_iter()
+        .map(|row| row.client_type)
+        .collect();
+    assert_eq!(types, vec!["claude-code".to_string()]);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A link below home is not followed into a row, even to a folder inside home.
