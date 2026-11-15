@@ -14,8 +14,9 @@ fn vscode_cursor_and_copilot_entries_carry_type_and_old_entries_gain_only_that_f
         let path = client_config_path(client).unwrap();
         // Toolport's old entry, with a user's extra env var and a comment.
         let text = format!(
-            "{{\n  // keep this comment\n  \"{key}\": {{\n    \"toolport\": {{\n      \"command\": \"{gw}\",\n      \"args\": [],\n      \"env\": {{\"TOOLPORT_CLIENT_ID\": \"{client}\", \"TOOLPORT_ATTRIBUTION_ID\": \"{client}\", \"MINE\": \"1\"}}\n    }},\n    \"native\": {{\"command\": \"native\"}}\n  }}\n}}\n",
-            gw = fixture.gateway(),
+            "{{\n  // keep this comment\n  \"{key}\": {{\n    \"toolport\": {{\n      \"command\": {gw},\n      \"args\": [],\n      \"env\": {{\"TOOLPORT_CLIENT_ID\": \"{client}\", \"TOOLPORT_ATTRIBUTION_ID\": \"{client}\", \"MINE\": \"1\"}}\n    }},\n    \"native\": {{\"command\": \"native\"}}\n  }}\n}}\n",
+            // JSON-escaped, so a Windows path keeps its backslashes.
+            gw = serde_json::to_string(fixture.gateway()).unwrap(),
         );
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &text).unwrap();

@@ -761,7 +761,13 @@ fn a_hand_edited_or_shared_http_legacy_entry_and_an_unreadable_target_block_the_
 #[test]
 fn moving_a_connection_restores_the_old_file_from_its_snapshot_and_releases_it() {
     let fixture = Fixture::new("relocate-snapshot");
-    let legacy = fixture.home.join(".codeium/windsurf/mcp_config.json");
+    // Spelled the way Toolport builds it: snapshot records are keyed by the path
+    // string, so `a/b` and `a\b` are different records on Windows.
+    let legacy = fixture
+        .home
+        .join(".codeium")
+        .join("windsurf")
+        .join("mcp_config.json");
     let original = json!({"mcpServers": {"native": {"command": "native"}}, "theme": "dark"});
     write(&legacy, &original);
     let before = std::fs::read_to_string(&legacy).unwrap();
