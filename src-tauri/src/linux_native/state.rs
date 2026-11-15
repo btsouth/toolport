@@ -451,6 +451,8 @@ pub(super) struct ClientView {
     pub(super) location_removable: bool,
     /// Set when several Claude Code profiles are listed, to tell them apart.
     pub(super) claude_profile: Option<crate::clients::ClaudeProfile>,
+    /// The T3 Code provider instances that use this config. Empty without T3 Code.
+    pub(super) t3_code: Vec<crate::clients::T3CodeUse>,
 }
 
 impl ClientView {
@@ -492,6 +494,7 @@ impl ClientView {
             config_error: client.error.is_some(),
             location_removable: client.location_removable,
             claude_profile: client.claude_profile,
+            t3_code: client.t3_code,
         }
     }
 }
@@ -1293,6 +1296,7 @@ mod tests {
             entry_state: crate::clients::GatewayEntryState::Managed,
             error: None,
             claude_profile: None,
+            t3_code: Vec::new(),
         };
 
         let view = ClientView::from_detected(detected);

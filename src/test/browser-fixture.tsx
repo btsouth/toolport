@@ -1137,6 +1137,7 @@ mockIPC(
       case "take_registry_recovery_notice":
       case "team_pair_state":
       case "plugin:updater|check":
+      case "t3_code_revision":
         return null;
       case "savings_summary":
         return savingsSummary;

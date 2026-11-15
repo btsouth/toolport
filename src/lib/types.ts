@@ -56,6 +56,15 @@ export interface DetectedClient {
   error: string | null;
   /** Set on each Claude Code profile when this machine has several of them. */
   claudeProfile?: ClaudeProfile;
+  /** T3 Code instances that run this client as a provider. Omitted when none. */
+  t3Code?: T3CodeUse[];
+}
+
+/** A T3 Code instance that uses a client row (src-tauri/src/clients/t3code.rs). */
+export interface T3CodeUse {
+  instanceId: string;
+  displayName: string;
+  enabled: boolean;
 }
 
 /** What tells one Claude Code profile apart (src-tauri/src/clients/claude_profiles.rs). */

@@ -63,6 +63,52 @@ fn location_name(kind: &str, folder: &str) -> String {
     label
 }
 
+/// The label of a T3 Code home: its folder below home, such as
+/// `Claude Code (t3/commandcode/claude)`. T3 Code's own instance name is shown beside it.
+pub(super) fn t3_location_name(client_type: &str, config: &Path) -> String {
+    let kind = defs()
+        .into_iter()
+        .find(|def| def.id == client_type)
+        .map(|def| def.name)
+        .unwrap_or(client_type);
+    let folder = config.parent().unwrap_or(config);
+    let shown = home()
+        .and_then(|root| {
+            let root = std::fs::canonicalize(&root).unwrap_or(root);
+            let rest = folder.strip_prefix(&root).ok()?;
+            let parts: Vec<String> = rest
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            Some(format!("~/{}", parts.join("/")))
+        })
+        .unwrap_or_else(|| folder.display().to_string());
+    let shown: String = shown
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || " ._-+()[]/~".contains(c) {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(80)
+        .collect();
+    format!("{kind} ({shown})")
+}
+
+/// A home found only because T3 Code lists it. Listed again on each refresh while T3 Code
+/// does, and saved only once Toolport changes its config.
+pub(super) fn is_t3_home(row: &ClientLocation) -> bool {
+    !row.manual && super::t3code::is_location_id(&row.id)
+}
+
+/// A saved T3 Code home that T3 Code no longer lists. It stays listed so it can be
+/// disconnected, then forgotten.
+fn t3_home_is_gone(row: &ClientLocation) -> bool {
+    is_t3_home(row) && !super::t3code::lists(&row.config_path)
+}
+
 pub fn remove_client_location(id: &str) -> Result<(), String> {
     let _auth = crate::registry_controller::acquire_auth_lock(&format!("client-config:{id}"))?;
     let store = store_path()?;
@@ -128,7 +174,11 @@ pub(super) fn saved() -> Result<Vec<ClientLocation>, String> {
                     .into_iter()
                     .find(|def| def.id == row.client_type)
                     .unwrap();
-                row.name = location_name(kind.name, &folder_label(&row.config_path));
+                row.name = if super::t3code::is_location_id(&row.id) {
+                    t3_location_name(&row.client_type, &row.config_path)
+                } else {
+                    location_name(kind.name, &folder_label(&row.config_path))
+                };
                 rows.push(row);
             }
             Ok(rows)
@@ -231,6 +281,9 @@ pub(super) fn generated_id_type(id: &str) -> Option<&str> {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     {
+        return Some(kind);
+    }
+    if super::t3code::is_location_id(id) {
         return Some(kind);
     }
     if kind == "codex" {
@@ -502,7 +555,7 @@ fn launcher_is_gone(row: &ClientLocation) -> bool {
 /// Saved locations Toolport can forget: ones added by hand, automatic ones whose folder
 /// is gone, and launcher homes whose launcher is gone.
 pub(super) fn forgettable(row: &ClientLocation) -> bool {
-    row.manual || automatic_path_is_missing(row) || launcher_is_gone(row)
+    row.manual || automatic_path_is_missing(row) || launcher_is_gone(row) || t3_home_is_gone(row)
 }
 
 /// Whether a Codex home outside the saved list is one automatic discovery lists.
@@ -608,6 +661,7 @@ pub(super) fn validate(row: &ClientLocation) -> Result<(), String> {
             && home().is_some_and(|root| automatic_path_is_safe(&root, &row.config_path)))
         || (row.client_type == "codex"
             && home().is_some_and(|root| codex_automatic_path_is_safe(&root, &row.config_path)))
+        || (is_t3_home(row) && super::t3code::path_is_safe(&row.config_path))
     {
         Ok(())
     } else {
@@ -670,6 +724,8 @@ fn automatic(home: &Path) -> Vec<ClientLocation> {
             &super::claude_profiles::user_path_dirs(),
         ),
     ));
+    let t3 = super::t3code::automatic(&rows);
+    rows.extend(t3);
     rows.sort_by(|a, b| a.id.cmp(&b.id));
     rows
 }
@@ -747,6 +803,11 @@ pub(super) fn lookup(id: &str) -> Option<ClientLocation> {
     }
     if let Some(row) = saved().ok()?.into_iter().find(|row| row.id == id) {
         return Some(row);
+    }
+    if super::t3code::is_location_id(id) {
+        return super::t3code::automatic(&[])
+            .into_iter()
+            .find(|row| row.id == id);
     }
     if let Some(key) = id.strip_prefix("codex@") {
         return codex_lookup(id, key);

@@ -32,6 +32,7 @@ mod locations;
 mod reasonix;
 pub(crate) mod reasonix_paths;
 mod synced;
+mod t3code;
 pub use discovery::DiscoveryCapabilities;
 pub(crate) use locations::folder_key as claude_profile_key;
 #[cfg(feature = "test-support")]
@@ -41,6 +42,7 @@ pub use locations::{
 };
 #[cfg(test)]
 mod gateway_path_tests;
+pub use t3code::{revision as t3_code_revision, T3CodeUse};
 mod moved;
 mod mutation;
 #[cfg(test)]
@@ -132,6 +134,9 @@ pub struct DetectedClient {
     /// Set when several Claude Code profiles are listed, to tell them apart.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_profile: Option<ClaudeProfile>,
+    /// The T3 Code provider instances that use this config. Empty without T3 Code.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub t3_code: Vec<T3CodeUse>,
 }
 
 fn serialize_config_error<S: serde::Serializer>(
@@ -1270,7 +1275,9 @@ pub(crate) fn claude_profile_name(name: &str) -> bool {
     name == ".claude" || profile_folder_name(name, ".claude")
 }
 
-/// `<base>2`, `<base>-work`: another profile folder beside `<base>`, not a backup of one.
+/// `<base>2`, `<base>-work`, `<base>_personal`: another profile folder beside `<base>`, not
+/// a backup of one. T3 Code's docs name the underscore form (`~/.claude_personal`,
+/// `~/.codex_personal`).
 pub(crate) fn profile_folder_name(name: &str, base: &str) -> bool {
     let Some(suffix) = name.strip_prefix(base) else {
         return false;
@@ -1278,7 +1285,11 @@ pub(crate) fn profile_folder_name(name: &str, base: &str) -> bool {
     if !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()) {
         return true;
     }
-    let Some(label) = suffix.strip_prefix('-').filter(|label| !label.is_empty()) else {
+    let Some(label) = suffix
+        .strip_prefix('-')
+        .or_else(|| suffix.strip_prefix('_'))
+        .filter(|label| !label.is_empty())
+    else {
         return false;
     };
     let lower = label.to_ascii_lowercase();
@@ -4845,6 +4856,7 @@ fn read_client(def: &ClientDef) -> DetectedClient {
             entry_state,
             error,
             claude_profile: None,
+            t3_code: Vec::new(),
         }
     };
 
@@ -4936,12 +4948,27 @@ pub fn detect_clients() -> Vec<DetectedClient> {
     clients
 }
 
+/// One client by id, as [`detect_clients`] reads it, including a location the Clients page
+/// lists without saving it yet: a launcher home or a T3 Code home. Connect saves those.
+pub fn detect_client(client_id: &str) -> Option<DetectedClient> {
+    let def = find_def(client_id)?;
+    if def
+        .location
+        .as_ref()
+        .is_some_and(|row| locations::validate(row).is_err())
+    {
+        return None;
+    }
+    Some(read_client(&def))
+}
+
 /// Skills needs every detected profile even before Clients has been opened. Keep
 /// this scan read-only: the display path can adopt gateways and remember locations.
 pub(crate) fn detect_clients_for_skills() -> Vec<DetectedClient> {
     let mut clients: Vec<_> = machine_defs(true).iter().map(read_client).collect();
     append_client_scan_errors(&mut clients);
     claude_profiles::annotate(&mut clients);
+    t3code::annotate(&mut clients);
     clients
 }
 
@@ -4961,6 +4988,7 @@ fn config_error_row(id: &str, name: &str, path: String, error: String) -> Detect
         entry_state: GatewayEntryState::Absent,
         error: Some(error),
         claude_profile: None,
+        t3_code: Vec::new(),
     }
 }
 
@@ -5023,6 +5051,7 @@ pub fn detect_clients_with_inspection(
     } else {
         let mut clients = detect_clients();
         claude_profiles::annotate(&mut clients);
+        t3code::annotate(&mut clients);
         Ok(clients)
     }
 }
@@ -5045,6 +5074,7 @@ fn detect_clients_for_display_with_gateway(
     let mut clients = detect_clients_for_display_in(definitions, current, gateway)?;
     append_client_scan_errors(&mut clients);
     claude_profiles::annotate(&mut clients);
+    t3code::annotate(&mut clients);
     Ok(clients)
 }
 
@@ -5085,11 +5115,9 @@ fn detect_clients_for_display_in(
     for def in &definitions {
         // A launcher home is found again on each refresh while its launcher exists, and
         // saved only once Toolport changes its config.
-        if let Some(location) = def
-            .location
-            .as_ref()
-            .filter(|location| !locations::is_launcher_home(location))
-        {
+        if let Some(location) = def.location.as_ref().filter(|location| {
+            !locations::is_launcher_home(location) && !locations::is_t3_home(location)
+        }) {
             if let Err(error) = locations::remember(location) {
                 failures.insert(def.client_id().to_string(), error);
             }
@@ -5186,6 +5214,7 @@ pub fn client_metadata() -> Vec<DetectedClient> {
                 entry_state: GatewayEntryState::Absent,
                 error: None,
                 claude_profile: None,
+                t3_code: Vec::new(),
             }
         })
         .collect()
@@ -13054,6 +13083,7 @@ bad = "not-a-table"
             entry_state: GatewayEntryState::Managed,
             error: None,
             claude_profile: None,
+            t3_code: Vec::new(),
         }
     }
 

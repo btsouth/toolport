@@ -1124,6 +1124,7 @@ mod tests {
             config_error: false,
             location_removable: true,
             claude_profile: None,
+            t3_code: Vec::new(),
         }
     }
     fn snapshot(clients: Vec<state::ClientView>) -> state::ClientSnapshot {
@@ -2015,6 +2016,7 @@ mod tests {
                     .config_error
                     .then(|| "Synthetic unreadable config".into()),
                 claude_profile: None,
+                t3_code: Vec::new(),
             }));
             clients.render(snapshot(vec![selected.clone()]));
             stack.set_visible_child_name("clients");

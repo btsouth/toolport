@@ -1,4 +1,8 @@
 {
+  "Used by T3 Code: {names}": "T3 Code が使用: {names}",
+  "{name} (off)": "{name}（オフ）",
+  "{name} is on in T3 Code": "{name} は T3 Code でオンです",
+  "{name} is off in T3 Code": "{name} は T3 Code でオフです",
   " · {count} call today": " · 本日の呼び出し{count}件",
   " · {count} calls today": " · 本日の呼び出し{count}件",
   " · Last saw {value0} tools": " · 最後の確認時：ツール{value0}件",

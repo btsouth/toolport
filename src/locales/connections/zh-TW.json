@@ -1,4 +1,8 @@
 {
+  "Used by T3 Code: {names}": "T3 Code 使用中：{names}",
+  "{name} (off)": "{name}（已關閉）",
+  "{name} is on in T3 Code": "{name} 在 T3 Code 中已開啟",
+  "{name} is off in T3 Code": "{name} 在 T3 Code 中已關閉",
   " · {count} call today": " · 今天呼叫 {count} 次",
   " · {count} calls today": " · 今天呼叫 {count} 次",
   " · Last saw {value0} tools": " · 上次發現 {value0} 個工具",

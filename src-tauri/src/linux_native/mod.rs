@@ -27,6 +27,7 @@ mod teams;
 mod theme;
 mod tools;
 mod tray;
+mod wrap_box;
 
 use self::i18n as l10n;
 use adw::prelude::*;
@@ -2096,6 +2097,96 @@ fn show_native_page(
     }
 }
 
+/// What an open Clients page does with T3 Code's settings revision. React's ClientsView
+/// follows the same rules.
+#[derive(Default)]
+struct T3SettingsWatch {
+    /// The last revision seen; `None` before the first check.
+    seen: Option<Option<String>>,
+}
+
+impl T3SettingsWatch {
+    /// Record a check; true when the settings changed since the last one, so the page
+    /// rescans. The first check only records: the page has just scanned.
+    fn observe(&mut self, revision: Option<String>) -> bool {
+        let previous = self.seen.replace(revision.clone());
+        previous.is_some_and(|previous| previous != revision)
+    }
+
+    /// Whether to check again in five seconds: only while T3 Code's settings exist.
+    /// Without T3 Code the page checks only when it opens and when the window gets focus.
+    fn polls(&self) -> bool {
+        matches!(self.seen, Some(Some(_)))
+    }
+}
+
+/// While Clients is visible, rescan quietly when T3 Code's settings change: an instance
+/// added, renamed or turned off moves the row badges and the card. One `stat` when the
+/// page is shown and when the window gets focus, then every five seconds only while T3
+/// Code's settings exist. Nothing runs while the page is hidden.
+fn watch_t3_code_settings(page: &ClientPage) {
+    use std::{cell::RefCell, rc::Rc};
+    let watch = Rc::new(RefCell::new(T3SettingsWatch::default()));
+    let timer = Rc::new(RefCell::new(None::<gtk::glib::SourceId>));
+    // One check; returns whether to keep polling.
+    let check: Rc<dyn Fn() -> bool> = {
+        let (page, watch) = (page.clone(), watch.clone());
+        Rc::new(move || {
+            if !page.scanning.get()
+                && watch
+                    .borrow_mut()
+                    .observe(crate::clients::t3_code_revision())
+            {
+                page.refresh();
+            }
+            watch.borrow().polls()
+        })
+    };
+    let start: Rc<dyn Fn()> = {
+        let (root, timer) = (page.root.clone(), timer.clone());
+        Rc::new(move || {
+            if !check() || !root.is_mapped() || timer.borrow().is_some() {
+                return;
+            }
+            let (check, slot) = (check.clone(), timer.clone());
+            *timer.borrow_mut() = Some(gtk::glib::timeout_add_local(
+                std::time::Duration::from_secs(5),
+                move || {
+                    if check() {
+                        gtk::glib::ControlFlow::Continue
+                    } else {
+                        slot.borrow_mut().take();
+                        gtk::glib::ControlFlow::Break
+                    }
+                },
+            ));
+        })
+    };
+    let focus_connected = std::cell::Cell::new(false);
+    {
+        let start = start.clone();
+        page.root.connect_map(move |root| {
+            start();
+            if focus_connected.replace(true) {
+                return;
+            }
+            if let Some(window) = root.root().and_downcast::<gtk::Window>() {
+                let (start, root) = (start.clone(), root.downgrade());
+                window.connect_is_active_notify(move |window| {
+                    if window.is_active() && root.upgrade().is_some_and(|root| root.is_mapped()) {
+                        start();
+                    }
+                });
+            }
+        });
+    }
+    page.root.connect_unmap(move |_| {
+        if let Some(source) = timer.borrow_mut().take() {
+            source.remove();
+        }
+    });
+}
+
 #[derive(Clone)]
 struct ServerPage {
     details: details::DetailHost,
@@ -2761,6 +2852,7 @@ impl ClientPage {
             codex_open: std::rc::Rc::new(std::cell::Cell::new(true)),
             claude_copies_shown: std::rc::Rc::new(std::cell::Cell::new(false)),
         };
+        watch_t3_code_settings(&client_page);
         let page_for_add = client_page.clone();
         add_location.connect_clicked(move |_| page_for_add.add_location());
         let page_for_refresh = client_page.clone();
@@ -13405,12 +13497,32 @@ fn state_card_formatted(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn t3_settings_watch_polls_only_while_t3_code_settings_exist() {
+        let mut watch = super::T3SettingsWatch::default();
+        assert!(!watch.polls(), "nothing checked yet");
+        // No T3 Code: the first check only records, and nothing polls.
+        assert!(!watch.observe(None));
+        assert!(!watch.polls());
+        assert!(!watch.observe(None));
+        assert!(!watch.polls());
+        // T3 Code appears (noticed on focus): rescan, then poll while it exists.
+        assert!(watch.observe(Some("1:10".into())));
+        assert!(watch.polls());
+        assert!(!watch.observe(Some("1:10".into())));
+        assert!(watch.observe(Some("2:11".into())));
+        // Removed again: rescan once, then stop polling.
+        assert!(watch.observe(None));
+        assert!(!watch.polls());
+    }
+
     /// Manual synthetic visual fixture. Run only in omabox with a request file;
     /// deleting that file ends the fixture. Uses the production state widgets.
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn b6_state_visual_gallery() {
         use super::*;
+
         let Ok(request) = std::env::var("TOOLPORT_STATE_GALLERY") else {
             return;
         };
@@ -14389,6 +14501,7 @@ mod tests {
             config_error: false,
             location_removable: false,
             claude_profile: None,
+            t3_code: Vec::new(),
         })
         .collect();
         clients.render(state::ClientSnapshot { clients: fixture_clients, profiles: Vec::new(), sessions_error: false, sessions: vec![serde_json::json!({"clientName":"Codex","clientType":"codex","sessionCount":5,"callsToday":60,"lastActiveMs":now-180000,"firstCatalogSize":1711})] });
@@ -14864,6 +14977,7 @@ mod tests {
             config_error: false,
             location_removable: false,
             claude_profile: None,
+            t3_code: Vec::new(),
         };
         use client_rows::{client_row, profile_group, ProfileProduct, RowStyle};
         let parts = |row: &gtk::Box, with_logo: bool| {
@@ -14874,9 +14988,10 @@ mod tests {
             } else {
                 lead.first_child().unwrap()
             };
-            // The name sits in a title box inside the button that opens details.
+            // The name and its chips sit in a wrapping line inside the details button.
             let open = copy.first_child().unwrap();
             let title = open.first_child().unwrap();
+            assert!(title.is::<wrap_box::WrapBox>());
             let detail = open
                 .next_sibling()
                 .unwrap()
@@ -14983,6 +15098,14 @@ mod tests {
             .unwrap();
         assert_eq!(account.text(), "me@home.example");
         assert_eq!(detail.text(), "~/.claude2");
+        // Narrower than the name and its chips: the chips wrap to a second line and the
+        // name keeps its full width instead of being squeezed.
+        let (_, name_width, _, _) = command.measure(gtk::Orientation::Horizontal, -1);
+        let (_, one_line, _, _) = title.measure(gtk::Orientation::Vertical, 2000);
+        let (_, wrapped, _, _) = title.measure(gtk::Orientation::Vertical, name_width + 4);
+        assert!(wrapped > one_line, "{wrapped} > {one_line}");
+        title.size_allocate(&gtk::Allocation::new(0, 0, name_width + 4, wrapped), -1);
+        assert_eq!(command.width(), name_width);
         // Outside the group the same client keeps its own name and logo.
         let row = client_row(&client, page.clone(), RowStyle::Line);
         let (title, _, _) = parts(&row, true);
@@ -15073,6 +15196,7 @@ mod tests {
             config_error: false,
             location_removable: false,
             claude_profile: None,
+            t3_code: Vec::new(),
         };
         let mut registry = crate::registry::Registry::default();
         registry.profiles[0].id = "work".into();

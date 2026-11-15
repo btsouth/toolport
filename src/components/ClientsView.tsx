@@ -2,10 +2,10 @@ import { ErrorCallout } from "@/components/ui/status-card";
 import { msg, Trans, translate, useI18n } from "@/lib/i18n";
 import { Button } from "@/components/ui/button";
 import { trustedClientName, clientIdentityTooltip } from "@/lib/clientIdentity";
-import { getClientSessions } from "@/lib/api";
+import { getClientSessions, t3CodeRevision } from "@/lib/api";
 import type { ClientActivity } from "@/lib/types";
 import { fmtAgo } from "@/lib/utils";
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -17,6 +17,14 @@ import {
 import { ClientRecoveryBanners } from "@/components/ClientRecoveryBanners";
 import { requestClientRecoveryScan } from "@/lib/clientRecoveryEvents";
 import { ClientLogo } from "@/components/ClientLogo";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { t3CodeBadge } from "@/lib/t3Code";
+import { useWindowVisible } from "@/lib/windowVisible";
 import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/ui/empty-state";
 import { SectionHeader } from "@/components/ui/section-header";
@@ -31,6 +39,11 @@ import {
 } from "@/lib/types";
 
 type ClientStatus = "connected" | "ready" | "customized" | "error" | "missing";
+
+/** A chip whose text wraps onto more lines instead of hiding names behind an ellipsis;
+ * a smaller radius keeps the corners of a tall chip from cutting into its text. */
+const WRAPPING_CHIP =
+  "h-auto min-w-0 rounded-lg max-w-full justify-start whitespace-normal text-left font-normal [overflow-wrap:anywhere]";
 
 function statusOf(client: DetectedClient): ClientStatus {
   if (client.error) return "error";
@@ -188,6 +201,7 @@ function ClientRow({
   const status = statusOf(client);
   const profile = variant === "profile" ? client.claudeProfile : undefined;
   const detail = clientDetail(client, registry, variant === "profile");
+  const t3Code = t3CodeBadge(client.t3Code ?? []);
 
   return (
     <button
@@ -202,24 +216,47 @@ function ClientRow({
     >
       {!profile && <ClientLogo id={client.id} name={client.name} size={28} />}
       <span className="min-w-0">
-        <span className="flex min-w-0 items-center gap-1.5">
+        {/* The title line wraps: the name keeps its width and chips move to the next line
+            when they don't fit. Each wraps when it alone is wider than the row. */}
+        <span className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1">
           {profile ? (
-            <span className="truncate font-mono text-sm font-medium">
+            <span className="max-w-full font-mono text-sm font-medium [overflow-wrap:anywhere]">
               {profile.command ?? profile.folder}
             </span>
           ) : (
-            <span className="break-words text-sm font-medium sm:truncate">
+            <span className="max-w-full text-sm font-medium [overflow-wrap:anywhere]">
               {client.name}
             </span>
           )}
           {/* An unreadable profile has no account to show, signed in or not. Codex
               keeps its account next to its tokens, so it is never read. */}
           {profile && status !== "error" && profileProduct(client) === "claude-code" && (
-            <Badge variant="secondary" className="min-w-0 max-w-64 font-normal">
-              <span className="truncate">
-                {profile.account ?? t("No claude.ai sign-in")}
-              </span>
+            <Badge variant="secondary" className={WRAPPING_CHIP}>
+              {profile.account ?? t("No claude.ai sign-in")}
             </Badge>
+          )}
+          {t3Code && (
+            // Every name shows in the chip itself; the tooltip adds whether each is on,
+            // and stays inside the window.
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Badge
+                    variant="secondary"
+                    className={WRAPPING_CHIP}
+                    data-t3-code-badge=""
+                  >
+                    {t3Code.text}
+                  </Badge>
+                </TooltipTrigger>
+                <TooltipContent
+                  collisionPadding={8}
+                  className="max-w-[min(20rem,calc(100vw-1rem))] whitespace-pre-line"
+                >
+                  {t3Code.title}
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
           )}
           {client.usesConnectors && (
             <Puzzle
@@ -229,7 +266,7 @@ function ClientRow({
           )}
         </span>
         <span
-          className="block truncate text-meta text-muted-foreground"
+          className="block text-meta text-muted-foreground [overflow-wrap:anywhere]"
           title={detail.full}
         >
           {detail.text}
@@ -386,9 +423,11 @@ function ProfileGroup({
       >
         <ClientLogo id={product} name={PRODUCT_NAMES[product]} size={28} />
         <span className="min-w-0">
-          <span className="flex items-center gap-1.5">
-            <span className="truncate text-sm font-medium">{PRODUCT_NAMES[product]}</span>
-            <Badge variant="secondary" className="font-normal">
+          <span className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1">
+            <span className="max-w-full truncate text-sm font-medium">
+              {PRODUCT_NAMES[product]}
+            </span>
+            <Badge variant="secondary" className="min-w-0 max-w-full font-normal">
               {t(
                 shown.length === 1 ? msg("{value0} profile") : msg("{value0} profiles"),
                 {
@@ -467,6 +506,51 @@ export function ClientsView({
       current = false;
     };
   }, [clients, sessionRetry]);
+  // T3 Code: rescan when its settings change while this page is on screen, so the row
+  // badges follow instances added, renamed or turned off. The page unmounts when another
+  // view is shown; the last revision seen survives the window being hidden, so a change
+  // made meanwhile still rescans on return. Without T3 Code its settings are checked (one
+  // `stat`) only when the page opens and when the window gets focus; every five seconds
+  // only while they exist. GTK does the same.
+  const onChangedRef = useRef(onChanged);
+  useEffect(() => {
+    onChangedRef.current = onChanged;
+  }, [onChanged]);
+  const windowVisible = useWindowVisible();
+  const t3Seen = useRef<{ value: string | null } | null>(null);
+  useEffect(() => {
+    if (!windowVisible) return;
+    let active = true;
+    let timer: number | undefined;
+    const check = async () => {
+      let revision: string | null;
+      try {
+        revision = await t3CodeRevision();
+      } catch {
+        return;
+      }
+      if (!active) return;
+      const previous = t3Seen.current;
+      t3Seen.current = { value: revision };
+      if (!previous || previous.value === revision) return;
+      try {
+        await onChangedRef.current?.();
+      } catch {
+        // The page shows scan errors itself.
+      }
+    };
+    const tick = async () => {
+      await check();
+      if (active && t3Seen.current?.value != null) {
+        timer = window.setTimeout(() => void tick(), 5_000);
+      }
+    };
+    void tick();
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [windowVisible]);
   const sorted = sortClients(clients);
   const present = sorted.filter((client) => statusOf(client) !== "missing");
   const missing = sorted.filter((client) => statusOf(client) === "missing");
