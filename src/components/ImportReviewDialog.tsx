@@ -1,5 +1,5 @@
 import { useI18n, Trans } from "@/lib/i18n";
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Check, Loader2, ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -26,6 +26,8 @@ interface Props {
   /** Shown under the description, before the user confirms. */
   notice?: ReactNode;
   error?: string;
+  /** Where focus goes when the dialog closes; Radix defaults to its trigger. */
+  onCloseAutoFocus?: (event: Event) => void;
   onOpenChange: (open: boolean) => void;
   onConfirm: (
     keys: string[],
@@ -47,6 +49,7 @@ export function ImportReviewDialog({
   details,
   notice,
   error,
+  onCloseAutoFocus,
   onOpenChange,
   onConfirm,
 }: Props) {
@@ -66,6 +69,7 @@ export function ImportReviewDialog({
         details={details}
         notice={notice}
         error={error}
+        onCloseAutoFocus={onCloseAutoFocus}
         onOpenChange={onOpenChange}
         onConfirm={onConfirm}
       />
@@ -84,10 +88,22 @@ function ImportReviewContent({
   details,
   notice,
   error,
+  onCloseAutoFocus,
   onOpenChange,
   onConfirm,
 }: Omit<Props, "open">) {
   const { t } = useI18n();
+  const contentRef = useRef<HTMLDivElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  // Starting a check disables the focused button; keep focus in the dialog
+  // instead of letting it fall to the page behind.
+  useEffect(() => {
+    const content = contentRef.current;
+    if (!busy || !content) return;
+    const active = document.activeElement;
+    if (!active || !content.contains(active) || active.matches(":disabled"))
+      content.focus();
+  }, [busy]);
   const keyedItems = items.map((item, index) => ({
     item,
     key: item.key ?? `${item.name}-${index}`,
@@ -129,7 +145,18 @@ function ImportReviewContent({
     : [];
 
   return (
-    <DialogContent className="sm:max-w-lg">
+    <DialogContent
+      ref={contentRef}
+      className="sm:max-w-lg"
+      closeDisabled={busy}
+      // Open on Cancel, as the GTK review does, so Enter never confirms or toggles
+      // a disclosure by accident.
+      onOpenAutoFocus={(event) => {
+        event.preventDefault();
+        cancelRef.current?.focus();
+      }}
+      onCloseAutoFocus={onCloseAutoFocus}
+    >
       <DialogHeader>
         <DialogTitle>{title ?? t("Review servers to import")}</DialogTitle>
       </DialogHeader>
@@ -343,7 +370,12 @@ function ImportReviewContent({
         </p>
       ))}
       <DialogFooter className="justify-between">
-        <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={busy}>
+        <Button
+          ref={cancelRef}
+          variant="ghost"
+          onClick={() => onOpenChange(false)}
+          disabled={busy}
+        >
           {t("Cancel")}
         </Button>
         <Button

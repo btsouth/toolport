@@ -1,5 +1,5 @@
 import { translate, useI18n } from "@/lib/i18n";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Check, Loader2 } from "lucide-react";
 import { migrateClient, previewClientSetup } from "@/lib/api";
 import type { ClientSetupReview, MigrateResult, Registry } from "@/lib/types";
@@ -24,6 +24,24 @@ export function ConnectReviewDialog({
   onConnected: (registry: Registry) => void;
 }) {
   const { t, locale } = useI18n();
+  // The dialog renders without a Radix trigger and swaps between its loading,
+  // review and result views, so Radix cannot return focus on its own. Remember
+  // the control that opened it and return there once the whole flow closes.
+  const [opener] = useState(() =>
+    typeof document === "undefined"
+      ? null
+      : (document.activeElement as HTMLElement | null),
+  );
+  const closing = useRef(false);
+  function close() {
+    closing.current = true;
+    onClose();
+  }
+  function restoreFocus(event: Event) {
+    event.preventDefault();
+    if (closing.current && opener?.isConnected && opener !== document.body)
+      opener.focus();
+  }
   const [review, setReview] = useState<ClientSetupReview | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -70,10 +88,10 @@ export function ConnectReviewDialog({
       <Dialog
         open
         onOpenChange={(open) => {
-          if (!open && !busy) onClose();
+          if (!open && !busy) close();
         }}
       >
-        <DialogContent>
+        <DialogContent onCloseAutoFocus={restoreFocus}>
           <DialogHeader>
             <DialogTitle>
               {result
@@ -142,7 +160,7 @@ export function ConnectReviewDialog({
                   </>
                 )}
               </details>
-              <Button onClick={onClose}>{t("Done")}</Button>
+              <Button onClick={close}>{t("Done")}</Button>
             </div>
           ) : error ? (
             <>
@@ -193,8 +211,9 @@ export function ConnectReviewDialog({
             )
           : t("Selected entries move into Toolport after verification.")
       }
+      onCloseAutoFocus={restoreFocus}
       onOpenChange={(open) => {
-        if (!open && !busy) onClose();
+        if (!open && !busy) close();
       }}
       onConfirm={connect}
     />

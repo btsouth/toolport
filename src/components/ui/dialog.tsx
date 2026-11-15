@@ -44,9 +44,12 @@ function DialogContent({
   className,
   children,
   showCloseButton = true,
+  closeDisabled = false,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean;
+  /** Keep the close button visible but off, e.g. while the dialog's work runs. */
+  closeDisabled?: boolean;
 }) {
   const { t } = useI18n();
   const parts = React.Children.toArray(children).flatMap(
@@ -82,7 +85,12 @@ function DialogContent({
         {parts.filter((child) => isPart(child, DialogFooter))}
         {showCloseButton && (
           <DialogPrimitive.Close data-slot="dialog-close" asChild>
-            <Button variant="ghost" className="absolute top-2 right-2" size="icon-sm">
+            <Button
+              variant="ghost"
+              className="absolute top-2 right-2"
+              size="icon-sm"
+              disabled={closeDisabled}
+            >
               <XIcon />
               <span className="sr-only">{t("Close")}</span>
             </Button>
