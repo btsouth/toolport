@@ -1692,6 +1692,10 @@ mod file {
 }
 
 fn set_secret_raw(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if tests::write_is_injected_failure(key) {
+        return Err("injected secret persistence failure".into());
+    }
     // Before the write, so a refreshed OAuth token is covered even if the store fails.
     crate::secret_redact::register(server_id, key, value);
     scrub_previous(server_id, key, Some(value));

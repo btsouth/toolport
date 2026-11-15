@@ -5771,6 +5771,34 @@ mod tests {
     }
 
     #[test]
+    fn a_value_that_cannot_be_kept_for_cleanup_is_not_replaced_or_deleted() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let dir = crate::registry::conduit_dir().unwrap();
+            let old = "retired-secret-kept-3Vb8Ny";
+            crate::secrets::set_secret("keep-srv", "KEEP_KEY", old).unwrap();
+            // The cleanup fails (a log it cannot read), and so does saving the
+            // value for a later one.
+            std::fs::create_dir_all(dir.join("audit.jsonl")).unwrap();
+            std::fs::write(dir.join("gateway.log"), "unrelated\n").unwrap();
+            let deleted = crate::secrets::tests::with_failed_write("retired-secret-values", || {
+                crate::secrets::delete_secret("keep-srv", "KEEP_KEY")
+            });
+            let replaced =
+                crate::secrets::tests::with_failed_write("retired-secret-values", || {
+                    crate::secrets::set_secret("keep-srv", "KEEP_KEY", "retired-secret-new-5Tq1")
+                });
+            assert!(deleted.is_err(), "the delete went on");
+            assert!(replaced.is_err(), "the replace went on");
+            assert_eq!(
+                crate::secrets::get_secret("keep-srv", "KEEP_KEY").as_deref(),
+                Some(old),
+                "the only copy of the old value was lost"
+            );
+            assert_eq!(crate::secrets::retired_scrubs_pending(), 0);
+        });
+    }
+
+    #[test]
     fn a_recorded_id_does_not_skip_a_value_this_process_knows() {
         let _lock = crate::registry::data_dir_test_lock();
         let dir = std::env::temp_dir().join(format!("tp-scrub-rerun-{}", std::process::id()));
