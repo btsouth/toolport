@@ -890,6 +890,7 @@ const DATA_FILES: &[&str] = &[
     "http-bridge-update-resume.json",
     "gtk-security-dismissed.json",
     "gtk-window-state.json",
+    "gtk-skills-project.json",
     ".secrets-file-migrated",
     ".keychain-dpk-migrated",
     ".tray-hint-shown",
@@ -1617,6 +1618,7 @@ mod tests {
         for name in [
             "ui-settings.json",
             "ui-settings.lock",
+            "gtk-skills-project.json",
             "ui-settings.json.123.1.conduit-tmp",
             "ui-settings.json.corrupt-123-12-0",
             "tool-pins.json.bak",
@@ -2519,6 +2521,7 @@ mod tests {
         std::fs::create_dir_all(env.dir.join("documents/broker")).unwrap();
         std::fs::write(env.dir.join("documents/broker/notes"), "keep nested").unwrap();
         for name in [
+            "gtk-skills-project.json",
             "registry.json.bak",
             "registry.json.bak.123",
             "registry.json.v2-123.bak",
