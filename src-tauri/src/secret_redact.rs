@@ -1355,34 +1355,9 @@ impl Matcher {
         }
         let all: Vec<usize> = (0..leaves.len()).collect();
         let mut changed = self.redact_members(leaves, &all, fragments, exempt, false, found);
-        let mut classes: Vec<&str> = leaves.iter().map(|(c, _)| c.as_str()).collect();
-        classes.sort_unstable();
-        classes.dedup();
-        if classes.len() < 2 {
-            return changed;
-        }
-        let classes: Vec<String> = classes.into_iter().map(str::to_string).collect();
-        let nonempty: Vec<usize> = (0..leaves.len())
-            .filter(|&i| !leaves[i].1.is_empty())
-            .collect();
-        for class in classes {
-            let members: Vec<usize> = nonempty
-                .iter()
-                .copied()
-                .filter(|&i| leaves[i].0 == class)
-                .collect();
-            // Members next to each other in document order were already one
-            // text in the stream of all leaves.
-            let apart = members.windows(2).any(|w| {
-                let (a, b) = (
-                    nonempty.binary_search(&w[0]).unwrap_or(0),
-                    nonempty.binary_search(&w[1]).unwrap_or(0),
-                );
-                b != a + 1
-            });
-            if apart {
-                changed |= self.redact_members(leaves, &members, false, exempt, true, found);
-            }
+        let groups = apart_groups(leaves.iter().map(|(c, l)| (c.as_str(), !l.is_empty())));
+        for members in groups {
+            changed |= self.redact_members(leaves, &members, false, exempt, true, found);
         }
         changed
     }
@@ -1490,19 +1465,8 @@ impl Matcher {
             }
         };
         search(leaves.iter().map(|(_, s)| s.as_str()).collect());
-        let mut classes: Vec<&str> = leaves.iter().map(|(c, _)| c.as_str()).collect();
-        classes.sort_unstable();
-        classes.dedup();
-        if classes.len() > 1 {
-            for class in classes {
-                search(
-                    leaves
-                        .iter()
-                        .filter(|(c, _)| c == class)
-                        .map(|(_, s)| s.as_str())
-                        .collect(),
-                );
-            }
+        for members in apart_groups(leaves.iter().map(|(c, s)| (c.as_str(), !s.is_empty()))) {
+            search(members.iter().map(|&i| leaves[i].1.as_str()).collect());
         }
         fn numbers(m: &Matcher, value: &Value, out: &mut HashSet<String>) {
             match value {
@@ -1876,53 +1840,24 @@ impl Matcher {
                 }
             }
         }
-        // One search for the whole line: the values as one text, then the
-        // keys after them, each key matched on its own.
-        let mut ranges: Vec<(usize, usize)> = t.values.iter().map(|(s, e, _)| (*s, *e)).collect();
-        let values = ranges.len();
-        ranges.extend(t.keys.iter().copied());
+        // Each key on its own: a key is one identifier, never a piece of a
+        // value, and a hit in it must not merge with one in a value.
+        if t.keys
+            .iter()
+            .any(|&(s, e)| !self.spans_with(&body[s..e], false).is_empty())
+        {
+            return None;
+        }
+        let ranges: Vec<(usize, usize)> = t.values.iter().map(|(s, e, _)| (*s, *e)).collect();
         if ranges.is_empty() {
             return Some(edits);
         }
         let (joined, starts) = join_ranges(body, &ranges);
-        let key_start = starts.get(values).copied().unwrap_or(joined.len());
-        let mut spans = self.piece_spans(&joined, &starts, fragments, None);
-        if spans
-            .iter()
-            .any(|(s, e, _)| *s >= key_start && !crosses(&starts, *s, *e))
-        {
-            return None;
-        }
-        // A span that runs on from the last value into the keys is kept to its
-        // value part (keys are never joined to values).
-        spans.retain(|(s, _, _)| *s < key_start);
-        for span in &mut spans {
-            span.1 = span.1.min(key_start);
-        }
-        let ranges = &ranges[..values];
-        self.spans_to_edits(body, ranges, &starts[..values], spans, &mut edits);
-        let mut classes: Vec<&str> = t.values.iter().map(|(_, _, c)| *c).collect();
-        classes.sort_unstable();
-        classes.dedup();
-        if classes.len() > 1 {
-            let nonempty: Vec<usize> = (0..ranges.len())
-                .filter(|&i| ranges[i].0 < ranges[i].1)
-                .collect();
-            for class in classes {
-                let members: Vec<usize> = nonempty
-                    .iter()
-                    .copied()
-                    .filter(|&i| t.values[i].2 == class)
-                    .collect();
-                let apart = members.windows(2).any(|w| {
-                    let a = nonempty.binary_search(&w[0]).unwrap_or(0);
-                    let b = nonempty.binary_search(&w[1]).unwrap_or(0);
-                    b != a + 1
-                });
-                if apart {
-                    self.json_stream_edits(body, ranges, &members, false, true, &mut edits);
-                }
-            }
+        let spans = self.piece_spans(&joined, &starts, fragments, None);
+        self.spans_to_edits(body, &ranges, &starts, spans, &mut edits);
+        let ranges = &ranges[..];
+        for members in apart_groups(t.values.iter().map(|(s, e, c)| (*c, s < e))) {
+            self.json_stream_edits(body, ranges, &members, false, true, &mut edits);
         }
         Some(edits)
     }
@@ -2229,6 +2164,44 @@ fn level_starts(level: &crate::secret_normalize::Normalized, starts: &[usize]) -
         .zip(&level.spans)
         .filter(|(_, (s, _))| starts.binary_search(s).is_ok())
         .map(|((b, _), _)| b)
+        .collect()
+}
+
+/// The pieces of each class (key name) that are not all next to each other
+/// among the non-empty pieces, found in one pass: the extra per-name streams
+/// of [`Matcher::redact_leaf_streams`]. `pieces` yields `(class, non-empty)` in
+/// document order. Empty when there is only one class.
+fn apart_groups<'a>(pieces: impl Iterator<Item = (&'a str, bool)>) -> Vec<Vec<usize>> {
+    // Per class: its members, the rank (among non-empty pieces) of the last
+    // one, and whether two of them are apart.
+    let mut groups: Vec<(Vec<usize>, usize, bool)> = Vec::new();
+    let mut slot: HashMap<&str, usize> = HashMap::new();
+    let mut rank = 0;
+    for (i, (class, nonempty)) in pieces.enumerate() {
+        if !nonempty {
+            continue;
+        }
+        match slot.get(class) {
+            Some(&g) => {
+                let group = &mut groups[g];
+                group.2 |= rank != group.1 + 1;
+                group.0.push(i);
+                group.1 = rank;
+            }
+            None => {
+                slot.insert(class, groups.len());
+                groups.push((vec![i], rank, false));
+            }
+        }
+        rank += 1;
+    }
+    if groups.len() < 2 {
+        return Vec::new();
+    }
+    groups
+        .into_iter()
+        .filter(|(_, _, apart)| *apart)
+        .map(|(members, _, _)| members)
         .collect()
 }
 
@@ -3392,15 +3365,44 @@ impl Held {
             advance(&mut out, &mut at, (*e).min(cut), false);
         }
         advance(&mut out, &mut at, cut, true);
-        let rest: Vec<(usize, String)> = seps[k..]
-            .iter()
-            .map(|(p, s)| (p - cut, s.clone()))
-            .collect();
+        // The rest is moved, never copied, so a push costs only its own bytes.
+        let mut seps = seps;
+        let mut rest = seps.split_off(k);
+        for (p, _) in &mut rest {
+            *p -= cut;
+        }
         self.text.drain(..cut);
         self.seps = rest;
         out
     }
+
+    /// Bytes held: text and separators.
+    fn bytes(&self) -> usize {
+        self.text.len() + self.seps.iter().map(|(_, s)| s.len()).sum::<usize>()
+    }
+
+    /// Stop waiting: [`WITHHELD`] in place of the held text, then the held
+    /// separators, so a held start of a secret is never written in part.
+    fn withhold(&mut self) -> String {
+        let mut out = String::with_capacity(WITHHELD.len() + self.seps.len());
+        if !self.text.is_empty() {
+            out.push_str(WITHHELD);
+        }
+        for (_, sep) in std::mem::take(&mut self.seps) {
+            out.push_str(&sep);
+        }
+        self.text.clear();
+        out
+    }
 }
+
+/// Most bytes a [`Stream`] holds (text and separators) while it waits to see
+/// whether a held start becomes a secret. The longest form expected is a 4 KiB
+/// private key in its longest registered spelling (JSON-escaped twice, about
+/// 4.5 KiB); two further percent levels make that at most 9 times longer,
+/// about 40 KiB. 64 KiB leaves room for it to be wrapped over lines. Past it
+/// the stream writes [`WITHHELD`] in place of the held text and goes on.
+pub const MAX_HELD_BYTES: usize = 64 * 1024;
 
 impl Stream {
     /// A log stream: fragment windows apply, as in [`redact_text`].
@@ -3458,7 +3460,16 @@ impl Stream {
             self.fragments,
             self.exempt.as_deref(),
         );
-        self.held.take(m, cut, &spans)
+        let mut out = self.held.take(m, cut, &spans);
+        if self.held.bytes() > MAX_HELD_BYTES {
+            out.push_str(&self.held.withhold());
+        }
+        out
+    }
+
+    /// Bytes this stream holds back (at most [`MAX_HELD_BYTES`] after a push).
+    pub fn held_bytes(&self) -> usize {
+        self.held.bytes()
     }
 
     /// Whether a tail is being held.
@@ -3916,9 +3927,10 @@ fn multi_link(path: &Path) -> std::io::Result<bool> {
         .file_name()
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
-    Err(blocked(path, format!(
-        "{name} has other hard links, so the secret scrub left it unchanged; remove the other links to it (or the file) and the cleanup finishes on the next start"
-    )))
+    Err(blocked(
+        path,
+        crate::scrub_io::multi_link_error(&name).to_string(),
+    ))
 }
 
 /// A file the scrub would not touch: a link, a reparse point, something that is
@@ -4084,7 +4096,13 @@ pub fn scrub_data_dir(dir: &Path) -> std::io::Result<usize> {
     let _scrub = crate::registry::lock_at_for(&dir.join("secret-scrub"), SCRUB_LOCK_WAIT)
         .map_err(std::io::Error::other)?;
     // A mask a crash interrupted is finished before anything else.
-    crate::scrub_io::recover_masks(dir)?;
+    // One a hard link blocks stays journaled; the rest of the scrub still
+    // runs, and the cleanup is reported unfinished like a file the scrub skips.
+    let recovery = crate::scrub_io::recover_masks(dir).err();
+    let unfinished = |recovery: Option<std::io::Error>| match recovery {
+        Some(e) => Err(blocked(&dir.join(SCRUB_MARKER), e.to_string())),
+        None => Ok(0),
+    };
     let scope = scope_of(dir);
     let from = SCRUBBED
         .lock()
@@ -4108,21 +4126,25 @@ pub fn scrub_data_dir(dir: &Path) -> std::io::Result<usize> {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(reg) = guard.as_ref().and_then(|map| map.get(&scope)) else {
-            return Ok(0);
+            return unfinished(recovery);
         };
         let pending: Vec<(String, String, String)> =
             reg.secrets.get(from..).unwrap_or_default().to_vec();
         (pending, reg.secrets.len())
     };
     if pending.is_empty() {
-        let _ = std::fs::remove_file(dir.join(SCRUB_PENDING_FILE));
-        return Ok(0);
+        if recovery.is_none() {
+            let _ = std::fs::remove_file(dir.join(SCRUB_PENDING_FILE));
+        }
+        return unfinished(recovery);
     }
     let Some(matcher) = complete_in(&scope) else {
-        return Ok(0);
+        return unfinished(recovery);
     };
     let mut rewritten = 0;
-    scrub_each(&matcher, dir, |changed| rewritten += usize::from(changed))?;
+    let each = scrub_each(&matcher, dir, |changed| rewritten += usize::from(changed));
+    unfinished(recovery)?;
+    each?;
     let mut ids: Vec<String> = done.into_iter().collect();
     ids.extend(pending.into_iter().map(|(id, _, _)| id));
     ids.sort();
@@ -5211,6 +5233,54 @@ mod tests {
         assert_eq!(mode, 0o400, "mode changed to {mode:o}");
     }
 
+    /// A mask a crash left journaled is never finished through a hard link
+    /// to a file outside: the journal stays and the cleanup is unfinished.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_through_a_hard_link_is_reported_and_changes_nothing() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let root = std::env::temp_dir().join(format!("tp-recover-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("data");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        let secret = "sk-RecoverLinkSecret77";
+        register("recover-srv", "KEY", secret);
+        let log = dir.join("daemon.log");
+        let text = format!("mine {secret}\n");
+        std::fs::write(&log, &text).unwrap();
+        crate::scrub_io::journal_for_test(&dir, &log, &[(5, secret.len() as u64)]);
+        let other = outside.join("notes.txt");
+        std::fs::hard_link(&log, &other).unwrap();
+        let result = scrub_data_dir(&dir);
+        let other_text = std::fs::read_to_string(&other).unwrap();
+        let journal_kept = std::fs::read_dir(&dir).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".mask-journal-")
+        });
+        let marker = dir.join(SCRUB_MARKER).exists();
+        let notes = SCRUB_BLOCKED
+            .lock()
+            .unwrap()
+            .get(&scope_of(&dir))
+            .cloned()
+            .unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(other_text, text, "a file outside was masked");
+        assert!(journal_kept, "the journal was dropped");
+        assert!(!marker, "the cleanup was marked done");
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.starts_with("daemon.log has other hard links")),
+            "{notes:?}"
+        );
+    }
+
     #[test]
     fn status_reports_stderr_that_is_not_relayed() {
         let silenced = crate::daemon_log::StderrRedaction::Silenced {
@@ -6198,5 +6268,121 @@ mod tests {
         );
         // Inside a word it is still not one.
         assert_eq!(m.redact_text("xab12y"), "xab12y");
+    }
+
+    #[test]
+    fn a_secret_in_a_json_key_is_redacted_whatever_the_values_hold() {
+        let m = m(&[("TOKEN", "abababab")]);
+        for line in [
+            r#"{"abababab":"ab"}"#,
+            r#"{"abababab":1}"#,
+            r#"{"abababab":"abababab"}"#,
+        ] {
+            let out = m.redact_line(line);
+            assert!(!out.contains("abababab"), "{line} gave {out}");
+            assert!(serde_json::from_str::<Value>(&out).is_ok(), "{out}");
+            // The rewrite scrub takes the same path.
+            let mut scrubbed = Vec::new();
+            let mut scrub = ScrubLines::new(&m, false);
+            scrub.feed(Some(line.as_bytes()), &mut scrubbed);
+            scrub.feed(None, &mut scrubbed);
+            let scrubbed = String::from_utf8(scrubbed).unwrap();
+            assert!(!scrubbed.contains("abababab"), "{line} scrubbed {scrubbed}");
+        }
+        assert!(m.redact_line(r#"{"abababab":"ab"}"#).contains(r#""ab""#));
+        assert_eq!(
+            m.redact_line(r#"{"k":"abababab"}"#),
+            r#"{"k":"[secret:TOKEN]"}"#
+        );
+    }
+
+    /// Best of three runs, so one slow scheduling slice does not decide it.
+    fn best_of_three(mut run: impl FnMut()) -> std::time::Duration {
+        (0..3)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                run();
+                start.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+
+    #[test]
+    fn many_distinct_json_keys_cost_linear_work() {
+        let m = m(&[("KEY", "sk-ManyKeysSecret42")]);
+        let object = |n: usize| {
+            let map: serde_json::Map<String, Value> = (0..n)
+                .map(|i| (format!("key{i}"), Value::String(format!("value {i}"))))
+                .collect();
+            Value::Object(map)
+        };
+        let (small, large) = (object(2_000), object(20_000));
+        let (small_line, large_line) = (small.to_string(), large.to_string());
+        let line = |text: &str| {
+            best_of_three(|| {
+                std::hint::black_box(m.redact_line(text));
+            })
+        };
+        let parsed = |v: &Value| {
+            best_of_three(|| {
+                let mut v = v.clone();
+                std::hint::black_box(m.redact_value(&mut v));
+            })
+        };
+        // Linear work is ten times as much; the old per-class scan was 100.
+        let (a, b) = (line(&small_line), line(&large_line));
+        assert!(b < a * 40, "JSON line: 2,000 keys {a:?}, 20,000 keys {b:?}");
+        let (a, b) = (parsed(&small), parsed(&large));
+        assert!(b < a * 40, "parsed: 2,000 keys {a:?}, 20,000 keys {b:?}");
+    }
+
+    #[test]
+    fn blank_lines_after_a_live_prefix_cost_linear_work_and_are_capped() {
+        let m = m(&[("KEY", "sk-AbC123xyZ")]);
+        // Pushes of sixteen blank lines: 32 KiB, then 320 KiB, past the cap.
+        let blank_lines = |n: usize| {
+            let lines = "\n".repeat(16);
+            best_of_three(|| {
+                let mut s = Stream::lines();
+                let mut out = s.push_with(&m, "x sk-AbC");
+                for _ in 0..n {
+                    out.push_str(&s.push_with(&m, &lines));
+                }
+                std::hint::black_box(out + &s.finish_with(&m));
+            })
+        };
+        let (a, b) = (blank_lines(2_000), blank_lines(20_000));
+        assert!(b < a * 40, "2,000 pushes {a:?}, 20,000 pushes {b:?}");
+
+        // Past the cap the stream stops waiting: the live prefix becomes the
+        // withheld marker and every separator is kept.
+        let mut s = Stream::lines();
+        let mut out = s.push_with(&m, "x sk-AbC");
+        let mut most = 0;
+        for _ in 0..MAX_HELD_BYTES + 10 {
+            out.push_str(&s.push_with(&m, "\n"));
+            most = most.max(s.held_bytes());
+        }
+        out.push_str(&s.push_with(&m, "123xyZ\n"));
+        out.push_str(&s.finish_with(&m));
+        assert!(most <= MAX_HELD_BYTES, "held {most} bytes");
+        assert!(
+            out.starts_with(&format!("x {WITHHELD}\n")),
+            "{}",
+            &out[..80]
+        );
+        assert!(!out.contains("sk-AbC"));
+        assert_eq!(out.matches('\n').count(), MAX_HELD_BYTES + 11);
+
+        // Within the cap a wrapped secret is still one span.
+        let mut s = Stream::lines();
+        let mut out = s.push_with(&m, "x sk-AbC");
+        for _ in 0..1_000 {
+            out.push_str(&s.push_with(&m, "\n"));
+        }
+        out.push_str(&s.push_with(&m, "123xyZ\n"));
+        out.push_str(&s.finish_with(&m));
+        assert_eq!(out, format!("x [secret:KEY]{}", "\n".repeat(1_001)));
     }
 }

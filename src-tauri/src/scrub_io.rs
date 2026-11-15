@@ -214,6 +214,9 @@ pub fn mask_ranges(
         Err(_) => return Ok(false),
     };
     let ident = sys::ident(&file)?;
+    if ident.links > 1 {
+        return Err(multi_link_error(&loc.name.to_string_lossy()));
+    }
     let size = ident.size;
     let ranges: Vec<(u64, u64)> = ranges
         .iter()
@@ -248,6 +251,7 @@ pub fn recover_masks(dir: &Path) -> std::io::Result<usize> {
         Err(e) => return Err(e),
     };
     let mut completed = 0;
+    let mut blocked = None;
     for entry in std::fs::read_dir(&canonical)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -269,8 +273,17 @@ pub fn recover_masks(dir: &Path) -> std::io::Result<usize> {
         // only removed after the masks are synced, so a crash here is finished
         // by the next start.
         if let Some((file_name, id)) = validate_journal(&canonical, &journal)? {
-            if file_name == target && apply_recovered(&canonical, &journal, &file_name, id)? {
-                completed += 1;
+            if file_name == target {
+                match apply_recovered(&canonical, &journal, &file_name, id)? {
+                    Some(true) => completed += 1,
+                    Some(false) => {}
+                    // Another name shares the file: masking it would change that
+                    // file too. The journal stays so the cleanup stays unfinished.
+                    None => {
+                        blocked.get_or_insert_with(|| multi_link_error(&file_name));
+                        continue;
+                    }
+                }
             }
         }
         remove_if_present(&journal)?;
@@ -278,7 +291,15 @@ pub fn recover_masks(dir: &Path) -> std::io::Result<usize> {
     if completed > 0 {
         sync_dir(&canonical)?;
     }
-    Ok(completed)
+    blocked.map_or(Ok(completed), Err)
+}
+
+/// The error for a log the scrub would not change because it has other hard
+/// links (names only).
+pub fn multi_link_error(name: &str) -> std::io::Error {
+    std::io::Error::other(format!(
+        "{name} has other hard links, so the secret scrub left it unchanged; remove the other links to it (or the file) and the cleanup finishes on the next start"
+    ))
 }
 
 /// Call `f(offset, line_bytes)` for each line of `path` (split on `\n`, which is
@@ -423,6 +444,15 @@ fn remove_if_present(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// A pending mask journal for `path`, as a crash after publishing it leaves.
+#[cfg(test)]
+pub(crate) fn journal_for_test(dir: &Path, path: &Path, ranges: &[(u64, u64)]) {
+    let loc = locate(dir, path).unwrap().unwrap();
+    let ident = sys::ident(&File::open(path).unwrap()).unwrap();
+    let journal = loc.dir.join(journal_name(&loc.name));
+    write_journal(&loc, &journal, ident.id, ranges).unwrap();
+}
+
 fn journal_name(file_name: &std::ffi::OsStr) -> String {
     format!("{JOURNAL_PREFIX}{}", file_name.to_string_lossy())
 }
@@ -549,31 +579,35 @@ fn validate_journal(dir: &Path, journal: &Path) -> std::io::Result<Option<Journa
 
 /// Re-apply a validated journal's ranges to `file_name` with `*` bytes,
 /// streaming them from the journal. Nothing is written unless the file still
-/// has the journaled identity.
+/// has the journaled identity; `None` (nothing written) when it has other hard
+/// links.
 fn apply_recovered(
     dir: &Path,
     journal: &Path,
     file_name: &str,
     id: (u64, u64),
-) -> std::io::Result<bool> {
+) -> std::io::Result<Option<bool>> {
     let loc = match locate(dir, &dir.join(file_name))? {
         Ok(loc) => loc,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(Some(false)),
     };
     let file = match open_located(&loc, true)? {
         Ok(file) => file,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(Some(false)),
     };
     let ident = sys::ident(&file)?;
     // A different file now has this name (rotated or replaced): leave it alone.
     if ident.id != id {
-        return Ok(false);
+        return Ok(Some(false));
+    }
+    if ident.links > 1 {
+        return Ok(None);
     }
     let Some((mut reader, (name, journal_id))) = JournalReader::open(dir, journal)? else {
-        return Ok(false);
+        return Ok(Some(false));
     };
     if name != file_name || journal_id != id {
-        return Ok(false);
+        return Ok(Some(false));
     }
     let mut mask = Vec::new();
     let complete = loop {
@@ -596,7 +630,7 @@ fn apply_recovered(
         }
     };
     file.sync_all()?;
-    Ok(complete)
+    Ok(Some(complete))
 }
 
 #[cfg(unix)]
@@ -1188,6 +1222,31 @@ mod tests {
         );
         assert!(leftovers(&dir.0).is_empty());
         assert_eq!(recover_masks(&dir.0).unwrap(), 0);
+    }
+
+    #[test]
+    fn recovery_never_masks_through_a_hard_link() {
+        let dir = TempDir::new("recover-link");
+        let outside = TempDir::new("recover-link-outside");
+        let path = dir.0.join("daemon.log");
+        let other = outside.0.join("notes.txt");
+        std::fs::write(&path, "key=SECRET1 tail\n").unwrap();
+        let loc = locate(&dir.0, &path).unwrap().unwrap();
+        let ident = sys::ident(&File::open(&path).unwrap()).unwrap();
+        let journal = loc.dir.join(journal_name(&loc.name));
+        write_journal(&loc, &journal, ident.id, &[(4, 7)]).unwrap();
+        std::fs::hard_link(&path, &other).unwrap();
+        let err = recover_masks(&dir.0).unwrap_err();
+        assert!(err.to_string().contains("hard links"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&other).unwrap(),
+            "key=SECRET1 tail\n"
+        );
+        // The journal stays, so the cleanup finishes once the link is gone.
+        assert!(journal.exists());
+        std::fs::remove_file(&other).unwrap();
+        assert_eq!(recover_masks(&dir.0).unwrap(), 1);
+        assert!(!journal.exists());
     }
 
     #[test]
