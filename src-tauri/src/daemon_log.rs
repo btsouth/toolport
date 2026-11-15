@@ -277,10 +277,26 @@ pub fn sync_stderr_relay(budget: std::time::Duration) {
     }) else {
         return;
     };
-    let _ = std::io::stderr().flush();
-    #[cfg(windows)]
-    crt_flush();
     let deadline = std::time::Instant::now() + budget;
+    // Rust's stderr is unbuffered, so there is nothing to flush, and flushing
+    // takes its lock: a thread holding it in a write blocked on a full pipe
+    // would hold the sync past its budget. The C runtime's buffered streams
+    // are flushed off this thread for the same reason, within the budget.
+    #[cfg(windows)]
+    {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        if std::thread::Builder::new()
+            .name("toolport-crt-flush".into())
+            .spawn(move || {
+                crt_flush();
+                let _ = done_tx.send(());
+            })
+            .is_ok()
+        {
+            let _ =
+                done_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+        }
+    }
     // Wait until the reader has taken every written byte out of the pipe and
     // handed it on; then the sync request queues behind all of it.
     while std::time::Instant::now() < deadline {
