@@ -97,6 +97,7 @@ impl CatalogPage {
         page.append(&search_row);
         let suggestion_list = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let suggestion_popover = gtk::Popover::new();
+        super::quiet_tooltips::guard_popover(&suggestion_popover);
         suggestion_popover.add_css_class("toolport-catalog-suggestions");
         suggestion_popover.set_has_arrow(false);
         suggestion_popover.set_position(gtk::PositionType::Bottom);

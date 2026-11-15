@@ -2781,6 +2781,7 @@ impl ClientPage {
             fields.append(&kind_label);
             let names: Vec<&str> = types.iter().map(|kind| kind.name.as_str()).collect();
             let kind = gtk::DropDown::from_strings(&names);
+            quiet_tooltips::guard_dropdown(&kind);
             kind.set_selected(
                 types
                     .iter()
@@ -4268,6 +4269,7 @@ impl ActivityPage {
         });
         let filter_row = wrapping_actions();
         let filter_server = gtk::DropDown::from_strings(&[&crate::i18n::tr("All servers")]);
+        quiet_tooltips::guard_dropdown(&filter_server);
         filter_server.add_css_class("toolport-input");
         filter_server.add_css_class("toolport-activity-filter");
         filter_server.set_valign(gtk::Align::Center);
@@ -10305,6 +10307,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
     };
     let methods = gtk::StringList::new(&["client_secret_basic", "client_secret_post"]);
     let method = gtk::DropDown::new(Some(methods), None::<gtk::Expression>);
+    quiet_tooltips::guard_dropdown(&method);
     method.set_selected(
         (server
             .client_credentials
@@ -11695,6 +11698,7 @@ fn open_server_editor_prefilled(
         &crate::i18n::tr("Remote HTTP"),
         &crate::i18n::tr("Remote SSE"),
     ]);
+    quiet_tooltips::guard_dropdown(&transport);
     l10n::bind_dropdown_choices(&transport, &["Local stdio", "Remote HTTP", "Remote SSE"]);
     transport.add_css_class("toolport-input");
     transport.set_selected(
@@ -17107,6 +17111,7 @@ fn secret_reference_fields(
         &crate::i18n::tr("Paste a key"),
         &crate::i18n::tr("From a password manager"),
     ]);
+    quiet_tooltips::guard_dropdown(&choice);
     l10n::bind_dropdown_choices(&choice, &["Paste a key", "From a password manager"]);
     choice.set_selected(u32::from(existing.is_some()));
     let container = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -17114,6 +17119,7 @@ fn secret_reference_fields(
     let providers = crate::secret_refs::PROVIDERS;
     let names: Vec<_> = providers.iter().map(|p| p.name).collect();
     let provider = gtk::DropDown::from_strings(&names);
+    quiet_tooltips::guard_dropdown(&provider);
     provider.set_selected(
         existing
             .and_then(|r| providers.iter().position(|p| r.starts_with(p.scheme)))

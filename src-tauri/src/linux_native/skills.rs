@@ -1169,6 +1169,7 @@ impl SkillsPage {
             .css_classes(["toolport-search"])
             .build();
         let agent_filter = gtk::DropDown::from_strings(&[]);
+        super::quiet_tooltips::guard_dropdown(&agent_filter);
         agent_filter.set_valign(gtk::Align::Center);
         // No tooltip: the menu names itself, and a tooltip fades out after the pointer leaves.
         agent_filter.update_property(&[gtk::accessible::Property::Label(&crate::i18n::tr(
@@ -2411,6 +2412,7 @@ impl SkillsPage {
             .child(&l10n::label(open_label))
             .popover(&popover)
             .build();
+        super::quiet_tooltips::guard_split_button(&open);
         open.set_dropdown_tooltip(&crate::i18n::tr("Open with"));
         {
             let page = self.clone();
