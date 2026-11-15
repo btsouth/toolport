@@ -187,11 +187,15 @@ fn evict_to_fit(store: &mut SessionStore<Cached>, new_entry_size: usize) -> bool
         if !oldest.value.describes.is_empty() {
             // A discovery result is dropped, not kept: search makes a fresh one.
             TRIM_PENDING.store(true, Ordering::Relaxed);
-        } else if spill::keep(&oldest.key, &oldest.value, oldest.last_seen) {
-            TRIM_PENDING.store(true, Ordering::Relaxed);
-        } else {
-            unspilled_bytes += oldest.value.size;
-            unspilled.push(oldest);
+            continue;
+        }
+        match spill::keep(&oldest.key, &oldest.value, oldest.last_seen) {
+            // An expired entry is simply gone; nobody can fetch it any more.
+            Ok(()) | Err(Refusal::Expired) => TRIM_PENDING.store(true, Ordering::Relaxed),
+            Err(_) => {
+                unspilled_bytes += oldest.value.size;
+                unspilled.push(oldest);
+            }
         }
     }
     if !unspilled.is_empty() {
@@ -204,7 +208,19 @@ fn evict_to_fit(store: &mut SessionStore<Cached>, new_entry_size: usize) -> bool
         && store.weight(|c| c.size) + new_entry_size <= HARD_MAX_CACHE_BYTES
 }
 
-fn retain_in(store: &mut SessionStore<Cached>, cursor: &str, entry: Cached) -> bool {
+/// Why a result got no cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refusal {
+    /// Larger than the disk cap, so it cannot be kept anywhere.
+    TooLarge,
+    /// It would fit, but storing it failed: no data dir, no sealing key, a failed
+    /// write, or memory at its hard cap with results that could not move to disk.
+    Unstored,
+    /// Its time was already up.
+    Expired,
+}
+
+fn retain_in(store: &mut SessionStore<Cached>, cursor: &str, entry: Cached) -> Result<(), Refusal> {
     if entry.size > MAX_CACHE_BYTES {
         // Too large to hold in memory: keep it, structured part included, on disk.
         return spill::keep(cursor, &entry, Instant::now());
@@ -216,10 +232,10 @@ fn retain_in(store: &mut SessionStore<Cached>, cursor: &str, entry: Cached) -> b
         return spill::keep(cursor, &entry, Instant::now());
     }
     store.insert(cursor, entry);
-    true
+    Ok(())
 }
 
-fn retain(cursor: &str, entry: Cached) -> bool {
+fn retain(cursor: &str, entry: Cached) -> Result<(), Refusal> {
     let size = entry.size;
     let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
     let retained = retain_in(&mut store, cursor, entry);
@@ -512,7 +528,9 @@ fn shape_inner(
         },
     );
     let marker = |head_chars: usize| -> String {
-        if retained {
+        if let Err(refusal) = retained {
+            not_retained_notice(body_bytes, refusal)
+        } else {
             format!(
                 "\n\n[Toolport shaped this result: ~{} KB exceeds {} KB budget. Showing first {} of {} \
                  characters. Continue with toolport_fetch_result {{\"cursor\":\"{}\",\"offset\":{}}}. \
@@ -524,8 +542,6 @@ fn shape_inner(
                 cursor,
                 head_chars
             )
-        } else {
-            not_retained_notice(body_bytes)
         }
     };
     let decline = || {
@@ -713,11 +729,18 @@ fn layout(result: &Value, body: &str) -> Vec<Slot> {
     slots
 }
 
-fn not_retained_notice(body_bytes: usize) -> String {
-    format!(
-        "\n\n[Toolport: full result ({:.1} MB) was too large to keep for paging. Re-run the tool with narrower arguments.]",
-        body_bytes as f64 / 1_000_000.0
-    )
+fn not_retained_notice(body_bytes: usize, refusal: Refusal) -> String {
+    let mb = body_bytes as f64 / 1_000_000.0;
+    match refusal {
+        Refusal::TooLarge => format!(
+            "\n\n[Toolport: full result ({mb:.1} MB) was too large to keep for paging, even \
+             on disk. Re-run the tool with narrower arguments.]"
+        ),
+        Refusal::Unstored | Refusal::Expired => format!(
+            "\n\n[Toolport: full result ({mb:.1} MB) could not be stored for paging (a disk \
+             or key failure). Re-run the tool, or narrow the call.]"
+        ),
+    }
 }
 
 /// Stash a Toolport-authored payload and return an admitted cursor readable through
@@ -745,7 +768,7 @@ pub fn stash_payload(
             realm: 0,
         },
     );
-    retained.then_some(cursor)
+    retained.is_ok().then_some(cursor)
 }
 
 /// Return the next slice of a cached shaped result, by cursor + character offset.
@@ -1049,7 +1072,7 @@ fn fetch_result_bounded(
 /// expires (the same 15 minutes as memory), when the disk cap pushes them out, and at
 /// the next start of any gateway for directories whose process has exited.
 mod spill {
-    use super::{Cached, CACHE_TTL};
+    use super::{Cached, Refusal, CACHE_TTL};
     use base64::Engine;
     use chacha20poly1305::aead::{Aead, KeyInit};
     use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -1231,49 +1254,49 @@ mod spill {
         }
     }
 
-    /// Keep `entry` on disk under `cursor` until `stored + CACHE_TTL`. Returns false
-    /// when it cannot be kept (no data dir, past the disk cap, or a failed write).
-    pub(super) fn keep(cursor: &str, entry: &Cached, stored: Instant) -> bool {
+    /// Keep `entry` on disk under `cursor` until `stored + CACHE_TTL`, or say why it
+    /// cannot be kept.
+    pub(super) fn keep(cursor: &str, entry: &Cached, stored: Instant) -> Result<(), Refusal> {
         // A discovery result stays in memory, where its visibility is checked on
-        // every fetch and `forget_discovery` drops it; pushed out, it is dropped
-        // and search makes a fresh one.
+        // every fetch and `forget_discovery` drops it. Pushed out of memory it is
+        // dropped, and one too large for memory is not kept: search makes a fresh one.
         if !entry.describes.is_empty() {
-            return false;
+            return Err(Refusal::TooLarge);
         }
         let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
         state.keep(cursor, entry, stored)
     }
 
     impl State {
-        fn keep(&mut self, cursor: &str, entry: &Cached, stored: Instant) -> bool {
+        fn keep(&mut self, cursor: &str, entry: &Cached, stored: Instant) -> Result<(), Refusal> {
             let state = self;
             #[cfg(test)]
             if FAIL_FOR_TESTS.with(std::cell::Cell::get) {
-                return false;
+                return Err(Refusal::Unstored);
             }
             if stored.elapsed() >= CACHE_TTL {
-                return false;
+                return Err(Refusal::Expired);
             }
             let plain = json!({ "body": entry.body, "structured": entry.structured }).to_string();
             // Base64 of the sealed text is a third larger; check before sealing.
             if plain.len() / 3 * 4 > max_spill_bytes() {
-                return false;
+                return Err(Refusal::TooLarge);
             }
             let (Some(dir), Some(cipher)) = (state.dir.clone(), state.cipher.as_ref()) else {
-                return false;
+                return Err(Refusal::Unstored);
             };
             let mut nonce = [0u8; NONCE_LEN];
             if getrandom::getrandom(&mut nonce).is_err() {
-                return false;
+                return Err(Refusal::Unstored);
             }
             let Ok(sealed) = cipher.encrypt(XNonce::from_slice(&nonce), plain.as_bytes()) else {
-                return false;
+                return Err(Refusal::Unstored);
             };
             let mut bytes = nonce.to_vec();
             bytes.extend_from_slice(&sealed);
             let text = base64::engine::general_purpose::STANDARD.encode(bytes);
             if text.len() > max_spill_bytes() {
-                return false;
+                return Err(Refusal::TooLarge);
             }
             reap(state);
             while state.entries.values().map(|s| s.bytes).sum::<usize>() + text.len()
@@ -1292,11 +1315,11 @@ mod spill {
                 }
             }
             if create_private_dir(&dir).is_err() {
-                return false;
+                return Err(Refusal::Unstored);
             }
             let path = dir.join(format!("{cursor}.sealed"));
             if crate::registry::atomic_write(&path, &text).is_err() {
-                return false;
+                return Err(Refusal::Unstored);
             }
             state.entries.insert(
                 cursor.to_string(),
@@ -1309,7 +1332,7 @@ mod spill {
                     stored,
                 },
             );
-            true
+            Ok(())
         }
     }
 
@@ -1418,7 +1441,10 @@ mod spill {
         fn spilling_is_off_when_the_sealing_key_cannot_be_made() {
             let root = case_root("no-key");
             let mut state = State::new(Some(root.clone()), None);
-            assert!(!state.keep("r1", &entry("secret body"), Instant::now()));
+            assert_eq!(
+                state.keep("r1", &entry("secret body"), Instant::now()),
+                Err(Refusal::Unstored)
+            );
             assert_eq!(
                 files_under(&root),
                 0,
@@ -1426,7 +1452,9 @@ mod spill {
             );
             // The same store with a key does spill, so the test exercises the key.
             let mut keyed = State::new(Some(root.clone()), Some([7; 32]));
-            assert!(keyed.keep("r1", &entry("secret body"), Instant::now()));
+            assert!(keyed
+                .keep("r1", &entry("secret body"), Instant::now())
+                .is_ok());
             assert_eq!(files_under(&root), 1);
             let _ = std::fs::remove_dir_all(&root);
         }
@@ -2022,19 +2050,11 @@ mod tests {
     fn over_cap_entries_go_to_disk_without_evicting_live_results() {
         let mut store = SessionStore::new(CACHE_TTL, MAX_CACHE_ENTRIES);
         store.insert("live", cached_entry(1024));
-        assert!(retain_in(
-            &mut store,
-            "oversize",
-            cached_entry(MAX_CACHE_BYTES + 1)
-        ));
+        assert!(retain_in(&mut store, "oversize", cached_entry(MAX_CACHE_BYTES + 1)).is_ok());
         assert!(store.get("oversize").is_none());
         assert!(spill::spilled_path("oversize").is_some());
         assert!(store.get("live").is_some());
-        assert!(retain_in(
-            &mut store,
-            "at-cap",
-            cached_entry(MAX_CACHE_BYTES)
-        ));
+        assert!(retain_in(&mut store, "at-cap", cached_entry(MAX_CACHE_BYTES)).is_ok());
         // The live entry made room and moved to disk; it was not dropped.
         assert!(store.get("live").is_none());
         assert!(spill::spilled_path("live").is_some());
@@ -2053,13 +2073,13 @@ mod tests {
         // Past the hard ceiling the new result is refused, never an issued one.
         let refused = retain_in(&mut store, "refused", cached_entry(1));
         spill::fail_writes_for_tests(false);
-        assert!(next);
+        assert!(next.is_ok());
         assert!(
             store.get("issued").is_some(),
             "an issued cursor was dropped"
         );
         assert!(store.get("next").is_some());
-        assert!(!refused);
+        assert_eq!(refused, Err(Refusal::Unstored));
         assert!(store.get("refused").is_none());
         assert!(crate::daemon::status_notes()
             .iter()
@@ -2109,10 +2129,24 @@ mod tests {
         assert_eq!(result["_meta"]["fixture"], true);
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.starts_with("xxx"));
-        assert!(text.ends_with("[Toolport: full result (67.1 MB) was too large to keep for paging. Re-run the tool with narrower arguments.]"));
+        assert!(text.ends_with("[Toolport: full result (67.1 MB) was too large to keep for paging, even on disk. Re-run the tool with narrower arguments.]"));
         assert!(!text.contains("cursor"));
         assert!(!text.contains("toolport_fetch_result"));
-        assert!(not_retained_notice(MAX_CACHE_BYTES).len() < 128);
+        for refusal in [Refusal::TooLarge, Refusal::Unstored] {
+            assert!(not_retained_notice(MAX_CACHE_BYTES, refusal).len() < 160);
+        }
+    }
+
+    #[test]
+    fn a_result_that_could_not_be_stored_is_not_called_too_large() {
+        spill::fail_writes_for_tests(true);
+        let mut result = text_result("x".repeat(MAX_CACHE_BYTES), false);
+        assert!(shape_result(&mut result, 2048, None));
+        spill::fail_writes_for_tests(false);
+        assert!(value_size(&result) <= 2048);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.ends_with("[Toolport: full result (67.1 MB) could not be stored for paging (a disk or key failure). Re-run the tool, or narrow the call.]"), "{}", &text[text.len() - 200..]);
+        assert!(!text.contains("cursor"));
     }
 
     #[test]

@@ -112,10 +112,11 @@ are sent to every client.
   its time. Each file is written 0600 and sealed with a key the gateway holds only in
   memory, so it is unreadable once that gateway exits. Files go when their result
   expires and, for exited gateways, when the next gateway starts. Only a result past
-  the 512 MiB disk cap gets no cursor, and its reply asks for a narrower call. A
-  result that cannot be written to disk stays in memory, so a cursor already handed
-  out is not lost; memory may then grow to twice the limits above, and past that a
-  new result gets no cursor. If the gateway cannot generate its sealing key, nothing
+  the 512 MiB disk cap gets no cursor, and its reply says it was too large and asks
+  for a narrower call. A result that cannot be written to disk stays in memory, so a
+  cursor already handed out is not lost; memory may then grow to twice the limits
+  above, and past that a new result gets no cursor and its reply says it could not be
+  stored. If the gateway cannot generate its sealing key, nothing
   is written to disk. Both cases are noted in `toolport_status`.
 
 Drift fingerprints and the listed-catalog digest do not cover `_meta`, so these keys
