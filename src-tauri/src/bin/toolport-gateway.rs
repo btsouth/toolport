@@ -23524,9 +23524,8 @@ mod tests {
             return;
         };
         let secret = secret.to_string_lossy().to_string();
-        conduit_lib::secret_redact::register("proxy-server", "PROXY_TOKEN", &secret);
-        // An invalid port is echoed to stderr before the proxy starts, the same
-        // early point at which an adapter, private gateway or daemon writes.
+        // An invalid port is reported before the configured secrets are
+        // preloaded, so the value may be a secret the redactor does not know.
         super::gateway_main(vec!["--http-proxy".into(), secret]);
     }
 
@@ -23563,10 +23562,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!status.success(), "an invalid port exits 1: {text}");
         assert!(!text.contains(secret), "{text}");
-        assert!(
-            text.contains("invalid HTTP proxy port: [secret:PROXY_TOKEN]"),
-            "{text}"
-        );
+        assert!(text.contains("invalid HTTP proxy port"), "{text}");
     }
 
     #[test]
