@@ -5024,45 +5024,41 @@ fn answer_to(client: &AdapterClient, id: &Value) -> Value {
     }
 }
 
-/// Assert no answer arrives for `id` within `within`.
-fn no_answer_to(client: &AdapterClient, id: &Value, within: Duration, label: &str) {
-    let quiet_until = Instant::now() + within;
-    while let Some(message) =
-        client.observed_message(quiet_until.saturating_duration_since(Instant::now()))
-    {
-        assert!(
-            message.get("method").is_some() || &message["id"] != id,
-            "{label}: {message}\n{}",
-            client.diagnostics()
-        );
-    }
-}
-
 /// An id is reused after its request was cancelled, before the cancelled exchange
 /// has finished. Cancellation belongs to the request, not the id: the replacement
-/// gets its own answer and never the cancelled one's, and the cancelled exchange
-/// finishing does not stop the replacement from being cancelled in turn.
+/// gets its own answer and never the cancelled one's, the cancelled request is
+/// cancelled at the server exactly once, and the cancelled exchange finishing does
+/// not stop the replacement from being cancelled in turn.
+///
+/// Ordered by gates, not timing: each call holds at the server until the test opens
+/// its gate, and the test moves on only after the event it waits for happened.
 fn cancelled_id_reused_before_its_exchange_finishes(era: Era, id: Value, label: &str) {
     let _guard = CASE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (_fixture, dir) = Fixture::new(&format!("adapter-reuse-{label}"));
     let transcript = dir.join("reuse.jsonl");
+    let wire = dir.join("wire.jsonl");
     let mut server = mock_server_entry("par", &transcript, None);
     server.source = Some("shared".to_string());
-    server.env.push(EnvVar {
-        key: "MOCK_MCP_CONCURRENT".to_string(),
-        value: Some("1".to_string()),
-        secret: false,
-        unknown_fields: Default::default(),
-    });
+    for (key, value) in [
+        ("MOCK_MCP_CONCURRENT", "1".to_string()),
+        ("MOCK_MCP_WIRE_TRACE", wire.display().to_string()),
+    ] {
+        server.env.push(EnvVar {
+            key: key.to_string(),
+            value: Some(value),
+            secret: false,
+            unknown_fields: Default::default(),
+        });
+    }
     write_registry(&dir, vec![server], vec![]);
 
     let mut client = spawn_adapter(&dir, &AdapterOptions::default());
-    let sleep = match era {
+    let hold = match era {
         Era::Handshake => {
             client.initialize(&format!("matrix-adapter-reuse-{label}"));
-            client.wait_for_tool("__sleep", Duration::from_secs(30))
+            client.wait_for_tool("__hold", Duration::from_secs(30))
         }
         Era::Modern => {
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -5076,40 +5072,73 @@ fn cancelled_id_reused_before_its_exchange_finishes(era: Era, id: Value, label: 
                     tools
                         .iter()
                         .filter_map(|tool| tool["name"].as_str())
-                        .find(|name| name.ends_with("__sleep"))
+                        .find(|name| name.ends_with("__hold"))
                         .map(str::to_string)
                 });
                 if let Some(found) = found {
                     break found;
                 }
-                assert!(Instant::now() < deadline, "no sleep tool: {reply}");
+                assert!(Instant::now() < deadline, "no hold tool: {reply}");
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
     };
-    let call = |ms: u64| {
+    let call = |gate: &str| {
         era.request(
             id.clone(),
             "tools/call",
-            json!({ "name": sleep, "arguments": { "ms": ms } }),
+            json!({ "name": hold, "arguments": { "gate": gate } }),
         )
     };
-    let reached = |count: usize| {
+    let calls_reached = |count: usize| {
         wait_until(
             || transcript_method_count(&transcript, "tools/call") >= count,
             "the call reached the server",
             Duration::from_secs(20),
         )
     };
-    let before = transcript_method_count(&transcript, "tools/call");
+    let cancels_reached = |count: usize| {
+        wait_until(
+            || transcript_method_count(&transcript, "notifications/cancelled") >= count,
+            "the cancellation reached the server",
+            Duration::from_secs(20),
+        )
+    };
+    let open = |gate: &str| {
+        std::fs::write(dir.join(format!("gate-{gate}")), b"").unwrap();
+        let released = format!("released {gate}");
+        wait_until(
+            || {
+                std::fs::read_to_string(&wire).is_ok_and(|trace| {
+                    trace
+                        .lines()
+                        .any(|line| line.contains("response-flush") && line.contains(&released))
+                })
+            },
+            "the held call answered at the server",
+            Duration::from_secs(20),
+        );
+    };
+    // The next answer the client reads is for `ping`: nothing for the reused id
+    // came before it.
+    let mut pings = 8_000;
+    let mut answered_next = |client: &mut AdapterClient| {
+        pings += 1;
+        let ping = json!(pings);
+        client.send(era.request(ping.clone(), "tools/list", json!({})));
+        let listed = answer_to(client, &ping);
+        assert!(listed["result"]["tools"].is_array(), "{listed}");
+    };
+    let calls = transcript_method_count(&transcript, "tools/call");
+    let cancels = transcript_method_count(&transcript, "notifications/cancelled");
 
-    // Open the id, cancel it, and open it again while the first is still running.
-    // The first finishes first; its answer must not pass for the replacement's.
-    client.send(call(400));
-    reached(before + 1);
+    // Open the id, cancel it, and open it again while the first is still held.
+    client.send(call("a"));
+    calls_reached(calls + 1);
     client.send(era.cancel(id.clone()));
-    client.send(call(1_200));
-    reached(before + 2);
+    cancels_reached(cancels + 1);
+    client.send(call("b"));
+    calls_reached(calls + 2);
     // `7` and `"7"` are different ids: cancelling the other spelling is a no-op.
     let other = if id.is_string() {
         json!(id.as_str().unwrap().parse::<i64>().unwrap())
@@ -5117,40 +5146,41 @@ fn cancelled_id_reused_before_its_exchange_finishes(era: Era, id: Value, label: 
         json!(id.to_string())
     };
     client.send(era.cancel(other));
+    // The cancelled call answers at the server first; the client must not get it.
+    open("a");
+    open("b");
     let answer = answer_to(&client, &id);
     assert_eq!(
         text_of(&answer["result"]),
-        "slept 1200 ms",
+        "released b",
         "the replacement got another request's answer: {answer}\n{}",
         client.diagnostics()
     );
-    no_answer_to(
-        &client,
-        &id,
-        Duration::from_millis(300),
-        "a second answer for the reused id",
+    answered_next(&mut client);
+    assert_eq!(
+        transcript_method_count(&transcript, "notifications/cancelled"),
+        cancels + 1,
+        "only the cancelled call is cancelled at the server, once"
     );
 
     // Again, and this time cancel the replacement after the first exchange ended.
-    client.send(call(200));
-    reached(before + 3);
+    client.send(call("c"));
+    calls_reached(calls + 3);
     client.send(era.cancel(id.clone()));
-    client.send(call(2_000));
-    reached(before + 4);
-    std::thread::sleep(Duration::from_millis(600));
+    cancels_reached(cancels + 2);
+    client.send(call("d"));
+    calls_reached(calls + 4);
+    open("c");
+    answered_next(&mut client);
     client.send(era.cancel(id.clone()));
-    no_answer_to(
-        &client,
-        &id,
-        Duration::from_millis(2_300),
-        "answer after cancelling the replacement",
+    cancels_reached(cancels + 3);
+    open("d");
+    answered_next(&mut client);
+    assert_eq!(
+        transcript_method_count(&transcript, "notifications/cancelled"),
+        cancels + 3,
+        "each cancelled call is cancelled at the server once"
     );
-
-    // The session still serves.
-    let ping = json!(8_000);
-    client.send(era.request(ping.clone(), "tools/list", json!({})));
-    let listed = answer_to(&client, &ping);
-    assert!(listed["result"]["tools"].is_array(), "{listed}");
 }
 
 #[test]
