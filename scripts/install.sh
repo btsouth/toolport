@@ -399,7 +399,11 @@ install_linux() {
       command -v sudo >/dev/null 2>&1 && sudo=sudo || err "Refreshing openSUSE package metadata needs root: re-run as root or install sudo."
     fi
     $sudo zypper --non-interactive refresh
+    if ! command -v awk >/dev/null 2>&1; then
+      $sudo zypper --non-interactive install --no-recommends gawk
+    fi
   fi
+  need awk
   linux_plan
   [ -z "$linux_reason" ] || say "$linux_reason"
   if [ "$linux_package" = deb ]; then

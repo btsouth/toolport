@@ -527,6 +527,11 @@ for unmet in 'gtk4 4.12.5 (requires 4.14+)' 'libadwaita 1.4.3 (requires 1.5+)' '
   check "Leap identifies unmet $unmet" "$unmet" "$result"
 done
 if grep -v -- '--no-refresh' "$rpm_dir/zypper.log" | grep -q .; then fail=$((fail+1)); else pass=$((pass+1)); fi
+# Supported Leap uses the same RPM after reading its own cached providers.
+sed -i 's/4.12.5/4.18.6/g; s/1.4.3/1.7.5/g; s/2.78.6/2.84.4/g; s/2.38/2.40/g' "$rpm_dir/shim/zypper"
+printf 'ID=opensuse-leap\nID_LIKE="suse opensuse"\nVERSION_ID=16.0\n' > "$rpm_dir/os-release"
+result="$(PATH="$rpm_dir/shim:$PATH" TOOLPORT_OS_RELEASE="$rpm_dir/os-release" bash "$INSTALL_SH" --print-plan)"
+check "Leap 16 cached provider floors select RPM" "package=rpm" "$result"
 unset TOOLPORT_TEST_ZYPPER_LOG
 
 # Cleanup is offline and honors the same XDG paths as installation.
