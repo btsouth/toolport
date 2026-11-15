@@ -1644,6 +1644,17 @@ mod spill {
     }
 
     #[cfg(test)]
+    pub(super) fn remove_stale_for_tests(root: &std::path::Path) {
+        remove_stale(root);
+    }
+
+    #[cfg(test)]
+    pub(super) fn spilled_path(cursor: &str) -> Option<PathBuf> {
+        let state = state().lock().unwrap_or_else(|e| e.into_inner());
+        state.entries.get(cursor).map(|s| s.path.clone())
+    }
+
+    #[cfg(test)]
     mod tests {
         use super::*;
 
@@ -1774,17 +1785,6 @@ mod spill {
             assert_eq!(files_under(&root), 0);
             let _ = std::fs::remove_dir_all(&root);
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn remove_stale_for_tests(root: &std::path::Path) {
-        remove_stale(root);
-    }
-
-    #[cfg(test)]
-    pub(super) fn spilled_path(cursor: &str) -> Option<PathBuf> {
-        let state = state().lock().unwrap_or_else(|e| e.into_inner());
-        state.entries.get(cursor).map(|s| s.path.clone())
     }
 }
 
