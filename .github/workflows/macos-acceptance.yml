@@ -33,8 +33,6 @@ jobs:
     timeout-minutes: 45
     env:
       GH_TOKEN: ${{ github.token }}
-      EVIDENCE: ${{ runner.temp }}/macos-acceptance
-      TPUI: ${{ runner.temp }}/macos-acceptance/bin/tpui
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -44,10 +42,15 @@ jobs:
         id: release
         env:
           TAG_INPUT: ${{ inputs.tag }}
-        run: bash scripts/macos-acceptance/resolve-release.sh "$TAG_INPUT" | tee -a "$GITHUB_OUTPUT"
+        run: |
+          bash scripts/macos-acceptance/resolve-release.sh "$TAG_INPUT" | tee -a "$GITHUB_OUTPUT"
+          sed -n 's/^tag=/TAG=/p; s/^previous=/PREVIOUS_TAG=/p' "$GITHUB_OUTPUT" >>"$GITHUB_ENV"
 
       - name: Record the runner
         run: |
+          echo "EVIDENCE=$RUNNER_TEMP/macos-acceptance" >>"$GITHUB_ENV"
+          echo "TPUI=$RUNNER_TEMP/macos-acceptance/bin/tpui" >>"$GITHUB_ENV"
+          EVIDENCE="$RUNNER_TEMP/macos-acceptance"
           mkdir -p "$EVIDENCE/logs" "$EVIDENCE/bin"
           { sw_vers; uname -a; id; echo "console user: $(stat -f %Su /dev/console)"; launchctl managername; } \
             | tee "$EVIDENCE/logs/runner.txt"
@@ -57,7 +60,7 @@ jobs:
         run: swiftc -O scripts/macos-acceptance/tpui.swift -o "$TPUI"
 
       - name: Install the Apple Silicon dmg
-        run: bash scripts/macos-acceptance/install-dmg.sh "${{ steps.release.outputs.tag }}" Toolport_aarch64-apple-darwin.dmg
+        run: bash scripts/macos-acceptance/install-dmg.sh "$TAG" Toolport_aarch64-apple-darwin.dmg
 
       - name: Check the installed bundle
         if: ${{ !cancelled() }}
@@ -66,7 +69,7 @@ jobs:
       - name: Check the Intel dmg
         if: ${{ !cancelled() }}
         run: |
-          bash scripts/macos-acceptance/install-dmg.sh "${{ steps.release.outputs.tag }}" Toolport_x86_64-apple-darwin.dmg --no-install
+          bash scripts/macos-acceptance/install-dmg.sh "$TAG" Toolport_x86_64-apple-darwin.dmg --no-install
           bash scripts/macos-acceptance/bundle-checks.sh "$RUNNER_TEMP/inspect/Toolport_x86_64-apple-darwin.dmg/Toolport.app" x86_64 Intel
 
       - name: First launch
@@ -80,7 +83,7 @@ jobs:
             mkdir -p "$EVIDENCE/crash-reports"; cp "$HOME/Library/Logs/DiagnosticReports/$f" "$EVIDENCE/crash-reports/"
           done || true
           python3 scripts/macos-acceptance/render_summary.py "$EVIDENCE/results.tsv" \
-            "macOS acceptance: ${{ steps.release.outputs.tag }} dmg" >>"$GITHUB_STEP_SUMMARY"
+            "macOS acceptance: $TAG dmg" >>"$GITHUB_STEP_SUMMARY"
 
       - name: Upload evidence
         if: always()
