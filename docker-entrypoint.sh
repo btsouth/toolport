@@ -20,4 +20,18 @@ if [ ! -w "$registry_dir" ]; then
   echo "toolport-gateway: fix the mount with 'sudo chown -R 10001:10001 <host dir>', or use the named volume in docker-compose.example.yml." >&2
 fi
 
+# The image's default CLI port otherwise overrides the documented environment.
+# Keep an explicitly different CLI port, and preserve any additional arguments.
+if [ "${1:-}" = toolport-gateway ] && [ "${2:-}" = --http ] && [ "${3:-}" = 8765 ]; then
+  port="${TOOLPORT_HTTP_PORT:-${CONDUIT_HTTP_PORT:-8765}}"
+  case "$port" in
+    ''|*[!0-9]*) echo "toolport-gateway: TOOLPORT_HTTP_PORT must be a number from 0 to 65535." >&2; exit 1 ;;
+  esac
+  if [ "${#port}" -gt 5 ] || [ "$port" -gt 65535 ]; then
+    echo "toolport-gateway: TOOLPORT_HTTP_PORT must be from 0 to 65535." >&2
+    exit 1
+  fi
+  shift 3
+  set -- toolport-gateway --http "$port" "$@"
+fi
 exec "$@"
