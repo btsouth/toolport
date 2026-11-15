@@ -26,9 +26,9 @@ On Fedora 40+ the installer verifies the release RPM checksum and installs it
 with dnf. Other dnf distributions use RPM when installed libraries or cached
 repository metadata establish all four dependency floors; otherwise they use
 AppImage. Older Fedora and RHEL 9 use AppImage. The RPM requires GTK 4.14+,
-libadwaita 1.5+, GLib 2.80+ and glibc 2.39+. openSUSE uses different dependency
-names (including libadwaita and D-Bus), so the current Fedora RPM is not selected
-there; openSUSE keeps the portable AppImage.
+libadwaita 1.5+, GLib 2.80+ and glibc 2.39+. A clean openSUSE Tumbleweed solver
+check rejects the current RPM because nothing provides its `libgcc` dependency.
+openSUSE keeps the portable AppImage until a compatible RPM is packaged.
 
 To inspect the installer's selection without network access or changes, download
 it from [the pinned installer URL](https://toolport.app/install.sh), then run
