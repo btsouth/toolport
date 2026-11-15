@@ -209,6 +209,20 @@ pub struct ApprovalRequest {
         deserialize_with = "deserialize_client_label"
     )]
     pub client_label: Option<String>,
+    /// The app hosting the client, such as `t3-code`. Display only.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_host"
+    )]
+    pub host: Option<String>,
+    /// The host's thread id (a T3 Code thread), when the client passes it on.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_host_thread"
+    )]
+    pub host_thread: Option<String>,
     /// The downstream server the tool belongs to.
     pub server: String,
     /// The tool name.
@@ -229,6 +243,20 @@ pub struct ApprovalRequest {
     /// Present only for [`ApprovalReason::PiiCrossServer`]; absent for ordinary approvals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pii_release: Option<PiiReleaseRequest>,
+}
+
+fn deserialize_host<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(value.filter(|host| crate::host_attribution::valid_host(host)))
+}
+
+fn deserialize_host_thread<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(value.and_then(|id| crate::host_attribution::valid_thread(&id)))
 }
 
 /// The already-screened browser interaction carried over the local broker. The gateway
@@ -806,6 +834,8 @@ mod tests {
             client: None,
             client_name: crate::session_observability::current().client_name,
             client_label: None,
+            host: None,
+            host_thread: None,
             server: "s".into(),
             tool: "t".into(),
             reason: ApprovalReason::Destructive,
@@ -890,6 +920,8 @@ mod tests {
             client: Some("cursor".into()),
             client_name: crate::session_observability::current().client_name,
             client_label: None,
+            host: None,
+            host_thread: None,
             server: "db".into(),
             tool: "drop_table".into(),
             reason: ApprovalReason::Destructive,
@@ -1001,6 +1033,8 @@ mod tests {
             client: None,
             client_name: crate::session_observability::current().client_name,
             client_label: None,
+            host: None,
+            host_thread: None,
             server: "db".into(),
             tool: "drop_table".into(),
             reason: ApprovalReason::Destructive,
@@ -1351,6 +1385,8 @@ mod p10c_decision_tests {
             client: None,
             client_name: crate::session_observability::current().client_name,
             client_label: None,
+            host: None,
+            host_thread: None,
             server: "s".into(),
             tool: "t".into(),
             reason: ApprovalReason::Destructive,

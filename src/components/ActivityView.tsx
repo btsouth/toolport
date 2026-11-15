@@ -7,7 +7,9 @@ import {
   selectSecurityEvents,
 } from "@/lib/securityReview";
 import { ToolChanges } from "./ToolChanges";
-import { activityClientName, clientIdentityTooltip } from "@/lib/clientIdentity";
+import { activityClientSegments, clientIdentityTooltip } from "@/lib/clientIdentity";
+import { hostedClientName } from "@/lib/hostAttribution";
+import { HostThreadChip } from "@/components/HostThreadChip";
 import { useWindowVisible } from "@/lib/windowVisible";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -799,7 +801,7 @@ function CallRow({ e }: { e: AuditEntry }) {
         : { label: msg("Failed"), variant: "destructive" };
   const duration = approvalOutcome ? e.heldMs : e.durationMs;
   const meta = [
-    activityClientName(e),
+    ...activityClientSegments(e, (name) => hostedClientName(name, e)),
     fmtAgo(e.ts),
     ...(e.failureKind ? [e.failureKind.replace(/_/g, " ")] : []),
     ...(duration == null
@@ -816,7 +818,7 @@ function CallRow({ e }: { e: AuditEntry }) {
       className={`border-b border-border text-sm last:border-b-0 ${e.kind === "internal" ? "bg-muted/30" : ""}`}
     >
       <div
-        className={`flex min-h-14 items-center gap-3 px-4 py-3 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring focus-visible:outline-none ${
+        className={`@container flex min-h-14 items-center gap-3 px-4 py-3 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring focus-visible:outline-none ${
           hasDetail ? "cursor-pointer hover:bg-foreground/[0.04]" : ""
         }`}
         role={hasDetail ? "button" : undefined}
@@ -847,39 +849,46 @@ function CallRow({ e }: { e: AuditEntry }) {
         <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
           <RowIcon aria-hidden="true" className="size-4" />
         </span>
-        <div className="min-w-0 flex-1">
-          <div className="flex min-w-0 items-center gap-2">
-            <span className="min-w-0 truncate font-medium">
-              {e.kind === "internal" ? internalActivityLabel(e.tool) : e.server}
-            </span>
-            {e.kind !== "internal" && (
-              <span className="min-w-0 truncate font-mono text-meta text-muted-foreground">
-                {e.tool}
+        {/* Narrow rows put the chips under the title and let the detail line wrap, so
+            neither squeezes the title. */}
+        <div className="flex min-w-0 flex-1 flex-col gap-1.5 @xl:flex-row @xl:items-center @xl:gap-3">
+          <div className="min-w-0 @xl:flex-1">
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="min-w-0 truncate font-medium">
+                {e.kind === "internal" ? internalActivityLabel(e.tool) : e.server}
               </span>
-            )}
+              {e.kind !== "internal" && (
+                <span className="min-w-0 truncate font-mono text-meta text-muted-foreground">
+                  {e.tool}
+                </span>
+              )}
+            </div>
+            <div
+              className="mt-1 break-words text-meta text-muted-foreground @xl:truncate"
+              title={[
+                meta,
+                clientIdentityTooltip(e),
+                e.client && tr("Client: {value}", { value: e.client }),
+                e.sessionId && tr("Session: {value}", { value: e.sessionId }),
+                e.runId && tr("Run: {value}", { value: e.runId }),
+                e.cold != null && (e.cold ? tr("cold catalog") : tr("warm catalog")),
+                e.dispatchMs != null &&
+                  tr("dispatch {duration}", { duration: fmtMs(e.dispatchMs) }),
+                e.kind === "internal" && tr("Toolport: {tool}", { tool: e.tool }),
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+              dir="auto"
+            >
+              {meta}
+            </div>
           </div>
-          <div
-            className="mt-1 truncate text-meta text-muted-foreground"
-            title={[
-              meta,
-              clientIdentityTooltip(e),
-              e.client && tr("Client: {value}", { value: e.client }),
-              e.sessionId && tr("Session: {value}", { value: e.sessionId }),
-              e.runId && tr("Run: {value}", { value: e.runId }),
-              e.cold != null && (e.cold ? tr("cold catalog") : tr("warm catalog")),
-              e.dispatchMs != null &&
-                tr("dispatch {duration}", { duration: fmtMs(e.dispatchMs) }),
-              e.kind === "internal" && tr("Toolport: {tool}", { tool: e.tool }),
-            ]
-              .filter(Boolean)
-              .join(" · ")}
-            dir="auto"
-          >
-            {meta}
+          <div className="flex flex-wrap items-center gap-2 @xl:shrink-0 @xl:flex-nowrap">
+            <HostThreadChip row={e} />
+            <PiiBadge entry={e} />
+            <Badge variant={status.variant}>{tr(status.label)}</Badge>
           </div>
         </div>
-        <PiiBadge entry={e} />
-        <Badge variant={status.variant}>{tr(status.label)}</Badge>
       </div>
       {open && hasDetail && (
         <div className="border-t border-border bg-destructive/5 py-2 pr-4 pl-[86px]">

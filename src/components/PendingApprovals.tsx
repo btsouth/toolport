@@ -13,6 +13,8 @@ import {
   clientIdentityTooltip,
 } from "@/lib/clientIdentity";
 import { toastError } from "@/lib/toast";
+import { hostedClientName, hostThreadChip } from "@/lib/hostAttribution";
+import { HostThreadChip } from "@/components/HostThreadChip";
 
 /** Fail-closed window (must match approval::DEFAULT_TIMEOUT_SECS on the gateway). A
  * pending call that isn't decided within this is auto-denied, so we show a countdown. */
@@ -277,7 +279,10 @@ export function PendingApprovals({
                       className="mt-1 text-meta"
                       title={clientIdentityTooltip(a) ?? a.client ?? undefined}
                     >
-                      {translate("{client} wants to run this", { client: clientName })} ·{" "}
+                      {translate("{client} wants to run this", {
+                        client: hostedClientName(clientName, a),
+                      })}{" "}
+                      ·{" "}
                       {a.reason === "destructive"
                         ? translate("destructive tool")
                         : a.reason === "destructive_and_untrusted"
@@ -285,6 +290,12 @@ export function PendingApprovals({
                           : a.reason === "pii_cross_server"
                             ? translate("cross-server data release")
                             : translate("untrusted source")}
+                      {hostThreadChip(a) && (
+                        <>
+                          {" "}
+                          <HostThreadChip row={a} />
+                        </>
+                      )}
                     </div>
                     {reportedLabel && (
                       <div

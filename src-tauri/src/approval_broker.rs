@@ -45,6 +45,12 @@ pub struct PendingView {
     pub client_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_label: Option<String>,
+    /// The app hosting the client (`t3-code`), display only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// The host's thread id, when the client passes it on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_thread: Option<String>,
     pub server: String,
     pub tool: String,
     pub tool_fingerprint: Option<String>,
@@ -777,6 +783,8 @@ fn handle_conn(stream: BrokerStream, broker: ApprovalBroker, host: BrokerHost) {
             req.client_name.as_deref(),
         ),
         client_label: req.client_label.clone(),
+        host: req.host.clone(),
+        host_thread: req.host_thread.clone(),
         server: req.server.clone(),
         tool: req.tool.clone(),
         tool_fingerprint: req.tool_fingerprint.clone(),
@@ -920,11 +928,32 @@ fn notification_host(host: BrokerHost, show: ShowPendingNotification) -> BrokerH
 pub fn approval_requester(view: &PendingView) -> String {
     let client =
         crate::clients::trusted_client_name(view.client.as_deref(), Some(&view.client_name));
-    match view
+    let label = view
         .client_label
         .as_deref()
-        .filter(|label| *label != client)
-    {
+        .filter(|label| *label != client);
+    // Display only: the client id that access and filters use is unchanged.
+    let client = if view.host.as_deref() == Some(crate::host_attribution::T3_CODE) {
+        // The notification has room for the thread's first characters, enough to match
+        // the thread chip in Toolport and T3 Code's own thread id.
+        match view
+            .host_thread
+            .as_deref()
+            .and_then(crate::host_attribution::valid_thread)
+        {
+            Some(thread) => crate::i18n::trf(
+                "{client} via T3 Code, thread {thread}",
+                &[
+                    ("client", &client),
+                    ("thread", &crate::host_attribution::short_thread(&thread)),
+                ],
+            ),
+            None => crate::i18n::trf("{client} via T3 Code", &[("client", &client)]),
+        }
+    } else {
+        client
+    };
+    match label {
         Some(label) => crate::i18n::trf(
             "{client} (reports: {label})",
             &[
@@ -1125,6 +1154,8 @@ mod tests {
             client: Some("adapter:claude-code".into()),
             client_name: "Claude Code".into(),
             client_label: Some("Claude Code 2.1.0".into()),
+            host: None,
+            host_thread: None,
             server: "github".into(),
             tool: "delete_issue".into(),
             tool_fingerprint: None,
@@ -1138,6 +1169,30 @@ mod tests {
         let mut view = view;
         view.client_label = Some("Claude Code".into());
         assert_eq!(approval_requester(&view), "Claude Code");
+        let mut hosted = view.clone();
+        hosted.host = Some("t3-code".into());
+        hosted.host_thread = Some("465774fd-c52e".into());
+        assert_eq!(
+            approval_requester(&hosted),
+            "Claude Code via T3 Code, thread 465774fd"
+        );
+        assert_eq!(
+            localized_approval_notification(&hosted).1,
+            "github / delete_issue needs approval. Requested by Claude Code via T3 Code, thread 465774fd."
+        );
+        // T3 Code's ids start with `thread:`; the notification shows the id, as the chip does.
+        hosted.host_thread = Some("thread:465774fd-c52e".into());
+        assert_eq!(
+            approval_requester(&hosted),
+            "Claude Code via T3 Code, thread 465774fd"
+        );
+        // A thread id that fails validation is never shown.
+        hosted.host_thread = Some("bad thread\u{202e}".into());
+        assert_eq!(approval_requester(&hosted), "Claude Code via T3 Code");
+        hosted.host_thread = None;
+        assert_eq!(approval_requester(&hosted), "Claude Code via T3 Code");
+        hosted.host = Some("elsewhere".into());
+        assert_eq!(approval_requester(&hosted), "Claude Code");
         view.client_label = Some("界".repeat(80));
         assert_eq!(
             approval_requester(&view),
@@ -1199,6 +1254,8 @@ mod tests {
             ),
             client: req.client,
             client_label: req.client_label,
+            host: None,
+            host_thread: None,
             server: req.server,
             tool: req.tool,
             reason: req.reason,
@@ -1293,6 +1350,8 @@ mod tests {
             id: id.into(),
             client: None,
             client_label: None,
+            host: None,
+            host_thread: None,
             client_name: "An AI client".into(),
             server: "s".into(),
             tool: "drop".into(),
@@ -1531,6 +1590,8 @@ mod tests {
             client: None,
             client_name: crate::session_observability::current().client_name,
             client_label: None,
+            host: None,
+            host_thread: None,
             server: "db".into(),
             tool: "drop_table".into(),
             reason: ApprovalReason::Destructive,

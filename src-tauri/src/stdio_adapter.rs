@@ -54,6 +54,10 @@ pub const STDIO_ADAPTER_FLAG: &str = "--stdio-adapter";
 pub const ADAPTER_CLIENT_ID_HEADER: &str = "Toolport-Adapter-Client-Id";
 pub const ADAPTER_ATTRIBUTION_HEADER: &str = "Toolport-Adapter-Attribution";
 pub const ADAPTER_PROFILE_HEADER: &str = "Toolport-Adapter-Profile";
+/// The app hosting the adapter's client, such as `t3-code`, and its thread. Display only;
+/// trusted only with the private rendezvous bearer, like the other adapter headers.
+pub const ADAPTER_HOST_HEADER: &str = "Toolport-Adapter-Host";
+pub const ADAPTER_HOST_THREAD_HEADER: &str = "Toolport-Adapter-Host-Thread";
 /// Path values are URL-safe base64 so Unicode and platform separators survive
 /// HTTP header transport. The daemon's cwd belongs to the first adapter only.
 pub const ADAPTER_CWD_HEADER: &str = "Toolport-Adapter-Cwd";
@@ -498,6 +502,8 @@ struct Session {
     client_id: String,
     attribution_id: Option<String>,
     env_profile: Option<String>,
+    /// The app hosting this client (T3 Code), detected once at start. Display only.
+    app_host: Option<crate::host_attribution::Host>,
     cwd: Option<String>,
     root_override: Option<String>,
     /// Roots learned from this client's reply to the daemon's roots/list.
@@ -578,6 +584,7 @@ impl Session {
                 .ok()
                 .filter(|id| crate::clients::known_adapter_name(id).is_some()),
             env_profile,
+            app_host: crate::host_attribution::detect(),
             cwd,
             root_override,
             declared_root: Mutex::new(None),
@@ -601,6 +608,16 @@ impl Session {
         };
         let request = match &self.env_profile {
             Some(profile) => request.set_header(ADAPTER_PROFILE_HEADER, profile),
+            None => request,
+        };
+        let request = match &self.app_host {
+            Some(host) => {
+                let request = request.set_header(ADAPTER_HOST_HEADER, &host.host);
+                match &host.thread {
+                    Some(thread) => request.set_header(ADAPTER_HOST_THREAD_HEADER, thread),
+                    None => request,
+                }
+            }
             None => request,
         };
         let request = match &self.cwd {

@@ -1065,5 +1065,15 @@
   "MCP server": "MCP server",
   "Server is no longer available": "Server is no longer available",
   "Hide prompts": "Hide prompts",
-  "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available.": "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available."
+  "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available.": "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available.",
+  "reports \"{label}\"": "reports \"{label}\"",
+  "Calls via T3 Code": "Calls via T3 Code",
+  "{count} session via T3 Code": "{count} session via T3 Code",
+  "{count} sessions via T3 Code": "{count} sessions via T3 Code",
+  "{client} via T3 Code": "{client} via T3 Code",
+  "Thread {id}": "Thread {id}",
+  "T3 Code thread {id}": "T3 Code thread {id}",
+  "Copy thread id {id}": "Copy thread id {id}",
+  "Copied thread id": "Copied thread id",
+  "{client} via T3 Code, thread {thread}": "{client} via T3 Code, thread {thread}"
 }

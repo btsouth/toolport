@@ -3319,7 +3319,27 @@ fn client_activity_detail(client: &serde_json::Value) -> String {
             &[("value0", &grouped_number(tools).to_string())],
         ));
     }
+    details.extend(t3_code_activity_segment(client));
     details.join(" · ")
+}
+
+/// How much of a client's recent activity came through T3 Code. React's
+/// `t3CodeActivitySegment` builds the same text.
+fn t3_code_activity_segment(client: &serde_json::Value) -> Option<String> {
+    if client["viaT3Code"] != serde_json::json!(true) {
+        return None;
+    }
+    Some(match client["t3CodeSessions"].as_u64().unwrap_or(0) {
+        0 => crate::i18n::tr("Calls via T3 Code"),
+        sessions => crate::i18n::trf(
+            if sessions == 1 {
+                crate::i18n::msg("{count} session via T3 Code")
+            } else {
+                crate::i18n::msg("{count} sessions via T3 Code")
+            },
+            &[("count", &grouped_number(sessions))],
+        ),
+    })
 }
 
 fn grouped_number(n: u64) -> String {
@@ -6699,34 +6719,119 @@ fn localized_caller_name(name: Option<&str>, label: Option<&str>) -> String {
 fn unrecorded_client_tooltip() -> String {
     crate::i18n::tr("Older Toolport versions did not record callers for these rows.")
 }
-fn activity_client_display(activity: &state::ActivityView) -> String {
+/// "{client} via T3 Code" when T3 Code hosts the client; the name alone for no host or a
+/// host Toolport does not know.
+fn hosted_client_name(client: String, host: Option<&str>) -> String {
+    match host.and_then(crate::host_attribution::host_name) {
+        Some(_) => crate::i18n::trf("{client} via T3 Code", &[("client", &client)]),
+        None => client,
+    }
+}
+
+/// The thread chip's label ("Thread 465774fd") and tooltip with the full id. Only for a
+/// known host that passed a thread on.
+fn host_thread_text(host: Option<&str>, thread: Option<&str>) -> Option<(String, String)> {
+    host.and_then(crate::host_attribution::host_name)?;
+    // Validated again for display: an edited audit row cannot show an odd id.
+    let thread = crate::host_attribution::valid_thread(thread?)?;
+    Some((
+        crate::i18n::trf(
+            "Thread {id}",
+            &[("id", &crate::host_attribution::short_thread(&thread))],
+        ),
+        crate::i18n::trf("T3 Code thread {id}", &[("id", &thread)]),
+    ))
+}
+
+/// The full thread id the chip copies, validated like its label.
+fn host_thread_id(host: Option<&str>, thread: Option<&str>) -> Option<String> {
+    host.and_then(crate::host_attribution::host_name)?;
+    crate::host_attribution::valid_thread(thread?)
+}
+
+/// The thread chip's accessible name, with the full id it copies.
+fn host_thread_copy_name(id: &str) -> String {
+    crate::i18n::trf("Copy thread id {id}", &[("id", id)])
+}
+
+/// A small badge naming the host's thread, kept in the current language. It is a
+/// button: click, Enter or Space copies the full thread id and confirms with a toast.
+/// React's `HostThreadChip` does the same.
+fn host_thread_chip(host: Option<&str>, thread: Option<&str>) -> Option<gtk::Button> {
+    host_thread_text(host, thread)?;
+    let id = host_thread_id(host, thread)?;
+    let label = gtk::Label::new(None);
+    let chip = gtk::Button::builder()
+        .child(&label)
+        .valign(gtk::Align::Center)
+        .halign(gtk::Align::Start)
+        .css_classes(["toolport-badge", "caption", "toolport-thread-chip"])
+        .build();
+    let (host, thread) = (host.map(str::to_owned), thread.map(str::to_owned));
+    {
+        let (host, thread) = (host.clone(), thread.clone());
+        l10n::bind_label_with(&label, move || {
+            host_thread_text(host.as_deref(), thread.as_deref())
+                .map(|(label, _)| label)
+                .unwrap_or_default()
+        });
+    }
+    l10n::bind_tooltip_with(&chip, move || {
+        host_thread_text(host.as_deref(), thread.as_deref())
+            .map(|(_, tooltip)| tooltip)
+            .unwrap_or_default()
+    });
+    chip.update_property(&[gtk::accessible::Property::Label(&host_thread_copy_name(
+        &id,
+    ))]);
+    {
+        let (weak, id) = (chip.downgrade(), id.clone());
+        l10n::on_language_change(&chip, move || {
+            if let Some(chip) = weak.upgrade() {
+                chip.update_property(&[gtk::accessible::Property::Label(&host_thread_copy_name(
+                    &id,
+                ))]);
+            }
+        });
+    }
+    chip.connect_clicked(move |chip| {
+        chip.clipboard().set_text(&id);
+        show_toast(chip, &crate::i18n::tr("Copied thread id"));
+    });
+    Some(chip)
+}
+
+/// The leading segments of an Activity detail line: the client (with its host, such
+/// as "via T3 Code"), then what it reported, as its own segment so the host stays
+/// beside the client it describes. React builds the same segments.
+fn activity_client_segments(activity: &state::ActivityView) -> Vec<String> {
     let canonical = crate::clients::display_caller_name(
         activity.client.as_deref(),
         activity.client_label.as_deref(),
     );
-    let display =
-        localized_caller_name(activity.client.as_deref(), activity.client_label.as_deref());
+    let display = hosted_client_name(
+        localized_caller_name(activity.client.as_deref(), activity.client_label.as_deref()),
+        activity.host.as_deref(),
+    );
     if canonical.ends_with(" (reported)") {
-        return display;
+        return vec![display];
     }
     match activity
         .client_label
         .as_deref()
         .filter(|label| !crate::clients::label_only_adds_version(&canonical, label))
     {
-        Some(label) => crate::i18n::trf(
-            "{value0} (reports \"{value1}\")",
-            &[("value0", &display), ("value1", label)],
-        ),
-        None => display,
+        Some(label) => vec![
+            display,
+            crate::i18n::trf("reports \"{label}\"", &[("label", label)]),
+        ],
+        None => vec![display],
     }
 }
 fn activity_detail(activity: &state::ActivityView) -> String {
     let outcome = activity.approval_decision.as_deref().map(approval_outcome);
-    let mut detail = vec![
-        activity_client_display(activity),
-        relative_activity_time(activity.timestamp_ms),
-    ];
+    let mut detail = activity_client_segments(activity);
+    detail.push(relative_activity_time(activity.timestamp_ms));
 
     if let Some(kind) = &activity.failure_kind {
         detail.push(kind.replace('_', " "));
@@ -6828,8 +6933,9 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
         .tooltip_text(activity_detail_tooltip(activity))
         .halign(gtk::Align::Fill)
         .xalign(0.0)
-        .single_line_mode(true)
-        .ellipsize(gtk::pango::EllipsizeMode::End)
+        // Wraps rather than cutting off "via T3 Code" and the time at narrow widths.
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
         .css_classes(["toolport-muted"])
         .build();
     let activity_for_detail = activity.clone();
@@ -6839,6 +6945,7 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
         activity_detail_tooltip(&activity_for_tooltip)
     });
     copy.append(&detail_label);
+    let thread_chip = host_thread_chip(activity.host.as_deref(), activity.host_thread.as_deref());
     if let Some(error) = activity.error.as_deref() {
         copy.append(
             &gtk::Label::builder()
@@ -6851,7 +6958,16 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
                 .build(),
         );
     }
-    card.append(&copy);
+    // The chips sit right of the text when both fit, and wrap below it otherwise, so
+    // they never squeeze the title.
+    let chips = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    chips.set_valign(gtk::Align::Center);
+    let wrap = page_header::HeaderWrap::new(&copy, &chips);
+    wrap.set_hexpand(true);
+    card.append(&wrap);
+    if let Some(chip) = thread_chip {
+        chips.append(&chip);
+    }
     if let Some((label, class, tooltip)) = pii_badge(activity.pii_replaced, activity.pii_incomplete)
     {
         let badge = gtk::Label::new(Some(&label));
@@ -6874,7 +6990,7 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
         badge.set_halign(gtk::Align::Start);
         badge.add_css_class(class);
         l10n::bind_tooltip(&badge, tooltip);
-        card.append(&badge);
+        chips.append(&badge);
     }
     let (status, class) = if let Some((label, _, tone, _)) = outcome {
         (label, tone)
@@ -6890,7 +7006,7 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
     badge.set_valign(gtk::Align::Center);
     badge.set_halign(gtk::Align::Start);
     badge.add_css_class(class);
-    card.append(&badge);
+    chips.append(&badge);
     card
 }
 
@@ -7706,7 +7822,10 @@ fn approval_card(
 
     let requester =
         crate::clients::display_caller_name(Some(&view.client_name), view.client_label.as_deref());
-    card.append(&{
+    // The requester line, with the T3 Code thread chip after it when there is one.
+    let requester_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    card.append(&requester_row);
+    requester_row.append(&{
         let widget = gtk::Label::builder()
             .tooltip_text(if requester == "Unrecorded client" {
                 unrecorded_client_tooltip()
@@ -7726,9 +7845,12 @@ fn approval_card(
                 &[
                     (
                         "value0",
-                        &localized_caller_name(
-                            Some(&view_for_requester.client_name),
-                            view_for_requester.client_label.as_deref(),
+                        &hosted_client_name(
+                            localized_caller_name(
+                                Some(&view_for_requester.client_name),
+                                view_for_requester.client_label.as_deref(),
+                            ),
+                            view_for_requester.host.as_deref(),
                         ),
                     ),
                     (
@@ -7746,6 +7868,10 @@ fn approval_card(
         }
         widget
     });
+    if let Some(chip) = host_thread_chip(view.host.as_deref(), view.host_thread.as_deref()) {
+        chip.set_valign(gtk::Align::Start);
+        requester_row.append(&chip);
+    }
 
     if let Some(label) = view
         .client_label
@@ -14083,6 +14209,8 @@ mod tests {
                 client: None,
                 client_name: name.into(),
                 client_label: None,
+                host: None,
+                host_thread: None,
                 server: "GitHub".into(),
                 tool: "delete_issue".into(),
                 tool_fingerprint: None,
@@ -14150,6 +14278,8 @@ mod tests {
             client: None,
             client_name: "Codex".into(),
             client_label: None,
+            host: None,
+            host_thread: None,
             server: "github".into(),
             tool: "delete_issue".into(),
             tool_fingerprint: Some("v2:abc".into()),
@@ -14273,6 +14403,8 @@ mod tests {
                 client: None,
                 client_name: canonical.into(),
                 client_label: Some("kt 1".into()),
+                host: None,
+                host_thread: None,
                 server: "team-slack".into(),
                 tool: "delete_issue".into(),
                 tool_fingerprint: None,
@@ -14410,7 +14542,7 @@ mod tests {
             let identity = if reported_only {
                 displayed.to_owned()
             } else {
-                format!("{canonical} (reports \"kt 1\")")
+                format!("{canonical} · reports \"kt 1\"")
             };
             let detail = activity_detail.text();
             assert!(
@@ -15502,6 +15634,8 @@ mod tests {
             tool: "tool".to_string(),
             client: None,
             client_label: None,
+            host: None,
+            host_thread: None,
             client_id: None,
             cold: None,
             dispatch_ms: None,
@@ -15757,6 +15891,20 @@ mod tests {
             detail,
             "Last active time unavailable · 12 calls today · Last saw 1,711 tools"
         );
+        assert_eq!(
+            client_activity_detail(
+                &serde_json::json!({"callsToday":2,"viaT3Code":true,"t3CodeSessions":3})
+            ),
+            "Last active time unavailable · 2 calls today · 3 sessions via T3 Code"
+        );
+        assert_eq!(
+            client_activity_detail(&serde_json::json!({"viaT3Code":true,"t3CodeSessions":1})),
+            "Last active time unavailable · 1 session via T3 Code"
+        );
+        assert_eq!(
+            client_activity_detail(&serde_json::json!({"viaT3Code":true,"t3CodeSessions":0})),
+            "Last active time unavailable · Calls via T3 Code"
+        );
         let mut row = call("toolport", true);
         row.internal = true;
         for (tool, title) in [
@@ -15820,6 +15968,8 @@ mod tests {
             id: "1".into(),
             client: Some("claude".into()),
             client_label: None,
+            host: None,
+            host_thread: None,
             client_name: "Claude Code".into(),
             server: "github".into(),
             tool: "create_issue".into(),
@@ -16692,6 +16842,8 @@ mod p10c_r1_presentation_tests {
             client: Some("Claude Code".into()),
             client_id: Some("adapter:claude-code".into()),
             client_label: Some("Claude Code 2.1".into()),
+            host: None,
+            host_thread: None,
             cold: None,
             dispatch_ms: None,
             failure_kind: None,
@@ -16721,6 +16873,84 @@ mod p10c_r1_presentation_tests {
         );
         assert_eq!(approval_outcome("denied").2, "approval-denied");
         assert_eq!(approval_outcome("withdrawn").2, "disabled");
+    }
+
+    #[test]
+    fn t3_code_host_names_the_client_and_its_thread() {
+        let thread = "465774fd-c52e-4b7e-9d5c-3f0f3a6f0a11";
+        assert_eq!(
+            hosted_client_name("Claude Code".into(), Some("t3-code")),
+            "Claude Code via T3 Code"
+        );
+        assert_eq!(
+            hosted_client_name("Claude Code".into(), Some("other")),
+            "Claude Code"
+        );
+        assert_eq!(hosted_client_name("Codex".into(), None), "Codex");
+        assert_eq!(
+            host_thread_text(Some("t3-code"), Some(thread)),
+            Some((
+                "Thread 465774fd".to_string(),
+                format!("T3 Code thread {thread}")
+            ))
+        );
+        // Codex under T3 Code has no thread; unknown hosts get nothing extra.
+        assert_eq!(host_thread_text(Some("t3-code"), None), None);
+        assert_eq!(host_thread_text(Some("t3-code"), Some("bad id")), None);
+        assert_eq!(
+            host_thread_text(Some("t3-code"), Some(&"a".repeat(129))),
+            None
+        );
+        assert_eq!(host_thread_text(Some("other"), Some(thread)), None);
+        assert_eq!(host_thread_text(None, Some(thread)), None);
+        // The chip copies, and is named by, the full id.
+        assert_eq!(
+            host_thread_id(Some("t3-code"), Some(thread)).as_deref(),
+            Some(thread)
+        );
+        assert_eq!(host_thread_id(Some("t3-code"), Some("bad id")), None);
+        assert_eq!(host_thread_id(Some("other"), Some(thread)), None);
+        assert_eq!(
+            host_thread_copy_name(thread),
+            format!("Copy thread id {thread}")
+        );
+
+        let mut row = state::ActivityView {
+            internal: false,
+            timestamp_ms: 0,
+            server: "github".into(),
+            tool: "create_issue".into(),
+            client: Some("Claude Code".into()),
+            client_id: Some("claude-code@claude2".into()),
+            client_label: None,
+            host: Some("t3-code".into()),
+            host_thread: Some(thread.into()),
+            cold: None,
+            dispatch_ms: None,
+            failure_kind: None,
+            run_id: None,
+            approval_decision: None,
+            ok: true,
+            held: false,
+            duration_ms: None,
+            error: None,
+            pii_replaced: None,
+            pii_incomplete: false,
+        };
+        assert!(activity_detail(&row).starts_with("Claude Code via T3 Code · "));
+        // The stored identity, used by filters, is unchanged.
+        assert_eq!(activity_client_name(&row), "Claude Code");
+        row.client_label = Some("Someone else".into());
+        assert_eq!(
+            activity_client_segments(&row),
+            ["Claude Code via T3 Code", "reports \"Someone else\""]
+        );
+        assert!(activity_detail(&row)
+            .starts_with("Claude Code via T3 Code · reports \"Someone else\" · "));
+        row.host = None;
+        assert!(activity_detail(&row).starts_with("Claude Code · reports \"Someone else\" · "));
+        row.client_label = None;
+        assert_eq!(activity_client_segments(&row), ["Claude Code"]);
     }
 }
 

@@ -47,8 +47,24 @@ impl Harness {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create data dir");
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_toolport-gateway"))
-            .arg("--stdio-adapter")
+        // With `TOOLPORT_TEST_UNDER_T3CODE`, the adapter runs under a shell named
+        // `t3code`, as it does under T3 Code's own process.
+        let gateway = env!("CARGO_BIN_EXE_toolport-gateway");
+        let mut command = if env
+            .iter()
+            .any(|(key, _)| *key == "TOOLPORT_TEST_UNDER_T3CODE")
+        {
+            let t3code = dir.join("t3code");
+            std::fs::copy("/bin/sh", &t3code).expect("copy a shell named t3code");
+            let mut command = Command::new(t3code);
+            command.args(["-c", "\"$0\" --stdio-adapter; exit $?", gateway]);
+            command
+        } else {
+            let mut command = Command::new(gateway);
+            command.arg("--stdio-adapter");
+            command
+        };
+        let mut child = command
             .env("TOOLPORT_DATA_DIR", &dir)
             .env("TOOLPORT_REGISTRY", dir.join("registry.json"))
             .envs(env.iter().copied())
@@ -577,5 +593,189 @@ fn a_stop_request_spares_a_connected_client_and_leaves_with_it() {
             harness.diagnostics()
         );
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// What a started adapter leaves behind once it has served `initialize` and `tools/list`:
+/// every path in its data directory (digits and hex folded, so pids and hashes compare)
+/// and the names of its own threads.
+#[cfg(target_os = "linux")]
+fn start_footprint(
+    env: &[(&str, &str)],
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
+    let mut harness = Harness::start_with_env(env);
+    harness.send(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "stdio-adapter-test", "version": "1" }
+        }
+    }));
+    harness.response_to(1);
+    harness.send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    harness.send(serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = harness.response_to(2);
+    assert!(tools["result"]["tools"].is_array(), "{tools}");
+    let fold = |text: &str| -> String {
+        let mut out = String::new();
+        for c in text.chars() {
+            let c = if c.is_ascii_hexdigit() { '0' } else { c };
+            if !(c == '0' && out.ends_with('0')) {
+                out.push(c);
+            }
+        }
+        out
+    };
+    let mut paths = std::collections::BTreeSet::new();
+    let mut pending = vec![harness.dir.clone()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let relative = path.strip_prefix(&harness.dir).unwrap().to_string_lossy();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                pending.push(path.clone());
+            }
+            let tag = if kind.is_dir() {
+                "dir"
+            } else if std::os::unix::fs::FileTypeExt::is_socket(&kind) {
+                "socket"
+            } else {
+                "file"
+            };
+            // The Activity log is written in the background as calls end, so whether it
+            // exists yet is timing, not start-up work. Host attribution only adds fields
+            // to its rows.
+            if relative.starts_with("audit.jsonl") {
+                continue;
+            }
+            paths.insert(format!("{tag} {}", fold(&relative)));
+        }
+    }
+    let threads = std::fs::read_dir(format!("/proc/{}/task", harness.child.id()))
+        .expect("read the adapter's threads")
+        .flatten()
+        .filter_map(|task| std::fs::read_to_string(task.path().join("comm")).ok())
+        .map(|name| fold(name.trim()))
+        .collect();
+    (paths, threads)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn host_detection_adds_no_files_sockets_or_threads_at_start() {
+    // Telling that T3 Code hosts the client only reads the environment and, with T3 Code
+    // installed, the parent processes: the adapter starts the same way for every client.
+    let (plain_paths, plain_threads) = start_footprint(&[]);
+    let cases: &[&[(&str, &str)]] = &[
+        &[("TOOLPORT_CLIENT_ID", "claude-code")],
+        &[("TOOLPORT_CLIENT_ID", "codex")],
+        &[("TOOLPORT_CLIENT_ID", "cursor")],
+        // Claude Code started by T3 Code.
+        &[
+            ("TOOLPORT_CLIENT_ID", "claude-code"),
+            ("CLAUDE_CODE_ENTRYPOINT", "t3-code"),
+            ("T3CODE_THREAD_ID", "465774fd"),
+        ],
+        // T3 Code installed: the ancestor walk runs.
+        &[
+            ("TOOLPORT_CLIENT_ID", "codex"),
+            ("TOOLPORT_TEST_T3_INSTALLED", "1"),
+        ],
+        &[
+            ("TOOLPORT_CLIENT_ID", "pi"),
+            ("TOOLPORT_TEST_T3_INSTALLED", "1"),
+            ("T3CODE_THREAD_ID", "465774fd"),
+        ],
+    ];
+    for env in cases {
+        let (paths, threads) = start_footprint(env);
+        assert_eq!(paths, plain_paths, "{env:?}: data dir differs");
+        assert_eq!(threads, plain_threads, "{env:?}: threads differ");
+    }
+}
+
+/// The daemon records which app hosts the client from the adapter's headers. They are on
+/// every request, so a call resent after the daemon stopped, with its replayed handshake
+/// on the new daemon, is still recorded as T3 Code's.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_host_survives_a_daemon_restart() {
+    let mut harness = Harness::start_with_env(&[
+        ("TOOLPORT_TEST_UNDER_T3CODE", "1"),
+        ("TOOLPORT_TEST_T3_INSTALLED", "1"),
+        ("TOOLPORT_CLIENT_ID", "claude-code"),
+        ("CLAUDE_CODE_ENTRYPOINT", "t3-code"),
+        ("T3CODE_THREAD_ID", "465774fd"),
+    ]);
+    harness.send(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "stdio-adapter-host", "version": "1" }
+        }
+    }));
+    harness.response_to(1);
+    harness.send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    harness.send(serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    assert!(harness.response_to(2)["result"]["tools"].is_array());
+    // Session rows the daemon writes in the background, with the client's name.
+    let dir = harness.dir.clone();
+    let rows = move || -> Vec<serde_json::Value> {
+        std::fs::read_to_string(dir.join("audit.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|row| row["kind"] == "session" && row["clientName"].is_string())
+            .collect()
+    };
+    let wait_for = |count: usize| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let found = rows();
+            if found.len() >= count || std::time::Instant::now() > deadline {
+                return found;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let before = wait_for(1);
+    assert!(
+        !before.is_empty(),
+        "no session row\n{}",
+        harness.diagnostics()
+    );
+    let first_daemon = daemon_pid(&harness.dir);
+    kill_daemon(&harness.dir);
+    // Never reached the dead daemon, so it is resent to a new one.
+    harness.send(serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}));
+    let resent = loop {
+        let message = harness.next_response();
+        if message["id"] == 3 {
+            break message;
+        }
+    };
+    assert!(
+        resent["result"]["tools"].is_array(),
+        "{resent}\n{}",
+        harness.diagnostics()
+    );
+    let second_daemon = daemon_pid(&harness.dir);
+    assert_ne!(second_daemon, first_daemon, "the daemon was not replaced");
+    // The new daemon wrote rows of its own, and every row carries the host and thread.
+    let recorded = wait_for(before.len() + 1);
+    assert!(
+        recorded.len() > before.len(),
+        "the new daemon recorded no session: {recorded:?}\n{}",
+        harness.diagnostics()
+    );
+    for row in &recorded {
+        assert_eq!(row["host"], "t3-code", "{row}");
+        assert_eq!(row["hostThread"], "465774fd", "{row}");
     }
 }

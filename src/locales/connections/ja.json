@@ -1065,5 +1065,15 @@
   "MCP server": "MCP サーバー",
   "Server is no longer available": "サーバーは利用できなくなりました",
   "Hide prompts": "プロンプトを非表示",
-  "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available.": "このサーバーのプロンプトを AI クライアントに表示しません。プロンプトはスラッシュコマンドとして表示されることがよくあります。ツールは引き続き使用できます。"
+  "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available.": "このサーバーのプロンプトを AI クライアントに表示しません。プロンプトはスラッシュコマンドとして表示されることがよくあります。ツールは引き続き使用できます。",
+  "reports \"{label}\"": "「{label}」をレポート",
+  "Calls via T3 Code": "T3 Code 経由の呼び出し",
+  "{count} session via T3 Code": "T3 Code 経由のセッション {count} 件",
+  "{count} sessions via T3 Code": "T3 Code 経由のセッション {count} 件",
+  "{client} via T3 Code": "{client}（T3 Code 経由）",
+  "Thread {id}": "スレッド {id}",
+  "T3 Code thread {id}": "T3 Code スレッド {id}",
+  "Copy thread id {id}": "スレッド ID {id} をコピー",
+  "Copied thread id": "スレッド ID をコピーしました",
+  "{client} via T3 Code, thread {thread}": "{client}（T3 Code 経由、スレッド {thread}）"
 }

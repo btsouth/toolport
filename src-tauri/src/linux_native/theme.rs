@@ -1557,6 +1557,25 @@ button.suggested-action {{
   color: @toolport_bg_dark;
 }}
 
+/* The T3 Code thread chip: a badge that copies the thread id, so it takes focus. */
+button.toolport-thread-chip {{
+  min-height: 0;
+  min-width: 0;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: none;
+  box-shadow: none;
+  background-color: @toolport_info_tint;
+  color: @toolport_text_secondary;
+}}
+button.toolport-thread-chip:hover {{
+  background-color: mix(@toolport_info_tint, @toolport_fg, 0.08);
+}}
+button.toolport-thread-chip:focus:focus-visible {{
+  outline: 2px solid @toolport_accent;
+  outline-offset: 2px;
+}}
+
 /* Button levels (spec 5). Secondary: raised fill and a border, for every
    repeated row action. Destructive trigger: red text on a 12% red tint. Only
    the final confirm in a dialog is filled red. */

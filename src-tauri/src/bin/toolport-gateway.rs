@@ -5421,6 +5421,8 @@ fn execute_call(
                 client: client.map(str::to_string),
                 client_name: observation::current().client_name,
                 client_label: active_client_label(),
+                host: observation::current().host.map(|host| host.host),
+                host_thread: observation::current().host.and_then(|host| host.thread),
                 server: server_id.to_string(),
                 tool: tool.to_string(),
                 reason,
@@ -6214,6 +6216,8 @@ fn approve_pii_release(
         client: client.map(str::to_string),
         client_name: observation::current().client_name,
         client_label: active_client_label(),
+        host: observation::current().host.map(|host| host.host),
+        host_thread: observation::current().host.and_then(|host| host.thread),
         server: server.to_string(),
         tool: tool.to_string(),
         reason: approval::ApprovalReason::PiiCrossServer,
@@ -14371,6 +14375,9 @@ struct GatewayState {
     client_id: Option<String>,
     attribution_id: Option<String>,
     env_profile: Option<String>,
+    /// The app hosting this stdio gateway's client (T3 Code), display only. Process
+    /// constant; an HTTP face reads it per request from its adapter's headers.
+    app_host: Option<conduit_lib::host_attribution::Host>,
 }
 
 impl std::ops::Deref for GatewayState {
@@ -15655,6 +15662,8 @@ fn broker_url_elicitation(
         client: None,
         client_name: observation::current().client_name,
         client_label: None,
+        host: observation::current().host.map(|host| host.host),
+        host_thread: observation::current().host.and_then(|host| host.thread),
         server: screened.origin.clone(),
         tool: "browser interaction".to_string(),
         reason: approval::ApprovalReason::UntrustedSource,
@@ -16861,6 +16870,11 @@ fn process_request_wire(
     }
     .map(|id| format!("adapter:{id}"));
     let display_client = display_client.as_deref().or(client);
+    let app_host = if state.http {
+        HTTP_ADAPTER_HOST.with(|current| current.borrow().clone())
+    } else {
+        state.app_host.clone()
+    };
     let name = observed_client_name(state, holder.as_deref(), display_client, client_name);
     let observed = if let Some(holder) = &holder {
         let mut current = holder
@@ -16874,11 +16888,12 @@ fn process_request_wire(
         }
         current
             .get_or_insert_with(|| {
-                observation::Session::start_attributed(
+                observation::Session::start_hosted(
                     client,
                     display_client,
                     Some(&name),
                     label.as_deref(),
+                    app_host.as_ref(),
                     if state.http { "http" } else { "stdio" },
                     reason,
                 )
@@ -16887,11 +16902,12 @@ fn process_request_wire(
     } else {
         // Modern remote HTTP has no protocol session. A request is the only
         // observable lifetime; never merge two windows merely by bearer identity.
-        observation::Session::start_attributed(
+        observation::Session::start_hosted(
             client,
             display_client,
             Some(&name),
             label.as_deref(),
+            app_host.as_ref(),
             "http_request",
             "sessionless_request",
         )
@@ -19725,6 +19741,9 @@ fn http_connection_cancellations() -> &'static Mutex<HashMap<SocketAddr, downstr
 thread_local! {
     static HTTP_ADAPTER_ATTRIBUTION: std::cell::RefCell<(Option<String>, Option<u32>)> = const { std::cell::RefCell::new((None, None)) };
     static HTTP_ADAPTER_INSTANCE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// The adapter's host app (T3 Code), from headers trusted only with the private
+    /// daemon bearer. Display only.
+    static HTTP_ADAPTER_HOST: std::cell::RefCell<Option<conduit_lib::host_attribution::Host>> = const { std::cell::RefCell::new(None) };
     static HTTP_CONNECTION_CANCEL: std::cell::RefCell<Option<downstream::CancelRegistry>> = const { std::cell::RefCell::new(None) };
 }
 struct HttpConnectionScope(Option<downstream::CancelRegistry>, Option<String>);
@@ -19738,6 +19757,30 @@ struct AdapterAttributionScope((Option<String>, Option<u32>));
 impl Drop for AdapterAttributionScope {
     fn drop(&mut self) {
         HTTP_ADAPTER_ATTRIBUTION.with(|current| current.replace(std::mem::take(&mut self.0)));
+    }
+}
+/// The display-only host a stdio adapter reports, such as T3 Code and its thread. Only an
+/// adapter holding the private daemon bearer with a valid client claim is believed; any
+/// other local process gets nothing, whatever headers it sends. The host must be one
+/// Toolport records and the thread id passes `valid_thread` (length and characters)
+/// before it is stored or shown.
+fn trusted_adapter_host(
+    trusted: bool,
+    header: impl Fn(&'static str) -> Option<String>,
+) -> Option<conduit_lib::host_attribution::Host> {
+    if !trusted {
+        return None;
+    }
+    conduit_lib::host_attribution::from_parts(
+        header(conduit_lib::stdio_adapter::ADAPTER_HOST_HEADER).as_deref(),
+        header(conduit_lib::stdio_adapter::ADAPTER_HOST_THREAD_HEADER).as_deref(),
+    )
+}
+
+struct AdapterHostScope(Option<conduit_lib::host_attribution::Host>);
+impl Drop for AdapterHostScope {
+    fn drop(&mut self) {
+        HTTP_ADAPTER_HOST.with(|current| current.replace(self.0.take()));
     }
 }
 struct HttpRequestEnd {
@@ -21710,6 +21753,16 @@ fn handle_connection(
                 let _attribution = AdapterAttributionScope(
                     HTTP_ADAPTER_ATTRIBUTION.with(|current| current.replace(attribution)),
                 );
+                let app_host =
+                    trusted_adapter_host(private_daemon_bearer && valid_adapter_claim, |name| {
+                        request
+                            .headers()
+                            .iter()
+                            .find(|h| h.field.equiv(name))
+                            .map(|h| h.value.as_str().to_string())
+                    });
+                let _app_host =
+                    AdapterHostScope(HTTP_ADAPTER_HOST.with(|current| current.replace(app_host)));
                 // A panic in a handler must return 500, not kill the listener.
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     handle_http_with_headers(
@@ -22676,6 +22729,11 @@ fn main() {
             .ok()
             .filter(|id| clients::known_adapter_name(id).is_some()),
         env_profile: env_profile.clone(),
+        app_host: if http_mode {
+            None
+        } else {
+            conduit_lib::host_attribution::detect()
+        },
     };
 
     let cache_host = Arc::clone(&state.host);
@@ -22834,6 +22892,52 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn adapter_host_headers_need_the_private_bearer_and_a_valid_thread() {
+        let headers = |thread: &'static str| {
+            move |name: &'static str| match name {
+                conduit_lib::stdio_adapter::ADAPTER_HOST_HEADER => Some("t3-code".to_string()),
+                conduit_lib::stdio_adapter::ADAPTER_HOST_THREAD_HEADER => Some(thread.to_string()),
+                _ => None,
+            }
+        };
+        // Any local process without the private bearer: nothing, whatever it sends.
+        assert_eq!(
+            super::trusted_adapter_host(false, headers("465774fd")),
+            None
+        );
+        let host = super::trusted_adapter_host(true, headers("465774fd")).unwrap();
+        assert_eq!(
+            (host.host.as_str(), host.thread.as_deref()),
+            ("t3-code", Some("465774fd"))
+        );
+        // A thread id that is too long or has other characters is dropped before storage.
+        for bad in ["a b", "x\ny", "<script>", "\u{202e}abc"] {
+            assert_eq!(
+                super::trusted_adapter_host(true, headers(bad))
+                    .unwrap()
+                    .thread,
+                None,
+                "{bad}"
+            );
+        }
+        let long: &'static str = Box::leak("a".repeat(129).into_boxed_str());
+        assert_eq!(
+            super::trusted_adapter_host(true, headers(long))
+                .unwrap()
+                .thread,
+            None
+        );
+        // An unknown host is not recorded at all.
+        assert_eq!(
+            super::trusted_adapter_host(true, |name: &'static str| {
+                (name == conduit_lib::stdio_adapter::ADAPTER_HOST_HEADER)
+                    .then(|| "other".to_string())
+            }),
+            None
+        );
+    }
+
     mod search_scale {
         include!("../gateway/search_eval_scale.rs");
     }
@@ -27750,6 +27854,8 @@ mod tests {
             client: None,
             client_name: observation::current().client_name,
             client_label: None,
+            host: observation::current().host.map(|host| host.host),
+            host_thread: observation::current().host.and_then(|host| host.thread),
             server: "db".into(),
             tool: "drop".into(),
             reason: approval::ApprovalReason::Destructive,
@@ -27808,6 +27914,8 @@ mod tests {
             client: None,
             client_name: observation::current().client_name,
             client_label: None,
+            host: observation::current().host.map(|host| host.host),
+            host_thread: observation::current().host.and_then(|host| host.thread),
             server: "crm".into(),
             tool: "export_all".into(),
             reason: approval::ApprovalReason::Destructive,
@@ -30382,6 +30490,7 @@ mod tests {
             client_id: None,
             attribution_id: None,
             env_profile: None,
+            app_host: None,
         }
     }
 
@@ -40330,6 +40439,8 @@ mod tests {
                     client: None,
                     client_name: observation::current().client_name,
                     client_label: None,
+                    host: observation::current().host.map(|host| host.host),
+                    host_thread: observation::current().host.and_then(|host| host.thread),
                     server: "s".into(),
                     tool: "t".into(),
                     reason: approval::ApprovalReason::Destructive,

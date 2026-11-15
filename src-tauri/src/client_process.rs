@@ -34,6 +34,45 @@ fn stable_process(
     (generation()? == before).then_some((before, name))
 }
 
+/// The executable names of `pid`'s nearest `count` ancestors, parent first. The walk stops
+/// at a PID that was reused by a process newer than its child. Interpreter parents are
+/// named by their script, as [`parent_app`] names them.
+pub fn ancestor_names(pid: u32, count: usize) -> Vec<String> {
+    ancestors_with(pid, count, process)
+}
+
+fn ancestors_with(
+    pid: u32,
+    count: usize,
+    mut read: impl FnMut(u32) -> Option<(Generation, String)>,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    let Some((mut generation, _)) = read(pid) else {
+        return names;
+    };
+    let mut seen = HashSet::from([pid]);
+    while names.len() < count {
+        let parent = generation.parent;
+        if parent <= 1 || !seen.insert(parent) {
+            break;
+        }
+        let Some((next, name)) = read(parent) else {
+            break;
+        };
+        // A parent that started after its child is a reused PID, not the real parent.
+        if next.started > generation.started {
+            break;
+        }
+        let name = Path::new(&name)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or(name);
+        names.push(name);
+        generation = next;
+    }
+    names
+}
+
 pub fn parent_app(pid: u32) -> Option<String> {
     walk(pid, process)
 }
@@ -419,6 +458,60 @@ fn process(_: u32) -> Option<(Generation, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ancestor_names_stop_at_a_reused_parent() {
+        let table = |pid: u32| -> Option<(Generation, String)> {
+            match pid {
+                10 => Some((
+                    Generation {
+                        parent: 20,
+                        started: 300,
+                    },
+                    "toolport-gateway".into(),
+                )),
+                20 => Some((
+                    Generation {
+                        parent: 30,
+                        started: 200,
+                    },
+                    "/usr/bin/codex".into(),
+                )),
+                30 => Some((
+                    Generation {
+                        parent: 1,
+                        started: 100,
+                    },
+                    "t3code".into(),
+                )),
+                // Started after its child: a reused PID.
+                40 => Some((
+                    Generation {
+                        parent: 50,
+                        started: 900,
+                    },
+                    "codex".into(),
+                )),
+                _ => None,
+            }
+        };
+        assert_eq!(ancestors_with(10, 2, table), vec!["codex", "t3code"]);
+        assert_eq!(ancestors_with(10, 5, table), vec!["codex", "t3code"]);
+        let reused = |pid: u32| -> Option<(Generation, String)> {
+            match pid {
+                10 => Some((
+                    Generation {
+                        parent: 40,
+                        started: 300,
+                    },
+                    "toolport-gateway".into(),
+                )),
+                _ => table(pid),
+            }
+        };
+        assert!(ancestors_with(10, 2, reused).is_empty());
+        assert!(ancestors_with(99, 2, table).is_empty());
+    }
     #[test]
     fn interpreter_wrappers_keep_walking_and_scripts_get_safe_names() {
         let cases: &[(&str, &[&str], Option<&str>)] = &[

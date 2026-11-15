@@ -549,8 +549,9 @@ fn client_activity_from_entries(
 ) -> Vec<Value> {
     fill_session_clients(&mut entries);
     let names = crate::clients::CallerNames::for_entries(&entries);
-    let mut groups =
-        std::collections::BTreeMap::<String, (Value, std::collections::HashSet<String>)>::new();
+    type Sessions = std::collections::HashSet<String>;
+    // Per client: its summary, its sessions, and the sessions T3 Code hosted.
+    let mut groups = std::collections::BTreeMap::<String, (Value, Sessions, Sessions)>::new();
     for entry in entries {
         let call = tool_call_ok(&entry).is_some();
         if !call
@@ -567,16 +568,24 @@ fn client_activity_from_entries(
             entry["clientLabel"].as_str(),
         );
         let ts = entry["ts"].as_u64().unwrap_or(0);
-        let (summary, sessions) = groups.entry(name).or_insert_with(|| (json!({
+        let (summary, sessions, hosted) = groups.entry(name).or_insert_with(|| (json!({
             "client":entry["client"], "clientName":entry["clientName"], "clientLabel":entry["clientLabel"],
             "lastActiveMs":0, "callsToday": if since_ms.is_some() { json!(0) } else { Value::Null }
-        }), Default::default()));
+        }), Default::default(), Default::default()));
         summary["lastActiveMs"] = json!(summary["lastActiveMs"].as_u64().unwrap_or(0).max(ts));
         if call && since_ms.is_some_and(|since| ts >= since) {
             summary["callsToday"] = json!(summary["callsToday"].as_u64().unwrap_or(0) + 1);
         }
+        let via_t3 = entry["host"].as_str() == Some(crate::host_attribution::T3_CODE);
         if let Some(id) = entry["sessionId"].as_str() {
             sessions.insert(id.to_string());
+            if via_t3 {
+                hosted.insert(id.to_string());
+            }
+        }
+        if via_t3 {
+            // Rows grouped per client drop the host, so keep how much came through T3 Code.
+            summary["viaT3Code"] = json!(true);
         }
         if summary.get("firstCatalogSize").is_none() && entry["firstCatalogSize"].is_u64() {
             summary["firstCatalogSize"] = entry["firstCatalogSize"].clone();
@@ -584,8 +593,11 @@ fn client_activity_from_entries(
     }
     let mut rows: Vec<Value> = groups
         .into_values()
-        .map(|(mut row, sessions)| {
+        .map(|(mut row, sessions, hosted)| {
             row["sessionCount"] = json!(sessions.len());
+            if row["viaT3Code"] == json!(true) {
+                row["t3CodeSessions"] = json!(hosted.len());
+            }
             row
         })
         .collect();
@@ -1083,6 +1095,32 @@ fn csv_cell(value: Option<&Value>) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn client_activity_keeps_how_many_sessions_came_through_t3_code() {
+        let rows = client_activity_from_entries(
+            vec![
+                json!({"kind":"session","sessionId":"a","clientName":"Claude Code","host":"t3-code","ts":30}),
+                json!({"sessionId":"a","clientName":"Claude Code","host":"t3-code","ts":31,"ok":true}),
+                json!({"sessionId":"b","clientName":"Claude Code","host":"t3-code","ts":40,"ok":true}),
+                json!({"sessionId":"c","clientName":"Claude Code","ts":50,"ok":true}),
+                // Another host, or none, is not counted as T3 Code.
+                json!({"sessionId":"d","clientName":"Codex","host":"other","ts":20,"ok":true}),
+                json!({"clientName":"Cursor","host":"t3-code","ts":10,"ok":true}),
+            ],
+            64,
+            None,
+        );
+        let row = |name: &str| rows.iter().find(|row| row["clientName"] == name).unwrap();
+        assert_eq!(row("Claude Code")["sessionCount"], 3);
+        assert_eq!(row("Claude Code")["t3CodeSessions"], 2);
+        assert_eq!(row("Claude Code")["viaT3Code"], true);
+        assert!(row("Codex").get("t3CodeSessions").is_none());
+        assert!(row("Codex").get("viaT3Code").is_none());
+        // Hosted calls without a session still say they came through T3 Code.
+        assert_eq!(row("Cursor")["viaT3Code"], true);
+        assert_eq!(row("Cursor")["t3CodeSessions"], 0);
+    }
 
     #[test]
     fn client_activity_groups_sessions_and_counts_only_todays_tool_calls() {
