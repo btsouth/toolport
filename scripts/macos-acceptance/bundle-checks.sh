@@ -117,7 +117,11 @@ what="every Mach-O is $WANT_ARCH"
 # looked at the wrong thing.
 exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist" 2>/dev/null)"
 missing=""
-for need in "Contents/MacOS/${exe:-conduit}" "Contents/Helpers/ToolportGateway.app/Contents/MacOS/toolport-gateway"; do
+# Release signing nests the gateway in its own helper app; an unsigned build
+# from a ref keeps it next to the app executable.
+gateway_path="Contents/Helpers/ToolportGateway.app/Contents/MacOS/toolport-gateway"
+[[ "$SIGNED" == "1" ]] || gateway_path="Contents/MacOS/toolport-gateway"
+for need in "Contents/MacOS/${exe:-conduit}" "$gateway_path"; do
   cut -f1 "$machos" | grep -qxF "$need" || missing+="$need "
 done
 if (( count == 0 )); then

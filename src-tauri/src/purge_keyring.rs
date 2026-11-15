@@ -1,14 +1,31 @@
 //! Read-only credential inventory followed by explicit account-scoped removal.
+//!
+//! Every owned item is attempted independently: one item that cannot be removed
+//! never stops the others. Each item ends in exactly one list: `removed` (this
+//! run deleted it), `absent` (it was already gone when deletion ran, for example
+//! a legacy view of an item the data-protection pass had just deleted),
+//! `preserved` (not this install's) or `leftovers` (still present, with why).
 use crate::purge::Leftover;
 
 #[derive(Default)]
 pub(crate) struct Removal {
     pub removed: Vec<String>,
+    /// Owned items that no longer existed when deletion ran. Not a failure.
+    pub absent: Vec<String>,
     pub team_token_removed: bool,
     pub team_token_in_file: bool,
     pub preserved: Vec<String>,
     pub notes: Vec<String>,
     pub leftovers: Vec<Leftover>,
+}
+
+/// What one delete attempt established about the item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    /// This call deleted it.
+    Deleted,
+    /// It did not exist (any more); nothing is left behind.
+    Absent,
 }
 
 /// Accounts have no install id. Never infer ownership from the service alone.
@@ -31,16 +48,19 @@ impl Scope {
     }
 }
 
+/// Inventory every entry first (attributes only, no secret data), then delete
+/// each owned entry. An entry whose attributes cannot be read is reported as a
+/// leftover and skipped: its owner is unknown, so it is never deleted. It does
+/// not stop the readable owned entries from being removed.
 #[cfg(any(target_os = "linux", target_os = "windows", test))]
 fn remove_owned<T>(
     entries: impl IntoIterator<Item = T>,
     scope: &Scope,
     mut attributes: impl FnMut(&T) -> Result<(String, String), String>,
     mut path: impl FnMut(&T) -> String,
-    mut delete: impl FnMut(&T) -> Result<(), String>,
+    mut delete: impl FnMut(&T) -> Result<Outcome, String>,
 ) -> Removal {
     let mut report = Removal::default();
-    // Finish the read-only inventory before deleting even one credential.
     let inventory: Vec<_> = entries
         .into_iter()
         .map(|entry| {
@@ -48,32 +68,41 @@ fn remove_owned<T>(
             (entry, attrs)
         })
         .collect();
-    for (entry, attrs) in &inventory {
-        if let Err(error) = attrs {
-            report.leftovers.push(Leftover {
-                path: path(entry),
-                error: error.clone(),
-            });
-        }
-    }
-    if !report.leftovers.is_empty() {
-        return report;
-    }
     for (entry, attrs) in inventory {
-        let (service, account) = attrs.expect("inventory checked");
+        let path = path(&entry);
+        let (service, account) = match attrs {
+            Ok(attrs) => attrs,
+            Err(error) => {
+                report.leftovers.push(Leftover {
+                    path,
+                    error: format!("{error}; owner unknown, so it was not removed"),
+                });
+                continue;
+            }
+        };
         if service != super::SERVICE {
             continue;
         }
-        let path = path(&entry);
         if !scope.owns(&account) {
             report.preserved.push(account);
-        } else if let Err(error) = delete(&entry) {
-            report.leftovers.push(Leftover { path, error });
-        } else {
-            record_deleted(&account, path, &mut report);
+            continue;
         }
+        record_outcome(&account, path, delete(&entry), &mut report);
     }
     report
+}
+
+fn record_outcome(
+    account: &str,
+    path: String,
+    outcome: Result<Outcome, String>,
+    report: &mut Removal,
+) {
+    match outcome {
+        Ok(Outcome::Deleted) => record_deleted(account, path, report),
+        Ok(Outcome::Absent) => report.absent.push(path),
+        Err(error) => report.leftovers.push(Leftover { path, error }),
+    }
 }
 
 fn record_deleted(account: &str, path: String, report: &mut Removal) {
@@ -87,6 +116,116 @@ fn record_deleted(account: &str, path: String, report: &mut Removal) {
             .strip_prefix(&team)
             .is_some_and(|suffix| suffix.starts_with("::toolport-chunk::"));
     report.removed.push(path);
+}
+
+/// A delete call failed with `first_error`. Decide from a fresh lookup whether
+/// the item is really still there: `still_present` re-queries the store and
+/// returns whether the item exists now. Gone means it was already removed
+/// (another view of the same item, or a concurrent delete), which is `Absent`;
+/// still there keeps the original error. A failed lookup keeps both errors.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn confirm_after_failed_delete(
+    first_error: String,
+    still_present: impl FnOnce() -> Result<bool, String>,
+) -> Result<Outcome, String> {
+    match still_present() {
+        Ok(false) => Ok(Outcome::Absent),
+        Ok(true) => Err(first_error),
+        Err(lookup) => Err(format!(
+            "{first_error}; could not confirm whether it remains: {lookup}"
+        )),
+    }
+}
+
+/// Keychain statuses that say the item (or the keychain holding it) does not
+/// exist, rather than that deletion was refused. From Security/SecBase.h:
+/// errSecItemNotFound -25300, errSecInvalidItemRef -25304 ("The specified item
+/// is no longer valid. It may have been deleted from the keychain."), and
+/// errSecNoSuchKeychain -25294. They are only a hint: removal still re-queries
+/// the keychain before calling an item absent.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const KEYCHAIN_NOT_FOUND: [i32; 3] = [-25300, -25304, -25294];
+
+#[cfg(any(target_os = "macos", test))]
+fn keychain_status_says_missing(status: i32) -> bool {
+    KEYCHAIN_NOT_FOUND.contains(&status)
+}
+
+/// Classify one keychain delete status. 0 is deleted. A not-found status is
+/// confirmed with a fresh lookup; any other status is a real failure.
+#[cfg(any(target_os = "macos", test))]
+fn keychain_delete_outcome(
+    api: &str,
+    status: i32,
+    still_present: impl FnOnce() -> Result<bool, String>,
+) -> Result<Outcome, String> {
+    if status == 0 {
+        Ok(Outcome::Deleted)
+    } else if keychain_status_says_missing(status) {
+        confirm_after_failed_delete(format!("{api}: {status}"), still_present)
+    } else {
+        Err(format!("{api}: {status}"))
+    }
+}
+
+/// A legacy reference failed with a not-found `status`. `lookup` lists the
+/// same account in the legacy keychain afresh: nothing there means the item is
+/// already gone; anything there is a real item, deleted through its fresh
+/// reference. When a fresh reference also says not found, the account is
+/// listed once more: an item that is still there is a leftover, never absent.
+#[cfg(any(target_os = "macos", test))]
+fn legacy_recheck<R>(
+    status: i32,
+    mut lookup: impl FnMut() -> Result<Vec<(R, String)>, String>,
+    mut delete: impl FnMut(&R) -> i32,
+) -> Result<Outcome, String> {
+    let unconfirmed = |lookup: String| {
+        format!("SecKeychainItemDelete: {status}; could not confirm whether it remains: {lookup}")
+    };
+    let fresh = lookup().map_err(unconfirmed)?;
+    let mut deleted = false;
+    let mut missing_again = false;
+    let mut refused = Vec::new();
+    for (reference, _) in &fresh {
+        match delete(reference) {
+            0 => deleted = true,
+            again if keychain_status_says_missing(again) => missing_again = true,
+            again => refused.push(again),
+        }
+    }
+    if !refused.is_empty() {
+        return Err(format!(
+            "SecKeychainItemDelete: {status}; the item is still in the keychain and deleting it failed: {}",
+            refused.iter().map(i32::to_string).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if missing_again {
+        let remaining = lookup().map_err(unconfirmed)?;
+        if !remaining.is_empty() {
+            return Err(format!(
+                "SecKeychainItemDelete: {status}; the item is still in the keychain although deleting it reported it missing"
+            ));
+        }
+    }
+    Ok(if deleted {
+        Outcome::Deleted
+    } else {
+        Outcome::Absent
+    })
+}
+
+/// `CredDeleteW` fails with ERROR_NOT_FOUND (1168) when no credential has that
+/// target name. That is "already removed", not a failure.
+#[cfg(any(target_os = "windows", test))]
+fn credential_delete_outcome(succeeded: bool, last_error: u32) -> Result<Outcome, String> {
+    const ERROR_NOT_FOUND: u32 = 1168;
+    if succeeded {
+        Ok(Outcome::Deleted)
+    } else if last_error == ERROR_NOT_FOUND {
+        Ok(Outcome::Absent)
+    } else {
+        Err(format!("CredDeleteW: {last_error}"))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -172,12 +311,23 @@ pub(crate) fn remove(scope: &Scope) -> Result<Removal, String> {
         }
         Err(error) => return Err(error.to_string()),
     };
+    let query = std::collections::HashMap::from([("service", super::SERVICE)]);
     let entries = service
-        .search_items(std::collections::HashMap::from([(
-            "service",
-            super::SERVICE,
-        )]))
+        .search_items(query.clone())
         .map_err(|error| error.to_string())?;
+    // Providers disagree on the error for an item that vanished between the
+    // search and the delete (NoSuchObject, UnknownObject, UnknownMethod), so a
+    // failed delete is settled by searching again rather than by error name.
+    let still_listed = |path: &str| -> Result<bool, String> {
+        let now = service
+            .search_items(query.clone())
+            .map_err(|error| error.to_string())?;
+        Ok(now
+            .unlocked
+            .iter()
+            .chain(&now.locked)
+            .any(|item| &*item.path == path))
+    };
     let mut report = remove_owned(
         entries.unlocked.into_iter().chain(entries.locked),
         scope,
@@ -199,7 +349,12 @@ pub(crate) fn remove(scope: &Scope) -> Result<Removal, String> {
                 })
         },
         |item| format!("secret-service:{}", item.path),
-        |item| item.delete().map_err(|error| error.to_string()),
+        |item| match item.delete() {
+            Ok(()) => Ok(Outcome::Deleted),
+            Err(error) => confirm_after_failed_delete(error.to_string(), || {
+                still_listed(&item.path.to_string())
+            }),
+        },
     );
     report.team_token_in_file = team_token_in_file;
     Ok(report)
@@ -257,11 +412,13 @@ pub(crate) fn remove(scope: &Scope) -> Result<Removal, String> {
             })
         },
         |entry| {
-            if unsafe { CredDeleteW((**entry).TargetName, CRED_TYPE_GENERIC, 0) } != 0 {
-                Ok(())
+            let succeeded = unsafe { CredDeleteW((**entry).TargetName, CRED_TYPE_GENERIC, 0) } != 0;
+            let last_error = if succeeded {
+                0
             } else {
-                Err(format!("CredDeleteW: {}", unsafe { GetLastError() }))
-            }
+                unsafe { GetLastError() }
+            };
+            credential_delete_outcome(succeeded, last_error)
         },
     );
     unsafe { CredFree(entries.cast()) };
@@ -292,6 +449,52 @@ pub(crate) fn remove(scope: &Scope) -> Result<Removal, String> {
         let value = attributes.find(unsafe { kSecAttrAccount.cast::<std::ffi::c_void>() })?;
         Some(unsafe { CFString::wrap_under_get_rule((*value).cast()) }.to_string())
     }
+    /// Legacy (file keychain) items that match `account`, as fresh references.
+    /// An entitled app's legacy search can also return data-protection items,
+    /// so this is what decides whether a legacy view still has an item behind it.
+    fn legacy_refs(wanted: Option<&str>) -> Result<Vec<(CFType, String)>, String> {
+        let mut search = ItemSearchOptions::new();
+        search
+            .class(ItemClass::generic_password())
+            .service(super::SERVICE)
+            .limit(Limit::All)
+            .load_refs(true)
+            .load_attributes(true)
+            .load_data(false);
+        if let Some(wanted) = wanted {
+            search.account(wanted);
+        }
+        match search.search() {
+            Ok(entries) => {
+                let mut found = Vec::new();
+                for entry in entries {
+                    let SearchResult::Dict(attributes) = entry else {
+                        return Err("Keychain did not return item attributes".into());
+                    };
+                    let Some(name) = account(&attributes) else {
+                        return Err("Missing account attribute".into());
+                    };
+                    let Some(reference) =
+                        attributes.find(unsafe { kSecValueRef.cast::<std::ffi::c_void>() })
+                    else {
+                        return Err("Keychain did not return an item reference".into());
+                    };
+                    found.push((unsafe { k((*reference).cast()) }, name));
+                }
+                Ok(found)
+            }
+            Err(error) if error.code() == -25300 => Ok(Vec::new()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+    fn delete_ref(reference: &CFType) -> i32 {
+        unsafe {
+            security_framework_sys::keychain_item::SecKeychainItemDelete(
+                reference.as_CFTypeRef().cast_mut().cast(),
+            )
+        }
+    }
+
     let mut report = Removal::default();
     let mut legacy = Vec::new();
     // Legacy ACL-bearing entries require reference deletion. No secret data is read.
@@ -309,14 +512,15 @@ pub(crate) fn remove(scope: &Scope) -> Result<Removal, String> {
                 let SearchResult::Dict(attributes) = entry else {
                     report.leftovers.push(Leftover {
                         path: "keychain:conduit-mcp/legacy (unreadable item)".into(),
-                        error: "Keychain did not return item attributes".into(),
+                        error: "Keychain did not return item attributes; owner unknown, so it was not removed".into(),
                     });
                     continue;
                 };
                 let Some(account) = account(&attributes) else {
                     report.leftovers.push(Leftover {
                         path: "keychain:conduit-mcp/legacy".into(),
-                        error: "Missing account attribute".into(),
+                        error: "Missing account attribute; owner unknown, so it was not removed"
+                            .into(),
                     });
                     continue;
                 };
@@ -358,6 +562,14 @@ pub(crate) fn remove(scope: &Scope) -> Result<Removal, String> {
                 CFBoolean::true_value().as_CFType(),
             ),
         ];
+        let with_account = |account: &str| {
+            let mut query = base.clone();
+            query.push((
+                k(kSecAttrAccount.cast()),
+                CFString::new(account).as_CFType(),
+            ));
+            query
+        };
         let mut search = base.clone();
         search.extend([
             (
@@ -371,43 +583,42 @@ pub(crate) fn remove(scope: &Scope) -> Result<Removal, String> {
         let status = SecItemCopyMatching(query.as_concrete_TypeRef().cast(), &mut result);
         if status == 0 && !result.is_null() {
             let entries = CFArray::<CFDictionary>::wrap_under_create_rule(result.cast());
-            let accounts: Option<Vec<_>> = entries
-                .iter()
-                .map(|attributes| account(&attributes))
-                .collect();
-            if accounts.is_none() {
-                report.leftovers.push(Leftover {
-                    path: "keychain:conduit-mcp/data-protection".into(),
-                    error: "Missing account attribute; no credentials removed".into(),
-                });
-            }
-            let inventory_failed = !report.leftovers.is_empty();
-            for account in accounts.unwrap_or_default() {
+            for attributes in entries.iter() {
+                let Some(account) = account(&attributes) else {
+                    report.leftovers.push(Leftover {
+                        path: "keychain:conduit-mcp/data-protection".into(),
+                        error: "Missing account attribute; owner unknown, so it was not removed"
+                            .into(),
+                    });
+                    continue;
+                };
                 let path = format!("keychain:conduit-mcp/data-protection/{account}");
                 if !scope.owns(&account) {
                     report.preserved.push(account);
                     continue;
                 }
-                if inventory_failed {
-                    continue;
-                }
-                let mut delete = base.clone();
-                delete.push((
-                    k(kSecAttrAccount.cast()),
-                    CFString::new(&account).as_CFType(),
-                ));
-                let query = CFDictionary::from_CFType_pairs(&delete);
+                let query = CFDictionary::from_CFType_pairs(&with_account(&account));
                 let status = SecItemDelete(query.as_concrete_TypeRef().cast());
-                if status == 0 {
-                    record_deleted(&account, path, &mut report);
-                } else if status == -25300 {
-                    report.removed.push(path);
-                } else {
-                    report.leftovers.push(Leftover {
-                        path: format!("keychain:conduit-mcp/data-protection/{account}"),
-                        error: format!("SecItemDelete: {status}"),
-                    });
-                }
+                let outcome = keychain_delete_outcome("SecItemDelete", status, || {
+                    let mut lookup = with_account(&account);
+                    lookup.push((
+                        k(kSecReturnAttributes.cast()),
+                        CFBoolean::true_value().as_CFType(),
+                    ));
+                    let lookup = CFDictionary::from_CFType_pairs(&lookup);
+                    let mut found = std::ptr::null();
+                    match SecItemCopyMatching(lookup.as_concrete_TypeRef().cast(), &mut found) {
+                        0 => {
+                            if !found.is_null() {
+                                drop(CFType::wrap_under_create_rule(found));
+                            }
+                            Ok(true)
+                        }
+                        -25300 => Ok(false),
+                        status => Err(format!("SecItemCopyMatching: {status}")),
+                    }
+                });
+                record_outcome(&account, path, outcome, &mut report);
             }
         } else if status != -25300 {
             report.leftovers.push(Leftover {
@@ -416,28 +627,20 @@ pub(crate) fn remove(scope: &Scope) -> Result<Removal, String> {
             });
         }
     }
-    if report.leftovers.is_empty() {
-        for (reference, account, path) in legacy {
-            let status = unsafe {
-                security_framework_sys::keychain_item::SecKeychainItemDelete(
-                    reference.as_CFTypeRef().cast_mut().cast(),
-                )
-            };
-            if status == 0 {
-                record_deleted(&account, path, &mut report);
-            } else {
-                report.leftovers.push(Leftover {
-                    path,
-                    error: format!("SecKeychainItemDelete: {status}"),
-                });
-            }
-        }
-    } else {
-        report.preserved.extend(
-            legacy
-                .into_iter()
-                .map(|(_, _, path)| format!("{path} (retained after keychain cleanup failure)")),
-        );
+    // The legacy pass runs even when a data-protection item failed: each item is
+    // independent. A legacy reference can be a second view of a data-protection
+    // item deleted above (the v2.3.5 acceptance run saw errSecInvalidItemRef for
+    // exactly that), so a not-found status is settled by a fresh legacy lookup.
+    for (reference, account, path) in legacy {
+        let status = delete_ref(&reference);
+        let outcome = if status == 0 {
+            Ok(Outcome::Deleted)
+        } else if !keychain_status_says_missing(status) {
+            Err(format!("SecKeychainItemDelete: {status}"))
+        } else {
+            legacy_recheck(status, || legacy_refs(Some(&account)), delete_ref)
+        };
+        record_outcome(&account, path, outcome, &mut report);
     }
     Ok(report)
 }
@@ -449,7 +652,7 @@ pub(crate) fn remove_fixture_accounts(scope: &Scope, accounts: &[&str]) -> Remov
         scope,
         |account| Ok((super::SERVICE.into(), (*account).into())),
         |account| (*account).into(),
-        |_| Ok(()),
+        |_| Ok(Outcome::Deleted),
     )
 }
 
@@ -477,7 +680,7 @@ mod tests {
                 if item.1.ends_with("chunk") {
                     Err("locked".into())
                 } else {
-                    Ok(())
+                    Ok(Outcome::Deleted)
                 }
             },
         );
@@ -503,7 +706,7 @@ mod tests {
             &scope,
             |account| Ok(("conduit-mcp".into(), (*account).into())),
             |account| (*account).into(),
-            |_| Ok(()),
+            |_| Ok(Outcome::Deleted),
         );
         assert_eq!(report.removed, items[..2]);
         assert_eq!(report.preserved, items[2..]);
@@ -511,13 +714,14 @@ mod tests {
     }
 
     #[test]
-    fn purge_keyring_inventory_failure_never_deletes_an_earlier_item() {
+    fn purge_keyring_unreadable_item_is_kept_but_never_blocks_the_readable_ones() {
         let scope = Scope {
             all_installs: true,
             server_ids: Default::default(),
         };
+        let mut deleted = Vec::new();
         let report = remove_owned(
-            ["readable", "unreadable"],
+            ["readable", "unreadable", "later"],
             &scope,
             |account| {
                 if *account == "unreadable" {
@@ -527,10 +731,232 @@ mod tests {
                 }
             },
             |account| (*account).into(),
-            |_| panic!("inventory must finish before deletion"),
+            |account| {
+                assert_ne!(
+                    *account, "unreadable",
+                    "an item with no known owner is never deleted"
+                );
+                deleted.push(*account);
+                Ok(Outcome::Deleted)
+            },
         );
-        assert!(report.removed.is_empty());
+        assert_eq!(deleted, ["readable", "later"]);
+        assert_eq!(report.removed, ["readable", "later"]);
+        assert_eq!(report.leftovers.len(), 1);
         assert_eq!(report.leftovers[0].path, "unreadable");
+        assert!(report.leftovers[0].error.starts_with("denied"));
+    }
+
+    #[test]
+    fn purge_keyring_absent_items_are_reported_apart_from_removed_and_leftovers() {
+        let scope = Scope {
+            all_installs: true,
+            server_ids: Default::default(),
+        };
+        let report = remove_owned(
+            ["gone", "deleted", "locked", "after"],
+            &scope,
+            |account| Ok(("conduit-mcp".into(), (*account).into())),
+            |account| (*account).into(),
+            |account| match *account {
+                "gone" => Ok(Outcome::Absent),
+                "locked" => Err("locked".into()),
+                _ => Ok(Outcome::Deleted),
+            },
+        );
+        assert_eq!(report.removed, ["deleted", "after"]);
+        assert_eq!(report.absent, ["gone"]);
+        assert_eq!(report.leftovers.len(), 1);
+        assert_eq!(report.leftovers[0].path, "locked");
+    }
+
+    #[test]
+    fn purge_failed_delete_is_absent_only_when_a_fresh_lookup_agrees() {
+        assert_eq!(
+            confirm_after_failed_delete("NoSuchObject".into(), || Ok(false)),
+            Ok(Outcome::Absent)
+        );
+        assert_eq!(
+            confirm_after_failed_delete("locked".into(), || Ok(true)),
+            Err("locked".into())
+        );
+        let error =
+            confirm_after_failed_delete("locked".into(), || Err("bus gone".into())).unwrap_err();
+        assert!(
+            error.contains("locked") && error.contains("bus gone"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn purge_keychain_status_classification() {
+        // Deleted.
+        assert_eq!(
+            keychain_delete_outcome("SecItemDelete", 0, || panic!("no lookup on success")),
+            Ok(Outcome::Deleted)
+        );
+        // Every not-found status is confirmed, then reported absent.
+        for status in KEYCHAIN_NOT_FOUND {
+            assert_eq!(
+                keychain_delete_outcome("SecItemDelete", status, || Ok(false)),
+                Ok(Outcome::Absent),
+                "{status}"
+            );
+            assert_eq!(
+                keychain_delete_outcome("SecItemDelete", status, || Ok(true)),
+                Err(format!("SecItemDelete: {status}"))
+            );
+        }
+        // A refusal (errSecAuthFailed, errSecInteractionNotAllowed) is a real leftover.
+        for status in [-25293, -25308] {
+            assert_eq!(
+                keychain_delete_outcome("SecItemDelete", status, || panic!("no lookup")),
+                Err(format!("SecItemDelete: {status}"))
+            );
+        }
+    }
+
+    #[test]
+    fn purge_legacy_recheck_settles_a_stale_reference_only_on_evidence() {
+        type Listing = Result<Vec<(i32, String)>, String>;
+        let listed = || -> Listing { Ok(vec![(1, "mock::TOKEN".into())]) };
+        let empty = || -> Listing { Ok(Vec::new()) };
+        let locked = || -> Listing { Err("locked".into()) };
+        // (case, successive lookups, status of each fresh delete, expected)
+        type Case = (
+            &'static str,
+            Vec<Listing>,
+            i32,
+            Result<Outcome, &'static str>,
+        );
+        let cases: Vec<Case> = vec![
+            // v2.3.5: the legacy search returned the data-protection item, which
+            // the first pass deleted; its stale reference then failed with -25304.
+            (
+                "stale view, nothing listed",
+                vec![empty()],
+                0,
+                Ok(Outcome::Absent),
+            ),
+            // A real legacy item behind the stale view is deleted through a fresh ref.
+            (
+                "real item behind the view",
+                vec![listed()],
+                0,
+                Ok(Outcome::Deleted),
+            ),
+            // One that vanishes during the retry, and is no longer listed, is absent.
+            (
+                "vanished during retry",
+                vec![listed(), empty()],
+                -25300,
+                Ok(Outcome::Absent),
+            ),
+            // Listed, the retry says -25304 again, and it is still listed: a leftover.
+            (
+                "still listed after retry",
+                vec![listed(), listed()],
+                -25304,
+                Err("still in the keychain"),
+            ),
+            (
+                "still listed after -25300",
+                vec![listed(), listed()],
+                -25300,
+                Err("still in the keychain"),
+            ),
+            // The second look itself fails: unknown, not absent.
+            (
+                "second look fails",
+                vec![listed(), locked()],
+                -25304,
+                Err("could not confirm"),
+            ),
+            ("refused", vec![listed()], -25293, Err("-25293")),
+            (
+                "first look fails",
+                vec![locked()],
+                0,
+                Err("could not confirm"),
+            ),
+        ];
+        for (case, lookups, retry, expected) in cases {
+            let mut lookups = lookups.into_iter();
+            let outcome = legacy_recheck(
+                -25304,
+                || {
+                    lookups
+                        .next()
+                        .unwrap_or_else(|| panic!("{case}: looked too often"))
+                },
+                |_| retry,
+            );
+            match (outcome, expected) {
+                (Ok(got), Ok(want)) => assert_eq!(got, want, "{case}"),
+                (Err(error), Err(want)) => assert!(error.contains(want), "{case}: {error}"),
+                (got, want) => panic!("{case}: got {got:?}, expected {want:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn purge_credential_manager_not_found_is_absent() {
+        assert_eq!(credential_delete_outcome(true, 0), Ok(Outcome::Deleted));
+        assert_eq!(credential_delete_outcome(false, 1168), Ok(Outcome::Absent));
+        assert_eq!(
+            credential_delete_outcome(false, 5),
+            Err("CredDeleteW: 5".into())
+        );
+    }
+
+    /// The numeric codes match the platform's own definitions, checked on the
+    /// macOS CI runner against Security.framework's messages.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn purge_macos_not_found_codes_are_the_security_framework_ones() {
+        assert_eq!(
+            KEYCHAIN_NOT_FOUND[0],
+            security_framework_sys::base::errSecItemNotFound
+        );
+        for status in KEYCHAIN_NOT_FOUND {
+            let message = security_framework::base::Error::from_code(status)
+                .message()
+                .unwrap_or_default()
+                .to_lowercase();
+            assert!(
+                message.contains("could not be found")
+                    || message.contains("no longer valid")
+                    || message.contains("does not exist"),
+                "{status}: {message}"
+            );
+        }
+    }
+
+    /// Deleting a credential that does not exist really reports ERROR_NOT_FOUND,
+    /// which removal treats as already removed.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn purge_windows_missing_credential_is_absent() {
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_NOT_FOUND};
+        use windows_sys::Win32::Security::Credentials::{CredDeleteW, CRED_TYPE_GENERIC};
+        assert_eq!(ERROR_NOT_FOUND, 1168);
+        let target: Vec<u16> = format!(
+            "toolport-purge-test-{}-{}.conduit-mcp-missing",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+        .encode_utf16()
+        .chain([0])
+        .collect();
+        let succeeded = unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) } != 0;
+        let error = unsafe { GetLastError() };
+        assert_eq!(
+            credential_delete_outcome(succeeded, error),
+            Ok(Outcome::Absent)
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -558,7 +984,7 @@ mod tests {
             &scope,
             |account| Ok(("conduit-mcp".into(), (*account).into())),
             |account| (*account).into(),
-            |_| Ok(()),
+            |_| Ok(Outcome::Deleted),
         );
         assert_eq!(report.removed, items);
         assert!(report.preserved.is_empty() && report.leftovers.is_empty());
@@ -582,7 +1008,7 @@ mod tests {
                     if *account == team && !delete_team {
                         Err("locked".into())
                     } else {
-                        Ok(())
+                        Ok(Outcome::Deleted)
                     }
                 },
             );
@@ -629,7 +1055,7 @@ mod tests {
             &scope,
             |account| Ok(("conduit-mcp".into(), (*account).into())),
             |account| (*account).into(),
-            |_| Ok(()),
+            |_| Ok(Outcome::Deleted),
         );
         assert_eq!(report.removed, items[..2]);
         assert_eq!(report.preserved, items[2..]);

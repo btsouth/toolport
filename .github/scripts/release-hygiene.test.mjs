@@ -401,17 +401,26 @@ test("PR package fixtures exercise the pacman archive checker", () => {
   }
 });
 
-test("Homebrew zap removes bundle storage but retains client recovery data", () => {
+test("Homebrew zap trashes bundle storage and only removes emptied data folders", () => {
   const cask = readFileSync("packaging/homebrew/toolport.rb", "utf8");
-  const zap = cask.slice(cask.indexOf("  zap trash:"));
+  const zap = cask.slice(cask.indexOf("  zap trash:"), cask.indexOf("  caveats"));
+  const trash = zap.slice(0, zap.indexOf("rmdir:"));
   for (const resource of [
+    "Application Support/com.tsout.conduit",
     "Caches/com.tsout.conduit",
     "HTTPStorages/com.tsout.conduit",
     "Preferences/com.tsout.conduit.plist",
     "Saved Application State/com.tsout.conduit.savedState",
     "WebKit/com.tsout.conduit",
   ]) {
-    assert.ok(zap.includes(resource));
+    assert.ok(trash.includes(resource));
   }
-  assert.doesNotMatch(zap, /Application Support|registry|conduit-mcp/);
+  assert.doesNotMatch(
+    trash,
+    /Application Support\/(Toolport|Conduit)|registry|conduit-mcp/,
+  );
+  assert.match(
+    zap,
+    /rmdir: \[\s*"~\/Library\/Application Support\/Conduit",\s*"~\/Library\/Application Support\/Toolport",/,
+  );
 });

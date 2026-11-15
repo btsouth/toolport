@@ -90,6 +90,14 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+      # Real Homebrew against packaging/homebrew/toolport.rb with a stub app:
+      # reinstall and upgrade must not touch clients, uninstall and zap must.
+      # Runs on the newest Homebrew each build, since the cask tells an upgrade
+      # from an uninstall by Homebrew's own call stack and command line.
+      - name: Homebrew cask lifecycle (reinstall, upgrade, uninstall, zap)
+        run: |
+          brew update --quiet
+          bash scripts/test-homebrew-cask-lifecycle.sh
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
@@ -106,10 +114,23 @@ jobs:
         run: npx tauri build --config src-tauri/tauri.bundle.conf.json --config '{"bundle":{"createUpdaterArtifacts":false}}' --bundles app -- --bin conduit
       - name: Check every app bundle file
         run: node .github/scripts/package-contents.mjs src-tauri/target/release/bundle/macos/*.app
+      # The release dmg builder, unsigned: Toolport.app beside an Applications
+      # shortcut over the drag-to-install background.
+      - name: Build the drag-to-install dmg
+        run: |
+          bash scripts/macos-build-dmg.sh src-tauri/target/release/bundle/macos/Toolport.app "$RUNNER_TEMP/Toolport.dmg"
+          mount="$(mktemp -d)"
+          hdiutil attach -readonly -nobrowse -noautoopen -mountpoint "$mount" "$RUNNER_TEMP/Toolport.dmg"
+          ls -la "$mount"
+          test -f "$mount/.background/background.tiff"
+          test -f "$mount/.DS_Store" || echo "::warning::Finder layout was not written; the dmg still has its Applications shortcut"
+          hdiutil detach "$mount"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-payload
-          path: src-tauri/target/release/bundle/macos/*.app
+          path: |
+            src-tauri/target/release/bundle/macos/*.app
+            ${{ runner.temp }}/Toolport.dmg
           if-no-files-found: error
           retention-days: 7
 
@@ -588,6 +609,14 @@ jobs:
       - name: Headless gateway security smoke (macOS)
         if: matrix.os == 'macos-latest' && matrix.group == 'integration'
         run: node scripts/smoke-headless.mjs
+
+      # Report only: what starting the daemon on demand costs the first call.
+      - name: First tool call with and without a running daemon (macOS, debug build)
+        if: matrix.os == 'macos-latest' && matrix.group == 'integration'
+        continue-on-error: true
+        env:
+          TOOLPORT_BENCH_PROFILE: debug
+        run: node benchmark/cold-start.mjs 20
 
       - name: Headless gateway security smoke (Windows)
         if: matrix.os == 'windows-latest' && matrix.group == 'integration'

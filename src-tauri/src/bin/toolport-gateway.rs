@@ -20444,8 +20444,25 @@ fn spawn_daemon_idle_watchdog(
     grace: Duration,
 ) {
     let poll = Duration::from_millis(200).min(grace);
+    // The app was deleted, moved to the Trash, or replaced by a package upgrade.
+    // Keep serving any connected client, but exit the moment none is, instead of
+    // lingering for the idle grace on a binary that is no longer installed. The
+    // watch only decides "gone" after the mismatch has held for several spaced
+    // looks, and never on a path it cannot read.
+    let mut executable = conduit_lib::daemon::BinaryWatch::current();
+    let mut binary_gone = false;
     std::thread::spawn(move || loop {
         std::thread::sleep(poll);
+        if !binary_gone && executable.poll(std::time::Instant::now()) {
+            binary_gone = true;
+            glog(&format!(
+                "daemon: executable {} was removed or replaced; exiting once no client is connected",
+                executable
+                    .path()
+                    .map_or_else(|| "<unknown>".into(), |path| path.display().to_string())
+            ));
+            host.shutdown_if_idle.store(true, Ordering::Release);
+        }
         if inflight.load(Ordering::Relaxed) > 0 {
             continue;
         }
@@ -20484,7 +20501,29 @@ fn spawn_daemon_idle_watchdog(
             let _ = conduit_lib::daemon::write_descriptor(&descriptor_path, &descriptor);
             continue;
         }
-        glog(if update_requested {
+        // Dragged to the Trash with Launch at login on: the LaunchAgent would
+        // start a missing app at every login. Done here, after the last client,
+        // because unloading the agent may end processes launchd started from it.
+        #[cfg(target_os = "macos")]
+        if binary_gone {
+            if let Some(path) = executable.path() {
+                let report = conduit_lib::purge::remove_stale_launch_agents(path);
+                for removed in &report.removed {
+                    glog(&format!(
+                        "daemon: removed launch at login {removed}: its app is gone"
+                    ));
+                }
+                for left in &report.leftovers {
+                    glog(&format!(
+                        "daemon: could not remove launch at login {}: {}",
+                        left.path, left.error
+                    ));
+                }
+            }
+        }
+        glog(if binary_gone {
+            "daemon_exit reason=binary_removed prior=healthy"
+        } else if update_requested {
             "daemon_exit reason=update_idle prior=healthy"
         } else {
             "daemon_exit reason=idle_timeout prior=healthy"
@@ -21818,6 +21857,9 @@ enum ArgAction {
     },
     DisconnectAll {
         dry_run: bool,
+        /// Also remove Toolport's own launch-at-login entry: the app is going
+        /// away (an uninstaller runs this), so the entry would point at nothing.
+        uninstall: bool,
     },
     /// Fall through to normal gateway startup.
     Run,
@@ -21877,14 +21919,17 @@ fn parse_args(args: &[String]) -> ArgAction {
         };
     }
     if args.iter().any(|arg| arg == "--disconnect-all") {
-        if let Some(arg) = args
-            .iter()
-            .find(|arg| !matches!(arg.as_str(), "--disconnect-all" | "--dry-run"))
-        {
+        if let Some(arg) = args.iter().find(|arg| {
+            !matches!(
+                arg.as_str(),
+                "--disconnect-all" | "--dry-run" | "--uninstall"
+            )
+        }) {
             return ArgAction::Unknown(arg.clone());
         }
         return ArgAction::DisconnectAll {
             dry_run: args.iter().any(|arg| arg == "--dry-run"),
+            uninstall: args.iter().any(|arg| arg == "--uninstall"),
         };
     }
     // Checked before the unknown-flag scan, and never added to KNOWN_FLAGS: falling
@@ -21959,7 +22004,8 @@ fn usage() -> String {
          \x20                        unresponsive (internal)\n\
          \x20   --installer-preflight <absolute-install-dir> Defer installation while client gateways are open\n\
          \x20   --remove-data [--dry-run | --confirm] Remove this install's data; --all-installs also clears shared credentials\n\
-         \x20   --disconnect-all [--dry-run] Restore all client configs and exit; JSON per-client results\n\
+         \x20   --disconnect-all [--dry-run] [--uninstall] Restore all client configs and exit; JSON per-client results.\n\
+         \x20                                --uninstall also removes Toolport's launch-at-login entry (uninstallers)\n\
          \x20   --setup-review       Private setup verification with a 30-second catalog wait\n\
          \x20   --selftest-secrets    Diagnostic: read every vaulted secret and report\n\
          \x20   --toolport-hook EVENT Deprecated no-op accepted so hook entries an\n\
@@ -22111,10 +22157,35 @@ fn main() {
                 }
             }
         }
-        ArgAction::DisconnectAll { dry_run } => {
+        ArgAction::DisconnectAll { dry_run, uninstall } => {
             if conduit_lib::registry::conduit_dir().is_none_or(|dir| !dir.exists()) {
                 eprintln!("No Toolport data dir found. Run --disconnect-all as the desktop user; root reads root's data dir.");
             }
+            // Independent of client restoration: a client that could not be
+            // restored must not leave a login item pointing at a removed app.
+            let startup_failed = uninstall
+                && !dry_run
+                && match conduit_lib::purge::remove_startup_entries() {
+                    Ok(report) => {
+                        for removed in &report.removed {
+                            eprintln!("Removed launch at login: {removed}");
+                        }
+                        for preserved in &report.preserved {
+                            eprintln!("Kept: {preserved}");
+                        }
+                        for left in &report.leftovers {
+                            eprintln!(
+                                "Could not remove launch at login {}: {}",
+                                left.path, left.error
+                            );
+                        }
+                        !report.leftovers.is_empty()
+                    }
+                    Err(error) => {
+                        eprintln!("Could not remove launch at login: {error}");
+                        true
+                    }
+                };
             match conduit_lib::clients::disconnect_all(dry_run) {
                 Ok(results) => {
                     println!(
@@ -22122,7 +22193,7 @@ fn main() {
                         serde_json::to_string(&results).expect("serializable disconnect results")
                     );
                     conduit_lib::telemetry::exit_with(
-                        if results.iter().any(|result| result.error.is_some()) {
+                        if startup_failed || results.iter().any(|result| result.error.is_some()) {
                             1
                         } else {
                             0
@@ -22970,11 +23041,24 @@ mod tests {
     fn disconnect_all_is_a_standalone_role_and_dry_run_cannot_start_gateway() {
         assert_eq!(
             parse_args(&["--disconnect-all".into()]),
-            ArgAction::DisconnectAll { dry_run: false }
+            ArgAction::DisconnectAll {
+                dry_run: false,
+                uninstall: false
+            }
+        );
+        assert_eq!(
+            parse_args(&["--disconnect-all".into(), "--uninstall".into()]),
+            ArgAction::DisconnectAll {
+                dry_run: false,
+                uninstall: true
+            }
         );
         assert_eq!(
             parse_args(&["--disconnect-all".into(), "--dry-run".into()]),
-            ArgAction::DisconnectAll { dry_run: true }
+            ArgAction::DisconnectAll {
+                dry_run: true,
+                uninstall: false
+            }
         );
         assert!(matches!(
             parse_args(&["--dry-run".into()]),

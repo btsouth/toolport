@@ -100,6 +100,7 @@ fn container(format: Format) -> Container {
     let json = |key| Container::Json { key, nested: None };
     match format {
         Format::JsonMcpServers
+        | Format::JsonCursorMcpServers
         | Format::JsonCopilotMcpServers
         | Format::JsonDroidMcpServers
         | Format::JsonQwenMcpServers
@@ -128,11 +129,51 @@ fn container(format: Format) -> Container {
     }
 }
 
+/// [`container`] for one file's contents: an OpenCode config that already uses the
+/// 2.x `mcp.servers` map keeps its servers one level down.
+fn container_in(format: Format, root: &serde_json::Value) -> Container {
+    if matches!(format, Format::JsonOpenCodeMcp)
+        && root["mcp"]
+            .as_object()
+            .is_some_and(opencode_uses_server_map)
+    {
+        return Container::Json {
+            key: "mcp",
+            nested: Some("servers"),
+        };
+    }
+    container(format)
+}
+
+/// [`container_in`] for the file at `path`, as the current mutation sees it.
+fn container_at(format: Format, path: &Path) -> Result<Container, String> {
+    if !matches!(format, Format::JsonOpenCodeMcp) || !mutation::exists(path) {
+        return Ok(container(format));
+    }
+    let text = read_config_file(path)?;
+    if text.trim().is_empty() {
+        return Ok(container(format));
+    }
+    Ok(container_in(format, &read_existing_json(&text, true)?))
+}
+
 pub(super) fn server_container(format: Format, root: &serde_json::Value) -> serde_json::Value {
     if matches!(format, Format::JsonOpenHandsMcpServers) {
         return openhands::server_map(root)
             .map(serde_json::Value::Object)
             .unwrap_or(serde_json::Value::Null);
+    }
+    // Every OpenCode server, 2.x map and 1.x entries alike, by name.
+    if matches!(format, Format::JsonOpenCodeMcp) {
+        return match root["mcp"].as_object() {
+            Some(mcp) => serde_json::Value::Object(
+                opencode_server_definitions(mcp)
+                    .into_iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+            ),
+            None => root["mcp"].clone(),
+        };
     }
     match container(format) {
         Container::Json { key, nested } => {
@@ -599,7 +640,7 @@ pub(super) fn remove_selected(format: Format, path: &Path, names: &[String]) -> 
     if matches!(format, Format::JsonOpenHandsMcpServers) {
         return openhands::remove_selected(path, names);
     }
-    match container(format) {
+    match container_at(format, path)? {
         Container::Json { key, nested } => {
             let original = read_config_file(path)?;
             let mut root = read_existing_json(&original, true)?;
@@ -612,6 +653,16 @@ pub(super) fn remove_selected(format: Format, path: &Path, names: &[String]) -> 
                 .ok_or("Could not read the reviewed server list")?;
             for name in names {
                 servers.remove(name);
+            }
+            // OpenCode 2.x still loads 1.x entries beside its `mcp.servers` map.
+            if nested.is_some() && matches!(format, Format::JsonOpenCodeMcp) {
+                if let Some(mcp) = root.get_mut(key).and_then(|v| v.as_object_mut()) {
+                    for name in names {
+                        if !opencode_container_key(mcp, name) {
+                            mcp.remove(name);
+                        }
+                    }
+                }
             }
             atomic_write_json_config(path, Some(&original), &root, key)
         }
@@ -685,7 +736,7 @@ pub(super) fn backfill_identity(
     } else {
         vec![crate::brand::ATTRIBUTION_ID]
     };
-    match container(format) {
+    match container_at(format, path)? {
         Container::Json {
             key: container_key,
             nested,
@@ -910,8 +961,13 @@ pub(super) fn restore(
         return Ok(None);
     }
     let backup = || backup_file(client_id, path);
-    let (names, backup) =
-        insert_missing(client_id, container(format), path, &record.entries, backup)?;
+    let (names, backup) = insert_missing(
+        client_id,
+        container_at(format, path)?,
+        path,
+        &record.entries,
+        backup,
+    )?;
     Ok(Some(Restored { names, backup }))
 }
 
@@ -961,11 +1017,16 @@ fn extract(format: Format, text: &str) -> Result<Vec<Moved>, String> {
             if matches!(format, Format::JsonOpenHandsMcpServers) {
                 root = serde_json::json!({"mcpServers": openhands::server_map(&root)?});
             }
-            let mut servers = root.get(key);
+            let mut servers = root.get(key).cloned();
             if let Some(nested) = nested {
-                servers = servers.and_then(|value| value.get(nested));
+                servers = servers.and_then(|value| value.get(nested).cloned());
+            }
+            // OpenCode: the 2.x map and 1.x entries, never `servers`/`timeout` themselves.
+            if matches!(format, Format::JsonOpenCodeMcp) {
+                servers = Some(server_container(format, &root));
             }
             for (name, definition) in servers
+                .as_ref()
                 .and_then(|value| value.as_object())
                 .into_iter()
                 .flatten()

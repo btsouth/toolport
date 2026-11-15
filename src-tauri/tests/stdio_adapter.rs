@@ -200,6 +200,18 @@ fn kill_daemon(dir: &std::path::Path) {
         };
         if let Some(pid) = value["pid"].as_u64() {
             let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+            // Until it is gone its listener can still accept a connection.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline
+                && Command::new("kill")
+                    .arg("-0")
+                    .arg(pid.to_string())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
     }
 }
@@ -294,26 +306,29 @@ fn the_adapter_recovers_after_the_daemon_dies() {
     // Kill the daemon out from under the adapter.
     kill_daemon(&harness.dir);
 
-    // The call that hits the dead daemon fails with an error, and is not replayed.
+    // Nothing reached the dead daemon (its port refuses the connection), so the
+    // call re-rendezvouses, replays the handshake and is sent to the new daemon.
+    // A call the daemon dies during is never replayed; see
+    // one_gateway_conformance's installer mid-call case.
     harness.send(serde_json::json!({
         "jsonrpc": "2.0",
         "id": 3,
         "method": "tools/list"
     }));
-    let failed = loop {
+    let resent = loop {
         let message = harness.next_response();
         if message["id"] == 3 {
             break message;
         }
     };
     assert!(
-        failed.get("error").is_some(),
-        "the call against a dead daemon should have failed: {failed}\n{}",
+        resent["result"]["tools"].is_array(),
+        "the call after the daemon died was not sent to a new one: {resent}\n{}",
         harness.diagnostics()
     );
 
-    // The next request re-rendezvouses, replays the handshake, and succeeds. The
-    // replayed initialize answer is not forwarded, so only id 4 is expected back.
+    // Later requests use the recovered session. The replayed initialize answer
+    // is not forwarded, so only id 4 is expected back.
     harness.send(serde_json::json!({
         "jsonrpc": "2.0",
         "id": 4,
@@ -508,4 +523,59 @@ fn a_modern_client_keeps_its_daemon_alive_while_idle() {
         first_daemon,
         "the daemon idled out under a connected client"
     );
+}
+
+fn pid_alive(pid: u64) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Quitting the app (or removing Toolport from every client) asks the daemon to
+/// stop. A client that is connected right now keeps its daemon; the daemon goes
+/// as soon as that client does, without waiting out the idle grace.
+#[test]
+fn a_stop_request_spares_a_connected_client_and_leaves_with_it() {
+    let mut harness = Harness::start_with_env(&[("TOOLPORT_DAEMON_IDLE_GRACE_MS", "600000")]);
+    harness.send(modern_request(1, "server/discover", serde_json::json!({})));
+    assert!(
+        harness.response_to(1).get("result").is_some(),
+        "the first request failed\n{}",
+        harness.diagnostics()
+    );
+    let pid = daemon_pid(&harness.dir).expect("a daemon descriptor");
+    let outcomes = conduit_lib::daemon::stop_when_idle(&harness.dir, Duration::from_secs(3));
+    assert_eq!(
+        outcomes,
+        vec![conduit_lib::daemon::IdleStop::Serving(pid as u32)],
+        "{}",
+        harness.diagnostics()
+    );
+    // Well past several watchdog polls, the same daemon still answers.
+    std::thread::sleep(Duration::from_secs(3));
+    harness.send(modern_request(2, "server/discover", serde_json::json!({})));
+    assert!(
+        harness.response_to(2).get("result").is_some(),
+        "a call after the stop request failed\n{}",
+        harness.diagnostics()
+    );
+    assert_eq!(
+        daemon_pid(&harness.dir),
+        Some(pid),
+        "the daemon was replaced"
+    );
+    // The client disconnects: the adapter exits and closes its lifetime stream.
+    let _ = harness.child.kill();
+    let _ = harness.child.wait();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while pid_alive(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon outlived its last client\n{}",
+            harness.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }

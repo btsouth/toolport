@@ -112,12 +112,17 @@ if [[ -d "$MNT/Toolport.app" ]]; then
 else
   fail "$ASSET contains Toolport.app" "volume has: $(ls "$MNT" | tr '\n' ' ')"
 fi
-# A plain hdiutil volume has no Applications shortcut; the README tells users
-# to drag the app to Applications, so record whether the dmg offers one.
-if [[ -L "$MNT/Applications" ]]; then
-  info "note: $ASSET Applications shortcut" "present"
+# The README tells users to drag the app to Applications: the dmg must offer
+# the drag target (scripts/macos-build-dmg.sh).
+if [[ "$(readlink "$MNT/Applications")" == /Applications ]]; then
+  pass "$ASSET has an Applications shortcut"
 else
-  info "note: $ASSET Applications shortcut" "absent: the dmg window shows only Toolport.app, with no drag target"
+  fail "$ASSET has an Applications shortcut" "absent: the dmg window shows only Toolport.app, with no drag target"
+fi
+if [[ -f "$MNT/.background/background.tiff" ]]; then
+  pass "$ASSET has its drag-to-install background"
+else
+  fail "$ASSET has its drag-to-install background" "no .background/background.tiff"
 fi
 
 if [[ $INSTALL -eq 1 ]]; then

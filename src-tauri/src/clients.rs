@@ -36,10 +36,17 @@ pub use locations::measure_scan as measure_client_location_scan;
 pub use locations::{
     add_client_location, client_location_types, remove_client_location, ClientLocationType,
 };
+#[cfg(test)]
+mod gateway_path_tests;
 mod moved;
 mod mutation;
+#[cfg(test)]
+mod paths_tests;
+mod relocate;
 mod restore;
 mod toml_preservation;
+#[cfg(test)]
+mod typed_entries_tests;
 pub(crate) use restore::after_capture_conflict as record_config_capture_conflict;
 pub(crate) use restore::after_rollback as record_config_rollback;
 pub(crate) mod nanobot;
@@ -134,8 +141,11 @@ fn serialize_config_error<S: serde::Serializer>(
 /// How a given client stores its server list.
 #[derive(Clone, Copy, Serialize, serde::Deserialize)]
 enum Format {
-    /// JSON with a top-level `mcpServers` object (Claude Desktop, Cursor, Windsurf).
+    /// JSON with a top-level `mcpServers` object (Claude Desktop, Windsurf, ...).
     JsonMcpServers,
+    /// Cursor's `mcpServers` object. Standard shape, but Cursor documents `type` as a
+    /// required field, so stdio entries carry `"type": "stdio"`.
+    JsonCursorMcpServers,
     /// GitHub Copilot CLI's `mcpServers` object. Entries use the standard JSON
     /// shape but require a `tools` allowlist; Toolport enables every gateway tool.
     JsonCopilotMcpServers,
@@ -161,7 +171,8 @@ enum Format {
     JsonAuggieMcpServers,
     /// ZCode CLI and desktop share the user config's nested `mcp.servers` map.
     JsonZCodeMcp,
-    /// JSON with a top-level `servers` object (VS Code).
+    /// JSON with a top-level `servers` object (VS Code). VS Code requires `type` on
+    /// every entry, `"stdio"` for a local command.
     JsonServers,
     /// JSON with a top-level `mcp` object (Crush).
     JsonMcp,
@@ -671,11 +682,10 @@ fn resolve_client_config_path(
         "omp" => home.join(".omp").join("agent").join("mcp.json"),
         "vscode" => config.join("Code").join("User").join("mcp.json"),
         "amp" => home.join(".config").join("amp").join("settings.json"),
-        "windsurf" => home
-            .join(".codeium")
-            .join("windsurf")
-            .join("mcp_config.json"),
-        "devin-cli" => match platform {
+        // Devin Desktop (formerly Windsurf) and the Devin CLI read one shared file.
+        // `~/.codeium/windsurf/mcp_config.json` only feeds Cascade's optional
+        // discovery now; see `resolve_legacy_config_paths`.
+        "windsurf" | "devin-cli" => match platform {
             Platform::Windows => config.join("devin").join("mcp_config.json"),
             Platform::MacOs | Platform::Linux => {
                 home.join(".config").join("devin").join("mcp_config.json")
@@ -691,11 +701,10 @@ fn resolve_client_config_path(
         "qwen-code" => home.join(".qwen").join("settings.json"),
         "junie" => home.join(".junie").join("mcp").join("mcp.json"),
         "antigravity" => home.join(".gemini").join("config").join("mcp_config.json"),
-        "cline" => config
-            .join("Code")
-            .join("User")
-            .join("globalStorage")
-            .join("saoudrizwan.claude-dev")
+        // Cline 4.1 (extension and CLI); see `resolve_cline_path` for the old file.
+        "cline" => home
+            .join(".cline")
+            .join("data")
             .join("settings")
             .join("cline_mcp_settings.json"),
         "roo-code" => config
@@ -725,6 +734,7 @@ fn resolve_client_config_path(
         "nanobot" => home.join(".nanobot").join("config.json"),
         "command-code" => home.join(".commandcode").join("mcp.json"),
         "tabnine" => home.join(".tabnine").join("mcp_servers.json"),
+        "tabnine-cli" => home.join(".tabnine").join("agent").join("settings.json"),
         "lm-studio" => home.join(".lmstudio").join("mcp.json"),
         "jan" => data.join("Jan").join("data").join("mcp_config.json"),
         "zed" => match platform {
@@ -740,13 +750,11 @@ fn resolve_client_config_path(
                 .join("goose")
                 .join("config")
                 .join("config.yaml"),
-            Platform::MacOs => home
-                .join("Library")
-                .join("Application Support")
-                .join("Block")
-                .join("goose")
-                .join("config.yaml"),
-            Platform::Linux => home.join(".config").join("goose").join("config.yaml"),
+            // Goose uses etcetera's XDG strategy on macOS too, so it never reads
+            // `~/Library/Application Support/Block/goose` (older Toolport wrote there).
+            Platform::MacOs | Platform::Linux => {
+                home.join(".config").join("goose").join("config.yaml")
+            }
         },
         "anythingllm" => match platform {
             Platform::Windows => config
@@ -768,7 +776,15 @@ fn resolve_client_config_path(
                 .join("plugins")
                 .join("anythingllm_mcp_servers.json"),
         },
-        "hermes" => home.join(".hermes").join("config.yaml"),
+        // The Windows build always reads %LOCALAPPDATA%\hermes; see `resolve_hermes_path`.
+        "hermes" => match platform {
+            Platform::Windows => home
+                .join("AppData")
+                .join("Local")
+                .join("hermes")
+                .join("config.yaml"),
+            Platform::MacOs | Platform::Linux => home.join(".hermes").join("config.yaml"),
+        },
         "witsy" => config.join("Witsy").join("settings.json"),
         _ => return None,
     };
@@ -1298,7 +1314,49 @@ fn client_config_path_with_home(client_id: &str, home: Option<PathBuf>) -> Optio
         resolve_client_config_path_linux(client_id, &home)
     }
     #[cfg(not(all(unix, not(target_os = "macos"))))]
-    resolve_client_config_path(client_id, &home, Platform::current())
+    resolve_client_config_path_env(client_id, &home, Platform::current(), &client_path_env)
+}
+
+/// `XDG_CONFIG_HOME` when it is an absolute path, else `~/.config`. This is the
+/// rule both `dirs` (Linux) and etcetera's XDG strategy (Goose, on every Unix) use;
+/// a relative value is ignored by them, so it is ignored here too.
+fn xdg_config_home(home: &Path, env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> PathBuf {
+    absolute_env_dir(env("XDG_CONFIG_HOME")).unwrap_or_else(|| home.join(".config"))
+}
+
+fn xdg_data_home(home: &Path, env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> PathBuf {
+    absolute_env_dir(env("XDG_DATA_HOME")).unwrap_or_else(|| home.join(".local").join("share"))
+}
+
+/// [`resolve_client_config_path`] with the location env vars a client reads applied,
+/// for one platform. macOS and Windows production use it with the real environment;
+/// the cross-platform tests drive it with a fixture environment. Linux production
+/// takes the same answers through `dirs` in [`resolve_client_config_path_linux`].
+#[cfg_attr(all(unix, not(target_os = "macos"), not(test)), allow(dead_code))]
+fn resolve_client_config_path_env(
+    client_id: &str,
+    home: &Path,
+    platform: Platform,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let path = match (client_id, platform) {
+        (_, Platform::Linux) => {
+            return resolve_client_config_path_linux_in(
+                client_id,
+                home,
+                &xdg_config_home(home, env),
+                &xdg_data_home(home, env),
+            )
+        }
+        // Goose (etcetera's XDG strategy) and the Devin apps follow XDG_CONFIG_HOME
+        // on macOS as well as Linux.
+        ("goose", Platform::MacOs) => xdg_config_home(home, env).join("goose").join("config.yaml"),
+        ("windsurf" | "devin-cli", Platform::MacOs) => xdg_config_home(home, env)
+            .join("devin")
+            .join("mcp_config.json"),
+        _ => return resolve_client_config_path(client_id, home, platform),
+    };
+    Some(path)
 }
 
 /// Linux production paths honor `XDG_CONFIG_HOME` / `XDG_DATA_HOME` via `dirs`.
@@ -1306,6 +1364,16 @@ fn client_config_path_with_home(client_id: &str, home: Option<PathBuf>) -> Optio
 fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> Option<PathBuf> {
     let config = client_config_dir().unwrap_or_else(|| home.join(".config"));
     let data = client_data_dir().unwrap_or_else(|| home.join(".local").join("share"));
+    resolve_client_config_path_linux_in(client_id, home, &config, &data)
+}
+
+/// The Linux table, given the resolved XDG config and data dirs.
+fn resolve_client_config_path_linux_in(
+    client_id: &str,
+    home: &Path,
+    config: &Path,
+    data: &Path,
+) -> Option<PathBuf> {
     let path = match client_id {
         "claude-desktop" => config.join("Claude").join("claude_desktop_config.json"),
         "cursor" => home.join(".cursor").join("mcp.json"),
@@ -1317,11 +1385,7 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
         "vscode" => config.join("Code").join("User").join("mcp.json"),
         // Amp documents this literal home-relative location on Linux.
         "amp" => home.join(".config").join("amp").join("settings.json"),
-        "windsurf" => home
-            .join(".codeium")
-            .join("windsurf")
-            .join("mcp_config.json"),
-        "devin-cli" => config.join("devin").join("mcp_config.json"),
+        "windsurf" | "devin-cli" => config.join("devin").join("mcp_config.json"),
         // OpenCode and Kilo Code document literal home-relative paths on every
         // platform; unlike most Linux clients they do not follow XDG_CONFIG_HOME.
         "opencode" => home.join(".config").join("opencode").join("opencode.json"),
@@ -1334,11 +1398,10 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
         "qwen-code" => home.join(".qwen").join("settings.json"),
         "junie" => home.join(".junie").join("mcp").join("mcp.json"),
         "antigravity" => home.join(".gemini").join("config").join("mcp_config.json"),
-        "cline" => config
-            .join("Code")
-            .join("User")
-            .join("globalStorage")
-            .join("saoudrizwan.claude-dev")
+        // Cline 4.1 (extension and CLI); see `resolve_cline_path` for the old file.
+        "cline" => home
+            .join(".cline")
+            .join("data")
             .join("settings")
             .join("cline_mcp_settings.json"),
         "roo-code" => config
@@ -1364,6 +1427,7 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
         "nanobot" => home.join(".nanobot").join("config.json"),
         "command-code" => home.join(".commandcode").join("mcp.json"),
         "tabnine" => home.join(".tabnine").join("mcp_servers.json"),
+        "tabnine-cli" => home.join(".tabnine").join("agent").join("settings.json"),
         "lm-studio" => home.join(".lmstudio").join("mcp.json"),
         "jan" => data.join("Jan").join("data").join("mcp_config.json"),
         "zed" => config.join("zed").join("settings.json"),
@@ -1610,9 +1674,18 @@ pub fn client_rules_target(
             scope,
         ));
     }
+    // pi and Oh My Pi load AGENTS.md from the agent dir their mcp.json lives in.
+    if client_id == "pi" {
+        let dir = pi_agent_dir(&home()?, &client_path_env);
+        return Some(rules_sentinel_block(dir.join("AGENTS.md"), scope));
+    }
+    if client_id == "omp" {
+        let dir = omp_agent_dir(&home()?, &client_path_env);
+        return Some(rules_sentinel_block(dir.join("AGENTS.md"), scope));
+    }
     if client_id == "reasonix" {
         let home = home()?;
-        let reasonix = reasonix_path()?.parent()?.to_path_buf();
+        let reasonix = reasonix_home_dir()?;
         let env = |key: &str| client_path_env(key).and_then(|v| v.into_string().ok());
         let state = reasonix_paths::state_root(&home, &reasonix, &env);
         return Some(rules_sentinel_block(state.join("AGENTS.md"), scope));
@@ -1629,40 +1702,65 @@ pub fn client_rules_target(
         };
         return Some(rules_sentinel_block(path, scope));
     }
+    // Goose and Devin follow XDG_CONFIG_HOME on macOS too, as their configs do.
+    #[cfg(target_os = "macos")]
+    if matches!(client_id, "goose" | "devin-cli") {
+        let config = xdg_config_home(&home, &client_path_env);
+        let path = match client_id {
+            "goose" => config.join("goose").join(".goosehints"),
+            _ => config.join("devin").join("AGENTS.md"),
+        };
+        return Some(rules_sentinel_block(path, scope));
+    }
     resolve_rules_target(client_id, &home, Platform::current(), scope)
 }
 
 fn claude_desktop_path() -> Option<PathBuf> {
-    // Claude Desktop is MSIX-packaged, so its Roaming config can live at the real
-    // %APPDATA% and/or inside the package's virtualized LocalCache. Prefer the
-    // real path (home-anchored via `client_config_path`); if only the package copy exists,
-    // find it by scanning for the `Claude*` package so we don't depend on a
-    // process running under the same virtualization.
     let real = client_config_path("claude-desktop")?;
-    if real.exists() {
+    if Platform::current() != Platform::Windows {
         return Some(real);
     }
-    if let Some(home) = home() {
-        let packages = home.join("AppData").join("Local").join("Packages");
-        if let Ok(entries) = std::fs::read_dir(&packages) {
-            for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().starts_with("Claude") {
-                    let p = entry
-                        .path()
-                        .join("LocalCache")
-                        .join("Roaming")
-                        .join("Claude")
-                        .join("claude_desktop_config.json");
-                    if p.exists() {
-                        return Some(p);
-                    }
-                }
-            }
-        }
+    let local = absolute_env_dir(client_path_env("LOCALAPPDATA"))
+        .or_else(client_local_data_dir)
+        .or_else(|| Some(home()?.join("AppData").join("Local")))?;
+    Some(resolve_claude_desktop_path(real, &local))
+}
+
+/// Claude Desktop's Roaming config can live at the real `%APPDATA%\Claude` and/or in
+/// a `Claude*` MSIX package's virtualized `LocalCache`. The real file wins when it
+/// exists; a package copy is used only when it is the only one. Which file the Store
+/// build reads when both exist is unverified, so Toolport never moves an entry
+/// between them.
+fn resolve_claude_desktop_path(real: PathBuf, local_app_data: &Path) -> PathBuf {
+    if real.exists() {
+        return real;
     }
-    // Default to the real path even if absent, so the status reads "not found"
-    // rather than erroring.
-    Some(real)
+    claude_desktop_msix_configs(local_app_data)
+        .into_iter()
+        .find(|path| path.is_file())
+        .unwrap_or(real)
+}
+
+/// Claude Desktop's config inside every installed `Claude*` MSIX package, in a stable
+/// order, whether or not the file exists yet.
+fn claude_desktop_msix_configs(local_app_data: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(local_app_data.join("Packages")) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("Claude"))
+        .map(|entry| {
+            entry
+                .path()
+                .join("LocalCache")
+                .join("Roaming")
+                .join("Claude")
+                .join("claude_desktop_config.json")
+        })
+        .collect();
+    paths.sort();
+    paths
 }
 
 fn crush_override_path(config_dir: Option<std::ffi::OsString>) -> Option<PathBuf> {
@@ -1688,33 +1786,39 @@ fn resolve_crush_path(
 }
 
 /// Crush v0.88.0 resolves its global config through CRUSH_GLOBAL_CONFIG, then
-/// XDG_CONFIG_HOME, and finally ~/.config on every OS. Older Windows releases
-/// used LocalAppData, so retain that path only when it already contains a file.
+/// XDG_CONFIG_HOME, and finally ~/.config on every OS. On Windows,
+/// `%LOCALAPPDATA%\crush\crush.json` is now Crush's machine-owned state file, not a
+/// config it reads for servers, so Toolport never writes it; an entry older Toolport
+/// left there is moved by `relocate`.
 fn crush_path() -> Option<PathBuf> {
     let home = home()?;
     if let Some(path) = crush_override_path(client_path_env("CRUSH_GLOBAL_CONFIG")) {
         return Some(path);
     }
-    let current = resolve_crush_path(&home, None, client_path_env("XDG_CONFIG_HOME"));
-    #[cfg(windows)]
-    if !current.exists() {
-        if let Some(local_app_data) = client_path_env("LOCALAPPDATA").filter(|p| !p.is_empty()) {
-            let legacy = PathBuf::from(local_app_data)
-                .join("crush")
-                .join("crush.json");
-            if legacy.exists() {
-                return Some(legacy);
-            }
-        }
-    }
-    Some(current)
+    Some(resolve_crush_path(
+        &home,
+        None,
+        client_path_env("XDG_CONFIG_HOME"),
+    ))
 }
 
+/// Amp reads `~/.config/amp/settings.json` or `settings.jsonc`. The `.json` file wins
+/// when both exist (the documented primary name); a `.jsonc`-only setup is written
+/// in place instead of gaining a second, competing `settings.json`.
 fn amp_path() -> Option<PathBuf> {
     client_path_env("AMP_SETTINGS_FILE")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
-        .or_else(|| client_config_path("amp"))
+        .or_else(|| client_config_path("amp").map(prefer_existing_jsonc))
+}
+
+fn prefer_existing_jsonc(json: PathBuf) -> PathBuf {
+    let jsonc = json.with_extension("jsonc");
+    if !json.exists() && jsonc.is_file() {
+        jsonc
+    } else {
+        json
+    }
 }
 
 /// Codex reads `$CODEX_HOME/config.toml` when `CODEX_HOME` is set, otherwise
@@ -1815,20 +1919,12 @@ fn qwen_code_path() -> Option<PathBuf> {
     client_config_path("qwen-code")
 }
 
-/// Google Antigravity reads MCP servers from `mcp_config.json` under `~/.gemini`.
-/// The subdir has shifted across versions (`config`, `antigravity-ide`,
-/// `antigravity`) and installers leave empty decoy files in the unused ones, so
-/// prefer whichever actually has content; otherwise default to `config` (what
-/// current Antigravity writes).
+/// Google Antigravity (IDE and CLI) reads MCP servers from
+/// `~/.gemini/config/mcp_config.json` on every OS. Earlier builds used
+/// `antigravity-ide` and `antigravity` subdirs, and Toolport used to pick whichever of
+/// the three had content, which could keep it writing a file current Antigravity no
+/// longer reads. Those files are now only cleaned up (see `relocate`).
 fn antigravity_path() -> Option<PathBuf> {
-    let base = home()?.join(".gemini");
-    let candidates = ["config", "antigravity-ide", "antigravity"];
-    for dir in candidates {
-        let p = base.join(dir).join("mcp_config.json");
-        if std::fs::metadata(&p).map(|m| m.len() > 0).unwrap_or(false) {
-            return Some(p);
-        }
-    }
     client_config_path("antigravity")
 }
 
@@ -1859,7 +1955,8 @@ fn resolved_definition_path(def: &ClientDef) -> Result<PathBuf, String> {
         .map(|location| location.config_path.clone())
         .or_else(|| (def.path)())
         .ok_or("Could not resolve a config path on this OS")?;
-    if def.id == "opencode" {
+    // An explicit OPENCODE_CONFIG file is used as named.
+    if def.id == "opencode" && path.file_name().is_some_and(|name| name == "opencode.json") {
         resolve_opencode_config_path(path)
     } else {
         Ok(path)
@@ -1900,11 +1997,35 @@ fn dsh_home_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
 /// expanded), else `~/.reasonix` (macOS, Linux) or `%APPDATA%\\reasonix`
 /// (Windows). A relative value resolves against Reasonix's own working
 /// directory, which Toolport cannot know, so it falls back to the default.
+///
+/// Without `REASONIX_HOME`, a missing home file means Reasonix loads the first
+/// existing legacy `config.toml` and migrates it on its next start; see
+/// [`reasonix_legacy_configs`]. The rules state root stays the home either way.
 fn reasonix_path() -> Option<PathBuf> {
     if let Some(dir) = reasonix_home_from(client_path_env("REASONIX_HOME")) {
         return Some(dir.join("config.toml"));
     }
-    client_config_path("reasonix")
+    let primary = client_config_path("reasonix")?;
+    if primary.exists() {
+        return Some(primary);
+    }
+    let home = home()?;
+    Some(
+        reasonix_legacy_configs(&home, Platform::current(), &client_path_env)
+            .into_iter()
+            .find(|path| path.is_file())
+            .unwrap_or(primary),
+    )
+}
+
+/// Reasonix's home directory: `REASONIX_HOME`, else the platform default.
+fn reasonix_home_dir() -> Option<PathBuf> {
+    if let Some(dir) = reasonix_home_from(client_path_env("REASONIX_HOME")) {
+        return Some(dir);
+    }
+    client_config_path("reasonix")?
+        .parent()
+        .map(Path::to_path_buf)
 }
 
 fn reasonix_home_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
@@ -1992,53 +2113,334 @@ fn codewhale_state_path(name: &str) -> Option<PathBuf> {
 }
 
 /// Goose keeps extensions (its MCP servers) in config.yaml. It resolves the dir
-/// via the `etcetera` "Block/goose" app strategy: ~/.config/goose on Linux, an
-/// app-support path on macOS, and %APPDATA%\Block\goose\config on Windows. (The
-/// Windows path is the etcetera default and is confirmed against a real install.)
+/// via `etcetera::choose_app_strategy("Block/goose")`, which is the XDG strategy on
+/// Linux AND macOS (`$XDG_CONFIG_HOME/goose`, else `~/.config/goose`) and
+/// `%APPDATA%\Block\goose\config` on Windows (confirmed against a real install).
+/// Older Toolport wrote `~/Library/Application Support/Block/goose/config.yaml` on
+/// macOS, which Goose never reads; `relocate` moves an entry left there.
 fn goose_path() -> Option<PathBuf> {
     client_config_path("goose")
 }
 
-/// Hermes keeps MCP servers in ~/.hermes/config.yaml under the `mcp_servers:` key.
-/// The file is YAML and also holds the user's model and platform toolsets config,
-/// so it's read leniently and never wiped on a parse failure.
-///
-/// The Windows desktop build does NOT use the home-anchored path: it writes
-/// `%LOCALAPPDATA%\hermes\config.yaml` (lowercase dir), so resolving only
-/// `~/.hermes` made an installed Hermes undetectable there and there was no way
-/// to connect it. Related to [`crush_path`], but the preference is the other way
-/// round: Crush's platform path is the LEGACY one, so it only wins when it holds a
-/// file, whereas Hermes' platform path is the CURRENT one on Windows and so also
-/// wins when neither exists. Writing a fresh config into `~/.hermes` on Windows
-/// would put it somewhere Hermes never reads.
+/// Hermes keeps MCP servers in `config.yaml` under the `mcp_servers:` key. The file
+/// is YAML and also holds the user's model and platform toolsets config, so it's read
+/// leniently and never wiped on a parse failure.
 fn hermes_path() -> Option<PathBuf> {
-    let canonical = client_config_path("hermes")?;
-    // Only the Windows build uses the platform data dir. Passing None elsewhere
-    // keeps macOS and Linux on the home-anchored path with no probing at all.
-    let local = if cfg!(windows) {
-        client_local_data_dir()
-    } else {
-        None
-    };
-    Some(resolve_hermes_path(canonical, local))
+    let home = home()?;
+    Some(resolve_hermes_path(
+        &home,
+        Platform::current(),
+        &client_path_env,
+    ))
 }
 
-/// Body of [`hermes_path`], taking the two roots directly so the fallback can be
-/// tested on any platform. An existing canonical file always wins, so a user who
-/// already has `~/.hermes/config.yaml` is never silently repointed.
-fn resolve_hermes_path(canonical: PathBuf, local_data: Option<PathBuf>) -> PathBuf {
-    if canonical.exists() {
-        return canonical;
+/// Hermes' own rule (`hermes_constants.get_hermes_home`): `HERMES_HOME` (trimmed, `~`
+/// expanded), else `%LOCALAPPDATA%\hermes` on Windows and `~/.hermes` elsewhere, the
+/// directory name carrying `HERMES_DATA_DIR_SUFFIX`. The Windows build always uses
+/// `%LOCALAPPDATA%`; older Toolport preferred an existing `~\.hermes` there, which
+/// Hermes never reads, so that file is only cleaned up now (see `relocate`). A
+/// relative `HERMES_HOME` depends on Hermes' working directory, so it falls back.
+fn resolve_hermes_path(
+    home: &Path,
+    platform: Platform,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> PathBuf {
+    let text = |key: &str| env(key).and_then(|value| value.into_string().ok());
+    if let Some(dir) = text("HERMES_HOME")
+        .map(|raw| raw.trim().to_string())
+        .and_then(|raw| expand_tilde_in(home, &raw))
+    {
+        return dir.join("config.yaml");
     }
-    // Nothing at the canonical path. Where a platform dir applies at all (Windows
-    // only), that is the file the installed build reads, whether it exists yet or
-    // not, so a first write has to land there. Returning the canonical path here
-    // would write a config into `~/.hermes` that Hermes never looks at, which reads
-    // to the user as "Toolport said it connected and nothing happened".
-    match local_data {
-        Some(local) => local.join("hermes").join("config.yaml"),
-        None => canonical,
+    let suffix = text("HERMES_DATA_DIR_SUFFIX").unwrap_or_default();
+    match platform {
+        Platform::Windows => text("LOCALAPPDATA")
+            .map(|raw| raw.trim().to_string())
+            .filter(|raw| !raw.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData").join("Local"))
+            .join(format!("hermes{suffix}"))
+            .join("config.yaml"),
+        Platform::MacOs | Platform::Linux => {
+            home.join(format!(".hermes{suffix}")).join("config.yaml")
+        }
     }
+}
+
+/// `~`, `~/x` or `~\x` against `home`, else the value itself; `None` unless absolute.
+fn expand_tilde_in(home: &Path, raw: &str) -> Option<PathBuf> {
+    let path = if raw == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix(r"~\")) {
+        home.join(rest.trim_start_matches(['/', '\\']))
+    } else {
+        PathBuf::from(raw)
+    };
+    (!raw.is_empty() && path.is_absolute()).then_some(path)
+}
+
+/// A trimmed, absolute env value. Clients that use a relative value resolve it against
+/// their own working directory, which Toolport cannot know.
+fn absolute_trimmed(
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    key: &str,
+) -> Option<PathBuf> {
+    let raw = env(key)?.into_string().ok()?;
+    let path = PathBuf::from(raw.trim());
+    path.is_absolute().then_some(path)
+}
+
+fn cline_path() -> Option<PathBuf> {
+    let home = home()?;
+    Some(resolve_cline_path(
+        &home,
+        Platform::current(),
+        &client_path_env,
+    ))
+}
+
+/// Cline 4.1 (extension and CLI) reads `~/.cline/data/settings/cline_mcp_settings.json`,
+/// relocated by `CLINE_MCP_SETTINGS_PATH` (the file), `CLINE_DATA_DIR` or `CLINE_DIR`.
+/// It merges the old VS Code storage file in once and then ignores it.
+///
+/// Until the new settings file exists, the old file is the one an installed pre-4.1
+/// extension reads, and writing it works for both versions: an older Cline reads it,
+/// and 4.1 carries the entry over on its first start. A `~/.cline` folder alone is not
+/// evidence (the CLI and shared rules create it while an older extension still reads
+/// its storage). Once the new file exists it is the target, and the old entry is kept
+/// and written too unless `relocate` has evidence the extension moved.
+fn resolve_cline_path(
+    home: &Path,
+    platform: Platform,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(file) = absolute_trimmed(env, "CLINE_MCP_SETTINGS_PATH") {
+        return file;
+    }
+    let data_override = absolute_trimmed(env, "CLINE_DATA_DIR");
+    let dir_override = absolute_trimmed(env, "CLINE_DIR");
+    let cline_dir = dir_override.clone().unwrap_or_else(|| home.join(".cline"));
+    let current = data_override
+        .clone()
+        .unwrap_or_else(|| cline_dir.join("data"))
+        .join("settings")
+        .join("cline_mcp_settings.json");
+    if data_override.is_some() || dir_override.is_some() {
+        return current;
+    }
+    let legacy = cline_legacy_settings_path(home, platform, env);
+    let extension_storage = legacy.parent().and_then(Path::parent);
+    if !current.exists()
+        && !relocate::cline_moved(home)
+        && extension_storage.is_some_and(Path::is_dir)
+    {
+        return legacy;
+    }
+    current
+}
+
+/// The pre-4.1 Cline file in VS Code's extension storage.
+fn cline_legacy_settings_path(
+    home: &Path,
+    platform: Platform,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> PathBuf {
+    let config = match platform {
+        Platform::Linux => xdg_config_home(home, env),
+        Platform::Windows | Platform::MacOs => roaming_config_dir(home, platform),
+    };
+    config
+        .join("Code")
+        .join("User")
+        .join("globalStorage")
+        .join("saoudrizwan.claude-dev")
+        .join("settings")
+        .join("cline_mcp_settings.json")
+}
+
+/// pi reads `<agent dir>/mcp.json`, the agent dir being `PI_CODING_AGENT_DIR` (with
+/// `~` expanded) or `~/.pi/agent`.
+fn pi_agent_dir(home: &Path, env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> PathBuf {
+    env("PI_CODING_AGENT_DIR")
+        .and_then(|value| value.into_string().ok())
+        .and_then(|raw| expand_tilde_in(home, &raw))
+        .unwrap_or_else(|| home.join(".pi").join("agent"))
+}
+
+fn pi_path() -> Option<PathBuf> {
+    Some(pi_agent_dir(&home()?, &client_path_env).join("mcp.json"))
+}
+
+/// Oh My Pi's agent dir (`packages/utils/src/dirs.ts`): a profile from `OMP_PROFILE`
+/// (or `PI_PROFILE` when that is unset) selects `~/<config>/profiles/<name>/agent`;
+/// otherwise an absolute `PI_CODING_AGENT_DIR`, else `~/<config>/agent`. `<config>` is
+/// `PI_CONFIG_DIR`, a directory NAME under home, defaulting to `.omp`.
+fn omp_agent_dir(home: &Path, env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> PathBuf {
+    let text = |key: &str| env(key).and_then(|value| value.into_string().ok());
+    let config = text("PI_CONFIG_DIR")
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| ".omp".into());
+    let root = home.join(config);
+    let profile = text("OMP_PROFILE")
+        .or_else(|| text("PI_PROFILE"))
+        .map(|name| name.trim().to_string())
+        .filter(|name| {
+            let bytes = name.as_bytes();
+            name != "default"
+                && (1..=64).contains(&bytes.len())
+                && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+                && bytes.iter().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+                })
+        });
+    if let Some(profile) = profile {
+        return root.join("profiles").join(profile).join("agent");
+    }
+    absolute_env_dir(env("PI_CODING_AGENT_DIR")).unwrap_or_else(|| root.join("agent"))
+}
+
+fn omp_path() -> Option<PathBuf> {
+    Some(omp_agent_dir(&home()?, &client_path_env).join("mcp.json"))
+}
+
+/// `XDG_CONFIG_HOME` as the Node `xdg-basedir` package reads it (OpenCode, Kilo): on
+/// every OS, falling back to `~/.config`. A relative value is the client's cwd, so it
+/// falls back here.
+fn node_xdg_config(home: &Path, env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> PathBuf {
+    absolute_trimmed(env, "XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"))
+}
+
+fn opencode_path() -> Option<PathBuf> {
+    Some(resolve_opencode_path(&home()?, &client_path_env))
+}
+
+/// OpenCode loads `OPENCODE_CONFIG` (a file) over its global dir, which is
+/// `OPENCODE_CONFIG_DIR` or `$XDG_CONFIG_HOME/opencode` (`~/.config/opencode`).
+/// [`resolve_opencode_config_path`] then picks `opencode.json` or `.jsonc` in it.
+fn resolve_opencode_path(home: &Path, env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> PathBuf {
+    if let Some(file) = absolute_trimmed(env, "OPENCODE_CONFIG") {
+        return file;
+    }
+    absolute_trimmed(env, "OPENCODE_CONFIG_DIR")
+        .unwrap_or_else(|| node_xdg_config(home, env).join("opencode"))
+        .join("opencode.json")
+}
+
+fn kilo_path() -> Option<PathBuf> {
+    Some(resolve_kilo_path(&home()?, &client_path_env))
+}
+
+/// Kilo CLI: `KILO_CONFIG` (a file), else its config dir, `KILO_CONFIG_DIR` or
+/// `$XDG_CONFIG_HOME/kilo` (`~/.config/kilo`). In the dir Kilo writes the first of
+/// `kilo.jsonc`, `kilo.json`, `opencode.jsonc`, `opencode.json`, `config.json` that
+/// exists, and seeds `kilo.jsonc` when none does.
+fn resolve_kilo_path(home: &Path, env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> PathBuf {
+    if let Some(file) = absolute_trimmed(env, "KILO_CONFIG") {
+        return file;
+    }
+    let dir = absolute_trimmed(env, "KILO_CONFIG_DIR")
+        .unwrap_or_else(|| node_xdg_config(home, env).join("kilo"));
+    [
+        "kilo.jsonc",
+        "kilo.json",
+        "opencode.jsonc",
+        "opencode.json",
+        "config.json",
+    ]
+    .into_iter()
+    .map(|name| dir.join(name))
+    .find(|path| path.is_file())
+    .unwrap_or_else(|| dir.join("kilo.jsonc"))
+}
+
+fn lm_studio_path() -> Option<PathBuf> {
+    Some(resolve_lm_studio_home(&home()?).join("mcp.json"))
+}
+
+/// LM Studio's home (`lmstudio-js` `findLMStudioHome`): the absolute path in
+/// `~/.lmstudio-home-pointer`, else `~/.cache/lm-studio` when it exists, else
+/// `~/.lmstudio`. `mcp.json` sits directly in it.
+fn resolve_lm_studio_home(home: &Path) -> PathBuf {
+    if let Some(pointed) = std::fs::read_to_string(home.join(".lmstudio-home-pointer"))
+        .ok()
+        .map(|text| PathBuf::from(text.trim()))
+        .filter(|path| path.is_absolute())
+    {
+        return pointed;
+    }
+    let [default, cache] = lm_studio_default_homes(home);
+    if cache.is_dir() {
+        cache
+    } else {
+        default
+    }
+}
+
+fn lm_studio_default_homes(home: &Path) -> [PathBuf; 2] {
+    [
+        home.join(".lmstudio"),
+        home.join(".cache").join("lm-studio"),
+    ]
+}
+
+fn amazon_q_dir(home: &Path) -> PathBuf {
+    home.join(".aws").join("amazonq")
+}
+
+fn amazon_q_path() -> Option<PathBuf> {
+    Some(resolve_amazon_q_path(&home()?))
+}
+
+/// The Amazon Q IDE language server keeps servers in the agent file
+/// `agents/default.json` (it creates it on first run) and also loads the legacy
+/// `mcp.json` on top while that file's `useLegacyMcpJson` is true, the default
+/// (mcpUtils.ts@lsp-codewhisperer/v0.0.134). Toolport keeps writing `mcp.json` then,
+/// which every version reads, and writes the agent file once legacy reading is off.
+fn resolve_amazon_q_path(home: &Path) -> PathBuf {
+    let dir = amazon_q_dir(home);
+    let agent = dir.join("agents").join("default.json");
+    let legacy_off = std::fs::read_to_string(&agent)
+        .ok()
+        .and_then(|text| parse_json_value(&text).ok())
+        .is_some_and(|root| root.get("useLegacyMcpJson") == Some(&serde_json::Value::Bool(false)));
+    if legacy_off {
+        agent
+    } else {
+        dir.join("mcp.json")
+    }
+}
+
+/// Reasonix loads `config.toml` from its home, or, when that file is missing, the
+/// first legacy `config.toml` that exists, which it then migrates into the home on its
+/// next start (`internal/contract/config/paths.go`). Creating the home file first
+/// would stop that migration and hide the user's legacy settings, so Toolport writes
+/// the file Reasonix is loading. `REASONIX_HOME` turns legacy lookup off.
+fn reasonix_legacy_configs(
+    home: &Path,
+    platform: Platform,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let primary_dir = match platform {
+        Platform::Windows => roaming_config_dir(home, platform).join("reasonix"),
+        Platform::MacOs | Platform::Linux => home.join(".reasonix"),
+    };
+    let user_config = match platform {
+        Platform::Linux => xdg_config_home(home, env),
+        Platform::Windows | Platform::MacOs => roaming_config_dir(home, platform),
+    };
+    let mut dirs = vec![user_config.join("reasonix")];
+    if platform != Platform::Windows {
+        dirs.push(xdg_config_home(home, env).join("reasonix"));
+        dirs.push(home.join(".config").join("reasonix"));
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        let path = dir.join("config.toml");
+        if dir != primary_dir && !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    out
 }
 
 fn continue_path() -> Option<PathBuf> {
@@ -2364,7 +2766,7 @@ fn defs() -> Vec<ClientDef> {
                 dashed: false,
             }),
             name: "Cursor",
-            format: Format::JsonMcpServers,
+            format: Format::JsonCursorMcpServers,
             uses_connectors: false,
             path: || client_config_path("cursor"),
             plugin_scan: Some(scan_cursor_plugins),
@@ -2456,7 +2858,7 @@ fn defs() -> Vec<ClientDef> {
             uses_connectors: false,
             // OpenCode stores its global config at the literal
             // `~/.config/opencode/opencode.json` or `opencode.jsonc` on every supported OS.
-            path: || client_config_path("opencode"),
+            path: opencode_path,
             plugin_scan: None,
         },
         ClientDef {
@@ -2469,7 +2871,7 @@ fn defs() -> Vec<ClientDef> {
             uses_connectors: false,
             // Kilo Code stores its global JSONC config at the literal
             // `~/.config/kilo/kilo.jsonc` on every supported OS.
-            path: || client_config_path("kilo-code"),
+            path: kilo_path,
             plugin_scan: None,
         },
         ClientDef {
@@ -2578,7 +2980,7 @@ fn defs() -> Vec<ClientDef> {
             name: "Cline",
             format: Format::JsonMcpServers,
             uses_connectors: false,
-            path: || client_config_path("cline"),
+            path: cline_path,
             plugin_scan: None,
         },
         ClientDef {
@@ -2616,7 +3018,7 @@ fn defs() -> Vec<ClientDef> {
             // Amazon Q Developer CLI global MCP config: `~/.aws/amazonq/mcp.json`
             // (`mcpServers`). A per-workspace `.amazonq/mcp.json` also exists; we manage the
             // global one so the gateway is available everywhere.
-            path: || client_config_path("amazon-q"),
+            path: amazon_q_path,
             plugin_scan: None,
         },
         ClientDef {
@@ -2775,6 +3177,19 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             location: None,
+            id: "tabnine-cli",
+            discovery: discovery::capabilities("tabnine-cli"),
+            tool_names: None,
+            name: "Tabnine CLI",
+            format: Format::JsonMcpServers,
+            uses_connectors: false,
+            // The Tabnine CLI's user settings, `~/.tabnine/agent/settings.json`, keep
+            // `mcpServers` beside its other settings; a separate file from the IDE's.
+            path: || client_config_path("tabnine-cli"),
+            plugin_scan: None,
+        },
+        ClientDef {
+            location: None,
             id: "zed",
             discovery: discovery::capabilities("zed"),
             tool_names: None,
@@ -2797,7 +3212,7 @@ fn defs() -> Vec<ClientDef> {
             uses_connectors: false,
             // LM Studio reads MCP servers from `~/.lmstudio/mcp.json` (`mcpServers`, plain
             // JSON). The file is created by LM Studio, so the parent-dir presence check works.
-            path: || client_config_path("lm-studio"),
+            path: lm_studio_path,
             plugin_scan: None,
         },
         ClientDef {
@@ -2837,7 +3252,7 @@ fn defs() -> Vec<ClientDef> {
             // Pi coding agent reads its Pi-owned global MCP config from ~/.pi/agent/mcp.json
             // (standard `mcpServers` shape; pi's optional `lifecycle`/`idleTimeout` keys are
             // left unset so it uses its defaults). Home-anchored, identical on every OS.
-            path: || client_config_path("pi"),
+            path: pi_path,
             plugin_scan: None,
         },
         ClientDef {
@@ -2850,7 +3265,7 @@ fn defs() -> Vec<ClientDef> {
             uses_connectors: false,
             // Oh My Pi (omp) is a fork of Pi with its own config directory (~/.omp).
             // Same `mcpServers` JSON format as Pi; home-anchored, identical on every OS.
-            path: || client_config_path("omp"),
+            path: omp_path,
             plugin_scan: None,
         },
         ClientDef {
@@ -3894,7 +4309,7 @@ fn parse_opencode_json(content: &str) -> Result<Vec<McpServer>, String> {
 
     let mut malformed = Vec::new();
     let mut servers = Vec::new();
-    for (name, definition) in obj {
+    for (name, definition) in opencode_server_definitions(obj) {
         match opencode_server_with_values(name, definition) {
             Ok(Some(server)) => servers.push(McpServer {
                 name: server.name,
@@ -4052,6 +4467,22 @@ fn install_override(id: &str) -> Option<PathBuf> {
         "openhands" => openhands_dir(),
         // The instance root nanobot creates on its first run.
         "nanobot" => Some(nanobot::home_dir(&home()?)),
+        // Devin Desktop still keeps its own data under `~/.codeium/windsurf`, which
+        // marks an install before it has written the shared Devin config.
+        "windsurf" => Some(home()?.join(".codeium").join("windsurf")).filter(|dir| dir.exists()),
+        // The CLI's own folder; `~/.tabnine` alone is the IDE plugin's.
+        "tabnine-cli" => Some(home()?.join(".tabnine").join("agent")),
+        // Cline 4.1 creates `~/.cline`; before that, its VS Code storage folder.
+        "cline" => {
+            let home = home()?;
+            let dir = absolute_trimmed(&client_path_env, "CLINE_DIR")
+                .unwrap_or_else(|| home.join(".cline"));
+            if dir.exists() {
+                return Some(dir);
+            }
+            let legacy = cline_legacy_settings_path(&home, Platform::current(), &client_path_env);
+            Some(legacy.parent()?.parent()?.to_path_buf())
+        }
         _ => None,
     }
 }
@@ -4502,7 +4933,7 @@ pub(crate) fn validate_client_import(
 /// still match without storing tokens on the registry (SOU-406/407).
 fn parse_client_content(format: Format, content: &str) -> Result<Vec<McpServer>, String> {
     match format {
-        Format::JsonMcpServers => parse_json(content, "mcpServers"),
+        Format::JsonMcpServers | Format::JsonCursorMcpServers => parse_json(content, "mcpServers"),
         Format::JsonCopilotMcpServers => parse_json(content, "mcpServers"),
         Format::JsonDroidMcpServers => parse_json(content, "mcpServers"),
         Format::JsonAmpMcpServers => parse_json(content, "amp.mcpServers"),
@@ -4805,9 +5236,28 @@ impl PurgeBackupClient {
                 add(path);
             }
         }
-        if def.id == "opencode" {
-            basenames.insert("opencode.jsonc".into());
+        // Older and alternative files a client reads, which Toolport backs up under
+        // their own names when it edits them.
+        for platform in [Platform::Windows, Platform::MacOs, Platform::Linux] {
+            for path in
+                relocate::resolve_legacy_config_paths(def.id, Path::new("/"), platform, &|_| None)
+            {
+                add(path);
+            }
         }
+        let alternates: &[&str] = match def.id {
+            "opencode" => &["opencode.jsonc"],
+            "kilo-code" => &[
+                "kilo.json",
+                "opencode.jsonc",
+                "opencode.json",
+                "config.json",
+            ],
+            "amp" => &["settings.jsonc"],
+            "amazon-q" => &["default.json"],
+            _ => &[],
+        };
+        basenames.extend(alternates.iter().map(|name| name.to_string()));
         Self {
             basenames,
             named_prefixes: match def.id {
@@ -5129,6 +5579,80 @@ fn entry_to_json(entry: &ServerEntry) -> serde_json::Value {
         map.insert(key.into(), serde_json::Value::Object(kv));
     }
     serde_json::Value::Object(map)
+}
+
+/// [`entry_to_json`] with `"type": "stdio"` on a local command. VS Code requires
+/// `type` on every `servers` entry and Cursor documents it as required; remote
+/// entries already carry `http`/`sse`.
+fn entry_to_typed_json(entry: &ServerEntry) -> serde_json::Value {
+    let mut value = entry_to_json(entry);
+    if entry.command.is_some() {
+        if let Some(fields) = value.as_object_mut() {
+            fields.insert("type".into(), serde_json::Value::String("stdio".into()));
+        }
+    }
+    value
+}
+
+/// [`entry_to_json`] with `"type": "local"` on a local command. Every GitHub
+/// Copilot CLI example carries it and newer releases expect it.
+fn entry_to_copilot_json(entry: &ServerEntry) -> serde_json::Value {
+    let mut value = entry_to_json(entry);
+    if entry.command.is_some() {
+        if let Some(fields) = value.as_object_mut() {
+            fields.insert("type".into(), serde_json::Value::String("local".into()));
+        }
+    }
+    value
+}
+
+/// Fields a format requires that an older Toolport entry may lack, as
+/// `(field, value)` to add: `type` on a local command for VS Code and Cursor
+/// (`stdio`) and GitHub Copilot CLI (`local`). A field the entry already has,
+/// whatever its value, is never touched.
+fn missing_required_fields(
+    format: Format,
+    entry: &serde_json::Value,
+) -> Vec<(&'static str, serde_json::Value)> {
+    let local_without_type = entry
+        .get("command")
+        .is_some_and(serde_json::Value::is_string)
+        && entry.get("type").is_none()
+        && entry.get("url").is_none();
+    match format {
+        Format::JsonServers | Format::JsonCursorMcpServers if local_without_type => {
+            vec![("type", serde_json::Value::String("stdio".into()))]
+        }
+        Format::JsonCopilotMcpServers if local_without_type => {
+            vec![("type", serde_json::Value::String("local".into()))]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Add [`missing_required_fields`] to Toolport's own entry in place, keeping every
+/// other byte the user may have edited. Returns whether the file changed.
+fn backfill_required_fields(format: Format, path: &Path, name: &str) -> Result<bool, String> {
+    let key = match format {
+        Format::JsonServers => "servers",
+        Format::JsonCursorMcpServers | Format::JsonCopilotMcpServers => "mcpServers",
+        _ => return Ok(false),
+    };
+    let original = read_config_file(path)?;
+    let mut root = read_existing_json(&original, true)?;
+    let Some(entry) = root.get_mut(key).and_then(|servers| servers.get_mut(name)) else {
+        return Ok(false);
+    };
+    let missing = missing_required_fields(format, entry);
+    if missing.is_empty() {
+        return Ok(false);
+    }
+    let fields = entry.as_object_mut().ok_or("Invalid gateway entry")?;
+    for (field, value) in missing {
+        fields.insert(field.into(), value);
+    }
+    atomic_write_json_config(path, Some(&original), &root, key)?;
+    Ok(true)
 }
 
 /// Crush uses the standard command/args/env fields but requires an explicit
@@ -6432,7 +6956,7 @@ fn write_copilot_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String
         "mcpServers",
         servers,
         false,
-        entry_to_json,
+        entry_to_copilot_json,
         false,
         true,
     )
@@ -6601,6 +7125,52 @@ fn opencode_mcp_mut(
     Ok(object.get_mut("mcp").unwrap().as_object_mut().unwrap())
 }
 
+/// OpenCode 2.x keeps servers under `mcp.servers` beside an `mcp.timeout` block; 1.x
+/// put each server straight under `mcp`, and 2.x still converts that shape at load.
+/// A `servers` or `timeout` key is the 2.x container unless it is itself typed as a
+/// server (`local`/`remote`), which is how OpenCode tells them apart.
+fn opencode_container_key(mcp: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+    matches!(key, "servers" | "timeout")
+        && mcp.get(key).is_some_and(|value| {
+            !matches!(
+                value.get("type").and_then(serde_json::Value::as_str),
+                Some("local" | "remote")
+            )
+        })
+}
+
+/// The file already uses OpenCode 2.x's `mcp.servers` map.
+fn opencode_uses_server_map(mcp: &serde_json::Map<String, serde_json::Value>) -> bool {
+    opencode_container_key(mcp, "servers") && mcp.get("servers").is_some_and(|v| v.is_object())
+}
+
+/// Every server definition in an OpenCode `mcp` block, 2.x map first, then any 1.x
+/// entries beside it. Neither `servers` nor `timeout` is ever read as a server name.
+fn opencode_server_definitions(
+    mcp: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<(&String, &serde_json::Value)> {
+    let native = mcp
+        .get("servers")
+        .filter(|_| opencode_uses_server_map(mcp))
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten();
+    let legacy = mcp
+        .iter()
+        .filter(|(name, _)| !opencode_container_key(mcp, name));
+    native.chain(legacy).collect()
+}
+
+/// The OpenCode 2.x local entry: no `enabled` (2.x uses `disabled`, absent meaning
+/// enabled, and drops an `enabled`-only record).
+fn entry_to_opencode_v2_json(entry: &ServerEntry) -> serde_json::Value {
+    let mut value = entry_to_opencode_json(entry);
+    if let Some(fields) = value.as_object_mut() {
+        fields.remove("enabled");
+    }
+    value
+}
+
 fn opencode_entry_is_override_only(definition: &serde_json::Value) -> bool {
     let Some(object) = definition.as_object() else {
         return false;
@@ -6624,15 +7194,37 @@ fn write_opencode_json(path: &Path, servers: &[ServerEntry]) -> Result<(), Strin
         None => serde_json::Value::Object(serde_json::Map::new()),
     };
     let mcp = opencode_mcp_mut(&mut root)?;
+    let native = opencode_uses_server_map(mcp);
     // Complete server definitions are replaced by Toolport's inventory, but an
     // `enabled`-only entry may override a server inherited from another OpenCode
-    // config layer and has no inventory representation of its own.
-    mcp.retain(|_, definition| opencode_entry_is_override_only(definition));
-    mcp.extend(
-        servers
-            .iter()
-            .map(|server| (server.name.clone(), entry_to_opencode_json(server))),
-    );
+    // config layer and has no inventory representation of its own. The 2.x
+    // `servers`/`timeout` blocks are containers, not servers.
+    let containers: Vec<String> = mcp
+        .keys()
+        .filter(|key| opencode_container_key(mcp, key))
+        .cloned()
+        .collect();
+    mcp.retain(|name, definition| {
+        containers.contains(name) || opencode_entry_is_override_only(definition)
+    });
+    if native {
+        let map = mcp
+            .get_mut("servers")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("'mcp.servers' must be an object; leaving the client config untouched.")?;
+        map.retain(|_, definition| opencode_entry_is_override_only(definition));
+        map.extend(
+            servers
+                .iter()
+                .map(|server| (server.name.clone(), entry_to_opencode_v2_json(server))),
+        );
+    } else {
+        mcp.extend(
+            servers
+                .iter()
+                .map(|server| (server.name.clone(), entry_to_opencode_json(server))),
+        );
+    }
     atomic_write_json_config(path, original.as_deref(), &root, "mcp")
 }
 
@@ -7044,8 +7636,34 @@ fn continue_servers_mut(root: &mut serde_yaml::Value) -> &mut Vec<serde_yaml::Va
     map.get_mut(&key).unwrap().as_sequence_mut().unwrap()
 }
 
+/// Continue's `config.yaml` schema requires top-level `name`, `version` and `schema`;
+/// a file without them fails validation and its servers never load. Only a file
+/// Toolport creates gets them; an existing file is the user's and is left as it is.
+fn seed_new_continue_config(original: Option<&str>, root: &mut serde_yaml::Value) {
+    if original.is_some_and(|text| !text.trim().is_empty()) {
+        return;
+    }
+    let mut seeded = serde_yaml::Mapping::new();
+    for (key, value) in [
+        ("name", "Local Config"),
+        ("version", "1.0.0"),
+        ("schema", "v1"),
+    ] {
+        seeded.insert(key.into(), value.into());
+    }
+    if let Some(existing) = root.as_mapping() {
+        for (key, value) in existing {
+            seeded.insert(key.clone(), value.clone());
+        }
+    }
+    *root = serde_yaml::Value::Mapping(seeded);
+}
+
 fn write_continue_yaml_servers(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
     let (original, mut root) = read_existing_yaml_with_source(path)?;
+    if !servers.is_empty() {
+        seed_new_continue_config(original.as_deref(), &mut root);
+    }
 
     let list = continue_servers_mut(&mut root);
 
@@ -7105,6 +7723,9 @@ fn edit_synced_gateway(
 
 fn edit_continue_yaml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
     let (original, mut root) = read_existing_yaml_with_source(path)?;
+    if entry.is_some() {
+        seed_new_continue_config(original.as_deref(), &mut root);
+    }
 
     let servers = continue_servers_mut(&mut root);
 
@@ -7342,6 +7963,15 @@ fn write_format(
 ) -> Result<(), String> {
     match format {
         Format::JsonMcpServers => write_json(path, "mcpServers", servers, lenient)?,
+        Format::JsonCursorMcpServers => write_json_with(
+            path,
+            "mcpServers",
+            servers,
+            lenient,
+            entry_to_typed_json,
+            false,
+            false,
+        )?,
         Format::JsonCopilotMcpServers => write_copilot_json(path, servers)?,
         Format::JsonDroidMcpServers => write_droid_json(path, servers)?,
         Format::JsonAmpMcpServers => write_json(path, "amp.mcpServers", servers, true)?,
@@ -7352,7 +7982,15 @@ fn write_format(
         Format::JsonOpenClawMcp => openclaw::write_servers(path, servers)?,
         Format::JsonOpenHandsMcpServers => openhands::write_servers(path, servers)?,
         Format::JsonNanobotMcp => nanobot::write_servers(path, servers)?,
-        Format::JsonServers => write_json(path, "servers", servers, lenient)?,
+        Format::JsonServers => write_json_with(
+            path,
+            "servers",
+            servers,
+            lenient,
+            entry_to_typed_json,
+            false,
+            false,
+        )?,
         Format::JsonMcp => write_crush_json(path, servers)?,
         Format::JsonOpenCodeMcp => write_opencode_json(path, servers)?,
         Format::JsonContextServers => write_json(path, "context_servers", servers, true)?,
@@ -7480,7 +8118,10 @@ fn resolve_gateway_sidecar() -> Option<PathBuf> {
                 .join("MacOS")
                 .join(exe);
             if nested.exists() {
-                return Some(nested);
+                // Client configs show this path to the user and compare it on every
+                // launch, so hand out `Toolport.app/Contents/Helpers/...` rather
+                // than `Contents/MacOS/../Helpers/...`.
+                return Some(tidy_existing_path(nested));
             }
         }
     }
@@ -7518,6 +8159,55 @@ fn resolve_gateway_sidecar() -> Option<PathBuf> {
     // Fall back to the plain path so callers surface a clear "not found" error
     // rather than silently resolving to nothing.
     Some(plain)
+}
+
+/// Collapse `.` and `name/..` components without touching the filesystem.
+///
+/// Only a `..` that follows a normal component is collapsed; a leading `..` (or one
+/// right after the root) is kept, so a relative path never silently changes meaning.
+fn lexically_normalized(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out: Vec<Component> = Vec::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => match out.last() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => out.push(part),
+            },
+            other => out.push(other),
+        }
+    }
+    out.iter().map(|part| part.as_os_str()).collect()
+}
+
+/// [`lexically_normalized`] for a path that exists, kept only when it still names the
+/// same file. `a/b/..` and `a` differ when `b` is a symlink to another directory, and
+/// the kernel follows the link before applying `..`; in that case the original
+/// spelling is the one that works, so it is returned unchanged. Symlinks along the
+/// path are never resolved into the result: the macOS bundle keeps
+/// `Contents/MacOS/toolport-gateway` as a link on purpose, and older configs use it.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn tidy_existing_path(path: PathBuf) -> PathBuf {
+    let tidy = lexically_normalized(&path);
+    if tidy == path {
+        return path;
+    }
+    match (std::fs::canonicalize(&path), std::fs::canonicalize(&tidy)) {
+        (Ok(real), Ok(tidy_real)) if real == tidy_real => tidy,
+        _ => path,
+    }
+}
+
+/// Whether two stored gateway commands name the same path once `.`/`..` are
+/// collapsed. Entries written before the gateway path was tidied still carry
+/// `Contents/MacOS/../Helpers/...`; they are the current binary, not stale ones.
+fn same_gateway_spelling(stored: &str, current: &str) -> bool {
+    stored == current
+        || lexically_normalized(Path::new(stored)) == lexically_normalized(Path::new(current))
 }
 
 /// Copy the gateway binary to a stable per-user location, so a client config can
@@ -7793,7 +8483,15 @@ fn edit_crush_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), St
 }
 
 fn edit_copilot_json_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
-    edit_json_gateway_with(path, "mcpServers", entry, false, None, false, true)
+    edit_json_gateway_with(
+        path,
+        "mcpServers",
+        entry,
+        false,
+        Some(entry_to_copilot_json),
+        false,
+        true,
+    )
 }
 
 fn edit_droid_json_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
@@ -7950,16 +8648,34 @@ fn edit_opencode_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(),
         None => serde_json::Value::Object(serde_json::Map::new()),
     };
     let mcp = opencode_mcp_mut(&mut root)?;
-    mcp.retain(|name, value| {
-        !gateway_edit_matches(
+    let ours = |name: &String, value: &serde_json::Value| {
+        gateway_edit_matches(
             name,
             value["command"]
                 .as_array()
                 .and_then(|argv| argv.first())
                 .and_then(|value| value.as_str()),
         )
-    });
-    if let Some(entry) = entry {
+    };
+    let containers: Vec<String> = mcp
+        .keys()
+        .filter(|key| opencode_container_key(mcp, key))
+        .cloned()
+        .collect();
+    let native = opencode_uses_server_map(mcp);
+    mcp.retain(|name, value| containers.contains(name) || !ours(name, value));
+    if native {
+        // A file OpenCode 2.x already wrote gets the 2.x shape; any 1.x entry of
+        // ours beside it was removed above, so only one Toolport entry remains.
+        let map = mcp
+            .get_mut("servers")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("'mcp.servers' must be an object; leaving the client config untouched.")?;
+        map.retain(|name, value| !ours(name, value));
+        if let Some(entry) = entry {
+            map.insert(GATEWAY_ENTRY_NAME.into(), entry_to_opencode_v2_json(entry));
+        }
+    } else if let Some(entry) = entry {
         mcp.insert(GATEWAY_ENTRY_NAME.into(), entry_to_opencode_json(entry));
     }
     atomic_write_json_config(path, original.as_deref(), &root, "mcp")
@@ -8059,6 +8775,7 @@ fn config_is_whole_app_state(client_id: &str) -> bool {
             | "reasonix"
             | "openclaw"
             | "nanobot"
+            | "tabnine-cli"
     )
 }
 
@@ -8105,6 +8822,15 @@ fn edit_format(
 ) -> Result<(), String> {
     match format {
         Format::JsonMcpServers => edit_json_gateway(path, "mcpServers", entry, lenient)?,
+        Format::JsonCursorMcpServers => edit_json_gateway_with(
+            path,
+            "mcpServers",
+            entry,
+            lenient,
+            Some(entry_to_typed_json),
+            false,
+            false,
+        )?,
         Format::JsonCopilotMcpServers => edit_copilot_json_gateway(path, entry)?,
         Format::JsonDroidMcpServers => edit_droid_json_gateway(path, entry)?,
         Format::JsonAmpMcpServers => edit_json_gateway(path, "amp.mcpServers", entry, true)?,
@@ -8115,7 +8841,15 @@ fn edit_format(
         Format::JsonOpenClawMcp => openclaw::edit_gateway(path, entry)?,
         Format::JsonOpenHandsMcpServers => openhands::edit_gateway(path, entry)?,
         Format::JsonNanobotMcp => nanobot::edit_gateway(path, entry)?,
-        Format::JsonServers => edit_json_gateway(path, "servers", entry, lenient)?,
+        Format::JsonServers => edit_json_gateway_with(
+            path,
+            "servers",
+            entry,
+            lenient,
+            Some(entry_to_typed_json),
+            false,
+            false,
+        )?,
         Format::JsonMcp => edit_crush_gateway(path, entry)?,
         Format::JsonOpenCodeMcp => edit_opencode_gateway(path, entry)?,
         Format::JsonContextServers => edit_json_gateway(path, "context_servers", entry, true)?,
@@ -8144,7 +8878,13 @@ fn backfill_gateway_identity(
 /// `profile` scopes the client to one profile via `TOOLPORT_PROFILE` (None = all).
 pub fn install_gateway(client_id: &str, profile: Option<&str>) -> Result<WriteOutcome, String> {
     let entry = gateway_entry(profile, client_id)?;
-    install_or_remove(client_id, Some(&entry))
+    let mut outcome = install_or_remove(client_id, Some(&entry))?;
+    // Older files the client may still read get the same entry; ones it no longer
+    // reads lose the entry an older Toolport left there.
+    outcome
+        .warnings
+        .extend(relocate::after_connect(client_id, &entry));
+    Ok(outcome)
 }
 
 /// Remove Toolport's gateway entry from a client's config, first putting back
@@ -8156,13 +8896,16 @@ pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
     if let Some(location) = &def.location {
         locations::remember(location)?;
     }
-    mutation::run(client_id, &path, def.format, || {
+    let mut outcome = mutation::run(client_id, &path, def.format, || {
         let mut outcome = revision_outcome(client_id, uninstall_gateway_inner(client_id))?;
         outcome
             .warnings
             .extend(disconnect_warnings(def.format, &path)?);
         Ok(outcome)
-    })
+    })?;
+    // Disconnect leaves no Toolport entry behind in a file the client used to read.
+    outcome.warnings.extend(relocate::clean(client_id, None));
+    Ok(outcome)
 }
 
 fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
@@ -8365,7 +9108,7 @@ fn command_is_gateway_binary(stored: &str) -> bool {
 /// unversioned `toolport-gateway` binary in place, so existence alone does not
 /// make that command path current.
 fn gateway_command_is_stale(stored: &str, current: &str) -> bool {
-    if stored.is_empty() || stored == current {
+    if stored.is_empty() || same_gateway_spelling(stored, current) {
         return false;
     }
     #[cfg(not(windows))]
@@ -8595,7 +9338,19 @@ pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> Repoin
     // Preserve paths cached by clients before their on-disk configs are repointed.
     #[cfg(target_os = "linux")]
     let before = referenced_gateway_paths();
-    let mut outcome = repoint_stale_gateways_in(&current, detect_clients(), managed);
+    // Move connections out of files a client no longer reads first, so the pass
+    // below sees (and keeps maintaining) the entry where the client reads it.
+    let relocated = relocate::relocate_all(&current, managed);
+    let mut managed = managed.clone();
+    for (id, entry) in &relocated.repointed {
+        managed.insert(id.clone(), entry.clone());
+    }
+    let mut outcome = repoint_stale_gateways_in(&current, detect_clients(), &managed);
+    // A client the pass below rewrote again keeps that later ownership snapshot.
+    let mut moved = relocated.repointed;
+    moved.retain(|(id, _)| !outcome.repointed.iter().any(|(later, _)| later == id));
+    outcome.repointed.splice(0..0, moved);
+    outcome.failed.extend(relocated.failed);
     repoint_other_claude_configs(&current, &mut outcome);
     log_repoint_outcome(&current, &outcome);
     #[cfg(target_os = "linux")]
@@ -8800,6 +9555,18 @@ fn repoint_stale_gateways_in(
             outcome.customized.push(client.id.clone());
             continue;
         }
+        // Entries written before a client's format required a field (VS Code's
+        // `type`) get just that field added; the rest stays as the user left it.
+        if let Err(error) = backfill_client_fields(&client.id, entry_name) {
+            let msg = format!(
+                "toolport: could not add required fields to {}'s gateway entry: {error}",
+                client.id
+            );
+            eprintln!("{msg}");
+            crate::gatewaylog::append(&msg);
+            outcome.failed.push((client.id.clone(), error));
+            continue;
+        }
         // Raw config text for profile preservation + legacy CONDUIT_* env detection.
         let config_text = find_def(&client.id)
             .and_then(|def| resolved_definition_path(&def).ok())
@@ -8943,6 +9710,44 @@ fn repoint_stale_gateways_in(
         }
     }
     outcome
+}
+
+/// [`backfill_required_fields`] for one client's owned entry, under the config lock
+/// and with a backup first. A no-op for formats without required fields and for an
+/// entry that already has them, so the file is only touched when it needs it.
+fn backfill_client_fields(client_id: &str, entry_name: &str) -> Result<(), String> {
+    let Some(def) = find_def(client_id) else {
+        return Ok(());
+    };
+    if !matches!(
+        def.format,
+        Format::JsonServers | Format::JsonCursorMcpServers | Format::JsonCopilotMcpServers
+    ) {
+        return Ok(());
+    }
+    let path = resolved_definition_path(&def)?;
+    let needed = |text: &str| -> Result<bool, String> {
+        let root = read_existing_json(text, true)?;
+        let key = if matches!(def.format, Format::JsonServers) {
+            "servers"
+        } else {
+            "mcpServers"
+        };
+        Ok(root
+            .get(key)
+            .and_then(|servers| servers.get(entry_name))
+            .is_some_and(|entry| !missing_required_fields(def.format, entry).is_empty()))
+    };
+    if !needed(&read_config_file(&path)?)? {
+        return Ok(());
+    }
+    mutation::run(client_id, &path, def.format, || {
+        if needed(&read_config_file(&path)?)? {
+            backup_file(client_id, &path)?;
+            backfill_required_fields(def.format, &path, entry_name)?;
+        }
+        Ok(())
+    })
 }
 
 /// Repair Toolport's entry in every Claude Code config EXCEPT the one
@@ -10661,54 +11466,66 @@ mod tests {
         std::env::temp_dir().join(format!("conduit-w-{}-{}.cfg", std::process::id(), label))
     }
 
-    /// The Windows Hermes desktop build writes `%LOCALAPPDATA%\hermes\config.yaml`,
-    /// not `~/.hermes/config.yaml`, so resolving only the home path left an
-    /// installed Hermes undetectable with no way to connect it. The canonical path
-    /// still wins when it exists, so nobody with an existing config is repointed.
+    /// Hermes resolves its home as `hermes_constants.get_hermes_home` does: the
+    /// Windows build always reads `%LOCALAPPDATA%\hermes`, never `~\.hermes`, and
+    /// `HERMES_HOME` / `HERMES_DATA_DIR_SUFFIX` move it on every OS.
     #[test]
-    fn hermes_path_falls_back_to_the_platform_dir_only_when_home_has_no_config() {
-        let root = std::env::temp_dir().join(format!("toolport-hermes-{}", std::process::id()));
-        std::fs::remove_dir_all(&root).ok();
-        let home_cfg = root.join("home").join(".hermes").join("config.yaml");
-        let local = root.join("local");
-        let local_cfg = local.join("hermes").join("config.yaml");
-
-        // Neither exists: a first write must still land where the installed build
-        // reads. Returning the home path here would write a config into `~/.hermes`
-        // that Hermes never opens, so connecting would silently do nothing.
+    fn hermes_path_follows_hermes_home_suffix_and_windows_local_app_data() {
+        let none = |_: &str| None;
+        for platform in Platform::ALL {
+            let home = mock_home(platform);
+            let expected = match platform {
+                Platform::Windows => home.join("AppData").join("Local").join("hermes"),
+                Platform::MacOs | Platform::Linux => home.join(".hermes"),
+            };
+            assert_eq!(
+                resolve_hermes_path(&home, platform, &none),
+                expected.join("config.yaml"),
+                "{platform:?}"
+            );
+        }
+        let home = mock_home(Platform::Windows);
+        // Even an existing `~\.hermes` no longer wins on Windows (Hermes never reads it).
+        let local = std::env::temp_dir().join("toolport-hermes-local");
+        let env = |key: &str| match key {
+            "LOCALAPPDATA" => Some(local.clone().into_os_string()),
+            "HERMES_DATA_DIR_SUFFIX" => Some("-work".into()),
+            _ => None,
+        };
         assert_eq!(
-            resolve_hermes_path(home_cfg.clone(), Some(local.clone())),
-            local_cfg,
-            "a fresh Windows config must be written where Hermes reads it"
+            resolve_hermes_path(&home, Platform::Windows, &env),
+            local.join("hermes-work").join("config.yaml")
         );
-
-        // Only the platform dir has a config: that is the file Hermes actually reads.
-        std::fs::create_dir_all(local_cfg.parent().unwrap()).unwrap();
-        std::fs::write(&local_cfg, "mcp_servers: {}\n").unwrap();
+        let unix = mock_home(Platform::Linux);
+        let suffix = |key: &str| (key == "HERMES_DATA_DIR_SUFFIX").then(|| "2".into());
         assert_eq!(
-            resolve_hermes_path(home_cfg.clone(), Some(local.clone())),
-            local_cfg,
-            "an installed Hermes must be found in the platform data dir"
+            resolve_hermes_path(&unix, Platform::Linux, &suffix),
+            unix.join(".hermes2").join("config.yaml")
         );
-
-        // Both exist: the canonical path wins, so an existing setup is untouched.
-        std::fs::create_dir_all(home_cfg.parent().unwrap()).unwrap();
-        std::fs::write(&home_cfg, "mcp_servers: {}\n").unwrap();
+        let relocated = std::env::temp_dir().join("toolport-hermes-home");
+        for platform in Platform::ALL {
+            let home = mock_home(platform);
+            let padded = format!("  {}  ", relocated.display());
+            let env = |key: &str| (key == "HERMES_HOME").then(|| padded.clone().into());
+            assert_eq!(
+                resolve_hermes_path(&home, platform, &env),
+                relocated.join("config.yaml"),
+                "{platform:?}"
+            );
+            // Relative values are Hermes' cwd, which Toolport cannot know.
+            let relative = |key: &str| (key == "HERMES_HOME").then(|| "work/hermes".into());
+            assert_eq!(
+                resolve_hermes_path(&home, platform, &relative),
+                resolve_hermes_path(&home, platform, &none),
+                "{platform:?}"
+            );
+        }
+        let tilde_home = std::env::temp_dir().join("toolport-hermes-tilde");
+        let tilde = |key: &str| (key == "HERMES_HOME").then(|| "~/hermes-alt".into());
         assert_eq!(
-            resolve_hermes_path(home_cfg.clone(), Some(local.clone())),
-            home_cfg,
-            "an existing home config must never be silently repointed"
+            resolve_hermes_path(&tilde_home, Platform::Linux, &tilde),
+            tilde_home.join("hermes-alt").join("config.yaml")
         );
-
-        // No platform dir at all (macOS / Linux pass None): canonical, no probing.
-        std::fs::remove_file(&home_cfg).unwrap();
-        assert_eq!(
-            resolve_hermes_path(home_cfg.clone(), None),
-            home_cfg,
-            "platforms without the fallback resolve the home path unchanged"
-        );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// SOU-433: config backups carry a live Shared HTTP bearer, so the directory
@@ -14609,14 +15426,31 @@ command = "npx"
     }
 
     #[test]
-    fn devin_clients_keep_legacy_and_current_configs_distinct() {
-        let legacy = defs().into_iter().find(|d| d.id == "windsurf").unwrap();
-        let current = defs().into_iter().find(|d| d.id == "devin-cli").unwrap();
-        assert_eq!(legacy.name, "Devin Desktop (Cascade)");
-        assert_eq!(current.name, "Devin Local / CLI");
-        assert!(matches!(legacy.format, Format::JsonMcpServers));
-        assert!(matches!(current.format, Format::JsonMcpServers));
-        assert_ne!((legacy.path)(), (current.path)());
+    fn devin_desktop_and_cli_share_the_devin_config() {
+        // Cascade reads the Devin file now; `~/.codeium/windsurf` only feeds its
+        // optional discovery, so it is a legacy file that Toolport cleans up.
+        let desktop = defs().into_iter().find(|d| d.id == "windsurf").unwrap();
+        let cli = defs().into_iter().find(|d| d.id == "devin-cli").unwrap();
+        assert_eq!(desktop.name, "Devin Desktop (Cascade)");
+        assert_eq!(cli.name, "Devin Local / CLI");
+        assert!(matches!(desktop.format, Format::JsonMcpServers));
+        assert!(matches!(cli.format, Format::JsonMcpServers));
+        assert_eq!((desktop.path)(), (cli.path)());
+        for platform in Platform::ALL {
+            let home = mock_home(platform);
+            assert_eq!(
+                relocate::resolve_legacy_config_paths("windsurf", &home, platform, &|_| None),
+                vec![home
+                    .join(".codeium")
+                    .join("windsurf")
+                    .join("mcp_config.json")],
+                "{platform:?}"
+            );
+            assert!(
+                relocate::resolve_legacy_config_paths("devin-cli", &home, platform, &|_| None)
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
@@ -14664,6 +15498,10 @@ command = "npx"
         assert_eq!(
             installed_json["mcpServers"][GATEWAY_ENTRY_NAME]["tools"],
             serde_json::json!(["*"])
+        );
+        assert_eq!(
+            installed_json["mcpServers"][GATEWAY_ENTRY_NAME]["type"],
+            serde_json::json!("local")
         );
 
         edit_copilot_json_gateway(&path, None).unwrap();
@@ -15931,15 +16769,14 @@ rules:
                     .join("Claude")
                     .join("claude_desktop_config.json")
             }),
-            ("cline", |home, platform| {
-                roaming_config_dir(home, platform)
-                    .join("Code")
-                    .join("User")
-                    .join("globalStorage")
-                    .join("saoudrizwan.claude-dev")
+            // Cline 4.1 moved out of VS Code storage on every OS.
+            ("cline", |home, _| {
+                home.join(".cline")
+                    .join("data")
                     .join("settings")
                     .join("cline_mcp_settings.json")
             }),
+            // Goose uses etcetera's XDG strategy on macOS as well as Linux.
             ("goose", |home, platform| match platform {
                 Platform::Windows => home
                     .join("AppData")
@@ -15948,13 +16785,9 @@ rules:
                     .join("goose")
                     .join("config")
                     .join("config.yaml"),
-                Platform::MacOs => home
-                    .join("Library")
-                    .join("Application Support")
-                    .join("Block")
-                    .join("goose")
-                    .join("config.yaml"),
-                Platform::Linux => home.join(".config").join("goose").join("config.yaml"),
+                Platform::MacOs | Platform::Linux => {
+                    home.join(".config").join("goose").join("config.yaml")
+                }
             }),
             ("zed", |home, platform| match platform {
                 Platform::Windows => home

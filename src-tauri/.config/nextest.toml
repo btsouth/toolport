@@ -12,6 +12,14 @@ platform = 'cfg(not(target_os = "linux"))'
 filter = "binary_id(conduit::one_gateway_conformance) and test(=matrix_cold_start_twenty_simultaneous_adapters_elect_exactly_one_daemon)"
 threads-required = "num-test-threads"
 
+# The installer preflight inventories every gateway process this user runs and
+# refuses to continue while one cannot be inspected. Other tests briefly make one
+# uninspectable: a gateway being stopped (Windows, mid-exit) or one whose binary is
+# chmod 000 (daemon_idle_exit). Tests that run the preflight run alone.
+[[profile.default.overrides]]
+filter = "binary_id(conduit::installer_preflight) or (binary_id(conduit::one_gateway_conformance) and test(=an_installer_stopping_the_daemon_mid_call_fails_that_call_and_the_client_recovers))"
+threads-required = "num-test-threads"
+
 # These secrets tests use the real per-user Windows Credential Manager. ENV_LOCK
 # serialized them under cargo test, but not across nextest processes. The
 # generation-swap case rewrites credentials as fast as it can, which can make

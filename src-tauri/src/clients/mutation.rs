@@ -278,7 +278,9 @@ fn run_inner<T>(
         && !matches!(
             client_id.split('@').next().unwrap_or(client_id),
             "vscode" | "zed" | "opencode" | "kilo-code" | "openclaw"
-        );
+        )
+        // A `.jsonc` file (Amp's `settings.jsonc`) is read with comments by its client.
+        && path.extension().is_none_or(|ext| ext != "jsonc");
     for _ in 0..3 {
         if !value(format, original.as_deref())?.is_object() {
             return Err("Client config root must be an object; leaving it untouched".into());

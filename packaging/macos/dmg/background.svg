@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="660" height="400" viewBox="0 0 660 400">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f7f8fa"/>
+      <stop offset="1" stop-color="#eceef2"/>
+    </linearGradient>
+  </defs>
+  <rect width="660" height="400" fill="url(#bg)"/>
+  <g fill="none" stroke="#9aa3b2" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M262 190 H392"/>
+    <path d="M374 172 L394 190 L374 208"/>
+  </g>
+  <text x="330" y="330" text-anchor="middle" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="15" fill="#5b6472">Drag Toolport to Applications to install it</text>
+</svg>

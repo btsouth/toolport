@@ -133,6 +133,8 @@ pub fn run() {
     app.connect_shutdown(|_| {
         crate::oauth_controller::cancel_all_attempts();
         crate::telemetry::shutdown();
+        // Quitting with no client connected leaves no gateway behind.
+        crate::daemon::stop_when_idle_on_app_quit();
     });
     app.run_with_args(&args);
     finish_allow_saves();

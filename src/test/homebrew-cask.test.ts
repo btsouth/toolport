@@ -1,7 +1,7 @@
-// Pins the in-repo Homebrew cask snapshot to package.json so a release
-// bump that forgets packaging/homebrew/toolport.rb fails CI. brew install
-// reads btsouth/homebrew-toolport, not this file; RELEASING.md is the
-// step that updates the live tap. SBS-936.
+// packaging/homebrew/toolport.rb is the only source of the tap's cask: the
+// tap's bump workflow copies it at each release tag and fills in version and
+// sha256. These tests pin its version to package.json and its uninstall and
+// zap behaviour to docs/uninstall.md. SBS-936.
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -32,21 +32,74 @@ describe("homebrew cask snapshot (packaging/homebrew/toolport.rb)", () => {
     expect(armSha?.[1]).not.toBe(intelSha?.[1]);
   });
 
-  it("keeps recovery data and directs users to explicit removal before uninstall", () => {
-    const zap = cask.match(/zap trash: \[([\s\S]*?)\n {2}\]/)?.[1];
-    expect(zap).toBeDefined();
-    expect([...zap!.matchAll(/"([^"\n]+)"/g)].map((match) => match[1])).toEqual([
+  it("restores clients on uninstall, never on upgrade or reinstall", () => {
+    const preflight = cask.match(/uninstall_preflight do([\s\S]*?)\n {2}end\n/)?.[1];
+    expect(preflight).toBeDefined();
+    // Homebrew runs this block for upgrades and reinstalls too. The call stack
+    // and the brew command line tell them apart, and both must agree.
+    for (const marker of [
+      "/cask/upgrade.rb",
+      "/cask/reinstall.rb",
+      "start_upgrade",
+      "uninstall_existing_cask",
+      '"/bin/ps", args: ["-o", "command=", "-p", Process.pid.to_s]',
+      "%r{/Homebrew/brew\\.rb\\s+(\\S+)}",
+      "%w[upgrade reinstall install].include?(brew_command)",
+      "%w[uninstall rm remove].include?(brew_command)",
+      "if stack_replacing && command_replacing",
+      "elsif stack_replacing || !command_uninstall",
+      "Toolport could not tell whether Homebrew is upgrading or removing it",
+    ]) {
+      expect(preflight).toContain(marker);
+    }
+    // The test-only switches can only hide a signal, never invent one.
+    expect(preflight).toContain(
+      'stack_replacing = false if ENV["HOMEBREW_TOOLPORT_CASK_TEST_IGNORE_STACK"] == "1"',
+    );
+    expect(preflight).toContain(
+      'brew_command = nil if ENV["HOMEBREW_TOOLPORT_CASK_TEST_IGNORE_COMMAND"] == "1"',
+    );
+    expect(preflight).toContain('args: ["--disconnect-all", "--uninstall"]');
+    expect(preflight).toContain('args: ["--remove-data", "--confirm"]');
+    expect(preflight).toContain('labels.include?("zap")');
+    expect(cask).toContain('uninstall quit: "com.tsout.conduit"');
+  });
+
+  it("removes data only on zap, and data folders only once emptied", () => {
+    const zap = cask.slice(cask.indexOf("  zap trash:"), cask.indexOf("  caveats"));
+    const trash = zap.match(/zap trash: \[([\s\S]*?)\]/)?.[1];
+    const rmdir = zap.match(/rmdir: \[([\s\S]*?)\]/)?.[1];
+    const paths = (list?: string) =>
+      [...(list ?? "").matchAll(/"([^"\n]+)"/g)].map((m) => m[1]);
+    expect(paths(trash)).toEqual([
+      "~/Library/Application Support/com.tsout.conduit",
       "~/Library/Caches/com.tsout.conduit",
       "~/Library/HTTPStorages/com.tsout.conduit",
       "~/Library/Preferences/com.tsout.conduit.plist",
       "~/Library/Saved Application State/com.tsout.conduit.savedState",
       "~/Library/WebKit/com.tsout.conduit",
     ]);
-    expect(zap).not.toMatch(/Application Support|registry|conduit-mcp/);
-    expect(cask).toContain("Uninstall keeps data and credentials");
-    expect(cask).toContain("but keeps the registry, recovery data and credentials");
-    expect(cask).toContain('"Remove Toolport data" in Settings before uninstalling');
-    expect(cask).toContain("--disconnect-all");
+    // The data folders are never trashed: Toolport's own removal empties them
+    // and keeps the registry when a credential could not be removed.
+    expect(trash).not.toMatch(
+      /Application Support\/(Toolport|Conduit)|registry|conduit-mcp/,
+    );
+    expect(paths(rmdir)).toEqual([
+      "~/Library/Application Support/Conduit",
+      "~/Library/Application Support/Toolport",
+    ]);
+  });
+
+  it("matches what docs/uninstall.md says the cask does", () => {
+    const docs = readFileSync(join(repoRoot, "docs", "uninstall.md"), "utf8");
+    expect(docs).toContain("brew uninstall --cask toolport");
+    expect(docs).toContain("Upgrades and reinstalls skip it");
+    expect(docs).toContain("brew uninstall --cask --zap toolport");
+    expect(docs).toContain("--remove-data --confirm");
+    expect(docs).toContain("Plain `brew uninstall` never removes");
+    expect(cask).toContain(
+      "brew uninstall restores every client's config and keeps Toolport's data",
+    );
   });
 
   it("points at the published darwin dmgs for this version", () => {

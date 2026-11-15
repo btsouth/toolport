@@ -340,6 +340,310 @@ pub fn request_shutdown_if_idle(descriptor: &DaemonDescriptor) -> Result<(), Str
         .map_err(|error| format!("could not request idle daemon shutdown: {error}"))
 }
 
+/// What [`stop_when_idle`] found for one advertised daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdleStop {
+    /// It exited (or was already gone).
+    Stopped(u32),
+    /// It accepted the request but is still serving a client session. It exits
+    /// on its own as soon as that session ends.
+    Serving(u32),
+    /// It could not be asked: its identity did not check out, or the request failed.
+    Failed(u32, String),
+}
+
+/// Ask every daemon this data directory advertises to exit once no client
+/// session is open, then wait up to `wait` for the idle ones to go. A daemon
+/// whose identity does not authenticate against its descriptor is never asked:
+/// it may be an unrelated process that reused the pid.
+///
+/// Used when Toolport's own presence ends: the app quits ("no wait"), the user
+/// removes Toolport from every client, or an uninstaller runs `--disconnect-all`.
+/// A daemon serving a live client keeps serving; the request stays set inside it,
+/// so it exits the moment that client disconnects instead of after the idle grace.
+pub fn stop_when_idle(data_dir: &Path, wait: Duration) -> Vec<IdleStop> {
+    let mut asked = Vec::new();
+    let mut outcomes = Vec::new();
+    for path in purge_descriptors(data_dir) {
+        let Some(descriptor) = read_descriptor(&path) else {
+            continue;
+        };
+        let pid = descriptor.pid;
+        let request = match attempt_identity_probe(&descriptor) {
+            Ok(identity) if identity.pid == pid && identity.compat == descriptor.compat => {
+                request_shutdown_if_idle(&descriptor)
+            }
+            Ok(_) => Err("its identity does not match its descriptor".to_string()),
+            // Nothing is listening: the daemon is already gone.
+            Err(ProbeFailure::Unreachable) if !process_exists(pid) => {
+                outcomes.push(IdleStop::Stopped(pid));
+                continue;
+            }
+            Err(ProbeFailure::Unreachable | ProbeFailure::Answered(_)) => {
+                Err("it does not answer as a Toolport daemon".to_string())
+            }
+            Err(ProbeFailure::Silent) => Err("it did not answer".to_string()),
+        };
+        match request {
+            Ok(()) => asked.push(pid),
+            Err(error) => outcomes.push(IdleStop::Failed(pid, error)),
+        }
+    }
+    let deadline = Instant::now() + wait;
+    loop {
+        let running = asked.iter().any(|pid| process_exists(*pid));
+        if !running || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::park_timeout(Duration::from_millis(50));
+    }
+    outcomes.extend(asked.into_iter().map(|pid| {
+        if process_exists(pid) {
+            IdleStop::Serving(pid)
+        } else {
+            IdleStop::Stopped(pid)
+        }
+    }));
+    outcomes
+}
+
+/// Called as the desktop app (either shell) exits: ask this data directory's
+/// daemons to stop once no client is connected. Never blocks the quit for long;
+/// a wedged daemon is left to its idle grace.
+pub fn stop_when_idle_on_app_quit() {
+    let Some(dir) = registry::conduit_dir() else {
+        return;
+    };
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let outcomes = stop_when_idle(&dir, Duration::ZERO);
+        for line in describe_idle_stops(&outcomes) {
+            crate::gatewaylog::append(&format!("app quit: {line}"));
+        }
+        let _ = done.send(());
+    });
+    let _ = finished.recv_timeout(Duration::from_secs(3));
+}
+
+/// After Toolport was removed from every client (Settings, `--disconnect-all`,
+/// or an uninstaller): stop the daemons that no connected client still uses.
+pub fn stop_when_idle_after_disconnect() -> Vec<String> {
+    let Some(dir) = registry::conduit_dir() else {
+        return Vec::new();
+    };
+    let lines = describe_idle_stops(&stop_when_idle(&dir, Duration::from_secs(5)));
+    for line in &lines {
+        crate::gatewaylog::append(&format!("disconnect all: {line}"));
+    }
+    lines
+}
+
+/// One line per outcome for logs and stderr.
+pub fn describe_idle_stops(outcomes: &[IdleStop]) -> Vec<String> {
+    outcomes
+        .iter()
+        .map(|outcome| match outcome {
+            IdleStop::Stopped(pid) => format!("Toolport daemon pid {pid} stopped."),
+            IdleStop::Serving(pid) => format!(
+                "Toolport daemon pid {pid} is serving a connected client; it stops when that client disconnects."
+            ),
+            IdleStop::Failed(pid, error) => {
+                format!("Toolport daemon pid {pid} was not stopped: {error}.")
+            }
+        })
+        .collect()
+}
+
+/// The identity of the executable a daemon was started from, so it can notice
+/// that its app was deleted, moved to the Trash, or replaced by a package
+/// upgrade. Every OS compares size and modification time, which catches a copy
+/// written in place over the file (`cp`, some package managers). Unix also
+/// compares device and inode, which catches a new file renamed over the path.
+/// Windows uses size and modification time only: it cannot delete or overwrite
+/// a running image, but it can rename one, and stable `std` exposes no file
+/// index there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutableIdentity {
+    path: PathBuf,
+    id: FileId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileId {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl FileId {
+    fn of(path: &Path) -> std::io::Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            #[cfg(unix)]
+            dev: metadata.dev(),
+            #[cfg(unix)]
+            ino: metadata.ino(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
+/// What one look at the executable's path found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryCheck {
+    /// The same file is still there.
+    Same,
+    /// A different file is at the path (replaced, or rewritten in place).
+    Changed,
+    /// Nothing is at the path.
+    Missing,
+    /// The path could not be read (permissions, a volume that is not ready).
+    /// Never evidence that the app is gone.
+    Unknown,
+}
+
+/// Nothing at the path: the file, or a folder above it, is gone.
+fn says_missing(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+impl ExecutableIdentity {
+    pub fn of(path: &Path) -> std::io::Result<Self> {
+        // Resolve `Contents/MacOS/../Helpers/...` and symlinks now: after the
+        // app moves, the launch path no longer resolves at all.
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let id = FileId::of(&path)?;
+        Ok(Self { path, id })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Look at the path the process started from once.
+    pub fn check(&self) -> BinaryCheck {
+        match FileId::of(&self.path) {
+            Ok(id) if id == self.id => BinaryCheck::Same,
+            Ok(_) => BinaryCheck::Changed,
+            Err(error) if says_missing(&error) => BinaryCheck::Missing,
+            Err(_) => BinaryCheck::Unknown,
+        }
+    }
+
+    /// Whether the file the process started from is still at its path.
+    pub fn still_installed(&self) -> bool {
+        self.check() == BinaryCheck::Same
+    }
+}
+
+/// Minimum spacing between two counted looks at the executable.
+pub const BINARY_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+/// Consecutive changed-or-missing looks, at least [`BINARY_CHECK_INTERVAL`]
+/// apart, before the daemon treats its app as gone: the mismatch must hold for
+/// at least four seconds of awake time. `Instant` does not advance while the
+/// machine sleeps, so a wake cannot shortcut the window.
+pub const BINARY_CONFIRMATIONS: u32 = 3;
+
+/// Watches the daemon's own executable and decides, conservatively, when its
+/// app is gone. A look that cannot read the path (`Unknown`) or finds the same
+/// file again resets the count, so a volume that drops for a moment or a path
+/// that is unreadable for a while never counts. When the identity could not be
+/// taken at startup, a later look takes it instead of giving up.
+#[derive(Debug)]
+pub struct BinaryWatch {
+    launch: Option<PathBuf>,
+    identity: Option<ExecutableIdentity>,
+    streak: u32,
+    last: Option<Instant>,
+    gone: bool,
+}
+
+impl BinaryWatch {
+    /// Watch this process's executable.
+    pub fn current() -> Self {
+        let launch = std::env::current_exe().ok();
+        let identity = launch
+            .as_deref()
+            .and_then(|path| ExecutableIdentity::of(path).ok());
+        Self::new(launch, identity)
+    }
+
+    /// Watch `path`, as if the process had started from it.
+    pub fn of(path: &Path) -> Self {
+        Self::new(Some(path.to_path_buf()), ExecutableIdentity::of(path).ok())
+    }
+
+    fn new(launch: Option<PathBuf>, identity: Option<ExecutableIdentity>) -> Self {
+        Self {
+            launch,
+            identity,
+            streak: 0,
+            last: None,
+            gone: false,
+        }
+    }
+
+    /// The executable's path, once known.
+    pub fn path(&self) -> Option<&Path> {
+        self.identity
+            .as_ref()
+            .map(ExecutableIdentity::path)
+            .or(self.launch.as_deref())
+    }
+
+    /// Look at the executable if [`BINARY_CHECK_INTERVAL`] has passed since the
+    /// last look. Returns true once the app is confirmed gone, and from then on.
+    pub fn poll(&mut self, now: Instant) -> bool {
+        let due = self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= BINARY_CHECK_INTERVAL);
+        if self.gone || !due {
+            return self.gone;
+        }
+        let check = self.look();
+        self.record(now, check)
+    }
+
+    fn look(&mut self) -> BinaryCheck {
+        if let Some(identity) = &self.identity {
+            return identity.check();
+        }
+        if self.launch.is_none() {
+            self.launch = std::env::current_exe().ok();
+        }
+        let Some(launch) = self.launch.as_deref() else {
+            return BinaryCheck::Unknown;
+        };
+        match ExecutableIdentity::of(launch) {
+            Ok(identity) => {
+                self.identity = Some(identity);
+                BinaryCheck::Same
+            }
+            Err(error) if says_missing(&error) => BinaryCheck::Missing,
+            Err(_) => BinaryCheck::Unknown,
+        }
+    }
+
+    fn record(&mut self, now: Instant, check: BinaryCheck) -> bool {
+        self.last = Some(now);
+        match check {
+            BinaryCheck::Same | BinaryCheck::Unknown => self.streak = 0,
+            BinaryCheck::Changed | BinaryCheck::Missing => self.streak += 1,
+        }
+        self.gone = self.streak >= BINARY_CONFIRMATIONS;
+        self.gone
+    }
+}
+
 /// Stale or malformed descriptors are data, not live-process evidence.
 fn purge_descriptors(data_dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(data_dir)
@@ -878,11 +1182,15 @@ impl Rendezvous {
         known: Option<&DaemonDescriptor>,
     ) -> Result<DaemonDescriptor, String> {
         let deadline = Instant::now() + READY_TIMEOUT;
+        // A new daemon usually answers within a few milliseconds, so start with
+        // short polls instead of making every cold start wait a full READY_POLL.
+        let mut poll = Duration::from_millis(5);
         while Instant::now() < deadline {
             if let Probe::Live(descriptor) = self.probe_with_budget(path, budget, known, false)? {
                 return Ok(descriptor);
             }
-            std::thread::sleep(READY_POLL);
+            std::thread::sleep(poll);
+            poll = (poll * 2).min(READY_POLL);
         }
         Err("the daemon did not become ready before the deadline".to_string())
     }
@@ -1077,6 +1385,116 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn executable_identity_sees_an_in_place_rewrite() {
+        // `cp` over the file, or a package manager writing in place, keeps the
+        // inode. The identity must still change, on every OS.
+        let dir = temp_dir("identity-rewrite");
+        let exe = dir.join("toolport-gateway");
+        std::fs::write(&exe, b"first build").unwrap();
+        let identity = ExecutableIdentity::of(&exe).expect("identity");
+        assert!(identity.still_installed());
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&exe)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"second, longer build").unwrap();
+        drop(file);
+        assert!(
+            !identity.still_installed(),
+            "an in-place rewrite went unseen"
+        );
+        assert_eq!(identity.check(), BinaryCheck::Changed);
+        std::fs::remove_file(&exe).unwrap();
+        assert_eq!(identity.check(), BinaryCheck::Missing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn binary_watch_needs_a_held_mismatch_and_ignores_unknown() {
+        use BinaryCheck::*;
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        // (case, looks two seconds apart, gone after the last one)
+        let cases: &[(&str, &[BinaryCheck], bool)] = &[
+            ("removed and held", &[Missing, Missing, Missing], true),
+            ("replaced and held", &[Changed, Missing, Changed], true),
+            ("two looks are not enough", &[Missing, Missing], false),
+            (
+                "a transient that recovers",
+                &[Missing, Missing, Same, Missing, Missing],
+                false,
+            ),
+            ("unreadable for a long time", &[Unknown; 10], false),
+            (
+                "unreadable between misses",
+                &[Missing, Unknown, Missing, Missing],
+                false,
+            ),
+            (
+                "unreadable then readable",
+                &[Unknown, Unknown, Unknown, Same, Same],
+                false,
+            ),
+        ];
+        for (case, looks, gone) in cases {
+            let mut watch = BinaryWatch::new(None, None);
+            let mut result = false;
+            for (i, check) in looks.iter().enumerate() {
+                result = watch.record(at(2 * i as u64), *check);
+            }
+            assert_eq!(result, *gone, "{case}");
+        }
+        // Once confirmed, it stays confirmed without looking again.
+        let mut watch = BinaryWatch::new(None, None);
+        for i in 0..3 {
+            watch.record(at(2 * i), Missing);
+        }
+        assert!(watch.poll(at(100)));
+    }
+
+    #[test]
+    fn binary_watch_spaces_its_looks_and_confirms_removal_of_a_real_file() {
+        let dir = temp_dir("binary-watch");
+        let exe = dir.join("toolport-gateway");
+        std::fs::write(&exe, b"build").unwrap();
+        let mut watch = BinaryWatch::of(&exe);
+        let start = Instant::now();
+        assert!(!watch.poll(start));
+        std::fs::remove_file(&exe).unwrap();
+        // Looks closer together than the interval do not count.
+        for ms in [100, 500, 1_000, 1_900] {
+            assert!(!watch.poll(start + Duration::from_millis(ms)));
+        }
+        assert_eq!(watch.streak, 0);
+        assert!(!watch.poll(start + Duration::from_secs(2)));
+        assert!(!watch.poll(start + Duration::from_secs(4)));
+        assert!(watch.poll(start + Duration::from_secs(6)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn binary_watch_takes_its_identity_later_when_startup_could_not() {
+        let dir = temp_dir("binary-watch-late");
+        let exe = dir.join("toolport-gateway");
+        // Not readable at startup (a volume still mounting): no identity yet.
+        let mut watch = BinaryWatch::of(&exe);
+        assert!(watch.identity.is_none());
+        let start = Instant::now();
+        assert!(!watch.poll(start));
+        std::fs::write(&exe, b"build").unwrap();
+        assert!(!watch.poll(start + Duration::from_secs(2)));
+        assert!(watch.identity.is_some(), "the identity was not taken later");
+        assert_eq!(watch.streak, 0);
+        // The late identity still notices a rewrite in place.
+        std::fs::write(&exe, b"rewritten build").unwrap();
+        assert!(!watch.poll(start + Duration::from_secs(4)));
+        assert!(!watch.poll(start + Duration::from_secs(6)));
+        assert!(watch.poll(start + Duration::from_secs(8)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         let mut random = [0u8; 8];

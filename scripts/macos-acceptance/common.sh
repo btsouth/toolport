@@ -105,6 +105,18 @@ wait_for() {
 # used instead of pgrep -f, which missed the app on the runner.
 pids_of() { ps -axo pid=,command= | grep -F -- "$1" | grep -v -e 'grep -F' | awk '{print $1}'; }
 
+# daemon_gone_check <check-name> <seconds>: no toolport-gateway daemon may be
+# left once nothing is connected. Toolport stops it on quit, on Remove from all
+# clients and when its binary is removed; waiting out the idle grace is a bug.
+daemon_gone_check() {
+  local name="$1" secs="$2"
+  if wait_for "$secs" bash -c "! ps -axo command= | grep -F 'toolport-gateway --daemon' | grep -vq grep"; then
+    pass "$name" "none within ${secs}s"
+  else
+    fail "$name" "still running after ${secs}s: $(ps -axo pid=,ppid=,command= | grep -F 'toolport-gateway --daemon' | grep -v grep | tr '\n' ' ' | cut -c1-300)"
+  fi
+}
+
 # The tool the UI and window probes use. Built by the workflow from tpui.swift.
 TPUI_BIN="${TPUI:-$EVIDENCE/bin/tpui}"
 # Every probe call is bounded: an unresponsive app makes each AX call wait.

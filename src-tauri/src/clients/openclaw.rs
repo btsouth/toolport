@@ -384,11 +384,22 @@ pub(crate) fn dirs(user_home: &Path, env: &dyn Fn(&str) -> Option<String>) -> Di
         .unwrap_or_else(|| user_home.to_path_buf());
     let expand = |raw: String| expand_from(&home, &raw);
     let primary = home.join(".openclaw");
+    // `OPENCLAW_PROFILE` selects `<home>/.openclaw-<profile>` when no state dir is
+    // set. OpenClaw ignores an invalid name and the literal `default`.
+    let profile = env("OPENCLAW_PROFILE").filter(|name| openclaw_profile_name(name));
+    let profiled = env("OPENCLAW_STATE_DIR").is_none() && profile.is_some();
     let (state, default_state) = match env("OPENCLAW_STATE_DIR").and_then(expand) {
         Some(dir) => {
             let default = dir == primary;
             (dir, default)
         }
+        None if profiled => (
+            home.join(format!(
+                ".openclaw-{}",
+                profile.as_deref().unwrap_or_default()
+            )),
+            false,
+        ),
         None => {
             let legacy = home.join(".clawdbot");
             let dir = if !primary.exists() && legacy.exists() {
@@ -402,6 +413,10 @@ pub(crate) fn dirs(user_home: &Path, env: &dyn Fn(&str) -> Option<String>) -> Di
     let config = env("OPENCLAW_CONFIG_PATH")
         .and_then(expand)
         .unwrap_or_else(|| {
+            // A profile's config is only ever the one in its own state dir.
+            if profiled {
+                return state.join("openclaw.json");
+            }
             // The active config is independent of the selected state directory.
             // Search every existing candidate before creating a canonical file.
             env("OPENCLAW_STATE_DIR")
@@ -429,6 +444,18 @@ pub(crate) fn dirs(user_home: &Path, env: &dyn Fn(&str) -> Option<String>) -> Di
         default_state,
         relative,
     }
+}
+
+/// OpenClaw's profile name rule, `^[a-z0-9][a-z0-9_-]{0,63}$` (any case), with
+/// `default` meaning no profile.
+fn openclaw_profile_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !name.eq_ignore_ascii_case("default")
+        && (1..=64).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
 }
 
 /// Match the packaged agents-list default selection. A fleet without a default,
