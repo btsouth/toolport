@@ -38,8 +38,11 @@ pub const SHORT_SECRET_CHARS: usize = 6;
 /// Upper bound on remembered values. OAuth access tokens rotate, so a long-lived
 /// daemon would otherwise grow this forever; the oldest values drop first.
 const MAX_SECRETS: usize = 4096;
-/// Files in the data directory the one-time scrub rewrites.
+/// Records which secrets (by `server/key`, never value) the scrub has covered.
 const SCRUB_MARKER: &str = "secret-scrub-v1.json";
+/// How long a scrub waits for another process's scrub of the same directory.
+/// Long enough for a multi-megabyte audit log on a slow disk.
+const SCRUB_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Clone)]
 struct Pattern {
@@ -969,6 +972,9 @@ fn held_open(path: &Path) -> bool {
 /// fits, padded with `*`), so concurrent `O_APPEND` writers and open descriptors
 /// are unaffected: nothing moves and the file is never replaced.
 fn mask_in_place(matcher: &Matcher, path: &Path) -> std::io::Result<bool> {
+    // The daemon's own stderr writes take no lock; this one keeps two scrubbers
+    // (or a scrub and a delete-time scrub) from masking the same file at once.
+    let _lock = crate::registry::lock_at(path).map_err(std::io::Error::other)?;
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true);
     // The live daemon holds this file as its stderr handle (append access, the
@@ -1056,7 +1062,17 @@ fn scrub_file_with(matcher: &Matcher, path: &Path) -> std::io::Result<bool> {
 /// Scrub every log file in `dir` for secrets not yet scrubbed there, then record
 /// their ids (names only, never values) in the marker so later starts skip the work.
 pub fn scrub_data_dir(dir: &Path) -> std::io::Result<usize> {
+    // Nothing on disk to scrub: create no lock or marker either, so a directory
+    // that was just purged (or never used) stays exactly as it is.
+    if !persisted_log_files(dir).iter().any(|path| path.is_file()) {
+        return Ok(0);
+    }
     let marker = dir.join(SCRUB_MARKER);
+    // One scrub per data directory at a time, across every process. The marker is
+    // read, the logs rewritten and the marker updated under this one lock, so a
+    // second process waits, then finds the work recorded and skips it.
+    let _scrub = crate::registry::lock_at_for(&dir.join("secret-scrub"), SCRUB_LOCK_WAIT)
+        .map_err(std::io::Error::other)?;
     let done: HashSet<String> = std::fs::read_to_string(&marker)
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
@@ -1097,7 +1113,6 @@ pub fn scrub_data_dir(dir: &Path) -> std::io::Result<usize> {
     ids.sort();
     ids.dedup();
     let body = serde_json::json!({ "v": 1, "scrubbed": ids }).to_string();
-    let _lock = crate::registry::lock_at(&marker).map_err(std::io::Error::other)?;
     crate::registry::atomic_write(&marker, &body).map_err(std::io::Error::other)?;
     Ok(rewritten)
 }
@@ -1105,9 +1120,20 @@ pub fn scrub_data_dir(dir: &Path) -> std::io::Result<usize> {
 static SCRUB_PENDING: Mutex<Option<PathBuf>> = Mutex::new(None);
 static SCRUB_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Turn on the background scrub for this process (gateway, daemon and app call it
-/// once their data directory is bound). Off by default so unit tests, which share
-/// one process and swap data directories, never get a stray rewrite.
+/// Whether a newly learned secret starts the background scrub.
+///
+/// On in every shipped process that can learn a secret: the gateway and daemon,
+/// the Tauri and GTK apps and the CLI all read secrets through [`register`], so
+/// all of them scrub, with no per-entry-point call to forget. The scrub itself is
+/// serialized across processes ([`scrub_data_dir`]). Unit tests share one process
+/// and swap data directories, so there it stays off unless a test turns it on.
+fn scrub_enabled() -> bool {
+    !cfg!(test) || SCRUB_ENABLED.load(Ordering::Acquire)
+}
+
+/// Turn on the background scrub explicitly (and scrub for anything already
+/// known). Shipped processes have it on already; kept for unit tests and as the
+/// gateway's prompt to scrub as soon as its data directory is bound.
 pub fn enable_background_scrub() {
     SCRUB_ENABLED.store(true, Ordering::Release);
     if ACTIVE.load(Ordering::Acquire) {
@@ -1115,12 +1141,24 @@ pub fn enable_background_scrub() {
     }
 }
 
+/// The data directory a secret learned now belongs to, without ever resolving
+/// (or, in test builds, panicking on) the developer's real directory.
+#[cfg(not(any(test, feature = "test-support")))]
+fn scrub_dir_now() -> Option<PathBuf> {
+    crate::registry::conduit_dir()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn scrub_dir_now() -> Option<PathBuf> {
+    scope_now()
+}
+
 fn schedule_scrub(_id: &str) {
-    if !SCRUB_ENABLED.load(Ordering::Acquire) {
+    if !scrub_enabled() {
         return;
     }
     // Capture the directory now: it is the one the secret was resolved for.
-    let Some(dir) = crate::registry::conduit_dir() else {
+    let Some(dir) = scrub_dir_now() else {
         return;
     };
     let mut pending = SCRUB_PENDING
@@ -1403,6 +1441,55 @@ mod tests {
         let names: Vec<&str> = found.iter().map(|(k, _)| k.as_str()).collect();
         assert!(names.contains(&"access_token") && names.contains(&"refresh_token"));
         assert!(!names.contains(&"token_endpoint") && !names.contains(&"token_type"));
+    }
+
+    #[test]
+    fn concurrent_scrubs_of_one_directory_rewrite_each_log_once() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-scrub-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        let secret = "race-scrub-secret-9d2b4e";
+        let leaked = |i: usize| {
+            serde_json::json!({"ok":false,"i":i,"error":format!("echo {secret}")}).to_string()
+        };
+        let body: String = (0..2000).map(|i| leaked(i) + "\n").collect();
+        std::fs::write(dir.join("audit.jsonl"), &body).unwrap();
+        std::fs::write(dir.join("security.jsonl"), &body).unwrap();
+        register("race-server", "RACE_KEY", secret);
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || scrub_data_dir(&dir).unwrap())
+            })
+            .collect();
+        let rewritten: usize = workers.into_iter().map(|w| w.join().unwrap()).sum();
+        assert_eq!(rewritten, 2, "each log rewritten by exactly one scrubber");
+        for name in ["audit.jsonl", "security.jsonl"] {
+            let text = std::fs::read_to_string(dir.join(name)).unwrap();
+            assert!(!text.contains(secret));
+            assert_eq!(text.lines().count(), 2000, "no line lost or duplicated");
+            assert!(text
+                .lines()
+                .all(|l| serde_json::from_str::<Value>(l).is_ok()));
+        }
+        let marker = std::fs::read_to_string(dir.join(SCRUB_MARKER)).unwrap();
+        assert_eq!(marker.matches("race-server/RACE_KEY").count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_directory_is_left_untouched() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-scrub-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        register("empty-server", "EMPTY_KEY", "empty-dir-secret-77aa");
+        assert_eq!(scrub_data_dir(&dir).unwrap(), 0);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
