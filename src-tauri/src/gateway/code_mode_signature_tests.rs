@@ -497,3 +497,46 @@ fn describe_and_stubs_follow_search_visibility() {
         assert_eq!(report["described"]["s__app"], Value::Null, "{report}");
     }
 }
+
+/// `describe` reports `truncated` and keeps the complete signature, recursive types
+/// declared ahead of it.
+#[test]
+fn run_script_describe_returns_complete_recursive_signatures() {
+    let _data = DataDirTestEnv::new("describe-recursive");
+    let tools = vec![json!({
+        "name": "tree__walk",
+        "description": "Walk a tree.",
+        "inputSchema": {"$ref": "#/$defs/Node", "$defs": {"Node": {"type": "object", "properties": {
+            "value": {"type": "string"},
+            "children": {"type": "array", "items": {"$ref": "#/$defs/Node"}}
+        }, "required": ["value"]}}}
+    })];
+    let router = Arc::new(Router::new());
+    let reg = Registry {
+        code_mode: true,
+        ..Default::default()
+    };
+    let script = "const d = toolport.describe('tree__walk'); return { sig: d.signature, truncated: d.truncated, reason: d.truncatedReason === undefined };";
+    let result = run_script_dispatch(
+        &reg,
+        Some(&router),
+        &tools,
+        None,
+        None,
+        None,
+        None,
+        &json!({"script": script}),
+        None,
+    );
+    assert_eq!(
+        result["structuredContent"]["result"],
+        json!({
+            "sig": "type Node = {children?: Node[]; value: string};\nservers.tree.walk(args: Node): ToolResult",
+            "truncated": false,
+            "reason": true
+        }),
+        "{result}"
+    );
+    let hit = tool_signature::signature(&tools[0]).unwrap();
+    assert!(hit.ends_with("/* Node: see toolport.describe */"), "{hit}");
+}

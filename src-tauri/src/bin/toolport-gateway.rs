@@ -6498,11 +6498,17 @@ fn script_describe_binding(tools: SharedTools, catalog: &[String]) -> codemode::
             .cloned()
             .unwrap_or_else(|| json!({}));
         integrity::neutralize_value_strings(&mut schema);
-        json!({
+        let full = tool_signature::full_signature(tool);
+        let mut described = json!({
             "name": name,
-            "signature": tool_signature::full_signature(tool),
+            "signature": full.as_ref().map(|full| full.signature.clone()),
             "inputSchema": schema,
-        })
+            "truncated": full.as_ref().is_some_and(|full| full.truncated.is_some()),
+        });
+        if let Some(reason) = full.and_then(|full| full.truncated) {
+            described["truncatedReason"] = Value::String(reason);
+        }
+        described
     })
 }
 

@@ -20,8 +20,9 @@
 //!   `.async(args)` for the Promise form. CamelCase aliases are added when they differ
 //!   from the sanitized tool segment (e.g. `create_refund` and `createRefund`).
 //! - `toolport.listTools()` / `toolport.listServers()` — catalog introspection
-//! - `toolport.describe(name)` — `{name, signature, inputSchema}` for an in-scope tool
-//!   (or a `servers.*` stub), `null` when the name is unknown
+//! - `toolport.describe(name)` — `{name, signature, inputSchema, truncated}` for an
+//!   in-scope tool (or a `servers.*` stub), `null` when the name is unknown, or
+//!   `{name, error, size, limit}` when the description is too large to return
 //! - `toolport.fetchResult({cursor, offset?, len?, projection?})` — page a previously
 //!   shaped result (cursor handoff / structured projection) without leaving the script
 //!
@@ -89,8 +90,8 @@ pub struct FetchArgs {
 /// Host binding for paging a shaped result by cursor (same cache as `toolport_fetch_result`).
 pub type FetchBinding = Arc<dyn Fn(FetchArgs) -> Value + Send + Sync>;
 
-/// Host binding for `toolport.describe(name)`: `{name, signature, inputSchema}` for an
-/// in-scope tool, `null` otherwise. A lookup, not a downstream call, so it is not
+/// Host binding for `toolport.describe(name)`: `{name, signature, inputSchema, truncated}`
+/// for an in-scope tool, `null` otherwise. A lookup, not a downstream call, so it is not
 /// counted against `max_calls` and never enters the progress ledger.
 pub type DescribeBinding = Arc<dyn Fn(&str) -> Value + Send + Sync>;
 
