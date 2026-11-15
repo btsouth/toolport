@@ -330,6 +330,7 @@ jobs:
           GTK_A11Y: none
         run: |
           for case in \
+            catalog::tests::escape_closes_the_suggestions_and_then_clears_the_search \
             teams::tests::member_review_native_shows_diff_labels_and_both_decisions \
             teams::tests::member_review_native_keeps_remaining_decisions_open \
             teams::tests::share_preview_explains_each_selection_and_its_route \

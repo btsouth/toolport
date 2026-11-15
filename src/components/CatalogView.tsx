@@ -190,6 +190,11 @@ export function CatalogView({ registry, onAdded }: Props) {
           )}
           className="h-11 pl-9 text-base"
           onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => {
+            // Escape leaves the search and returns to the browse list, as in
+            // the GTK catalog.
+            if (e.key === "Escape" && query !== "") setQuery("");
+          }}
         />
       </div>
 

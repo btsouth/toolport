@@ -151,6 +151,24 @@ describe("CatalogView search and installed identity", () => {
     expect(screen.getByText(/1 result/)).toBeInTheDocument();
   });
 
+  it("leaves the search and shows the browse list again on Escape", async () => {
+    const result = { ...entry, name: "Search-only result" };
+    vi.mocked(searchCatalog).mockResolvedValue({
+      entries: [result],
+      registryStatus: "available",
+    });
+    const user = userEvent.setup();
+    render(<CatalogView registry={registry} onAdded={vi.fn()} />);
+    const search = screen.getByRole("textbox");
+    await user.type(search, "github");
+    await screen.findByText(result.name);
+    await user.keyboard("{Escape}");
+    expect(search).toHaveValue("");
+    expect(await screen.findByText("Popular servers")).toBeInTheDocument();
+    expect(screen.queryByText(result.name)).not.toBeInTheDocument();
+    expect(search).toHaveFocus();
+  });
+
   it("does not call an outage with no curated matches no results", async () => {
     vi.mocked(searchCatalog).mockResolvedValue({
       entries: [],

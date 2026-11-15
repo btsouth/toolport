@@ -175,6 +175,29 @@ impl CatalogPage {
                 page_for_change.schedule_suggestions(entry.text().as_str());
             }
         });
+        // Escape closes the suggestions, from the search field (GTK's
+        // stop-search) or from inside the list after a click moved focus.
+        // With the list already closed, Escape clears the search, as in the
+        // React catalog.
+        let page_for_stop = catalog.clone();
+        catalog.search.connect_stop_search(move |entry| {
+            if page_for_stop.suggestion_popover.is_visible() {
+                page_for_stop.close_suggestions();
+            } else {
+                entry.set_text("");
+            }
+        });
+        let escape = gtk::EventControllerKey::new();
+        let page_for_escape = catalog.clone();
+        escape.connect_key_pressed(move |_, key, _, _| {
+            if key != gtk::gdk::Key::Escape {
+                return gtk::glib::Propagation::Proceed;
+            }
+            page_for_escape.close_suggestions();
+            page_for_escape.search.grab_focus();
+            gtk::glib::Propagation::Stop
+        });
+        catalog.suggestion_popover.add_controller(escape);
         let outside_click = gtk::GestureClick::new();
         outside_click.set_propagation_phase(gtk::PropagationPhase::Capture);
         let page_for_outside = catalog.clone();
@@ -967,16 +990,9 @@ mod tests {
         assert!(page.pending_notice.borrow().is_none());
     }
 
-    #[test]
-    #[ignore = "requires an isolated GTK desktop; run in omabox"]
-    fn catalog_outage_and_installed_states() {
-        adw::init().unwrap();
-        let app = adw::Application::builder()
-            .application_id("com.tsout.Toolport.CatalogFixture")
-            .build();
-        app.register(None::<&gtk::gio::Cancellable>).unwrap();
-        // Only the catalog is mounted. No broker, registry load or probes run.
-        let server_page = super::super::ServerPage {
+    /// Only the catalog is mounted. No broker, registry load or probes run.
+    fn catalog_only(app: &adw::Application) -> CatalogPage {
+        CatalogPage::new(super::super::ServerPage {
             details: Default::default(),
             app: app.clone(),
             share_requests: Default::default(),
@@ -994,8 +1010,88 @@ mod tests {
             off_heading: Default::default(),
             health: Default::default(),
             registry_reload: Default::default(),
+        })
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn escape_closes_the_suggestions_and_then_clears_the_search() {
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.CatalogEscapeFixture")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let _data = crate::registry::DataDirTestEnv::new("catalog-escape");
+        let page = catalog_only(&app);
+        page.registry_fetch.replace(Some(std::sync::Arc::new(|_| {
+            Err(crate::catalog::RegistryStatus::Unavailable)
+        })));
+        let window = adw::ApplicationWindow::builder()
+            .application(&app)
+            .default_width(1000)
+            .default_height(720)
+            .content(&page.root)
+            .build();
+        window.present();
+        let open = |page: &CatalogPage| {
+            page.search.set_text("github");
+            page.load_suggestions("github");
+            wait_until(|| page.suggestion_popover.is_visible());
         };
-        let page = CatalogPage::new(server_page);
+
+        // Escape in the search field closes the list and keeps the text.
+        open(&page);
+        page.search.emit_by_name::<()>("stop-search", &[]);
+        wait_until(|| !page.suggestion_popover.is_visible());
+        assert_eq!(page.search.text(), "github");
+
+        // Escape from inside the list closes it and returns to the field.
+        open(&page);
+        let escape = page
+            .suggestion_popover
+            .observe_controllers()
+            .into_iter()
+            .filter_map(Result::ok)
+            .find_map(|controller| controller.downcast::<gtk::EventControllerKey>().ok())
+            .expect("the suggestion list handles keys");
+        let handled = escape.emit_by_name::<bool>(
+            "key-pressed",
+            &[
+                &gtk::glib::translate::IntoGlib::into_glib(gtk::gdk::Key::Escape),
+                &0u32,
+                &gtk::gdk::ModifierType::empty(),
+            ],
+        );
+        assert!(handled);
+        wait_until(|| !page.suggestion_popover.is_visible());
+        assert_eq!(page.search.text(), "github");
+        let other = escape.emit_by_name::<bool>(
+            "key-pressed",
+            &[
+                &gtk::glib::translate::IntoGlib::into_glib(gtk::gdk::Key::a),
+                &0u32,
+                &gtk::gdk::ModifierType::empty(),
+            ],
+        );
+        assert!(!other, "other keys pass through");
+
+        // With the list closed, Escape clears the search.
+        page.search.emit_by_name::<()>("stop-search", &[]);
+        assert_eq!(page.search.text(), "");
+        assert!(!page.suggestion_popover.is_visible());
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn catalog_outage_and_installed_states() {
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.CatalogFixture")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let page = catalog_only(&app);
         let window = adw::ApplicationWindow::builder()
             .application(&app)
             .title("Toolport catalog fixture")
