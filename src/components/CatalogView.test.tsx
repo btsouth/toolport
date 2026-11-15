@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { addCatalogServer, popularCatalog, searchCatalog } from "@/lib/api";
@@ -167,6 +167,20 @@ describe("CatalogView search and installed identity", () => {
     expect(await screen.findByText("Popular servers")).toBeInTheDocument();
     expect(screen.queryByText(result.name)).not.toBeInTheDocument();
     expect(search).toHaveFocus();
+  });
+
+  it.each([
+    ["isComposing", { isComposing: true }],
+    ["the IME key code", { keyCode: 229 }],
+  ])("keeps the search when Escape cancels an input method (%s)", async (_, event) => {
+    const user = userEvent.setup();
+    render(<CatalogView registry={registry} onAdded={vi.fn()} />);
+    const search = screen.getByRole("textbox");
+    await user.type(search, "github");
+    fireEvent.keyDown(search, { key: "Escape", ...event });
+    expect(search).toHaveValue("github");
+    fireEvent.keyDown(search, { key: "Escape" });
+    expect(search).toHaveValue("");
   });
 
   it("does not call an outage with no curated matches no results", async () => {
