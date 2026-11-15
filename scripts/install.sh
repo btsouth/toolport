@@ -91,6 +91,15 @@ deb_supported() {
   done
 }
 
+rpm_supported() {
+  local distro version
+  distro="$(os_value ID)"; version="$(os_value VERSION_ID)"
+  case "$distro" in
+    fedora) version_at_least "$version" 40 ;;
+    *) return 1 ;;
+  esac
+}
+
 linux_plan() {
   linux_package=appimage
   linux_reason=""
@@ -106,12 +115,33 @@ linux_plan() {
     grep -qE '^(ID|ID_LIKE)=.*\barch\b' "$os_release" 2>/dev/null; then
     linux_package=pacman
   elif grep -qE '^(ID|ID_LIKE)=.*\b(fedora|rhel|centos)\b' "$os_release" 2>/dev/null; then
+    if command -v dnf >/dev/null 2>&1 && rpm_supported; then
+      linux_package=rpm
+      return
+    fi
     linux_reason="Using AppImage on this RPM distro; the manual GTK RPM needs GTK 4.14+, libadwaita 1.5+, GLib 2.80+ and glibc 2.39+ (older Fedora/RHEL do not meet these requirements)."
   fi
 }
 
+# Run after disconnecting clients, as the user who installed the AppImage.
+uninstall_appimage() {
+  local bindir="${XDG_BIN_HOME:-$HOME/.local/bin}"
+  local data="${XDG_DATA_HOME:-$HOME/.local/share}"
+  local config="${XDG_CONFIG_HOME:-$HOME/.config}"
+  rm -f -- "$bindir/toolport" "$data/applications/toolport.desktop"
+  for name in Toolport Conduit conduit ToolportNativePreview; do
+    rm -f -- "$config/autostart/$name.desktop"
+  done
+  for size in 32x32 128x128 256x256 512x512 scalable; do
+    rm -f -- "$data/icons/hicolor/$size/apps/toolport.png" "$data/icons/hicolor/$size/apps/conduit.png"
+  done
+  rm -f -- "$config/Toolport/http-bridge-update-resume.json"
+  say "Removed the AppImage, launcher, icons, autostart entries and update state. Client configs must be disconnected first; other Toolport data is retained."
+}
+
 # Offline and read-only: useful before installing and in minimal distro containers.
 case "${1:-}" in
+  --uninstall-appimage) uninstall_appimage; exit 0 ;;
   --print-plan)
     [ "$os" = Linux ] && [ "$arch" = x86_64 ] || err "Print-plan supports Linux x86_64 only."
     linux_plan
@@ -120,7 +150,7 @@ case "${1:-}" in
     exit 0
     ;;
   "") ;;
-  *) err "Usage: bash install.sh [--print-plan]" ;;
+  *) err "Usage: bash install.sh [--print-plan|--uninstall-appimage]" ;;
 esac
 
 need curl
@@ -297,6 +327,9 @@ install_arch_repo() {
       ;;
   esac
 
+  say "Initializing the local pacman keyring if needed"
+  $sudo pacman-key --init ||
+    err "The local pacman keyring could not be initialized. Run: sudo pacman-key --init; sudo pacman-key --populate archlinux. Then retry this installer."
   say "Importing the Toolport signing key"
   tmpkey="$tmp/toolport.gpg"
   curl -fsSL "$keyring_url" -o "$tmpkey" ||
@@ -304,7 +337,7 @@ install_arch_repo() {
   $sudo pacman-key --add "$tmpkey" ||
     err "pacman-key could not import the Toolport signing key."
   $sudo pacman-key --lsign-key "$repo_key_id" ||
-    err "pacman-key could not trust $repo_key_id. The key served by $keyring_url is not the one this installer expects."
+    err "pacman-key could not trust $repo_key_id. Check the pacman-key output above. Run: sudo pacman-key --init; sudo pacman-key --populate archlinux. If the key is missing, retry the download from $keyring_url."
 
   if grep -q '^\[toolport\]' "$pacman_conf" 2>/dev/null; then
     say "Toolport repository already configured"
@@ -350,6 +383,19 @@ install_linux() {
     return
   fi
 
+  if [ "$linux_package" = rpm ]; then
+    url="$(asset_url '_x86_64[.]rpm')"
+    [ -n "$url" ] || err "No RPM found in $tag_name."
+    download_and_verify "$url" "$tmp/toolport.rpm" "$(asset_field '_x86_64[.]rpm' digest)" "$(asset_field '_x86_64[.]rpm' size)"
+    sudo=""
+    if [ "$(id -u)" -ne 0 ]; then
+      command -v sudo >/dev/null 2>&1 && sudo="sudo" || err "Installing the RPM needs root: re-run as root or install sudo."
+    fi
+    $sudo dnf install -y "$tmp/toolport.rpm"
+    say "Installed. Launch Toolport from your app menu, or run: toolport"
+    return
+  fi
+
   # Preserve the signed pacman repository path on Arch and derivatives.
   if [ "$linux_package" = pacman ]; then
     install_arch_repo
@@ -368,7 +414,7 @@ install_linux() {
   mv "$tmp/toolport.AppImage" "$bindir/toolport"
   chmod +x "$bindir/toolport"
 
-  apps="$HOME/.local/share/applications"
+  apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
   mkdir -p "$apps"
   cat >"$apps/toolport.desktop" <<EOF
 [Desktop Entry]

@@ -2,7 +2,7 @@
 
 Toolport installs a gateway entry into each AI client's own config file and keeps
 its state in a per-user data directory. A clean removal has two parts: disconnect
-the clients while Toolport is still installed, then remove the app. Normal uninstall and upgrades keep your data and credentials.
+the clients while Toolport is still installed, then remove the app. Normal uninstall keeps your registry and credentials. Verified client recovery releases backup payloads; upgrades keep connections and recovery data.
 
 ## 1. Disconnect your clients
 
@@ -19,6 +19,16 @@ disconnects; the daemon then exits at once instead of waiting out its idle time.
 The same happens when you quit Toolport. A daemon whose app was deleted, moved to
 the Trash or replaced by a package upgrade notices within a few seconds and exits
 as soon as no client is connected.
+
+Backups of imported credentials are stored in the vault with a recovery copy
+that omits secret values. If the original vault is locked or unavailable,
+restoration still recovers the config and names each missing credential in the
+result. Missing values are labeled `TOOLPORT_MISSING_CREDENTIAL_<number>`.
+Recovery data is retained; unlock the original vault and repeat disconnect to
+re-insert those credentials. Data removal refuses to discard incomplete recovery.
+After verified restoration, historical backup payloads are deleted and only
+empty ownership metadata remains, so a later uninstall cannot claim native entries.
+Turn off **Launch at login** in Settings.
 
 Windows NSIS and native GTK deb/rpm/Arch packages attempt the same operation before
 removing their gateway (`--disconnect-all --uninstall`), which also removes
@@ -65,7 +75,13 @@ distinct from the Tauri .deb. On macOS the CLI is
     [Arch and Omarchy](arch-pacman-repo.md) for removing the repo and key.
   - `.deb`: `sudo apt remove toolport` (or `sudo dpkg -r toolport`).
   - Native GTK `.rpm`: `sudo dnf remove toolport`.
-  - AppImage: quit Toolport and delete the `.AppImage` file.
+  - AppImage: disconnect clients, quit Toolport, then run the installer cleanup as
+    your normal user: `bash install.sh --uninstall-appimage` (download
+    [install.sh](https://toolport.app/install.sh) first). This removes the actual
+    extensionless `$XDG_BIN_HOME/toolport` (default `~/.local/bin/toolport`),
+    desktop launcher, icons, autostart entries and update resume state.
+    Use the same XDG paths as installation. For a manually downloaded AppImage,
+    also delete that file.
 
 ## Optional: remove Toolport data
 
@@ -173,6 +189,8 @@ existing `Conduit` directory or the separate `Toolport-dev` directory.
 ## Keeping Toolport
 
 To move a client off Toolport without uninstalling, use **Disconnect** on that
-client only. To keep a client connected but stop sending its tool definitions, set
-`TOOLPORT_DISCOVERY=full` on that client's gateway entry; see
-[Configuration](configuration.md).
+client only. To keep a client connected while finding tools on demand instead
+of sending the full tool list, choose lazy discovery for that client on the
+**Clients** page. `TOOLPORT_DISCOVERY=full` sends every definition and is only a
+standalone process default; shared daemon sessions use the saved client setting.
+See [Configuration](configuration.md).

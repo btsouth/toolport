@@ -273,6 +273,7 @@ arch_conf="$arch_workdir/pacman.conf"
 cat > "$arch_shim/pacman-key" <<EOF
 #!/usr/bin/env bash
 printf 'pacman-key %s\n' "\$*" >> "$arch_shim/pacman-key.log"
+if [ "\${1:-}" = --list-secret-keys ]; then echo 'sec   rsa4096'; fi
 EOF
 cat > "$arch_shim/sudo" <<'EOF'
 #!/usr/bin/env bash
@@ -346,6 +347,14 @@ if [ "$(grep -c '^\[toolport\]' "$arch_conf")" = "1" ]; then
 else
   echo "  FAIL: pacman.conf gained a duplicate [toolport] section"; fail=$((fail + 1))
 fi
+if grep -q -- '--init' "$arch_shim/pacman-key.log"; then pass=$((pass+1)); else fail=$((fail+1)); fi
+printf '#!/bin/sh\nexit 1\n' > "$arch_shim/pacman-key"
+set +e
+result="$(PATH="$arch_shim:$PATH" HOME="$arch_home" TOOLPORT_OS_RELEASE="$arch_shim/os-release-arch" TOOLPORT_PACMAN_CONF="$arch_conf" bash "$INSTALL_SH" 2>&1)"
+rc=$?
+set -e
+check "keyring failure gives initialization commands" "sudo pacman-key --init; sudo pacman-key --populate archlinux" "$result"
+if [ "$rc" != 0 ] && ! [[ "$result" == *"not the one this installer expects"* ]]; then pass=$((pass+1)); else fail=$((fail+1)); fi
 rm -rf "$arch_workdir"
 
 echo "Debian: verifies the .deb and installs it with apt"
@@ -455,5 +464,23 @@ CASES
 rm -rf "$compat_dir"
 
 echo
+echo "Fedora RPM: checksum and native install"
+rpm_dir="$(mktemp -d)"
+make_shim "$rpm_dir/shim" "$(fake_release "sha256:$fake_sha256" 64 | sed 's/amd64[.]AppImage/x86_64.rpm/g')"
+printf 'ID=fedora\nVERSION_ID=42\n' > "$rpm_dir/os-release"
+printf '#!/bin/sh\nprintf "%%s\n" "$*" > "%s"\n' "$rpm_dir/dnf.log" > "$rpm_dir/shim/dnf"
+printf '#!/bin/sh\nexec "$@"\n' > "$rpm_dir/shim/sudo"
+chmod +x "$rpm_dir/shim/dnf" "$rpm_dir/shim/sudo"
+result="$(PATH="$rpm_dir/shim:$PATH" HOME="$rpm_dir/home" TOOLPORT_OS_RELEASE="$rpm_dir/os-release" bash "$INSTALL_SH" 2>&1)"
+check "RPM checksum verified" "sha256 verified: $fake_sha256" "$result"
+if grep -q 'install -y .*toolport.rpm' "$rpm_dir/dnf.log"; then pass=$((pass+1)); else fail=$((fail+1)); fi
+
+# Cleanup is offline and honors the same XDG paths as installation.
+mkdir -p "$rpm_dir/home/.local/bin" "$rpm_dir/home/.local/share/applications" "$rpm_dir/home/.config/autostart" "$rpm_dir/home/.config/Toolport"
+touch "$rpm_dir/home/.local/bin/toolport" "$rpm_dir/home/.local/share/applications/toolport.desktop" "$rpm_dir/home/.config/autostart/Toolport.desktop" "$rpm_dir/home/.config/Toolport/http-bridge-update-resume.json"
+HOME="$rpm_dir/home" bash "$INSTALL_SH" --uninstall-appimage
+if [ -z "$(find "$rpm_dir/home" -type f -print -quit)" ]; then pass=$((pass+1)); else fail=$((fail+1)); fi
+rm -rf "$rpm_dir"
+
 echo "$pass passed, $fail failed"
 [ "$fail" = "0" ]

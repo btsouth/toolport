@@ -22,10 +22,11 @@ derivatives use apt's available library versions. If compatibility cannot be
 established, the installer chooses AppImage. Current Arch and its derivatives
 keep the signed pacman repository route.
 
-The installer uses AppImage on RPM distributions. To install GTK manually, the
-RPM requires GTK 4.14+, libadwaita 1.5+, GLib 2.80+ and glibc 2.39+, as available
-on Fedora 40+. Older Fedora and RHEL 9 use AppImage; other RPM systems must meet
-all four library floors before using the RPM. There is no automatic RPM install.
+On Fedora 40+ the installer verifies the release RPM checksum and installs it
+with dnf. Older Fedora and RHEL use AppImage. The RPM requires GTK 4.14+,
+libadwaita 1.5+, GLib 2.80+ and glibc 2.39+. openSUSE uses different dependency
+names (including libadwaita and D-Bus), so the current Fedora RPM is not selected
+there; openSUSE keeps the portable AppImage.
 
 To inspect the installer's selection without network access or changes, download
 it from [the pinned installer URL](https://toolport.app/install.sh), then run
