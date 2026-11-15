@@ -1698,6 +1698,11 @@ fn set_secret_raw(server_id: &str, key: &str, value: &str) -> Result<(), String>
     }
     // Before the write, so a refreshed OAuth token is covered even if the store fails.
     crate::secret_redact::register(server_id, key, value);
+    write_stored(server_id, key, value)
+}
+
+/// A write with no registration, for Toolport's own internal keys.
+fn write_stored(server_id: &str, key: &str, value: &str) -> Result<(), String> {
     scrub_previous(server_id, key, Some(value))?;
     if file::active() {
         return file::set_secret(server_id, key, value);
@@ -1783,14 +1788,18 @@ pub(crate) fn task_handle_key() -> Result<[u8; 32], String> {
 ///    `CONDUIT_SECRET_KEY`) is set
 /// 4. OS keychain / platform backend
 fn get_secret_result_raw(server_id: &str, key: &str) -> Result<Option<String>, String> {
-    let value = if let Some(v) = env_secret_override(key) {
+    registered(server_id, key, read_stored(server_id, key))
+}
+
+/// A read with no registration, for Toolport's own internal keys.
+fn read_stored(server_id: &str, key: &str) -> Result<Option<String>, String> {
+    if let Some(v) = env_secret_override(key) {
         Ok(Some(v))
     } else if file::active() {
         file::get_secret_result(server_id, key)
     } else {
         platform::get_secret_result(server_id, key)
-    };
-    registered(server_id, key, value)
+    }
 }
 
 /// Every value this process reads or stores is registered for redaction at the log
@@ -2039,7 +2048,14 @@ fn scrub_previous(server_id: &str, key: &str, replacement: Option<&str>) -> Resu
     } else {
         stored
     };
-    if let Ok(Some(old)) = stored {
+    // An unread value could be neither scrubbed nor kept: change nothing.
+    let stored = stored.map_err(|error| {
+        eprintln!("toolport: the stored value could not be read for its log cleanup ({error})");
+        crate::i18n::tr(
+            "The old value could not be kept for its log cleanup, so nothing was changed. Try again.",
+        )
+    })?;
+    if let Some(old) = stored {
         if Some(old.as_str()) != replacement {
             if let Err(error) = crate::secret_redact::scrub_value_now(server_id, key, &old) {
                 // A log may still hold it: keep the value in the vault, under
@@ -2057,7 +2073,9 @@ fn scrub_previous(server_id: &str, key: &str, replacement: Option<&str>) -> Resu
 const RETIRED_KEY: &str = "retired-secret-values";
 
 fn retired_load() -> Vec<(String, String, String)> {
-    let Ok(Some(raw)) = get_secret_result_raw(INTERNAL_SERVER_ID, RETIRED_KEY) else {
+    // Unregistered: the values in it are registered on their own, and the
+    // list changes on every save.
+    let Ok(Some(raw)) = read_stored(INTERNAL_SERVER_ID, RETIRED_KEY) else {
         return Vec::new();
     };
     serde_json::from_str::<Vec<serde_json::Value>>(&raw)
@@ -2077,7 +2095,7 @@ fn retired_save(entries: &[(String, String, String)]) -> Result<(), String> {
     crate::secret_redact::RETIRED_PENDING
         .store(entries.len(), std::sync::atomic::Ordering::Relaxed);
     if entries.is_empty() {
-        return match get_secret_result_raw(INTERNAL_SERVER_ID, RETIRED_KEY) {
+        return match read_stored(INTERNAL_SERVER_ID, RETIRED_KEY) {
             Ok(Some(_)) => delete_secret_raw(INTERNAL_SERVER_ID, RETIRED_KEY),
             _ => Ok(()),
         };
@@ -2086,7 +2104,11 @@ fn retired_save(entries: &[(String, String, String)]) -> Result<(), String> {
         .iter()
         .map(|(server, key, value)| serde_json::json!({"server": server, "key": key, "value": value}))
         .collect();
-    set_secret_raw(
+    #[cfg(test)]
+    if tests::write_is_injected_failure(RETIRED_KEY) {
+        return Err("injected secret persistence failure".into());
+    }
+    write_stored(
         INTERNAL_SERVER_ID,
         RETIRED_KEY,
         &serde_json::Value::Array(list).to_string(),
