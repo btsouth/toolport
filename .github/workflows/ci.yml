@@ -533,9 +533,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: matrix.os != 'ubuntu-22.04'
         with:
           node-version: 24
+
+      # The signature tests compile their output with the repository's tsc and
+      # fail in CI when it is missing.
+      - name: Install frontend dependencies for the signature compile checks
+        if: matrix.group == 'core'
+        run: npm ci
 
       # BGE uses Candle CPU on all release targets. No ONNX Runtime shared
       # library or execution-provider package is needed for search-static.

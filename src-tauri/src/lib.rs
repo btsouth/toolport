@@ -72,6 +72,7 @@ pub mod teams;
 pub mod teams_plan;
 pub mod telemetry;
 pub mod tool_definitions;
+pub mod tool_signature;
 pub mod topology;
 pub mod ui_settings;
 pub mod usage_report;

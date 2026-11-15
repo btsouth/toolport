@@ -20,6 +20,9 @@
 //!   `.async(args)` for the Promise form. CamelCase aliases are added when they differ
 //!   from the sanitized tool segment (e.g. `create_refund` and `createRefund`).
 //! - `toolport.listTools()` / `toolport.listServers()` — catalog introspection
+//! - `toolport.describe(name)` — `{name, signature, inputSchema, truncated}` for an
+//!   in-scope tool (or a `servers.*` stub), `null` when the name is unknown, or
+//!   `{name, error, size, limit}` when the description is too large to return
 //! - `toolport.fetchResult({cursor, offset?, len?, projection?})` — page a previously
 //!   shaped result (cursor handoff / structured projection) without leaving the script
 //!
@@ -86,6 +89,11 @@ pub struct FetchArgs {
 
 /// Host binding for paging a shaped result by cursor (same cache as `toolport_fetch_result`).
 pub type FetchBinding = Arc<dyn Fn(FetchArgs) -> Value + Send + Sync>;
+
+/// Host binding for `toolport.describe(name)`: `{name, signature, inputSchema, truncated}`
+/// for an in-scope tool, `null` otherwise. A lookup, not a downstream call, so it is not
+/// counted against `max_calls` and never enters the progress ledger.
+pub type DescribeBinding = Arc<dyn Fn(&str) -> Value + Send + Sync>;
 
 /// The JSON payload exposed to a script. Ordinary Code Mode keeps its historical mutable
 /// `data` global; an immutable `input` global lets a caller pass validated, deeply frozen
@@ -528,6 +536,20 @@ unsafe impl Trace for FetchHost {
     fn run_finalizer(&self) {}
 }
 
+/// Capture for `__toolport_describe` (no GC refs).
+struct DescribeHost {
+    describe: Option<DescribeBinding>,
+    deadline: Instant,
+}
+
+impl Finalize for DescribeHost {}
+// SAFETY: only an Arc of a host closure and an Instant — no boa heap pointers.
+unsafe impl Trace for DescribeHost {
+    unsafe fn trace(&self, _tracer: &mut boa_gc::Tracer) {}
+    unsafe fn trace_non_roots(&self) {}
+    fn run_finalizer(&self) {}
+}
+
 impl Clone for HostState {
     fn clone(&self) -> Self {
         Self {
@@ -621,6 +643,12 @@ globalThis.toolport = {
             projection: opts.projection
         })));
     },
+    // Shape of one in-scope tool without another search round trip. Accepts an
+    // exposed name or a servers.* stub; null when the name is not in scope.
+    describe: function (tool) {
+        var name = (typeof tool === "function" && typeof tool.toolName === "string") ? tool.toolName : String(tool);
+        return JSON.parse(__toolport_describe(name));
+    },
     listTools: function () { return []; },
     listServers: function () { return []; },
 };
@@ -636,7 +664,7 @@ pub fn build_servers_prelude(catalog: &[String]) -> String {
     // server -> (tool_prop -> full exposed name), BTree for stable output in tests.
     let mut by_server: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     for exposed in catalog {
-        let Some((server, tool)) = split_exposed_name(exposed) else {
+        let Some((server, tool)) = split_script_name(exposed) else {
             continue;
         };
         if server.is_empty() || tool.is_empty() {
@@ -723,6 +751,13 @@ pub fn build_servers_prelude(catalog: &[String]) -> String {
 /// allocates names). Returns `None` when the separator is missing.
 pub fn split_exposed_name(exposed: &str) -> Option<(&str, &str)> {
     exposed.split_once("__")
+}
+
+/// Split a name for a `servers.*` stub: `server__tool`, or the `server-tool` spelling of
+/// a dashed client view (Grok). Sanitized names never contain `-` otherwise, so the
+/// fallback cannot change how a `__` name splits.
+pub fn split_script_name(exposed: &str) -> Option<(&str, &str)> {
+    split_exposed_name(exposed).or_else(|| exposed.split_once('-'))
 }
 
 /// True when `name` is a gateway meta-tool that should not appear on `servers.*`.
@@ -823,11 +858,26 @@ pub fn run_script_with_input(
     limits: Limits,
     catalog: &[String],
 ) -> ScriptOutcome {
+    run_script_with_describe(script, input, call, fetch, None, limits, catalog)
+}
+
+/// [`run_script_with_input`] plus a `toolport.describe` binding. Without one,
+/// `describe` returns `null` for every name.
+pub fn run_script_with_describe(
+    script: &str,
+    input: ScriptInput,
+    call: CallBinding,
+    fetch: Option<FetchBinding>,
+    describe: Option<DescribeBinding>,
+    limits: Limits,
+    catalog: &[String],
+) -> ScriptOutcome {
     run_script_indexed(
         script,
         input,
         Arc::new(move |_, name, args| call(name, args)),
         fetch,
+        describe,
         limits,
         catalog,
         None,
@@ -840,6 +890,7 @@ pub(crate) fn run_script_indexed(
     input: ScriptInput,
     call: IndexedCallBinding,
     fetch: Option<FetchBinding>,
+    describe: Option<DescribeBinding>,
     limits: Limits,
     catalog: &[String],
     checkpoint_binding: Option<CheckpointBinding>,
@@ -1031,6 +1082,36 @@ pub(crate) fn run_script_indexed(
     );
     if let Err(e) =
         context.register_global_callable(js_string!("__toolport_fetch_result"), 1, fetch_native)
+    {
+        return fail(calls_made.get(), executed.take(), checkpoint.take(), e);
+    }
+
+    // Describe binding: a catalog lookup, so only the wall clock bounds it.
+    let describe_host = DescribeHost { describe, deadline };
+    let describe_native = NativeFunction::from_copy_closure_with_captures(
+        |_this: &JsValue, args: &[JsValue], host: &DescribeHost, _ctx: &mut Context| {
+            if Instant::now() >= host.deadline {
+                return Err(JsError::from_native(
+                    JsNativeError::error()
+                        .with_message("toolport script wall-clock deadline exceeded"),
+                ));
+            }
+            let name = args
+                .first()
+                .and_then(JsValue::as_string)
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_default();
+            let result = match host.describe.as_ref() {
+                Some(describe) if !name.is_empty() => describe(&name),
+                _ => Value::Null,
+            };
+            let result_str = serde_json::to_string(&result).unwrap_or_else(|_| "null".to_string());
+            Ok(JsValue::from(js_string!(result_str)))
+        },
+        describe_host,
+    );
+    if let Err(e) =
+        context.register_global_callable(js_string!("__toolport_describe"), 1, describe_native)
     {
         return fail(calls_made.get(), executed.take(), checkpoint.take(), e);
     }
@@ -2535,5 +2616,157 @@ mod tests {
         let error = validate_arguments(&schema, &Value::Object(arguments)).unwrap_err();
         assert_eq!(error.matches("instance ").count(), MAX_VALIDATION_ERRORS);
         assert!(!error.contains("private-value"));
+    }
+
+    #[test]
+    fn dashed_view_names_get_servers_stubs() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let call = recording_call(log.clone());
+        let catalog = vec!["mock-add".to_string(), "mock-echo_meta".to_string()];
+        let script = r#"
+            const a = servers.mock.add({ x: 1 });
+            const b = servers.mock.echoMeta({});
+            return { names: [a.echo, b.echo], tools: toolport.listTools().sort() };
+        "#;
+        let out = run_script(script, json!({}), call, None, Limits::default(), &catalog);
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(out.value["names"], json!(["mock-add", "mock-echo_meta"]));
+        assert_eq!(out.value["tools"], json!(["mock-add", "mock-echo_meta"]));
+        assert_eq!(split_script_name("s__a-b"), Some(("s", "a-b")));
+        assert_eq!(split_script_name("bare"), None);
+    }
+
+    #[test]
+    fn describe_returns_shape_without_spending_calls() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let call = recording_call(log.clone());
+        let describe: DescribeBinding = Arc::new(|name: &str| {
+            if name == "github__create_issue" {
+                json!({
+                    "name": name,
+                    "signature": "servers.github.create_issue(args: {title: string}): ToolResult",
+                    "inputSchema": {"type": "object", "required": ["title"]}
+                })
+            } else {
+                Value::Null
+            }
+        });
+        let catalog = vec!["github__create_issue".to_string()];
+        let script = r#"
+            const byName = toolport.describe("github__create_issue");
+            const byStub = toolport.describe(servers.github.create_issue);
+            const missing = toolport.describe("nope__tool");
+            const required = byName.inputSchema.required;
+            const made = servers.github.create_issue({ title: "t" });
+            return { sig: byStub.signature, same: byName.name === byStub.name, missing, required, echo: made.echo };
+        "#;
+        let out = run_script_with_describe(
+            script,
+            ScriptInput::Data(json!({})),
+            call,
+            None,
+            Some(describe),
+            Limits {
+                max_calls: 1,
+                ..Limits::default()
+            },
+            &catalog,
+        );
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(
+            out.value["sig"],
+            "servers.github.create_issue(args: {title: string}): ToolResult"
+        );
+        assert_eq!(out.value["same"], true);
+        assert_eq!(out.value["missing"], Value::Null);
+        assert_eq!(out.value["required"], json!(["title"]));
+        assert_eq!(out.value["echo"], "github__create_issue");
+        // Three describes and one call fit a one-call budget, and only the call is logged.
+        assert_eq!(out.calls, 1);
+        assert_eq!(out.progress.len(), 1);
+        // Without a binding describe is null, not an error.
+        let none = run_script(
+            "return toolport.describe('github__create_issue');",
+            json!({}),
+            recording_call(log),
+            None,
+            Limits::default(),
+            &catalog,
+        );
+        assert_eq!(none.error, None);
+        assert_eq!(none.value, Value::Null);
+    }
+
+    /// Upstream-controlled names cannot break out of the generated prelude: quotes,
+    /// backslashes, line terminators, comment closers, template openers and
+    /// backticks all reach the script as the exact strings, through `listTools`, the
+    /// stubs and `describe`.
+    #[test]
+    fn hostile_names_round_trip_through_the_prelude() {
+        let nasty = [
+            "q'uote",
+            "d\"q",
+            "back\\slash",
+            "line\nbreak",
+            "cr\rx",
+            "end*/",
+            "/*open",
+            "tmpl${x}",
+            "`tick`",
+            "ls\u{2028}",
+            "ps\u{2029}",
+            "</script>",
+            "名前",
+            "nul\u{0}",
+        ];
+        let mut catalog: Vec<String> = Vec::new();
+        for (i, part) in nasty.iter().enumerate() {
+            catalog.push(format!("s{i}__{part}"));
+            catalog.push(format!("{part}__t{i}"));
+        }
+        catalog.sort();
+        let prelude = build_servers_prelude(&catalog);
+        assert!(!prelude.contains('\u{2028}') && !prelude.contains('\u{2029}'));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let describe: DescribeBinding = Arc::new(
+            |name: &str| json!({"name": name, "signature": format!("toolport.call({}, args?: unknown): ToolResult", serde_json::to_string(name).unwrap())}),
+        );
+        let script = r#"
+            const calls = [];
+            const described = [];
+            for (const server of Object.keys(servers)) {
+                for (const tool of Object.keys(servers[server])) {
+                    const stub = servers[server][tool];
+                    calls.push(stub({}).echo);
+                    described.push(toolport.describe(stub).name);
+                }
+            }
+            return { listed: toolport.listTools(), calls: calls.sort(), described: described.sort() };
+        "#;
+        let out = run_script_with_describe(
+            script,
+            ScriptInput::Data(json!({})),
+            recording_call(log),
+            None,
+            Some(describe),
+            Limits {
+                max_calls: 1_000,
+                ..Limits::default()
+            },
+            &catalog,
+        );
+        assert_eq!(out.error, None, "prelude failed: {:?}", out.error);
+        let mut listed: Vec<String> = serde_json::from_value(out.value["listed"].clone()).unwrap();
+        listed.sort();
+        assert_eq!(listed, catalog);
+        // camelCase aliases may add calls; every call names a catalog entry.
+        let calls: Vec<String> = serde_json::from_value(out.value["calls"].clone()).unwrap();
+        assert!(calls.iter().all(|name| catalog.contains(name)), "{calls:?}");
+        for name in &catalog {
+            assert!(calls.contains(name), "{name:?} unreachable");
+        }
+        let described: Vec<String> =
+            serde_json::from_value(out.value["described"].clone()).unwrap();
+        assert!(described.iter().all(|name| catalog.contains(name)));
     }
 }

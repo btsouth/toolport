@@ -61,6 +61,7 @@ use conduit_lib::session_observability as observation;
 use conduit_lib::session_store::SessionStore;
 use conduit_lib::shaping;
 use conduit_lib::tool_definitions::{CatalogRef, SerializedTools, SharedTools, ToolCatalog};
+use conduit_lib::tool_signature;
 use conduit_lib::topology::LaunchKey;
 
 #[cfg(any(unix, windows))]
@@ -1547,7 +1548,9 @@ fn run_script_tool_def() -> Value {
             structuredContent.toolportScript.progress lists the calls that already ran in order; \
             resume by index, and use toolport.checkpoint(value) to record your own resume state. For \
             a reusable orchestration, pass immutable `input` plus `inputSchema`. Gates match \
-            toolport_call_tool.",
+            toolport_call_tool. A search hit ends with the tool's script signature, shortened when \
+            long; toolport.describe(name) returns the full {name, signature, inputSchema}. \
+            A call returns the MCP result {content, structuredContent, isError}.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3590,6 +3593,38 @@ fn project_search_results(tools: &[&Value], include_top_schema: bool) -> Vec<Val
     }).collect()
 }
 
+/// Code Mode only: give each search hit the signature of its script call. A menu row
+/// gains a trailing string; a full definition gains a `signature` field. A long
+/// signature is shortened, never dropped. The output schema only types the return:
+/// it stays out of the listed definition (see [`neutralize_listed_tool`]).
+fn add_search_signatures(entries: &mut [Value], source: &[&Value]) {
+    for entry in entries {
+        let name = match &*entry {
+            Value::Array(row) => row.first(),
+            Value::Object(map) => map.get("name"),
+            _ => None,
+        }
+        .and_then(Value::as_str);
+        let Some(tool) = name.and_then(|name| {
+            source
+                .iter()
+                .find(|tool| tool["name"].as_str() == Some(name))
+        }) else {
+            continue;
+        };
+        let Some(signature) = tool_signature::signature(tool) else {
+            continue;
+        };
+        match entry {
+            Value::Array(row) => row.push(Value::String(signature)),
+            Value::Object(map) => {
+                map.insert("signature".into(), Value::String(signature));
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Append this process's health notes, such as a client moved to a private
 /// gateway, so an agent sees why its gateway behaves differently.
 fn with_status_notes(summary: String) -> String {
@@ -3608,8 +3643,31 @@ fn with_status_notes(summary: String) -> String {
     out
 }
 
+/// [`enabled_summary_with`] against the host's live router (tests only; requests
+/// pass the router they were dispatched with).
+#[cfg(test)]
 fn enabled_summary(
     host: &HostState,
+    reg: &Registry,
+    cached: &dyn ToolCatalog,
+    profile: Option<&str>,
+    allowed: Option<&std::collections::HashSet<String>>,
+) -> String {
+    let router = Arc::clone(
+        &host
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    enabled_summary_with(host, &router, reg, cached, profile, allowed)
+}
+
+/// [`enabled_summary`] judged against `router`: its tool counts are the tools
+/// search would return to this caller ([`tool_visible_to_model`]), so a stale
+/// cache entry for a refused tool is not counted.
+fn enabled_summary_with(
+    host: &HostState,
+    router: &Router,
     reg: &Registry,
     cached: &dyn ToolCatalog,
     profile: Option<&str>,
@@ -3718,9 +3776,12 @@ fn enabled_summary(
         // belong to instead. An ambiguous prefix resolves to nothing and is counted for
         // neither twin, which is the same fail-closed answer scoping gives (SBS-866).
         let owners = unique_prefix_owners(reg);
+        let route_of = |name: &str| owner_of_exposed_tool(Some(router), &owners, name);
+        let deny_destructive = reg.deny_destructive_effective();
+        let refused = |tool: &Value| tool_refused(tool, router, deny_destructive);
         for t in cached.iter() {
             let prefix = tool_prefix(t);
-            if prefix.is_empty() {
+            if prefix.is_empty() || !tool_visible_to_model(t, allowed, &route_of, &refused) {
                 continue;
             }
             // `tool_prefix` already lower-cases, matching how `owners` is keyed.
@@ -4328,6 +4389,100 @@ fn mcp_app_tool_for_view(tool: &Value, router: &Router, relays: bool, servers: &
 /// Whether a client scoped to `allowed` may see the exposed tool `name`. See
 /// [`scope_tools`] for how `route_of` is resolved and why the `server__` prefix is only a
 /// fallback.
+/// The model-facing visibility rule `toolport_search_tools` applies to every
+/// candidate: MCP Apps visibility (an app-only tool is never shown to the model), the
+/// caller's server scope, and the router's refusals (`refused`, normally
+/// [`tool_refused`]), so a stale cache entry for a tool that was since quarantined,
+/// disabled, put outside this client's allow-list or denied as destructive never
+/// reaches the model. `toolport.describe` and the `servers.*` stubs use the same
+/// function, and execution refuses the same tools, so all four agree.
+fn tool_visible_to_model(
+    tool: &Value,
+    allowed: Option<&std::collections::HashSet<String>>,
+    route_of: &impl Fn(&str) -> Option<String>,
+    refused: &impl Fn(&Value) -> bool,
+) -> bool {
+    mcp_app_tool_is_model_visible(tool)
+        && !refused(tool)
+        && tool
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| {
+                allowed.is_none_or(|allowed| tool_in_scope(name, allowed, route_of))
+            })
+}
+
+/// Whether search could still return the exposed tool `name` to this caller: it is
+/// in the catalog search reads and passes [`tool_visible_to_model`] under the
+/// current router, registry and scope. Paged definitions are rechecked with it.
+fn discovery_tool_visible(
+    name: &str,
+    cached: &dyn ToolCatalog,
+    router: &Router,
+    reg: &Registry,
+    allowed: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    let live;
+    let base: &dyn ToolCatalog = if cached.is_empty() {
+        live = router.shared_tools();
+        &live
+    } else {
+        cached
+    };
+    let owners = unique_prefix_owners(reg);
+    let route_of = |exposed: &str| owner_of_exposed_tool(Some(router), &owners, exposed);
+    let deny_destructive = reg.deny_destructive_effective();
+    let refused = |tool: &Value| tool_refused(tool, router, deny_destructive);
+    let visible = base
+        .values()
+        .filter(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+        .any(|tool| tool_visible_to_model(tool, allowed, &route_of, &refused));
+    visible
+}
+
+/// Whether a running script may still see `name` under the live router: this
+/// connection's adapter scope still holds, the live policy still admits the tool
+/// (the recheck every dispatch makes), and search would still return it.
+fn script_live_visible(
+    name: &str,
+    catalog: &dyn ToolCatalog,
+    reg: &Registry,
+    allowed: Option<&std::collections::HashSet<String>>,
+    router: &Router,
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
+    resolver: Option<LiveRouterResolver>,
+) -> bool {
+    let _view = LiveRouterResolverGuard::enter(resolver);
+    if recheck_live_policy(router, live_router, DispatchTarget::Tool(name)).is_err() {
+        return false;
+    }
+    let live = live_router.map(|slot| {
+        Arc::clone(
+            &slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    });
+    discovery_tool_visible(
+        name,
+        catalog,
+        live.as_deref().unwrap_or(router),
+        reg,
+        allowed,
+    )
+}
+
+/// Whether the router refuses a catalog entry: blocked by policy (quarantine,
+/// disabled, outside the client's tool allow-list, Strict safety), or destructive
+/// while the destructive gate is on, judged from the entry itself so a cache
+/// written before the servers connect is covered too.
+fn tool_refused(tool: &Value, router: &Router, deny_destructive: bool) -> bool {
+    let Some(name) = tool.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+    (deny_destructive && cached_tool_is_destructive(tool, name, router)) || router.is_blocked(name)
+}
+
 fn tool_in_scope(
     name: &str,
     allowed: &std::collections::HashSet<String>,
@@ -6394,27 +6549,78 @@ fn script_catalog_tools(
     allowed: Option<&std::collections::HashSet<String>>,
     route_of: impl Fn(&str) -> Option<String>,
 ) -> Vec<String> {
+    // Search's own visibility rule. The router's refusals ([`tool_refused`]) were
+    // applied when the catalog was taken ([`script_source`]). Names with no server
+    // part (an override rename) stay in: they get no `servers.*` stub, but
+    // `toolport.call` and `describe` reach them, exactly as their search signature
+    // says.
     let mut names: Vec<String> = cached
         .iter()
+        .filter(|tool| tool_visible_to_model(tool, allowed, &route_of, &|_: &Value| false))
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
         .filter(|n| !codemode::is_code_mode_meta_tool(n))
-        .filter(|n| {
-            let Some((server, tool)) = codemode::split_exposed_name(n) else {
-                return false;
-            };
-            if server.is_empty() || tool.is_empty() {
-                return false;
-            }
-            match allowed {
-                Some(set) => route_of(n).is_some_and(|sid| server_in_allowed_scope(&sid, set)),
-                None => true,
-            }
-        })
         .map(str::to_string)
         .collect();
     names.sort();
     names.dedup();
     names
+}
+
+/// What a script may see: the catalog search would search (the cached one, or the
+/// live router's on a cold cache) without tools the router refuses
+/// ([`tool_refused`], the check search applies). A stale cache can still hold a tool
+/// that was disabled, quarantined or put outside this client's tool scope since; no
+/// stub or describe should offer it.
+fn script_source(cached: &dyn ToolCatalog, router: &Router, reg: &Registry) -> SharedTools {
+    let base = if cached.is_empty() {
+        router.shared_tools()
+    } else {
+        cached.shared()
+    };
+    drop_blocked_from_cache(base, router, reg)
+}
+
+/// `toolport.describe` over the same scoped names the `servers.*` stubs come from.
+/// The schema gets the neutralisation every listed `inputSchema` gets. The signature
+/// is complete; `truncated` is true only when a guard was reached, with the reason.
+/// A check of the live router a running script's callbacks apply on top of the
+/// catalog captured at script start ([`script_live_visible`]).
+type ScriptLiveCheck = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+fn script_describe_binding(
+    tools: SharedTools,
+    catalog: &[String],
+    live: Option<ScriptLiveCheck>,
+) -> codemode::DescribeBinding {
+    let in_scope: HashSet<String> = catalog.iter().cloned().collect();
+    Arc::new(move |name: &str| {
+        let Some(tool) = (in_scope.contains(name) && live.as_ref().is_none_or(|live| live(name)))
+            .then(|| {
+                tools
+                    .iter()
+                    .find(|tool| tool["name"].as_str() == Some(name))
+            })
+            .flatten()
+        else {
+            return Value::Null;
+        };
+        let mut schema = tool
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        integrity::neutralize_value_strings(&mut schema);
+        let full = tool_signature::full_signature(tool);
+        let mut described = json!({
+            "name": name,
+            "signature": full.as_ref().map(|full| full.signature.clone()),
+            "inputSchema": schema,
+            "truncated": full.as_ref().is_some_and(|full| full.truncated.is_some()),
+        });
+        if let Some(reason) = full.and_then(|full| full.truncated) {
+            described["truncatedReason"] = Value::String(reason);
+        }
+        described
+    })
 }
 
 /// Dry-run a code-mode script: compile it, bind the same client-scoped `servers.*`
@@ -6492,11 +6698,13 @@ fn validate_script(
     let fetch: codemode::FetchBinding =
         Arc::new(|_args: codemode::FetchArgs| json!({ "content": [], "isError": false }));
 
+    let describe = script_describe_binding(cached.shared(), &catalog, None);
     let outcome = run_code_mode_isolated(
         script,
         input,
         call,
         Some(fetch),
+        Some(describe),
         limits,
         &catalog,
         None,
@@ -6721,7 +6929,8 @@ fn run_script_dispatch(
         .unwrap_or(false)
     {
         let owners = unique_prefix_owners(reg);
-        return validate_script_dispatch(&script, input, cached, allowed, client, |name| {
+        let source = script_source(cached, router_arc, reg);
+        return validate_script_dispatch(&script, input, &source, allowed, client, |name| {
             owner_of_exposed_tool(Some(router_arc.as_ref()), &owners, name)
         });
     }
@@ -6812,29 +7021,63 @@ fn execute_script_dispatch(
         run()
     });
 
-    // Cursor handoff for any already-shaped result (prior turn, or external cursor in data).
+    // Typed `servers.*` stubs from the client-scoped catalog (meta-tools excluded).
+    let owners = unique_prefix_owners(reg);
+    let source = script_source(cached, router_arc, reg);
+    let catalog = script_catalog_tools(&source, allowed, |name| {
+        owner_of_exposed_tool(Some(router_arc.as_ref()), &owners, name)
+    });
+
+    // A script can wait on calls, and policy can change meanwhile. Its describe
+    // callback and its fetches of paged tool definitions keep the catalog and scope
+    // captured here and also ask the live router, as each `toolport.call` does.
+    // Fetching an ordinary tool-call result is not rechecked: that output stays
+    // readable to its caller after a policy change.
+    let live_check: ScriptLiveCheck = {
+        let source = source.clone();
+        let reg = reg.clone();
+        let allowed = allowed.cloned();
+        let router = Arc::clone(router_arc);
+        let live = live_router.cloned();
+        let resolver = active_live_router_resolver();
+        Arc::new(move |name: &str| {
+            script_live_visible(
+                name,
+                &source,
+                &reg,
+                allowed.as_ref(),
+                &router,
+                live.as_ref(),
+                resolver.clone(),
+            )
+        })
+    };
+
+    // Cursor handoff for any already-shaped result (prior turn, or external cursor in
+    // data). A paged tool definition is served only while the script could still
+    // see that tool: `catalog` is search's own visibility rule over this catalog.
+    // The check runs only for discovery pages, and with the shaping cache unlocked.
     let client_for_fetch = client.map(str::to_string);
+    let fetch_visible: HashSet<String> = catalog.iter().cloned().collect();
+    let fetch_live = Arc::clone(&live_check);
     let fetch: codemode::FetchBinding = Arc::new(move |args: codemode::FetchArgs| {
-        shaping::fetch_result(
+        shaping::fetch_result_visible(
             &args.cursor,
             args.offset,
             args.len,
             client_for_fetch.as_deref(),
             args.projection.as_deref(),
+            &|name| fetch_visible.contains(name) && fetch_live(name),
         )
     });
 
-    // Typed `servers.*` stubs from the client-scoped catalog (meta-tools excluded).
-    let owners = unique_prefix_owners(reg);
-    let catalog = script_catalog_tools(cached, allowed, |name| {
-        owner_of_exposed_tool(Some(router_arc.as_ref()), &owners, name)
-    });
-
+    let describe = script_describe_binding(source, &catalog, Some(live_check));
     let outcome = run_code_mode_isolated(
         script,
         input,
         call,
         Some(fetch),
+        Some(describe),
         limits,
         &catalog,
         cancel.clone(),
@@ -7940,9 +8183,15 @@ fn handle_request_with_cancel(
                 let projection = arguments.get("projection").and_then(|v| v.as_str());
                 // Pass the calling client so a client can only fetch results it stashed
                 // (the stash is process-global in HTTP mode).
+                // A paged tool definition is served only while search would still
+                // return that tool to this caller.
+                let visible =
+                    |name: &str| discovery_tool_visible(name, cached, router, reg, allowed);
                 return Some(success(
                     id,
-                    shaping::fetch_result(cursor, offset, len, client, projection),
+                    shaping::fetch_result_visible(
+                        cursor, offset, len, client, projection, &visible,
+                    ),
                 ));
             }
 
@@ -7950,7 +8199,7 @@ fn handle_request_with_cancel(
                 return Some(success(
                     id,
                     json!({
-                        "content": [{ "type": "text", "text": with_status_notes(enabled_summary(host, reg, cached, profile, allowed)) }],
+                        "content": [{ "type": "text", "text": with_status_notes(enabled_summary_with(host, router, reg, cached, profile, allowed)) }],
                         "isError": false
                     }),
                 ));
@@ -8015,20 +8264,17 @@ fn handle_request_with_cancel(
                         .map(|entry| entry.id.as_str())
                         .or_else(|| owners.get(&selector.to_lowercase()).map(String::as_str))
                 });
+                let route_of = |name: &str| owner_of_exposed_tool(Some(router), &owners, name);
+                let deny_destructive = reg.deny_destructive_effective();
+                let refused = |tool: &Value| tool_refused(tool, router, deny_destructive);
                 let visible = |tool: &Value| {
-                    mcp_app_tool_is_model_visible(tool)
+                    tool_visible_to_model(tool, allowed, &route_of, &refused)
                         && tool
                             .get("name")
                             .and_then(Value::as_str)
                             .is_some_and(|name| {
-                                server_owner.is_none_or(|owner| {
-                                    owner_of_exposed_tool(Some(router), &owners, name).as_deref()
-                                        == Some(owner)
-                                }) && allowed.is_none_or(|allowed| {
-                                    tool_in_scope(name, allowed, &|name| {
-                                        owner_of_exposed_tool(Some(router), &owners, name)
-                                    })
-                                })
+                                server_owner
+                                    .is_none_or(|owner| route_of(name).as_deref() == Some(owner))
                             })
                 };
                 let source: Vec<&Value> = base.iter().filter(|tool| visible(tool)).collect();
@@ -8198,6 +8444,9 @@ fn handle_request_with_cancel(
                 } else {
                     format!("{lead} {} pinned prerequisite tool(s) included with full schema; unranked prerequisites listed first.", pinned.len())
                 };
+                if host.code_mode_enabled() {
+                    add_search_signatures(&mut entries, &source);
+                }
                 // Count the exact serialized payload sent to the client.
                 let payload = serde_json::to_string(&entries).unwrap_or_default();
                 let matched_schema_bytes = payload.len() as u64;
@@ -8205,9 +8454,22 @@ fn handle_request_with_cancel(
                 drop(payload);
                 let mut search_result = json!({ "content": [{ "type": "text", "text": text }], "isError": false, "low_confidence": low_confidence });
                 // A menu must keep every selected candidate visible. Only explicit
-                // describe requests page a large complete definition.
+                // describe requests page a large complete definition. Its cursor
+                // remembers the tools it describes, so a later fetch rechecks them.
                 if exact {
-                    shaping::shape_result(&mut search_result, SEARCH_DESCRIBE_BUDGET_BYTES, client);
+                    let describes = pinned
+                        .iter()
+                        .chain(matches.iter())
+                        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+                        .map(str::to_string)
+                        .collect();
+                    shaping::shape_discovery_result(
+                        &mut search_result,
+                        SEARCH_DESCRIBE_BUDGET_BYTES,
+                        client,
+                        describes,
+                        host.discovery_realm(),
+                    );
                 }
                 let response_content_bytes = search_result["content"][0]["text"]
                     .as_str()
@@ -11461,15 +11723,7 @@ fn drop_blocked_from_cache(
     // router has no `blocked` entries to consult.
     let deny_destructive = reg.deny_destructive_effective();
     let mut catalog = catalog.into();
-    catalog.retain(|tool| {
-        let Some(name) = tool.get("name").and_then(Value::as_str) else {
-            return true;
-        };
-        if deny_destructive && cached_tool_is_destructive(tool, name, router) {
-            return false;
-        }
-        !router.is_blocked(name)
-    });
+    catalog.retain(|tool| !tool_refused(tool, router, deny_destructive));
     catalog
 }
 
@@ -11489,16 +11743,18 @@ fn cached_tool_is_destructive(tool: &Value, exposed: &str, router: &Router) -> b
     let definition = router.policy_definition(tool);
     let exposed = definition["name"].as_str().unwrap_or(exposed);
     match conduit_lib::codemode::split_exposed_name(exposed) {
-        Some((_, original)) => {
-            let mut probe = (*definition).clone();
-            probe["name"] = Value::String(original.to_string());
-            is_destructive(&probe)
-        }
+        Some((_, original)) => conduit_lib::router::is_destructive_as(&definition, Some(original)),
         None => is_destructive(&definition),
     }
 }
 
 impl HostState {
+    /// This host's key for its stashed discovery results ([`shaping::forget_discovery`]):
+    /// the address of its registry, which lives as long as the host.
+    fn discovery_realm(&self) -> usize {
+        Arc::as_ptr(&self.registry) as usize
+    }
+
     /// Freeze every access profile before a refresh mutates the shared slots.
     /// A session can initialize during the refresh, so freezing only registered
     /// owners leaves its prior view unavailable at fanout time.
@@ -12236,6 +12492,10 @@ fn watch_tick(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             registry_trusted.store(new_source.is_authoritative(), Ordering::SeqCst);
             *live = new_reg;
+            // Scope, allow-lists and the destructive gate live in the registry: drop
+            // this host's paged definitions stashed under the previous one. Search
+            // makes fresh ones on demand.
+            shaping::forget_discovery(host.discovery_realm(), |_| true);
         };
         // Refresh the live discovery mode from the freshly-loaded registry: a per-client
         // override edit (`client_discovery`) may be the only change, and it isn't
@@ -21655,6 +21915,7 @@ fn run_code_mode_isolated(
     input: codemode::ScriptInput,
     call: codemode::CallBinding,
     fetch: Option<codemode::FetchBinding>,
+    describe: Option<codemode::DescribeBinding>,
     limits: codemode::Limits,
     catalog: &[String],
     cancel: Option<downstream::CancelContext>,
@@ -21668,11 +21929,11 @@ fn run_code_mode_isolated(
         // Cargo's unit-test harness cannot re-enter the gateway's worker mode.
         // Integration tests exercise the real executable and process boundary.
         let _ = (cancel, host_calls);
-        codemode::run_script_with_input(script, input, call, fetch, limits, catalog)
+        codemode::run_script_with_describe(script, input, call, fetch, describe, limits, catalog)
     }
     #[cfg(not(test))]
     worker::run_script(
-        script, input, call, fetch, limits, catalog, cancel, host_calls,
+        script, input, call, fetch, describe, limits, catalog, cancel, host_calls,
     )
 }
 
@@ -22362,6 +22623,18 @@ fn main() {
     let _cache_maintenance = spawn_cache_maintenance(cache_interval, move || {
         let idle = cache_host.idle_for() >= Duration::from_secs(30);
         conduit_lib::shaping::maintain_cache(idle && !was_idle);
+        // A tool quarantined, disabled or put outside its allow-list since its
+        // definition was paged: drop that page. Fetch rechecks visibility anyway;
+        // this keeps the text from sitting in memory until the TTL.
+        let live = Arc::clone(
+            &cache_host
+                .router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        conduit_lib::shaping::forget_discovery(cache_host.discovery_realm(), |name| {
+            live.is_blocked(name)
+        });
         was_idle = idle;
         #[cfg(feature = "test-support")]
         if let Some(path) = &probe {
@@ -28522,11 +28795,25 @@ mod tests {
         };
         let names = script_catalog_tools(&cached, Some(&allowed), route);
         assert_eq!(names, vec!["file_system__read".to_string()]);
-        // Unscoped sees every namespaced non-meta tool, still drops bare + meta.
+        // Unscoped sees every non-meta tool. A bare (override-renamed) name stays
+        // describable and callable; it just gets no `servers.*` stub.
         let all = script_catalog_tools(&cached, None, |_| None);
         assert_eq!(
             all,
-            vec!["file_system__read".to_string(), "other__tool".to_string(),]
+            vec![
+                "file_system__read".to_string(),
+                "no_separator".to_string(),
+                "other__tool".to_string(),
+            ]
+        );
+        // Scoped, a bare name needs an owner in scope, as search requires.
+        let routed = |name: &str| match name {
+            "no_separator" => Some("file-system".to_string()),
+            other => route(other),
+        };
+        assert_eq!(
+            script_catalog_tools(&cached, Some(&allowed), routed),
+            vec!["file_system__read".to_string(), "no_separator".to_string()]
         );
     }
 
@@ -47476,6 +47763,8 @@ mod tests {
     }
 
     include!("../gateway/token_budget_tests.rs");
+    include!("../gateway/code_mode_signature_tests.rs");
+    include!("../gateway/code_mode_off_identity_tests.rs");
 
     #[test]
     fn discovery_surface_token_measurement() {

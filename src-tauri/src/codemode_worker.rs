@@ -58,6 +58,14 @@ pub enum Frame {
         id: u64,
         result: Value,
     },
+    Describe {
+        id: u64,
+        name: String,
+    },
+    DescribeResult {
+        id: u64,
+        result: Value,
+    },
     Checkpoint {
         value: Value,
     },

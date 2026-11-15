@@ -581,6 +581,75 @@ fn host_calls_remain_ordered_and_completed_work_survives_worker_failure() {
     gateway.assert_alive();
 }
 
+/// `toolport.describe` crosses the worker boundary as its own frame, costs no call
+/// budget and leaves the progress ledger empty, in execution and in a dry run.
+#[test]
+fn isolated_describe_returns_signature_and_schema() {
+    let mut gateway = Gateway::configured(mock_registry, None);
+    gateway.wait_for_tool(None, "s__echo");
+    let script = "const d = toolport.describe(servers.s.echo); \
+        const missing = toolport.describe('s__nope'); \
+        toolport.checkpoint({ sig: d.signature, props: Object.keys(d.inputSchema.properties), missing }); \
+        throw new Error('sig=' + d.signature);";
+    for validate in [false, true] {
+        let result = gateway.run(json!({ "script": script, "validate": validate }));
+        let text = result.to_string();
+        assert!(
+            text.contains("servers.s.echo(args?: {text?: string}): ToolResult"),
+            "validate={validate}: {text}"
+        );
+        if !validate {
+            let metadata = &result["structuredContent"]["toolportScript"];
+            assert_eq!(metadata["checkpoint"]["props"], json!(["text"]), "{result}");
+            assert_eq!(metadata["checkpoint"]["missing"], Value::Null, "{result}");
+            assert_eq!(metadata["calls"], 0, "{result}");
+            assert_eq!(metadata["progress"], json!([]), "{result}");
+        }
+    }
+    gateway.assert_alive();
+}
+
+/// A describe reply larger than one worker frame comes back to the script as an
+/// error object for that call (name, size, limit); the script keeps running.
+#[test]
+fn isolated_oversized_describe_is_an_error_for_that_call_only() {
+    let mut gateway = Gateway::configured(
+        |reg, dir| {
+            mock_registry(reg, dir);
+            // About 6 MiB of enum literals (the signature) and 5 MiB of description
+            // text (schema only): each fits, the reply with both does not.
+            let values: Vec<String> = (0..6_000).map(|i| format!("{i:01024}")).collect();
+            let tools = json!([
+                {"name":"echo", "inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}, "annotations":{"destructiveHint":false}},
+                {"name":"big", "inputSchema":{"type":"object","properties":{
+                    "mode":{"enum": values, "description": "d".repeat(5 * 1024 * 1024)}
+                }}, "annotations":{"destructiveHint":false}}
+            ]);
+            std::fs::write(dir.join("tools.json"), tools.to_string()).unwrap();
+        },
+        None,
+    );
+    // The exact-name reply for `s__big` is trimmed; its sibling shows the server is up.
+    gateway.wait_for_tool(None, "s__echo");
+    let script = "const big = toolport.describe('s__big'); \
+        const echo = toolport.describe(servers.s.echo); \
+        toolport.checkpoint({ error: typeof big.error, name: big.name, size: big.size, limit: big.limit, echo: echo.signature }); \
+        throw new Error('stop');";
+    let result = gateway.run(json!({ "script": script }));
+    let checkpoint = &result["structuredContent"]["toolportScript"]["checkpoint"];
+    assert_eq!(checkpoint["error"], "string", "{checkpoint}");
+    assert_eq!(checkpoint["name"], "s__big", "{checkpoint}");
+    assert!(
+        checkpoint["size"].as_u64().unwrap() > checkpoint["limit"].as_u64().unwrap(),
+        "{checkpoint}"
+    );
+    assert_eq!(
+        checkpoint["echo"], "servers.s.echo(args?: {text?: string}): ToolResult",
+        "{checkpoint}"
+    );
+    gateway.assert_alive();
+}
+
 #[test]
 fn isolated_host_calls_preserve_confirmation_pii_and_rate_limits() {
     let mut gateway = Gateway::configured(

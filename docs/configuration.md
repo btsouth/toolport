@@ -103,6 +103,34 @@ scope, approval, content-defense, and rate-limit checks. On failure, completed c
 and the last checkpoint remain available; calls already in flight are cancelled where
 supported and must not be automatically retried.
 
+**Code mode signatures.** While code mode is on, each `toolport_search_tools` hit ends
+with a TypeScript-style signature for its script call, for example
+`servers.github.create_issue(args: {body?: string; owner: string; repo: string; title: string}): ToolResult`.
+A menu row gains it as a trailing string; an exact-name definition gains a `signature`
+field. A script written from a signature is valid against the tool's schema: types may
+be wider than the schema (`string` for a pattern, `unknown` for what TypeScript cannot
+spell), but a required argument is never shown as optional. `allOf` branches are
+merged, `anyOf` and `oneOf` become unions of the merged shapes, and `args?` appears
+only when the schema accepts `{}`. Signatures are capped at 240 characters. A longer
+one is shortened in steps: nested objects become `object`, the typed return becomes
+plain `ToolResult`, optional parameters fold into `...+N optional`, enums become their
+base type, and required parameters keep their names with an `unknown` type or fold
+into `...+N required`. When the upstream tool declares an `outputSchema`, the return
+reads `ToolResult<...>` and types `structuredContent`, because calls inside a script
+are not shaped. The schema itself stays out of `tools/list` and search results. Names
+without a `__` separator, such as Grok's dashed `server-tool` spelling, get `servers.*`
+stubs too; a name with no server part is shown as `toolport.call("name", args)`, and
+one too long for the cap as `toolport.call(name, args)`, where `name` is the hit's
+name. A recursive type is named in the hit, with a note that `toolport.describe` has
+its definition. In a script, `toolport.describe(name)` (or
+`toolport.describe(servers.s.tool)`) returns `{name, signature, inputSchema, truncated}`
+with the complete signature, recursive types written as `type Name = ...;` lines ahead
+of it, or `null` for a name outside your scope. `truncated` is true, with a
+`truncatedReason`, only when a schema is past the renderer's guards. A description too
+large for the code mode frame comes back as `{name, error, size, limit}` for that call
+only. Describe sees exactly the tools search can return. It costs no call budget and
+works in `validate` dry runs. With code mode off, search output is unchanged.
+
 **Semantic search (optional).** Lazy discovery ranks tools lexically by default. Point it
 at any `/v1/embeddings` endpoint (LM Studio, Ollama, or a cloud provider) to blend in
 embedding similarity for paraphrased queries: `TOOLPORT_SEMANTIC=on`,
