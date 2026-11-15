@@ -6462,8 +6462,8 @@ mod tests {
         let (a, b) = (blank_lines(2_000), blank_lines(20_000));
         assert!(b < a * 40, "2,000 pushes {a:?}, 20,000 pushes {b:?}");
 
-        // Past the cap the stream stops waiting: the live prefix becomes the
-        // withheld marker and every separator is kept.
+        // Past the cap the separators are written and only the live prefix
+        // stays held, so the secret is still matched whole when it ends.
         let mut s = Stream::lines();
         let mut out = s.push_with(&m, "x sk-AbC");
         let mut most = 0;
@@ -6471,16 +6471,27 @@ mod tests {
             out.push_str(&s.push_with(&m, "\n"));
             most = most.max(s.held_bytes());
         }
-        out.push_str(&s.push_with(&m, "123xyZ\n"));
+        out.push_str(&s.push_with(&m, "123xyZ end\n"));
         out.push_str(&s.finish_with(&m));
         assert!(most <= MAX_HELD_BYTES, "held {most} bytes");
         assert!(
-            out.starts_with(&format!("x {WITHHELD}\n")),
+            !out.contains("sk-AbC") && !out.contains("123xyZ"),
             "{}",
-            &out[..80]
+            out.replace('\n', "")
         );
-        assert!(!out.contains("sk-AbC"));
+        assert_eq!(out.replace('\n', ""), "x [secret:KEY] end");
         assert_eq!(out.matches('\n').count(), MAX_HELD_BYTES + 11);
+        // A secret with no fragment window over its end: the rest is gone too.
+        let m2 = Matcher::new(&[("PASS", "correcthorsebatterystaple")]);
+        let mut s = Stream::lines();
+        let mut out = s.push_with(&m2, "token correcthorse");
+        for _ in 0..70 {
+            out.push_str(&s.push_with(&m2, &"\n".repeat(1_000)));
+        }
+        out.push_str(&s.push_with(&m2, "batterystaple end\n"));
+        out.push_str(&s.finish_with(&m2));
+        assert_eq!(out.replace('\n', ""), "token [secret:PASS] end");
+        assert_eq!(out.matches('\n').count(), 70_001);
 
         // Within the cap a wrapped secret is still one span.
         let mut s = Stream::lines();
