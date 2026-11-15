@@ -38,6 +38,9 @@ pub fn try_clear() -> std::io::Result<()> {
     let Some(path) = audit_path() else {
         return Ok(());
     };
+    // Under the appenders' and the scrub's lock, so neither can put cleared
+    // lines back.
+    let _lock = crate::registry::lock_at(&path).map_err(std::io::Error::other)?;
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
