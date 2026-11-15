@@ -176,7 +176,7 @@ jobs:
         if: ${{ !cancelled() && env.TAG_IS_LATEST == 'true' }}
         timeout-minutes: 20
         run: bash scripts/macos-acceptance/ui-setup.sh brew "$CLIENT_MANIFEST"
-      - name: Uninstall with Homebrew (zap)
+      - name: Uninstall with Homebrew (reinstall, uninstall, zap)
         if: ${{ !cancelled() && env.TAG_IS_LATEST == 'true' }}
         timeout-minutes: 8
         run: bash scripts/macos-acceptance/homebrew.sh uninstall "$CLIENT_MANIFEST"

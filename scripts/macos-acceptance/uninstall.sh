@@ -67,6 +67,7 @@ fi
 record_rows "uninstall ($LABEL)" "client configs compared after disconnecting" python3 "$HERE/clients.py" restored "$HOME" "$MANIFEST"
 
 quit_check "app quits"
+daemon_gone_check "no gateway daemon after quitting with no client connected" 15
 
 if [[ $REMOVE_DATA -eq 1 && "$MODE" == "ui" ]]; then
   # Settings > Help and data > Remove Toolport data closes the app and removes
@@ -121,4 +122,5 @@ mkdir -p "$HOME/.Trash"
 rm -rf "$HOME/.Trash/Toolport.app"
 if mv "$APP_PATH" "$HOME/.Trash/Toolport.app"; then pass "app moved to the Trash"; else fail "app moved to the Trash"; fi
 sleep 5
+daemon_gone_check "no gateway daemon after the app went to the Trash" 15
 finish_step
