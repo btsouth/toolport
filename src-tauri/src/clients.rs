@@ -12776,6 +12776,30 @@ bad = "not-a-table"
         assert!(!err.contains(key) && err.contains("at line 4"), "{err}");
     }
 
+    /// Failure mode: the parser's message can quote a table name, and a
+    /// registered secret used as one reached the configuration error.
+    #[test]
+    fn a_toml_error_never_quotes_a_registered_secret_in_a_table_name() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-toml-name-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        let key = "sk-live-canary-8Jx3QwPz";
+        crate::secret_redact::register("toml-srv", "API_KEY", key);
+        let content = format!("[mcp_servers.\"{key}\"]\ncommand = \"npx\"\ncommand = \"uvx\"\n");
+        let errors = [
+            parse_toml(&content).unwrap_err(),
+            read_existing_toml(&content).unwrap_err(),
+            {
+                let err = content.parse::<toml_edit::DocumentMut>().unwrap_err();
+                toml_error_text(err.message(), err.span(), &content)
+            },
+        ];
+        let _ = std::fs::remove_dir_all(&dir);
+        for err in errors {
+            assert!(!err.contains(key), "{err}");
+        }
+    }
+
     #[test]
     fn yaml_extensions_syntax_error_includes_location() {
         let content = "extensions:\n  fetch:\n    cmd: uvx\n bad-indent: true\n";
