@@ -10024,7 +10024,41 @@ l10n::bind_dialog_response(&dialog, "enable", "Enable");
     let popover = gtk::Popover::new();
     popover.add_css_class("toolport-action-menu");
     popover.add_css_class("toolport-menu");
-    popover.set_child(Some(&actions));
+    popover.set_position(gtk::PositionType::Bottom);
+    popover.set_halign(gtk::Align::End);
+    let menu_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .child(&actions)
+        .build();
+    popover.set_child(Some(&menu_scroll));
+    let actions_for_size = actions.downgrade();
+    let scroll_for_size = menu_scroll.downgrade();
+    popover.connect_show(move |popover| {
+        let (Some(anchor), Some(actions), Some(scroll)) = (
+            popover.parent(),
+            actions_for_size.upgrade(),
+            scroll_for_size.upgrade(),
+        ) else {
+            return;
+        };
+        let Some(root) = anchor.root().and_downcast::<gtk::Window>() else {
+            return;
+        };
+        let Some(bounds) = anchor.compute_bounds(&root) else {
+            return;
+        };
+        let (_, natural, _, _) = actions.measure(gtk::Orientation::Vertical, -1);
+        let (position, room) = row_menu_placement(
+            bounds.y() as i32,
+            bounds.height() as i32,
+            root.height(),
+            natural + 32,
+        );
+        popover.set_position(position);
+        scroll.set_max_content_height((room - 32).max(64));
+    });
     let menu = gtk::MenuButton::builder()
         .icon_name("view-more-symbolic")
         .tooltip_text(crate::i18n::trf(
@@ -10039,6 +10073,21 @@ l10n::bind_dialog_response(&dialog, "enable", "Enable");
         card.append(&menu);
     }
     card
+}
+
+fn row_menu_placement(
+    top: i32,
+    anchor_height: i32,
+    window_height: i32,
+    menu_height: i32,
+) -> (gtk::PositionType, i32) {
+    let above = top.max(0);
+    let below = (window_height - top - anchor_height).max(0);
+    if below >= menu_height || below >= above {
+        (gtk::PositionType::Bottom, below)
+    } else {
+        (gtk::PositionType::Top, above)
+    }
 }
 
 fn server_actions(server: &state::ServerView, page: ServerPage, include_details: bool) -> gtk::Box {
@@ -11908,13 +11957,43 @@ fn open_server_editor_prefilled(
         .build();
     let url_row = editor_field(crate::i18n::msg("Server URL"), &url);
     connection.append(&url_row);
+    let timeout = gtk::Entry::builder()
+        .input_purpose(gtk::InputPurpose::Number)
+        .build();
+    let saved_timeouts = server_id.as_deref().and_then(|id| {
+        crate::registry::load()
+            .ok()?
+            .servers
+            .into_iter()
+            .find(|s| s.id == id)
+            .map(|s| {
+                (
+                    s.initialize_timeout_ms,
+                    s.request_timeout_ms,
+                    s.command.is_some(),
+                )
+            })
+    });
+    if let Some((Some(ms), _, _)) = saved_timeouts {
+        timeout.set_text(&(ms as f64 / 1000.0).to_string());
+    }
+    let timeout_row = editor_field(crate::i18n::msg("Startup timeout (optional)"), &timeout);
+    timeout_row.append(&{
+        let widget = l10n::label("Seconds to wait for this server to initialize. Raise this for a slow first start, such as a model download or index build. ");
+        widget.set_halign(gtk::Align::Start);
+        widget.set_xalign(0.0);
+        widget.set_wrap(true);
+        widget.add_css_class("toolport-muted");
+        widget.add_css_class("caption");
+        widget
+    });
+    connection.append(&timeout_row);
     // Prompts become slash commands in clients like Claude Code. This applies to
     // every transport, so it stays visible when the transport changes.
     let (hide_prompts_row, hide_prompts) =
         hide_prompts_field(server.as_ref().is_some_and(|server| server.hide_prompts));
     connection.append(&hide_prompts_row);
     test.set_halign(gtk::Align::End);
-    connection.append(&test);
     form.append(&connection);
 
     // Plain values can only be edited once the server exists; a new server
@@ -12062,6 +12141,9 @@ fn open_server_editor_prefilled(
                     ));
                     feedback_for_fill.remove_css_class("error");
                     feedback_for_fill.add_css_class("success");
+                    // Filling the fields re-validated the form, which hides
+                    // stale feedback; this message is new.
+                    feedback_for_fill.set_visible(true);
                 }
                 Err(error) => {
                     l10n::bind_formatted_label(&feedback_for_fill, "Could not parse the snippet: {value0}", &[("value0", &error.to_string())]);
@@ -12108,11 +12190,166 @@ fn open_server_editor_prefilled(
         .build();
     scroller.set_child(Some(&clamp));
     root.append(&scroller);
-    root.append(&dialog_footer(&[&cancel, &save]));
+    form.remove(&feedback);
+    // Lined up with the form's fields, just above the footer.
+    feedback.set_margin_start(30);
+    feedback.set_margin_end(30);
+    feedback.set_margin_bottom(8);
+    root.append(&feedback);
+    root.append(&dialog_footer(&[&test, &cancel, &save]));
     editor.set_content(Some(&root));
     // Start typing the name, not on the footer's first button.
     gtk::prelude::GtkWindowExt::set_focus(&editor, Some(&name));
 
+    let validation_errors = [
+        (&name, crate::i18n::msg("Give the server a name.")),
+        (
+            &command,
+            crate::i18n::msg("Enter the command to run (e.g. npx)."),
+        ),
+        (
+            &url,
+            crate::i18n::msg("The URL must start with http:// or https://."),
+        ),
+        (
+            &timeout,
+            crate::i18n::msg("Startup timeout must be greater than 0 and at most 86,400 seconds."),
+        ),
+    ]
+    .map(|(entry, message)| {
+        let label = l10n::label(message);
+        label.set_xalign(0.0);
+        label.set_wrap(true);
+        label.set_visible(false);
+        label.add_css_class("error");
+        if let Some(parent) = entry.parent().and_downcast::<gtk::Box>() {
+            parent.append(&label);
+        }
+        (
+            entry.clone(),
+            label,
+            std::rc::Rc::new(std::cell::Cell::new(false)),
+        )
+    });
+    // Set while a Test or Save runs: edits must not re-enable either button
+    // or hide the result that is on its way.
+    let busy = std::rc::Rc::new(std::cell::Cell::new(false));
+    let validate: std::rc::Rc<dyn Fn()> = {
+        let busy = busy.clone();
+        let (name, command, url, transport, timeout, save, test, feedback) = (
+            name.clone(),
+            command.clone(),
+            url.clone(),
+            transport.clone(),
+            timeout.clone(),
+            save.clone(),
+            test.clone(),
+            feedback.clone(),
+        );
+        let validation_errors = validation_errors.clone();
+        std::rc::Rc::new(move || {
+            let remote = transport.selected() != 0;
+            let lower_url = url.text().trim().to_ascii_lowercase();
+            let valid_url = lower_url.starts_with("https://") || lower_url.starts_with("http://");
+            let checks = [
+                (&name, !name.text().trim().is_empty()),
+                (&command, remote || !command.text().trim().is_empty()),
+                (&url, !remote || valid_url),
+                (&timeout, editor_timeout_ms(&timeout.text()).is_ok()),
+            ];
+            let valid = checks.iter().all(|(_, valid)| *valid);
+            for ((field, ok), (_, error, touched)) in checks.into_iter().zip(&validation_errors) {
+                error.set_visible(!ok && touched.get());
+                if ok || !touched.get() {
+                    field.remove_css_class("error");
+                } else {
+                    field.add_css_class("error");
+                }
+            }
+            let (_, url_error, _) = &validation_errors[2];
+            l10n::bind_text(
+                url_error,
+                if url.text().trim().is_empty() {
+                    "Enter the server URL."
+                } else {
+                    "The URL must start with http:// or https://."
+                },
+            );
+            save.set_sensitive(valid && !busy.get());
+            test.set_sensitive(valid && !busy.get());
+            if !busy.get() {
+                feedback.set_visible(false);
+            }
+        })
+    };
+    // Empty means the default, except when editing a server whose saved
+    // value could not be read: then the saved value is kept.
+    let saved_unknown = server_id.is_some() && saved_timeouts.is_none();
+    let timeout_value = move |text: &str| -> Option<Option<Option<u64>>> {
+        let value = editor_timeout_ms(text).ok()?;
+        Some(if value.is_none() && saved_unknown {
+            None
+        } else {
+            Some(value)
+        })
+    };
+    for (entry, _, touched) in &validation_errors {
+        let validate_change = validate.clone();
+        let touched_change = touched.clone();
+        entry.connect_changed(move |_| {
+            touched_change.set(true);
+            validate_change();
+        });
+        let focus = gtk::EventControllerFocus::new();
+        let (touched, validate) = (touched.clone(), validate.clone());
+        focus.connect_leave(move |_| {
+            touched.set(true);
+            validate();
+        });
+        entry.add_controller(focus);
+    }
+    let validate_args = validate.clone();
+    args.buffer().connect_changed(move |_| validate_args());
+    let validate_cwd = validate.clone();
+    cwd.connect_changed(move |_| validate_cwd());
+    let validate_transport = validate.clone();
+    transport.connect_selected_notify(move |_| validate_transport());
+    validate();
+    // The default shown matches React: 10 seconds for a local command, 120
+    // when it downloads its package first, the request timeout for a remote.
+    let timeout_hint: std::rc::Rc<dyn Fn()> = {
+        let (transport, command, args, timeout) = (
+            transport.clone(),
+            command.clone(),
+            args.clone(),
+            timeout.clone(),
+        );
+        std::rc::Rc::new(move || {
+            let milliseconds = if transport.selected() == 0 {
+                let argv = editor_args(&args);
+                if crate::clients::is_download_launcher(command.text().trim(), &argv) {
+                    120_000
+                } else {
+                    10_000
+                }
+            } else {
+                match saved_timeouts {
+                    Some((_, request, false)) => request.unwrap_or(30_000),
+                    _ => 30_000,
+                }
+            };
+            let seconds = milliseconds as f64 / 1000.0;
+            timeout.set_placeholder_text(Some(&seconds.to_string()));
+        })
+    };
+    let hint_command = timeout_hint.clone();
+    command.connect_changed(move |_| hint_command());
+    let hint_args = timeout_hint.clone();
+    args.buffer().connect_changed(move |_| hint_args());
+    let hint_transport = timeout_hint.clone();
+    transport.connect_selected_notify(move |_| hint_transport());
+    timeout_hint();
+    let timeout_for_test = timeout.clone();
     let server_id_for_test = server_id.clone();
     let feedback_for_test = feedback.clone();
     let name_for_test = name.clone();
@@ -12127,13 +12364,20 @@ fn open_server_editor_prefilled(
     let original_command_for_test = original_command.clone();
     let original_args_for_test = original_args.clone();
     let plain_env_for_test = plain_env.clone();
-    test.connect_clicked(move |button| {
-        button.set_sensitive(false);
+    let busy_for_test = busy.clone();
+    let validate_for_test = validate.clone();
+    test.connect_clicked(move |_| {
+        let Some(timeout_ms) = timeout_value(&timeout_for_test.text()) else {
+            validate_for_test();
+            return;
+        };
+        busy_for_test.set(true);
+        validate_for_test();
         l10n::bind_text(&feedback_for_test, "Testing connection…");
         feedback_for_test.remove_css_class("error");
         feedback_for_test.add_css_class("success");
         feedback_for_test.set_visible(true);
-        let fields = collect_server_fields(
+        let mut fields = collect_server_fields(
             &name_for_test,
             &transport_for_test,
             &command_for_test,
@@ -12142,6 +12386,7 @@ fn open_server_editor_prefilled(
             &cwd_for_test,
             &inherit_env_for_test,
         );
+        fields.initialize_timeout_ms = timeout_ms;
         let binding_changed =
             fields.command != original_command_for_test || fields.args != original_args_for_test;
         let launch_values = launch_for_test
@@ -12162,7 +12407,8 @@ fn open_server_editor_prefilled(
         let env_edits = plain_env_for_test.as_ref().map(collect_plain_env);
         let server_id = server_id_for_test.clone();
         let feedback = feedback_for_test.clone();
-        let button = button.clone();
+        let busy = busy_for_test.clone();
+        let validate = validate_for_test.clone();
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || {
                 let mut entry = crate::registry_controller::server_entry_for_probe(
@@ -12191,7 +12437,9 @@ fn open_server_editor_prefilled(
                 Ok::<_, String>(crate::server_runtime::probe_one_bounded(&entry))
             })
             .await;
-            button.set_sensitive(true);
+            busy.set(false);
+            validate();
+            feedback.set_visible(true);
             match result {
                 Ok(Ok(probe)) if probe.ok => {
                     l10n::bind_formatted_label(
@@ -12246,12 +12494,20 @@ fn open_server_editor_prefilled(
     let original_launch_for_save = original_launch.clone();
     let original_command_for_save = original_command.clone();
     let original_args_for_save = original_args.clone();
-    save.connect_clicked(move |save| {
-        save.set_sensitive(false);
+    let busy_for_save = busy;
+    let validate_for_save = validate;
+    save.connect_clicked(move |_| {
+        let Some(timeout_ms) = timeout_value(&timeout.text()) else {
+            validate_for_save();
+            return;
+        };
         feedback.set_visible(false);
+        busy_for_save.set(true);
+        validate_for_save();
         let server_id = server_id.clone();
         let mut fields =
             collect_server_fields(&name, &transport, &command, &args, &url, &cwd, &inherit_env);
+        fields.initialize_timeout_ms = timeout_ms;
         fields.sync_local_only = local_only.is_active();
         fields.hide_prompts = Some(hide_prompts.is_active());
         let binding_changed =
@@ -12275,7 +12531,8 @@ fn open_server_editor_prefilled(
         let env = snippet_env.borrow().clone();
         let env_edits = plain_env.as_ref().map(collect_plain_env);
         let page = page.clone();
-        let save = save.clone();
+        let busy = busy_for_save.clone();
+        let validate = validate_for_save.clone();
         let feedback = feedback.clone();
         let editor = editor_for_save.clone();
         gtk::glib::spawn_future_local(async move {
@@ -12354,13 +12611,15 @@ fn open_server_editor_prefilled(
                         "Could not save: {value0}",
                         &[("value0", &error.to_string())],
                     );
+                    busy.set(false);
+                    validate();
                     feedback.set_visible(true);
-                    save.set_sensitive(true);
                 }
                 Err(_) => {
                     l10n::bind_text(&feedback, "Could not save: the operation stopped");
+                    busy.set(false);
+                    validate();
                     feedback.set_visible(true);
-                    save.set_sensitive(true);
                 }
             }
         });
@@ -12595,6 +12854,33 @@ fn server_saved_feedback(
     message
 }
 
+fn editor_timeout_ms(text: &str) -> Result<Option<u64>, String> {
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let seconds = text
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| "Startup timeout must be greater than 0 and at most 86,400 seconds.")?;
+    let milliseconds = (seconds * 1000.0).round();
+    if !milliseconds.is_finite() || milliseconds < 1.0 || milliseconds > 86_400_000.0 {
+        return Err("Startup timeout must be greater than 0 and at most 86,400 seconds.".into());
+    }
+    Ok(Some(milliseconds as u64))
+}
+
+/// The editor's arguments, one per non-empty line.
+fn editor_args(args: &gtk::TextView) -> Vec<String> {
+    let buffer = args.buffer();
+    buffer
+        .text(&buffer.start_iter(), &buffer.end_iter(), false)
+        .lines()
+        .map(str::trim)
+        .filter(|argument| !argument.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 fn collect_server_fields(
     name: &gtk::Entry,
     transport: &gtk::DropDown,
@@ -12606,6 +12892,7 @@ fn collect_server_fields(
 ) -> crate::registry_controller::ServerFields {
     crate::registry_controller::ServerFields {
         sync_local_only: false,
+        initialize_timeout_ms: None,
         name: name.text().to_string(),
         transport: match transport.selected() {
             1 => "http",
@@ -12614,18 +12901,7 @@ fn collect_server_fields(
         }
         .into(),
         command: Some(command.text().to_string()),
-        args: args
-            .buffer()
-            .text(
-                &args.buffer().start_iter(),
-                &args.buffer().end_iter(),
-                false,
-            )
-            .lines()
-            .map(str::trim)
-            .filter(|argument| !argument.is_empty())
-            .map(ToOwned::to_owned)
-            .collect(),
+        args: editor_args(args),
         url: Some(url.text().to_string()),
         cwd: Some(cwd.text().to_string()),
         inherit_env: Some(inherit_env.is_active()),
@@ -15797,6 +16073,159 @@ mod tests {
         assert_eq!(filter_tool_identities(&identities, "search").len(), 1);
         assert_eq!(filter_tool_identities(&identities, "jira").len(), 1);
         assert_eq!(filter_tool_identities(&identities, "nothing").len(), 0);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn editor_validation_clears_feedback_and_keeps_test_result_outside_scroll() {
+        use super::*;
+        adw::init().unwrap();
+        let _data = crate::registry::DataDirTestEnv::new("gtk-editor-validation");
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.EditorRegression")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gtk::gio::Cancellable::NONE).unwrap();
+        let parent = adw::ApplicationWindow::builder().application(&app).build();
+        let (content, page, _) = build_content(&app, crate::approval_broker::start_native());
+        parent.set_content(Some(&content));
+        parent.present();
+        let editor = open_server_editor_prefilled(None, None, page, None).unwrap();
+        fn widgets(widget: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+            out.push(widget.clone());
+            let mut child = widget.first_child();
+            while let Some(node) = child {
+                child = node.next_sibling();
+                widgets(&node, out);
+            }
+        }
+        let mut all = Vec::new();
+        widgets(editor.upcast_ref(), &mut all);
+        let entry = |placeholder: &str| {
+            all.iter()
+                .filter_map(|w| w.downcast_ref::<gtk::Entry>())
+                .find(|e| e.placeholder_text().as_deref() == Some(placeholder))
+                .unwrap()
+                .clone()
+        };
+        let button = |label: &str| {
+            all.iter()
+                .filter_map(|w| w.downcast_ref::<gtk::Button>())
+                .find(|b| b.label().as_deref() == Some(label))
+                .unwrap()
+                .clone()
+        };
+        let (name, command, save, test) = (
+            entry("My MCP server"),
+            entry("npx"),
+            button("Add"),
+            button("Test connection"),
+        );
+        assert!(!save.is_sensitive());
+        assert!(!test.is_sensitive());
+        name.set_text("fixture");
+        assert!(!save.is_sensitive());
+        command.set_text("fixture-command");
+        assert!(save.is_sensitive() && test.is_sensitive());
+        assert!(
+            test.ancestor(gtk::ScrolledWindow::static_type()).is_none(),
+            "connection testing must remain in the fixed footer"
+        );
+        let feedback = all
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .find(|l| l.has_css_class("toolport-feedback"))
+            .unwrap();
+        assert!(
+            feedback
+                .ancestor(gtk::ScrolledWindow::static_type())
+                .is_none(),
+            "test feedback must remain visible outside the form scroller"
+        );
+        feedback.set_label("Old failure");
+        feedback.set_visible(true);
+        name.set_text("");
+        assert!(!feedback.is_visible());
+        assert!(!save.is_sensitive());
+        assert!(name.has_css_class("error"));
+        name.set_text("fixture again");
+        assert!(!name.has_css_class("error"));
+        assert!(save.is_sensitive());
+
+        // The startup timeout: validated like the other fields, with the
+        // same default shown as in React.
+        let timeout = all
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Entry>())
+            .find(|e| e.input_purpose() == gtk::InputPurpose::Number)
+            .unwrap()
+            .clone();
+        assert_eq!(timeout.placeholder_text().as_deref(), Some("10"));
+        command.set_text("npx -y @scope/slow-server");
+        assert_eq!(timeout.placeholder_text().as_deref(), Some("120"));
+        timeout.set_text("0");
+        assert!(!save.is_sensitive());
+        assert!(timeout.has_css_class("error"));
+        timeout.set_text("90.5");
+        assert!(save.is_sensitive());
+        assert!(!timeout.has_css_class("error"));
+        let transport = all
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::DropDown>())
+            .next()
+            .unwrap()
+            .clone();
+        transport.set_selected(1);
+        assert_eq!(timeout.placeholder_text().as_deref(), Some("30"));
+
+        // The URL error says what is wrong, as in React.
+        let url = entry("https://example.com/mcp");
+        let url_error = || {
+            url.parent()
+                .unwrap()
+                .last_child()
+                .and_downcast::<gtk::Label>()
+                .unwrap()
+        };
+        url.set_text("ftp://example.com");
+        assert!(url_error().is_visible());
+        assert_eq!(
+            url_error().label(),
+            "The URL must start with http:// or https://."
+        );
+        url.set_text("");
+        assert_eq!(url_error().label(), "Enter the server URL.");
+        url.set_text("https://example.com/mcp");
+        assert!(!url_error().is_visible());
+        assert!(save.is_sensitive());
+        editor.close();
+        parent.close();
+    }
+
+    #[test]
+    fn row_menu_uses_window_space_instead_of_desktop_space() {
+        assert_eq!(
+            row_menu_placement(423, 34, 700, 320),
+            (gtk::PositionType::Top, 423)
+        );
+        assert_eq!(
+            row_menu_placement(150, 34, 700, 320),
+            (gtk::PositionType::Bottom, 516)
+        );
+        assert_eq!(
+            row_menu_placement(240, 34, 360, 320),
+            (gtk::PositionType::Top, 240)
+        );
+    }
+
+    #[test]
+    fn startup_timeout_editor_accepts_seconds_and_default() {
+        assert_eq!(editor_timeout_ms(""), Ok(None));
+        assert_eq!(editor_timeout_ms(" 0.001 "), Ok(Some(1)));
+        assert_eq!(editor_timeout_ms("120.5"), Ok(Some(120500)));
+        for value in ["0", "-1", "NaN", "inf", "86401", "not a number"] {
+            assert!(editor_timeout_ms(value).is_err(), "{value}");
+        }
     }
 
     #[test]
