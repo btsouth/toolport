@@ -9713,7 +9713,7 @@ fn backfill_client_fields(client_id: &str, entry_name: &str) -> Result<(), Strin
     };
     if !matches!(
         def.format,
-        Format::JsonServers | Format::JsonCursorMcpServers
+        Format::JsonServers | Format::JsonCursorMcpServers | Format::JsonCopilotMcpServers
     ) {
         return Ok(());
     }
