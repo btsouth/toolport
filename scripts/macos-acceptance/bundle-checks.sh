@@ -83,7 +83,10 @@ else
 fi
 
 # Gateway entry points clients spawn: the current name and the pre-rename one.
-for link in toolport-gateway conduit-gateway; do
+links="toolport-gateway conduit-gateway"
+# The pre-rename link is made by the release signing script only.
+[[ "$SIGNED" == "1" ]] || links="toolport-gateway"
+for link in $links; do
   p="$APP/Contents/MacOS/$link"
   if [[ -x "$p" ]]; then
     pass "client entry point $link resolves" "$(readlink "$p" || echo regular file)"

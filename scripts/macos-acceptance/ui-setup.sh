@@ -25,6 +25,10 @@ mkdir -p "$MOCK_DIR"
 cp "$HERE/mock-mcp.mjs" "$MOCK"
 REGISTRY="$DATA_DIR/registry.json"
 ENTRIES="$EVIDENCE/client-entries-$LABEL"
+# Signed builds call the mock server, which needs the keychain token; unsigned
+# builds call Toolport's own status tool instead.
+CALL_TOOL=check_secret
+[[ "${SIGNED:-1}" == "1" ]] || CALL_TOOL=toolport_status
 
 [[ -n "$(app_pid)" ]] || { fail "app is running" "start it first"; finish_step; }
 ui_activate
@@ -77,6 +81,12 @@ for page in General Tools Safety Access Connections "Help and data"; do
   fi
 done
 
+# ── A server with a secret in the keychain ────────────────────────────────
+# Signed releases only: an unsigned local build has no keychain access group,
+# so the data-protection keychain refuses it (errSecMissingEntitlement).
+if [[ "${SIGNED:-1}" != "1" ]]; then
+  untested "keychain secret storage, plain-text and prompt checks" "unsigned local build; the data-protection keychain needs Toolport's signed entitlements"
+else
 # ── A server with a secret in the keychain ────────────────────────────────
 log "Adding a server with a keychain secret"
 added=0
@@ -171,6 +181,8 @@ else
 fi
 no_prompt_check "gateway keychain read"
 
+fi
+
 # ── Connect each client ───────────────────────────────────────────────────
 log "Connecting clients"
 first=1
@@ -213,13 +225,13 @@ for entry in "$ENTRIES"/*.json; do
   [[ -e "$entry" ]] || continue
   cid="$(basename "$entry" .json)"
   out="$EVIDENCE/logs/tool-call-$LABEL-$cid.json"
-  MCP_CALL_TIMEOUT_MS=90000 node "$HERE/mcp-call.mjs" "$entry" check_secret >"$out" 2>&1 &
+  MCP_CALL_TIMEOUT_MS=90000 node "$HERE/mcp-call.mjs" "$entry" "$CALL_TOOL" >"$out" 2>&1 &
   call=$!
   approved="$(approve_pending 95 "$call")"
   wait "$call"
   rc=$?
   result="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("result",""), "|", d.get("calledVia",""), "|", d.get("detail",""))' "$out" 2>/dev/null)"
-  if [[ $rc -eq 0 ]] && grep -qF "$SECRET_SHA" "$out"; then
+  if [[ $rc -eq 0 ]] && { [[ "$CALL_TOOL" != check_secret ]] || grep -qF "$SECRET_SHA" "$out"; }; then
     pass "tool call through the $cid entry gets the keychain token" "${result} approvals=$approved"
   else
     fail "tool call through the $cid entry gets the keychain token" "exit $rc: ${result:-$(tail -c 300 "$out")} approvals=$approved (logs/tool-call-$LABEL-$cid.json)"

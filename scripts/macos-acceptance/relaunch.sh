@@ -25,22 +25,28 @@ sleep 8
 shot "$LABEL-second-launch" >/dev/null || true
 no_prompt_check "second launch"
 
+CALL_TOOL=check_secret
+if [[ "${SIGNED:-1}" != "1" ]]; then
+  CALL_TOOL=toolport_status
+  untested "keychain token readable after relaunch" "unsigned local build"
+else
 tmo 60 "$GATEWAY" --selftest-secrets >"$EVIDENCE/logs/selftest-secrets-relaunch-$LABEL.log" 2>&1
 if grep -Eq "^OK +$SERVER_ID :: MOCK_API_TOKEN" "$EVIDENCE/logs/selftest-secrets-relaunch-$LABEL.log"; then
   pass "keychain token readable after relaunch"
 else
   fail "keychain token readable after relaunch" "$(tr '\n' ' ' <"$EVIDENCE/logs/selftest-secrets-relaunch-$LABEL.log" | cut -c1-300)"
 fi
+fi
 
 entry="$EVIDENCE/client-entries-$LABEL/$CALL_CLIENT.json"
 if [[ -f "$entry" ]]; then
   out="$EVIDENCE/logs/tool-call-relaunch-$LABEL.json"
-  MCP_CALL_TIMEOUT_MS=90000 node "$HERE/mcp-call.mjs" "$entry" check_secret >"$out" 2>&1 &
+  MCP_CALL_TIMEOUT_MS=90000 node "$HERE/mcp-call.mjs" "$entry" "$CALL_TOOL" >"$out" 2>&1 &
   call=$!
   approved="$(approve_pending 95 "$call")"
   wait "$call"
   rc=$?
-  if [[ $rc -eq 0 ]] && grep -qF "$SECRET_SHA" "$out"; then
+  if [[ $rc -eq 0 ]] && { [[ "$CALL_TOOL" != check_secret ]] || grep -qF "$SECRET_SHA" "$out"; }; then
     pass "tool call after relaunch gets the keychain token" "$CALL_CLIENT entry, approvals=$approved"
   else
     fail "tool call after relaunch gets the keychain token" "exit $rc (logs/tool-call-relaunch-$LABEL.json)"

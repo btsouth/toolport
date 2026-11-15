@@ -14,6 +14,11 @@ on:
         required: false
         type: string
         default: ""
+      build_ref:
+        description: "Instead of a release, build the app from this ref (unsigned; keychain checks are skipped)"
+        required: false
+        type: boolean
+        default: false
   # Temporary while the job is developed: runs only when the job itself changes.
   pull_request:
     paths:
@@ -34,6 +39,7 @@ env:
 jobs:
   new-user:
     name: New user (dmg)
+    if: ${{ !inputs.build_ref }}
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
@@ -87,6 +93,7 @@ jobs:
 
   upgrade:
     name: Upgrade from the previous release (dmg)
+    if: ${{ !inputs.build_ref }}
     runs-on: macos-latest
     timeout-minutes: 50
     steps:
@@ -134,6 +141,7 @@ jobs:
 
   homebrew:
     name: Homebrew cask
+    if: ${{ !inputs.build_ref }}
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
@@ -172,6 +180,76 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-acceptance-homebrew
+          path: ${{ runner.temp }}/macos-acceptance
+          if-no-files-found: error
+          retention-days: 14
+
+  current-ref:
+    name: Build from this ref (unsigned)
+    if: ${{ inputs.build_ref }}
+    runs-on: macos-latest
+    timeout-minutes: 90
+    # Same CI-only release-profile overrides as ci.yml's macOS payload job.
+    env:
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "256"
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      SIGNED: "0"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri
+          key: macos-payload
+          cache-bin: "false"
+          save-if: "false"
+      - run: npm ci
+      - name: Build the app without release signing or publishing
+        run: npx tauri build --config src-tauri/tauri.bundle.conf.json --config '{"bundle":{"createUpdaterArtifacts":false}}' --bundles app -- --bin conduit
+      - name: Prepare the runner and seed client configs
+        run: bash scripts/macos-acceptance/prepare.sh
+      - name: Install the built app
+        run: |
+          ditto src-tauri/target/release/bundle/macos/Toolport.app /Applications/Toolport.app
+          printf 'install\tINFO\tbuilt from\t%s\n' "$GITHUB_SHA" >>"$EVIDENCE/results.tsv"
+      - name: Check the installed bundle
+        run: bash scripts/macos-acceptance/bundle-checks.sh /Applications/Toolport.app arm64 "current ref"
+      - name: First launch
+        if: ${{ !cancelled() }}
+        timeout-minutes: 8
+        run: bash scripts/macos-acceptance/first-run.sh ref
+      - name: Set up through the window
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: bash scripts/macos-acceptance/ui-setup.sh ref "$CLIENT_MANIFEST"
+      - name: Second launch
+        if: ${{ !cancelled() }}
+        timeout-minutes: 6
+        run: bash scripts/macos-acceptance/relaunch.sh ref
+      - name: Uninstall (Settings, then Trash)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 6
+        run: bash scripts/macos-acceptance/uninstall.sh ref "$CLIENT_MANIFEST" ui
+      - name: List leftovers
+        if: ${{ !cancelled() }}
+        run: bash scripts/macos-acceptance/leftovers.sh "uninstall, data kept"
+      - name: Write the job summary
+        if: always()
+        run: bash scripts/macos-acceptance/finish.sh "Current ref (unsigned) ${GITHUB_SHA}"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-acceptance-current-ref
           path: ${{ runner.temp }}/macos-acceptance
           if-no-files-found: error
           retention-days: 14
