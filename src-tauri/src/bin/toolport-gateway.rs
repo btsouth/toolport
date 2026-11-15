@@ -10634,7 +10634,18 @@ struct ProgressRoute {
     /// own unique token downstream and translates back here, the same way it
     /// namespaces tool names.
     client_token: Value,
+    /// The request instance that asked for it. Its progress is delivered only while
+    /// that instance is live, so a cancelled call's late progress never reaches the
+    /// client, which may already have reused the token for its next request.
+    owner: Option<downstream::CancelContext>,
 }
+
+/// A stdio progress message and the request instance it belongs to.
+type StdioProgress = (Value, Option<downstream::CancelContext>);
+
+/// `_meta` key that tells the stdio adapter which of its requests a progress
+/// message belongs to. The adapter removes it before the client sees the message.
+const ADAPTER_REQUEST_META: &str = conduit_lib::stdio_adapter::ADAPTER_REQUEST_META;
 
 /// Depth of the stdio progress hand-off queue. Bounded so a client that stops
 /// reading costs dropped notifications rather than a stalled drain thread.
@@ -10703,6 +10714,7 @@ fn register_progress(
             session: session.to_string(),
             producer: producer.to_string(),
             client_token,
+            owner: APPROVAL_CANCEL.with(|current| current.borrow().clone()),
         },
     );
     Some((
@@ -10764,14 +10776,16 @@ fn deliver_progress(
     let Some(key) = token.as_str().map(str::to_string) else {
         return;
     };
-    let (session, client_token) = {
+    let (session, client_token, owner) = {
         let table = routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match table.active.get(&key) {
-            Some(route) if route.producer == producer => {
-                (route.session.clone(), route.client_token.clone())
-            }
+            Some(route) if route.producer == producer => (
+                route.session.clone(),
+                route.client_token.clone(),
+                route.owner.clone(),
+            ),
             Some(route) => {
                 eprintln!(
                     "toolport: progress for token from '{producer}' dropped \
@@ -10789,6 +10803,15 @@ fn deliver_progress(
     let mut note = note.clone();
     if let Some(params) = note.get_mut("params").and_then(Value::as_object_mut) {
         params.insert("progressToken".to_string(), client_token);
+        if let Some(tag) = owner
+            .as_ref()
+            .and_then(downstream::CancelContext::adapter_tag)
+        {
+            let meta = params.entry("_meta").or_insert_with(|| json!({}));
+            if let Some(meta) = meta.as_object_mut() {
+                meta.insert(ADAPTER_REQUEST_META.to_string(), json!(tag));
+            }
+        }
     }
     let note = &note;
     if session == RESOURCE_SUB_STDIO {
@@ -10806,7 +10829,7 @@ fn deliver_progress(
             eprintln!("toolport: stdio progress for a session with no stdio face; dropped");
             return;
         };
-        if sender.try_send(note.clone()).is_err() {
+        if sender.try_send((note.clone(), owner)).is_err() {
             eprintln!("toolport: stdio progress queue full or closed; progress dropped");
         }
         return;
@@ -10823,8 +10846,17 @@ fn deliver_progress(
     if target.is_expired() || target.closed.load(Ordering::SeqCst) {
         return;
     }
-    if !target.push_message(json, None) {
-        eprintln!("toolport: MCP session outbound queue full; progress dropped");
+    let push = || {
+        if !target.push_message(json, None) {
+            eprintln!("toolport: MCP session outbound queue full; progress dropped");
+        }
+    };
+    // Queued only while its request is live, as one step against its cancellation.
+    match &owner {
+        Some(owner) => {
+            owner.speak_with(push);
+        }
+        None => push(),
     }
 }
 
@@ -15005,7 +15037,7 @@ struct SessionState {
     /// closes over a connection instead of over whichever stdout started the
     /// process. Unused (and never created) for an HTTP face or a client that never
     /// asks for progress.
-    stdio_progress: OnceLock<std::sync::mpsc::SyncSender<Value>>,
+    stdio_progress: OnceLock<std::sync::mpsc::SyncSender<StdioProgress>>,
     /// Whether this stdio peer has spoken past `initialize`. Connection-local by
     /// decision: as a process global it silently assumed one stdio client per host,
     /// and a second connection would have inherited the first one's handshake and
@@ -15033,7 +15065,7 @@ struct SessionState {
     /// client-chosen, so two stdio clients on one host would collide. One client
     /// cancelling its id 7 could cancel another's id 7.
     cancellations: downstream::CancelRegistry,
-    owner_cancel_guard: Mutex<Option<downstream::CancelGuard>>,
+    owner_cancel_guard: Mutex<Option<downstream::CloseGuard>>,
     /// How many requests this connection is running on workers, against a cap, so a
     /// client cannot spawn unbounded workers. Per connection for the same reason as
     /// the registry: it is this peer's concurrency, not the host's.
@@ -15172,19 +15204,31 @@ impl SessionState {
     /// This session's progress hand-off, or `None` when it has no stdio face.
     /// Created on first use, so a client that never asks for progress pays for
     /// neither the queue nor the writer thread.
-    fn stdio_progress_sender(&self) -> Option<&std::sync::mpsc::SyncSender<Value>> {
+    fn stdio_progress_sender(&self) -> Option<&std::sync::mpsc::SyncSender<StdioProgress>> {
         let stdout = match &self.transport {
             SessionTransportFace::Stdio(stdout) => Arc::clone(stdout),
             SessionTransportFace::Http => return None,
         };
         Some(self.stdio_progress.get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<Value>(PROGRESS_STDIO_QUEUE);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<StdioProgress>(PROGRESS_STDIO_QUEUE);
             std::thread::spawn(move || {
-                for note in rx {
-                    let mut out = stdout
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if write_json_line(&mut *out, &note).is_err() {
+                for (note, owner) in rx {
+                    let mut failed = false;
+                    let mut write = || {
+                        let mut out = stdout
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        failed = write_json_line(&mut *out, &note).is_err();
+                    };
+                    // Written only while its request is live, as one step against
+                    // that request's cancellation.
+                    match &owner {
+                        Some(owner) => {
+                            owner.speak_with(write);
+                        }
+                        None => write(),
+                    }
+                    if failed {
                         // The stdio client is gone; nothing further will be readable.
                         break;
                     }
@@ -15198,7 +15242,7 @@ impl SessionState {
     /// what the writer thread would have written. Real sessions create the queue
     /// lazily, on first use.
     #[cfg(test)]
-    fn set_stdio_progress(&self, sender: std::sync::mpsc::SyncSender<Value>) {
+    fn set_stdio_progress(&self, sender: std::sync::mpsc::SyncSender<StdioProgress>) {
         let _ = self.stdio_progress.set(sender);
     }
 
@@ -15477,7 +15521,7 @@ impl SessionState {
 struct McpSseReader {
     session: Arc<SessionState>,
     cleanup: Option<(GatewayState, String)>,
-    cancel_guard: Option<downstream::CancelGuard>,
+    cancel_guard: Option<downstream::CloseGuard>,
     buf: Vec<u8>,
     pos: usize,
     tools_changed: bool,
@@ -15636,14 +15680,11 @@ fn mint_mcp_session(
     let session = Arc::new(session);
     if let Some(lifetime) = lifetime {
         let weak = Arc::downgrade(&session);
-        let guard = lifetime
-            .cancellations
-            .context(sid.clone())
-            .on_cancel(Arc::new(move |_| {
-                if let Some(session) = weak.upgrade() {
-                    session.close();
-                }
-            }));
+        let guard = lifetime.cancellations.on_close(Arc::new(move |_| {
+            if let Some(session) = weak.upgrade() {
+                session.close();
+            }
+        }));
         *session
             .owner_cancel_guard
             .lock()
@@ -17901,27 +17942,35 @@ fn handle_stdio_request(
         Some(error(id, -32603, "internal error").into())
     });
 
-    if cancel_context.is_cancelled() {
+    let Some(resp) = response else {
+        cancel_context.finish();
+        return;
+    };
+    // The peer has an answer on the wire now, so anything the catalog
+    // withheld may follow it. Every id-bearing request counts, not just
+    // `initialize`: whatever the client opened with, its own reply has to be
+    // the first thing it reads. This is the second of the two conditions in
+    // `stdio_may_speak`; the peer's post-handshake message is the other, and
+    // either one may land last.
+    //
+    // The reply is claimed and written as one step against a cancellation, so a
+    // request the client cancelled first gets nothing, and one it cancels while the
+    // reply is being written is answered.
+    let mut written = false;
+    let claimed = cancel_context.reply_with(|| {
+        written = write_stdio_response_then(&state.stdio_upstream, &resp, || resp.record_listed());
+    });
+    cancel_context.finish();
+    if !claimed {
         glog(&format!(
             "suppressing response for cancelled request {request_key}"
         ));
-        cancel_context.finish();
         return;
     }
-    cancel_context.finish();
-
-    if let Some(resp) = response {
-        // The peer has an answer on the wire now, so anything the catalog
-        // withheld may follow it. Every id-bearing request counts, not just
-        // `initialize`: whatever the client opened with, its own reply has to be
-        // the first thing it reads. This is the second of the two conditions in
-        // `stdio_may_speak`; the peer's post-handshake message is the other, and
-        // either one may land last.
-        if write_stdio_response_then(&state.stdio_upstream, &resp, || resp.record_listed()) {
-            resp.delivered();
-            state.stdio_upstream.mark_stdio_responded();
-            drain_stdio_deferred(&state.stdio_upstream);
-        }
+    if written {
+        resp.delivered();
+        state.stdio_upstream.mark_stdio_responded();
+        drain_stdio_deferred(&state.stdio_upstream);
     }
 }
 
@@ -18333,7 +18382,7 @@ struct McpHttpRequestHeaders<'a> {
 
 struct McpListen {
     session: Arc<SessionState>,
-    cancel_guard: Option<downstream::CancelGuard>,
+    cancel_guard: Option<downstream::CloseGuard>,
     cleanup: Option<(GatewayState, String)>,
 }
 
@@ -18973,42 +19022,59 @@ fn handle_mcp_http(
             // A cancellation POST on another connection cannot target this call.
             let cancellations =
                 http_call_cancellations(state, session_id.as_deref(), session_owner);
+            // The stdio adapter numbers each request, so its cancellation names the
+            // instance it means even when it arrives before that request does.
+            let adapter_request = HTTP_ADAPTER_REQUEST.with(std::cell::Cell::get);
             if let Some(id) = cancellation_request_id(&req) {
-                cancellations.cancel(&id, cancellation_reason(&req));
+                match adapter_request {
+                    Some(tag) => {
+                        cancellations.cancel_instance(&id, tag, cancellation_reason(&req));
+                    }
+                    None => {
+                        cancellations.cancel(&id, cancellation_reason(&req));
+                    }
+                }
                 return HttpOut::new(202, "text/plain", String::new());
             }
-            let request_key = request_id_key(&req);
-            if let Some(key) = &request_key {
-                if !cancellations.begin_client_request(key.clone()) {
-                    return mcp_rpc_response(
-                        200,
-                        error(req["id"].clone(), -32600, "duplicate or closed request id")
-                            .to_string(),
-                        session_id.as_deref(),
-                        prefer_sse,
-                    );
-                }
-            }
-            let cancel = request_key.map(|key| cancellations.context(key));
+            let cancel = match request_id_key(&req) {
+                Some(key) => match cancellations.begin_instance(key, adapter_request) {
+                    Some(context) => Some(context),
+                    None => {
+                        return mcp_rpc_response(
+                            200,
+                            error(req["id"].clone(), -32600, "duplicate or closed request id")
+                                .to_string(),
+                            session_id.as_deref(),
+                            prefer_sse,
+                        );
+                    }
+                },
+                None => None,
+            };
             let _request_end = HttpRequestEnd {
                 cancel: cancel.clone(),
             };
+            // A dropped socket cancels this instance through its own handle, never
+            // whatever later reuses its id.
             let _connection_cancel = HTTP_CONNECTION_CANCEL.with(|current| {
-                current.borrow().as_ref().map(|connection| {
-                    let owned = cancellations.clone();
-                    let key = cancel.clone();
-                    connection
-                        .context("connection".into())
-                        .on_cancel(Arc::new(move |_| {
-                            if let Some(context) = &key {
-                                owned.cancel(
-                                    &context.request_key(),
-                                    Some("HTTP caller disconnected"),
-                                );
-                            }
+                current
+                    .borrow()
+                    .as_ref()
+                    .zip(cancel.clone())
+                    .map(|(connection, own)| {
+                        connection.on_close(Arc::new(move |_| {
+                            own.cancel(Some("HTTP caller disconnected"));
                         }))
-                })
+                    })
             });
+            // Cancelled before it began (the adapter's cancellation overtook it):
+            // nothing runs and nothing is answered.
+            if cancel
+                .as_ref()
+                .is_some_and(downstream::CancelContext::is_cancelled)
+            {
+                return http_no_reply(session_id.as_deref());
+            }
 
             // A legacy MCP session owns its own search guard (P1.2). A request
             // with no session record keeps the listener-level guard passed in,
@@ -19050,11 +19116,17 @@ fn handle_mcp_http(
                 allowed,
                 session_owner.and_then(|owner| owner.profile.as_deref()),
                 connection_profile,
-                cancel,
+                cancel.clone(),
                 client,
                 client_name,
                 discovery,
             );
+            // Claim the reply: a request the client cancelled first gets none.
+            if let Some(cancel) = &cancel {
+                if !cancel.reply_with(|| ()) {
+                    return http_no_reply(session_id.as_deref());
+                }
+            }
             match resp {
                 Some(resp) => {
                     let status = if is_modern {
@@ -19238,13 +19310,11 @@ fn handle_http_with_headers(
             sessions.insert(key.clone(), session.clone());
         }
         let weak = Arc::downgrade(&session);
-        let guard = connection
-            .context("connection".into())
-            .on_cancel(Arc::new(move |_| {
-                if let Some(session) = weak.upgrade() {
-                    session.close();
-                }
-            }));
+        let guard = connection.on_close(Arc::new(move |_| {
+            if let Some(session) = weak.upgrade() {
+                session.close();
+            }
+        }));
         session.push_message(
             json!({"jsonrpc":"2.0","method":"notifications/toolport/connected"}).to_string(),
             None,
@@ -19904,6 +19974,28 @@ thread_local! {
     /// daemon bearer. Display only.
     static HTTP_ADAPTER_HOST: std::cell::RefCell<Option<conduit_lib::host_attribution::Host>> = const { std::cell::RefCell::new(None) };
     static HTTP_CONNECTION_CANCEL: std::cell::RefCell<Option<downstream::CancelRegistry>> = const { std::cell::RefCell::new(None) };
+    /// The stdio adapter's number for the request being handled (`Toolport-Adapter-Request`).
+    static HTTP_ADAPTER_REQUEST: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+/// Restores the previous adapter request number when dropped.
+struct AdapterRequestScope(Option<u64>);
+impl AdapterRequestScope {
+    fn enter(tag: Option<u64>) -> Self {
+        Self(HTTP_ADAPTER_REQUEST.with(|current| current.replace(tag)))
+    }
+}
+impl Drop for AdapterRequestScope {
+    fn drop(&mut self) {
+        HTTP_ADAPTER_REQUEST.with(|current| current.set(self.0));
+    }
+}
+/// The answer to a request the client cancelled: an empty acceptance, no message.
+fn http_no_reply(session_id: Option<&str>) -> HttpOut {
+    let out = HttpOut::new(202, "text/plain", String::new());
+    match session_id {
+        Some(sid) => out.with_header("Mcp-Session-Id", sid),
+        None => out,
+    }
 }
 struct HttpConnectionScope(Option<downstream::CancelRegistry>, Option<String>);
 impl Drop for HttpConnectionScope {
@@ -20165,7 +20257,6 @@ fn proxy_deadline_http_connection(
         Err(_) => return,
     };
     let cancellations = downstream::CancelRegistry::new();
-    cancellations.begin_client_request("connection".into());
     http_connection_cancellations()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -21888,6 +21979,21 @@ fn handle_connection(
                 let previous_instance =
                     HTTP_ADAPTER_INSTANCE.with(|current| current.replace(instance));
                 let _connection_scope = HttpConnectionScope(previous, previous_instance);
+                let _adapter_request = AdapterRequestScope::enter(
+                    private_daemon_bearer
+                        .then(|| {
+                            request
+                                .headers()
+                                .iter()
+                                .find(|header| {
+                                    header
+                                        .field
+                                        .equiv(conduit_lib::stdio_adapter::ADAPTER_REQUEST_HEADER)
+                                })
+                                .and_then(|header| header.value.as_str().parse::<u64>().ok())
+                        })
+                        .flatten(),
+                );
                 let attribution = if private_daemon_bearer && valid_adapter_claim {
                     let id = request
                         .headers()
@@ -23019,7 +23125,8 @@ fn main() {
             );
             continue;
         };
-        if !cancel_registry.begin_client_request(request_key.clone()) {
+        // The instance's handle comes from the same step that registers it.
+        let Some(cancel_context) = cancel_registry.begin_client_request(request_key.clone()) else {
             gtrace(&format!(
                 "rejected duplicate in-flight request id {request_key}"
             ));
@@ -23029,10 +23136,7 @@ fn main() {
                 break;
             }
             continue;
-        }
-
-        // Capture this instance now: a reused id begins a new one.
-        let cancel_context = state.stdio_upstream.cancellations().context(request_key);
+        };
         let state = state.clone();
         let job = move || {
             handle_stdio_request(state, req, cancel_context);
@@ -36525,8 +36629,10 @@ mod tests {
         let gate = OpenGate::new();
         let cancellations = downstream::CancelRegistry::new();
         let request_id = "resource-sub-waiter".to_string();
-        assert!(cancellations.begin_client_request(request_id.clone()));
-        let cancel = cancellations.context(request_id.clone());
+        let ctx_request_id = cancellations
+            .begin_client_request(request_id.clone())
+            .expect("begins");
+        let cancel = ctx_request_id.clone();
         let cancel_registry = cancellations.clone();
         let cancel_id = request_id.clone();
         let canceller = std::thread::spawn(move || {
@@ -36552,8 +36658,10 @@ mod tests {
         let gate = OpenGate::new();
         let cancellations = downstream::CancelRegistry::new();
         let request_id = "resource-sub-already-cancelled".to_string();
-        assert!(cancellations.begin_client_request(request_id.clone()));
-        let cancel = cancellations.context(request_id.clone());
+        let ctx_request_id = cancellations
+            .begin_client_request(request_id.clone())
+            .expect("begins");
+        let cancel = ctx_request_id.clone();
         assert!(cancellations.cancel(&request_id, Some("client went away")));
 
         let err = gate
@@ -36572,8 +36680,10 @@ mod tests {
         let gate = OpenGate::new();
         let cancellations = downstream::CancelRegistry::new();
         let request_id = "resource-sub-finish-cancel-race".to_string();
-        assert!(cancellations.begin_client_request(request_id.clone()));
-        let cancel = cancellations.context(request_id.clone());
+        let ctx_request_id = cancellations
+            .begin_client_request(request_id.clone())
+            .expect("begins");
+        let cancel = ctx_request_id.clone();
         gate.finish(Ok(()));
         assert!(cancellations.cancel(&request_id, Some("client went away")));
 
@@ -36622,8 +36732,10 @@ mod tests {
 
         let cancellations = downstream::CancelRegistry::new();
         let request_id = "cancelled-listen-request".to_string();
-        assert!(cancellations.begin_client_request(request_id.clone()));
-        let cancel = cancellations.context(request_id.clone());
+        let ctx_request_id = cancellations
+            .begin_client_request(request_id.clone())
+            .expect("begins");
+        let cancel = ctx_request_id.clone();
         let cancel_registry = cancellations.clone();
         let cancel_id = request_id.clone();
         let canceller = std::thread::spawn(move || {
@@ -36826,7 +36938,8 @@ mod tests {
     /// test can assert what the session's writer thread would have written to
     /// stdout. The session normally creates that queue lazily on first use; the
     /// test seam injects one up front.
-    fn stdio_session_with_progress() -> (Arc<SessionState>, std::sync::mpsc::Receiver<Value>) {
+    fn stdio_session_with_progress() -> (Arc<SessionState>, std::sync::mpsc::Receiver<StdioProgress>)
+    {
         let session = Arc::new(SessionState::new_stdio(Arc::new(Mutex::new(
             std::io::stdout(),
         ))));
@@ -38733,7 +38846,7 @@ mod tests {
             &progress_note(&wire),
         );
 
-        let delivered = stdio_rx
+        let (delivered, _owner) = stdio_rx
             .try_recv()
             .expect("the stdio client's progress must be queued");
         // Translated back to the client's own token, same as the HTTP path.
@@ -38761,7 +38874,7 @@ mod tests {
             .stdio_progress_sender()
             .expect("a stdio session owns a progress hand-off");
         for _ in 0..PROGRESS_STDIO_QUEUE {
-            let _ = sender.try_send(json!({}));
+            let _ = sender.try_send((json!({}), None));
         }
         deliver_progress(
             &stdio,
@@ -40199,12 +40312,12 @@ mod tests {
                     .get(request.remote_addr().unwrap())
                     .unwrap()
                     .clone();
-                assert!(registry.begin_client_request("1".into()));
+                let ctx_1 = registry.begin_client_request("1".into()).expect("begins");
                 let seen = f2.clone();
-                guards.push(registry.context("1".into()).on_cancel(Arc::new(move |_| {
+                guards.push(ctx_1.clone().on_cancel(Arc::new(move |_| {
                     seen.fetch_add(1, Ordering::SeqCst);
                 })));
-                registry.finish_client_request("1");
+                ctx_1.finish();
                 respond_http(
                     request,
                     tiny_http::Response::from_string(
@@ -40273,11 +40386,11 @@ mod tests {
             .unwrap()
             .insert(key, session.clone());
         let calls = session.cancellations();
-        assert!(calls.begin_client_request("held".into()));
+        let ctx_held = calls.begin_client_request("held".into()).expect("begins");
         let free = Arc::new(AtomicBool::new(false));
         let observed = free.clone();
         let sessions = state.mcp_sessions.clone();
-        let _hook = calls.context("held".into()).on_cancel(Arc::new(move |_| {
+        let _hook = ctx_held.clone().on_cancel(Arc::new(move |_| {
             observed.store(sessions.try_lock().is_ok(), Ordering::SeqCst);
         }));
         let _scope = HttpConnectionScope(
@@ -40334,12 +40447,12 @@ mod tests {
             let _scope = p08_connection_scope(first);
             http_call_cancellations(&state, None, Some(&owner))
         };
-        assert!(a.begin_client_request("1".into()));
+        let _ctx_1 = a.begin_client_request("1".into()).expect("begins");
         let b = {
             let _scope = p08_connection_scope(second);
             http_call_cancellations(&state, None, Some(&owner))
         };
-        assert!(b.begin_client_request("1".into()));
+        let _ctx_1 = b.begin_client_request("1".into()).expect("begins");
         a.close();
         assert!(!b.is_cancelled("1"));
     }
@@ -40355,7 +40468,7 @@ mod tests {
             let _scope = p08_connection_scope(first);
             http_call_cancellations(&state, None, Some(&owner))
         };
-        assert!(a.begin_client_request("1".into()));
+        let _ctx_1 = a.begin_client_request("1".into()).expect("begins");
         let _scope = p08_connection_scope(downstream::CancelRegistry::new());
         let out = handle_mcp_http(
             &state,
@@ -40388,14 +40501,16 @@ mod tests {
         };
         let cancelled = Arc::new(AtomicUsize::new(0));
         let mut hooks = Vec::new();
+        let mut contexts = HashMap::new();
         for key in ["active", "retained"] {
-            assert!(registry.begin_client_request(key.into()));
+            let context = registry.begin_client_request(key.into()).expect("begins");
             let seen = cancelled.clone();
-            hooks.push(registry.context(key.into()).on_cancel(Arc::new(move |_| {
+            hooks.push(context.on_cancel(Arc::new(move |_| {
                 seen.fetch_add(1, Ordering::SeqCst);
             })));
+            contexts.insert(key, context);
         }
-        registry.finish_client_request("retained");
+        contexts["retained"].finish();
         for id in 0..100 {
             let _scope = p08_connection_scope(downstream::CancelRegistry::new());
             let other = test_caller(&format!("client:other-{id}"), None);
@@ -40416,7 +40531,9 @@ mod tests {
         let state = http_state(false);
         let owner = test_caller("adapter:p08-long-lived", None).session_owner;
         let connection = downstream::CancelRegistry::new();
-        assert!(connection.begin_client_request("connection".into()));
+        let _ctx_connection = connection
+            .begin_client_request("connection".into())
+            .expect("begins");
         let _scope = HttpConnectionScope(
             HTTP_CONNECTION_CANCEL.with(|current| current.replace(Some(connection.clone()))),
             HTTP_ADAPTER_INSTANCE.with(|current| current.replace(Some("p08-ttl".into()))),
@@ -40435,7 +40552,10 @@ mod tests {
         );
         assert_eq!(out.status, 200);
         let lifetime = adapter_lifetime(&state, Some(&owner)).unwrap();
-        assert!(lifetime.cancellations.begin_client_request("held".into()));
+        let _ctx_held = lifetime
+            .cancellations
+            .begin_client_request("held".into())
+            .expect("begins");
         *lifetime.last_seen.lock().unwrap() =
             Instant::now() - MCP_SESSION_TTL - Duration::from_secs(1);
         mint_mcp_session(&state, Some(&owner)).unwrap_or_else(|_| panic!("session capacity"));
@@ -40467,7 +40587,8 @@ mod tests {
         let replacement = Arc::new(replacement);
         assert!(replacement
             .cancellations
-            .begin_client_request("held".into()));
+            .begin_client_request("held".into())
+            .is_some());
         state
             .mcp_sessions
             .lock()
@@ -40591,7 +40712,7 @@ mod tests {
                 }
             });
             let registry = downstream::CancelRegistry::new();
-            assert!(registry.begin_client_request("1".into()));
+            let ctx_1 = registry.begin_client_request("1".into()).expect("begins");
             let decision = request_human_decision_with_cancel(
                 approval::ApprovalRequest {
                     token: String::new(),
@@ -40609,7 +40730,7 @@ mod tests {
                     url_elicitation: None,
                     pii_release: None,
                 },
-                Some(&registry.context("1".into())),
+                Some(&ctx_1.clone()),
             );
             // On the old denial path the second connection never happens.
             if decision == approval::ApprovalDecision::Denied && reply.is_empty() {
@@ -40699,7 +40820,8 @@ mod tests {
         assert_eq!(deleted.status, 204);
         closed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let out = call.join().unwrap();
-        assert!(out.body.contains("isError"), "{}", out.body);
+        // The session's end cancelled the call, so its POST gets no message.
+        assert_eq!((out.status, out.body.as_str()), (202, ""));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         late_allow_tx.send(()).unwrap();
         let other = handle_http(
@@ -40775,12 +40897,10 @@ mod tests {
                 .unwrap()
                 .clone();
             let (released_tx, released_rx) = std::sync::mpsc::channel();
-            let _guard = registry
-                .context("connection".into())
-                .on_cancel(Arc::new(move |_| {
-                    closed_tx.send(()).unwrap();
-                    released_tx.send(()).unwrap();
-                }));
+            let _guard = registry.on_close(Arc::new(move |_| {
+                closed_tx.send(()).unwrap();
+                released_tx.send(()).unwrap();
+            }));
             parked_tx.send(()).unwrap();
             released_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             let _ = request.respond(tiny_http::Response::from_string("x"));
@@ -40899,8 +41019,10 @@ mod tests {
     fn p10c_modern_approval_records_owner_close_once() {
         let _env = DataDirTestEnv::new("p10c-modern-withdrawal");
         let registry = downstream::CancelRegistry::new();
-        assert!(registry.begin_client_request("modern-approval".into()));
-        let _cancel = ApprovalCancelGuard::enter(Some(registry.context("modern-approval".into())));
+        let ctx_modern_approval = registry
+            .begin_client_request("modern-approval".into())
+            .expect("begins");
+        let _cancel = ApprovalCancelGuard::enter(Some(ctx_modern_approval.clone()));
         let hash = audit::args_hash(&json!({}));
         let token = start_modern_hitl(
             "s__work",
@@ -40914,7 +41036,7 @@ mod tests {
             MrtrRequest::default(),
         )
         .unwrap();
-        registry.finish_client_request("modern-approval");
+        ctx_modern_approval.finish();
         registry.close();
         assert!(matches!(
             poll_modern_hitl(
@@ -41038,7 +41160,10 @@ mod tests {
             .get(&second)
             .unwrap()
             .clone();
-        assert!(session.cancellations.begin_client_request("new".into()));
+        let _ctx_new = session
+            .cancellations
+            .begin_client_request("new".into())
+            .expect("begins");
         lifetime.close();
         assert!(session.cancellations.is_cancelled("new"));
     }
@@ -41047,17 +41172,28 @@ mod tests {
     fn p08_closing_a_session_cancels_all_and_rejects_late_requests() {
         let session = SessionState::new_http(None);
         let other = SessionState::new_http(None);
+        let mut contexts = Vec::new();
         for id in ["blocked", "approval"] {
-            assert!(session.cancellations.begin_client_request(id.into()));
-            assert!(other.cancellations.begin_client_request(id.into()));
+            let mine = session
+                .cancellations
+                .begin_client_request(id.into())
+                .expect("begins");
+            let theirs = other
+                .cancellations
+                .begin_client_request(id.into())
+                .expect("begins");
+            contexts.push((mine, theirs));
         }
         session.close();
         session.close();
-        for id in ["blocked", "approval"] {
-            assert!(session.cancellations.context(id.into()).is_cancelled());
-            assert!(!other.cancellations.context(id.into()).is_cancelled());
+        for (mine, theirs) in &contexts {
+            assert!(mine.is_cancelled());
+            assert!(!theirs.is_cancelled());
         }
-        assert!(!session.cancellations.begin_client_request("late".into()));
+        assert!(session
+            .cancellations
+            .begin_client_request("late".into())
+            .is_none());
     }
 
     #[test]
@@ -41069,18 +41205,21 @@ mod tests {
         let other_registry = other.cancellations();
         let id = "1".to_string();
 
+        let asking_context = asking_registry.begin_client_request(id.clone());
         assert!(
-            asking_registry.begin_client_request(id.clone()),
+            asking_context.is_some(),
             "a fresh connection accepts its first request id"
         );
+        let other_context = other_registry.begin_client_request(id.clone());
         assert!(
-            other_registry.begin_client_request(id.clone()),
+            other_context.is_some(),
             "the same id on another connection is that connection's own request, not a duplicate"
         );
 
         // Cancel through the asking connection's context, which is how the dispatch
         // observes it, then check both registries.
-        let asking_context = asking_registry.context(id.clone());
+        let asking_context = asking_context.unwrap();
+        let other_context = other_context.unwrap();
         assert!(
             asking_registry.cancel(&id, Some("user")),
             "the owning connection cancels its own in-flight request"
@@ -41090,7 +41229,7 @@ mod tests {
             "the connection that cancelled sees it"
         );
         assert!(
-            !other_registry.context(id.clone()).is_cancelled(),
+            !other_context.is_cancelled(),
             "one connection cancelling its id must not cancel another's"
         );
 

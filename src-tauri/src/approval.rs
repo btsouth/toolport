@@ -1429,8 +1429,10 @@ mod p10c_decision_tests {
             Some(ApprovalDecision::Denied),
         ] {
             let registry = crate::downstream::CancelRegistry::new();
-            assert!(registry.begin_client_request("poll".into()));
-            let cancel = registry.context("poll".into());
+            let ctx_poll = registry
+                .begin_client_request("poll".into())
+                .expect("begins");
+            let cancel = ctx_poll.clone();
             let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let result = exchange_approval_request_with_cancel(
                 &req,

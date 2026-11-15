@@ -131,10 +131,12 @@ fn a_fast_call_is_not_blocked_behind_a_slow_call_to_the_same_server() {
         transcript.to_string_lossy().into_owned(),
     )]);
     let cancellations = CancelRegistry::new();
-    assert!(cancellations.begin_client_request("slow".to_string()));
+    let slow_context = cancellations
+        .begin_client_request("slow".to_string())
+        .expect("begins");
     let slow = {
         let router = Arc::clone(&router);
-        let cancel = cancellations.context("slow".to_string());
+        let cancel = slow_context.clone();
         std::thread::spawn(move || {
             router.route_call_with_cancel(
                 "mock__sleep",
@@ -172,7 +174,7 @@ fn a_fast_call_is_not_blocked_behind_a_slow_call_to_the_same_server() {
     let result = slow.join().unwrap();
     assert!(result.is_err(), "the cancelled call must not succeed");
     assert!(started.elapsed() < Duration::from_secs(5));
-    cancellations.finish_client_request("slow");
+    slow_context.finish();
     let _ = std::fs::remove_dir_all(&dir);
 }
 

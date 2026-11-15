@@ -6673,8 +6673,10 @@ for line in sys.stdin:
     fn cancellation_during_reconnect_prevents_the_retried_call() {
         let router = Router::new();
         let cancellations = CancelRegistry::new();
-        assert!(cancellations.begin_client_request("reconnect-cancel".to_string()));
-        let cancel = cancellations.context("reconnect-cancel".to_string());
+        let ctx_reconnect_cancel = cancellations
+            .begin_client_request("reconnect-cancel".to_string())
+            .expect("begins");
+        let cancel = ctx_reconnect_cancel.clone();
         let cancel_from_factory = cancellations.clone();
         let slot = dead_slot(Some(Box::new(move || {
             assert!(cancel_from_factory.cancel("reconnect-cancel", Some("user pressed stop")));
@@ -6708,15 +6710,17 @@ for line in sys.stdin:
             0,
             "a reconnect that races cancellation must not emit the retry"
         );
-        cancellations.finish_client_request("reconnect-cancel");
+        ctx_reconnect_cancel.finish();
     }
 
     #[test]
     fn cancellation_from_reconnected_attempt_does_not_penalize_breaker() {
         let router = Router::new();
         let cancellations = CancelRegistry::new();
-        assert!(cancellations.begin_client_request("retry-cancel".to_string()));
-        let cancel = cancellations.context("retry-cancel".to_string());
+        let ctx_retry_cancel = cancellations
+            .begin_client_request("retry-cancel".to_string())
+            .expect("begins");
+        let cancel = ctx_retry_cancel.clone();
         let cancel_from_retry = cancellations.clone();
         let slot = dead_slot(Some(Box::new(|| Some(mock_server("s")))));
 
@@ -6745,7 +6749,7 @@ for line in sys.stdin:
         assert_eq!(breaker.consecutive_failures, 0);
         assert!(breaker.open_remaining(Instant::now()).is_none());
         drop(breaker);
-        cancellations.finish_client_request("retry-cancel");
+        ctx_retry_cancel.finish();
     }
 
     #[test]
@@ -7007,8 +7011,10 @@ for line in sys.stdin:
         let effects = Arc::new(AtomicU32::new(0));
         let fresh_effects = Arc::clone(&effects);
         let cancellations = CancelRegistry::new();
-        assert!(cancellations.begin_client_request("uncertain-cancel".into()));
-        let cancel = cancellations.context("uncertain-cancel".into());
+        let ctx_uncertain_cancel = cancellations
+            .begin_client_request("uncertain-cancel".into())
+            .expect("begins");
+        let cancel = ctx_uncertain_cancel.clone();
         let cancel_from_factory = cancellations.clone();
         let router = expired_probe_router(
             "tools/call",
@@ -7036,7 +7042,7 @@ for line in sys.stdin:
                 .consecutive_failures,
             BREAKER_FAILURE_THRESHOLD
         );
-        cancellations.finish_client_request("uncertain-cancel");
+        ctx_uncertain_cancel.finish();
     }
 
     #[test]
@@ -9420,20 +9426,17 @@ for line in sys.stdin:
         let mut router = Router::new();
         router.add(ds);
         let registry = CancelRegistry::new();
-        assert!(registry.begin_client_request("99".to_string()));
+        let ctx_99 = registry
+            .begin_client_request("99".to_string())
+            .expect("begins");
 
         let result = router
-            .route_call_with_cancel(
-                "s__echo",
-                json!({}),
-                Some(registry.context("99".to_string())),
-                None,
-            )
+            .route_call_with_cancel("s__echo", json!({}), Some(ctx_99.clone()), None)
             .unwrap();
 
         assert_eq!(result["content"][0]["text"], "ok");
         assert!(saw_cancel.load(Ordering::SeqCst));
-        registry.finish_client_request("99");
+        ctx_99.finish();
     }
 
     #[test]
@@ -9962,8 +9965,10 @@ for line in sys.stdin:
         router.add(server);
         let router = Arc::new(router);
         let cancellations = CancelRegistry::new();
-        assert!(cancellations.begin_client_request("cancel-retry-1".to_string()));
-        let cancel = cancellations.context("cancel-retry-1".to_string());
+        let ctx_cancel_retry_1 = cancellations
+            .begin_client_request("cancel-retry-1".to_string())
+            .expect("begins");
+        let cancel = ctx_cancel_retry_1.clone();
 
         let worker_router = Arc::clone(&router);
         let handle = std::thread::spawn(move || {
@@ -10001,7 +10006,7 @@ for line in sys.stdin:
             breaker.open_until.is_none(),
             "cancellation must leave the breaker closed"
         );
-        cancellations.finish_client_request("cancel-retry-1");
+        ctx_cancel_retry_1.finish();
     }
 
     fn failure(message: &str, needs_auth: bool) -> ConnectFailure {
