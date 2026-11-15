@@ -1842,6 +1842,8 @@ pub(crate) fn has_own_credentials(server: &crate::registry::ServerEntry) -> Resu
 
 pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
     #[cfg(test)]
+    tests::record_read(server_id, key);
+    #[cfg(test)]
     if tests::read_is_injected_failure(key) {
         return Err("injected secret read failure".into());
     }
@@ -2393,6 +2395,22 @@ pub(crate) mod tests {
     thread_local! {
         static FAILED_READ: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
         static FAILED_WRITE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    }
+
+    thread_local! {
+        static READS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn record_read(server_id: &str, key: &str) {
+        READS.with(|reads| reads.borrow_mut().push(format!("{server_id}/{key}")));
+    }
+
+    /// The `server/key` reads of [`super::get_secret_result`] on this thread
+    /// while `test` runs.
+    pub(crate) fn reads_during(test: impl FnOnce()) -> Vec<String> {
+        READS.with(|reads| reads.borrow_mut().clear());
+        test();
+        READS.with(|reads| std::mem::take(&mut *reads.borrow_mut()))
     }
 
     pub(crate) fn read_is_injected_failure(key: &str) -> bool {

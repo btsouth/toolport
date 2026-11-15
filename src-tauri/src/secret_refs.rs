@@ -1407,6 +1407,30 @@ mod tests {
         );
     }
 
+    /// Failure mode: the startup preload read the vault of every server,
+    /// disabled ones too, so a locked keyring could prompt for a server that
+    /// is never used.
+    #[test]
+    fn the_preload_reads_no_disabled_server_vault() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let registry = crate::registry::Registry {
+                servers: serde_json::from_value(serde_json::json!([
+                    {"id":"pre-on","name":"On","enabled":true,"source":"fixture","transport":"stdio","command":"node","args":[],"inheritEnv":false,"env":[{"key":"ON_TOKEN","secret":true}]},
+                    {"id":"pre-off","name":"Off","enabled":false,"source":"fixture","transport":"stdio","command":"node","args":[],"inheritEnv":false,"env":[{"key":"OFF_TOKEN","secret":true}]}
+                ]))
+                .unwrap(),
+                ..Default::default()
+            };
+            crate::registry::save(&registry).unwrap();
+            let reads = crate::secrets::tests::reads_during(super::preload_configured_secrets);
+            assert!(reads.contains(&"pre-on/ON_TOKEN".to_string()), "{reads:?}");
+            assert!(
+                !reads.iter().any(|r| r.starts_with("pre-off/")),
+                "{reads:?}"
+            );
+        });
+    }
+
     /// Failure mode: an unflagged env value was registered by its name alone,
     /// and a name such as `AUTH_ENABLED` carries ordinary settings: `true`,
     /// `3600` or `8` was then replaced wherever it appeared in a result.
