@@ -132,7 +132,14 @@ if tpui menubar "$PID" >"$EVIDENCE/logs/ax-menubar-$LABEL.txt" 2>&1; then
     else
       fail "menu bar item opens its menu" "no Quit Toolport item after clicking it (screenshots/$LABEL-tray-menu.png)"
     fi
-    tpui key 53 >/dev/null 2>&1 || true
+    # Close the menu by clicking its item again, only while it is open. An
+    # Escape would reach the window once the menu is gone and dismiss the
+    # onboarding dialog the setup step checks next.
+    if TPUI_MENUS=1 tpui find "$PID" "Quit Toolport" >/dev/null 2>&1; then
+      tpui click $((${xy% *} + 12)) $((${xy#* } + 12)) >/dev/null 2>&1
+      sleep 1
+      TPUI_MENUS=1 tpui find "$PID" "Quit Toolport" >/dev/null 2>&1 && info "note: tray menu" "still open after clicking its item again"
+    fi
   else
     fail "menu bar item opens its menu" "could not read the item's position from $(head -n 1 "$EVIDENCE/logs/ax-menubar-$LABEL.txt")"
   fi
