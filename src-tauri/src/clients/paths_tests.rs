@@ -659,7 +659,8 @@ fn json_connections_reach_the_current_file_and_leave_old_ones_only_on_evidence()
             |_| {},
             false,
         ),
-        // Cline 4 recorded its one-time migration of the storage file.
+        // R3-1: Cline's old entry is never removed. Cline 4 recorded its one-time
+        // migration of the storage file, but a rollback to Cline 3 reads it again.
         (
             "cline",
             |h| cline_legacy_settings_path(h, Platform::current(), &client_path_env),
@@ -669,10 +670,10 @@ fn json_connections_reach_the_current_file_and_leave_old_ones_only_on_evidence()
                     &json!({"__vscodeLegacyMcpSettingsMigration": {"done": true}}),
                 )
             },
-            true,
+            false,
         ),
-        // A rollback to Cline 3 after the migration: the record stays, the old
-        // file is read again.
+        // A rollback to Cline 3 with the Cline 4 folder still present: the newest
+        // folder is 4 and the record stays, yet Cline 3 reads the old file.
         (
             "cline",
             |h| cline_legacy_settings_path(h, Platform::current(), &client_path_env),
@@ -681,8 +682,12 @@ fn json_connections_reach_the_current_file_and_leave_old_ones_only_on_evidence()
                     &h.join(".cline/data/globalState.json"),
                     &json!({"__vscodeLegacyMcpSettingsMigration": {"done": true}}),
                 );
-                std::fs::create_dir_all(h.join(".vscode/extensions/saoudrizwan.claude-dev-3.89.2"))
+                for version in ["3.89.2", "4.1.26"] {
+                    std::fs::create_dir_all(h.join(format!(
+                        ".vscode/extensions/saoudrizwan.claude-dev-{version}"
+                    )))
                     .unwrap()
+                }
             },
             false,
         ),

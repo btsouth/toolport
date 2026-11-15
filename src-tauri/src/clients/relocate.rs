@@ -439,16 +439,7 @@ pub(super) fn old_file_status(client_id: &str, legacy: &Path) -> OldFile {
     if let Some(status) = STATUS_OVERRIDE.with(std::cell::Cell::get) {
         return status;
     }
-    let Some(home) = home() else {
-        return OldFile::MaybeRead;
-    };
-    resolve_old_file_status(
-        client_id,
-        legacy,
-        &home,
-        Platform::current(),
-        &client_path_env,
-    )
+    resolve_old_file_status(client_id, legacy, Platform::current(), &client_path_env)
 }
 
 /// Whether `client_id` on `platform` still reads `legacy`, one of its old files.
@@ -457,7 +448,6 @@ pub(super) fn old_file_status(client_id: &str, legacy: &Path) -> OldFile {
 pub(super) fn resolve_old_file_status(
     client_id: &str,
     _legacy: &Path,
-    home: &Path,
     platform: Platform,
     env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
 ) -> OldFile {
@@ -468,18 +458,6 @@ pub(super) fn resolve_old_file_status(
         ("goose", Platform::MacOs) => {
             OldFile::Unread("Goose has never read Application Support on macOS")
         }
-        // Cline 4 migrates the old storage file once and records it in globalState
-        // (mcp-settings-legacy-migration.ts@v4.1.26); 3.x reads only the old file.
-        // Only Cline's own record proves the migration ran: a downloaded Cline 4
-        // folder may not be active yet while Cline 3 still reads the old file.
-        // A rollback to Cline 3 keeps that record, so an installed 3.x (the newest
-        // folder in VS Code's extensions) reads the old file again.
-        ("cline", _)
-            if cline_migrated(home)
-                && installed_cline_major(home).is_none_or(|major| major >= 4) =>
-        {
-            OldFile::Unread("Cline 4 recorded its one-time migration and no Cline 3 is installed")
-        }
         // The Windows installer sets HERMES_HOME (install.ps1@v2026.5.16), and Hermes
         // then reads only that folder (hermes_constants.py@v0.23.1).
         ("hermes", Platform::Windows) if env("HERMES_HOME").is_some_and(|v| !v.is_empty()) => {
@@ -488,8 +466,9 @@ pub(super) fn resolve_old_file_status(
         // LM Studio's home pointer is written by lmstudio-js (the CLI and SDK);
         // the closed-source app may predate it and read ~/.lmstudio. Reasonix
         // reads only its home config.toml once it exists, but a rollback to a
-        // release that knew only the legacy file reads that again. Both keep the
-        // old entry.
+        // release that knew only the legacy file reads that again. Cline 3.x reads
+        // only the VS Code storage file, and a rollback from Cline 4 reads it again
+        // even after Cline 4 recorded its migration. All three keep the old entry.
         // Devin Desktop still imports ~/.codeium/windsurf by default
         // (read_config_from.windsurf), Crush still merges %LOCALAPPDATA%\crush last,
         // Amazon Q still loads mcp.json while useLegacyMcpJson is on, and Antigravity
@@ -499,8 +478,8 @@ pub(super) fn resolve_old_file_status(
 }
 
 /// Cline 4's own record, in `~/.cline/data/globalState.json`, that it migrated the
-/// VS Code storage file (mcp-settings-legacy-migration.ts@v4.1.26). The only
-/// evidence that lets Toolport remove its entry from the old file.
+/// VS Code storage file (mcp-settings-legacy-migration.ts@v4.1.26). It only picks
+/// where Toolport writes; the old file always keeps its entry.
 pub(super) fn cline_migrated(home: &Path) -> bool {
     std::fs::read_to_string(home.join(".cline").join("data").join("globalState.json"))
         .ok()
@@ -509,8 +488,8 @@ pub(super) fn cline_migrated(home: &Path) -> bool {
 }
 
 /// Where to write Cline's entry: the new file once Cline 4 migrated or is present
-/// in VS Code's extensions folder. A present folder only guides the write; the old
-/// file keeps its entry until [`cline_migrated`].
+/// in VS Code's extensions folder. The old file keeps its entry either way, since a
+/// rollback to Cline 3 reads it again.
 pub(super) fn cline_moved(home: &Path) -> bool {
     cline_migrated(home) || installed_cline_major(home).is_some_and(|major| major >= 4)
 }
