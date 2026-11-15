@@ -597,8 +597,13 @@ pub fn stash_payload(
     retained.then_some(cursor)
 }
 
+/// Room a model-facing page keeps under the budget for its footer, which is at most
+/// about 210 bytes with five 20-digit numbers.
+const PAGE_FOOTER_RESERVE_BYTES: usize = 256;
+
 /// Return the next slice of a cached shaped result, by cursor + character offset.
-/// `len` of 0 means "use the current budget".
+/// `len` of 0 means "use the current budget" (the whole rest when it is 0). This is
+/// the code-mode read: the slice stays in the sandbox, so it is not byte-bounded.
 pub fn fetch_result(
     cursor: &str,
     offset: usize,
@@ -606,7 +611,7 @@ pub fn fetch_result(
     requester: Option<&str>,
     projection: Option<&str>,
 ) -> Value {
-    fetch_result_visible(cursor, offset, len, requester, projection, &|_| true)
+    fetch_result_bounded(cursor, offset, len, requester, projection, None, &|_| true)
 }
 
 /// [`fetch_result`], refusing a discovery result whose tool `visible` no longer
@@ -626,6 +631,64 @@ pub fn fetch_result_visible(
     len: usize,
     requester: Option<&str>,
     projection: Option<&str>,
+    visible: &dyn Fn(&str) -> bool,
+) -> Value {
+    fetch_result_bounded(cursor, offset, len, requester, projection, None, visible)
+}
+
+/// The model-facing `toolport_fetch_result`. Every reply's text, footer included, fits
+/// `budget` UTF-8 bytes, so it also fits `budget` characters as Claude Code counts them
+/// (UTF-16 units never outnumber UTF-8 bytes) and the `anthropic/maxResultSizeChars`
+/// hint Toolport derives from the budget holds. A page stops at `len` characters or the
+/// byte bound, whichever comes first. A projection larger than the budget is shaped like
+/// any other result: a head plus a cursor for paging the projected JSON. `budget` 0
+/// never shapes, so pages run to the end and projections return whole.
+pub fn fetch_result_for_model(
+    cursor: &str,
+    offset: usize,
+    len: usize,
+    requester: Option<&str>,
+    projection: Option<&str>,
+    budget: usize,
+) -> Value {
+    fetch_result_for_model_visible(cursor, offset, len, requester, projection, budget, &|_| {
+        true
+    })
+}
+
+/// [`fetch_result_for_model`], rechecking a discovery result with `visible` as
+/// [`fetch_result_visible`] does.
+pub fn fetch_result_for_model_visible(
+    cursor: &str,
+    offset: usize,
+    len: usize,
+    requester: Option<&str>,
+    projection: Option<&str>,
+    budget: usize,
+    visible: &dyn Fn(&str) -> bool,
+) -> Value {
+    let mut result = fetch_result_bounded(
+        cursor,
+        offset,
+        len,
+        requester,
+        projection,
+        Some(budget),
+        visible,
+    );
+    if projection.is_some() && result["isError"] != true {
+        shape_result(&mut result, budget, requester);
+    }
+    result
+}
+
+fn fetch_result_bounded(
+    cursor: &str,
+    offset: usize,
+    len: usize,
+    requester: Option<&str>,
+    projection: Option<&str>,
+    model_budget: Option<usize>,
     visible: &dyn Fn(&str) -> bool,
 ) -> Value {
     let unknown = || {
@@ -715,32 +778,47 @@ pub fn fetch_result_visible(
             false,
         );
     }
-    let len = if len == 0 {
-        let (budget, warning) = budget();
-        if let Some(msg) = warning {
-            eprintln!("{msg}");
+    let len = match (len, model_budget) {
+        (0, Some(0)) => usize::MAX,
+        (0, Some(budget)) => budget,
+        (0, None) => {
+            let (budget, warning) = budget();
+            if let Some(msg) = warning {
+                eprintln!("{msg}");
+            }
+            if budget == 0 {
+                usize::MAX
+            } else {
+                budget
+            }
         }
-        budget
-    } else {
-        len
+        (len, _) => len,
     };
+    // A model-facing page also stops before its text and footer pass the budget.
+    let max_page_bytes = model_budget
+        .filter(|&budget| budget > 0)
+        .map(|budget| budget.saturating_sub(PAGE_FOOTER_RESERVE_BYTES).max(1));
     // saturating_add: a client-supplied `len` near usize::MAX must not overflow
     // `offset + len`. On debug that panics; on release it wraps to `end < offset`,
     // and the byte-mapping below then slices `body[start_byte..end_byte]` with
     // start > end - a panic that, on the stdio transport (no catch_unwind), takes
     // down the whole gateway. Saturating clamps `end` to `total` instead.
-    let end = offset.saturating_add(len).min(total);
+    let mut end = offset.saturating_add(len).min(total);
     // Map the character window [offset, end) to byte offsets in a single pass, so a
     // page read never allocates a Vec<char> of the whole (possibly multi-MB) body.
     // `end == total` leaves end_byte at the body's byte length (the loop never yields
-    // char index `total`), so the last page runs cleanly to the end.
+    // char index `total`), so the last page runs cleanly to the end. A byte bound ends
+    // the page early, but never before its first character, so paging always advances.
     let mut start_byte = c.body.len();
     let mut end_byte = c.body.len();
-    for (char_idx, (byte_idx, _)) in c.body.char_indices().enumerate() {
+    for (char_idx, (byte_idx, ch)) in c.body.char_indices().enumerate() {
         if char_idx == offset {
             start_byte = byte_idx;
         }
-        if char_idx == end {
+        let over_bytes = char_idx > offset
+            && max_page_bytes.is_some_and(|max| byte_idx + ch.len_utf8() - start_byte > max);
+        if char_idx == end || over_bytes {
+            end = char_idx;
             end_byte = byte_idx;
             break;
         }
@@ -1530,6 +1608,53 @@ mod tests {
             text.contains("\"cursor\":\"r"),
             "the failure must stay pageable"
         );
+    }
+
+    #[test]
+    fn model_pages_and_projections_fit_the_budget() {
+        let body = "a😀".repeat(1_000);
+        let rows = json!({ "rows": vec!["r".repeat(100); 100] });
+        let cursor = stash_payload(body.clone(), Some(rows), None).unwrap();
+        let text = |v: &Value| v["content"][0]["text"].as_str().unwrap().to_string();
+        let budget = 1_000;
+        let mut offset = 0;
+        let mut paged = String::new();
+        loop {
+            let page = text(&fetch_result_for_model(
+                &cursor, offset, 0, None, None, budget,
+            ));
+            assert!(page.len() <= budget, "{} bytes", page.len());
+            let (slice, footer) = page.split_once("\n\n[Toolport: ").unwrap();
+            paged.push_str(slice);
+            offset += slice.chars().count();
+            if footer.starts_with("end of result") {
+                break;
+            }
+        }
+        assert_eq!(paged, body);
+        // An explicit len is still bounded for the model.
+        let long = text(&fetch_result_for_model(
+            &cursor,
+            0,
+            usize::MAX,
+            None,
+            None,
+            budget,
+        ));
+        assert!(long.len() <= budget);
+        // Budget 0 never shapes: the page is the rest of the body, never empty.
+        let whole = text(&fetch_result_for_model(&cursor, 0, 0, None, None, 0));
+        assert!(whole.starts_with(&body), "{}", &whole[..40]);
+        // A projection over the budget comes back shaped, with a cursor to page it.
+        let projected = fetch_result_for_model(&cursor, 0, 0, None, Some("rows"), budget);
+        assert!(serde_json::to_string(&projected).unwrap().len() <= budget);
+        assert!(text(&projected).contains("Toolport shaped this result"));
+        // A small projection is unchanged.
+        let small = fetch_result_for_model(&cursor, 0, 0, None, Some("rows.0"), budget);
+        assert_eq!(text(&small), format!("\"{}\"", "r".repeat(100)));
+        // Code mode keeps reading whole slices.
+        let sandbox = text(&fetch_result(&cursor, 0, usize::MAX, None, None));
+        assert!(sandbox.starts_with(&body));
     }
 
     #[test]

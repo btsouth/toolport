@@ -8315,15 +8315,20 @@ fn handle_request_with_cancel(
                 let len = arguments.get("len").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let projection = arguments.get("projection").and_then(|v| v.as_str());
                 // Pass the calling client so a client can only fetch results it stashed
-                // (the stash is process-global in HTTP mode).
+                // (the stash is process-global in HTTP mode). The reply fits the global
+                // budget, which is what this tool's maxResultSizeChars hint advertises.
                 // A paged tool definition is served only while search would still
                 // return that tool to this caller.
+                let (budget, warning) = shaping::budget();
+                if let Some(msg) = warning {
+                    eprintln!("{msg}");
+                }
                 let visible =
                     |name: &str| discovery_tool_visible(name, cached, router, reg, allowed);
                 return Some(success(
                     id,
-                    shaping::fetch_result_visible(
-                        cursor, offset, len, client, projection, &visible,
+                    shaping::fetch_result_for_model_visible(
+                        cursor, offset, len, client, projection, budget, &visible,
                     ),
                 ));
             }
@@ -17207,9 +17212,6 @@ fn process_request_wire_inner(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone()
             })
-            // Stateless modern HTTP has no session to hold a label, so each request
-            // names its client in _meta.
-            .or_else(|| approval::client_info_label(req.get("params")))
     } else {
         state
             .stdio_upstream
@@ -17217,7 +17219,7 @@ fn process_request_wire_inner(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-    };
+    });
     let _label = ClientLabelGuard::enter(session_label);
 
     let wait = match method {
@@ -46979,6 +46981,124 @@ mod tests {
             other_meta["_meta"],
             json!({CLAUDE_RESULT_SIZE_META: 300_000, "x": 1})
         );
+    }
+
+    /// Characters as Claude Code counts them: UTF-16 code units over the text blocks.
+    fn claude_text_chars(result: &Value) -> usize {
+        let blocks = result["content"].as_array().cloned().unwrap_or_default();
+        let texts: Vec<&str> = blocks.iter().filter_map(|b| b["text"].as_str()).collect();
+        texts
+            .iter()
+            .map(|t| t.encode_utf16().count())
+            .sum::<usize>()
+            + texts.len().saturating_sub(1)
+    }
+
+    #[test]
+    fn meta_tool_outputs_fit_their_advertised_result_size() {
+        let _env = DataDirTestEnv::new("meta-tool-output-hints");
+        let previous = std::env::var("TOOLPORT_RESULT_BUDGET").ok();
+        std::env::set_var("TOOLPORT_RESULT_BUDGET", "100000");
+        let host = dispatch_host(true);
+        let mut reg = Registry::default();
+        reg.servers.push(stub_server("s", "s"));
+        reg.result_budgets.insert("s".into(), 150_000);
+        // Astral characters count twice in UTF-16, the worst case for a char-sized page.
+        let body = "a😀".repeat(200_000);
+        let router = Arc::new(paging_router(body.clone()));
+        let hints = ResultSizeHints::new(&reg, None);
+        let mut floor = floor_tool_defs_with_code_mode(true);
+        hints.apply_all(&mut floor, &router);
+        let hint = |name: &str| {
+            listed_named(&floor, name)["_meta"][CLAUDE_RESULT_SIZE_META]
+                .as_u64()
+                .unwrap_or(CLAUDE_RESULT_CHARS_DEFAULT as u64) as usize
+        };
+        let call = |name: &str, arguments: Value| {
+            let req = json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            });
+            handle_request(
+                &host,
+                &req,
+                &reg,
+                &router,
+                &[],
+                true,
+                None,
+                &SearchGuard::default(),
+                None,
+                None,
+            )
+            .unwrap()["result"]
+                .clone()
+        };
+        let mut outputs = Vec::new();
+
+        // toolport_call_tool: the largest per-server budget in scope.
+        let called = call("toolport_call_tool", json!({ "name": "s__big" }));
+        outputs.push(("toolport_call_tool", "call", called));
+
+        // toolport_fetch_result: a default page and a structured projection.
+        let structured = json!({ "rows": vec!["r😀".repeat(50); 6_000] });
+        let cursor = shaping::stash_payload(body.clone(), Some(structured), None).unwrap();
+        for offset in [0, 1, 150_000] {
+            let page = call(
+                "toolport_fetch_result",
+                json!({ "cursor": cursor, "offset": offset }),
+            );
+            outputs.push(("toolport_fetch_result", "page", page));
+        }
+        let long_len = call(
+            "toolport_fetch_result",
+            json!({ "cursor": cursor, "offset": 0, "len": 10_000_000 }),
+        );
+        outputs.push(("toolport_fetch_result", "len", long_len));
+        let projection = call(
+            "toolport_fetch_result",
+            json!({ "cursor": cursor, "projection": "rows" }),
+        );
+        outputs.push(("toolport_fetch_result", "projection", projection));
+
+        // toolport_run_script: a large aggregate and a large failure.
+        for script in [
+            "return 'b😀'.repeat(300000);",
+            "toolport.call('s__big', {}); throw new Error('E😀'.repeat(300000));",
+        ] {
+            let result = run_script_dispatch(
+                &reg,
+                Some(&router),
+                &[],
+                None,
+                None,
+                None,
+                None,
+                &json!({ "script": script }),
+                None,
+            );
+            outputs.push(("toolport_run_script", "script", result));
+        }
+
+        match previous {
+            Some(value) => std::env::set_var("TOOLPORT_RESULT_BUDGET", value),
+            None => std::env::remove_var("TOOLPORT_RESULT_BUDGET"),
+        }
+        assert_eq!(hint("toolport_call_tool"), 150_000);
+        assert_eq!(hint("toolport_fetch_result"), 100_000);
+        assert_eq!(hint("toolport_run_script"), 100_000);
+        for (tool, case, output) in outputs {
+            let chars = claude_text_chars(&output);
+            assert!(
+                chars > 50_000,
+                "{tool} {case} must be a large output: {chars}"
+            );
+            assert!(
+                chars <= hint(tool),
+                "{tool} {case}: {chars} chars over the advertised {}",
+                hint(tool)
+            );
+        }
     }
 
     fn stdio_state() -> GatewayState {

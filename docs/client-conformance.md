@@ -79,12 +79,25 @@ are sent to every client.
 - `anthropic/maxResultSizeChars` when Toolport lets results through that are larger
   than Claude Code's 50,000-character file threshold: a `TOOLPORT_RESULT_BUDGET` or
   per-server result budget above 50,000 bytes, or `0` (never shape). The value is the
-  byte budget, capped at Claude's 500,000 ceiling; bytes bound characters, so a result
-  within budget is never saved to a file. `toolport_call_tool` gets the largest
-  budget among the servers the client may reach, `toolport_fetch_result` and
+  byte budget, capped at Claude's 500,000 ceiling. Claude counts UTF-16 characters of
+  the text, and UTF-16 never has more units than UTF-8 has bytes, so text within the
+  byte budget is never saved to a file. `toolport_call_tool` gets the largest budget
+  among the servers the client may reach, `toolport_fetch_result` and
   `toolport_run_script` the global budget, and a directly listed tool its server's
   budget unless the server set the key itself. With default budgets nothing is added.
   A result budget change rebuilds the router and sends `tools/list_changed`.
+
+  Each meta-tool's text stays within the budget it advertises. A
+  `toolport_fetch_result` page stops at the budget in bytes, footer included, even
+  when a caller asks for a longer `len`. A projection larger than the budget comes
+  back shaped like any other large result, with a cursor to page the projected JSON
+  (projections exist to cut a result down, so they follow the same budget). Script
+  results and failures are shaped with the global budget, and a successful
+  `toolport_call_tool` result gets no Toolport text after shaping. Two kinds of
+  result are passed through whole because shaping would drop data: results with
+  non-text blocks (images, audio, resource links) and results whose envelope outweighs
+  their text. Those are not budget-bound, and Claude's own file fallback applies to
+  them above the advertised size.
 
 Drift fingerprints and the listed-catalog digest do not cover `_meta`, so these keys
 never cause drift warnings or extra list notifications.
