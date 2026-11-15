@@ -65,6 +65,28 @@ pub struct Matcher {
     /// Longest raw pattern in chars, used to bound how much text a truncation site
     /// must scan.
     longest_chars: usize,
+    /// Edge index for [`Matcher::redact_fragment`]: the first and the last
+    /// [`SHORT_SECRET_CHARS`] characters of every whole-value pattern, each with the
+    /// patterns that start (or end) with them.
+    heads: Option<(AhoCorasick, Vec<Vec<usize>>)>,
+    tails: Option<(AhoCorasick, Vec<Vec<usize>>)>,
+}
+
+/// Index `keys` (one per pattern) into an automaton over the distinct keys and,
+/// per distinct key, the patterns that have it.
+fn edge_index(keys: Vec<(String, usize)>) -> Option<(AhoCorasick, Vec<Vec<usize>>)> {
+    let mut distinct: Vec<String> = Vec::new();
+    let mut owners: Vec<Vec<usize>> = Vec::new();
+    for (key, pattern) in keys {
+        match distinct.iter().position(|k| *k == key) {
+            Some(i) => owners[i].push(pattern),
+            None => {
+                distinct.push(key);
+                owners.push(vec![pattern]);
+            }
+        }
+    }
+    build(&distinct).map(|ac| (ac, owners))
 }
 
 fn marker_name(name: &str) -> String {
@@ -263,9 +285,18 @@ fn build(patterns: &[String]) -> Option<AhoCorasick> {
     if patterns.is_empty() {
         return None;
     }
+    // A full DFA: every log line is scanned, and with every form and fragment of
+    // every secret the default NFA would be several times slower. Falls back to
+    // the default if the DFA would exceed the crate's size limit.
     AhoCorasickBuilder::new()
         .match_kind(MatchKind::Standard)
+        .kind(Some(aho_corasick::AhoCorasickKind::DFA))
         .build(patterns)
+        .or_else(|_| {
+            AhoCorasickBuilder::new()
+                .match_kind(MatchKind::Standard)
+                .build(patterns)
+        })
         .ok()
 }
 
@@ -323,13 +354,44 @@ impl Matcher {
             .map(|p| p.chars().count())
             .max()
             .unwrap_or(0);
+        let edge_patterns = || {
+            raw_patterns.iter().enumerate().filter(|(_, (text, meta))| {
+                !meta.whole_token && !meta.fragment && text.chars().count() > SHORT_SECRET_CHARS
+            })
+        };
+        let heads = edge_index(
+            edge_patterns()
+                .map(|(i, (text, _))| (text.chars().take(SHORT_SECRET_CHARS).collect(), i))
+                .collect(),
+        );
+        let tails = edge_index(
+            edge_patterns()
+                .map(|(i, (text, _))| {
+                    let skip = text.chars().count() - SHORT_SECRET_CHARS;
+                    (text.chars().skip(skip).collect(), i)
+                })
+                .collect(),
+        );
         Self {
             names,
             raw: build(&raw_texts),
             raw_patterns,
             json: build(&json_texts),
             longest_chars,
+            heads,
+            tails,
         }
+    }
+
+    /// Heap bytes held by the compiled automata, for the performance notes.
+    pub fn memory_usage(&self) -> usize {
+        let edge = |e: &Option<(AhoCorasick, Vec<Vec<usize>>)>| {
+            e.as_ref().map_or(0, |(ac, _)| ac.memory_usage())
+        };
+        self.raw.as_ref().map_or(0, AhoCorasick::memory_usage)
+            + self.json.as_ref().map_or(0, AhoCorasick::memory_usage)
+            + edge(&self.heads)
+            + edge(&self.tails)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -423,36 +485,50 @@ impl Matcher {
                 spans.push((start, end, vec![n]));
             }
         };
-        for (pattern, meta) in &self.raw_patterns {
-            if meta.whole_token {
-                continue;
+        // Only the ends of `text` matter, so only the last (first) stretch as long
+        // as the longest pattern is searched for pattern heads (tails).
+        let reach = self.longest_chars * 4;
+        if let Some((ac, owners)) = &self.heads {
+            let mut from = text.len().saturating_sub(reach);
+            while !text.is_char_boundary(from) {
+                from += 1;
             }
-            let len = pattern.len();
-            // Longest proper prefix at the end of `text`.
-            for k in (1..len).rev() {
-                if !pattern.is_char_boundary(k) {
-                    continue;
-                }
-                if pattern[..k].chars().count() < SHORT_SECRET_CHARS {
-                    break;
-                }
-                if text.ends_with(&pattern[..k]) {
-                    edge(&mut spans, text.len() - k, text.len(), meta.name);
-                    break;
-                }
+            // Longest dangling prefix: the earliest head whose pattern continues
+            // past the end of `text`.
+            let found = ac.find_overlapping_iter(&text[from..]).find_map(|m| {
+                let start = from + m.start();
+                let rest = &text[start..];
+                owners[m.pattern().as_usize()].iter().find_map(|&p| {
+                    let (pattern, meta) = &self.raw_patterns[p];
+                    (pattern.len() > rest.len() && pattern.starts_with(rest))
+                        .then_some((start, meta.name))
+                })
+            });
+            if let Some((start, name)) = found {
+                edge(&mut spans, start, text.len(), name);
             }
-            // Longest proper suffix at the start of `text`.
-            for k in 1..len {
-                if !pattern.is_char_boundary(k) {
-                    continue;
-                }
-                if pattern[k..].chars().count() < SHORT_SECRET_CHARS {
-                    break;
-                }
-                if text.starts_with(&pattern[k..]) {
-                    edge(&mut spans, 0, len - k, meta.name);
-                    break;
-                }
+        }
+        if let Some((ac, owners)) = &self.tails {
+            let mut to = text.len().min(reach);
+            while !text.is_char_boundary(to) {
+                to -= 1;
+            }
+            // Longest dangling suffix: the last tail whose pattern began before
+            // the start of `text`.
+            let found = ac
+                .find_overlapping_iter(&text[..to])
+                .filter_map(|m| {
+                    let end = m.end();
+                    let head = &text[..end];
+                    owners[m.pattern().as_usize()].iter().find_map(|&p| {
+                        let (pattern, meta) = &self.raw_patterns[p];
+                        (pattern.len() > head.len() && pattern.ends_with(head))
+                            .then_some((end, meta.name))
+                    })
+                })
+                .max_by_key(|(end, _)| *end);
+            if let Some((end, name)) = found {
+                edge(&mut spans, 0, end, name);
             }
         }
         if spans.is_empty() {
@@ -633,7 +709,9 @@ fn merge(mut hits: Vec<(usize, usize, usize, bool)>) -> Vec<(usize, usize, Vec<u
 struct Registry {
     /// `(id, marker name, value)`; `id` is `server/key` for the scrub marker.
     secrets: Vec<(String, String, String)>,
-    matcher: Arc<Matcher>,
+    /// Compiled on first use after a change, so a burst of registrations (every
+    /// server's secrets at startup) costs one build, not one per secret.
+    matcher: Option<Arc<Matcher>>,
     /// `(id, value)` pairs [`register`] has fully processed, so the repeat reads
     /// (remote servers read their credential from the vault on every call) cost one
     /// read-locked lookup instead of re-deriving forms.
@@ -699,12 +777,29 @@ fn current_in(scope: &Scope) -> Option<Arc<Matcher>> {
     if !ACTIVE.load(Ordering::Relaxed) {
         return None;
     }
-    REGISTRY
+    if let Some(matcher) = REGISTRY
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()?
-        .get(scope)
-        .map(|r| Arc::clone(&r.matcher))
+        .get(scope)?
+        .matcher
+        .clone()
+    {
+        return Some(matcher);
+    }
+    let mut guard = REGISTRY
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let reg = guard.as_mut()?.get_mut(scope)?;
+    let matcher = reg.matcher.get_or_insert_with(|| {
+        let pairs: Vec<(&str, &str)> = reg
+            .secrets
+            .iter()
+            .map(|(_, n, v)| (n.as_str(), v.as_str()))
+            .collect();
+        Arc::new(Matcher::new(&pairs))
+    });
+    Some(Arc::clone(matcher))
 }
 
 fn current() -> Option<Arc<Matcher>> {
@@ -726,7 +821,7 @@ fn add(scope: &Scope, id: &str, name: &str, value: &str) -> bool {
         .entry(scope.clone())
         .or_insert_with(|| Registry {
             secrets: Vec::new(),
-            matcher: Arc::new(Matcher::new::<&str, &str>(&[])),
+            matcher: None,
             seen: HashSet::new(),
         });
     if reg
@@ -743,12 +838,7 @@ fn add(scope: &Scope, id: &str, name: &str, value: &str) -> bool {
         reg.secrets.drain(..excess);
         reg.seen.clear();
     }
-    let pairs: Vec<(&str, &str)> = reg
-        .secrets
-        .iter()
-        .map(|(_, n, v)| (n.as_str(), v.as_str()))
-        .collect();
-    reg.matcher = Arc::new(Matcher::new(&pairs));
+    reg.matcher = None;
     ACTIVE.store(true, Ordering::Release);
     true
 }
@@ -1140,7 +1230,7 @@ pub fn scrub_data_dir(dir: &Path) -> std::io::Result<usize> {
             })
         })
         .unwrap_or_default();
-    let (pending, matcher) = {
+    let pending = {
         let guard = REGISTRY
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1153,11 +1243,14 @@ pub fn scrub_data_dir(dir: &Path) -> std::io::Result<usize> {
             .filter(|(id, _, _)| !done.contains(id))
             .cloned()
             .collect();
-        (pending, Arc::clone(&reg.matcher))
+        pending
     };
     if pending.is_empty() {
         return Ok(0);
     }
+    let Some(matcher) = current_in(&scope_of(dir)) else {
+        return Ok(0);
+    };
     let mut rewritten = 0;
     for path in persisted_log_files(dir) {
         if scrub_file_with(&matcher, &path)? {
