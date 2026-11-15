@@ -522,6 +522,10 @@ fn crt_flush() {
 fn crt_point_fd2(handle: windows_sys::Win32::Foundation::HANDLE) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    #[cfg(test)]
+    if tests::CRT_POINT_FAILS.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
     // SAFETY: duplicates a live handle; `_open_osfhandle` takes ownership of the
     // duplicate, `_dup2` gives fd 2 its own copy, and the temporary fd is closed.
     unsafe {
@@ -1094,6 +1098,53 @@ mod tests {
     use super::*;
 
     static RUN_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Makes [`super::crt_point_fd2`] fail, as a failed handle duplication or
+    /// descriptor creation does.
+    #[cfg(windows)]
+    pub(super) static CRT_POINT_FAILS: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Child half of the CRT fd 2 test: it changes the process's stderr.
+    #[cfg(windows)]
+    #[test]
+    fn stderr_crt_point_fails_child() {
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+        if std::env::var_os("TOOLPORT_STDERR_CRT_FAILS_CHILD").is_none() {
+            return;
+        }
+        CRT_POINT_FAILS.store(true, std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: reads the process's standard error handle.
+        let before = unsafe { GetStdHandle(STD_ERROR_HANDLE) } as usize;
+        let redirected = redirect_stderr().is_some();
+        let kept = unsafe { GetStdHandle(STD_ERROR_HANDLE) } as usize == before;
+        let silenced = silence_stderr().is_ok();
+        println!("redirected={redirected} kept={kept} silenced={silenced}");
+    }
+
+    /// Failure mode: when the C runtime's fd 2 could not be pointed at the
+    /// relay (or the null device), the failure was ignored: stderr reported
+    /// `Relayed` while native writes still reached the original in clear.
+    #[cfg(windows)]
+    #[test]
+    fn stderr_is_not_protected_unless_the_crt_fd_is_redirected_too() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon_log::tests::stderr_crt_point_fails_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TOOLPORT_STDERR_CRT_FAILS_CHILD", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}");
+        assert!(
+            stdout.contains("redirected=false kept=true silenced=false"),
+            "{stdout}"
+        );
+    }
 
     /// Child half of `daemon_stderr_is_redacted_before_it_reaches_the_log`: runs in
     /// its own process, because it replaces the process's stderr.
