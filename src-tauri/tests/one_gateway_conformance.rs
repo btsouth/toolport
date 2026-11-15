@@ -4982,6 +4982,256 @@ fn matrix_cancelling_one_of_two_overlapping_calls_leaks_no_late_answer() {
     }
 }
 
+/// The two ways a client speaks to the adapter: a handshake-era session opened by
+/// `initialize`, or modern `2026-07-28` requests that each carry their version.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Era {
+    Handshake,
+    Modern,
+}
+
+impl Era {
+    fn request(self, id: Value, method: &str, mut params: Value) -> Value {
+        if self == Era::Modern {
+            params["_meta"] = json!({ "io.modelcontextprotocol/protocolVersion": "2026-07-28" });
+        }
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+    }
+
+    fn cancel(self, id: Value) -> Value {
+        let mut params = json!({ "requestId": id, "reason": "user cancelled" });
+        if self == Era::Modern {
+            params["_meta"] = json!({ "io.modelcontextprotocol/protocolVersion": "2026-07-28" });
+        }
+        json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": params })
+    }
+}
+
+/// The answer to `id` (any JSON-RPC id), skipping notifications.
+fn answer_to(client: &AdapterClient, id: &Value) -> Value {
+    loop {
+        let message = client.next_message();
+        if message.get("method").is_some() {
+            continue;
+        }
+        assert_eq!(
+            &message["id"],
+            id,
+            "unexpected answer: {message}\n{}",
+            client.diagnostics()
+        );
+        return message;
+    }
+}
+
+/// Assert no answer arrives for `id` within `within`.
+fn no_answer_to(client: &AdapterClient, id: &Value, within: Duration, label: &str) {
+    let quiet_until = Instant::now() + within;
+    while let Some(message) =
+        client.observed_message(quiet_until.saturating_duration_since(Instant::now()))
+    {
+        assert!(
+            message.get("method").is_some() || &message["id"] != id,
+            "{label}: {message}\n{}",
+            client.diagnostics()
+        );
+    }
+}
+
+/// An id is reused after its request was cancelled, before the cancelled exchange
+/// has finished. Cancellation belongs to the request, not the id: the replacement
+/// gets its own answer and never the cancelled one's, and the cancelled exchange
+/// finishing does not stop the replacement from being cancelled in turn.
+fn cancelled_id_reused_before_its_exchange_finishes(era: Era, id: Value, label: &str) {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new(&format!("adapter-reuse-{label}"));
+    let transcript = dir.join("reuse.jsonl");
+    let mut server = mock_server_entry("par", &transcript, None);
+    server.source = Some("shared".to_string());
+    server.env.push(EnvVar {
+        key: "MOCK_MCP_CONCURRENT".to_string(),
+        value: Some("1".to_string()),
+        secret: false,
+        unknown_fields: Default::default(),
+    });
+    write_registry(&dir, vec![server], vec![]);
+
+    let mut client = spawn_adapter(&dir, &AdapterOptions::default());
+    let sleep = match era {
+        Era::Handshake => {
+            client.initialize(&format!("matrix-adapter-reuse-{label}"));
+            client.wait_for_tool("__sleep", Duration::from_secs(30))
+        }
+        Era::Modern => {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut next = 9_000;
+            loop {
+                next += 1;
+                let list = json!(next);
+                client.send(era.request(list.clone(), "tools/list", json!({})));
+                let reply = answer_to(&client, &list);
+                let found = reply["result"]["tools"].as_array().and_then(|tools| {
+                    tools
+                        .iter()
+                        .filter_map(|tool| tool["name"].as_str())
+                        .find(|name| name.ends_with("__sleep"))
+                        .map(str::to_string)
+                });
+                if let Some(found) = found {
+                    break found;
+                }
+                assert!(Instant::now() < deadline, "no sleep tool: {reply}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    };
+    let call = |ms: u64| {
+        era.request(
+            id.clone(),
+            "tools/call",
+            json!({ "name": sleep, "arguments": { "ms": ms } }),
+        )
+    };
+    let reached = |count: usize| {
+        wait_until(
+            || transcript_method_count(&transcript, "tools/call") >= count,
+            "the call reached the server",
+            Duration::from_secs(20),
+        )
+    };
+    let before = transcript_method_count(&transcript, "tools/call");
+
+    // Open the id, cancel it, and open it again while the first is still running.
+    // The first finishes first; its answer must not pass for the replacement's.
+    client.send(call(400));
+    reached(before + 1);
+    client.send(era.cancel(id.clone()));
+    client.send(call(1_200));
+    reached(before + 2);
+    // `7` and `"7"` are different ids: cancelling the other spelling is a no-op.
+    let other = if id.is_string() {
+        json!(id.as_str().unwrap().parse::<i64>().unwrap())
+    } else {
+        json!(id.to_string())
+    };
+    client.send(era.cancel(other));
+    let answer = answer_to(&client, &id);
+    assert_eq!(
+        text_of(&answer["result"]),
+        "slept 1200 ms",
+        "the replacement got another request's answer: {answer}\n{}",
+        client.diagnostics()
+    );
+    no_answer_to(
+        &client,
+        &id,
+        Duration::from_millis(300),
+        "a second answer for the reused id",
+    );
+
+    // Again, and this time cancel the replacement after the first exchange ended.
+    client.send(call(200));
+    reached(before + 3);
+    client.send(era.cancel(id.clone()));
+    client.send(call(2_000));
+    reached(before + 4);
+    std::thread::sleep(Duration::from_millis(600));
+    client.send(era.cancel(id.clone()));
+    no_answer_to(
+        &client,
+        &id,
+        Duration::from_millis(2_300),
+        "answer after cancelling the replacement",
+    );
+
+    // The session still serves.
+    let ping = json!(8_000);
+    client.send(era.request(ping.clone(), "tools/list", json!({})));
+    let listed = answer_to(&client, &ping);
+    assert!(listed["result"]["tools"].is_array(), "{listed}");
+}
+
+#[test]
+fn matrix_cancelling_then_reusing_a_numeric_id_handshake() {
+    cancelled_id_reused_before_its_exchange_finishes(Era::Handshake, json!(7), "hs-num");
+}
+
+#[test]
+fn matrix_cancelling_then_reusing_a_string_id_handshake() {
+    cancelled_id_reused_before_its_exchange_finishes(Era::Handshake, json!("7"), "hs-str");
+}
+
+#[test]
+fn matrix_cancelling_then_reusing_a_numeric_id_modern() {
+    cancelled_id_reused_before_its_exchange_finishes(Era::Modern, json!(7), "modern-num");
+}
+
+#[test]
+fn matrix_cancelling_then_reusing_a_string_id_modern() {
+    cancelled_id_reused_before_its_exchange_finishes(Era::Modern, json!("7"), "modern-str");
+}
+
+/// MCP: `initialize` must not be cancelled. A cancellation for it, sent right
+/// behind it, is ignored: the reply still arrives and the session works. The same
+/// holds for an `initialize` sent again on an open session, which runs on a worker
+/// and so is still open when its cancellation is read.
+#[test]
+fn matrix_cancelling_initialize_is_ignored() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("adapter-cancel-initialize");
+    let transcript = dir.join("init.jsonl");
+    let mut server = mock_server_entry("init", &transcript, None);
+    server.source = Some("shared".to_string());
+    write_registry(&dir, vec![server], vec![]);
+
+    let mut client = spawn_adapter(&dir, &AdapterOptions::default());
+    let initialize = |id: i64| {
+        json!({
+            "jsonrpc": "2.0", "id": id, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "matrix-cancel-initialize", "version": "1" }
+            }
+        })
+    };
+    let cancel = Era::Handshake.cancel(json!(1));
+    // One write, so the cancellation is read while initialize is in flight.
+    {
+        let mut guard = client.stdin.lock().unwrap();
+        let stdin = guard.as_mut().unwrap();
+        writeln!(stdin, "{}\n{cancel}", initialize(1)).unwrap();
+        stdin.flush().unwrap();
+    }
+    let reply = answer_to(&client, &json!(1));
+    assert!(reply.get("result").is_some(), "initialize failed: {reply}");
+    client.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+    client.next_id = 100;
+    client.wait_for_tool("__echo", Duration::from_secs(30));
+
+    let cancel = Era::Handshake.cancel(json!(2));
+    {
+        let mut guard = client.stdin.lock().unwrap();
+        let stdin = guard.as_mut().unwrap();
+        writeln!(stdin, "{}\n{cancel}", initialize(2)).unwrap();
+        stdin.flush().unwrap();
+    }
+    let reply = answer_to(&client, &json!(2));
+    assert!(
+        reply.get("result").is_some(),
+        "the second initialize failed: {reply}\n{}",
+        client.diagnostics()
+    );
+    client.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+    let echo = client.wait_for_tool("__echo", Duration::from_secs(30));
+    let result = client.call_tool(&echo, json!({ "text": "still here" }));
+    assert_eq!(text_of(&result), "still here", "{result}");
+}
+
 /// Hold one approval request open like the app's prompt does, and report how long
 /// after the request the gateway withdrew it by closing the connection.
 fn approval_broker_holding(

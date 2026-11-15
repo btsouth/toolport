@@ -132,6 +132,10 @@ stdio adapter alike, in both protocol eras: the handshake-era spec says a receiv
 should not answer a cancelled request, and the `2026-07-28` stdio transport forbids
 further messages for it. A cancellation that arrives after the reply changes nothing.
 A cancelled call that is waiting on an approval prompt withdraws the prompt.
+Cancellation belongs to the request, not its id: a client that reuses a cancelled
+request's id before that call finishes gets the new request's reply and never the old
+one's, and can cancel the new request too. `initialize` cannot be cancelled, as MCP
+requires, so a cancellation for it is ignored and its reply still arrives.
 
 Codex config keys Toolport writes for its own entry are listed in
 [docs/clients.md](clients.md#codex-setup-walkthrough). Every Toolport meta-tool input

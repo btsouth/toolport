@@ -37,7 +37,7 @@ use crate::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -512,15 +512,58 @@ struct Session {
     /// Open `subscriptions/listen` requests by id, each with the flag the
     /// client's cancellation sets.
     subscriptions: Mutex<HashMap<String, Arc<AtomicBool>>>,
-    /// The client's requests still open on this connection, by id, each with whether
-    /// the client cancelled it. A cancelled request gets no further message: the
-    /// handshake-era spec says a receiver should not answer it and the 2026-07-28
-    /// stdio transport forbids it, and the plain stdio loop already complies.
-    open_requests: Mutex<HashMap<String, bool>>,
+    /// The client's requests still open on this connection, by id. A cancelled
+    /// request gets no further message: the handshake-era spec says a receiver
+    /// should not answer it and the 2026-07-28 stdio transport forbids it, and the
+    /// plain stdio loop already complies. A client may reuse a cancelled request's
+    /// id before that exchange ends, so an id can hold more than one instance, and
+    /// each instance's worker answers and closes only its own.
+    open_requests: Mutex<HashMap<String, Vec<OpenRequest>>>,
+    next_request: AtomicU64,
     instance: String,
     stopping: AtomicBool,
     closed: Arc<AtomicBool>,
     lifetime_endpoint: Arc<Mutex<Option<DaemonDescriptor>>>,
+}
+
+/// One client request open on the connection. Cancellation belongs to the
+/// request, not its id, which the client may reuse once it has cancelled it.
+struct OpenRequest {
+    generation: u64,
+    cancelled: bool,
+    /// `initialize` must not be cancelled (MCP), so a cancellation for it is ignored.
+    cancellable: bool,
+}
+
+/// A request instance the client opened: its id's key and the generation that
+/// tells it apart from a later request that reuses the id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RequestTicket {
+    key: String,
+    generation: u64,
+}
+
+thread_local! {
+    /// The request whose exchange this thread is running, so the messages it writes
+    /// are judged against that request instance rather than whatever holds its id.
+    static ANSWERING: std::cell::RefCell<Option<RequestTicket>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Marks this thread as answering one request until dropped.
+struct AnsweringScope(Option<RequestTicket>);
+
+impl AnsweringScope {
+    fn enter(ticket: Option<RequestTicket>) -> Self {
+        Self(ANSWERING.with(|current| current.replace(ticket)))
+    }
+}
+
+impl Drop for AnsweringScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        ANSWERING.with(|current| *current.borrow_mut() = previous);
+    }
 }
 
 /// Keeps an open subscription cancellable while its reply is relayed.
@@ -596,6 +639,7 @@ impl Session {
             roots_request_ids: Mutex::new(HashSet::new()),
             subscriptions: Mutex::new(HashMap::new()),
             open_requests: Mutex::new(HashMap::new()),
+            next_request: AtomicU64::new(0),
             instance: crate::approval::new_correlation_id(),
             stopping: AtomicBool::new(false),
             closed: Arc::new(AtomicBool::new(false)),
@@ -730,30 +774,44 @@ impl Session {
         out.flush().map_err(|error| error.to_string())
     }
 
-    /// Note a client request as open until its handling ends.
-    fn open_request(&self, request: &serde_json::Value) -> Option<String> {
-        let key = request
-            .get("id")
-            .filter(|id| !id.is_null() && request.get("method").is_some())?
-            .to_string();
+    /// Note a client request as open until its handling ends. The ticket is what
+    /// its exchange answers and closes under.
+    fn open_request(&self, request: &serde_json::Value) -> Option<RequestTicket> {
+        let key = request_key(request)?;
+        let generation = self.next_request.fetch_add(1, Ordering::Relaxed);
         self.open_requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key.clone(), false);
-        Some(key)
+            .entry(key.clone())
+            .or_default()
+            .push(OpenRequest {
+                generation,
+                cancelled: false,
+                cancellable: request["method"] != "initialize",
+            });
+        Some(RequestTicket { key, generation })
     }
 
-    fn close_request(&self, key: Option<String>) {
-        if let Some(key) = key {
-            self.open_requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&key);
+    /// Close one request instance. A later request that reused its id stays open.
+    fn close_request(&self, ticket: Option<RequestTicket>) {
+        let Some(ticket) = ticket else {
+            return;
+        };
+        let mut open = self
+            .open_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(instances) = open.get_mut(&ticket.key) {
+            instances.retain(|instance| instance.generation != ticket.generation);
+            if instances.is_empty() {
+                open.remove(&ticket.key);
+            }
         }
     }
 
-    /// Mark an open request the client cancelled. A cancellation for a request that
-    /// already finished, or one this connection never saw, changes nothing.
+    /// Mark the open requests with the cancelled id as cancelled. A cancellation
+    /// for a request that already finished, one this connection never saw, or an
+    /// `initialize` changes nothing, and neither does a later request reusing the id.
     fn note_cancellation(&self, message: &serde_json::Value) {
         if message["method"] != "notifications/cancelled" {
             return;
@@ -761,31 +819,72 @@ impl Session {
         let Some(id) = message["params"].get("requestId") else {
             return;
         };
-        if let Some(cancelled) = self
+        if let Some(instances) = self
             .open_requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_mut(&id.to_string())
         {
-            *cancelled = true;
+            for instance in instances.iter_mut().filter(|instance| instance.cancellable) {
+                instance.cancelled = true;
+            }
         }
     }
 
-    /// Whether `message` is a response to a request the client cancelled.
+    /// Run one client request's exchange as `ticket`, then close it. A failed
+    /// exchange is answered with an error under the same rules as a reply.
+    fn answer_request(
+        &self,
+        body: &str,
+        request: &serde_json::Value,
+        ticket: Option<RequestTicket>,
+    ) {
+        {
+            let _answering = AnsweringScope::enter(ticket.clone());
+            if let Err(error) = self.exchange(body) {
+                report_request_error(self, request, &error);
+            }
+        }
+        self.close_request(ticket);
+    }
+
+    /// Whether `message` is a response the client must not get: one for a request
+    /// it cancelled. On a thread answering a request, a response with that request's
+    /// id is judged by that instance alone, so a cancelled instance's late reply is
+    /// dropped even after the id was reused, and the live instance's reply is sent.
     fn answers_a_cancelled_request(&self, message: &str) -> bool {
+        let answering = ANSWERING.with(|current| current.borrow().clone());
         let open = self
             .open_requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !open.values().any(|cancelled| *cancelled) {
+        let instance = |ticket: &RequestTicket| {
+            open.get(&ticket.key).and_then(|instances| {
+                instances
+                    .iter()
+                    .find(|instance| instance.generation == ticket.generation)
+            })
+        };
+        let any_cancelled = open.values().flatten().any(|instance| instance.cancelled);
+        let own_live = answering
+            .as_ref()
+            .is_none_or(|ticket| instance(ticket).is_some_and(|instance| !instance.cancelled));
+        if !any_cancelled && own_live {
             return false;
         }
-        serde_json::from_str::<serde_json::Value>(message).is_ok_and(|value| {
-            value.get("method").is_none()
-                && value
-                    .get("id")
-                    .is_some_and(|id| open.get(&id.to_string()) == Some(&true))
-        })
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(message) else {
+            return false;
+        };
+        let Some(id) = value.get("id").filter(|_| value.get("method").is_none()) else {
+            return false;
+        };
+        let key = id.to_string();
+        match answering.as_ref().filter(|ticket| ticket.key == key) {
+            Some(ticket) => !instance(ticket).is_some_and(|instance| !instance.cancelled),
+            None => open
+                .get(&key)
+                .is_some_and(|instances| instances.iter().any(|instance| instance.cancelled)),
+        }
     }
 
     /// Remember the client's handshake so a replacement daemon can be given an
@@ -1606,15 +1705,15 @@ fn try_acquire_inflight(inflight: &Arc<AtomicUsize>, limit: usize) -> Option<Inf
 /// a worker, because the reader is the only path a server-initiated answer or a
 /// cancellation can take back to the daemon. The job is a closure rather than a
 /// `Session` method so the dispatch and bounding can be tested without a daemon.
-struct Dispatcher {
-    run: Arc<dyn Fn(String) + Send + Sync>,
+struct Dispatcher<J> {
+    run: Arc<dyn Fn(J) + Send + Sync>,
     inflight: Arc<AtomicUsize>,
     workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
     limit: usize,
 }
 
-impl Dispatcher {
-    fn new(run: Arc<dyn Fn(String) + Send + Sync>, limit: usize) -> Self {
+impl<J: Send + 'static> Dispatcher<J> {
+    fn new(run: Arc<dyn Fn(J) + Send + Sync>, limit: usize) -> Self {
         Self {
             run,
             inflight: Arc::new(AtomicUsize::new(0)),
@@ -1639,7 +1738,7 @@ impl Dispatcher {
     }
 
     /// Send one request on a worker thread, or inline when the pool is full.
-    fn dispatch(&self, body: String) {
+    fn dispatch(&self, body: J) {
         self.reap();
         match try_acquire_inflight(&self.inflight, self.limit) {
             Some(guard) => {
@@ -1694,12 +1793,9 @@ fn proxy_stdio(
     let dispatcher = Dispatcher::new(
         {
             let session = Arc::clone(&session);
-            Arc::new(move |body: String| {
+            Arc::new(move |(body, ticket): (String, Option<RequestTicket>)| {
                 let request = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
-                if let Err(error) = session.exchange(&body) {
-                    report_request_error(&session, &request, &error);
-                }
-                session.close_request(request_key(&request));
+                session.answer_request(&body, &request, ticket);
             })
         },
         MAX_INFLIGHT,
@@ -1746,16 +1842,13 @@ fn proxy_stdio(
         session.cancel_subscription(&request);
         session.note_cancellation(&request);
         let is_request = request.get("id").map(|id| !id.is_null()).unwrap_or(false);
-        let open = session.open_request(&request);
+        let ticket = session.open_request(&request);
         // A modern request carries everything it needs, so it runs as soon as it
         // is read. A legacy one waits for `initialize` to open the session.
         if is_request && (session.session_id().is_some() || declared_version(&request).is_some()) {
-            dispatcher.dispatch(trimmed.to_string());
+            dispatcher.dispatch((trimmed.to_string(), ticket));
         } else {
-            if let Err(error) = session.exchange(trimmed) {
-                report_request_error(&session, &request, &error);
-            }
-            session.close_request(open);
+            session.answer_request(trimmed, &request, ticket);
         }
     }
     session.stopping.store(true, Ordering::SeqCst);
@@ -1764,7 +1857,7 @@ fn proxy_stdio(
     Ok(())
 }
 
-/// The key [`Session::open_request`] used for a client request.
+/// The key [`Session::open_request`] files a client request under.
 fn request_key(request: &serde_json::Value) -> Option<String> {
     request
         .get("id")
@@ -2405,6 +2498,135 @@ mod tests {
         drop(replacement);
         drop(second);
         assert!(session.subscriptions.lock().unwrap().is_empty());
+    }
+
+    /// A session that writes to `sink` and has no daemon behind it.
+    fn sink_session(sink: &Sink) -> Session {
+        let data_dir = std::env::temp_dir();
+        let compat = CompatKey::new("test", data_dir.to_string_lossy());
+        let mut session = Session::new(
+            Rendezvous::new(&data_dir, compat.clone()),
+            DaemonDescriptor::new("127.0.0.1:1", "test-token", &compat),
+            None,
+        );
+        session.stdout = Mutex::new(Box::new(sink.clone()));
+        session
+    }
+
+    fn client_request(id: serde_json::Value, method: &str) -> serde_json::Value {
+        serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": {} })
+    }
+
+    fn client_cancel(id: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": id }
+        })
+    }
+
+    /// Write `text` as the reply to `id` from a thread answering `ticket`.
+    fn reply_as(
+        session: &Session,
+        ticket: &Option<RequestTicket>,
+        id: serde_json::Value,
+        text: &str,
+    ) {
+        let _answering = AnsweringScope::enter(ticket.clone());
+        let reply = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "text": text } });
+        session.write_message(&reply.to_string()).unwrap();
+    }
+
+    fn written_texts(sink: &Sink) -> Vec<String> {
+        sink.messages()
+            .iter()
+            .map(|message| {
+                message["result"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_reused_id_is_answered_and_closed_per_request() {
+        let sink = Sink::default();
+        let session = sink_session(&sink);
+        let old = session.open_request(&client_request(serde_json::json!(7), "tools/call"));
+        session.note_cancellation(&client_cancel(serde_json::json!(7)));
+        let replacement = session.open_request(&client_request(serde_json::json!(7), "tools/call"));
+        assert_ne!(old, replacement);
+
+        // The cancelled request's late reply is dropped; the replacement's is sent.
+        reply_as(&session, &old, serde_json::json!(7), "old");
+        reply_as(&session, &replacement, serde_json::json!(7), "replacement");
+        assert_eq!(written_texts(&sink), vec!["replacement"]);
+
+        // The old request closing leaves the replacement open and cancellable.
+        session.close_request(old);
+        session.note_cancellation(&client_cancel(serde_json::json!(7)));
+        reply_as(&session, &replacement, serde_json::json!(7), "late");
+        // With no request on this thread, a reply for the cancelled id is dropped too.
+        reply_as(&session, &None, serde_json::json!(7), "unowned");
+        assert_eq!(written_texts(&sink), vec!["replacement"]);
+        session.close_request(replacement);
+        assert!(session.open_requests.lock().unwrap().is_empty());
+
+        // Once closed, the id is free again, and a late cancellation is harmless.
+        session.note_cancellation(&client_cancel(serde_json::json!(7)));
+        let next = session.open_request(&client_request(serde_json::json!(7), "tools/call"));
+        reply_as(&session, &next, serde_json::json!(7), "next");
+        session.close_request(next);
+        assert_eq!(written_texts(&sink), vec!["replacement", "next"]);
+    }
+
+    #[test]
+    fn a_string_id_and_a_numeric_id_are_cancelled_apart() {
+        let sink = Sink::default();
+        let session = sink_session(&sink);
+        let string = session.open_request(&client_request(serde_json::json!("7"), "tools/call"));
+        let number = session.open_request(&client_request(serde_json::json!(7), "tools/call"));
+        session.note_cancellation(&client_cancel(serde_json::json!(7)));
+        reply_as(&session, &number, serde_json::json!(7), "number");
+        reply_as(&session, &string, serde_json::json!("7"), "string");
+        assert_eq!(written_texts(&sink), vec!["string"]);
+        session.close_request(number);
+        session.close_request(string);
+        assert!(session.open_requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_cancellation_for_initialize_is_ignored() {
+        let sink = Sink::default();
+        let session = sink_session(&sink);
+        let initialize = session.open_request(&client_request(serde_json::json!(1), "initialize"));
+        session.note_cancellation(&client_cancel(serde_json::json!(1)));
+        reply_as(&session, &initialize, serde_json::json!(1), "initialized");
+        session.close_request(initialize);
+        assert_eq!(written_texts(&sink), vec!["initialized"]);
+    }
+
+    #[test]
+    fn messages_that_are_not_replies_to_a_cancelled_request_pass() {
+        let sink = Sink::default();
+        let session = sink_session(&sink);
+        let call = session.open_request(&client_request(serde_json::json!(3), "tools/call"));
+        session.note_cancellation(&client_cancel(serde_json::json!(3)));
+        // A notification and a server request written while answering it still pass,
+        // and so does a reply for an id nobody cancelled.
+        {
+            let _answering = AnsweringScope::enter(call.clone());
+            session
+                .write_message(r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{}}"#)
+                .unwrap();
+            session
+                .write_message(r#"{"jsonrpc":"2.0","id":"s1","method":"roots/list"}"#)
+                .unwrap();
+        }
+        reply_as(&session, &None, serde_json::json!(4), "other");
+        session.close_request(call);
+        assert_eq!(sink.messages().len(), 3);
     }
 
     /// Client output captured in memory instead of the process stdout.
@@ -4131,7 +4353,7 @@ mod tests {
         release: Arc<(Mutex<bool>, Condvar)>,
         completed: Arc<Mutex<Vec<String>>>,
         started: std::sync::mpsc::Sender<String>,
-    ) -> Dispatcher {
+    ) -> Dispatcher<String> {
         Dispatcher::new(
             Arc::new(move |body: String| {
                 if body == "slow" {
