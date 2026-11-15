@@ -84,7 +84,15 @@ pub struct Matcher {
     /// Every registered value as written (and trimmed), for whole-value checks of
     /// JSON numbers and identifiers.
     exact: std::collections::HashMap<String, usize>,
+    /// A larger matcher searched together with this one, its names numbered
+    /// after this one's: the process registry's main matcher, while this one
+    /// holds only the values registered since it was built. Hits from both are
+    /// merged in one pass, exactly as if they were one matcher. Never nested.
+    extra: Option<Arc<Matcher>>,
 }
+
+/// `(start, end, name, fragment)`: one automaton hit.
+type Hit = (usize, usize, usize, bool);
 
 /// Index `keys` (one per pattern) into an automaton over the distinct keys and,
 /// per distinct key, the patterns that have it.
@@ -500,7 +508,56 @@ impl Matcher {
             heads,
             tails,
             exact,
+            extra: None,
         }
+    }
+
+    /// This matcher searched together with `main` (see [`Matcher::extra`]).
+    fn over(mut self, main: Option<Arc<Matcher>>) -> Self {
+        debug_assert!(main.as_ref().is_none_or(|m| m.extra.is_none()));
+        self.extra = main;
+        self
+    }
+
+    /// The marker name of name index `n` (this matcher's, then `extra`'s).
+    fn name(&self, n: usize) -> &str {
+        match (n.checked_sub(self.names.len()), &self.extra) {
+            (Some(i), Some(extra)) => extra.names[i].as_str(),
+            _ => self.names[n].as_str(),
+        }
+    }
+
+    fn base(&self) -> usize {
+        self.names.len()
+    }
+
+    /// `extra`'s hits for `f`, with names shifted after this matcher's.
+    fn extra_hits(&self, f: impl Fn(&Matcher) -> Vec<Hit>) -> Vec<Hit> {
+        let base = self.base();
+        self.extra.as_ref().map_or_else(Vec::new, |m| {
+            f(m).into_iter()
+                .map(|(s, e, n, frag)| (s, e, n + base, frag))
+                .collect()
+        })
+    }
+
+    fn longest(&self) -> usize {
+        self.extra.as_ref().map_or(self.longest_chars, |m| {
+            m.longest_chars.max(self.longest_chars)
+        })
+    }
+
+    fn exact_get(&self, text: &str) -> Option<usize> {
+        self.exact.get(text).copied().or_else(|| {
+            let base = self.base();
+            self.extra
+                .as_ref()
+                .and_then(|m| m.exact.get(text).map(|n| n + base))
+        })
+    }
+
+    fn has_exact(&self) -> bool {
+        !self.exact.is_empty() || self.extra.as_ref().is_some_and(|m| !m.exact.is_empty())
     }
 
     /// Heap bytes held by the compiled automata, for the performance notes.
@@ -513,16 +570,17 @@ impl Matcher {
             + self.ci.as_ref().map_or(0, AhoCorasick::memory_usage)
             + edge(&self.heads)
             + edge(&self.tails)
+            + self.extra.as_ref().map_or(0, |m| m.memory_usage())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.raw.is_none()
+        self.raw.is_none() && self.extra.as_ref().is_none_or(|m| m.is_empty())
     }
 
     fn marker(&self, names: &[usize]) -> String {
         let mut listed: Vec<&str> = Vec::new();
         for &n in names {
-            let name = self.names[n].as_str();
+            let name = self.name(n);
             if !listed.contains(&name) {
                 listed.push(name);
             }
@@ -537,10 +595,16 @@ impl Matcher {
 
     /// [`Self::spans`], optionally without fragment windows (whole forms only).
     fn spans_with(&self, text: &str, fragments: bool) -> Vec<(usize, usize, Vec<usize>)> {
+        let mut hits = self.own_hits(text, fragments);
+        hits.extend(self.extra_hits(|m| m.own_hits(text, fragments)));
+        merge(hits)
+    }
+
+    fn own_hits(&self, text: &str, fragments: bool) -> Vec<Hit> {
         let Some(ac) = &self.raw else {
             return Vec::new();
         };
-        let mut hits: Vec<(usize, usize, usize, bool)> = Vec::new();
+        let mut hits: Vec<Hit> = Vec::new();
         for m in ac.find_overlapping_iter(text) {
             let pattern = &self.raw_patterns[m.pattern().as_usize()].1;
             if pattern.fragment && !fragments {
@@ -568,7 +632,7 @@ impl Matcher {
                 hits.push((m.start(), m.end(), pattern.name, false));
             }
         }
-        merge(hits)
+        hits
     }
 
     fn apply(&self, text: &str, spans: &[(usize, usize, Vec<usize>)]) -> String {
@@ -587,6 +651,12 @@ impl Matcher {
     /// outside ASCII counts as a token character for the short-secret rule, the
     /// conservative choice for a whole-token check.
     fn byte_spans(&self, bytes: &[u8]) -> Vec<(usize, usize, Vec<usize>)> {
+        let mut hits = self.own_byte_hits(bytes);
+        hits.extend(self.extra_hits(|m| m.own_byte_hits(bytes)));
+        merge(hits)
+    }
+
+    fn own_byte_hits(&self, bytes: &[u8]) -> Vec<Hit> {
         let Some(ac) = &self.raw else {
             return Vec::new();
         };
@@ -616,7 +686,7 @@ impl Matcher {
                 hits.push((m.start(), m.end(), pattern.name, false));
             }
         }
-        merge(hits)
+        hits
     }
 
     /// Replace every whole occurrence of a secret or one of its encodings.
@@ -640,6 +710,28 @@ impl Matcher {
                 spans.push((start, end, vec![n]));
             }
         };
+        for (start, end, name, _) in self
+            .own_edges(text)
+            .into_iter()
+            .chain(self.extra_hits(|m| m.own_edges(text)))
+        {
+            edge(&mut spans, start, end, name);
+        }
+        if spans.is_empty() {
+            return Cow::Borrowed(text);
+        }
+        let hits = spans
+            .into_iter()
+            .flat_map(|(s, e, names)| names.into_iter().map(move |n| (s, e, n, false)))
+            .collect();
+        let spans = merge(hits);
+        Cow::Owned(self.apply(text, &spans))
+    }
+
+    /// This matcher's dangling prefix of a secret at the end of `text` and
+    /// dangling suffix at its start, as hits.
+    fn own_edges(&self, text: &str) -> Vec<Hit> {
+        let mut out = Vec::new();
         // Only the ends of `text` matter, so only the last (first) stretch as long
         // as the longest pattern is searched for pattern heads (tails).
         let reach = self.longest_chars * 4;
@@ -660,7 +752,7 @@ impl Matcher {
                 })
             });
             if let Some((start, name)) = found {
-                edge(&mut spans, start, text.len(), name);
+                out.push((start, text.len(), name, false));
             }
         }
         if let Some((ac, owners)) = &self.tails {
@@ -683,25 +775,17 @@ impl Matcher {
                 })
                 .max_by_key(|(end, _)| *end);
             if let Some((end, name)) = found {
-                edge(&mut spans, 0, end, name);
+                out.push((0, end, name, false));
             }
         }
-        if spans.is_empty() {
-            return Cow::Borrowed(text);
-        }
-        let hits = spans
-            .into_iter()
-            .flat_map(|(s, e, names)| names.into_iter().map(move |n| (s, e, n, false)))
-            .collect();
-        let spans = merge(hits);
-        Cow::Owned(self.apply(text, &spans))
+        out
     }
 
     /// Redact then cut to `max_chars`, so a cut can never leave part of a secret.
     /// Scans only the window that can reach the kept prefix, so a multi-megabyte
     /// error costs no more than a short one.
     pub fn truncate_chars(&self, text: &str, max_chars: usize) -> String {
-        let window_chars = max_chars.saturating_add(self.longest_chars);
+        let window_chars = max_chars.saturating_add(self.longest());
         let window = match text.char_indices().nth(window_chars) {
             Some((byte, _)) => &text[..byte],
             None => text,
@@ -819,7 +903,7 @@ impl Matcher {
         if a.is_empty() || b.is_empty() {
             return None;
         }
-        let reach = self.longest_chars * 4;
+        let reach = self.longest() * 4;
         let mut from = a.len().saturating_sub(reach);
         while !a.is_char_boundary(from) {
             from += 1;
@@ -939,15 +1023,15 @@ impl Matcher {
     /// The secret a JSON number spells, by its text or, for an integral value
     /// written another way (`482193.0`, `4.82193e5`), by its integer text.
     fn number_secret(&self, n: &serde_json::Number) -> Option<usize> {
-        if self.exact.is_empty() {
+        if !self.has_exact() {
             return None;
         }
-        if let Some(&name) = self.exact.get(&n.to_string()) {
+        if let Some(name) = self.exact_get(&n.to_string()) {
             return Some(name);
         }
         let f = n.as_f64()?;
         (f.fract() == 0.0 && f.abs() < 9.0e15)
-            .then(|| self.exact.get(&format!("{}", f as i64)).copied())
+            .then(|| self.exact_get(&format!("{}", f as i64)))
             .flatten()
     }
 
@@ -987,7 +1071,7 @@ impl Matcher {
     /// value as the quoted marker, before parsing loses that text (`1.50`, `0042`
     /// as written). Strings are skipped; the result is still valid JSON.
     fn redact_number_tokens(&self, body: &str) -> Option<String> {
-        if self.exact.is_empty() {
+        if !self.has_exact() {
             return None;
         }
         let bytes = body.as_bytes();
@@ -1019,7 +1103,7 @@ impl Matcher {
                     i += 1;
                 }
                 let token = &body[start..i];
-                let name = self.exact.get(token).copied().or_else(|| {
+                let name = self.exact_get(token).or_else(|| {
                     serde_json::from_str::<serde_json::Number>(token)
                         .ok()
                         .and_then(|n| self.number_secret(&n))
@@ -1053,13 +1137,13 @@ impl Matcher {
     }
 
     fn line_with<'a>(&self, line: &'a str, fragments: bool) -> Cow<'a, str> {
-        let Some(json) = &self.json else {
+        if self.is_empty() {
             return Cow::Borrowed(line);
-        };
+        }
         let body = line.trim_end_matches(['\n', '\r']);
         let looks_json = body.trim_start().starts_with(['{', '[']);
         if looks_json {
-            if !json.is_match(body) && !self.ci.as_ref().is_some_and(|a| a.is_match(body)) {
+            if !self.may_contain(body) {
                 return Cow::Borrowed(line);
             }
             let numbers = self.redact_number_tokens(body);
@@ -1079,20 +1163,28 @@ impl Matcher {
             Some(new) => Cow::Owned(new),
             None => Cow::Borrowed(line),
         };
-        let Some(ac) = &self.json else {
-            return raw;
-        };
-        if !ac.is_match(raw.as_ref()) {
+        let text = raw.as_ref();
+        let mut hits = self.own_json_hits(text, fragments);
+        hits.extend(self.extra_hits(|m| m.own_json_hits(text, fragments)));
+        let spans = merge(hits);
+        if spans.is_empty() {
             return raw;
         }
+        Cow::Owned(self.apply(raw.as_ref(), &spans))
+    }
+
+    /// Hits of the JSON-escaped forms, for text that is not valid JSON.
+    fn own_json_hits(&self, text: &str, fragments: bool) -> Vec<Hit> {
+        let Some(ac) = &self.json else {
+            return Vec::new();
+        };
         let mut hits = Vec::new();
-        for m in ac.find_overlapping_iter(raw.as_ref()) {
+        for m in ac.find_overlapping_iter(text) {
             let pattern = &self.raw_patterns[m.pattern().as_usize()].1;
             if pattern.fragment && !fragments {
                 continue;
             }
             if pattern.whole_token {
-                let text = raw.as_ref();
                 let before = text[..m.start()].chars().next_back();
                 let after = text[m.end()..].chars().next();
                 if before.is_some_and(is_token_char) || after.is_some_and(is_token_char) {
@@ -1101,11 +1193,7 @@ impl Matcher {
             }
             hits.push((m.start(), m.end(), pattern.name, pattern.fragment));
         }
-        let spans = merge(hits);
-        if spans.is_empty() {
-            return raw;
-        }
-        Cow::Owned(self.apply(raw.as_ref(), &spans))
+        hits
     }
 
     /// Cheap pre-check: could `text` hold any registered form, raw or JSON-escaped?
@@ -1114,6 +1202,7 @@ impl Matcher {
         self.raw.as_ref().is_some_and(|a| a.is_match(text))
             || self.json.as_ref().is_some_and(|a| a.is_match(text))
             || self.ci.as_ref().is_some_and(|a| a.is_match(text))
+            || self.extra.as_ref().is_some_and(|m| m.may_contain(text))
     }
 }
 
@@ -1194,13 +1283,16 @@ impl Registry {
         }
     }
 
+    /// The matcher readers use: the delta (which searches the main matcher it
+    /// was built over as its `extra`) while it covers values the main one lacks,
+    /// else the main one.
     fn layers(&self) -> Option<Layers> {
-        let mut layers = Vec::with_capacity(2);
-        layers.extend(self.main.clone());
-        if self.delta_end > self.main_len {
-            layers.extend(self.delta.clone());
-        }
-        (!layers.is_empty()).then_some(Layers(layers))
+        let current = if self.delta_end > self.main_len {
+            self.delta.clone().or_else(|| self.main.clone())
+        } else {
+            self.main.clone()
+        };
+        current.map(|m| Layers(vec![m]))
     }
 }
 
@@ -1289,7 +1381,7 @@ impl Layers {
             if found.is_empty() {
                 continue;
             }
-            names.extend(found.into_iter().map(|n| m.names[n].clone()));
+            names.extend(found.into_iter().map(|n| m.name(n).to_string()));
             m.screen_definition(item, record);
         }
         names.sort();
@@ -1381,26 +1473,9 @@ fn current() -> Option<Layers> {
     current_in(&scope_now())
 }
 
-/// One matcher over every value registered in `scope`, for the scrub (a
-/// background job, which may build one).
+/// One matcher over every value registered in `scope`, for the scrub.
 fn complete_in(scope: &Scope) -> Option<Arc<Matcher>> {
-    let layers = current_in(scope)?;
-    if layers.0.len() == 1 {
-        return layers.0.into_iter().next();
-    }
-    let (pairs, whole_only) = {
-        let guard = REGISTRY
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let reg = guard.as_ref()?.get(scope)?;
-        let pairs: Vec<(String, String)> = reg
-            .secrets
-            .iter()
-            .map(|(_, n, v)| (n.clone(), v.clone()))
-            .collect();
-        (pairs, reg.whole_only.clone())
-    };
-    Some(Arc::new(Matcher::new_with(&pairs, &whole_only)))
+    current_in(scope)?.0.into_iter().next()
 }
 
 /// Wakes [`builder`]: some scope has values its main matcher does not cover.
@@ -1511,7 +1586,7 @@ fn rebuild_stale_mains() {
 /// install it unless a wider one already was.
 fn cover(scope: &Scope, index: usize) {
     loop {
-        let (end, pairs, whole_only) = {
+        let (end, pairs, whole_only, main) = {
             let guard = REGISTRY
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1527,9 +1602,11 @@ fn cover(scope: &Scope, index: usize) {
                 .iter()
                 .map(|(_, n, v)| (n.clone(), v.clone()))
                 .collect();
-            (end, pairs, reg.whole_only.clone())
+            (end, pairs, reg.whole_only.clone(), reg.main.clone())
         };
-        let built = Arc::new(Matcher::new_with(&pairs, &whole_only));
+        // Searched together with the main matcher it was read with, which covers
+        // everything before the delta's first value.
+        let built = Arc::new(Matcher::new_with(&pairs, &whole_only).over(main));
         let mut guard = REGISTRY
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2787,6 +2864,32 @@ mod tests {
             Some(("x [secret:SPLIT]".to_string(), " y".to_string()))
         );
         assert_eq!(m.redact_pair("abcdefghijkl", "999", None), None);
+    }
+
+    #[test]
+    fn a_value_registered_after_the_main_build_merges_with_it() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-layers-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        register("layers-srv", "A", "xxxxyyyy1-layer");
+        // Let the background build take A into the main matcher.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let built = REGISTRY
+                .read()
+                .unwrap()
+                .as_ref()
+                .and_then(|m| m.get(&scope_now()))
+                .is_some_and(|r| r.main_len == r.secrets.len());
+            if built || std::time::Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // B overlaps A and is only in the delta right after it registers: the two
+        // are still matched as one set, leaving no tail of either.
+        register("layers-srv", "B", "yyyy1-layerzzzz");
+        assert_eq!(redact_text("<xxxxyyyy1-layerzzzz>"), "<[secret:A,B]>");
     }
 
     #[test]
