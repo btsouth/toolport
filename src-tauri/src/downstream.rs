@@ -9449,6 +9449,15 @@ impl DownstreamServer {
     /// this downstream (SOU-394). The gateway only calls this when at least one
     /// upstream client is subscribed to the same URI.
     pub fn subscribe_resource(&mut self, uri: &str) -> Result<Value, TransportError> {
+        // The server's own URI, before either path: an advertised alias means
+        // nothing to it.
+        let uri = crate::secret_redact::upstream_identifier(
+            self.server_id(),
+            crate::secret_redact::Catalog::Resource,
+            uri,
+        )
+        .into_owned();
+        let uri = uri.as_str();
         if matches!(self.era, Era::Modern { .. }) {
             if self.modern_resource_subscriptions.insert(uri.to_string()) {
                 let mut resource_subscriptions: Vec<String> =
@@ -9469,17 +9478,21 @@ impl DownstreamServer {
             }
             return Ok(json!({}));
         }
-        let uri = crate::secret_redact::upstream_identifier(
-            self.server_id(),
-            crate::secret_redact::Catalog::Resource,
-            uri,
-        );
         self.transport
             .request("resources/subscribe", json!({ "uri": uri }))
     }
 
     /// Drop a previously established downstream resource subscription.
     pub fn unsubscribe_resource(&mut self, uri: &str) -> Result<Value, TransportError> {
+        // The server's own URI, before either path: an advertised alias means
+        // nothing to it.
+        let uri = crate::secret_redact::upstream_identifier(
+            self.server_id(),
+            crate::secret_redact::Catalog::Resource,
+            uri,
+        )
+        .into_owned();
+        let uri = uri.as_str();
         if matches!(self.era, Era::Modern { .. }) {
             if self.modern_resource_subscriptions.remove(uri) {
                 let mut resource_subscriptions: Vec<String> =
@@ -9500,11 +9513,6 @@ impl DownstreamServer {
             }
             return Ok(json!({}));
         }
-        let uri = crate::secret_redact::upstream_identifier(
-            self.server_id(),
-            crate::secret_redact::Catalog::Resource,
-            uri,
-        );
         self.transport
             .request("resources/unsubscribe", json!({ "uri": uri }))
     }
