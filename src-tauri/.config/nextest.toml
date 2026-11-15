@@ -35,6 +35,11 @@ filter = "binary_id(conduit) and test(/^secrets::tests::(windows_|set_get_delete
 test-group = "windows-credential-manager"
 
 [[profile.default.overrides]]
+platform = 'cfg(target_os = "windows")'
+filter = "binary_id(conduit) and test(=clients::backup_storage::tests::platform_native_backup_vault_round_trip)"
+test-group = "windows-credential-manager"
+
+[[profile.default.overrides]]
 filter = "binary_id(conduit::one_gateway_conformance)"
 test-group = "one-gateway-conformance"
 
