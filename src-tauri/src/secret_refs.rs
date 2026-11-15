@@ -1079,7 +1079,65 @@ fn resolved_server_with_values(
             i.value = Some(values[r].clone());
         }
     }
+    register_inline_secrets(&resolved);
     Ok(resolved)
+}
+
+/// Register every secret value a server entry carries itself (inline `secret`
+/// env values and launch inputs, and references once resolved) with the
+/// redactor, before anything is launched or sent with them. Vault reads register
+/// on their own ([`crate::secrets`]); this covers the values that never pass
+/// through the vault. Every stdio launch resolves through [`resolve_server`],
+/// and remote connects call this directly.
+pub fn register_inline_secrets(server: &ServerEntry) {
+    for e in &server.env {
+        let Some(value) = &e.value else { continue };
+        // An unflagged inline value that is credential-shaped (by its name or its
+        // value) is protected too: a hand-edited registry need not set the flag.
+        if e.secret || crate::import_credentials::secret_env(&e.key, Some(value)) {
+            crate::secret_redact::register(&server.id, &e.key, value);
+        }
+    }
+    for arg in server
+        .args
+        .iter()
+        .filter(|a| crate::registry::arg_looks_secret(a))
+    {
+        crate::secret_redact::register(&server.id, "arg", arg);
+    }
+    // Credential parts of a configured URL, never the bare URL or the username.
+    if let Some(url) = server.url.as_deref().and_then(|u| url::Url::parse(u).ok()) {
+        if let Some(password) = url.password() {
+            crate::secret_redact::register(&server.id, "url_password", password);
+        }
+        for (name, value) in url.query_pairs() {
+            if crate::import_credentials::secret_url_name(&name)
+                || crate::registry::arg_looks_secret(&value)
+            {
+                crate::secret_redact::register(&server.id, &name, &value);
+            }
+        }
+        let mut after_secret_name = false;
+        for segment in url.path_segments().into_iter().flatten() {
+            let decoded = urlencoding::decode(segment)
+                .map(|d| d.into_owned())
+                .unwrap_or_else(|_| segment.to_string());
+            if after_secret_name || crate::registry::arg_looks_secret(&decoded) {
+                crate::secret_redact::register(&server.id, "url_path", &decoded);
+            }
+            after_secret_name = crate::import_credentials::secret_url_name(&decoded);
+        }
+    }
+    for i in server
+        .launch
+        .iter()
+        .flat_map(|l| &l.inputs)
+        .filter(|i| i.secret)
+    {
+        if let Some(value) = &i.value {
+            crate::secret_redact::register(&server.id, &i.key, value);
+        }
+    }
 }
 pub fn has_references(server: &ServerEntry) -> bool {
     server

@@ -9996,6 +9996,10 @@ fn connect_one_result(
     } else {
         server
     };
+    // Every inline or URL-borne secret this server carries is registered before
+    // anything is launched or sent (stdio entries were registered as they
+    // resolved; this also covers the HTTP branch).
+    conduit_lib::secret_refs::register_inline_secrets(server);
     let initialize_timeout = server.initialize_timeout();
     let result = if let Err(error) = &initialize_timeout {
         Err(error.clone())

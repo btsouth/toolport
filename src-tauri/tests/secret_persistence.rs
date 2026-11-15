@@ -76,7 +76,16 @@ fn leaks(dir: &Path) -> Vec<String> {
         };
         // Case-folded: the security scan lowercases the text it quotes.
         let text = String::from_utf8_lossy(&bytes).to_lowercase();
+        // The registry is the user's own config: an inline value lives there by
+        // design, the way they typed it. Every other file is Toolport output.
+        let config = file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("registry.json"));
         for secret in [ENV_SECRET, VAULT_SECRET, INLINE_SECRET] {
+            if config && secret == INLINE_SECRET {
+                continue;
+            }
             for form in forms(secret) {
                 if text.contains(&form.to_lowercase()) {
                     found.push(format!("{} contains {form}", file.display()));

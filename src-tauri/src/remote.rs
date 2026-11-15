@@ -1806,6 +1806,8 @@ fn connect_remote_inner(
         });
     }
     let server = &server_with_headers;
+    // Inline secret values and resolved headers, before anything is sent.
+    crate::secret_refs::register_inline_secrets(server);
     let url = server.url.as_deref().unwrap_or("");
     let server_id = &server.id;
     // Untrusted-provenance servers also get private/loopback refused at the resolver,

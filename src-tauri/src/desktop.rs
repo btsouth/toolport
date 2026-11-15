@@ -345,6 +345,8 @@ fn prewarm_launcher(server: &ServerEntry) {
     }
     let server = server.clone();
     std::thread::spawn(move || {
+        // Same registration as every other launch, before the child starts.
+        crate::secret_refs::register_inline_secrets(&server);
         let Ok(resolved) = crate::launch_inputs::resolve_args_for_prewarm(&server) else {
             return;
         };
