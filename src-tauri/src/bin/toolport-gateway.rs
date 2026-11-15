@@ -10838,8 +10838,7 @@ struct ProgressRoute {
 }
 
 /// Hands a finished progress notification to one client session.
-type ProgressDeliver =
-    Arc<dyn Fn(&str, &Value, Option<&downstream::CancelContext>) + Send + Sync>;
+type ProgressDeliver = Arc<dyn Fn(&str, &Value, Option<&downstream::CancelContext>) + Send + Sync>;
 
 /// A stdio progress message and the request instance it belongs to.
 type StdioProgress = (Value, Option<downstream::CancelContext>);
@@ -11137,9 +11136,11 @@ fn make_progress_sink(
         routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .deliver = Some(Arc::new(move |session: &str, note: &Value, owner: Option<&downstream::CancelContext>| {
-            deliver_progress_to(&stdio, &mcp_sessions, session, note, owner);
-        }));
+            .deliver = Some(Arc::new(
+            move |session: &str, note: &Value, owner: Option<&downstream::CancelContext>| {
+                deliver_progress_to(&stdio, &mcp_sessions, session, note, owner);
+            },
+        ));
     }
     Arc::new(move |producer: String, note: Value| {
         deliver_progress(&stdio, &mcp_sessions, &routes, &producer, &note);
@@ -39236,9 +39237,11 @@ mod tests {
         let (stdio, _stdio_rx) = stdio_session_with_progress();
         {
             let (stdio, sessions) = (Arc::clone(&stdio), state.mcp_sessions.clone());
-            routes.lock().unwrap().deliver = Some(Arc::new(move |session: &str, note: &Value, owner: Option<&downstream::CancelContext>| {
-                deliver_progress_to(&stdio, &sessions, session, note, owner);
-            }));
+            routes.lock().unwrap().deliver = Some(Arc::new(
+                move |session: &str, note: &Value, owner: Option<&downstream::CancelContext>| {
+                    deliver_progress_to(&stdio, &sessions, session, note, owner);
+                },
+            ));
         }
         let request = json!({ "arguments": { "key": "sk-OwnProgress789" } });
         let note = |wire: &str, progress: u64, message: &str| {
@@ -39293,9 +39296,11 @@ mod tests {
         let (stdio, _stdio_rx) = stdio_session_with_progress();
         {
             let (stdio, sessions) = (Arc::clone(&stdio), state.mcp_sessions.clone());
-            routes.lock().unwrap().deliver = Some(Arc::new(move |session: &str, note: &Value, owner: Option<&downstream::CancelContext>| {
-                deliver_progress_to(&stdio, &sessions, session, note, owner);
-            }));
+            routes.lock().unwrap().deliver = Some(Arc::new(
+                move |session: &str, note: &Value, owner: Option<&downstream::CancelContext>| {
+                    deliver_progress_to(&stdio, &sessions, session, note, owner);
+                },
+            ));
         }
         let (registration, wire) = register_progress(
             &routes,
