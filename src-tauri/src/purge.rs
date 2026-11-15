@@ -1080,6 +1080,10 @@ fn bin_file(name: &str) -> bool {
         .is_some_and(|(base, id)| hex_name(id, 32) && gateway_file(base))
 }
 
+pub(crate) fn owned_backup_file(client: &crate::clients::PurgeBackupClient, name: &str) -> bool {
+    generated_file_name(name, |name| backup_file(client, name))
+}
+
 fn backup_file(client: &crate::clients::PurgeBackupClient, name: &str) -> bool {
     name == "moved-servers.json"
         || name
@@ -1201,8 +1205,9 @@ fn owned_data_entry_with_backups(
         ["backups", client] if backup_client(client).is_some() => {
             return Some(DataEntry::Directory)
         }
-        ["backups", client, name] => backup_client(client)
-            .is_some_and(|client| generated_file_name(name, |name| backup_file(&client, name))),
+        ["backups", client, name] => {
+            backup_client(client).is_some_and(|client| owned_backup_file(&client, name))
+        }
         ["exports", name] => generated_file_name(name, export_file),
         ["children" | "daemon-runs", name] => generated_file_name(name, pid_json),
         ["oauth-locks", name] => oauth_file(name),

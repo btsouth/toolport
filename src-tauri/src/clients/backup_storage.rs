@@ -372,6 +372,7 @@ pub(crate) fn protect_existing() -> Result<(), String> {
     let Some(root) = crate::registry::conduit_dir().map(|dir| dir.join("backups")) else {
         return Ok(());
     };
+    let ownership = super::purge_backup_inventory();
     let clients = match std::fs::read_dir(root) {
         Ok(clients) => clients,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -382,9 +383,20 @@ pub(crate) fn protect_existing() -> Result<(), String> {
         if !client.file_type().map_err(|e| e.to_string())?.is_dir() {
             continue;
         }
+        let component = client.file_name();
+        let Some(owner) = component.to_str().and_then(|name| ownership.get(name)) else {
+            continue;
+        };
         for file in std::fs::read_dir(client.path()).map_err(|e| e.to_string())? {
             let file = file.map_err(|e| e.to_string())?;
             if !file.file_type().map_err(|e| e.to_string())?.is_file() {
+                continue;
+            }
+            if !file
+                .file_name()
+                .to_str()
+                .is_some_and(|name| crate::purge::owned_backup_file(owner, name))
+            {
                 continue;
             }
             let path = file.path();
@@ -421,7 +433,16 @@ mod tests {
             clear();
             crate::secrets::set_secret("a", "API_KEY", "rotated-key").unwrap();
             register("a", "TOKEN", "sk-second-fake-value");
+            let note = path.parent().unwrap().join("personal-notes.txt");
+            let binary = path.parent().unwrap().join("personal.bin");
+            std::fs::write(&note, b"sk-original-fake-value sk-second-fake-value").unwrap();
+            std::fs::write(&binary, [0xff, 0xfe]).unwrap();
             protect_existing().unwrap();
+            assert_eq!(
+                std::fs::read(&note).unwrap(),
+                b"sk-original-fake-value sk-second-fake-value"
+            );
+            assert_eq!(std::fs::read(&binary).unwrap(), [0xff, 0xfe]);
             clear();
             let raw = std::fs::read_to_string(&path).unwrap();
             assert!(!raw.contains("sk-original-fake-value"));
