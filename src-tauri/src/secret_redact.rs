@@ -255,9 +255,18 @@ fn fragment_windows(value: &str, t: &Thresholds) -> Vec<String> {
     // the signature is what makes a piece of a token usable, and it differs
     // per token. The whole token is still matched in every form.
     let from = jwt_signature_start(value).map_or(0, |sig| sig.saturating_sub(width - 1));
+    // PEM armor lines are public too: no window touches one.
+    let mut armor = Vec::with_capacity(chars.len());
+    for line in value.split_inclusive('\n') {
+        let public = line.trim().starts_with("-----");
+        armor.extend(line.chars().map(|_| public));
+    }
     chars
         .windows(width)
+        .enumerate()
         .skip(from)
+        .filter(|(i, _)| !armor[*i..*i + width].contains(&true))
+        .map(|(_, window)| window)
         .filter(|window| {
             let lower = window.iter().any(|c| c.is_lowercase());
             let upper = window.iter().any(|c| c.is_uppercase());
@@ -323,8 +332,10 @@ fn text_forms(value: &str) -> Vec<String> {
         push(value.nfkc().collect());
     }
     if value.contains(['\n', '\r']) {
+        // PEM armor ("-----BEGIN ... KEY-----") is public, the same in
+        // every key: never a form of this one.
         for line in value.lines().map(str::trim) {
-            if line.chars().count() >= MIN_SECRET_LINE_CHARS {
+            if line.chars().count() >= MIN_SECRET_LINE_CHARS && !line.starts_with("-----") {
                 push(line.to_string());
             }
         }
@@ -371,22 +382,8 @@ fn variants(value: &str, t: &Thresholds) -> Vec<String> {
         }
     };
     for form in text_forms(value) {
-        push(form.clone(), &mut out);
-        let percent = urlencoding::encode(&form).into_owned();
-        push(percent.to_ascii_lowercase_hex(), &mut out);
-        push(percent, &mut out);
-        push(
-            url::form_urlencoded::byte_serialize(form.as_bytes()).collect(),
-            &mut out,
-        );
-        let hex: String = form.bytes().map(|b| format!("{b:02x}")).collect();
-        push(hex.to_ascii_uppercase(), &mut out);
-        push(hex, &mut out);
-        let once = json_escaped(&form);
-        push(json_escaped(&once), &mut out);
-        push(once, &mut out);
-        for engine in BASE64_ENGINES {
-            push(engine.encode(form.as_bytes()), &mut out);
+        for spelling in encodings(&form) {
+            push(spelling, &mut out);
         }
     }
     for engine in BASE64_ENGINES {
@@ -396,6 +393,37 @@ fn variants(value: &str, t: &Thresholds) -> Vec<String> {
         push(inner, &mut out);
     }
     out
+}
+
+/// `form` and its lossless encodings: percent, form, hex, JSON escapes, base64.
+fn encodings(form: &str) -> Vec<String> {
+    let mut out = vec![form.to_string()];
+    let percent = urlencoding::encode(form).into_owned();
+    out.push(percent.to_ascii_lowercase_hex());
+    out.push(percent);
+    out.push(url::form_urlencoded::byte_serialize(form.as_bytes()).collect());
+    let hex: String = form.bytes().map(|b| format!("{b:02x}")).collect();
+    out.push(hex.to_ascii_uppercase());
+    out.push(hex);
+    let once = json_escaped(form);
+    out.push(json_escaped(&once));
+    out.push(once);
+    for engine in BASE64_ENGINES {
+        out.push(engine.encode(form.as_bytes()));
+    }
+    out
+}
+
+/// Whether `text` spells all of `value`, as written or losslessly encoded
+/// (at any decoding level). A line, a case-folded copy or another partial
+/// form never does: it does not show the client knows the value.
+fn spells_whole(text: &str, value: &str) -> bool {
+    let all = encodings(value);
+    let exact = |s: &str| all.iter().any(|e| e == s);
+    exact(text)
+        || crate::secret_normalize::levels(text)
+            .iter()
+            .any(|l| exact(&l.text))
 }
 
 trait LowerHex {
@@ -1457,8 +1485,9 @@ impl Matcher {
                     j += 1;
                 }
                 for h in &hits[i..j] {
-                    if h.0 == gs && h.1 == ge {
-                        out.insert(self.value(h.4).to_string());
+                    let value = self.value(h.4);
+                    if h.0 == gs && h.1 == ge && spells_whole(&joined[gs..ge], value) {
+                        out.insert(value.to_string());
                     }
                 }
                 i = j;
@@ -5356,6 +5385,34 @@ mod tests {
             response["text"],
             "a sk-AlphaSecret123 b [secret:API_KEY] c [secret:LONGER,API_KEY] d [secret:INNER] e wrap-InnerValue-889-end"
         );
+    }
+
+    #[test]
+    fn a_line_or_case_folded_copy_of_a_secret_exempts_nothing() {
+        use serde_json::json;
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-exempt-line-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        let key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAx1y2z3PrivateBody\n-----END RSA PRIVATE KEY-----";
+        register("srv-pem", "KEY", key);
+        register("srv-case", "MIXED", "Mixed-Case-Secret-91");
+        for q in ["-----BEGIN RSA PRIVATE KEY-----", "mixed-case-secret-91"] {
+            let request = json!({"arguments": {"q": q}});
+            let mut response = json!({"text": format!("{key} and Mixed-Case-Secret-91")});
+            redact_outgoing(&mut response, Some(&request));
+            let text = response["text"].as_str().unwrap();
+            assert!(!text.contains("PrivateBody"), "{q}: {text}");
+            assert!(!text.contains("Mixed-Case-Secret-91"), "{q}: {text}");
+            let mut s = Stream::whole_for(exempt_values(Some(&request)));
+            let out = s.push(&format!("{key} Mixed-Case-Secret-91")) + &s.finish();
+            assert!(!out.contains("PrivateBody"), "{q}: {out}");
+            assert!(!out.contains("Mixed-Case-Secret-91"), "{q}: {out}");
+        }
+        // The armor lines are public: other text that has them is kept.
+        let m = m(&[("KEY", key)]);
+        let other = "-----BEGIN RSA PRIVATE KEY-----\nunrelated\n-----END RSA PRIVATE KEY-----";
+        assert_eq!(m.redact_text(other), other);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
