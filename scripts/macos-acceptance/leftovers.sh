@@ -26,7 +26,7 @@ PATTERN='toolport|conduit|com\.tsout'
   ls -d /Applications/Toolport.app "$HOME/Applications/Toolport.app" 2>/dev/null || echo "(none)"
   echo
   echo "## Files and folders under ~ (excluding the runner's work folders and the test server)"
-  find "$HOME" \( -path "$HOME/work" -o -path "$HOME/hostedtoolcache" -o -path "$HOME/Library/Keychains" \
+  tmo 300 find "$HOME" \( -path "$HOME/work" -o -path "$HOME/hostedtoolcache" -o -path "$HOME/Library/Keychains" \
     -o -path "$HOME/mcp-servers" -o -path "$HOME/.Trash" -o -path "$HOME/Library/Caches/Homebrew" \) -prune -o \
     \( -iname '*toolport*' -o -iname '*conduit*' -o -iname '*com.tsout*' \) -print 2>/dev/null | sort || true
   echo
@@ -37,17 +37,17 @@ PATTERN='toolport|conduit|com\.tsout'
   echo
   echo "## LaunchAgents"
   ls -la "$HOME/Library/LaunchAgents" 2>/dev/null | grep -iE "$PATTERN" || echo "(none in ~/Library/LaunchAgents)"
-  launchctl list 2>/dev/null | grep -iE "$PATTERN" || echo "(none loaded)"
+  tmo 20 launchctl list 2>/dev/null | grep -iE "$PATTERN" || echo "(none loaded)"
   echo
   echo "## Login items (System Events)"
-  tmo 20 osascript -e 'tell application "System Events" to get the name of every login item' 2>&1 || true
-  sfltool dumpbtm 2>/dev/null | grep -iE -B3 -A6 "$PATTERN" || echo "(no background task entries mention Toolport)"
+  tmo 20 osascript -e 'tell application "System Events" to get the name of every login item' </dev/null 2>&1 || true
+  # sfltool dumpbtm asks for an administrator password, so it is not used.
   echo
   echo "## defaults domains"
-  defaults domains 2>/dev/null | tr ',' '\n' | sed 's/^ //' | grep -iE "$PATTERN" || echo "(none)"
+  tmo 30 defaults domains 2>/dev/null | tr ',' '\n' | sed 's/^ //' | grep -iE "$PATTERN" || echo "(none)"
   echo
   echo "## Login keychain items (attributes only)"
-  security dump-keychain "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null |
+  tmo 30 security dump-keychain "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null |
     awk '/^keychain:/{if (blk ~ /conduit|toolport|tsout/) print blk; blk=$0; next} {blk=blk "\n" $0} END {if (blk ~ /conduit|toolport|tsout/) print blk}' ||
     true
 } >"$OUT" 2>&1

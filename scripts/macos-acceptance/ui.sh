@@ -5,7 +5,7 @@
 
 EXE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Contents/Info.plist" 2>/dev/null || echo conduit)"
 EXE_PATH="$APP_PATH/Contents/MacOS/$EXE"
-app_pid() { pids_of "$EXE_PATH" | head -n 1; }
+app_pid() { pids_of "/Contents/MacOS/$EXE" | head -n 1; }
 UI_FAILS=0
 
 _slug() { printf '%s' "$*" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-60; }

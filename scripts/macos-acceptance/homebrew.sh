@@ -51,8 +51,9 @@ uninstall)
   # Docs: disconnect clients first (the CLI is the documented route for brew users).
   tmo 120 "$GATEWAY" --disconnect-all >"$EVIDENCE/logs/brew-disconnect-all.json" 2>&1
   info "--disconnect-all before brew uninstall" "exit $?"
-  pid="$(pids_of "$APP_PATH/Contents/MacOS/" | head -1)"
-  [[ -n "$pid" ]] && { tmo 20 osascript -e 'tell application id "com.tsout.conduit" to quit' >/dev/null 2>&1; sleep 5; }
+  # shellcheck source=ui.sh
+  source "$HERE/ui.sh"
+  quit_app || info "app quit" "had to be killed"
   had_registry=0
   [[ -f "$DATA_DIR/registry.json" ]] && had_registry=1
   find "$DATA_DIR" -maxdepth 2 -print >"$EVIDENCE/logs/data-dir-before-zap.txt" 2>/dev/null || true

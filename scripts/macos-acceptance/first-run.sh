@@ -13,7 +13,9 @@ source "$(dirname "$0")/common.sh"
 
 EXE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Contents/Info.plist")"
 EXE_PATH="$APP_PATH/Contents/MacOS/$EXE"
-app_pid() { pids_of "$EXE_PATH" | head -n 1; }
+# Match any path: a quarantined app copied without Finder runs from a random
+# App Translocation folder, which is itself worth reporting.
+app_pid() { pids_of "/Contents/MacOS/$EXE" | head -n 1; }
 crash_list() { ls -1 "$HOME/Library/Logs/DiagnosticReports" 2>/dev/null | grep -iE 'toolport|conduit' || true; }
 windows_json() { TPUI_TIMEOUT=15 tpui windows; }
 
@@ -32,14 +34,16 @@ tmo 120 open "$APP_PATH" >"$EVIDENCE/logs/open-$LABEL.log" 2>&1 &
 gk_pid=""
 if [[ -n "$quarantine" ]]; then
   log "Looking for the Gatekeeper prompt"
-  for _ in $(seq 1 20); do
-    [[ -n "$(app_pid)" ]] && break
+  # The app's process can exist while the prompt holds it, so look for the
+  # prompt itself until the app shows a window.
+  for _ in $(seq 1 25); do
     gk_pid="$(windows_json | python3 -c '
 import json, sys
 for w in json.load(sys.stdin):
     if w["owner"] in ("CoreServicesUIAgent", "UserNotificationCenter") and w["layer"] >= 0 and w["w"] > 100:
         print(w["pid"]); break' 2>/dev/null)"
     [[ -n "$gk_pid" ]] && break
+    [[ -n "$(app_pid)" ]] && TPUI_TIMEOUT=15 tpui windows | grep -q '"owner" : "Toolport"' && break
     sleep 1
   done
   if [[ -n "$gk_pid" ]]; then
@@ -65,6 +69,12 @@ else
 fi
 PID="$(app_pid)"
 echo "$PID" >"$EVIDENCE/app.pid"
+running_from="$(ps -o command= -p "$PID" | cut -c1-300)"
+if [[ "$running_from" == "$EXE_PATH"* ]]; then
+  pass "app runs from $APP_PATH" "$running_from"
+else
+  fail "app runs from $APP_PATH" "running from $running_from (App Translocation means Gatekeeper still treats it as unmoved; client configs would get this temporary path)"
+fi
 
 # The window is created hidden and shown once the UI loads.
 has_window() {

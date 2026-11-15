@@ -70,11 +70,19 @@ else
 fi
 
 if [[ $INSTALL -eq 1 ]]; then
-  rm -rf "/Applications/Toolport.app"
-  if ditto "$MNT/Toolport.app" "/Applications/Toolport.app"; then
-    pass "copied to /Applications"
+  # Drag to Applications: Finder does the copy, as for a user. A Finder copy
+  # also marks the app as moved by the user, which keeps Gatekeeper from
+  # running it from a random App Translocation folder.
+  if [[ -d /Applications/Toolport.app ]]; then
+    tmo 60 osascript -e 'tell application "Finder" to delete (POSIX file "/Applications/Toolport.app" as alias)' \
+      >"$EVIDENCE/logs/finder-replace-$ASSET.log" 2>&1 || rm -rf /Applications/Toolport.app
+  fi
+  if tmo 180 osascript -e "tell application \"Finder\" to duplicate (POSIX file \"$MNT/Toolport.app\" as alias) to (POSIX file \"/Applications\" as alias) with replacing" \
+    >"$EVIDENCE/logs/finder-copy-$ASSET.log" 2>&1 && [[ -d /Applications/Toolport.app ]]; then
+    pass "dragged to /Applications (Finder copy)"
   else
-    fail "copied to /Applications"
+    fail "dragged to /Applications (Finder copy)" "$(tr '\n' ' ' <"$EVIDENCE/logs/finder-copy-$ASSET.log" | cut -c1-200)"
+    ditto "$MNT/Toolport.app" /Applications/Toolport.app
   fi
   q="$(xattr -p com.apple.quarantine /Applications/Toolport.app 2>/dev/null || true)"
   if [[ -n "$q" ]]; then
