@@ -17,7 +17,7 @@
 //! * Codex strips the environment it gives MCP servers (it keeps an allow-list such as
 //!   `HOME` and `PATH`), so a Codex gateway has neither. T3 Code starts `codex app-server`
 //!   itself, so the gateway's parent is `codex` and its grandparent is T3 Code's own
-//!   process. That says "via T3 Code" but not which thread: one app-server serves many
+//!   process (or npm's Node launcher, then T3 Code). That says "via T3 Code" but not which thread: one app-server serves many
 //!   threads, T3 Code puts the thread id only in Codex's shell environment, and the
 //!   `threadId` Codex sends in tool call `_meta` is Codex's own id, not T3 Code's.
 //! * Nothing else is attributed: a thread id without T3 Code among the ancestors is not.
@@ -127,17 +127,22 @@ pub fn detect_with(
             });
         }
     }
-    match names.as_slice() {
-        [parent, grandparent, ..]
-            if stem(parent) == "codex" && is_t3_code_process_on(grandparent, os) =>
-        {
-            Some(Host {
-                host: T3_CODE.into(),
-                thread: None,
-            })
+    // T3 Code starts Codex directly, or through npm's Node launcher, which starts the
+    // native binary.
+    let codex_under_t3 = match names.as_slice() {
+        [parent, grandparent, rest @ ..] if stem(parent) == "codex" => {
+            is_t3_code_process_on(grandparent, os)
+                || (matches!(stem(grandparent).as_str(), "codex" | "codex.js" | "node")
+                    && rest
+                        .first()
+                        .is_some_and(|name| is_t3_code_process_on(name, os)))
         }
-        _ => None,
-    }
+        _ => false,
+    };
+    codex_under_t3.then(|| Host {
+        host: T3_CODE.into(),
+        thread: None,
+    })
 }
 
 /// Whether T3 Code has a data folder on this machine: `T3CODE_HOME` is set, or
@@ -234,8 +239,8 @@ mod tests {
 
     #[test]
     fn a_thread_id_alone_is_not_t3_code() {
-        // A Claude Code run from a T3 Code terminal inherits the thread id but was started
-        // by the user's shell, so it is not attributed.
+        // A thread id with no T3 Code process among the ancestors (a copied or exported
+        // variable) is not attributed.
         assert_eq!(
             detect_with(
                 env(&[
@@ -247,6 +252,30 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn codex_installed_with_npm_is_attributed_through_its_launcher() {
+        // npm's `codex` is a Node launcher that starts the native binary.
+        for launcher in ["codex.js", "node", "codex"] {
+            assert!(
+                detect_with(
+                    env(&[]),
+                    || true,
+                    || vec!["codex".into(), launcher.into(), "t3code".into()]
+                )
+                .is_some(),
+                "{launcher}"
+            );
+        }
+        // Any other process between Codex and T3 Code says nothing.
+        assert!(detect_with(
+            env(&[]),
+            || true,
+            || vec!["codex".into(), "bash".into(), "t3code".into()]
+        )
+        .is_none());
     }
 
     #[test]

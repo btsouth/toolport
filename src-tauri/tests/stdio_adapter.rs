@@ -631,6 +631,12 @@ fn start_footprint(
             } else {
                 "file"
             };
+            // The Activity log is written in the background as calls end, so whether it
+            // exists yet is timing, not start-up work. Host attribution only adds fields
+            // to its rows.
+            if relative.starts_with("audit.jsonl") {
+                continue;
+            }
             paths.insert(format!("{tag} {}", fold(&relative)));
         }
     }
@@ -645,17 +651,34 @@ fn start_footprint(
 
 #[cfg(target_os = "linux")]
 #[test]
-fn a_client_id_adds_no_files_sockets_or_threads_at_start() {
-    // A session's gateway must start the same way whichever client it serves: no
-    // claim folder, socket or watcher thread of its own.
+fn host_detection_adds_no_files_sockets_or_threads_at_start() {
+    // Telling that T3 Code hosts the client only reads the environment and, with T3 Code
+    // installed, the parent processes: the adapter starts the same way for every client.
     let (plain_paths, plain_threads) = start_footprint(&[]);
-    for client in ["claude-code", "codex", "cursor", "zed", "claude-desktop"] {
-        let (paths, threads) = start_footprint(&[("TOOLPORT_CLIENT_ID", client)]);
-        assert!(
-            !paths.iter().any(|path| path.contains("sessions")),
-            "{client}: {paths:?}"
-        );
-        assert_eq!(paths, plain_paths, "{client}: data dir differs");
-        assert_eq!(threads, plain_threads, "{client}: threads differ");
+    let cases: &[&[(&str, &str)]] = &[
+        &[("TOOLPORT_CLIENT_ID", "claude-code")],
+        &[("TOOLPORT_CLIENT_ID", "codex")],
+        &[("TOOLPORT_CLIENT_ID", "cursor")],
+        // Claude Code started by T3 Code.
+        &[
+            ("TOOLPORT_CLIENT_ID", "claude-code"),
+            ("CLAUDE_CODE_ENTRYPOINT", "t3-code"),
+            ("T3CODE_THREAD_ID", "465774fd"),
+        ],
+        // T3 Code installed: the ancestor walk runs.
+        &[
+            ("TOOLPORT_CLIENT_ID", "codex"),
+            ("TOOLPORT_TEST_T3_INSTALLED", "1"),
+        ],
+        &[
+            ("TOOLPORT_CLIENT_ID", "pi"),
+            ("TOOLPORT_TEST_T3_INSTALLED", "1"),
+            ("T3CODE_THREAD_ID", "465774fd"),
+        ],
+    ];
+    for env in cases {
+        let (paths, threads) = start_footprint(env);
+        assert_eq!(paths, plain_paths, "{env:?}: data dir differs");
+        assert_eq!(threads, plain_threads, "{env:?}: threads differ");
     }
 }

@@ -945,7 +945,7 @@ pub fn approval_requester(view: &PendingView) -> String {
                 "{client} via T3 Code, thread {thread}",
                 &[
                     ("client", &client),
-                    ("thread", &thread.chars().take(8).collect::<String>()),
+                    ("thread", &crate::host_attribution::short_thread(&thread)),
                 ],
             ),
             None => crate::i18n::trf("{client} via T3 Code", &[("client", &client)]),
@@ -1179,6 +1179,12 @@ mod tests {
         assert_eq!(
             localized_approval_notification(&hosted).1,
             "github / delete_issue needs approval. Requested by Claude Code via T3 Code, thread 465774fd."
+        );
+        // T3 Code's ids start with `thread:`; the notification shows the id, as the chip does.
+        hosted.host_thread = Some("thread:465774fd-c52e".into());
+        assert_eq!(
+            approval_requester(&hosted),
+            "Claude Code via T3 Code, thread 465774fd"
         );
         // A thread id that fails validation is never shown.
         hosted.host_thread = Some("bad thread\u{202e}".into());

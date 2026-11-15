@@ -1513,36 +1513,3 @@ it("names calls made through T3 Code and shows their thread", async () => {
   expect(screen.getByText("Claude Code · 2m ago · 120 ms")).toBeVisible();
   expect(screen.queryByText(/Zed via/)).not.toBeInTheDocument();
 });
-
-it("names live-inspected calls made through T3 Code", async () => {
-  getInspectLog.mockResolvedValue([
-    {
-      ts: 1700000000000,
-      clientName: "Codex",
-      server: "github",
-      tool: "create_issue",
-      request: {},
-      response: {},
-      ok: true,
-      host: "t3-code",
-      hostThread: "thread:abcdef0123456789",
-    },
-    {
-      ts: 1700000000000,
-      clientName: "Zed",
-      server: "github",
-      tool: "list_issues",
-      request: {},
-      response: {},
-      ok: true,
-    },
-  ]);
-  render(<ActivityView refreshKey={0} registry={{ liveInspect: true } as never} />);
-  expect(await screen.findByText("Codex via T3 Code")).toBeVisible();
-  expect(screen.getByText("Thread abcdef01")).toHaveAttribute(
-    "title",
-    "T3 Code thread thread:abcdef0123456789",
-  );
-  expect(screen.getByText("Zed")).toBeVisible();
-  expect(screen.getAllByText(/^Thread /)).toHaveLength(1);
-});

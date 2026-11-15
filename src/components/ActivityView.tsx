@@ -1140,10 +1140,9 @@ function InspectRow({ e }: { e: InspectEntry }) {
                 : tr("Client that made this call")
             }
           >
-            {hostedClientName(e.clientName ?? e.client ?? "", e)}
+            {e.clientName ?? e.client}
           </span>
         )}
-        <HostThreadChip row={e} />
         <span className="ml-auto shrink-0 text-xs tabular-nums text-muted-foreground">
           {fmtMs(e.durationMs ?? null)}
         </span>

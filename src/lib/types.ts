@@ -177,7 +177,7 @@ export interface AuditEntry extends HostAttribution {
 /** One live-inspection capture: a tool call's request args and response, plus timing.
  * Only present while live inspection is on. `request`/`response` are the raw captured
  * bodies (or a "<truncated N bytes>" marker string when the body exceeded the size cap). */
-export interface InspectEntry extends HostAttribution {
+export interface InspectEntry {
   ts: number;
   client?: string;
   clientName?: string;
