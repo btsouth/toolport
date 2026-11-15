@@ -3266,7 +3266,10 @@ mod tests {
             "select the settings copy, not the original recovery snapshot"
         );
         let backup = &backups[0];
-        assert_eq!(std::fs::read_to_string(backup).unwrap(), original);
+        assert_eq!(
+            crate::clients::read_client_backup(backup, &config).unwrap(),
+            original
+        );
         assert!(
             owned_data_entry(backup.strip_prefix(&env.dir).unwrap()).is_some(),
             "{}",

@@ -617,6 +617,50 @@ pub(super) fn read(path: &Path) -> Result<String, std::io::Error> {
     let text = std::fs::read_to_string(path)?;
     decode(&text).map_err(std::io::Error::other)
 }
+
+/// Rollback may publish only the exact pre-operation bytes, never a recovery
+/// template with missing-value markers. Keep the current config if the saved
+/// payload cannot be authenticated and recovered in full.
+pub(super) fn read_exact(path: &Path, source: &Path) -> Result<String, String> {
+    let invalid = || {
+        crate::i18n::tr("This recovery file does not match its original config path. Toolport will not write or discard it.")
+    };
+    let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_file() || crate::purge::is_link(&meta) {
+        return Err(invalid());
+    }
+    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    if source_path_in(path, &raw)?.is_some_and(|saved| Path::new(&saved) != source) {
+        return Err(invalid());
+    }
+    let Some(saved) = envelope(&raw) else {
+        if serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .is_some_and(|v| v.get("toolportBackupVersion").is_some())
+        {
+            return Err(crate::i18n::tr("This recovery file uses an unsupported version. Open it with a compatible Toolport version."));
+        }
+        return decode(&raw);
+    };
+    crate::secrets::with_backup_batch(|| {
+        use crate::secrets::BackupSecretError;
+        let result = crate::secrets::backup_secret_status(&saved.account, &saved.key);
+        if let Ok(Some(payload)) = &result {
+            if crate::registry::sha256_hex(payload) == saved.hash {
+                return Ok(payload.clone());
+            }
+        }
+        if let Some(payload) = verified_copy_payload(&saved) {
+            return Ok(payload);
+        }
+        let state = match result {
+            Ok(None) => BackupSecretError::Missing,
+            Ok(Some(_)) => BackupSecretError::Corrupt,
+            Err(state) => state,
+        };
+        Err(recovery::next_step(state, false))
+    })
+}
 pub(super) fn missing() -> bool {
     MISSING.with(|v| *v.borrow())
 }
@@ -1011,6 +1055,79 @@ pub(crate) fn protect_existing() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rollback_reads_exact_plain_and_vaulted_bytes_but_never_missing_templates() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            clear();
+            reset_missing();
+            let dir = crate::registry::conduit_dir()
+                .unwrap()
+                .join("backups/cursor");
+            std::fs::create_dir_all(&dir).unwrap();
+            let source = dir
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("native/mcp.json");
+            let plain = dir.join("1-mcp.json");
+            let bytes = "{ \"mcpServers\": {} }\r\n";
+            std::fs::write(
+                &plain,
+                encode_backup(&plain, bytes, false, &source).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                super::super::read_client_backup(&plain, &source).unwrap(),
+                bytes
+            );
+            assert!(
+                super::super::read_client_backup(&plain, &source.with_file_name("other.json"))
+                    .is_err()
+            );
+            #[cfg(unix)]
+            {
+                let link = dir.join("link-mcp.json");
+                std::os::unix::fs::symlink(&plain, &link).unwrap();
+                assert!(super::super::read_client_backup(&link, &source).is_err());
+            }
+            let secret = "sk-exact-rollback-fixture";
+            let bytes = format!("{{\n  \"mcpServers\": {{\"native\": {{\"command\": \"echo\", \"env\": {{\"API_KEY\": \"{secret}\"}}}}}},\n  \"originalHash\": \"a native setting, not receipt metadata\"\n}}\r\n");
+            register("native", "API_KEY", secret);
+            let protected = dir.join("2-mcp.json");
+            let encoded = encode_backup(&protected, &bytes, false, &source).unwrap();
+            std::fs::write(&protected, &encoded).unwrap();
+            clear();
+            assert_eq!(
+                super::super::read_client_backup(&protected, &source).unwrap(),
+                bytes
+            );
+            let unlock = std::env::var("TOOLPORT_SECRET_KEY").unwrap();
+            std::env::set_var("TOOLPORT_SECRET_KEY", "locked-exact-rollback");
+            let error = super::super::read_client_backup(&protected, &source).unwrap_err();
+            assert!(!error.contains(secret));
+            assert!(!error.contains("TOOLPORT_MISSING_CREDENTIAL_"));
+            assert!(read(&protected)
+                .unwrap()
+                .contains("TOOLPORT_MISSING_CREDENTIAL_"));
+            assert_eq!(std::fs::read_to_string(&protected).unwrap(), encoded);
+            std::env::set_var("TOOLPORT_SECRET_KEY", unlock);
+            reset_missing();
+            let (account, key, _) = test_recovery_key(&protected);
+            crate::secrets::delete_backup_secret(&account, &key).unwrap();
+            assert_eq!(
+                super::super::read_client_backup(&protected, &source).unwrap(),
+                bytes,
+                "independent copies must reconstruct the exact payload"
+            );
+            crate::secrets::delete_backup_secret(&account, &format!("{key}-credential-0")).unwrap();
+            assert!(super::super::read_client_backup(&protected, &source).is_err());
+            assert_eq!(std::fs::read_to_string(&protected).unwrap(), encoded);
+            clear();
+            reset_missing();
+        });
+    }
+
     #[test]
     fn future_or_malformed_plain_wrappers_are_refused_and_never_rewritten() {
         crate::secrets::tests::with_isolated_vault(|| {
@@ -1757,13 +1874,16 @@ pub(super) fn test_recovery_key(path: &Path) -> (String, String, usize) {
 
 pub(super) fn source_path(path: &Path) -> Result<Option<String>, String> {
     let raw = std::fs::read_to_string(path).map_err(|_| "Could not inspect saved recovery copy")?;
-    if let Some(plain) = plain_backup(&raw)? {
+    source_path_in(path, &raw)
+}
+fn source_path_in(path: &Path, raw: &str) -> Result<Option<String>, String> {
+    if let Some(plain) = plain_backup(raw)? {
         if plain.binding != plain_binding(path, &plain.source_config_path, &plain.text) {
             return Err("Saved recovery copy has conflicting path provenance".into());
         }
         return Ok(Some(plain.source_config_path));
     }
-    let Some(saved) = envelope(&raw) else {
+    let Some(saved) = envelope(raw) else {
         return Ok(None);
     };
     if let Some(source) = saved.source_config_path {

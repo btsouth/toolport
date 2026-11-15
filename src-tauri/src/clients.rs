@@ -5657,6 +5657,11 @@ fn epoch_millis() -> u128 {
 /// check, so this only guards against an abnormally huge regular file.
 pub(crate) const MAX_CONFIG_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Read authenticated, byte-exact rollback data bound to this client config.
+pub(crate) fn read_client_backup(path: &Path, source: &Path) -> Result<String, String> {
+    backup_storage::read_exact(path, source)
+}
+
 /// Read a client config to a string, refusing anything that isn't a regular file
 /// (after following symlinks, so a benign symlinked dotfile still works but a
 /// link to a device/FIFO/directory does not) and capping the size. Returns the

@@ -315,9 +315,8 @@ impl ClientConfigReceipt {
         let original = self
             .backup
             .as_ref()
-            .map(std::fs::read_to_string)
-            .transpose()
-            .map_err(|e| e.to_string())?;
+            .map(|path| clients::read_client_backup(path, &self.target))
+            .transpose()?;
         registry::client_file::commit(&self.target, &revision, original.as_deref())?;
         if let Some(file) = &self.recovery_path {
             clients::record_config_rollback(file, &self.target, original.as_deref())?;
@@ -6220,6 +6219,73 @@ API_KEY = "synthetic-first-origin"
         disconnect_client("claude-code").unwrap();
         assert_eq!(json_file(&fixture.claude())["mcpServers"], servers);
         assert!(!fixture.move_record("claude-code").exists());
+    }
+
+    /// Rollback reads the backup through its wrapper. A vaulted backup restores
+    /// the exact native bytes, a locked vault refuses without touching the config,
+    /// and a raw backup written by an older version still restores byte for byte.
+    #[test]
+    fn rollback_decodes_vaulted_and_legacy_backups_into_exact_native_bytes() {
+        let fixture = MoveFixture::new(&Registry::default());
+        let target = fixture.claude();
+        let secret = "sk-rollback-wrapper-fixture";
+        let original = format!(
+            "{{\n  \"mcpServers\": {{\"native\": {{\"command\": \"echo\", \"env\": {{\"API_KEY\": \"{secret}\"}}}}}},\n  \"numStartups\": 3\n}}\r\n"
+        );
+        let connected = "{\"mcpServers\":{\"toolport\":{\"command\":\"toolport-gateway\"}}}";
+        let outcome = |backup: &std::path::Path| WriteOutcome {
+            path: target.display().to_string(),
+            backup: Some(backup.display().to_string()),
+            managed: None,
+            restored: Vec::new(),
+            used_move_record: false,
+            revision: None,
+            warnings: Vec::new(),
+            recovery_path: None,
+        };
+
+        std::fs::write(&target, &original).unwrap();
+        clients::backup_storage::register("native", "API_KEY", secret);
+        let backup = clients::backup_config("claude-code", &target)
+            .unwrap()
+            .unwrap();
+        clients::backup_storage::clear();
+        let stored = std::fs::read_to_string(&backup).unwrap();
+        assert!(stored.contains("toolportBackupVersion"), "{stored}");
+        assert!(
+            !stored.contains(secret),
+            "the backup itself holds no plaintext"
+        );
+
+        std::fs::write(&target, connected).unwrap();
+        let error =
+            finish_client_config_mutation(outcome(&backup), |_| Err("registry full".into()))
+                .unwrap_err();
+        assert!(error.contains("rolled back"), "{error}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+
+        // Locked vault: the native config keeps Toolport's write, never the
+        // wrapper or a template with missing-value markers.
+        std::fs::write(&target, connected).unwrap();
+        let unlock = std::env::var("TOOLPORT_SECRET_KEY").unwrap();
+        std::env::set_var("TOOLPORT_SECRET_KEY", "locked-rollback-fixture");
+        let error =
+            finish_client_config_mutation(outcome(&backup), |_| Err("registry full".into()))
+                .unwrap_err();
+        std::env::set_var("TOOLPORT_SECRET_KEY", &unlock);
+        assert!(error.contains("rollback"), "{error}");
+        assert!(!error.contains(secret), "{error}");
+        assert!(!error.contains("TOOLPORT_MISSING_CREDENTIAL_"), "{error}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), connected);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), stored);
+
+        // A raw backup left by an older Toolport in the same folder.
+        let legacy = backup.with_file_name("1700000000000-.claude.json");
+        std::fs::write(&legacy, &original).unwrap();
+        std::fs::write(&target, connected).unwrap();
+        finish_client_config_mutation(outcome(&legacy), |_| Err("registry full".into()))
+            .unwrap_err();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
     }
 
     #[test]
