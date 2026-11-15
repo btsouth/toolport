@@ -144,14 +144,6 @@ pub(super) fn write(path: &Path, contents: &str) -> Result<(), String> {
     }
 }
 
-pub(super) fn is_disconnecting() -> bool {
-    PENDING.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .is_some_and(|pending| pending.disconnecting)
-    })
-}
-
 pub(super) fn disconnecting() {
     PENDING.with(|slot| {
         if let Some(pending) = slot.borrow_mut().as_mut() {
@@ -362,7 +354,7 @@ fn run_inner<T>(
                 auxiliary_recovery.push(super::restore::checkpoint(&auxiliary)?);
                 crate::registry::atomic_write(
                     &auxiliary,
-                    &backup_storage::encode(&auxiliary, &text)?,
+                    &backup_storage::encode_recovery(&auxiliary, &text, pending.disconnecting)?,
                 )?;
             }
             let recovery = super::restore::remember(

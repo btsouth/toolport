@@ -198,8 +198,16 @@ fn redact(text: &str, secret: &str, marker: &str, depth: usize) -> String {
 }
 
 pub(super) fn encode(path: &Path, text: &str) -> Result<String, String> {
+    encode_recovery(path, text, false)
+}
+
+pub(super) fn encode_recovery(
+    path: &Path,
+    text: &str,
+    disconnecting: bool,
+) -> Result<String, String> {
     let mut values = IMPORTS.with(|v| v.borrow().clone());
-    if !missing() || !mutation::is_disconnecting() {
+    if !missing() || !disconnecting {
         values.extend(vaulted_credentials(text)?);
     }
     let mut generations = Vec::new();

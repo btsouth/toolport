@@ -284,9 +284,10 @@ pub(super) fn remember(
     secure_backup_dir(file.parent().ok_or("Could not resolve snapshot parent")?)?;
     crate::registry::atomic_write(
         &file,
-        &backup_storage::encode(
+        &backup_storage::encode_recovery(
             &file,
             &serde_json::to_string(&record).map_err(|e| e.to_string())?,
+            disconnecting,
         )?,
     )?;
     Ok(Receipt {
@@ -1214,6 +1215,8 @@ mod tests {
                 let original = "{\r\n  \"mcpServers\" : {\"native\":{\"command\":\"echo\",\"env\":{\"API_KEY\":\"sk-fake-hc-install-secret\"}}}, \"theme\": \"dark\"\r\n}\r\n";
                 std::fs::write(&path, original).unwrap();
                 crate::secrets::set_secret(id, "API_KEY", "sk-fake-hc-install-secret").unwrap();
+                let registry = serde_json::from_value(serde_json::json!({"version":3,"profiles":[],"servers":[{"id":id,"name":"Native","transport":"stdio","env":[{"key":"API_KEY","secret":true}]}]})).unwrap();
+                crate::registry::save(&registry).unwrap();
                 backup_storage::register(id, "API_KEY", "sk-fake-hc-install-secret");
                 mutation::run(id, &path, Format::JsonMcpServers, || {
                     backup_file(id, &path)?;
