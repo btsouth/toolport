@@ -209,6 +209,23 @@ case "press", "focus":
         print("focused \(shown)")
     }
 
+case "value", "setvalue":
+    // value <pid> <field> [n]: print the n-th matching text field's value.
+    // setvalue <pid> <field> <text> [n]: set it through accessibility.
+    guard args.count >= 4 else { die("usage: tpui value <pid> <field> [n] | setvalue <pid> <field> <text> [n]") }
+    let set = args[1] == "setvalue"
+    if set && args.count < 5 { die("usage: tpui setvalue <pid> <field> <text> [n]") }
+    let nArg = set ? (args.count >= 6 ? args[5] : "1") : (args.count >= 5 ? args[4] : "1")
+    let n = max(1, Int(nArg) ?? 1)
+    let fields = matches(args[2], args[3], roles: ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"])
+    guard fields.count >= n else { die("no text field matching \"\(args[3])\"", 2) }
+    let el = fields[n - 1]
+    if set {
+        let err = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, args[4] as CFString)
+        if err != .success { die("AXValue set failed (\(err.rawValue))", 1) }
+    }
+    print(str(el, kAXValueAttribute))
+
 case "keys":
     guard args.count >= 3 else { die("usage: tpui keys <text>") }
     let src = CGEventSource(stateID: .hidSystemState)
@@ -233,6 +250,24 @@ case "click":
         CGEvent(mouseEventSource: nil, mouseType: t, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
         usleep(50_000)
     }
+
+case "drag":
+    // drag <x1> <y1> <x2> <y2>: press at p1, move in steps, release at p2.
+    guard args.count >= 6, let x1 = Double(args[2]), let y1 = Double(args[3]),
+          let x2 = Double(args[4]), let y2 = Double(args[5]) else { die("usage: tpui drag <x1> <y1> <x2> <y2>") }
+    let a = CGPoint(x: x1, y: y1), b = CGPoint(x: x2, y: y2)
+    CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: a, mouseButton: .left)?.post(tap: .cghidEventTap)
+    usleep(200_000)
+    CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: a, mouseButton: .left)?.post(tap: .cghidEventTap)
+    usleep(300_000)
+    for i in 1...40 {
+        let t = Double(i) / 40
+        let p = CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t)
+        CGEvent(mouseEventSource: nil, mouseType: .leftMouseDragged, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
+        usleep(25_000)
+    }
+    usleep(400_000)
+    CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: b, mouseButton: .left)?.post(tap: .cghidEventTap)
 
 case "menubar":
     guard args.count >= 3 else { die("usage: tpui menubar <pid>") }

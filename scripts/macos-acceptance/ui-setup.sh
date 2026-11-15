@@ -87,15 +87,20 @@ if ui_press "Servers" && ui_press "Add server" && ui_wait "Add MCP server" 15; t
     ui_fill "-y @scope/package" "$MOCK" &&
     ui_press "Add variable" &&
     ui_fill "ENV_NAME" "MOCK_API_TOKEN" &&
-    ui_fill "value" "$SECRET" &&
+    ui_fill "value" "$SECRET" secure &&
     added=1
   shot "$LABEL-add-server-filled" >/dev/null
-  if [[ $added -eq 1 ]] && ui_press "Add"; then
-    sleep 4
+  if [[ $added -eq 1 ]] && ui_press "Add" && ui_gone "Add MCP server" 30; then
+    sleep 2
     shot "$LABEL-add-server-done" >/dev/null
   else
     added=0
+    shot "$LABEL-add-server-not-closed" >/dev/null
+    tpui key 53 >/dev/null 2>&1 # Escape so later steps see the main window
   fi
+fi
+if [[ -s "$EVIDENCE/logs/ui-input-methods.txt" ]]; then
+  info "text input method that reached the web view" "$(cut -f2 "$EVIDENCE/logs/ui-input-methods.txt" | sort | uniq -c | tr -s ' \n' ' ')"
 fi
 if [[ $added -eq 1 ]]; then
   pass "server form filled and submitted through the UI"
@@ -220,6 +225,12 @@ for entry in "$ENTRIES"/*.json; do
     fail "tool call through the $cid entry gets the keychain token" "exit $rc: ${result:-$(tail -c 300 "$out")} approvals=$approved (logs/tool-call-$LABEL-$cid.json)"
   fi
 done
+if [[ -n "$(pids_of toolport-gateway)" ]]; then
+  pass "gateway daemon runs after client calls" "$(ps -axo pid=,command= | grep toolport-gateway | grep -v grep | head -3 | sed 's/^ *//' | cut -c1-140 | tr '\n' ';')"
+else
+  fail "gateway daemon runs after client calls" "no toolport-gateway process"
+fi
+ui_press "Activity" >/dev/null 2>&1 && sleep 2
 shot "$LABEL-activity-after-calls" >/dev/null || true
 no_prompt_check "after tool calls"
 finish_step

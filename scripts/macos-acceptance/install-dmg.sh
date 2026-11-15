@@ -49,6 +49,60 @@ check "$ASSET Gatekeeper (open)" spctl -a -vv -t open --context context:primary-
 check "$ASSET stapled ticket" xcrun stapler validate "$DMG"
 codesign -dvv "$DMG" >"$EVIDENCE/logs/$ASSET.codesign-d.log" 2>&1 || true
 
+TPUI_BIN="${TPUI:-$EVIDENCE/bin/tpui}"
+finder_drag_install() {
+  local dlog="$EVIDENCE/logs/finder-drag-$ASSET.log" fpid src dst i want have
+  {
+    tmo 60 osascript -e 'on run argv' -e 'tell application "Finder"' -e 'activate' -e 'close every window' \
+      -e 'set w to make new Finder window to (POSIX file (item 1 of argv) as alias)' \
+      -e 'set current view of w to icon view' -e 'set bounds of w to {40, 80, 760, 560}' -e 'end tell' -e 'end run' "$MNT"
+    sleep 2
+    fpid="$(pgrep -x Finder | head -1)"
+    "$TPUI_BIN" find "$fpid" "Toolport" | tee "$EVIDENCE/logs/finder-items-$ASSET.txt"
+    "$TPUI_BIN" find "$fpid" "Applications" | tee -a "$EVIDENCE/logs/finder-items-$ASSET.txt"
+  } >"$dlog" 2>&1
+  shot "finder-drag-before-$ASSET" >/dev/null || true
+  # Icon: an image or text element labelled Toolport inside the window's
+  # content area. Target: the sidebar's Applications row.
+  read -r src dst < <(python3 - "$EVIDENCE/logs/finder-items-$ASSET.txt" <<'PY'
+import re, sys
+icon = target = None
+for line in open(sys.argv[1]):
+    m = re.match(r'(\S+) "(.*)" @(-?\d+),(-?\d+) (\d+)x(\d+)', line.strip())
+    if not m:
+        continue
+    role, label, x, y, w, h = m.group(1), m.group(2), *map(int, m.groups()[2:])
+    cx, cy = x + w // 2, y + h // 2
+    if role in ("AXImage", "AXTextField", "AXCell", "AXGroup") and label.lower().startswith("toolport") and x > 200 and icon is None:
+        icon = (cx, cy)
+    if label == "Applications" and role in ("AXRow", "AXCell", "AXStaticText", "AXOutlineRow") and x < 260 and target is None:
+        target = (cx, cy)
+if icon and target:
+    print("%d,%d %d,%d" % (icon + target))
+PY
+)
+  if [[ -z "${src:-}" || -z "${dst:-}" ]]; then
+    echo "could not locate the icon or the Applications sidebar row" >>"$dlog"
+    return 1
+  fi
+  echo "drag $src -> $dst" >>"$dlog"
+  "$TPUI_BIN" drag "${src%,*}" "${src#*,}" "${dst%,*}" "${dst#*,}" >>"$dlog" 2>&1
+  want="$(du -sk "$MNT/Toolport.app" | cut -f1)"
+  for i in $(seq 1 120); do
+    # Upgrades: Finder asks to replace the existing app.
+    "$TPUI_BIN" press "$fpid" "Replace" >>"$dlog" 2>&1 && shot "finder-drag-replace-$ASSET" >/dev/null
+    have="$(du -sk /Applications/Toolport.app 2>/dev/null | cut -f1)"
+    if [[ -n "$have" && "$have" -ge "$want" ]] && cmp -s "$MNT/Toolport.app/Contents/MacOS/conduit" /Applications/Toolport.app/Contents/MacOS/conduit; then
+      sleep 3
+      break
+    fi
+    sleep 1
+  done
+  shot "finder-drag-after-$ASSET" >/dev/null || true
+  tmo 20 osascript -e 'tell application "Finder" to close every window' >/dev/null 2>&1 || true
+  [[ -d /Applications/Toolport.app ]] && cmp -s "$MNT/Toolport.app/Contents/MacOS/conduit" /Applications/Toolport.app/Contents/MacOS/conduit
+}
+
 MNT="$(mktemp -d /tmp/toolport-dmg.XXXXXX)"
 if ! hdiutil attach -nobrowse -readonly -mountpoint "$MNT" "$DMG" >"$EVIDENCE/logs/$ASSET.attach.log" 2>&1; then
   fail "$ASSET mounts" "hdiutil attach failed (logs/$ASSET.attach.log)"
@@ -70,19 +124,18 @@ else
 fi
 
 if [[ $INSTALL -eq 1 ]]; then
-  # Drag to Applications: Finder does the copy, as for a user. A Finder copy
-  # also marks the app as moved by the user, which keeps Gatekeeper from
-  # running it from a random App Translocation folder.
-  if [[ -d /Applications/Toolport.app ]]; then
-    tmo 60 osascript -e 'tell application "Finder" to delete (POSIX file "/Applications/Toolport.app" as alias)' \
-      >"$EVIDENCE/logs/finder-replace-$ASSET.log" 2>&1 || rm -rf /Applications/Toolport.app
-  fi
-  if tmo 180 osascript -e "tell application \"Finder\" to duplicate (POSIX file \"$MNT/Toolport.app\" as alias) to (POSIX file \"/Applications\" as alias) with replacing" \
-    >"$EVIDENCE/logs/finder-copy-$ASSET.log" 2>&1 && [[ -d /Applications/Toolport.app ]]; then
-    pass "dragged to /Applications (Finder copy)"
+  # Drag Toolport.app onto Applications in the Finder sidebar with the mouse,
+  # as a user does. Finder records the move, which keeps Gatekeeper from
+  # running the app from a random App Translocation folder.
+  if finder_drag_install; then
+    pass "dragged to Applications in Finder"
   else
-    fail "dragged to /Applications (Finder copy)" "$(tr '\n' ' ' <"$EVIDENCE/logs/finder-copy-$ASSET.log" | cut -c1-200)"
-    ditto "$MNT/Toolport.app" /Applications/Toolport.app
+    fail "dragged to Applications in Finder" "see logs/finder-drag-$ASSET.log and screenshots/finder-drag-*"
+    if [[ ! -d /Applications/Toolport.app ]]; then
+      tmo 180 osascript -e "tell application \"Finder\" to duplicate (POSIX file \"$MNT/Toolport.app\" as alias) to (POSIX file \"/Applications\" as alias) with replacing" >/dev/null 2>&1 ||
+        ditto "$MNT/Toolport.app" /Applications/Toolport.app
+      info "fallback copy" "copied without a drag; the app may run translocated"
+    fi
   fi
   q="$(xattr -p com.apple.quarantine /Applications/Toolport.app 2>/dev/null || true)"
   if [[ -n "$q" ]]; then

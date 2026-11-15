@@ -339,6 +339,8 @@ def entry_of(client, data):
         return None, [f"unknown format {fmt}"]
     if not isinstance(cmd, str) or not cmd:
         return None, problems + [f"command is {cmd!r}"]
+    if "AppTranslocation" in cmd or cmd.startswith("/Volumes/") or cmd.startswith("/private/var/folders/"):
+        problems.append(f"command {cmd} is a temporary location that disappears after a restart or eject")
     if not os.path.isabs(cmd):
         problems.append(f"command {cmd} is not an absolute path")
     elif not os.access(cmd, os.X_OK):

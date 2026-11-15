@@ -27,7 +27,7 @@ PATTERN='toolport|conduit|com\.tsout'
   echo
   echo "## Files and folders under ~ (excluding the runner's work folders and the test server)"
   tmo 300 find "$HOME" \( -path "$HOME/work" -o -path "$HOME/hostedtoolcache" -o -path "$HOME/Library/Keychains" \
-    -o -path "$HOME/mcp-servers" -o -path "$HOME/.Trash" -o -path "$HOME/Library/Caches/Homebrew" \) -prune -o \
+    -o -path "$HOME/mcp-servers" -o -path "$HOME/.Trash" -o -path "$HOME/Downloads" -o -path "$HOME/Library/Caches/Homebrew" \) -prune -o \
     \( -iname '*toolport*' -o -iname '*conduit*' -o -iname '*com.tsout*' \) -print 2>/dev/null | sort || true
   echo
   echo "## Toolport data folder contents"

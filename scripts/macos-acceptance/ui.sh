@@ -73,24 +73,50 @@ ui_press_any() {
   return 1
 }
 
-# ui_fill <field-label> <text> [n]: focus a text field, clear it, type <text>.
+# ui_fill <field-label> <text> [secure]: focus a text field (by label or
+# placeholder; AX keeps the placeholder attribute after text is entered),
+# clear it and type <text>, then read the value back. Tries real key events
+# first (what a user does), then System Events keystrokes, then setting the
+# accessibility value, and records which input method worked. A secure field
+# only has to become non-empty, since its value reads back masked.
+UI_INPUT_METHODS="$EVIDENCE/logs/ui-input-methods.txt"
 ui_fill() {
-  local field="$1" text="$2" n="${3:-1}" i pid out
-  for ((i = 0; i < 20; i++)); do
-    pid="$(app_pid)"
-    if [[ -n "$pid" ]] && out="$(TPUI_TIMEOUT=30 tpui focus "$pid" "$field" "$n" 2>&1)"; then
-      printf '[ui] %s\n' "$out" >&2
-      sleep 0.3
-      tpui key 0 cmd   # select all
-      tpui key 51      # delete
-      tpui keys "$text"
-      sleep 0.3
+  local field="$1" text="$2" secure="${3:-}" pid method got
+  pid="$(app_pid)"
+  [[ -n "$pid" ]] || { ui_evidence "fill $field"; return 1; }
+  for method in cgevent systemevents axvalue; do
+    TPUI_TIMEOUT=30 tpui focus "$pid" "$field" >/dev/null 2>&1 || break
+    sleep 0.3
+    tpui key 0 cmd >/dev/null 2>&1 # select all
+    tpui key 51 >/dev/null 2>&1    # delete
+    case "$method" in
+    cgevent) tpui keys "$text" >/dev/null 2>&1 ;;
+    systemevents)
+      tmo 30 osascript -e 'on run argv' -e 'tell application "System Events" to keystroke (item 1 of argv)' -e 'end run' "$text" >/dev/null 2>&1
+      ;;
+    axvalue) TPUI_TIMEOUT=30 tpui setvalue "$pid" "$field" "$text" >/dev/null 2>&1 ;;
+    esac
+    sleep 0.5
+    got="$(TPUI_TIMEOUT=20 tpui value "$pid" "$field" 2>/dev/null)"
+    if [[ "$got" == "$text" ]] || [[ -n "$secure" && -n "$got" ]]; then
+      printf '%s\t%s\n' "$field" "$method" >>"$UI_INPUT_METHODS"
+      printf '[ui] filled "%s" with %s\n' "$field" "$method" >&2
       return 0
     fi
+    printf '[ui] %s did not fill "%s" (length now %s)\n' "$method" "$field" "${#got}" >&2
+  done
+  ui_evidence "fill $field"
+  return 1
+}
+
+# ui_gone <text> [seconds]: wait until no element labelled <text> exists.
+ui_gone() {
+  local text="$1" secs="${2:-15}" i pid
+  for ((i = 0; i < secs; i++)); do
+    pid="$(app_pid)"
+    TPUI_TIMEOUT=20 tpui find "$pid" "$text" >/dev/null 2>&1 || return 0
     sleep 1
   done
-  printf '[ui] could not focus "%s": %s\n' "$field" "${out:-no app process}" >&2
-  ui_evidence "fill $field"
   return 1
 }
 

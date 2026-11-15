@@ -106,24 +106,31 @@ fi
 # Menu bar status item: a layer-25 window owned by the app in CGWindowList, and
 # the AX extras menu bar when accessibility is available.
 log "Looking for the menu bar item"
-tray="$(windows_json | python3 -c '
-import json, sys
-pid = int(sys.argv[1])
-for w in json.load(sys.stdin):
-    if w["pid"] == pid and w["layer"] == 25:
-        print("%dx%d at %d,%d" % (w["w"], w["h"], w["x"], w["y"]))' "$PID" | head -1)"
-if [[ -n "$tray" ]]; then
-  pass "menu bar item exists" "status item window $tray"
+# macOS 26 hosts status items in Control Center's windows, so ask the app's
+# own accessibility extras menu bar instead of CGWindowList.
+if tpui menubar "$PID" >"$EVIDENCE/logs/ax-menubar-$LABEL.txt" 2>&1; then
+  pass "menu bar item exists" "$(head -n 1 "$EVIDENCE/logs/ax-menubar-$LABEL.txt")"
+  xy="$(sed -n 's/.*@\(-\{0,1\}[0-9]*\),\([0-9]*\).*/\1 \2/p' "$EVIDENCE/logs/ax-menubar-$LABEL.txt" | head -1)"
+  if [[ -n "$xy" ]]; then
+    tpui click $((${xy% *} + 12)) $((${xy#* } + 12)) >/dev/null 2>&1
+    sleep 1.5
+    shot "$LABEL-tray-menu" >/dev/null || true
+    if tpui find "$PID" "Quit Toolport" >"$EVIDENCE/logs/tray-menu-$LABEL.txt" 2>&1; then
+      pass "menu bar item opens its menu" "has Quit Toolport (screenshots/$LABEL-tray-menu.png)"
+    else
+      fail "menu bar item opens its menu" "no Quit Toolport item after clicking it (screenshots/$LABEL-tray-menu.png)"
+    fi
+    tpui key 53 >/dev/null 2>&1 || true
+  fi
 else
-  fail "menu bar item exists" "no layer-25 window owned by pid $PID"
+  fail "menu bar item exists" "$(tr '\n' ' ' <"$EVIDENCE/logs/ax-menubar-$LABEL.txt")"
 fi
-tpui menubar "$PID" >"$EVIDENCE/logs/ax-menubar-$LABEL.txt" 2>&1 || true
 
-gateway_running() { [[ -n "$(pids_of toolport-gateway)" ]]; }
-if wait_for 30 gateway_running; then
-  pass "gateway process starts" "$(ps -axo pid=,command= | grep toolport-gateway | grep -v grep | head -3 | cut -c1-160 | tr '\n' ';')"
+# The gateway daemon starts when a client first connects, not with the app.
+if [[ -n "$(pids_of toolport-gateway)" ]]; then
+  info "gateway process at first launch" "$(ps -axo pid=,command= | grep toolport-gateway | grep -v grep | head -3 | cut -c1-160 | tr '\n' ';')"
 else
-  fail "gateway process starts" "no toolport-gateway process 30s after launch"
+  info "gateway process at first launch" "none yet (it starts with the first client connection)"
 fi
 ps -axo pid,ppid,user,command | grep -iE 'toolport|conduit' | grep -v grep >"$EVIDENCE/logs/processes-$LABEL.txt" || true
 
