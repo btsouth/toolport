@@ -1,0 +1,53 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.btsouth/toolport",
+  "title": "Toolport",
+  "description": "Local MCP gateway: set up servers once and share them with every AI client",
+  "version": "2.3.5",
+  "websiteUrl": "https://toolport.app",
+  "repository": {
+    "url": "https://github.com/btsouth/toolport",
+    "source": "github",
+    "id": "1274695288"
+  },
+  "icons": [
+    {
+      "src": "https://toolport.app/favicon.svg",
+      "mimeType": "image/svg+xml",
+      "sizes": ["any"]
+    }
+  ],
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/btsouth/toolport-gateway:v2.3.5",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "name": "-i",
+          "description": "Keep stdin open for the stdio transport"
+        },
+        {
+          "type": "named",
+          "name": "--rm",
+          "description": "Remove the container when the client disconnects"
+        },
+        {
+          "type": "named",
+          "name": "--entrypoint",
+          "value": "toolport-gateway",
+          "description": "Run the gateway on stdio instead of the image's default HTTP mode"
+        },
+        {
+          "type": "named",
+          "name": "-v",
+          "value": "toolport-gateway-data:/data",
+          "description": "Volume holding registry.json, logs and gateway state"
+        }
+      ]
+    }
+  ]
+}

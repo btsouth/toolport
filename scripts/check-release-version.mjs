@@ -12,13 +12,15 @@
 //   GITHUB_REF_NAME=v2.0.0 node scripts/check-release-version.mjs
 //
 // Preview tags map to each tool's embedded form: v2.0.0-preview.1 is
-// 2.0.0-preview.1 in package.json/Cargo/tauri/plugin/homebrew, and
+// 2.0.0-preview.1 in package.json/Cargo/tauri/plugin/homebrew/server.json, and
 // 2.0.0preview.1 in the Arch PKGBUILD (Arch pkgver forbids '-').
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+const OCI_IMAGE = "ghcr.io/btsouth/toolport-gateway";
 
 const TAG_PATTERN = /^v(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*))?$/;
 
@@ -124,6 +126,26 @@ export function expectedChecks(parsed) {
           "utf8",
         );
         return /^ {2}version "([^"]+)"/m.exec(text)?.[1];
+      },
+    },
+    {
+      // The MCP registry manifest. docker-publish.yml lists it on the official
+      // registry after a release image push, so its version and the image tag it
+      // points at must both be this release.
+      file: "server.json",
+      expected: parsed.version,
+      read: (root) => jsonVersion(root, "server.json"),
+    },
+    {
+      file: "server.json (OCI image tag)",
+      expected: `${OCI_IMAGE}:${parsed.tag}`,
+      read: (root) => {
+        const manifest = JSON.parse(readFileSync(path.join(root, "server.json"), "utf8"));
+        const images = (manifest.packages ?? [])
+          .filter((pkg) => pkg.registryType === "oci")
+          .map((pkg) => pkg.identifier);
+        // No OCI package at all is a mismatch, not a vacuous pass.
+        return images.length > 0 ? images : undefined;
       },
     },
     {

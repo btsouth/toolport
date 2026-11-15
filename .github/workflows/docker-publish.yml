@@ -10,9 +10,15 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      registry_tag:
+        description: "List an existing release tag (vX.Y.Z) on the MCP registry without rebuilding the image"
+        required: false
+        default: ""
 
 concurrency:
-  group: docker-gateway-${{ github.ref }}
+  # A registry-only dispatch gets its own group so it never cancels an image build.
+  group: docker-gateway-${{ github.ref }}${{ inputs.registry_tag && format('-registry-{0}', inputs.registry_tag) || '' }}
   cancel-in-progress: true
 
 # Least privilege at the top level: read-only. Only the publish job below is
@@ -29,6 +35,8 @@ jobs:
     # Backstop only - GitHub defaults to 360 minutes. Matches the Rust jobs in ci.yml: this compiles the same crate from a cold cache.
     timeout-minutes: 30
     name: build gateway binary
+    # A registry-only dispatch lists an image that already exists.
+    if: ${{ !inputs.registry_tag }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -140,3 +148,97 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  # Lists each release on the official MCP registry (registry.modelcontextprotocol.io)
+  # as io.github.btsouth/toolport. Nothing depends on this job, so a registry
+  # outage or rejection never blocks the image or the rest of the release.
+  # Runs only in btsouth/toolport (forks have no claim to the namespace), only for
+  # plain vX.Y.Z tags whose image push succeeded, or by hand for an existing tag.
+  publish-mcp-registry:
+    # Backstop only - an image pull and three small registry calls.
+    timeout-minutes: 15
+    name: list on MCP registry
+    needs: publish
+    if: >-
+      ${{ !cancelled() && github.repository == 'btsouth/toolport' && (
+        (github.event_name == 'push' && github.ref_type == 'tag' &&
+          !contains(github.ref_name, '-') && needs.publish.result == 'success') ||
+        (github.event_name == 'workflow_dispatch' && inputs.registry_tag != '')) }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write # mcp-publisher login github-oidc
+    env:
+      # Upgrade deliberately: bump the version and the archive digest together
+      # (the digest is on the release page and in the GitHub asset metadata).
+      MCP_PUBLISHER_VERSION: v1.8.9
+      MCP_PUBLISHER_SHA256: 4d527ca8f1ced0394c962dc925c2a4a4addef441cbefd62501c875e9481823a8
+      RELEASE_TAG: ${{ inputs.registry_tag || github.ref_name }}
+    steps:
+      - name: Check the tag is a stable release tag
+        run: |
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::$RELEASE_TAG is not a vX.Y.Z release tag; only stable releases are listed."
+            exit 1
+          fi
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      # check-release-version.mjs already gates the release on this; repeat it
+      # here so a hand-run against an older tag fails with a clear message.
+      - name: Check server.json matches the tag
+        run: |
+          set -euo pipefail
+          test -f server.json || { echo "::error::$RELEASE_TAG has no server.json"; exit 1; }
+          version="$(jq -r .version server.json)"
+          image="$(jq -r '.packages[] | select(.registryType == "oci") | .identifier' server.json)"
+          if [ "$version" != "${RELEASE_TAG#v}" ] || [ "$image" != "$IMAGE:$RELEASE_TAG" ]; then
+            echo "::error::server.json has version $version and image $image, expected ${RELEASE_TAG#v} and $IMAGE:$RELEASE_TAG"
+            exit 1
+          fi
+
+      # The registry verifies ownership of an OCI package by this image config
+      # label, so check it before asking the registry to.
+      - name: Check the pushed image carries the registry label
+        run: |
+          set -euo pipefail
+          docker pull --quiet "$IMAGE:$RELEASE_TAG"
+          want="$(jq -r .name server.json)"
+          got="$(docker image inspect "$IMAGE:$RELEASE_TAG" --format '{{ index .Config.Labels "io.modelcontextprotocol.server.name" }}')"
+          if [ "$got" != "$want" ]; then
+            echo "::error::$IMAGE:$RELEASE_TAG has io.modelcontextprotocol.server.name=\"$got\", expected \"$want\""
+            exit 1
+          fi
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      - name: Download and verify mcp-publisher
+        run: |
+          set -euo pipefail
+          archive=mcp-publisher_linux_amd64.tar.gz
+          base_url="https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}"
+          dir="$RUNNER_TEMP/mcp-publisher"
+          mkdir -p "$dir" && cd "$dir"
+          curl --fail --location --silent --show-error --output "$archive" "$base_url/$archive"
+          curl --fail --location --silent --show-error --output "$archive.sigstore.json" "$base_url/$archive.sigstore.json"
+          echo "$MCP_PUBLISHER_SHA256  $archive" | sha256sum --check --strict
+          cosign verify-blob \
+            --bundle "$archive.sigstore.json" \
+            --certificate-identity "https://github.com/modelcontextprotocol/registry/.github/workflows/release.yml@refs/tags/${MCP_PUBLISHER_VERSION}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$archive"
+          tar xzf "$archive" mcp-publisher
+          echo "$dir" >> "$GITHUB_PATH"
+
+      - name: Validate server.json
+        run: mcp-publisher validate server.json
+
+      - name: Log in to the MCP registry
+        run: mcp-publisher login github-oidc
+
+      - name: Publish to the MCP registry
+        run: mcp-publisher publish server.json
