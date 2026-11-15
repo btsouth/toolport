@@ -773,3 +773,33 @@ it("shows disconnect and restart feedback once inline without a duplicate toast"
   expect(toastSuccess).not.toHaveBeenCalled();
   expect(toastError).not.toHaveBeenCalled();
 });
+
+it("refreshes the committed disconnect even when recovery notices cannot be read", async () => {
+  const onChanged = vi.fn();
+  uninstallGateway.mockResolvedValue({
+    path: "/fixture/config",
+    restored: [],
+    warnings: [],
+  });
+  render(
+    <ClientDetail
+      client={client({ gatewayInstalled: true, entryState: "managed" })}
+      registry={emptyRegistry()}
+      onChanged={onChanged}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  await waitFor(() => expect(listClientRecoveries).toHaveBeenCalled());
+  vi.mocked(listClientRecoveries).mockRejectedValue(
+    new Error("Recovery receipt is unreadable"),
+  );
+  await userEvent.click(screen.getByRole("button", { name: "Disconnect" }));
+  await userEvent.click(
+    within(screen.getByRole("dialog")).getByRole("button", { name: "Disconnect" }),
+  );
+  await waitFor(() => expect(onChanged).toHaveBeenCalledOnce());
+  expect(
+    await screen.findByText("Error: Recovery receipt is unreadable"),
+  ).toBeInTheDocument();
+  expect(toastError).not.toHaveBeenCalled();
+});

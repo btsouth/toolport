@@ -356,6 +356,8 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     try {
       if (installed) {
         const outcome = await uninstallGateway(client.id);
+        // The disconnect already committed, even if loading notices later fails.
+        onChanged();
         const restored = outcome.restored?.length ?? 0;
         // Recovery owns its own persistent notice. Do not also announce it in
         // an ordinary success notice or in a transient toast.
@@ -380,7 +382,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           ]);
         }
       }
-      onChanged();
+      if (!installed) onChanged();
     } catch (e) {
       showFeedback(String(e));
     } finally {
