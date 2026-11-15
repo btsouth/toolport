@@ -39540,6 +39540,7 @@ mod tests {
     struct ColdTargetRoute {
         calls: Arc<AtomicUsize>,
         destructive: bool,
+        tools: &'static [&'static str],
     }
 
     impl conduit_lib::downstream::Transport for ColdTargetRoute {
@@ -39554,16 +39555,21 @@ mod tests {
                     "capabilities": { "tools": {} }
                 })),
                 "tools/list" => {
-                    let mut tool = json!({"name": "run-item", "inputSchema": {"type": "object"}});
-                    tool["annotations"] = if self.destructive {
+                    let annotations = if self.destructive {
                         json!({"destructiveHint": true})
                     } else {
                         json!({"readOnlyHint": true, "destructiveHint": false})
                     };
-                    Ok(json!({ "tools": [tool] }))
+                    let tools: Vec<_> = self
+                        .tools
+                        .iter()
+                        .map(|name| json!({"name": name, "inputSchema": {"type": "object"}, "annotations": annotations}))
+                        .collect();
+                    Ok(json!({ "tools": tools }))
                 }
                 "tools/call" => {
-                    assert_eq!(params["name"], "run-item");
+                    let name = params["name"].as_str().unwrap_or_default();
+                    assert!(self.tools.contains(&name), "{params}");
                     self.calls.fetch_add(1, Ordering::SeqCst);
                     Ok(json!({"content":[{"type":"text","text":"cold result"}],"isError":false}))
                 }
@@ -39604,6 +39610,15 @@ mod tests {
         destructive: bool,
         before_connect: Arc<dyn Fn() + Send + Sync>,
     ) -> ColdTarget {
+        cold_target_tools(reg, destructive, &["run-item"], before_connect)
+    }
+
+    fn cold_target_tools(
+        reg: Registry,
+        destructive: bool,
+        tools: &'static [&'static str],
+        before_connect: Arc<dyn Fn() + Send + Sync>,
+    ) -> ColdTarget {
         let state = http_state(false);
         let starts = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -39620,6 +39635,7 @@ mod tests {
                     Box::new(ColdTargetRoute {
                         calls: Arc::clone(&counted_calls),
                         destructive,
+                        tools,
                     }),
                 )
                 .unwrap();
@@ -39629,7 +39645,7 @@ mod tests {
             ReconnectBackoff::default(),
             json!({"revision":1}),
         );
-        assert!(router.exposed_tool_name("cold", "run-item").is_none());
+        assert!(router.exposed_tool_name("cold", tools[0]).is_none());
         *state.host.registry.lock().unwrap() = reg;
         *state.router.lock().unwrap() = Arc::new(router);
         ColdTarget {
@@ -39936,7 +39952,7 @@ mod tests {
     fn tools_tab_target_never_starts_a_server_for_a_quarantined_tool() {
         let _env = DataDirTestEnv::new("tools-tab-cold-quarantine");
         // The default alias, and the spelling a dashed client view uses.
-        for alias in ["cold__run_item", "cold-run-item"] {
+        for alias in ["cold__run_item", "cold-run_item", "cold__run_item_2"] {
             let fixture = cold_target(cold_registry(true, Vec::new()), false);
             edit_cold_router(&fixture, |router| {
                 router.requarantine(BTreeSet::from([alias.to_string()]));
@@ -39958,6 +39974,60 @@ mod tests {
         assert_eq!(reply["result"]["isError"], false, "{reply}");
         assert_eq!(fixture.starts.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn cold_target_request_for(tool: &str) -> Value {
+        let mut req = cold_target_request();
+        req["params"]["arguments"]["_toolportTarget"]["tool"] = json!(tool);
+        req
+    }
+
+    #[test]
+    fn tools_tab_target_never_starts_a_server_for_a_quarantined_renamed_tool() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-renamed-quarantine");
+        let fixture = cold_target(cold_registry(true, Vec::new()), false);
+        edit_cold_router(&fixture, |router| {
+            router.set_overrides(HashMap::from([(
+                "cold".to_string(),
+                HashMap::from([(
+                    "run-item".to_string(),
+                    registry::ToolOverride {
+                        name: Some("say".into()),
+                        ..Default::default()
+                    },
+                )]),
+            )]));
+            router.requarantine(BTreeSet::from(["say".to_string()]));
+        });
+        let reply = run_cold_target(&fixture, None);
+        assert_cold_refused_without_start(&fixture, &reply);
+    }
+
+    #[test]
+    fn tools_tab_target_quarantine_matches_the_whole_tool_name() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-whole-name");
+        let quarantined = || {
+            let fixture = cold_target_tools(
+                cold_registry(true, Vec::new()),
+                false,
+                &["user", "get_user"],
+                Arc::new(|| {}),
+            );
+            edit_cold_router(&fixture, |router| {
+                router.requarantine(BTreeSet::from(["cold__get_user".to_string()]));
+            });
+            fixture
+        };
+        // `get_user` ends with `user`, but `user` is not quarantined.
+        let fixture = quarantined();
+        let reply = run_cold_request(&fixture, None, cold_target_request_for("user"));
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+
+        let fixture = quarantined();
+        let reply = run_cold_request(&fixture, None, cold_target_request_for("get_user"));
+        assert_cold_refused_without_start(&fixture, &reply);
     }
 
     #[test]
