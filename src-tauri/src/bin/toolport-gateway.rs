@@ -1473,7 +1473,8 @@ fn search_tool_def() -> Value {
             },
             "required": ["query"],
             "additionalProperties": false
-        }
+        },
+        "_meta": { CLAUDE_ALWAYS_LOAD_META: true }
     })
 }
 
@@ -1500,7 +1501,8 @@ fn call_tool_def() -> Value {
             },
             "required": ["name"],
             "additionalProperties": false
-        }
+        },
+        "_meta": { CLAUDE_ALWAYS_LOAD_META: true }
     })
 }
 
@@ -1579,7 +1581,8 @@ fn run_script_tool_def() -> Value {
             },
             "required": ["script"],
             "additionalProperties": false
-        }
+        },
+        "_meta": { CLAUDE_ALWAYS_LOAD_META: true }
     })
 }
 
@@ -1598,8 +1601,123 @@ fn fetch_result_tool_def() -> Value {
             },
             "required": ["cursor"],
             "additionalProperties": false
-        }
+        },
+        "_meta": { CLAUDE_ALWAYS_LOAD_META: true }
     })
+}
+
+/// Claude Code defers MCP tool schemas behind its own tool search and loads a tool
+/// upfront when its `tools/list` entry sets this `_meta` key to `true`
+/// (code.claude.com/docs/en/mcp, v2.1.285+). Search, call, fetch-result and
+/// run-script carry it: in Lazy mode the model needs search and call before it can
+/// reach anything else, and a trimmed result names toolport_fetch_result, which must be
+/// callable without another lookup. Status and help_<server> stay deferred. The key is
+/// vendor-prefixed, so other clients ignore it.
+const CLAUDE_ALWAYS_LOAD_META: &str = "anthropic/alwaysLoad";
+
+/// Claude Code saves a text result longer than this many characters to a file unless
+/// the tool's `tools/list` entry raises the threshold with this `_meta` key, up to
+/// [`CLAUDE_RESULT_CHARS_CEILING`].
+const CLAUDE_RESULT_SIZE_META: &str = "anthropic/maxResultSizeChars";
+const CLAUDE_RESULT_CHARS_DEFAULT: usize = 50_000;
+const CLAUDE_RESULT_CHARS_CEILING: usize = 500_000;
+
+/// The `anthropic/maxResultSizeChars` value for a shaping budget, or `None` when Claude
+/// Code's default already covers every result the budget lets through. The budget counts
+/// serialized bytes and Claude counts text characters; bytes bound characters from
+/// above, so advertising the byte budget is safe. `0` never shapes, so it gets the
+/// ceiling.
+fn claude_result_size_hint(budget: usize) -> Option<usize> {
+    match budget {
+        0 => Some(CLAUDE_RESULT_CHARS_CEILING),
+        budget if budget > CLAUDE_RESULT_CHARS_DEFAULT => {
+            Some(budget.min(CLAUDE_RESULT_CHARS_CEILING))
+        }
+        _ => None,
+    }
+}
+
+/// Shaping budgets for one `tools/list` view, used to raise Claude Code's result
+/// threshold where Toolport lets larger results through than Claude's default.
+struct ResultSizeHints {
+    /// `TOOLPORT_RESULT_BUDGET`, or the default. Fetch-result pages and script
+    /// results are shaped with it.
+    global: usize,
+    /// Per-server `resultBudgets`, keyed like `defend_and_shape` reads them.
+    servers: HashMap<String, usize>,
+    /// The largest budget among the servers this view may call, which bounds every
+    /// `toolport_call_tool` result.
+    call: usize,
+}
+
+impl ResultSizeHints {
+    fn new(reg: &Registry, allowed: Option<&HashSet<String>>) -> Self {
+        let (global, _warning) = shaping::budget();
+        let servers: HashMap<String, usize> = reg
+            .result_budgets
+            .iter()
+            .map(|(server, &budget)| (server.clone(), budget as usize))
+            .collect();
+        // 0 means never shape, which is larger than any byte budget. Counting a
+        // configured server the router does not serve right now only raises the
+        // threshold; results stay capped by their real budget either way.
+        let larger = |a: usize, b: usize| if a == 0 || b == 0 { 0 } else { a.max(b) };
+        let call = reg
+            .servers
+            .iter()
+            .filter(|server| {
+                !clients::is_gateway_server(server)
+                    && allowed.is_none_or(|scope| server_in_allowed_scope(&server.id, scope))
+            })
+            .filter_map(|server| servers.get(&sanitize_segment(&server.id)).copied())
+            .fold(global, larger);
+        Self {
+            global,
+            servers,
+            call,
+        }
+    }
+
+    /// Add `anthropic/maxResultSizeChars` to one listed tool when its results can exceed
+    /// Claude Code's default. An upstream tool that already set the key keeps its value.
+    fn apply(&self, tool: &mut Value, router: &Router) {
+        let Some(name) = tool.get("name").and_then(Value::as_str) else {
+            return;
+        };
+        let budget = match name {
+            "toolport_call_tool" => self.call,
+            "toolport_fetch_result" | "toolport_run_script" => self.global,
+            "toolport_status" | "toolport_search_tools" => return,
+            _ => match router.route_of(name) {
+                Some((server, _)) => self
+                    .servers
+                    .get(&sanitize_segment(server))
+                    .copied()
+                    .unwrap_or(self.global),
+                None => return,
+            },
+        };
+        let Some(chars) = claude_result_size_hint(budget) else {
+            return;
+        };
+        let Some(map) = tool.as_object_mut() else {
+            return;
+        };
+        if let Some(meta) = map
+            .entry("_meta")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+        {
+            meta.entry(CLAUDE_RESULT_SIZE_META)
+                .or_insert_with(|| json!(chars));
+        }
+    }
+
+    fn apply_all(&self, tools: &mut [Value], router: &Router) {
+        for tool in tools {
+            self.apply(tool, router);
+        }
+    }
 }
 
 /// The fixed 2.0 agent-facing floor: the meta-tools every connection advertises,
@@ -1627,8 +1745,10 @@ fn floor_tool_defs_with_code_mode(code_mode: bool) -> Vec<Value> {
 /// The byte guard complements the exact `o200k_base` gate in token_budget_regression;
 /// bytes alone cannot establish a token budget for JSON or non-ASCII text.
 /// The default floor goal is at most 550 o200k_base tokens, including 10% headroom.
+/// Raised from 2,400 for Claude Code's `anthropic/alwaysLoad` on search, call and
+/// fetch-result: 2,376 -> 2,490 bytes with Code Mode off.
 #[cfg(test)]
-const META_TOOL_FLOOR_BYTE_BUDGET: usize = 2_400;
+const META_TOOL_FLOOR_BYTE_BUDGET: usize = 2_520;
 
 /// The floor, named in the error a client gets when it calls a meta-tool that 2.0
 /// removed. Kept as one string so every refusal reads the same.
@@ -1714,10 +1834,10 @@ impl DiscoveryMode {
 /// The code-mode flag a registry load seeds (WS2-5).
 ///
 /// A successful load copies `registry.code_mode`, which is the value a host's flag starts
-/// from (see [`HostState::code_mode_enabled`]). A load failure must fail closed (`false`):
-/// [`Registry::default`] has `code_mode: true`, so seeding from the error fallback would
-/// silently re-enable code mode after a corrupt registry. The watcher already fails safe by
-/// not touching the flag when a reload fails.
+/// from (see [`HostState::code_mode_enabled`]). A load failure must fail closed (`false`)
+/// rather than seed from the [`Registry::default`] fallback, so a corrupt registry can
+/// never turn code mode on. The watcher already fails safe by not touching the flag
+/// when a reload fails.
 fn seed_code_mode_after_registry_load(loaded: Result<&Registry, ()>) -> bool {
     match loaded {
         Ok(reg) => reg.code_mode,
@@ -7824,12 +7944,15 @@ fn build_tool_surfaces(
         })
         .collect();
     let relays_apps = key.relays_apps;
+    let hints = ResultSizeHints::new(reg, allowed);
     let neutralized = |tool: &Value| {
         let mut tool = tool.clone();
         neutralize_listed_tool(&mut tool);
+        hints.apply(&mut tool, router);
         tool
     };
-    let floor = full_tool_floor(key.code_mode, key.full_fallback);
+    let mut floor = full_tool_floor(key.code_mode, key.full_fallback);
+    hints.apply_all(&mut floor, router);
     let full_tools = || {
         floor.iter().cloned().chain(
             scoped
@@ -7853,13 +7976,14 @@ fn build_tool_surfaces(
         summary: Arc::new(savings::SurfaceSummary::from_tools(full_tools())),
         key: key.clone(),
     });
-    let floor = grouped_tool_defs_from_tools(
+    let mut floor = grouped_tool_defs_from_tools(
         key.code_mode,
         scoped
             .iter()
             .copied()
             .filter(|_| mode == DiscoveryMode::Grouped),
     );
+    hints.apply_all(&mut floor, router);
     let apps = scoped
         .iter()
         .copied()
@@ -7928,7 +8052,7 @@ fn tool_surface_with_code_mode(
             owner_of_exposed_tool(Some(router), &owners, name)
         })
     };
-    match mode {
+    let mut tools = match mode {
         DiscoveryMode::Full => {
             let mut tools = full_tool_floor(code_mode, false);
             if !relays_mcp_app_html_to_active_client(router, allowed) {
@@ -7952,7 +8076,9 @@ fn tool_surface_with_code_mode(
             tools.extend(app_tools);
             tools
         }
-    }
+    };
+    ResultSizeHints::new(reg, allowed).apply_all(&mut tools, router);
+    tools
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8074,13 +8200,16 @@ fn handle_request_with_cancel(
             } else {
                 drop_blocked_from_cache(cached.shared(), router, reg)
             };
+            let hints = ResultSizeHints::new(reg, allowed);
             let mut tools = tool_surface(host, reg, router, &catalog, allowed, mode);
             if mode == DiscoveryMode::Full && full_discovery_fallback(client) {
                 tools.splice(2..2, [search_tool_def(), call_tool_def()]);
+                hints.apply_all(&mut tools[2..4], router);
             }
             let mut full = tool_surface(host, reg, router, &catalog, allowed, DiscoveryMode::Full);
             if full_discovery_fallback(client) {
                 full.splice(2..2, [search_tool_def(), call_tool_def()]);
+                hints.apply_all(&mut full[2..4], router);
             }
             let full_floor =
                 full_tool_floor(host.code_mode_enabled(), full_discovery_fallback(client)).len();
@@ -17048,6 +17177,17 @@ fn process_request_wire_inner(
         // so the initialize response is never blocked on the round-trip (issue #239).
         let st = state.clone();
         std::thread::spawn(move || refresh_client_root(&st));
+    } else if !state.http && !method.is_empty() {
+        // A modern client never sends initialize; it names itself in every
+        // request's _meta. Keep the first name seen for the session's label.
+        if let Some(label) = approval::client_info_label(req.get("params")) {
+            state
+                .stdio_upstream
+                .client_label
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_or_insert(label);
+        }
     }
 
     let session_label = if state.http {
@@ -17067,6 +17207,9 @@ fn process_request_wire_inner(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone()
             })
+            // Stateless modern HTTP has no session to hold a label, so each request
+            // names its client in _meta.
+            .or_else(|| approval::client_info_label(req.get("params")))
     } else {
         state
             .stdio_upstream
@@ -46616,6 +46759,303 @@ mod tests {
         }
         let catalog = Arc::new(CatalogSnapshot::new(router.shared_tools()));
         (reg, Arc::new(router), catalog)
+    }
+
+    fn listed_view(
+        host: &HostState,
+        reg: &Registry,
+        router: &Arc<Router>,
+        snapshot: &Arc<CatalogSnapshot>,
+        allowed: Option<&HashSet<String>>,
+        mode: DiscoveryMode,
+    ) -> Vec<Value> {
+        let exposed = cached_tool_surfaces(host, reg, router, snapshot, allowed, None, mode).1;
+        serde_json::from_str(exposed.json.get()).unwrap()
+    }
+
+    fn listed_named<'a>(tools: &'a [Value], name: &str) -> &'a Value {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} not listed: {tools:?}"))
+    }
+
+    #[test]
+    fn claude_always_load_marks_the_working_meta_tools_in_every_mode() {
+        let _env = DataDirTestEnv::new("claude-always-load");
+        let (reg, router, snapshot) = tool_surface_fixture();
+        let working = [
+            "toolport_search_tools",
+            "toolport_call_tool",
+            "toolport_fetch_result",
+            "toolport_run_script",
+        ];
+        for code_mode in [false, true] {
+            let host = dispatch_host(code_mode);
+            for mode in [
+                DiscoveryMode::Lazy,
+                DiscoveryMode::Grouped,
+                DiscoveryMode::Full,
+            ] {
+                let tools = listed_view(&host, &reg, &router, &snapshot, None, mode);
+                for tool in &tools {
+                    let name = tool["name"].as_str().unwrap();
+                    assert_eq!(
+                        tool["_meta"][CLAUDE_ALWAYS_LOAD_META] == true,
+                        working.contains(&name),
+                        "{mode:?} code_mode={code_mode}: {tool}"
+                    );
+                }
+                assert_eq!(
+                    tools.iter().any(|t| t["name"] == "toolport_run_script"),
+                    code_mode
+                );
+            }
+        }
+        // The direct dispatch path and the full-discovery fallback agree.
+        let host = dispatch_host(true);
+        let direct = tool_surface(
+            &host,
+            &reg,
+            &router,
+            &snapshot.tools,
+            None,
+            DiscoveryMode::Lazy,
+        );
+        assert_eq!(
+            direct
+                .iter()
+                .filter(|t| t["_meta"][CLAUDE_ALWAYS_LOAD_META] == true)
+                .count(),
+            4
+        );
+        // Drift fingerprints never cover _meta, so the key cannot raise a drift warning.
+        let mut bare = search_tool_def();
+        bare.as_object_mut().unwrap().remove("_meta");
+        assert_eq!(
+            integrity::fingerprint(&search_tool_def()),
+            integrity::fingerprint(&bare)
+        );
+    }
+
+    #[test]
+    fn claude_always_load_bytes_per_tools_list() {
+        let bpe = tiktoken_rs::o200k_base().unwrap();
+        let strip = |mut tools: Vec<Value>| {
+            for tool in &mut tools {
+                tool.as_object_mut().unwrap().remove("_meta");
+            }
+            serde_json::to_string(&tools).unwrap()
+        };
+        for code_mode in [false, true] {
+            let tools = floor_tool_defs_with_code_mode(code_mode);
+            let with = serde_json::to_string(&tools).unwrap();
+            let without = strip(tools);
+            let per_tool = r#","_meta":{"anthropic/alwaysLoad":true}"#.len();
+            assert_eq!(
+                with.len() - without.len(),
+                per_tool * if code_mode { 4 } else { 3 }
+            );
+            println!(
+                "CLAUDE_META code_mode={code_mode} bytes {} -> {} tokens {} -> {}",
+                without.len(),
+                with.len(),
+                bpe.encode_ordinary(&without).len(),
+                bpe.encode_ordinary(&with).len()
+            );
+        }
+    }
+
+    #[test]
+    fn meta_tool_input_schemas_fit_codex_schema_limit() {
+        // Codex drops parameter descriptions from an input schema over
+        // `tool_input_schema_max_bytes` (default 5000 bytes).
+        const CODEX_DEFAULT_SCHEMA_MAX_BYTES: usize = 5_000;
+        let mut tools = floor_tool_defs_with_code_mode(true);
+        tools.push(help_tool_def("synthetic00", 618));
+        for tool in tools {
+            let bytes = serde_json::to_vec(&tool["inputSchema"]).unwrap().len();
+            println!(
+                "META_SCHEMA_BYTES {} {bytes}",
+                tool["name"].as_str().unwrap()
+            );
+            assert!(
+                bytes <= CODEX_DEFAULT_SCHEMA_MAX_BYTES,
+                "{} input schema is {bytes} bytes",
+                tool["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn claude_result_size_hint_follows_the_shaping_budget() {
+        assert_eq!(claude_result_size_hint(shaping::DEFAULT_BUDGET_BYTES), None);
+        assert_eq!(claude_result_size_hint(2048), None);
+        assert_eq!(claude_result_size_hint(CLAUDE_RESULT_CHARS_DEFAULT), None);
+        assert_eq!(claude_result_size_hint(50_001), Some(50_001));
+        assert_eq!(claude_result_size_hint(200_000), Some(200_000));
+        assert_eq!(
+            claude_result_size_hint(900_000),
+            Some(CLAUDE_RESULT_CHARS_CEILING)
+        );
+        assert_eq!(
+            claude_result_size_hint(0),
+            Some(CLAUDE_RESULT_CHARS_CEILING)
+        );
+
+        // A raised global budget covers fetch-result and scripts too.
+        let router = Router::new();
+        let hints = ResultSizeHints {
+            global: 120_000,
+            servers: HashMap::new(),
+            call: 120_000,
+        };
+        let mut tools = floor_tool_defs_with_code_mode(true);
+        hints.apply_all(&mut tools, &router);
+        for tool in &tools {
+            let expected = match tool["name"].as_str().unwrap() {
+                "toolport_call_tool" | "toolport_fetch_result" | "toolport_run_script" => {
+                    json!(120_000)
+                }
+                _ => Value::Null,
+            };
+            assert_eq!(tool["_meta"][CLAUDE_RESULT_SIZE_META], expected, "{tool}");
+        }
+    }
+
+    #[test]
+    fn raised_server_budgets_advertise_claude_result_size() {
+        let _env = DataDirTestEnv::new("claude-result-size");
+        let (base, router, snapshot) = tool_surface_fixture();
+        // One host for every case: the surface cache must not serve a stale budget.
+        let host = dispatch_host(false);
+        let size = |tool: &Value| tool["_meta"][CLAUDE_RESULT_SIZE_META].as_u64();
+
+        // Default budgets: nothing is added anywhere.
+        for mode in [DiscoveryMode::Lazy, DiscoveryMode::Full] {
+            let tools = listed_view(&host, &base, &router, &snapshot, None, mode);
+            assert!(tools.iter().all(|t| size(t).is_none()), "{tools:?}");
+        }
+
+        for (budget, expected) in [(200_000, 200_000), (0, 500_000), (900_000, 500_000)] {
+            let mut reg = base.clone();
+            reg.result_budgets.insert("alpha".into(), budget);
+            let full = listed_view(&host, &reg, &router, &snapshot, None, DiscoveryMode::Full);
+            assert_eq!(size(listed_named(&full, "alpha__read")), Some(expected));
+            assert_eq!(size(listed_named(&full, "beta__read")), None);
+            // Fetch-result pages use the global budget, which did not change.
+            assert_eq!(size(listed_named(&full, "toolport_fetch_result")), None);
+            let lazy = listed_view(&host, &reg, &router, &snapshot, None, DiscoveryMode::Lazy);
+            assert_eq!(
+                size(listed_named(&lazy, "toolport_call_tool")),
+                Some(expected)
+            );
+            assert_eq!(size(listed_named(&lazy, "toolport_search_tools")), None);
+            assert_eq!(size(listed_named(&lazy, "toolport_status")), None);
+            // A client scoped away from alpha cannot reach its larger results.
+            let beta_only = HashSet::from(["beta".to_string()]);
+            let scoped = listed_view(
+                &host,
+                &reg,
+                &router,
+                &snapshot,
+                Some(&beta_only),
+                DiscoveryMode::Lazy,
+            );
+            assert_eq!(size(listed_named(&scoped, "toolport_call_tool")), None);
+        }
+
+        // An upstream tool that set its own value keeps it.
+        let mut reg = base.clone();
+        reg.result_budgets.insert("alpha".into(), 300_000);
+        let hints = ResultSizeHints::new(&reg, None);
+        let mut own =
+            json!({"name":"alpha__read", "_meta":{CLAUDE_RESULT_SIZE_META: 1234, "x": 1}});
+        hints.apply(&mut own, &router);
+        assert_eq!(own["_meta"], json!({CLAUDE_RESULT_SIZE_META: 1234, "x": 1}));
+        let mut other_meta = json!({"name":"alpha__read", "_meta":{"x": 1}});
+        hints.apply(&mut other_meta, &router);
+        assert_eq!(
+            other_meta["_meta"],
+            json!({CLAUDE_RESULT_SIZE_META: 300_000, "x": 1})
+        );
+    }
+
+    fn stdio_state() -> GatewayState {
+        let mut state = http_state(false);
+        let mut host = Arc::try_unwrap(state.host).ok().expect("a fresh host");
+        host.http = false;
+        state.host = Arc::new(host);
+        state
+    }
+
+    #[test]
+    fn a_modern_stdio_client_is_named_on_its_approval() {
+        let _env = DataDirTestEnv::new("modern-client-label-approval");
+        session_tables().hitl().clear();
+        let state = stdio_state();
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .set_safety_level(registry::SafetyLevel::Ask);
+        let router = routed_router("s", "delete");
+        *state.cached_tools.lock().unwrap() =
+            Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+        swap_router(&state, router);
+        let request = |id: i64, name: &str| {
+            json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {
+                    "name": "s__delete", "arguments": { "id": id },
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} },
+                        "io.modelcontextprotocol/clientInfo": { "name": name, "version": "2.1.290" }
+                    }
+                }
+            })
+        };
+        let call = |req: &Value| {
+            process_request(
+                &state,
+                req,
+                &SearchGuard::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                DiscoveryMode::Full,
+            )
+            .unwrap()
+        };
+        let reply = call(&request(1, "Claude Code"));
+        assert_eq!(reply["result"]["resultType"], "input_required", "{reply}");
+        // The first modern request names the session; a later one does not rename it.
+        let _ = call(&request(2, "Someone Else"));
+        assert_eq!(
+            state.stdio_upstream.client_label.lock().unwrap().as_deref(),
+            Some("Claude Code 2.1.290")
+        );
+        let token = reply["result"]["requestState"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let pending = session_tables()
+            .hitl()
+            .with(&token, |approval| approval.abandoned_audit.take())
+            .flatten()
+            .expect("the approval keeps its audit record");
+        pending.finish("withdrawn", 0);
+        let rows = audit::read_all().unwrap();
+        let approval = rows
+            .iter()
+            .find(|row| row["kind"] == "approval")
+            .expect("approval audit row");
+        assert_eq!(approval["clientLabel"], "Claude Code 2.1.290", "{approval}");
+        session_tables().hitl().clear();
     }
 
     #[test]

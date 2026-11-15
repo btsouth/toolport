@@ -3700,6 +3700,26 @@ pub(super) fn update_entry(doc: &mut DocumentMut, name: &str, entry: &super::Ser
     }
 }
 
+/// Set one key on a server entry only when neither it nor any of `aliases` is present,
+/// so a value the user wrote survives. A missing or non-table entry is left untouched.
+pub(super) fn insert_if_absent(
+    doc: &mut DocumentMut,
+    name: &str,
+    key: &str,
+    aliases: &[&str],
+    value: toml_edit::Value,
+) {
+    let Some(table) = super::toml_mcp_servers_mut(doc)
+        .get_mut(name)
+        .and_then(Item::as_table_like_mut)
+    else {
+        return;
+    };
+    if table.get(key).is_none() && aliases.iter().all(|alias| table.get(alias).is_none()) {
+        table.insert(key, Item::Value(value));
+    }
+}
+
 pub(super) fn put(doc: &mut DocumentMut, name: &str, mut item: Item) {
     // Replacing a table reserves positions for its entire incoming subtree.
     // Otherwise a saved child can sort before its parent after unrelated edits.

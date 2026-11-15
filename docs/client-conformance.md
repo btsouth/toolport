@@ -64,6 +64,41 @@ The fixture replay covers small structured results, oversized structured results
 and cursor retrieval through the real adapter and daemon. It does not claim
 acceptance by an authenticated Claude Code or other client application.
 
+## Client hints in tools/list
+
+Toolport adds two vendor-prefixed `_meta` keys that Claude Code reads
+([MCP docs](https://code.claude.com/docs/en/mcp)). Other clients ignore them, so they
+are sent to every client.
+
+- `anthropic/alwaysLoad: true` on `toolport_search_tools`, `toolport_call_tool`,
+  `toolport_fetch_result` and, with Code Mode on, `toolport_run_script`. Claude Code
+  (v2.1.285+) defers MCP tool schemas behind its own tool search; with this key the
+  model can search, call and page a trimmed result without first searching Claude's
+  index for Toolport's tools. `toolport_status` and `help_<server>` stay deferred. The
+  key adds 38 bytes per marked tool.
+- `anthropic/maxResultSizeChars` when Toolport lets results through that are larger
+  than Claude Code's 50,000-character file threshold: a `TOOLPORT_RESULT_BUDGET` or
+  per-server result budget above 50,000 bytes, or `0` (never shape). The value is the
+  byte budget, capped at Claude's 500,000 ceiling; bytes bound characters, so a result
+  within budget is never saved to a file. `toolport_call_tool` gets the largest
+  budget among the servers the client may reach, `toolport_fetch_result` and
+  `toolport_run_script` the global budget, and a directly listed tool its server's
+  budget unless the server set the key itself. With default budgets nothing is added.
+  A result budget change rebuilds the router and sends `tools/list_changed`.
+
+Drift fingerprints and the listed-catalog digest do not cover `_meta`, so these keys
+never cause drift warnings or extra list notifications.
+
+Modern (`2026-07-28`) clients send no `initialize`, so Toolport reads the client's name
+and version from `params._meta["io.modelcontextprotocol/clientInfo"]`: from the first
+request on stdio, and from each request on sessionless HTTP. Approvals and Activity
+show it the same way as a legacy client's `clientInfo`.
+
+Codex config keys Toolport writes for its own entry are listed in
+[docs/clients.md](clients.md#codex-setup-walkthrough). Every Toolport meta-tool input
+schema stays under Codex's default 5,000-byte `tool_input_schema_max_bytes`, so Codex
+keeps their parameter descriptions; a gateway test enforces it.
+
 ## Tool name budgets
 
 Client profiles in `clients.rs` declare combined name budgets. Cursor has a

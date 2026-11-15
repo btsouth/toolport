@@ -154,8 +154,17 @@ pub fn shorten_client_label(label: &str, limit: usize) -> String {
     }
 }
 
+/// Where a `2026-07-28` request carries the client's identity. Modern clients send no
+/// `initialize`, so this `_meta` entry is the only place their name and version appear.
+pub const MODERN_CLIENT_INFO_META: &str = "io.modelcontextprotocol/clientInfo";
+
+/// The display label for a request's client: `params.clientInfo` (legacy `initialize`),
+/// else `params._meta["io.modelcontextprotocol/clientInfo"]` (any modern request).
 pub fn client_info_label(params: Option<&serde_json::Value>) -> Option<String> {
-    let info = params?.get("clientInfo")?;
+    let params = params?;
+    let info = params
+        .get("clientInfo")
+        .or_else(|| params.get("_meta")?.get(MODERN_CLIENT_INFO_META))?;
     let name = info.get("name")?.as_str()?;
     let version = info.get("version").and_then(serde_json::Value::as_str);
     // Cropping first can hide a path separator while retaining a private prefix.
@@ -1218,6 +1227,25 @@ mod tests {
 mod client_label_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn modern_requests_name_their_client_in_meta() {
+        let params = json!({
+            "name": "x",
+            "_meta": { "io.modelcontextprotocol/clientInfo": { "name": "Claude Code", "version": "2.1.290" } }
+        });
+        assert_eq!(
+            client_info_label(Some(&params)),
+            Some("Claude Code 2.1.290".into())
+        );
+        // A legacy initialize keeps its own clientInfo even when _meta names another.
+        let both = json!({
+            "clientInfo": { "name": "Codex", "version": "1" },
+            "_meta": { "io.modelcontextprotocol/clientInfo": { "name": "Other" } }
+        });
+        assert_eq!(client_info_label(Some(&both)), Some("Codex 1".into()));
+        assert_eq!(client_info_label(Some(&json!({ "_meta": {} }))), None);
+    }
 
     #[test]
     fn p08b_labels_are_bounded_and_strip_controls_and_bidi() {

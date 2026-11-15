@@ -713,6 +713,23 @@ fn approval_broker(
     expected_server: &str,
     expected_tool: &str,
 ) -> std::thread::JoinHandle<()> {
+    let serving = approval_broker_serving(dir, expected_server, 1);
+    let expected_tool = expected_tool.to_string();
+    std::thread::spawn(move || {
+        assert_eq!(
+            serving.join().expect("approval broker"),
+            vec![expected_tool]
+        );
+    })
+}
+
+/// Approve `count` requests for `expected_server`, one connection at a time, and
+/// return the tools that were approved in arrival order.
+fn approval_broker_serving(
+    dir: &Path,
+    expected_server: &str,
+    count: usize,
+) -> std::thread::JoinHandle<Vec<String>> {
     let listener = TcpListener::bind("127.0.0.1:0").expect("approval listener");
     listener
         .set_nonblocking(true)
@@ -729,10 +746,10 @@ fn approval_broker(
     )
     .expect("approval descriptor");
     let expected_server = expected_server.to_string();
-    let expected_tool = expected_tool.to_string();
     std::thread::spawn(move || {
         let deadline = Instant::now() + RESPONSE_TIMEOUT;
-        loop {
+        let mut approved = Vec::new();
+        while approved.len() < count {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     // BSD may inherit nonblocking mode from the listener.
@@ -760,9 +777,8 @@ fn approval_broker(
                     let request: approval::ApprovalRequest =
                         serde_json::from_str(&line).expect("valid approval request");
                     assert_eq!(request.server, expected_server);
-                    assert_eq!(request.tool, expected_tool);
                     writeln!(stream, "\"approved\"").expect("approval decision");
-                    return;
+                    approved.push(request.tool);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     assert!(Instant::now() < deadline, "no approval request");
@@ -771,6 +787,7 @@ fn approval_broker(
                 Err(error) => panic!("approval accept failed: {error}"),
             }
         }
+        approved
     })
 }
 
@@ -4799,6 +4816,87 @@ fn matrix_routing_approved_call_rebinds_to_its_profile_view() {
         rejected["isError"] == true,
         "approval did not preserve the caller's tool scope"
     );
+}
+
+/// Toolport's Codex entry sets `supports_parallel_tool_calls`, so Codex may send
+/// overlapping calls down one stdio adapter. Every call here waits on a human
+/// approval, one makes a server-to-client elicitation round trip while another is
+/// parked at the server, and the two sleeps only answer once both reached the
+/// server at the same time.
+#[test]
+fn matrix_overlapping_calls_through_one_adapter_keep_their_answers() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("adapter-overlap");
+    let transcript = dir.join("parallel.jsonl");
+    let mut server = mock_server_entry("par", &transcript, None);
+    server.source = Some("shared".to_string());
+    for (key, value) in [
+        ("MOCK_MCP_CONCURRENT", "1"),
+        ("MOCK_MCP_SLEEP_BARRIER", "2"),
+    ] {
+        server.env.push(EnvVar {
+            key: key.to_string(),
+            value: Some(value.to_string()),
+            secret: false,
+            unknown_fields: Default::default(),
+        });
+    }
+    write_registry(&dir, vec![server], vec![]);
+    let registry_path = dir.join("registry.json");
+    let mut reg = registry::load_from(&registry_path).expect("load registry");
+    reg.set_safety_level(registry::SafetyLevel::Strict);
+    registry::save_to(&registry_path, &reg).expect("enable approval");
+    let broker = approval_broker_serving(&dir, "par", 3);
+
+    let mut client = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            elicitation: true,
+            ..AdapterOptions::default()
+        },
+    );
+    client.initialize("matrix-adapter-overlap");
+    let sleep = client.wait_for_tool("__sleep", Duration::from_secs(30));
+    let elicit = client.wait_for_tool("__legacy_elicitation", Duration::from_secs(30));
+    let call = |id: i64, name: &str, arguments: Value| {
+        json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        })
+    };
+
+    // The first sleep is approved, then parks at the server until a second arrives.
+    client.send(call(100, &sleep, json!({ "ms": 50 })));
+    // Meanwhile a call that needs the client to answer an elicitation completes.
+    client.send(call(101, &elicit, json!({})));
+    let confirmed = client.response_to(101);
+    assert_eq!(
+        text_of(&confirmed["result"]),
+        "legacy confirmed",
+        "{confirmed}\n{}",
+        client.diagnostics()
+    );
+    // The second sleep releases both. Each answer carries its own id.
+    client.send(call(102, &sleep, json!({ "ms": 60 })));
+    let mut answers = std::collections::BTreeMap::new();
+    while answers.len() < 2 {
+        let message = client.next_message();
+        match message["id"].as_i64() {
+            Some(id @ (100 | 102)) => {
+                answers.insert(id, text_of(&message["result"]));
+            }
+            Some(other) => panic!("unexpected answer {other}: {message}"),
+            None => assert!(message.get("method").is_some(), "{message}"),
+        }
+    }
+    assert_eq!(answers[&100], "slept 50 ms after 2 arrivals", "{answers:?}");
+    assert_eq!(answers[&102], "slept 60 ms after 2 arrivals", "{answers:?}");
+    assert_eq!(client.elicitation_queries.load(Ordering::Relaxed), 1);
+    let mut approved = broker.join().expect("approval broker");
+    approved.sort();
+    assert_eq!(approved, vec!["legacy_elicitation", "sleep", "sleep"]);
 }
 
 #[test]

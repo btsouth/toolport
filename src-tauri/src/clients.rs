@@ -387,6 +387,126 @@ pub fn client_alias_rule(id: Option<&str>, registered_key: &str) -> crate::route
 /// [`LEGACY_GATEWAY_ENTRY_NAME`] for the entry-name migration path.
 pub const GATEWAY_ENTRY_NAME: &str = "toolport";
 
+/// Settings Toolport writes into its own Codex entry, each only when the user has not
+/// set it (or an alias Codex reads for it). A value the user wrote, either way, stays.
+/// Grok shares Codex's TOML format but gets none of these.
+///
+/// - `supports_parallel_tool_calls = true`: Codex runs a server's calls one at a time
+///   by default. The stdio adapter dispatches each request on its own worker and the
+///   daemon serves each on its own thread, with server-to-client requests and approval
+///   prompts matched by id, so overlapping calls are safe.
+/// - `startup_timeout_sec = 75`: Codex waits 10 s for initialize and the first tool
+///   list. A cold adapter can spend up to 20 s on daemon election
+///   (`daemon::ELECTION_TIMEOUT`), 10 s waiting for the daemon (`daemon::READY_TIMEOUT`),
+///   30 s on a private gateway when the daemon is wedged
+///   (`PRIVATE_GATEWAY_READY_TIMEOUT`), then 8 s holding the first full list for
+///   Codex's servers (`cold_full_list_wait_ms`): 68 s, plus margin. `startup_timeout_ms`
+///   counts as set because Codex prefers the `_sec` key over it.
+/// - `tool_timeout_sec = 600`: Codex fails a call after 60 s. Through Toolport a call
+///   can wait 120 s for a human approval (`approval::DEFAULT_TIMEOUT_SECS`) and then run
+///   its own downstream call, an upstream elicitation can wait 120 s, a script runs up
+///   to its 60 s wall clock plus overhead, and a server's `requestTimeoutMs` may be
+///   longer still. The adapter fails any one request at 600 s (`REQUEST_TIMEOUT` in
+///   `stdio_adapter.rs`), so a longer Codex limit could never help.
+const CODEX_GATEWAY_SETTINGS: &[(&str, &[&str], CodexSetting)] = &[
+    (
+        "supports_parallel_tool_calls",
+        &[],
+        CodexSetting::Bool(true),
+    ),
+    (
+        "startup_timeout_sec",
+        &["startup_timeout_ms"],
+        CodexSetting::Seconds(75),
+    ),
+    ("tool_timeout_sec", &[], CodexSetting::Seconds(600)),
+];
+
+#[derive(Clone, Copy)]
+enum CodexSetting {
+    Bool(bool),
+    Seconds(i64),
+}
+
+impl CodexSetting {
+    fn json(self) -> serde_json::Value {
+        match self {
+            CodexSetting::Bool(value) => value.into(),
+            CodexSetting::Seconds(value) => value.into(),
+        }
+    }
+}
+
+/// Codex, including a Codex home added as a location (`codex@<key>`).
+fn is_codex_client(client_id: &str) -> bool {
+    client_id == "codex" || client_id.starts_with("codex@")
+}
+
+/// Client-specific keys a fresh gateway entry carries beyond command, args and env.
+fn gateway_entry_client_fields(client_id: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    if is_codex_client(client_id) {
+        for (key, _, value) in CODEX_GATEWAY_SETTINGS {
+            fields.insert(key.to_string(), value.json());
+        }
+    }
+    fields
+}
+
+/// The Codex settings a gateway entry asks for, with the keys that count as already set.
+fn codex_settings_for(
+    entry: &ServerEntry,
+) -> impl Iterator<Item = (&'static str, &'static [&'static str], toml_edit::Value)> + '_ {
+    CODEX_GATEWAY_SETTINGS
+        .iter()
+        .filter_map(move |(key, aliases, _)| {
+            let value = match entry.unknown_fields.get(*key)? {
+                serde_json::Value::Bool(value) => toml_edit::Value::from(*value),
+                serde_json::Value::Number(value) => toml_edit::Value::from(value.as_i64()?),
+                _ => return None,
+            };
+            Some((*key, *aliases, value))
+        })
+}
+
+/// A Codex config whose gateway entry lacks one of [`CODEX_GATEWAY_SETTINGS`].
+/// Unparseable text or a missing entry counts as "not lacking", so this never forces a
+/// rewrite on its own.
+fn codex_entry_lacks_settings(
+    client_id: &str,
+    entry_name: &str,
+    config_text: Option<&str>,
+) -> bool {
+    if !is_codex_client(client_id) {
+        return false;
+    }
+    let Some(doc) = config_text.and_then(|text| text.parse::<toml::Table>().ok()) else {
+        return false;
+    };
+    doc.get("mcp_servers")
+        .and_then(|servers| servers.get(entry_name))
+        .and_then(toml::Value::as_table)
+        .is_some_and(|entry| {
+            CODEX_GATEWAY_SETTINGS.iter().any(|(key, aliases, _)| {
+                !entry.contains_key(*key) && !aliases.iter().any(|alias| entry.contains_key(*alias))
+            })
+        })
+}
+
+/// [`gateway_entry_needs_rewrite`], plus a Codex entry Toolport wrote before it set
+/// [`CODEX_GATEWAY_SETTINGS`]. The provenance gate applies to both.
+fn client_gateway_entry_needs_rewrite(
+    client_id: &str,
+    entry_name: &str,
+    stored_command: &str,
+    current: &str,
+    config_text: Option<&str>,
+) -> bool {
+    gateway_entry_needs_rewrite(entry_name, stored_command, current, config_text)
+        || (command_is_gateway_binary(stored_command)
+            && codex_entry_lacks_settings(client_id, entry_name, config_text))
+}
+
 /// The name Toolport wrote before the SOU-318 rename. Existing installs still have
 /// their entry named this; [`gateway_identity_matches`] keeps recognizing it so we
 /// detect, de-duplicate, and (via [`repoint_stale_gateways`]) migrate those entries
@@ -8368,6 +8488,7 @@ fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, 
     if let Some(p) = profile.map(str::trim).filter(|p| !p.is_empty()) {
         env.push(env_var(crate::brand::PROFILE, p));
     }
+    let unknown_fields = gateway_entry_client_fields(client_id);
     Ok(ServerEntry {
         enabled: false,
         inherit_env: false,
@@ -8386,7 +8507,7 @@ fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, 
         request_timeout_ms: None,
         initialize_timeout_ms: None,
         launch: None,
-        unknown_fields: serde_json::Map::new(),
+        unknown_fields,
     })
 }
 
@@ -8720,6 +8841,9 @@ fn edit_toml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), Str
         let before = doc.clone();
         let was_missing = toml_preservation::raw_entry(&before, GATEWAY_ENTRY_NAME).is_none();
         toml_preservation::update_entry(&mut doc, GATEWAY_ENTRY_NAME, entry);
+        for (key, aliases, value) in codex_settings_for(entry) {
+            toml_preservation::insert_if_absent(&mut doc, GATEWAY_ENTRY_NAME, key, aliases, value);
+        }
         if was_missing {
             if let Some((_, item)) = toml_preservation::raw_entry(&doc, GATEWAY_ENTRY_NAME) {
                 if item.is_table() {
@@ -9597,7 +9721,13 @@ fn repoint_stale_gateways_in(
             > 1;
         if !duplicate_gateways
             && !location_identity_changed
-            && !gateway_entry_needs_rewrite(entry_name, stored, current, config_text.as_deref())
+            && !client_gateway_entry_needs_rewrite(
+                &client.id,
+                entry_name,
+                stored,
+                current,
+                config_text.as_deref(),
+            )
             && entry
                 .env_keys
                 .iter()
@@ -9631,7 +9761,8 @@ fn repoint_stale_gateways_in(
                         )?;
                     }
                     if !duplicate_gateways
-                        && !gateway_entry_needs_rewrite(
+                        && !client_gateway_entry_needs_rewrite(
+                            &client.id,
                             entry_name,
                             stored,
                             current,
@@ -12918,6 +13049,119 @@ bad = "not-a-table"
             .get(crate::brand::PROFILE_LEGACY)
             .is_none());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn codex_gateway_entry_adds_its_settings_only_when_absent() {
+        let data = crate::registry::DataDirTestEnv::new("codex-gateway-settings");
+        assert!(gateway_entry_client_fields("grok").is_empty());
+        assert!(gateway_entry_client_fields("claude-code").is_empty());
+        assert_eq!(
+            gateway_entry_client_fields("codex@work"),
+            gateway_entry_client_fields("codex")
+        );
+        let mut codex = sample_gateway(None, "codex");
+        codex.unknown_fields = gateway_entry_client_fields("codex");
+        let entry_of = |path: &Path, name: &str| -> toml::Value {
+            let doc: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            doc["mcp_servers"][name].clone()
+        };
+
+        // Fresh install: every setting is written, unrelated settings stay.
+        let fresh = data.dir.join("fresh.toml");
+        std::fs::write(&fresh, "model = \"gpt-5\"\n").unwrap();
+        edit_toml_gateway(&fresh, Some(&codex)).unwrap();
+        let written = entry_of(&fresh, GATEWAY_ENTRY_NAME);
+        assert_eq!(
+            written["supports_parallel_tool_calls"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(written["startup_timeout_sec"].as_integer(), Some(75));
+        assert_eq!(written["tool_timeout_sec"].as_integer(), Some(600));
+        assert_eq!(written["command"].as_str(), Some("toolport-gateway"));
+        let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&fresh).unwrap()).unwrap();
+        assert_eq!(doc["model"].as_str(), Some("gpt-5"));
+        // A second write changes nothing.
+        let first = std::fs::read_to_string(&fresh).unwrap();
+        edit_toml_gateway(&fresh, Some(&codex)).unwrap();
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), first);
+
+        // Values the user set, either way, survive a rewrite, and so do their other
+        // keys on our entry and on other servers. `startup_timeout_ms` counts as a
+        // startup timeout because Codex would let `_sec` override it.
+        for user_value in [false, true] {
+            let path = data.dir.join(format!("existing-{user_value}.toml"));
+            let text = format!(
+                "[mcp_servers.toolport]\ncommand = \"toolport-gateway\"\n\
+                 supports_parallel_tool_calls = {user_value} # mine\n\
+                 startup_timeout_ms = 5000\ntool_timeout_sec = 90\n\
+                 enabled_tools = [\"a\"]\n\n\
+                 [mcp_servers.other]\ncommand = \"npx\"\n"
+            );
+            std::fs::write(&path, &text).unwrap();
+            edit_toml_gateway(&path, Some(&codex)).unwrap();
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert!(after.contains(&format!(
+                "supports_parallel_tool_calls = {user_value} # mine"
+            )));
+            let ours = entry_of(&path, GATEWAY_ENTRY_NAME);
+            assert_eq!(
+                ours["supports_parallel_tool_calls"].as_bool(),
+                Some(user_value)
+            );
+            assert_eq!(ours["tool_timeout_sec"].as_integer(), Some(90));
+            assert_eq!(ours["startup_timeout_ms"].as_integer(), Some(5000));
+            assert!(ours.get("startup_timeout_sec").is_none());
+            assert_eq!(ours["enabled_tools"][0].as_str(), Some("a"));
+            let other = entry_of(&path, "other");
+            assert_eq!(other.as_table().unwrap().len(), 1, "{after}");
+        }
+
+        // Grok shares the TOML format but never gets the Codex settings.
+        let grok = data.dir.join("grok.toml");
+        std::fs::write(&grok, "").unwrap();
+        edit_toml_gateway(&grok, Some(&sample_gateway(None, "grok"))).unwrap();
+        let grok_entry = entry_of(&grok, GATEWAY_ENTRY_NAME);
+        for (key, _, _) in CODEX_GATEWAY_SETTINGS {
+            assert!(grok_entry.get(*key).is_none(), "grok got {key}");
+        }
+    }
+
+    #[test]
+    fn existing_codex_installs_are_repaired_once_for_their_settings() {
+        let current = "/opt/toolport/toolport-gateway";
+        let head = "[mcp_servers.toolport]\ncommand = \"/opt/toolport/toolport-gateway\"\n";
+        let lacking = format!("{head}env = {{ TOOLPORT_CLIENT_ID = \"codex\" }}\n");
+        let complete = format!(
+            "{head}supports_parallel_tool_calls = false\nstartup_timeout_ms = 3000\n\
+             tool_timeout_sec = 30\n"
+        );
+        let partial = format!("{head}supports_parallel_tool_calls = true\n");
+        let needs = |client: &str, stored: &str, text: &str| {
+            client_gateway_entry_needs_rewrite(
+                client,
+                GATEWAY_ENTRY_NAME,
+                stored,
+                current,
+                Some(text),
+            )
+        };
+        assert!(needs("codex", current, &lacking));
+        assert!(needs("codex@work", current, &lacking));
+        assert!(needs("codex", current, &partial));
+        // Present values, whatever they are, are the user's and stop the repair.
+        assert!(!needs("codex", current, &complete));
+        // Other clients and entries that are not ours are never touched for it.
+        assert!(!needs("grok", current, &lacking));
+        assert!(!needs("codex", "npx", &lacking));
+        assert!(!needs("codex", current, "not toml ["));
+        assert!(!client_gateway_entry_needs_rewrite(
+            "codex",
+            GATEWAY_ENTRY_NAME,
+            current,
+            current,
+            None
+        ));
     }
 
     #[test]

@@ -360,6 +360,14 @@ Use this when Codex has already created its home directory (`$CODEX_HOME`, or `~
 1. In Toolport, add or enable the MCP servers you want Codex to use.
 2. Open **Clients**, select **Codex**, choose its Access, and click **Connect to Toolport**.
 3. Toolport updates `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`) with a single `[mcp_servers.toolport]` entry. That entry runs the resolved `toolport-gateway` binary; existing Codex TOML keys and other MCP servers are preserved, and an existing config is backed up before the write. (Older installs that still have `[mcp_servers.conduit]` are renamed to `toolport` on the next Toolport launch.)
+   The entry also sets three Codex keys, each only when it is absent, so a value you
+   wrote is never changed: `supports_parallel_tool_calls = true` (Toolport serves
+   overlapping calls), `startup_timeout_sec = 75` (a cold start can elect and wait for
+   the shared daemon before the first tool list; a `startup_timeout_ms` you set counts
+   as set) and `tool_timeout_sec = 600` (a call can wait up to 120 seconds on an
+   approval prompt before it runs, and Toolport's adapter ends any request at 600
+   seconds). Existing Toolport-managed Codex entries get the missing keys on the next
+   Toolport launch. To opt out of one, write your own value for it.
 4. Start a new Codex session so it re-reads the config. In Toolport, the Codex row changes to **connected to Toolport**; in Codex, Toolport-managed tools are served through the one `toolport` MCP server. With lazy discovery enabled, Codex gets Toolport's compact search tools instead of every downstream tool up front.
 
 Gotcha: when running Toolport from source, build the gateway first with `npm run build:gateway`. The desktop dev server does not build the separate binary that Codex spawns, so Codex will report the gateway as missing until that binary exists.
