@@ -13,7 +13,6 @@ const native = new Set([
   "usr/share/toolport/toolport-preview-rollback.sh",
   "usr/share/toolport/disconnect-users.sh",
   "usr/share/licenses/toolport/LICENSE",
-  "usr/share/licenses/toolport-bin/LICENSE",
   "usr/share/doc/toolport/copyright",
 ]);
 const nsis = new Set([

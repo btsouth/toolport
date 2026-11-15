@@ -6,6 +6,9 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+- Arch and Omarchy install only from the Toolport pacman repository. The
+  unpublished AUR `toolport-bin` package and its workflow are gone.
+
 ## [2.3.5] - 2026-11-13
 
 Toolport 2.3.5 lets you hide a server's prompts while keeping its tools, keeps

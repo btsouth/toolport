@@ -62,11 +62,11 @@ sudo pacman-key --delete A16BFA2E1014BD6BD718CC6E6621247E3FFA6AA7
 
 ## Notes
 
-- The package conflicts with the AUR `toolport-bin` and replaces
-  `toolport-native-preview`, so only one Toolport runs at a time. Both Linux
-  builds read the same `~/.config/Toolport` and only one process can hold the
-  approval broker, so pacman swaps an existing `toolport-bin` install in place
-  rather than installing beside it.
+- The package conflicts with `toolport-bin`, a name some locally built Toolport
+  packages used, and replaces `toolport-native-preview`, so only one Toolport
+  runs at a time. Both Linux builds read the same `~/.config/Toolport` and only
+  one process can hold the approval broker, so pacman offers to remove an
+  existing `toolport-bin` install rather than installing beside it.
 - In 2.0 the `.deb` and `.rpm` also ship GTK. The `.deb` needs Ubuntu 24.04+
   or Debian 13+. Ubuntu 22.04 and Debian 12 use the Tauri AppImage. See
   [Linux installation](linux-packages.md#install) for other distributions.

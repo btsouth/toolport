@@ -5,8 +5,8 @@ Fedora 40+ (with the libraries below), and current Arch. Debian and RPM packages
 24.04 x86_64, packaged with pinned nFPM and one
 [`nfpm.yaml`](../packaging/linux/native/nfpm.yaml). Runtime dependencies are
 listed for that build's GTK 4.14, libadwaita 1.5, GLib 2.80 and glibc 2.39 floor.
-Arch offers the native PKGBUILD and AUR `toolport-bin`, which repackages the GTK
-deb with Arch dependencies. The Tauri AppImage is still built on Ubuntu 22.04
+Arch and Omarchy install the native PKGBUILD from Toolport's signed
+[pacman repository](arch-pacman-repo.md). The Tauri AppImage is still built on Ubuntu 22.04
 for older distributions and keeps its in-app updater.
 
 ## Install
@@ -47,13 +47,12 @@ preserve CLI and launch-at-login paths. Both shells use `~/.config/Toolport`.
 Native package removal restores client configs through a bounded per-user
 cleanup helper; upgrades preserve connections. Debian's `remove in-favour`
 replacement also preserves connections. pacman supplies no replacement flag to
-`pre_remove`, so replacing `toolport` with a conflicting package such as
-`toolport-bin` disconnects clients too. Reconnect them in the replacement app.
+`pre_remove`, so replacing `toolport` with a conflicting package
+disconnects clients too. Reconnect them in the replacement app.
 For a `.deb` update, download the new file from the release page and run
 `sudo apt install ./<file>.deb`; for an `.rpm`, run
 `sudo dnf install ./<file>.rpm`. There is no Toolport apt or dnf repository.
-Arch repository users update with `sudo pacman -Syu`; `toolport-bin` users update
-with their AUR helper or rebuild the AUR package.
+Arch repository users update with `sudo pacman -Syu`.
 React uses Tauri's bundle type for package guidance. GTK queries dpkg, rpm and
 pacman for ownership of its running executable, so installing a manager on a
 different distro does not select its advice. GTK does not check for new releases;
