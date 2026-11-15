@@ -1014,14 +1014,9 @@ fn an_upgraders_goose_connection_moves_from_application_support_on_macos() {
     let outcome = relocate::relocate_all(fixture.gateway(), &HashMap::new());
     assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
     let target = client_config_path("goose").unwrap();
-    assert_eq!(
-        target,
-        fixture
-            .home
-            .join(".config")
-            .join("goose")
-            .join("config.yaml")
-    );
+    // The XDG file Goose reads (the fixture isolates XDG_CONFIG_HOME), not the old one.
+    let xdg = std::path::PathBuf::from(client_path_env("XDG_CONFIG_HOME").unwrap());
+    assert_eq!(target, xdg.join("goose").join("config.yaml"));
     let moved = parse_client_content(
         Format::YamlExtensions,
         &std::fs::read_to_string(&target).unwrap(),
