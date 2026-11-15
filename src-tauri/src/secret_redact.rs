@@ -2472,23 +2472,55 @@ pub fn hold_from(text: &str) -> usize {
 }
 
 /// Redaction for text written in chunks (a relayed stream, a child's stderr,
-/// a sequence of messages): [`Self::push`] returns the part that is safe to
-/// write now and holds the tail that may be the start of a secret, until the
-/// next chunk shows whether the rest follows (the held text is then matched
-/// together with it) or [`Self::finish`] ends the stream.
-#[derive(Debug, Default)]
+/// the messages of one progress stream): [`Self::push`] returns the part that
+/// is safe to write now and holds the tail that may be the start of a secret,
+/// until the next chunk shows whether the rest follows (the held text is then
+/// matched together with it) or [`Self::finish`] ends the stream.
+#[derive(Debug)]
 pub struct Stream {
     held: String,
+    fragments: bool,
+}
+
+impl Default for Stream {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Stream {
+    /// A log stream: fragment windows apply, as in [`redact_text`].
+    pub fn new() -> Self {
+        Self {
+            held: String::new(),
+            fragments: true,
+        }
+    }
+
+    /// A stream of message text bound for a client: whole forms only, as in
+    /// [`redact_outgoing`], so ordinary words in content are never renamed.
+    pub fn whole() -> Self {
+        Self {
+            held: String::new(),
+            fragments: false,
+        }
+    }
+
     /// `chunk` appended to the held tail; the redacted part to write now.
     pub fn push(&mut self, chunk: &str) -> String {
         self.held.push_str(chunk);
         let cut = hold_from(&self.held);
         let rest = self.held.split_off(cut);
         let ready = std::mem::replace(&mut self.held, rest);
-        redact_text(&ready).into_owned()
+        let Some(m) = current() else {
+            return ready;
+        };
+        if self.fragments {
+            m.redact_text(&ready).into_owned()
+        } else {
+            m.fold(&ready, |m, t| m.text_with(t, false, None))
+                .into_owned()
+        }
     }
 
     /// Whether a tail is being held.

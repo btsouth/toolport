@@ -10785,6 +10785,12 @@ struct ProgressRoute {
     /// own unique token downstream and translates back here, the same way it
     /// namespaces tool names.
     client_token: Value,
+    /// The progress messages of this call are one stream: a message that ends
+    /// with what may be the start of a secret has that tail held and matched
+    /// with the next message, so a secret split across two notifications is
+    /// never delivered in pieces. What is still held when the call ends is
+    /// dropped (it is at most the start of a registered form).
+    messages: conduit_lib::secret_redact::Stream,
     /// The request instance that asked for it. Its progress is delivered only while
     /// that instance is live, so a cancelled call's late progress never reaches the
     /// client, which may already have reused the token for its next request.
@@ -10865,6 +10871,7 @@ fn register_progress(
             session: session.to_string(),
             producer: producer.to_string(),
             client_token,
+            messages: conduit_lib::secret_redact::Stream::whole(),
             owner: APPROVAL_CANCEL.with(|current| current.borrow().clone()),
         },
     );
@@ -10927,16 +10934,29 @@ fn deliver_progress(
     let Some(key) = token.as_str().map(str::to_string) else {
         return;
     };
+    let mut note = note.clone();
     let (session, client_token, owner) = {
-        let table = routes
+        let mut table = routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match table.active.get(&key) {
-            Some(route) if route.producer == producer => (
-                route.session.clone(),
-                route.client_token.clone(),
-                route.owner.clone(),
-            ),
+        match table.active.get_mut(&key) {
+            Some(route) if route.producer == producer => {
+                if let Some(message) = note
+                    .get_mut("params")
+                    .and_then(|p| p.get_mut("message"))
+                    .and_then(|m| match m {
+                        Value::String(text) => Some(text),
+                        _ => None,
+                    })
+                {
+                    *message = route.messages.push(message);
+                }
+                (
+                    route.session.clone(),
+                    route.client_token.clone(),
+                    route.owner.clone(),
+                )
+            }
             Some(route) => {
                 eprintln!(
                     "toolport: progress for token from '{producer}' dropped \
@@ -10951,7 +10971,6 @@ fn deliver_progress(
         }
     };
     // Hand the client back ITS token; ours is an internal correlator.
-    let mut note = note.clone();
     conduit_lib::secret_redact::redact_outgoing(&mut note, None);
     if let Some(params) = note.get_mut("params").and_then(Value::as_object_mut) {
         params.insert("progressToken".to_string(), client_token);
@@ -38903,6 +38922,54 @@ mod tests {
         assert!(
             drain_session(&state, &s2).is_empty(),
             "another client must never see it"
+        );
+    }
+
+    #[test]
+    fn a_secret_split_across_two_progress_messages_is_never_delivered_in_pieces() {
+        let _data = DataDirTestEnv::new("progress-split-secret");
+        conduit_lib::secret_redact::register("alpha", "PROGRESS_KEY", "sk-ProgressSecret456");
+        let state = http_state(false);
+        let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
+        let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+        let (stdio, _stdio_rx) = stdio_session_with_progress();
+        let (_registration, wire) = register_progress(
+            &routes,
+            Some(&json!({ "progressToken": "tok-split" })),
+            "alpha",
+            &s1,
+        )
+        .unwrap();
+        let note = |progress: u64, message: &str| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {"progressToken": wire, "progress": progress, "message": message}
+            })
+        };
+        for (i, message) in ["uploading with sk-Progr", "essSecret456 accepted"]
+            .iter()
+            .enumerate()
+        {
+            deliver_progress(
+                &stdio,
+                &state.mcp_sessions,
+                &routes,
+                "alpha",
+                &note(i as u64, message),
+            );
+        }
+        let got = drain_session(&state, &s1);
+        assert_eq!(got.len(), 2, "{got:?}");
+        let joined = got.join("\n");
+        for piece in ["sk-Progr", "essSecret456", "Secret456"] {
+            assert!(!joined.contains(piece), "{piece} delivered: {joined}");
+        }
+        assert!(got[0].contains("\"uploading with \""), "{}", got[0]);
+        assert!(
+            got[1].contains("\"[secret:PROGRESS_KEY] accepted\""),
+            "{}",
+            got[1]
         );
     }
 
