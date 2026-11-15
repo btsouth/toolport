@@ -2708,6 +2708,7 @@ fn add(scope: &Scope, id: &str, name: &str, value: &str) -> bool {
             Ok(index)
         }
     };
+    crate::daemon_log::secret_registered();
     match index {
         Ok(index) => {
             cover(scope, index);

@@ -796,6 +796,10 @@ pub fn end_run_cleanly(dir: &Path) {
 pub enum StderrRedaction {
     /// [`install_stderr_redaction`] has not run in this process.
     NotInstalled,
+    /// Redaction is wanted, but no secret is registered in this process yet, so
+    /// there is nothing to redact: stderr is still the original and no relay
+    /// runs. The first registration starts the relay before it returns.
+    AwaitingSecret,
     /// Stderr is the relay: this process's writes, and those of every child that
     /// inherits stderr, are redacted before they reach the original destination.
     Relayed,
@@ -809,9 +813,38 @@ pub enum StderrRedaction {
     Unprotected { reason: String },
 }
 
+/// Also the lock the deferred start runs under, so a reader never sees
+/// [`StderrRedaction::AwaitingSecret`] once a registration has started the relay.
 static STDERR_REDACTION: Mutex<StderrRedaction> = Mutex::new(StderrRedaction::NotInstalled);
 
-/// What [`install_stderr_redaction`] achieved, for status reporting.
+/// [`install_stderr_redaction`] ran in this process.
+const LAZY_WANTED: u8 = 1;
+/// A secret was registered in this process.
+const LAZY_SEEN: u8 = 2;
+/// The relay was started (or failed and stderr was silenced): nothing left to do.
+const LAZY_DONE: u8 = 4;
+/// Both halves set their bit with one read-modify-write on this one atomic, so
+/// whichever comes second sees the other's bit and starts the relay; a store
+/// and a load on two separate flags could each miss the other.
+static LAZY_RELAY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Called by `secret_redact` each time a new secret value is registered. The
+/// first one in a process that wants redaction starts the relay and returns
+/// only once stderr is the relay (or the null device), so that secret is never
+/// written unredacted. After that, and in a process that never wants redaction
+/// once it has recorded one secret, every call is one atomic load.
+pub fn secret_registered() {
+    use std::sync::atomic::Ordering;
+    let state = LAZY_RELAY.load(Ordering::Acquire);
+    if state & LAZY_DONE != 0 || (state & LAZY_SEEN != 0 && state & LAZY_WANTED == 0) {
+        return;
+    }
+    if LAZY_RELAY.fetch_or(LAZY_SEEN, Ordering::AcqRel) & LAZY_WANTED != 0 {
+        // Also when another registration is starting it: this waits for it.
+        start_relay();
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn set_stderr_redaction_state_for_test(state: StderrRedaction) {
     *STDERR_REDACTION
@@ -819,6 +852,7 @@ pub(crate) fn set_stderr_redaction_state_for_test(state: StderrRedaction) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
 }
 
+/// What [`install_stderr_redaction`] achieved, for status reporting.
 pub fn stderr_redaction_state() -> StderrRedaction {
     STDERR_REDACTION
         .lock()
@@ -828,58 +862,117 @@ pub fn stderr_redaction_state() -> StderrRedaction {
 
 /// Route stderr through the redactor (see [`install_stderr_redactor`]) for every
 /// Toolport process: each gateway mode and both desktop shells. Call it first
-/// thing, before anything can write a secret to stderr. If the relay cannot
-/// start, stderr is pointed at the null device rather than left unredacted, and
-/// [`stderr_redaction_state`] says why. Call [`flush_stderr_relay`] before the
-/// process ends normally so its last lines are not lost.
+/// thing, before anything can write a secret to stderr.
+///
+/// A process with no secret has nothing to redact, so this only records that
+/// redaction is wanted ([`StderrRedaction::AwaitingSecret`]); the relay's pipe
+/// and threads start when the first secret is registered (at once, if one
+/// already was). If the relay cannot start, stderr is pointed at the null device
+/// rather than left unredacted, and [`stderr_redaction_state`] says why. Call
+/// [`flush_stderr_relay`] before the process ends normally so its last lines are
+/// not lost.
 pub fn install_stderr_redaction() -> StderrRedaction {
+    use std::sync::atomic::Ordering;
+    // With no stderr at all there is nothing to relay to, and on Unix any file
+    // opened later would take the free fd 2: point it at the null device now.
+    if !has_stderr() {
+        let mut state = STDERR_REDACTION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if LAZY_RELAY.fetch_or(LAZY_WANTED | LAZY_DONE, Ordering::AcqRel) & LAZY_DONE == 0 {
+            *state = match silence_stderr() {
+                Ok(()) => StderrRedaction::NoStderr,
+                Err(error) => StderrRedaction::Unprotected {
+                    reason: format!(
+                        "stderr was closed and the null device could not replace it ({error})"
+                    ),
+                },
+            };
+        }
+        return state.clone();
+    }
+    {
+        let mut state = STDERR_REDACTION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *state == StderrRedaction::NotInstalled {
+            *state = StderrRedaction::AwaitingSecret;
+            // A panic that ends the process (the main thread's, or an abort)
+            // must not take its own report with it. Set now rather than when the
+            // relay starts: a registration may run inside a panic hook, where
+            // the hook cannot be replaced. A no-op until the relay exists.
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                previous(info);
+                sync_stderr_relay(std::time::Duration::from_millis(300));
+            }));
+        }
+    }
+    if LAZY_RELAY.fetch_or(LAZY_WANTED, Ordering::AcqRel) & LAZY_SEEN != 0 {
+        start_relay();
+    }
+    stderr_redaction_state()
+}
+
+/// Start the relay once a secret exists and redaction is wanted, or fall back to
+/// the null device. Idempotent; a concurrent caller waits for the first.
+///
+/// The switch loses and reorders nothing. On Unix, `dup2` replaces fd 2
+/// atomically, and a `write(2)` resolves its descriptor once, on entry: each
+/// write, even one in progress on another thread during the swap, lands whole in
+/// the original file or whole in the pipe. Bytes written before the swap are
+/// already in the original file; the relay writes only bytes written after it,
+/// through a duplicate of the same open file (same offset), so a thread's later
+/// lines always follow its earlier ones. Rust's stderr is unbuffered, so no
+/// bytes wait in-process across the switch. No lock a writer holds is taken
+/// here, so a registration on a thread that holds stderr cannot deadlock; nor
+/// can one on the relay's own threads, which take neither lock held here (their
+/// sync uses `try_lock`) and so cannot block the start they would wait for.
+///
+/// On Windows, Rust fetches the standard error handle on every write, and
+/// pointing the C runtime's fd 2 at the pipe closes the handle fd 2 wrapped
+/// (usually that same handle) and clears the standard handle for a moment. A
+/// Rust write in that window would be dropped, so the swap holds Rust's stderr
+/// lock and every Rust write falls wholly before or after it; the C runtime's
+/// own writes take its fd lock, which `_dup2` holds too. The stderr lock is
+/// reentrant and always taken before ours, so a registering thread that already
+/// holds it proceeds, and two registering threads take the locks in one order.
+fn start_relay() {
+    use std::sync::atomic::Ordering;
+    #[cfg(windows)]
+    let _writers = std::io::stderr().lock();
     let mut state = STDERR_REDACTION
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if LAZY_RELAY.load(Ordering::Acquire) & LAZY_DONE != 0 {
+        return;
+    }
     let relayed = || {
         STDERR_RELAY
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some()
     };
-    if relayed() {
-        *state = StderrRedaction::Relayed;
-        return state.clone();
-    }
-    // With no stderr at all there is nothing to relay to, and on Unix the
-    // relay's own pipe would take the free fd 2.
-    let had_stderr = has_stderr();
-    if had_stderr {
+    if !relayed() {
         install_stderr_redactor();
-        if relayed() {
-            // A panic that ends the process (the main thread's, or an abort)
-            // must not take its own report with it.
-            let previous = std::panic::take_hook();
-            std::panic::set_hook(Box::new(move |info| {
-                previous(info);
-                sync_stderr_relay(std::time::Duration::from_millis(300));
-            }));
-            *state = StderrRedaction::Relayed;
-            return state.clone();
-        }
     }
-    let failure = std::io::Error::last_os_error();
-    *state = match silence_stderr() {
-        Ok(()) if !had_stderr => StderrRedaction::NoStderr,
-        Err(error) if !had_stderr => StderrRedaction::Unprotected {
-            reason: format!("stderr was closed and the null device could not replace it ({error})"),
-        },
-        Ok(()) => StderrRedaction::Silenced {
-            reason: format!("the stderr redaction relay could not start ({failure})"),
-        },
-        Err(error) => StderrRedaction::Unprotected {
-            reason: format!(
-                "the stderr redaction relay could not start ({failure}), and the null \
-                 device could not replace stderr ({error})"
-            ),
-        },
+    *state = if relayed() {
+        StderrRedaction::Relayed
+    } else {
+        let failure = std::io::Error::last_os_error();
+        match silence_stderr() {
+            Ok(()) => StderrRedaction::Silenced {
+                reason: format!("the stderr redaction relay could not start ({failure})"),
+            },
+            Err(error) => StderrRedaction::Unprotected {
+                reason: format!(
+                    "the stderr redaction relay could not start ({failure}), and the null \
+                     device could not replace stderr ({error})"
+                ),
+            },
+        }
     };
-    state.clone()
+    LAZY_RELAY.fetch_or(LAZY_DONE, Ordering::AcqRel);
 }
 
 #[cfg(unix)]
@@ -1235,6 +1328,186 @@ mod tests {
             "{stdout}"
         );
         assert!(stdout.contains("recorded=Silenced"), "{stdout}");
+    }
+
+    /// What fd 2 is right now: an identity to compare, and whether it is a pipe.
+    #[cfg(unix)]
+    fn stderr_identity() -> (u64, u64, bool) {
+        // SAFETY: fstat fills a zeroed struct for fd 2.
+        unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            assert_eq!(libc::fstat(2, &mut st), 0);
+            (
+                st.st_dev as u64,
+                st.st_ino as u64,
+                st.st_mode & libc::S_IFMT == libc::S_IFIFO,
+            )
+        }
+    }
+
+    #[cfg(windows)]
+    fn stderr_identity() -> (u64, u64, bool) {
+        use windows_sys::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_PIPE};
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+        // SAFETY: reads the standard error handle and asks its type.
+        unsafe {
+            let handle = GetStdHandle(STD_ERROR_HANDLE);
+            (handle as u64, 0, GetFileType(handle) == FILE_TYPE_PIPE)
+        }
+    }
+
+    /// Whether any relay machinery exists in this process: the relay itself, or
+    /// (on Linux, where threads can be listed) one of its threads.
+    fn relay_running() -> bool {
+        let relay = STDERR_RELAY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        #[cfg(target_os = "linux")]
+        let threads = std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .flatten()
+            .filter_map(|task| std::fs::read_to_string(task.path().join("comm")).ok())
+            .any(|name| name.starts_with("toolport-stderr"));
+        #[cfg(not(target_os = "linux"))]
+        let threads = false;
+        relay || threads
+    }
+
+    /// Child half of the lazy relay tests: wants redaction with no secret known,
+    /// then learns one while another thread keeps writing.
+    #[test]
+    fn stderr_lazy_relay_child() {
+        let Some(secret) = std::env::var_os("TOOLPORT_STDERR_LAZY_CHILD") else {
+            return;
+        };
+        let secret = secret.to_string_lossy().to_string();
+        let before = stderr_identity();
+        let state = install_stderr_redaction();
+        let after = stderr_identity();
+        println!("state={state:?}");
+        println!("recorded={:?}", stderr_redaction_state());
+        println!("unchanged={} pipe={}", after == before, after.2);
+        println!("relay={}", relay_running());
+        let warnings = crate::secret_redact::status_notes()
+            .into_iter()
+            .filter(|note| note.contains("stderr"))
+            .count();
+        println!("stderr-warnings={warnings}");
+        eprintln!("before switch 1");
+        eprintln!("before switch 2");
+        // One thread writes a numbered stream across the switch; every line must
+        // arrive, in order.
+        let progress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&progress);
+        let writer = std::thread::spawn(move || {
+            for i in 0..3000 {
+                eprintln!("seq {i}");
+                seen.store(i + 1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        while progress.load(std::sync::atomic::Ordering::SeqCst) < 500 {
+            std::thread::yield_now();
+        }
+        crate::secret_redact::register("lazy-server", "LAZY_TOKEN", &secret);
+        // Registration returned, so the relay is in place: this is redacted.
+        eprintln!("after switch {secret}");
+        println!(
+            "registered relay={} pipe={} recorded={:?}",
+            relay_running(),
+            stderr_identity().2,
+            stderr_redaction_state()
+        );
+        writer.join().unwrap();
+        let native = format!("native after switch {secret}\n");
+        #[cfg(unix)]
+        // SAFETY: writes a live buffer to fd 2.
+        unsafe {
+            libc::write(2, native.as_ptr().cast(), native.len());
+        }
+        #[cfg(windows)]
+        {
+            extern "C" {
+                fn _write(fd: i32, buf: *const std::ffi::c_void, count: u32) -> i32;
+            }
+            // SAFETY: writes a live buffer to the CRT's fd 2.
+            unsafe {
+                _write(2, native.as_ptr().cast(), native.len() as u32);
+            }
+        }
+        eprintln!("last line {secret}");
+        flush_stderr_relay(std::time::Duration::from_secs(5));
+    }
+
+    fn run_lazy_child(label: &str, secret: &str) -> (String, String) {
+        let dir = scratch(label);
+        let err = dir.join("stderr.txt");
+        let file = std::fs::File::create(&err).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon_log::tests::stderr_lazy_relay_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TOOLPORT_STDERR_LAZY_CHILD", secret)
+            .stderr(file)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let text = std::fs::read_to_string(&err).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(output.status.success(), "{stdout}\n{text}");
+        (stdout, text)
+    }
+
+    /// Failure mode: every process that wants redaction starts the relay (two
+    /// threads, a pipe, a signal thread) at once, though most installs never
+    /// register a secret and so have nothing to redact.
+    #[test]
+    fn a_process_without_secrets_keeps_its_stderr_and_starts_no_relay() {
+        let (stdout, _) = run_lazy_child("stderr-lazy-idle", "lazy-canary-4Nf7-SECRET");
+        assert!(stdout.contains("state=AwaitingSecret"), "{stdout}");
+        assert!(stdout.contains("recorded=AwaitingSecret"), "{stdout}");
+        assert!(stdout.contains("unchanged=true pipe=false"), "{stdout}");
+        assert!(stdout.contains("relay=false"), "{stdout}");
+        assert!(stdout.contains("stderr-warnings=0"), "{stdout}");
+    }
+
+    /// Failure mode: the relay starts after the first secret is learned, but the
+    /// registration returns before stderr is swapped (the secret is written in
+    /// the clear), or lines written across the swap are lost or reordered.
+    #[test]
+    fn the_first_secret_starts_the_relay_without_losing_or_reordering_output() {
+        let secret = "lazy-canary-4Nf7-SECRET";
+        let (stdout, text) = run_lazy_child("stderr-lazy-switch", secret);
+        assert!(
+            stdout.contains("registered relay=true pipe=true recorded=Relayed"),
+            "{stdout}"
+        );
+        assert!(!text.contains(secret), "{text}");
+        assert!(
+            text.contains("after switch [secret:LAZY_TOKEN]\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("native after switch [secret:LAZY_TOKEN]\n"),
+            "{text}"
+        );
+        assert!(text.contains("last line [secret:LAZY_TOKEN]"), "{text}");
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {text}"))
+        };
+        assert!(at("before switch 1\n") < at("before switch 2\n"));
+        assert!(at("before switch 2\n") < at("seq 0\n"));
+        assert!(at("native after switch") < at("last line"));
+        let seq: Vec<usize> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("seq "))
+            .map(|n| n.parse().unwrap())
+            .collect();
+        assert_eq!(seq, (0..3000).collect::<Vec<_>>(), "lost or reordered");
     }
 
     fn scratch(label: &str) -> PathBuf {
