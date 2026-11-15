@@ -973,3 +973,64 @@ fn crush_and_antigravity_ignore_their_old_locations() {
         fixture.home.join(".gemini/config/mcp_config.json")
     );
 }
+
+/// An upgrader's Goose connection in `~/Library/Application Support/Block/goose`
+/// (where older Toolport wrote it) moves to the file Goose reads, and the user's
+/// own extensions stay in the old file untouched.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_upgraders_goose_connection_moves_from_application_support_on_macos() {
+    let fixture = Fixture::new("relocate-goose");
+    let legacy = fixture
+        .home
+        .join("Library")
+        .join("Application Support")
+        .join("Block")
+        .join("goose")
+        .join("config.yaml");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(
+        &legacy,
+        "extensions:\n  native:\n    type: stdio\n    name: native\n    cmd: native\n    args: []\n    enabled: true\n",
+    )
+    .unwrap();
+    let entry: ServerEntry = serde_json::from_value(json!({"id": "toolport", "name": "toolport",
+        "transport": "stdio", "command": fixture.gateway(),
+        "env": [{"key": "TOOLPORT_CLIENT_ID", "value": "goose"}]}))
+    .unwrap();
+    edit_format(Format::YamlExtensions, &legacy, Some(&entry), false).unwrap();
+    let names = |path: &Path| -> Vec<String> {
+        parse_client_content(
+            Format::YamlExtensions,
+            &std::fs::read_to_string(path).unwrap(),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|server| server.name)
+        .collect()
+    };
+    assert!(names(&legacy).contains(&GATEWAY_ENTRY_NAME.to_string()));
+
+    let outcome = relocate::relocate_all(fixture.gateway(), &HashMap::new());
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    let target = client_config_path("goose").unwrap();
+    assert_eq!(
+        target,
+        fixture
+            .home
+            .join(".config")
+            .join("goose")
+            .join("config.yaml")
+    );
+    let moved = parse_client_content(
+        Format::YamlExtensions,
+        &std::fs::read_to_string(&target).unwrap(),
+    )
+    .unwrap();
+    let gateway = moved
+        .iter()
+        .find(|server| server.name == GATEWAY_ENTRY_NAME)
+        .expect("Toolport's Goose connection is in the file Goose reads");
+    assert_eq!(gateway.command.as_deref(), Some(fixture.gateway()));
+    assert_eq!(names(&legacy), vec!["native".to_string()]);
+}
