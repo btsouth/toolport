@@ -17,12 +17,15 @@ source "$HERE/common.sh"
 source "$HERE/ui.sh"
 
 SECRET="$(cat "$SECRET_FILE")"
-SECRET_SHA="sha256:$(printf '%s' "$SECRET" | shasum -a 256 | cut -d' ' -f1)"
+[[ ${#SECRET} -ge 20 ]] || { fail "test token is ready" "$SECRET_FILE is missing or short"; finish_step; }
+CLIENTS="$(client_list "$MANIFEST")" || { fail "client manifest readable" "$MANIFEST"; finish_step; }
 NODE="$(command -v node)"
 MOCK_DIR="$HOME/mcp-servers"
 MOCK="$MOCK_DIR/mock-mcp.mjs"
 mkdir -p "$MOCK_DIR"
 cp "$HERE/mock-mcp.mjs" "$MOCK"
+# The mock compares its token with this file in constant time (no hashing).
+printf '%s' "$SECRET_FILE" >"$MOCK_DIR/expected-token-path"
 REGISTRY="$DATA_DIR/registry.json"
 ENTRIES="$EVIDENCE/client-entries-$LABEL"
 # Signed builds call the mock server, which needs the keychain token; unsigned
@@ -43,8 +46,8 @@ if ui_wait "Welcome to Toolport" 10; then
   missing=""
   while IFS=$'\t' read -r _ name; do
     if ui_wait "$name" 3; then detected+="$name, "; else missing+="$name, "; fi
-  done < <(python3 -c 'import json,sys; [print(k + "\t" + v["name"]) for k, v in json.load(open(sys.argv[1])).items()]' "$MANIFEST")
-  if [[ -z "$missing" ]]; then
+  done <<<"$CLIENTS"
+  if [[ -z "$missing" && -n "$detected" ]]; then
     pass "onboarding lists every seeded client" "${detected%, }"
   else
     fail "onboarding lists every seeded client" "missing: ${missing%, } (listed: ${detected%, })"
@@ -55,8 +58,10 @@ if ui_wait "Welcome to Toolport" 10; then
   else
     fail "onboarding can be completed" "no finish button found"
   fi
+elif [[ "$LABEL" == previous ]]; then
+  untested "onboarding on the previous release" "not shown within 10s; the earlier release may word or gate it differently"
 else
-  info "onboarding" "not shown on this launch"
+  fail "onboarding shows on a clean first launch" "no \"Welcome to Toolport\" within 10s"
 fi
 
 # ── Every main screen ─────────────────────────────────────────────────────
@@ -149,25 +154,41 @@ else
 fi
 
 # The token must not be on disk in plain text anywhere Toolport or a client writes.
-plain="$(grep -rIl --exclude-dir=Keychains -F -- "$SECRET" "$HOME/Library" "$HOME/.claude.json" "$HOME/.cursor" \
-  "$HOME/.codex" "$HOME/.config" "$HOME/.gemini" "$HOME/.copilot" "$HOME/.codeium" "$HOME/.kiro" 2>/dev/null | head -5)"
-if [[ -z "$plain" ]]; then
-  pass "token is not on disk in plain text" "searched ~/Library (except Keychains) and client config folders"
+# grep: 0 found, 1 searched and not found, 2 some files could not be read.
+search=()
+for p in "$HOME/Library" "$HOME/.claude.json" "$HOME/.claude" "$HOME/.cursor" "$HOME/.codex" "$HOME/.config" \
+  "$HOME/.gemini" "$HOME/.copilot" "$HOME/.codeium" "$HOME/.kiro" "$HOME/Library/Application Support/Toolport"; do
+  [[ -e "$p" ]] && search+=("$p")
+done
+grep -rIl --exclude-dir=Keychains -F -- "$SECRET" "${search[@]}" >"$EVIDENCE/logs/plain-text-hits-$LABEL.txt" 2>"$EVIDENCE/logs/plain-text-errors-$LABEL.txt"
+rc=$?
+unreadable="$(grep -c . "$EVIDENCE/logs/plain-text-errors-$LABEL.txt")"
+others="$(grep -vcE 'Operation not permitted|Permission denied|No such file' "$EVIDENCE/logs/plain-text-errors-$LABEL.txt")"
+if [[ $rc -eq 0 ]]; then
+  fail "token is not on disk in plain text" "found in: $(head -5 "$EVIDENCE/logs/plain-text-hits-$LABEL.txt" | tr '\n' ' ')"
+elif [[ $rc -eq 1 || ( $rc -eq 2 && $others -eq 0 ) ]]; then
+  pass "token is not on disk in plain text" "searched ${#search[@]} locations (~/Library except Keychains, client config folders)"
+  [[ $unreadable -eq 0 ]] || untested "token not in plain text in files the runner cannot read" "$unreadable paths protected by macOS privacy controls (logs/plain-text-errors-$LABEL.txt)"
 else
-  fail "token is not on disk in plain text" "found in: $plain"
+  fail "token is not on disk in plain text" "grep exit $rc: $(head -3 "$EVIDENCE/logs/plain-text-errors-$LABEL.txt" | tr '\n' ' ')"
 fi
 
 # Toolport keeps server secrets in the data-protection keychain under its team
 # access group, not in the file-based login keychain.
-if security find-generic-password -s conduit-mcp -a "${SERVER_ID:-x}::MOCK_API_TOKEN" >/dev/null 2>&1; then
+# security exits 44 (errSecItemNotFound) when the item is absent.
+tmo 30 security find-generic-password -s conduit-mcp -a "${SERVER_ID:-x}::MOCK_API_TOKEN" >/dev/null 2>"$EVIDENCE/logs/login-keychain-lookup-$LABEL.err"
+rc=$?
+if [[ $rc -eq 44 ]]; then
+  pass "token is not in the legacy login keychain" "expected: it lives in the data-protection keychain"
+elif [[ $rc -eq 0 ]]; then
   fail "token is not in the legacy login keychain" "found conduit-mcp ${SERVER_ID}::MOCK_API_TOKEN in the login keychain"
 else
-  pass "token is not in the legacy login keychain" "expected: it lives in the data-protection keychain"
+  fail "token is not in the legacy login keychain" "lookup failed (exit $rc): $(head -c 200 "$EVIDENCE/logs/login-keychain-lookup-$LABEL.err")"
 fi
 security dump-keychain "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null |
   awk '/^keychain:/{blk=$0; next} {blk=blk "\n" $0} /^    "svce"/ && tolower($0) ~ /conduit|toolport/ {print blk}' \
-  >"$EVIDENCE/logs/login-keychain-toolport-items-$LABEL.txt" || true
-info "Toolport items in the login keychain" "$(grep -c '"svce"' "$EVIDENCE/logs/login-keychain-toolport-items-$LABEL.txt" 2>/dev/null || echo 0) (logs/login-keychain-toolport-items-$LABEL.txt)"
+  >"$EVIDENCE/logs/login-keychain-toolport-items-$LABEL.txt"
+info "note: Toolport items in the login keychain" "$(grep -c '"svce"' "$EVIDENCE/logs/login-keychain-toolport-items-$LABEL.txt" 2>/dev/null || echo 0) (logs/login-keychain-toolport-items-$LABEL.txt)"
 
 log "Reading the token back from the gateway process"
 tmo 60 "$GATEWAY" --selftest-secrets >"$EVIDENCE/logs/selftest-secrets-$LABEL.log" 2>&1
@@ -205,7 +226,7 @@ while IFS=$'\t' read -r cid name; do
     tpui key 53 >/dev/null 2>&1 || true # Escape any open dialog before the next client
   fi
   first=0
-done < <(python3 -c 'import json,sys; [print(k + "\t" + v["name"]) for k, v in json.load(open(sys.argv[1])).items()]' "$MANIFEST")
+done <<<"$CLIENTS"
 shot "$LABEL-clients-after-connect" >/dev/null
 no_prompt_check "after connecting clients"
 
@@ -216,33 +237,54 @@ python3 -c 'import json,sys,shutil,os
 for k, v in json.load(open(sys.argv[1])).items():
     if os.path.exists(v["path"]):
         shutil.copyfile(v["path"], os.path.join(sys.argv[2], k + os.path.splitext(v["path"])[1]))' "$MANIFEST" "$EVIDENCE/client-configs-$LABEL"
-python3 "$HERE/clients.py" check "$HOME" "$MANIFEST" "$ENTRIES" "--registry=$REGISTRY" | sed "s/^clients\t/clients ($LABEL)\t/" >>"$RESULTS"
-grep -q $'\tFAIL\t' <(grep "^clients ($LABEL)" "$RESULTS") && STEP_FAILED=1
+record_rows "clients ($LABEL)" "client configs validated" python3 "$HERE/clients.py" check "$HOME" "$MANIFEST" "$ENTRIES" "--registry=$REGISTRY"
 
 # ── A real stdio tool call through each entry Toolport wrote ──────────────
 log "Calling the mock server through each client entry"
-for entry in "$ENTRIES"/*.json; do
-  [[ -e "$entry" ]] || continue
-  cid="$(basename "$entry" .json)"
-  out="$EVIDENCE/logs/tool-call-$LABEL-$cid.json"
-  MCP_CALL_TIMEOUT_MS=90000 node "$HERE/mcp-call.mjs" "$entry" "$CALL_TOOL" >"$out" 2>&1 &
-  call=$!
-  approved="$(approve_pending 95 "$call")"
-  wait "$call"
-  rc=$?
-  result="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("result",""), "|", d.get("calledVia",""), "|", d.get("detail",""))' "$out" 2>/dev/null)"
-  if [[ $rc -eq 0 ]] && { [[ "$CALL_TOOL" != check_secret ]] || grep -qF "$SECRET_SHA" "$out"; }; then
-    pass "tool call through the $cid entry gets the keychain token" "${result} approvals=$approved"
-  else
-    fail "tool call through the $cid entry gets the keychain token" "exit $rc: ${result:-$(tail -c 300 "$out")} approvals=$approved (logs/tool-call-$LABEL-$cid.json)"
+# Every seeded client gets a call: a client with no usable entry is a FAIL here
+# too, so a missing entry can never shrink the set of calls that must pass.
+what="gets the keychain token"
+[[ "$CALL_TOOL" == check_secret ]] || what="reaches Toolport"
+while IFS=$'\t' read -r cid name; do
+  entry="$ENTRIES/$cid.json"
+  if [[ ! -f "$entry" ]]; then
+    fail "tool call through the $cid entry $what" "no usable entry was written for $name"
+    continue
   fi
-done
+  out="$EVIDENCE/logs/tool-call-$LABEL-$cid.json"
+  if tool_call "$entry" "$CALL_TOOL" "$out"; then
+    pass "tool call through the $cid entry $what" "$TOOL_CALL_DETAIL"
+  else
+    fail "tool call through the $cid entry $what" "$TOOL_CALL_DETAIL (logs/tool-call-$LABEL-$cid.json)"
+  fi
+done <<<"$CLIENTS"
 if [[ -n "$(pids_of toolport-gateway)" ]]; then
   pass "gateway daemon runs after client calls" "$(ps -axo pid=,command= | grep toolport-gateway | grep -v grep | head -3 | sed 's/^ *//' | cut -c1-140 | tr '\n' ';')"
 else
   fail "gateway daemon runs after client calls" "no toolport-gateway process"
 fi
 ui_press "Activity" >/dev/null 2>&1 && sleep 2
-shot "$LABEL-activity-after-calls" >/dev/null || true
+shot "$LABEL-activity-after-calls" >/dev/null
 no_prompt_check "after tool calls"
+
+# ── Launch at login ───────────────────────────────────────────────────────
+# Off by default. Turn it on the way a user does and check the login item it
+# creates; the uninstall steps then turn it off (or leave it on) and check.
+log "Launch at login"
+state="$(login_item_state)"
+if [[ "$state" == absent ]]; then
+  pass "Launch at login is off by default" "no $LOGIN_PLIST"
+else
+  fail "Launch at login is off by default" "$state"
+fi
+if set_launch_at_login on; then
+  cp "$LOGIN_PLIST" "$EVIDENCE/logs/login-item-$LABEL.plist"
+  pass "Launch at login creates a login item that starts Toolport" "$(login_item_state) ($LOGIN_PLIST)"
+else
+  fail "Launch at login creates a login item that starts Toolport" "$(login_item_state); see screenshots/fail-*"
+fi
+shot "$LABEL-launch-at-login-on" >/dev/null
+if TPUI_TIMEOUT=20 tpui find "$(app_pid)" "Couldn't enable launch at login" >/dev/null 2>&1; then
+  fail "Launch at login shows no error" "the app shows \"Couldn't enable launch at login\""
+fi
 finish_step

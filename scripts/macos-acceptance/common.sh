@@ -109,6 +109,69 @@ pids_of() { ps -axo pid=,command= | grep -F -- "$1" | grep -v -e 'grep -F' | awk
 TPUI_BIN="${TPUI:-$EVIDENCE/bin/tpui}"
 # Every probe call is bounded: an unresponsive app makes each AX call wait.
 tpui() { tmo "${TPUI_TIMEOUT:-60}" "$TPUI_BIN" "$@"; }
+# winq <query> [arg]: ask windows_query.py about the current window list.
+# 0 found, 1 none, 2 the list was unusable, 3 the probe itself failed.
+winq() {
+  local json
+  json="$(TPUI_TIMEOUT=15 tpui windows 2>/dev/null)" || return 3
+  printf '%s' "$json" | python3 "$(dirname "${BASH_SOURCE[0]}")/windows_query.py" "$@"
+}
+
 APP_PATH="${APP_PATH:-/Applications/Toolport.app}"
 GATEWAY="$APP_PATH/Contents/MacOS/toolport-gateway"
 DATA_DIR="$HOME/Library/Application Support/Toolport"
+
+# record_rows <area> <name> <command...>: append the result rows a helper such
+# as clients.py prints, under <area>. The helper exits 0 (all passed) or 1 (a
+# row failed); any other exit, or no rows at all, is a FAIL of its own, so a
+# crashed helper can never look like a clean result.
+record_rows() {
+  local area="$1" name="$2" out rc err
+  shift 2
+  err="$EVIDENCE/logs/$(printf '%s' "$area-$name" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80).err"
+  out="$("$@" 2>"$err")"
+  rc=$?
+  if [[ $rc -gt 1 || -z "$out" ]] || ! grep -qE $'\t(PASS|FAIL|UNTESTED|INFO)\t' <<<"$out"; then
+    fail "$name" "helper exited $rc with no usable rows: $(tail -c 300 "$err" | tr '\n' ' ')"
+    return 1
+  fi
+  printf '%s\n' "$out" | awk -F'\t' -v OFS='\t' -v a="$area" '{ $1 = a; print }' >>"$RESULTS"
+  if grep -q $'\tFAIL\t' <<<"$out"; then
+    STEP_FAILED=1
+    return 1
+  fi
+  [[ $rc -eq 0 ]] || { fail "$name" "helper exited 1 without a FAIL row"; return 1; }
+}
+
+# client_list <manifest>: "id<TAB>name" lines, or exit non-zero (never an empty
+# success) so loops over clients cannot silently check nothing.
+client_list() {
+  local out
+  out="$(python3 -c 'import json,sys; [print(k + "\t" + v["name"]) for k, v in json.load(open(sys.argv[1])).items()]' "$1")" || return 1
+  [[ -n "$out" ]] || return 1
+  printf '%s\n' "$out"
+}
+
+# Launch at login: tauri-plugin-autostart writes this LaunchAgent (not an
+# SMAppService registration). launchd loads it at the next login.
+LOGIN_PLIST="$HOME/Library/LaunchAgents/Toolport.plist"
+# login_item_state: prints "absent", "ok <program>" or "bad <why>"; returns 0
+# for absent/ok, 1 for a plist that would not start Toolport, 2 if unreadable.
+login_item_state() {
+  [[ -e "$LOGIN_PLIST" ]] || { echo absent; return 0; }
+  local json
+  json="$(plutil -convert json -o - "$LOGIN_PLIST" 2>&1)" || { echo "bad unreadable plist: $json"; return 2; }
+  python3 -c '
+import json, os, sys
+d = json.loads(sys.argv[1])
+args = d.get("ProgramArguments") or []
+prog = args[0] if args else d.get("Program", "")
+why = []
+if d.get("Label") != "Toolport": why.append("Label is %r" % d.get("Label"))
+if not prog: why.append("no program")
+elif not os.access(prog, os.X_OK): why.append("%s does not exist or is not executable" % prog)
+if "--hidden" not in args: why.append("no --hidden argument")
+if d.get("RunAtLoad") is not True: why.append("RunAtLoad is not true")
+print(("bad " + "; ".join(why) + " (program " + str(prog) + ")") if why else ("ok " + prog))
+sys.exit(1 if why else 0)' "$json"
+}

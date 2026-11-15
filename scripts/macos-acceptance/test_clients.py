@@ -123,6 +123,64 @@ class ClientsTest(unittest.TestCase):
         rows = clients.compare(self.home, snap, "untouched")
         self.assertEqual(statuses(rows, "Cursor untouched"), ["FAIL"])
 
+    def cursor_connected(self, user=None):
+        def change(d):
+            d["mcpServers"]["toolport"] = {"command": self.gw, "args": [], "env": {"TOOLPORT_CLIENT_ID": "cursor"}}
+            if user is False:
+                del d["mcpServers"]["filesystem"]
+            elif user is not None:
+                d["mcpServers"]["filesystem"] = user
+
+        self.edit_json("cursor", change)
+
+    def registry(self, server):
+        p = os.path.join(self.tmp.name, "registry.json")
+        with open(p, "w") as f:
+            json.dump({"servers": [server]}, f)
+        return p
+
+    def keeps(self, registry=None):
+        rows = clients.check(self.home, self.manifest, self.entries, registry=registry)
+        return statuses(rows, "Cursor keeps the user's existing server")
+
+    def test_changed_user_server_fails(self):
+        changed = dict(clients.USER_SERVER, args=["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])
+        self.cursor_connected(user=changed)
+        self.assertEqual(self.keeps(), ["FAIL"])
+        self.cursor_connected(user=dict(clients.USER_SERVER, env={"X": "1"}))
+        self.assertEqual(self.keeps(), ["FAIL"])
+
+    def test_registry_copy_must_be_unchanged(self):
+        self.cursor_connected(user=False)
+        self.assertEqual(self.keeps(), ["FAIL"])
+        same = {"id": "fs", "command": "npx", "args": list(clients.USER_SERVER["args"]), "transport": "stdio"}
+        self.assertEqual(self.keeps(self.registry(same)), ["PASS"])
+        other_arg = dict(same, args=["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])
+        self.assertEqual(self.keeps(self.registry(other_arg)), ["FAIL"])
+        self.assertEqual(self.keeps(self.registry(dict(same, env=[{"key": "A", "value": "1"}]))), ["FAIL"])
+        self.assertEqual(self.keeps(self.registry(dict(same, command="node"))), ["FAIL"])
+
+    def test_changed_in_client_and_copied_to_registry_fails(self):
+        same = {"id": "fs", "command": "npx", "args": list(clients.USER_SERVER["args"]), "transport": "stdio"}
+        self.cursor_connected(user=dict(clients.USER_SERVER, args=["-y"]))
+        self.assertEqual(self.keeps(self.registry(same)), ["FAIL"])
+
+    def test_malformed_entry_is_a_fail_row_not_a_crash(self):
+        self.edit_json("cursor", lambda d: d.update(mcpServers={"toolport": [], "filesystem": 3}))
+        rows = clients.check(self.home, self.manifest, self.entries)
+        self.assertEqual(statuses(rows, "Cursor config has the client's documented shape"), ["FAIL"])
+        self.assertTrue(statuses(rows, "Windsurf") or statuses(rows, "Devin"), "later clients are still checked")
+
+    def test_goose_wrong_location_is_named(self):
+        wrong = os.path.join(self.home, "Library/Application Support/Block/goose/config.yaml")
+        os.makedirs(os.path.dirname(wrong))
+        with open(wrong, "w") as f:
+            f.write("extensions:\n  toolport:\n    type: stdio\n")
+        rows = clients.check(self.home, self.manifest, self.entries)
+        detail = [r for r in rows if "Goose has a Toolport entry" in r][0]
+        self.assertIn("\tFAIL\t", detail)
+        self.assertIn("never reads", detail)
+
     def test_strip_jsonc_keeps_strings(self):
         text = '{"a": "http://x//y", /* c */ "b": [1, 2,], // tail\n}'
         self.assertEqual(json.loads(clients.strip_jsonc(text)), {"a": "http://x//y", "b": [1, 2]})

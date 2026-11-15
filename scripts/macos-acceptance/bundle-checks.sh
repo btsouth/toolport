@@ -17,8 +17,8 @@ HELPER="$APP/Contents/Helpers/ToolportGateway.app"
 
 [[ -d "$APP" ]] || { fail "app bundle exists" "$APP missing"; finish_step; }
 version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null)"
-info "version" "$version"
-info "minimum macOS" "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$APP/Contents/Info.plist" 2>/dev/null || echo unset)"
+if [[ -n "$version" ]]; then pass "bundle version readable" "$version"; else fail "bundle version readable" "no CFBundleShortVersionString"; fi
+info "note: minimum macOS" "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$APP/Contents/Info.plist" 2>/dev/null || echo unset)"
 
 if [[ "$SIGNED" == "1" ]]; then
   check "codesign --verify --deep --strict" codesign --verify --deep --strict --verbose=2 "$APP"
@@ -111,14 +111,25 @@ while IFS= read -r -d '' f; do
     if [[ "$sig" != "ok" ]]; then wrong=$((wrong + 1)); fi
   fi
 done < <(find "$APP" -type f -print0)
+what="every Mach-O is $WANT_ARCH"
+[[ "$SIGNED" == "1" ]] && what="$what and signed"
+# The scan must have seen the app's own executable and the gateway, or it
+# looked at the wrong thing.
+exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist" 2>/dev/null)"
+missing=""
+for need in "Contents/MacOS/${exe:-conduit}" "Contents/Helpers/ToolportGateway.app/Contents/MacOS/toolport-gateway"; do
+  cut -f1 "$machos" | grep -qxF "$need" || missing+="$need "
+done
 if (( count == 0 )); then
-  fail "Mach-O binaries found" "none under $APP"
+  fail "$what" "no Mach-O binaries found under $APP"
+elif [[ -n "$missing" ]]; then
+  fail "$what" "the scan did not see: $missing($count binaries, logs/macho-$WANT_ARCH.tsv)"
 elif (( wrong == 0 )); then
-  pass "every Mach-O is $WANT_ARCH and signed" "$count binaries: $(cut -f1,2 "$machos" | tr '\t\n' '= ' | cut -c1-300)"
+  pass "$what" "$count binaries: $(cut -f1,2 "$machos" | tr '\t\n' '= ' | cut -c1-300)"
 else
-  fail "every Mach-O is $WANT_ARCH and signed" "$wrong problems; see logs/macho-$WANT_ARCH.tsv"
+  fail "$what" "$wrong problems; see logs/macho-$WANT_ARCH.tsv"
 fi
 if cut -f2 "$machos" | grep -q 'x86_64' && cut -f2 "$machos" | grep -q 'arm64'; then
-  info "universal binaries" "at least one binary is universal"
+  info "note: universal binaries" "at least one binary is universal"
 fi
 finish_step

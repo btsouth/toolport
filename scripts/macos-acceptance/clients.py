@@ -159,7 +159,12 @@ CLIENTS = [
         "name": "Goose",
         "path": ".config/goose/config.yaml",
         "format": "yaml-goose",
-        "doc": "https://block.github.io/goose/docs/guides/config-files (macOS/Linux: ~/.config/goose/config.yaml, extensions with cmd, args, envs)",
+        # Settled 2026-11-15 from Goose v1.59.1 source: crates/goose/src/config/paths.rs
+        # uses etcetera::choose_app_strategy, which is Xdg on macOS (~/.config/goose),
+        # never ~/Library/Application Support. Goose Desktop runs the same goosed config.
+        "doc": "https://goose-docs.ai/docs/guides/config-files (macOS/Linux: ~/.config/goose/config.yaml, extensions with cmd, args, envs); source: https://github.com/aaif-goose/goose/blob/2365bc5e898a38133c373eef2d1357416acd66e2/crates/goose/src/config/paths.rs",
+        # Where Toolport 2.3.x writes on macOS instead; Goose never reads it.
+        "wrong_paths": ["Library/Application Support/Block/goose/config.yaml"],
         "seed_text": (
             "GOOSE_PROVIDER: openai\n"
             "GOOSE_MODEL: gpt-4o\n"
@@ -356,28 +361,67 @@ def entry_of(client, data):
     return {"command": cmd, "args": [str(a) for a in args], "env": {k: str(v) for k, v in env.items()}}, problems
 
 
-def user_server_kept(client, data):
+USER_TABLES = {
+    "json-mcpServers": "mcpServers",
+    "json-copilot": "mcpServers",
+    "json-vscode": "servers",
+    "toml-codex": "mcp_servers",
+    "jsonc-zed": "context_servers",
+    "json-opencode": "mcp",
+}
+
+
+def user_server(client, data):
+    """The user's own pre-existing server object in a parsed config, or None."""
+    if client["format"] == "yaml-goose":
+        return ((data or {}).get("extensions") or {}).get("developer")
+    return ((data or {}).get(USER_TABLES[client["format"]]) or {}).get("filesystem")
+
+
+def seeded_user_server(client):
+    """The same object as it was seeded, parsed with the client's own loader."""
     fmt = client["format"]
-    if fmt == "yaml-goose":
-        return ((data or {}).get("extensions") or {}).get("developer", {}).get("type") == "builtin"
-    table = {
-        "json-mcpServers": "mcpServers",
-        "json-copilot": "mcpServers",
-        "json-vscode": "servers",
-        "toml-codex": "mcp_servers",
-        "jsonc-zed": "context_servers",
-        "json-opencode": "mcp",
-    }[fmt]
-    return "filesystem" in (data.get(table) or {})
+    text = seed_text(client)
+    if fmt.startswith("toml"):
+        data = tomllib.loads(text)
+    elif fmt.startswith("yaml"):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(text)
+        try:
+            data = load_yaml(f.name)
+        finally:
+            os.unlink(f.name)
+    elif fmt.startswith("jsonc"):
+        data = json.loads(strip_jsonc(text))
+    else:
+        data = json.loads(text)
+    return user_server(client, data)
+
+
+def user_server_kept(client, data):
+    """True only when the user's server is still there with every field unchanged."""
+    return user_server(client, data) == seeded_user_server(client)
 
 
 def imported_into(registry):
-    """True when Toolport's registry holds the seeded filesystem server."""
+    """True when Toolport's registry holds the seeded filesystem server unchanged:
+    same command, same arguments, stdio, and no environment added."""
     if not registry or not os.path.exists(registry):
         return False
     with open(registry, encoding="utf-8") as f:
         reg = json.load(f)
-    return any("server-filesystem" in " ".join(s.get("args", [])) for s in reg.get("servers", []))
+    for s in reg.get("servers", []):
+        if (
+            s.get("command") == USER_SERVER["command"]
+            and s.get("args") == USER_SERVER["args"]
+            and s.get("transport", "stdio") == "stdio"
+            and not s.get("env")
+            and not s.get("url")
+        ):
+            return True
+    return False
 
 
 def check(home, manifest_path, entries_dir, expect_connected=True, registry=None):
@@ -397,10 +441,22 @@ def check(home, manifest_path, entries_dir, expect_connected=True, registry=None
         except Exception as e:  # noqa: BLE001 - report any parse failure
             rows.append(row(area, "FAIL", f"{client['name']} config parses", f"{path}: {e}"))
             continue
-        entry, problems = entry_of(client, data)
+        try:
+            entry, problems = entry_of(client, data)
+            kept = user_server_kept(client, data)
+            found = user_server(client, data)
+            imported = found is None and imported_into(registry)
+        except Exception as e:  # noqa: BLE001 - a malformed config is a FAIL, not a crash
+            rows.append(row(area, "FAIL", f"{client['name']} config has the client's documented shape", f"{path}: {type(e).__name__}: {e}"))
+            continue
         if entry is None:
             status = "FAIL" if expect_connected else "INFO"
-            rows.append(row(area, status, f"{client['name']} has a Toolport entry", f"{'; '.join(problems)} ({path})"))
+            detail = f"{'; '.join(problems)} ({path})"
+            for wrong in client.get("wrong_paths", []):
+                wp = os.path.join(home, wrong)
+                if os.path.exists(wp):
+                    detail += f"; Toolport wrote {wp} instead, which {client['name']} never reads. Doc: {client['doc']}"
+            rows.append(row(area, status, f"{client['name']} has a Toolport entry where it reads its config", detail))
             continue
         with open(os.path.join(entries_dir, f"{cid}.json"), "w", encoding="utf-8") as f:
             json.dump(entry, f, indent=2)
@@ -408,12 +464,13 @@ def check(home, manifest_path, entries_dir, expect_connected=True, registry=None
             rows.append(row(area, "FAIL", f"{client['name']} entry matches the client's documented format", f"{'; '.join(problems)}. Doc: {client['doc']}"))
         else:
             rows.append(row(area, "PASS", f"{client['name']} entry matches the client's documented format", f"{entry['command']} at {path}"))
-        if user_server_kept(client, data):
+        if kept:
             rows.append(row(area, "PASS", f"{client['name']} keeps the user's existing server"))
-        elif imported_into(registry):
-            rows.append(row(area, "INFO", f"{client['name']} existing server moved into Toolport", "the connect review imported it; Toolport now serves it through its entry"))
+        elif imported:
+            rows.append(row(area, "PASS", f"{client['name']} keeps the user's existing server", "moved unchanged into Toolport's registry by the connect review"))
         else:
-            rows.append(row(area, "FAIL", f"{client['name']} keeps the user's existing server", f"the seeded server is gone from {path}"))
+            why = "is gone" if found is None else f"was changed to {json.dumps(found)[:200]}"
+            rows.append(row(area, "FAIL", f"{client['name']} keeps the user's existing server", f"the seeded server {why} in {path}, and Toolport's registry has no unchanged copy"))
     return rows
 
 
@@ -428,14 +485,22 @@ def compare(home, manifest_path, label):
         if not os.path.exists(path):
             rows.append(row("clients", "FAIL", f"{name} {label}", f"{path} is missing"))
             continue
-        actual = sha256(path)
+        try:
+            actual = sha256(path)
+        except OSError as e:
+            rows.append(row("clients", "FAIL", f"{name} {label}", f"{path} unreadable: {e}"))
+            continue
         if actual == item["sha256"]:
             rows.append(row("clients", "PASS", f"{name} {label}", f"sha256 {actual[:16]}"))
         else:
-            with open(os.path.join(originals, cid), encoding="utf-8", errors="replace") as f:
-                before = f.read()
-            with open(path, encoding="utf-8", errors="replace") as f:
-                after = f.read()
+            try:
+                with open(os.path.join(originals, cid), encoding="utf-8", errors="replace") as f:
+                    before = f.read()
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    after = f.read()
+            except OSError as e:
+                rows.append(row("clients", "FAIL", f"{name} {label}", f"{path} differs; no diff: {e}"))
+                continue
             import difflib
 
             diff = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), "before", "after", n=0))

@@ -3,9 +3,18 @@
 # clicks and types. Source after common.sh. Every helper waits for its target,
 # and on failure saves the accessibility tree and a screenshot as evidence.
 
+_UI_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Contents/Info.plist" 2>/dev/null || echo conduit)"
 EXE_PATH="$APP_PATH/Contents/MacOS/$EXE"
-app_pid() { pids_of "/Contents/MacOS/$EXE" | head -n 1; }
+# The app's own process: the executable path (ps comm) must end with
+# /Contents/MacOS/<exe> exactly, so helpers such as conduit-gateway or
+# toolport-gateway never match.
+app_pid() {
+  ps -axo pid=,comm= | awk -v s="/Contents/MacOS/$EXE" '{
+    pid = $1; sub(/^ *[0-9]+ +/, "")
+    if (length($0) >= length(s) && substr($0, length($0) - length(s) + 1) == s) { print pid; exit }
+  }'
+}
 UI_FAILS=0
 
 _slug() { printf '%s' "$*" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-60; }
@@ -117,38 +126,39 @@ ui_fill() {
 }
 
 # ui_gone <text> [seconds]: wait until no element labelled <text> exists.
+# Only tpui's "not found" exit (2) counts as gone; a probe error never does.
 ui_gone() {
-  local text="$1" secs="${2:-15}" i pid
+  local text="$1" secs="${2:-15}" i pid rc
   for ((i = 0; i < secs; i++)); do
     pid="$(app_pid)"
-    TPUI_TIMEOUT=20 tpui find "$pid" "$text" >/dev/null 2>&1 || return 0
+    [[ -n "$pid" ]] || return 2
+    TPUI_TIMEOUT=20 tpui find "$pid" "$text" >/dev/null 2>&1
+    rc=$?
+    [[ $rc -eq 2 ]] && return 0
     sleep 1
   done
   return 1
 }
 
-# A keychain or other system authorization prompt on screen. Any such window
-# would block a real user and hang an unattended run.
-system_prompt_visible() {
-  TPUI_TIMEOUT=15 tpui windows | python3 -c '
-import json, sys
-hits = [w for w in json.load(sys.stdin)
-        if w["owner"] in ("SecurityAgent", "UserNotificationCenter", "universalAccessAuthWarn", "coreautha")
-        and w["onscreen"] and w["w"] > 50]
-for w in hits:
-    print("%s %s %dx%d" % (w["owner"], w["name"], w["w"], w["h"]))
-sys.exit(0 if hits else 1)'
-}
-
-# no_prompt_check <label>: record whether a system prompt is on screen now.
+# no_prompt_check <label>: record whether a keychain or other system prompt is
+# on screen now. Any such window would block a real user and hang an
+# unattended run. A failed or unparseable probe is a FAIL, never a PASS.
 no_prompt_check() {
-  local what
-  if what="$(system_prompt_visible)"; then
+  local what rc
+  what="$(winq prompt 2>&1)"
+  rc=$?
+  case $rc in
+  0)
     shot "prompt-$(_slug "$1")" >/dev/null || true
     fail "no keychain or system prompt ($1)" "$what (screenshots/prompt-$(_slug "$1").png)"
     return 1
-  fi
-  pass "no keychain or system prompt ($1)"
+    ;;
+  1) pass "no keychain or system prompt ($1)" ;;
+  *)
+    fail "no keychain or system prompt ($1)" "could not read the window list (probe exit $rc): $what"
+    return 1
+    ;;
+  esac
 }
 
 # approve_pending <seconds> <pid-of-call>: while a tool call runs, press
@@ -167,14 +177,83 @@ approve_pending() {
   printf '%s\n' "$approved"
 }
 
+# selftest_check <name> <log>: the gateway reads the server's token back from
+# the keychain. Needs SERVER_ID. A hang or a missing OK line is a FAIL.
+selftest_check() { # selftest_check <name> <log>
+  local name="$1" log="$2" rc
+  tmo 60 "$GATEWAY" --selftest-secrets >"$log" 2>&1
+  rc=$?
+  if [[ $rc -eq 0 ]] && grep -Eq "^OK +$SERVER_ID :: MOCK_API_TOKEN" "$log"; then
+    pass "$name"
+  elif [[ $rc -eq 142 ]]; then
+    fail "$name" "gateway --selftest-secrets hung for 60s (a keychain prompt would do this)"
+  else
+    fail "$name" "exit $rc: $(tr '\n' ' ' <"$log" | cut -c1-300)"
+  fi
+}
+
+# tool_call <entry.json> <tool> <out.json>: make a real MCP call through a
+# client entry, pressing Approve if Toolport holds it. Sets TOOL_CALL_DETAIL.
+# Returns 0 only when the call succeeded and, for check_secret, the mock
+# server reported "token matches". Unparseable output is a failure.
+tool_call() {
+  local entry="$1" tool="$2" out="$3" call rc approved summary
+  MCP_CALL_TIMEOUT_MS=90000 node "$_UI_HERE/mcp-call.mjs" "$entry" "$tool" >"$out" 2>&1 &
+  call=$!
+  approved="$(approve_pending 95 "$call")"
+  wait "$call"
+  rc=$?
+  summary="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    print("unparseable call report: %s" % e)
+    sys.exit(1)
+ok = d.get("ok") is True and (sys.argv[2] != "check_secret" or d.get("result") == "token matches")
+print("%s | via %s | %s" % (str(d.get("result", ""))[:120], d.get("calledVia", ""), d.get("detail", "")))
+sys.exit(0 if ok else 1)' "$out" "$tool")"
+  local parsed=$?
+  TOOL_CALL_DETAIL="exit $rc: $summary; approvals=$approved"
+  [[ $rc -eq 0 && $parsed -eq 0 ]]
+}
+
+# set_launch_at_login <on|off>: flip the Settings > General switch until the
+# LaunchAgent on disk matches. Returns 0 when it does; the plist is the truth,
+# not the switch's look. Leaves Settings > General open.
+set_launch_at_login() {
+  local want="$1" n state
+  ui_press "Settings" >/dev/null 2>&1 && ui_press "General" >/dev/null 2>&1 || return 1
+  for n in 1 -1 2; do
+    state="$(login_item_state)"
+    [[ "$want" == on && "$state" == ok* ]] && return 0
+    [[ "$want" == off && "$state" == absent ]] && return 0
+    TPUI_TIMEOUT=30 tpui press "$(app_pid)" "Launch at login" "$n" >&2 2>/dev/null || continue
+    if [[ "$want" == on ]]; then wait_for 10 test -e "$LOGIN_PLIST"; else wait_for 10 test ! -e "$LOGIN_PLIST"; fi
+  done
+  state="$(login_item_state)"
+  [[ "$want" == on && "$state" == ok* ]] || [[ "$want" == off && "$state" == absent ]]
+}
+
+# quit_app: 0 quit normally, 1 had to be killed, 3 was not running.
 quit_app() {
   local pid
   pid="$(app_pid)"
-  [[ -z "$pid" ]] && return 0
+  [[ -z "$pid" ]] && return 3
   tmo 20 osascript -e 'tell application id "com.tsout.conduit" to quit' >/dev/null 2>&1 || true
   if ! wait_for 20 bash -c "! ps -p $pid >/dev/null"; then
     kill "$pid" 2>/dev/null || true
     wait_for 10 bash -c "! ps -p $pid >/dev/null" || kill -9 "$pid" 2>/dev/null || true
     return 1
   fi
+}
+
+# quit_check <check-name>: quit the app and record the outcome.
+quit_check() {
+  quit_app
+  case $? in
+  0) pass "$1" ;;
+  3) fail "$1" "the app was not running" ;;
+  *) fail "$1" "did not quit within 20s and had to be killed" ;;
+  esac
 }

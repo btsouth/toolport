@@ -12,8 +12,15 @@
 //   key <code> [cmd]            post one virtual key code (36 return, 48 tab, 53 esc)
 //   click <x> <y>               left click at global screen coordinates
 //   menubar <pid>               the app's menu bar extras (status items)
+//   display                     JSON: main display's current mode and every mode
+//   setmode <w> <h>             switch the main display to a w x h mode (exit 2 if none)
+//   resize <pid> <w> <h>        move the main window to the top left and resize it;
+//                               prints the size the window actually took
+//   layout <pid>                JSON: window frame, screen frame and every control's
+//                               frame, with its nearest scroll container
 //
-// Exit codes: 0 success, 2 not found, 3 accessibility not granted, 1 other error.
+// Exit codes: 0 success, 2 not found, 3 accessibility not granted, 4 window
+// list unavailable, 1 other error. Callers treat only 2 as "not there".
 // Accessibility calls fail with kAXErrorAPIDisabled (-25211) when the calling
 // process has no Accessibility grant; that is reported, never hidden.
 
@@ -110,6 +117,11 @@ func matches(_ pidArg: String, _ text: String, roles: Set<String>? = nil) -> [AX
     return exact.isEmpty ? partial : exact
 }
 
+func mainWindow(_ app: AXUIElement) -> AXUIElement? {
+    if let w = attr(app, kAXMainWindowAttribute), CFGetTypeID(w) == AXUIElementGetTypeID() { return (w as! AXUIElement) }
+    return (attr(app, kAXWindowsAttribute) as? [AXUIElement])?.first
+}
+
 func postKey(_ code: CGKeyCode, cmd: Bool = false) {
     let src = CGEventSource(stateID: .hidSystemState)
     let down = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: true)
@@ -133,7 +145,9 @@ case "trust":
     ])
 
 case "windows":
-    let list = (CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]]) ?? []
+    guard let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]], !list.isEmpty else {
+        die("window list unavailable", 4)
+    }
     var rows: [[String: Any]] = []
     for w in list {
         let b = w[kCGWindowBounds as String] as? [String: Any] ?? [:]
@@ -286,6 +300,72 @@ case "menubar":
     let items = children(bar as! AXUIElement)
     for el in items { print("\(str(el, kAXRoleAttribute)) \"\(label(el))\" \(frame(el).map { "@\(Int($0.minX)),\(Int($0.minY))" } ?? "")") }
     if items.isEmpty { exit(2) }
+
+case "display":
+    let d = CGMainDisplayID()
+    guard let cur = CGDisplayCopyDisplayMode(d) else { die("no display mode", 4) }
+    let opts = [kCGDisplayShowDuplicateLowResolutionModes as String: true] as CFDictionary
+    let modes = (CGDisplayCopyAllDisplayModes(d, opts) as? [CGDisplayMode]) ?? []
+    emit([
+        "current": ["w": cur.width, "h": cur.height, "pixelW": cur.pixelWidth, "pixelH": cur.pixelHeight],
+        "bounds": ["w": Double(CGDisplayBounds(d).width), "h": Double(CGDisplayBounds(d).height)],
+        "modes": modes.map { ["w": $0.width, "h": $0.height, "pixelW": $0.pixelWidth, "pixelH": $0.pixelHeight, "usable": $0.isUsableForDesktopGUI()] },
+    ])
+
+case "setmode":
+    guard args.count >= 4, let w = Int(args[2]), let h = Int(args[3]) else { die("usage: tpui setmode <w> <h>") }
+    let d = CGMainDisplayID()
+    let opts = [kCGDisplayShowDuplicateLowResolutionModes as String: true] as CFDictionary
+    let modes = (CGDisplayCopyAllDisplayModes(d, opts) as? [CGDisplayMode]) ?? []
+    guard let mode = modes.first(where: { $0.width == w && $0.height == h && $0.isUsableForDesktopGUI() })
+        ?? modes.first(where: { $0.width == w && $0.height == h }) else { die("no \(w)x\(h) mode", 2) }
+    var cfg: CGDisplayConfigRef?
+    guard CGBeginDisplayConfiguration(&cfg) == .success else { die("CGBeginDisplayConfiguration failed") }
+    CGConfigureDisplayWithDisplayMode(cfg, d, mode, nil)
+    let err = CGCompleteDisplayConfiguration(cfg, .permanently)
+    guard err == .success else { die("display configuration failed (\(err.rawValue))") }
+    usleep(1_500_000)
+    let b = CGDisplayBounds(d)
+    print("\(Int(b.width))x\(Int(b.height))")
+    if Int(b.width) != w || Int(b.height) != h { die("display is \(Int(b.width))x\(Int(b.height)) after the switch", 1) }
+
+case "resize":
+    guard args.count >= 5, let w = Double(args[3]), let h = Double(args[4]) else { die("usage: tpui resize <pid> <w> <h>") }
+    let app = appElement(args[2])
+    guard let el = mainWindow(app) else { die("no window", 2) }
+    var origin = CGPoint(x: 0, y: 30)
+    var size = CGSize(width: w, height: h)
+    AXUIElementSetAttributeValue(el, kAXPositionAttribute as CFString, AXValueCreate(.cgPoint, &origin)!)
+    let err = AXUIElementSetAttributeValue(el, kAXSizeAttribute as CFString, AXValueCreate(.cgSize, &size)!)
+    if err != .success { die("AXSize set failed (\(err.rawValue))") }
+    usleep(800_000)
+    guard let f = frame(el) else { die("no window frame") }
+    print("\(Int(f.width))x\(Int(f.height))")
+
+case "layout":
+    guard args.count >= 3 else { die("usage: tpui layout <pid>") }
+    let app = appElement(args[2])
+    guard let win = mainWindow(app), let wf = frame(win) else { die("no window", 2) }
+    let controls: Set<String> = ["AXButton", "AXLink", "AXRadioButton", "AXCheckBox", "AXPopUpButton", "AXMenuButton", "AXTextField", "AXTextArea", "AXComboBox", "AXSearchField", "AXSlider", "AXSwitch", "AXTab"]
+    var rows: [[String: Any]] = []
+    func rect(_ r: CGRect) -> [String: Double] { ["x": Double(r.minX), "y": Double(r.minY), "w": Double(r.width), "h": Double(r.height)] }
+    func visit(_ el: AXUIElement, _ clip: CGRect?, _ depth: Int) {
+        if depth > 60 { return }
+        let role = str(el, kAXRoleAttribute)
+        if role == "AXMenuBar" { return }
+        var clipHere = clip
+        if role == "AXScrollArea", let f = frame(el) { clipHere = clip.map { $0.intersection(f) } ?? f }
+        if controls.contains(role), let f = frame(el), f.width > 0, f.height > 0 {
+            var row: [String: Any] = ["role": role, "label": String(label(el).prefix(80)), "frame": rect(f)]
+            if let c = clipHere { row["scroll"] = rect(c) }
+            rows.append(row)
+        }
+        for c in children(el) { visit(c, clipHere, depth + 1) }
+    }
+    visit(win, nil, 0)
+    let sb = CGDisplayBounds(CGMainDisplayID())
+    emit(["window": rect(wf), "screen": rect(sb), "controls": rows])
+    if rows.isEmpty { exit(2) }
 
 default:
     die("unknown command \(args[1])")

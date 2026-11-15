@@ -3,7 +3,9 @@
 # what it installed, then uninstall with zap and compare with docs/uninstall.md.
 #
 # usage: homebrew.sh install <expected-tag>
-#        homebrew.sh uninstall
+#        homebrew.sh uninstall <client-manifest.json>
+# The tap's cask tracks only the latest release; the workflow skips this leg
+# (with an UNTESTED row) when an older tag is under test.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 AREA="homebrew"
@@ -17,7 +19,10 @@ install)
   want="${2#v}"
   brew tap btsouth/toolport >"$EVIDENCE/logs/brew-tap.log" 2>&1 || { fail "brew tap btsouth/toolport" "$(tail -n 3 "$EVIDENCE/logs/brew-tap.log")"; finish_step; }
   cask_file="$(brew --repository btsouth/toolport)/Casks/toolport.rb"
-  cp "$cask_file" "$EVIDENCE/logs/live-cask.rb"
+  if ! [[ -s "$cask_file" ]] || ! cp "$cask_file" "$EVIDENCE/logs/live-cask.rb"; then
+    fail "tap cask readable" "$cask_file is missing or empty"
+    finish_step
+  fi
   tap_version="$(sed -n 's/^ *version "\(.*\)"/\1/p' "$cask_file" | head -1)"
   if [[ "$tap_version" == "$want" ]]; then
     pass "tap cask tracks the release" "$tap_version"
@@ -42,21 +47,43 @@ install)
     fail "cask zap keeps the registry, recovery data and credentials" "zap trashes the data folder: $zap_data (docs/uninstall.md: zap keeps registry/recovery data)"
   fi
   if check "brew install --cask $TAP_CASK" brew install --cask "$TAP_CASK"; then
-    q="$(xattr -p com.apple.quarantine "$APP_PATH" 2>/dev/null || true)"
-    info "installed app quarantine" "${q:-none}"
+    q="$(xattr -p com.apple.quarantine "$APP_PATH" 2>/dev/null)"
+    info "note: installed app quarantine" "${q:-none}"
   fi
-  brew info --cask toolport >"$EVIDENCE/logs/brew-info.log" 2>&1 || true
+  brew info --cask toolport >"$EVIDENCE/logs/brew-info.log" 2>&1
   ;;
 uninstall)
+  MANIFEST="${2:-}"
   # Docs: disconnect clients first (the CLI is the documented route for brew users).
   tmo 120 "$GATEWAY" --disconnect-all >"$EVIDENCE/logs/brew-disconnect-all.json" 2>&1
-  info "--disconnect-all before brew uninstall" "exit $?"
+  rc=$?
+  if [[ $rc -eq 0 ]]; then
+    pass "--disconnect-all before brew uninstall" "logs/brew-disconnect-all.json"
+  elif [[ $rc -eq 142 ]]; then
+    fail "--disconnect-all before brew uninstall" "timed out after 120s"
+  else
+    fail "--disconnect-all before brew uninstall" "exit $rc: $(tr -d '\n' <"$EVIDENCE/logs/brew-disconnect-all.json" | cut -c1-300)"
+  fi
+  # Same byte-exact restoration check as uninstall.sh.
+  [[ -n "$MANIFEST" ]] || { fail "client configs compared after disconnecting" "no manifest given"; finish_step; }
+  record_rows homebrew "client configs compared after disconnecting" python3 "$HERE/clients.py" restored "$HOME" "$MANIFEST"
   # shellcheck source=ui.sh
   source "$HERE/ui.sh"
-  quit_app || info "app quit" "had to be killed"
+  # docs/uninstall.md: turn off Launch at login before removing the app.
+  if [[ "$(login_item_state)" == absent ]]; then
+    untested "turning off Launch at login removes the login item" "it was not on (setup could not enable it)"
+  else
+    ui_activate
+    if set_launch_at_login off; then
+      pass "turning off Launch at login removes the login item" "$LOGIN_PLIST is gone"
+    else
+      fail "turning off Launch at login removes the login item" "still there: $(login_item_state)"
+    fi
+  fi
+  quit_check "app quits before uninstall"
   had_registry=0
   [[ -f "$DATA_DIR/registry.json" ]] && had_registry=1
-  find "$DATA_DIR" -maxdepth 2 -print >"$EVIDENCE/logs/data-dir-before-zap.txt" 2>/dev/null || true
+  find "$DATA_DIR" -maxdepth 2 -print >"$EVIDENCE/logs/data-dir-before-zap.txt" 2>&1
   check "brew uninstall --cask --zap toolport" brew uninstall --cask --zap toolport
   if [[ $had_registry -eq 0 ]]; then
     untested "zap keeps registry.json" "no registry existed before zap"

@@ -34,8 +34,9 @@ class RenderSummaryTest(unittest.TestCase):
 
     def test_detail_with_tabs_and_unknown_status(self):
         rows = render_summary.parse("a\tweird\tc\td1\td2\nshort\n")
-        self.assertEqual(rows[0], ("a", "INFO", "c", "d1\td2"))
-        self.assertEqual(rows[1], ("short", "INFO", "", ""))
+        self.assertEqual(rows[0][:3], ("a", "FAIL", "result row is well formed"))
+        self.assertIn("d1\td2", rows[0][3])
+        self.assertEqual(rows[1][1], "FAIL")
 
     def test_main_exit_codes(self):
         with tempfile.TemporaryDirectory() as d:
@@ -51,6 +52,12 @@ class RenderSummaryTest(unittest.TestCase):
             open(empty, "w").close()
             self.assertEqual(render_summary.main(["x", empty]), 1)
             self.assertEqual(render_summary.main(["x", os.path.join(d, "missing.tsv")]), 1)
+            # A failed job with no FAIL row still renders and exits as a failure.
+            self.assertEqual(render_summary.main(["x", ok, "t", "failure"]), 1)
+            self.assertEqual(render_summary.main(["x", ok, "t", "success"]), 0)
+
+    def test_empty_results_render_as_failed(self):
+        self.assertIn("FAILED", render_summary.render([]))
 
 
 if __name__ == "__main__":

@@ -16,10 +16,19 @@ EXE_PATH="$APP_PATH/Contents/MacOS/$EXE"
 # Match any path: a quarantined app copied without Finder runs from a random
 # App Translocation folder, which is itself worth reporting.
 app_pid() { pids_of "/Contents/MacOS/$EXE" | head -n 1; }
-crash_list() { ls -1 "$HOME/Library/Logs/DiagnosticReports" 2>/dev/null | grep -iE 'toolport|conduit' || true; }
+CRASH_DIR="$HOME/Library/Logs/DiagnosticReports"
+# Crash reports for Toolport; exits non-zero only when the folder exists but
+# cannot be listed (a missing folder means no reports yet).
+crash_list() {
+  [[ -d "$CRASH_DIR" ]] || return 0
+  local all
+  all="$(ls -1 "$CRASH_DIR")" || return 1
+  grep -iE 'toolport|conduit' <<<"$all" || true
+}
 windows_json() { TPUI_TIMEOUT=15 tpui windows; }
 
-crashes_before="$(crash_list)"
+crash_probe_ok=1
+crashes_before="$(crash_list)" || crash_probe_ok=0
 tpui trust >"$EVIDENCE/logs/tcc-$LABEL.json" 2>&1
 info "automation grants for the job's processes" "$(tr -d ' \n' <"$EVIDENCE/logs/tcc-$LABEL.json")"
 
@@ -36,27 +45,32 @@ if [[ -n "$quarantine" ]]; then
   log "Looking for the Gatekeeper prompt"
   # The app's process can exist while the prompt holds it, so look for the
   # prompt itself until the app shows a window.
+  gk_probe_errors=0
   for _ in $(seq 1 25); do
-    gk_pid="$(windows_json | python3 -c '
-import json, sys
-for w in json.load(sys.stdin):
-    if w["owner"] in ("CoreServicesUIAgent", "UserNotificationCenter") and w["layer"] >= 0 and w["w"] > 100:
-        print(w["pid"]); break' 2>/dev/null)"
-    [[ -n "$gk_pid" ]] && break
-    [[ -n "$(app_pid)" ]] && TPUI_TIMEOUT=15 tpui windows | grep -q '"owner" : "Toolport"' && break
+    gk_pid="$(winq gatekeeper)"
+    rc=$?
+    [[ $rc -eq 0 ]] && break
+    [[ $rc -ge 2 ]] && gk_probe_errors=$((gk_probe_errors + 1))
+    gk_pid=""
+    [[ -n "$(app_pid)" ]] && winq owner Toolport >/dev/null && break
     sleep 1
   done
   if [[ -n "$gk_pid" ]]; then
-    shot "$LABEL-gatekeeper-prompt" >/dev/null && info "Gatekeeper first-open prompt" "shown (screenshots/$LABEL-gatekeeper-prompt.png)"
+    shot "$LABEL-gatekeeper-prompt" >/dev/null || true
+    pass "Gatekeeper shows its first-open prompt for the quarantined app" "screenshots/$LABEL-gatekeeper-prompt.png"
     tpui dump "$gk_pid" 12 >"$EVIDENCE/logs/ax-gatekeeper-$LABEL.txt" 2>&1
     if tpui press "$gk_pid" "Open" >"$EVIDENCE/logs/gatekeeper-press-$LABEL.log" 2>&1; then
       pass "Gatekeeper prompt accepted through accessibility" "$(cat "$EVIDENCE/logs/gatekeeper-press-$LABEL.log")"
     else
       fail "Gatekeeper prompt accepted through accessibility" "$(tail -n 2 "$EVIDENCE/logs/gatekeeper-press-$LABEL.log" | tr '\n' ' ')"
     fi
-  elif [[ -n "$(app_pid)" ]]; then
-    info "Gatekeeper first-open prompt" "none appeared; the app started directly"
+  elif [[ $gk_probe_errors -gt 0 ]]; then
+    fail "Gatekeeper shows its first-open prompt for the quarantined app" "the window list could not be read $gk_probe_errors times while looking for it"
+  else
+    untested "Gatekeeper shows its first-open prompt for the quarantined app" "no prompt appeared and the app opened directly; macOS did not treat this copy as a first open"
   fi
+else
+  untested "Gatekeeper first-open prompt" "the installed app carries no quarantine attribute (Homebrew or local install path)"
 fi
 
 log "Waiting for the app process"
@@ -77,23 +91,12 @@ else
 fi
 
 # The window is created hidden and shown once the UI loads.
-has_window() {
-  windows_json | python3 -c '
-import json, sys
-pid = int(sys.argv[1])
-ok = [w for w in json.load(sys.stdin) if w["pid"] == pid and w["layer"] == 0 and w["onscreen"] and w["w"] >= 400]
-sys.exit(0 if ok else 1)' "$PID"
-}
+has_window() { winq app-window "$PID" >/dev/null; }
 log "Waiting for the main window"
 if wait_for 45 has_window; then
-  pass "main window appears" "$(windows_json | python3 -c '
-import json, sys
-pid = int(sys.argv[1])
-for w in json.load(sys.stdin):
-    if w["pid"] == pid and w["layer"] == 0 and w["onscreen"]:
-        print("%s %dx%d at %d,%d" % (w["name"] or "(title hidden without screen recording)", w["w"], w["h"], w["x"], w["y"]))' "$PID" | head -1)"
+  pass "main window appears" "$(winq app-window "$PID")"
 else
-  fail "main window appears" "no on-screen window for pid $PID after 45s"
+  fail "main window appears" "no on-screen window for pid $PID after 45s (window probe: $(winq app-window "$PID" 2>&1; echo "exit $?"))"
 fi
 windows_json >"$EVIDENCE/logs/windows-$LABEL.json"
 sleep 3
@@ -121,6 +124,8 @@ if tpui menubar "$PID" >"$EVIDENCE/logs/ax-menubar-$LABEL.txt" 2>&1; then
       fail "menu bar item opens its menu" "no Quit Toolport item after clicking it (screenshots/$LABEL-tray-menu.png)"
     fi
     tpui key 53 >/dev/null 2>&1 || true
+  else
+    fail "menu bar item opens its menu" "could not read the item's position from $(head -n 1 "$EVIDENCE/logs/ax-menubar-$LABEL.txt")"
   fi
 else
   fail "menu bar item exists" "$(tr '\n' ' ' <"$EVIDENCE/logs/ax-menubar-$LABEL.txt")"
@@ -146,14 +151,20 @@ else
 fi
 
 sleep 5
-crashes_after="$(crash_list)"
+crashes_after="$(crash_list)" || crash_probe_ok=0
+if [[ $crash_probe_ok -eq 0 ]]; then
+  fail "no crash report written" "$CRASH_DIR exists but could not be listed"
+  finish_step
+fi
 new_crashes="$(comm -13 <(printf '%s\n' "$crashes_before" | sort) <(printf '%s\n' "$crashes_after" | sort) | grep -v '^$' || true)"
 if [[ -z "$new_crashes" ]]; then
   pass "no crash report written"
 else
   fail "no crash report written" "$(printf '%s ' $new_crashes)"
 fi
-if [[ -z "$(app_pid)" ]]; then
+if [[ -n "$(app_pid)" ]]; then
+  pass "app still running after first launch"
+else
   fail "app still running after first launch" "process $PID exited"
 fi
 finish_step

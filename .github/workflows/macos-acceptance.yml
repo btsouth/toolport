@@ -7,6 +7,11 @@ name: macOS acceptance
 # reports) is uploaded as artifacts; each job summary lists every check and
 # everything the runner could not test.
 on:
+  # TEMPORARY: runs on the PR while the review fixes are checked; removed before merge.
+  pull_request:
+    paths:
+      - ".github/workflows/macos-acceptance.yml"
+      - "scripts/macos-acceptance/**"
   workflow_dispatch:
     inputs:
       tag:
@@ -42,7 +47,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Resolve the release under test
-        run: bash scripts/macos-acceptance/resolve-release.sh "$TAG_INPUT" | sed 's/^tag=/TAG=/; s/^previous=/PREVIOUS_TAG=/' >>"$GITHUB_ENV"
+        run: bash scripts/macos-acceptance/resolve-release.sh "$TAG_INPUT" | sed 's/^tag=/TAG=/; s/^previous=/PREVIOUS_TAG=/; s/^latest=/TAG_IS_LATEST=/' >>"$GITHUB_ENV"
       - name: Prepare the runner and seed client configs
         run: bash scripts/macos-acceptance/prepare.sh
       - name: Install the Apple Silicon dmg
@@ -67,6 +72,10 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 6
         run: bash scripts/macos-acceptance/relaunch.sh new
+      - name: Window and display sizes
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: bash scripts/macos-acceptance/screens.sh new
       - name: Uninstall (Settings, remove data, Trash)
         if: ${{ !cancelled() }}
         timeout-minutes: 8
@@ -76,7 +85,10 @@ jobs:
         run: bash scripts/macos-acceptance/leftovers.sh "uninstall, data removed" --expect-clean
       - name: Write the job summary
         if: always()
-        run: bash scripts/macos-acceptance/finish.sh "New user (dmg) ${TAG:-}"
+        # A step that failed without a FAIL row still fails the summary.
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: bash scripts/macos-acceptance/finish.sh "New user (dmg) ${TAG:-}" "$JOB_STATUS"
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -96,7 +108,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Resolve the release under test
-        run: bash scripts/macos-acceptance/resolve-release.sh "$TAG_INPUT" | sed 's/^tag=/TAG=/; s/^previous=/PREVIOUS_TAG=/' >>"$GITHUB_ENV"
+        run: bash scripts/macos-acceptance/resolve-release.sh "$TAG_INPUT" | sed 's/^tag=/TAG=/; s/^previous=/PREVIOUS_TAG=/; s/^latest=/TAG_IS_LATEST=/' >>"$GITHUB_ENV"
       - name: Prepare the runner and seed client configs
         run: bash scripts/macos-acceptance/prepare.sh
       - name: Install the previous release
@@ -121,10 +133,13 @@ jobs:
         run: bash scripts/macos-acceptance/uninstall.sh upgraded "$CLIENT_MANIFEST" cli
       - name: List leftovers
         if: ${{ !cancelled() }}
-        run: bash scripts/macos-acceptance/leftovers.sh "uninstall, data kept"
+        run: bash scripts/macos-acceptance/leftovers.sh "uninstall, data kept, Launch at login left on" --login-item-left-on
       - name: Write the job summary
         if: always()
-        run: bash scripts/macos-acceptance/finish.sh "Upgrade ${PREVIOUS_TAG:-} to ${TAG:-}"
+        # A step that failed without a FAIL row still fails the summary.
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: bash scripts/macos-acceptance/finish.sh "Upgrade ${PREVIOUS_TAG:-} to ${TAG:-}" "$JOB_STATUS"
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -144,37 +159,149 @@ jobs:
         with:
           persist-credentials: false
       - name: Resolve the release under test
-        run: bash scripts/macos-acceptance/resolve-release.sh "$TAG_INPUT" | sed 's/^tag=/TAG=/; s/^previous=/PREVIOUS_TAG=/' >>"$GITHUB_ENV"
+        run: bash scripts/macos-acceptance/resolve-release.sh "$TAG_INPUT" | sed 's/^tag=/TAG=/; s/^previous=/PREVIOUS_TAG=/; s/^latest=/TAG_IS_LATEST=/' >>"$GITHUB_ENV"
       - name: Prepare the runner and seed client configs
         run: bash scripts/macos-acceptance/prepare.sh
+      # The tap's cask only tracks the latest release, so an older tag cannot be
+      # installed through it. Pinning a local cask would not test the tap.
+      - name: Skip Homebrew for an older tag
+        if: ${{ env.TAG_IS_LATEST != 'true' }}
+        run: printf 'homebrew\tUNTESTED\tHomebrew cask install of %s\tthe tap only tracks the latest release; %s is not it\n' "$TAG" "$TAG" >>"$EVIDENCE/results.tsv"
       - name: Install with Homebrew
+        if: ${{ env.TAG_IS_LATEST == 'true' }}
         run: bash scripts/macos-acceptance/homebrew.sh install "$TAG"
       - name: Check the installed bundle
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.TAG_IS_LATEST == 'true' }}
         run: bash scripts/macos-acceptance/bundle-checks.sh /Applications/Toolport.app arm64 Homebrew
       - name: First launch
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.TAG_IS_LATEST == 'true' }}
         timeout-minutes: 8
         run: bash scripts/macos-acceptance/first-run.sh brew
       - name: Set up through the window
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.TAG_IS_LATEST == 'true' }}
         timeout-minutes: 20
         run: bash scripts/macos-acceptance/ui-setup.sh brew "$CLIENT_MANIFEST"
       - name: Uninstall with Homebrew (zap)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.TAG_IS_LATEST == 'true' }}
         timeout-minutes: 8
-        run: bash scripts/macos-acceptance/homebrew.sh uninstall
+        run: bash scripts/macos-acceptance/homebrew.sh uninstall "$CLIENT_MANIFEST"
       - name: List leftovers
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.TAG_IS_LATEST == 'true' }}
         run: bash scripts/macos-acceptance/leftovers.sh "brew uninstall --zap"
       - name: Write the job summary
         if: always()
-        run: bash scripts/macos-acceptance/finish.sh "Homebrew ${TAG:-}"
+        # A step that failed without a FAIL row still fails the summary.
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: bash scripts/macos-acceptance/finish.sh "Homebrew ${TAG:-}" "$JOB_STATUS"
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-acceptance-homebrew
+          path: ${{ runner.temp }}/macos-acceptance
+          if-no-files-found: error
+          retention-days: 14
+
+  in-app-update:
+    name: In-app update from the previous release
+    if: ${{ !inputs.build_ref }}
+    runs-on: macos-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Resolve the release under test
+        run: bash scripts/macos-acceptance/resolve-release.sh "$TAG_INPUT" | sed 's/^tag=/TAG=/; s/^previous=/PREVIOUS_TAG=/; s/^latest=/TAG_IS_LATEST=/' >>"$GITHUB_ENV"
+      - name: Prepare the runner and seed client configs
+        run: bash scripts/macos-acceptance/prepare.sh
+      # The updater only offers the latest release (releases/latest/download/latest.json).
+      - name: Skip for an older tag
+        if: ${{ env.TAG_IS_LATEST != 'true' }}
+        run: printf 'in-app update\tUNTESTED\tin-app update to %s\tthe updater only offers the latest release; %s is not it\n' "$TAG" "$TAG" >>"$EVIDENCE/results.tsv"
+      - name: Install the previous release
+        if: ${{ env.TAG_IS_LATEST == 'true' }}
+        run: |
+          test -n "$PREVIOUS_TAG" || { echo "::error::no published release before $TAG"; exit 1; }
+          bash scripts/macos-acceptance/install-dmg.sh "$PREVIOUS_TAG" Toolport_aarch64-apple-darwin.dmg
+      - name: First launch of the previous release
+        if: ${{ !cancelled() && env.TAG_IS_LATEST == 'true' }}
+        timeout-minutes: 8
+        run: bash scripts/macos-acceptance/first-run.sh previous
+      - name: Set up the previous release through the window
+        if: ${{ !cancelled() && env.TAG_IS_LATEST == 'true' }}
+        timeout-minutes: 20
+        run: bash scripts/macos-acceptance/ui-setup.sh previous "$CLIENT_MANIFEST"
+      - name: Update through the app
+        if: ${{ !cancelled() && env.TAG_IS_LATEST == 'true' }}
+        timeout-minutes: 15
+        run: bash scripts/macos-acceptance/updater.sh "$TAG" "$CLIENT_MANIFEST"
+      - name: Write the job summary
+        if: always()
+        # A step that failed without a FAIL row still fails the summary.
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: bash scripts/macos-acceptance/finish.sh "In-app update ${PREVIOUS_TAG:-} to ${TAG:-}" "$JOB_STATUS"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-acceptance-in-app-update
+          path: ${{ runner.temp }}/macos-acceptance
+          if-no-files-found: error
+          retention-days: 14
+
+  intel:
+    # macos-15-intel is GitHub's x86_64 image (macos-13 was retired in
+    # December 2025). It runs the Intel dmg natively, not under Rosetta.
+    name: Intel Mac (dmg)
+    if: ${{ !inputs.build_ref }}
+    runs-on: macos-15-intel
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Resolve the release under test
+        run: bash scripts/macos-acceptance/resolve-release.sh "$TAG_INPUT" | sed 's/^tag=/TAG=/; s/^previous=/PREVIOUS_TAG=/; s/^latest=/TAG_IS_LATEST=/' >>"$GITHUB_ENV"
+      - name: Prepare the runner and seed client configs
+        run: bash scripts/macos-acceptance/prepare.sh
+      - name: Install the Intel dmg
+        run: bash scripts/macos-acceptance/install-dmg.sh "$TAG" Toolport_x86_64-apple-darwin.dmg
+      - name: Check the installed bundle
+        if: ${{ !cancelled() }}
+        run: bash scripts/macos-acceptance/bundle-checks.sh /Applications/Toolport.app x86_64 Intel
+      - name: First launch
+        if: ${{ !cancelled() }}
+        timeout-minutes: 8
+        run: bash scripts/macos-acceptance/first-run.sh intel
+      - name: Set up through the window (servers, keychain, clients, tool calls)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: bash scripts/macos-acceptance/ui-setup.sh intel "$CLIENT_MANIFEST"
+      - name: Second launch
+        if: ${{ !cancelled() }}
+        timeout-minutes: 6
+        run: bash scripts/macos-acceptance/relaunch.sh intel
+      - name: Uninstall (Settings, then Trash)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 8
+        run: bash scripts/macos-acceptance/uninstall.sh intel "$CLIENT_MANIFEST" ui
+      - name: List leftovers
+        if: ${{ !cancelled() }}
+        run: bash scripts/macos-acceptance/leftovers.sh "uninstall, data kept"
+      - name: Write the job summary
+        if: always()
+        # A step that failed without a FAIL row still fails the summary.
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: bash scripts/macos-acceptance/finish.sh "Intel Mac (dmg) ${TAG:-}" "$JOB_STATUS"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-acceptance-intel
           path: ${{ runner.temp }}/macos-acceptance
           if-no-files-found: error
           retention-days: 14
@@ -230,6 +357,10 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 6
         run: bash scripts/macos-acceptance/relaunch.sh ref
+      - name: Window and display sizes
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: bash scripts/macos-acceptance/screens.sh ref
       - name: Uninstall (Settings, then Trash)
         if: ${{ !cancelled() }}
         timeout-minutes: 6
@@ -239,7 +370,10 @@ jobs:
         run: bash scripts/macos-acceptance/leftovers.sh "uninstall, data kept"
       - name: Write the job summary
         if: always()
-        run: bash scripts/macos-acceptance/finish.sh "Current ref (unsigned) ${GITHUB_SHA}"
+        # A step that failed without a FAIL row still fails the summary.
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: bash scripts/macos-acceptance/finish.sh "Current ref (unsigned) ${GITHUB_SHA}" "$JOB_STATUS"
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

@@ -18,7 +18,7 @@ source "$HERE/common.sh"
 # shellcheck source=ui.sh
 source "$HERE/ui.sh"
 
-ls -la "$HOME/Library/LaunchAgents" >"$EVIDENCE/logs/launchagents-before-uninstall-$LABEL.txt" 2>&1 || true
+ls -la "$HOME/Library/LaunchAgents" >"$EVIDENCE/logs/launchagents-before-uninstall-$LABEL.txt" 2>&1
 
 if [[ "$MODE" == "ui" ]]; then
   [[ -n "$(app_pid)" ]] || { tmo 60 open "$APP_PATH" & wait_for 45 app_pid; sleep 5; }
@@ -35,25 +35,38 @@ if [[ "$MODE" == "ui" ]]; then
   else
     fail "Remove Toolport from all clients (Settings)" "button or dialog not found"
   fi
-  if ui_press "General"; then
-    shot "$LABEL-settings-general-before-uninstall" >/dev/null
-    tpui find "$(app_pid)" "Launch at login" >"$EVIDENCE/logs/launch-at-login-$LABEL.txt" 2>&1 || true
-    info "Launch at login control" "$(head -n 3 "$EVIDENCE/logs/launch-at-login-$LABEL.txt" | tr '\n' ' ')"
+  # docs/uninstall.md: turn off Launch at login before removing the app.
+  before="$(login_item_state)"
+  if [[ "$before" == absent ]]; then
+    untested "turning off Launch at login removes the login item" "it was not on (setup could not enable it)"
+  elif set_launch_at_login off; then
+    pass "turning off Launch at login removes the login item" "$LOGIN_PLIST is gone"
+  else
+    fail "turning off Launch at login removes the login item" "still there: $(login_item_state)"
   fi
+  shot "$LABEL-settings-general-before-uninstall" >/dev/null
 else
+  # Left on deliberately: this path records what a user who skips that step
+  # is left with (listed by leftovers.sh).
+  state="$(login_item_state)"
+  info "note: Launch at login left on for this uninstall" "$state"
+  [[ "$state" == absent ]] || cp "$LOGIN_PLIST" "$EVIDENCE/logs/login-item-left-on-$LABEL.plist"
   tmo 60 "$GATEWAY" --disconnect-all --dry-run >"$EVIDENCE/logs/disconnect-dry-run-$LABEL.json" 2>&1
-  info "--disconnect-all --dry-run" "exit $? (logs/disconnect-dry-run-$LABEL.json)"
-  if tmo 120 "$GATEWAY" --disconnect-all >"$EVIDENCE/logs/disconnect-all-$LABEL.json" 2>&1; then
+  rc=$?
+  if [[ $rc -eq 0 ]]; then pass "--disconnect-all --dry-run" "logs/disconnect-dry-run-$LABEL.json"
+  else fail "--disconnect-all --dry-run" "exit $rc: $(tr -d '\n' <"$EVIDENCE/logs/disconnect-dry-run-$LABEL.json" | cut -c1-300)"; fi
+  tmo 120 "$GATEWAY" --disconnect-all >"$EVIDENCE/logs/disconnect-all-$LABEL.json" 2>&1
+  rc=$?
+  if [[ $rc -eq 0 ]]; then
     pass "toolport-gateway --disconnect-all" "$(tr -d '\n' <"$EVIDENCE/logs/disconnect-all-$LABEL.json" | cut -c1-200)"
   else
-    fail "toolport-gateway --disconnect-all" "exit $?: $(tr -d '\n' <"$EVIDENCE/logs/disconnect-all-$LABEL.json" | cut -c1-300)"
+    fail "toolport-gateway --disconnect-all" "exit $rc: $(tr -d '\n' <"$EVIDENCE/logs/disconnect-all-$LABEL.json" | cut -c1-300)"
   fi
 fi
 
-python3 "$HERE/clients.py" restored "$HOME" "$MANIFEST" | sed "s/^clients\t/uninstall ($LABEL)\t/" >>"$RESULTS"
-grep "^uninstall ($LABEL)" "$RESULTS" | grep -q $'\tFAIL\t' && STEP_FAILED=1
+record_rows "uninstall ($LABEL)" "client configs compared after disconnecting" python3 "$HERE/clients.py" restored "$HOME" "$MANIFEST"
 
-if quit_app; then pass "app quits"; else fail "app quits" "had to be killed"; fi
+quit_check "app quits"
 
 if [[ $REMOVE_DATA -eq 1 && "$MODE" == "ui" ]]; then
   # Settings > Help and data > Remove Toolport data closes the app and removes
@@ -64,7 +77,7 @@ if [[ $REMOVE_DATA -eq 1 && "$MODE" == "ui" ]]; then
   if ui_press "Settings" && ui_press "Help and data" && ui_press "Remove Toolport data" &&
     ui_wait "Remove Toolport data?" 15; then
     shot "$LABEL-remove-data-confirm" >/dev/null
-    ui_press "Close and remove data" || true
+    ui_press "Close and remove data" || fail "Remove Toolport data confirmed" "\"Close and remove data\" not found"
     if wait_for 120 bash -c "! ps -axo command= | grep -F '/Contents/MacOS/$EXE' | grep -vq grep"; then
       pass "Remove Toolport data closes the app"
     else
@@ -76,7 +89,7 @@ if [[ $REMOVE_DATA -eq 1 && "$MODE" == "ui" ]]; then
     if [[ -n "$report" ]]; then
       cp "$report" "$EVIDENCE/logs/remove-data-report-$LABEL.json"
       left="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get("leftovers") or []), json.dumps(d.get("leftovers"))[:300])' "$report" 2>&1)"
-      if [[ "${left%% *}" == "0" ]]; then
+      if [[ "$left" == "0 "* ]]; then
         pass "Remove Toolport data completes" "report: $(basename "$report")"
       else
         fail "Remove Toolport data completes" "report lists leftovers: $left (logs/remove-data-report-$LABEL.json)"
@@ -90,7 +103,9 @@ if [[ $REMOVE_DATA -eq 1 && "$MODE" == "ui" ]]; then
   no_prompt_check "remove data"
 elif [[ $REMOVE_DATA -eq 1 ]]; then
   tmo 120 "$GATEWAY" --remove-data --dry-run >"$EVIDENCE/logs/remove-data-dry-run-$LABEL.json" 2>&1
-  info "--remove-data --dry-run" "exit $? (logs/remove-data-dry-run-$LABEL.json)"
+  rc=$?
+  if [[ $rc -eq 0 ]]; then pass "--remove-data --dry-run" "logs/remove-data-dry-run-$LABEL.json"
+  else fail "--remove-data --dry-run" "exit $rc: $(tr -d '\n' <"$EVIDENCE/logs/remove-data-dry-run-$LABEL.json" | cut -c1-300)"; fi
   tmo 300 "$GATEWAY" --remove-data --confirm >"$EVIDENCE/logs/remove-data-$LABEL.json" 2>&1
   rc=$?
   if [[ $rc -eq 0 ]]; then
