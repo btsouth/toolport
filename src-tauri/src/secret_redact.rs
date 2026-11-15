@@ -5829,6 +5829,65 @@ mod tests {
         });
     }
 
+    /// Failure mode: a failed read of the stored value was ignored, so the
+    /// value was replaced or deleted with no scrub and no copy kept for one.
+    #[test]
+    fn a_value_whose_read_fails_is_not_replaced_or_deleted() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let old = "unread-secret-kept-8Hc2Wq";
+            crate::secrets::set_secret("unread-srv", "UNREAD_KEY", old).unwrap();
+            let (deleted, replaced) = crate::secrets::tests::with_failed_read("UNREAD_KEY", || {
+                (
+                    crate::secrets::delete_secret("unread-srv", "UNREAD_KEY"),
+                    crate::secrets::set_secret(
+                        "unread-srv",
+                        "UNREAD_KEY",
+                        "unread-secret-new-2Lp7",
+                    ),
+                )
+            });
+            assert!(deleted.is_err(), "the delete went on");
+            assert!(replaced.is_err(), "the replace went on");
+            assert_eq!(
+                crate::secrets::get_secret("unread-srv", "UNREAD_KEY").as_deref(),
+                Some(old)
+            );
+            // Deleting a value that is not there still works.
+            assert!(crate::secrets::delete_secret("unread-srv", "ABSENT_KEY").is_ok());
+        });
+    }
+
+    /// Failure mode: the retired list itself was registered as a secret on
+    /// every save and load, a new registry entry and matcher rebuild each time.
+    #[test]
+    fn the_retired_list_is_not_registered_as_a_secret() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let dir = crate::registry::conduit_dir().unwrap();
+            let old = "retired-listed-value-6Rk3";
+            crate::secrets::set_secret("list-srv", "LIST_KEY", old).unwrap();
+            // The cleanup fails (a log it cannot read), so the value is retired.
+            std::fs::create_dir_all(dir.join("audit.jsonl")).unwrap();
+            std::fs::write(dir.join("gateway.log"), "unrelated\n").unwrap();
+            crate::secrets::set_secret("list-srv", "LIST_KEY", "retired-listed-new-1Qa9").unwrap();
+            assert_eq!(crate::secrets::retired_scrubs_pending(), 1);
+            // A load as the retry runs it, then the count of registry entries
+            // for the list itself.
+            crate::secrets::retry_retired_scrubs();
+            let listed = REGISTRY
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(|map| map.get(&scope_now()))
+                .map_or(0, |reg| {
+                    reg.secrets
+                        .iter()
+                        .filter(|(id, _, _)| id.ends_with("/retired-secret-values"))
+                        .count()
+                });
+            assert_eq!(listed, 0, "the retired list was registered");
+        });
+    }
+
     #[test]
     fn a_recorded_id_does_not_skip_a_value_this_process_knows() {
         let _lock = crate::registry::data_dir_test_lock();

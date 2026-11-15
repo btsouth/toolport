@@ -2033,6 +2033,12 @@ fn scrub_previous(server_id: &str, key: &str, replacement: Option<&str>) -> Resu
     } else {
         platform::get_secret_result(server_id, key)
     };
+    #[cfg(test)]
+    let stored = if tests::read_is_injected_failure(key) {
+        Err("injected secret read failure".to_string())
+    } else {
+        stored
+    };
     if let Ok(Some(old)) = stored {
         if Some(old.as_str()) != replacement {
             if let Err(error) = crate::secret_redact::scrub_value_now(server_id, key, &old) {
