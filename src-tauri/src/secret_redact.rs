@@ -93,6 +93,10 @@ pub struct Matcher {
     ci_prefixes: Vec<String>,
     /// Longest entry of either list, in bytes.
     prefix_reach: usize,
+    /// An automaton could not be built, so this matcher cannot find every
+    /// form: it then withholds all text ([`WITHHELD`]) instead of letting any
+    /// through unredacted.
+    broken: bool,
     /// A larger matcher searched together with this one, its names numbered
     /// after this one's: the process registry's main matcher, while this one
     /// holds only the values registered since it was built. Hits from both are
@@ -359,12 +363,45 @@ fn build(patterns: &[String]) -> Option<AhoCorasick> {
     if patterns.is_empty() {
         return None;
     }
-    AhoCorasickBuilder::new()
-        .match_kind(MatchKind::Standard)
-        .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
-        .build(patterns)
-        .ok()
+    built(
+        AhoCorasickBuilder::new()
+            .match_kind(MatchKind::Standard)
+            .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
+            .build(patterns),
+    )
 }
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: every automaton build on this thread fails, as one past the
+    /// library's limits would.
+    static FAIL_BUILDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// Set when an automaton for a non-empty pattern set could not be built
+    /// during the [`Matcher::new_with`] running on this thread.
+    static BUILD_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn built(result: Result<AhoCorasick, aho_corasick::BuildError>) -> Option<AhoCorasick> {
+    #[cfg(test)]
+    let result = if FAIL_BUILDS.with(|f| f.get()) {
+        Err(())
+    } else {
+        result.map_err(|_| ())
+    };
+    match result {
+        Ok(ac) => Some(ac),
+        Err(_) => {
+            BUILD_FAILED.with(|f| f.set(true));
+            None
+        }
+    }
+}
+
+/// What a matcher that could not be built writes in place of any text.
+pub const WITHHELD: &str = "[withheld: secret redaction unavailable]";
 
 impl Matcher {
     pub fn new<N: AsRef<str>, V: AsRef<str>>(secrets: &[(N, V)]) -> Self {
@@ -443,6 +480,7 @@ impl Matcher {
                 }
             }
         }
+        BUILD_FAILED.with(|f| f.set(false));
         let raw_texts: Vec<String> = raw_patterns.iter().map(|(p, _)| p.clone()).collect();
         let json_texts: Vec<String> = raw_texts.iter().map(|p| json_escaped(p)).collect();
         let longest_chars = raw_texts
@@ -483,12 +521,13 @@ impl Matcher {
         let ci_texts: Vec<String> = ci_patterns.iter().map(|(t, _)| t.clone()).collect();
         let ci = (!ci_texts.is_empty())
             .then(|| {
-                AhoCorasickBuilder::new()
-                    .match_kind(MatchKind::Standard)
-                    .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
-                    .ascii_case_insensitive(true)
-                    .build(&ci_texts)
-                    .ok()
+                built(
+                    AhoCorasickBuilder::new()
+                        .match_kind(MatchKind::Standard)
+                        .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
+                        .ascii_case_insensitive(true)
+                        .build(&ci_texts),
+                )
             })
             .flatten();
         let mut prefixes: Vec<String> = raw_patterns
@@ -508,13 +547,17 @@ impl Matcher {
             .map(String::len)
             .max()
             .unwrap_or(0);
+        let raw = build(&raw_texts);
+        let json = build(&json_texts);
+        let broken = BUILD_FAILED.with(|f| f.replace(false));
         Self {
             names,
-            raw: build(&raw_texts),
+            raw,
             raw_patterns,
             ci,
             ci_patterns: ci_patterns.into_iter().map(|(_, p)| p).collect(),
-            json: build(&json_texts),
+            json,
+            broken,
             longest_chars,
             heads,
             tails,
@@ -593,11 +636,19 @@ impl Matcher {
             + self.extra.as_ref().map_or(0, |m| m.memory_usage())
     }
 
+    /// Whether this matcher (or the one searched with it) could not be built.
+    pub fn is_broken(&self) -> bool {
+        self.broken || self.extra.as_ref().is_some_and(|m| m.broken)
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.raw.is_none() && self.extra.as_ref().is_none_or(|m| m.is_empty())
+        !self.is_broken() && self.raw.is_none() && self.extra.as_ref().is_none_or(|m| m.is_empty())
     }
 
     fn marker(&self, names: &[usize]) -> String {
+        if names.is_empty() {
+            return WITHHELD.to_string();
+        }
         let mut listed: Vec<&str> = Vec::new();
         for &n in names {
             let name = self.name(n);
@@ -621,6 +672,9 @@ impl Matcher {
     /// there is mapped back to the source span it was decoded from, so a secret
     /// spelled `sk-&#65;%42\u0043` is replaced where it is written.
     fn spans_with(&self, text: &str, fragments: bool) -> Vec<(usize, usize, Vec<usize>)> {
+        if self.is_broken() {
+            return withheld_span(text.len());
+        }
         let mut hits = self.plain_hits(text, fragments);
         if crate::secret_normalize::has_encoding(text) {
             let n = crate::secret_normalize::normalize(text);
@@ -691,6 +745,9 @@ impl Matcher {
     /// outside ASCII counts as a token character for the short-secret rule, the
     /// conservative choice for a whole-token check.
     fn byte_spans(&self, bytes: &[u8]) -> Vec<(usize, usize, Vec<usize>)> {
+        if self.is_broken() {
+            return withheld_span(bytes.len());
+        }
         let mut hits = self.own_byte_hits(bytes);
         hits.extend(self.extra_hits(|m| m.own_byte_hits(bytes)));
         // Encoded spellings, as in `spans_with`, wherever the bytes are text.
@@ -748,6 +805,10 @@ impl Matcher {
     /// so no piece of a secret is written before the stream shows whether the
     /// rest follows. `text.len()` when nothing needs holding.
     pub fn hold_from(&self, text: &str) -> usize {
+        if self.is_broken() {
+            // Everything is withheld anyway; holding would only grow buffers.
+            return text.len();
+        }
         let mut cut = self.plain_hold(text);
         // An encoded sequence still being written, and the start of a secret in
         // its decoded spelling, are held the same way.
@@ -831,6 +892,13 @@ impl Matcher {
     /// trailing prefix or a leading suffix of a secret of at least
     /// [`SHORT_SECRET_CHARS`] chars, the part a reader could otherwise complete.
     pub fn redact_fragment<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        if self.is_broken() {
+            return if text.is_empty() {
+                Cow::Borrowed(text)
+            } else {
+                Cow::Owned(WITHHELD.to_string())
+            };
+        }
         let mut spans = self.spans(text);
         let edge = |spans: &mut Vec<(usize, usize, Vec<usize>)>, start: usize, end: usize, n| {
             if start < end && !spans.iter().any(|(s, e, _)| *s <= start && end <= *e) {
@@ -1458,6 +1526,9 @@ impl Matcher {
             return Cow::Borrowed(line);
         }
         let body = line.trim_end_matches(['\n', '\r']);
+        if self.is_broken() {
+            return Cow::Owned(format!("{WITHHELD}{}", &line[body.len()..]));
+        }
         let looks_json = body.trim_start().starts_with(['{', '[']);
         if looks_json {
             if !self.may_contain(body) {
@@ -1518,7 +1589,8 @@ impl Matcher {
     /// The fast reject: false only when no form, plain or encoded, can be in
     /// `text`. Text with an encoding introducer is also checked decoded.
     pub fn may_contain(&self, text: &str) -> bool {
-        self.may_contain_plain(text)
+        self.is_broken()
+            || self.may_contain_plain(text)
             || (crate::secret_normalize::has_encoding(text) && {
                 let n = crate::secret_normalize::normalize(text);
                 n.text != text && self.may_contain_plain(&n.text)
@@ -1533,6 +1605,16 @@ impl Matcher {
                 .extra
                 .as_ref()
                 .is_some_and(|m| m.may_contain_plain(text))
+    }
+}
+
+/// One span over all of a text, with no names: [`Matcher::marker`] writes
+/// [`WITHHELD`] for it.
+fn withheld_span(len: usize) -> Vec<(usize, usize, Vec<usize>)> {
+    if len == 0 {
+        Vec::new()
+    } else {
+        vec![(0, len, Vec::new())]
     }
 }
 
@@ -2947,6 +3029,11 @@ pub static RETIRED_PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::
 /// shown) so the user can lengthen or rotate it. Owed cleanups are listed too.
 pub fn status_notes() -> Vec<String> {
     let mut notes = Vec::new();
+    if current().is_some_and(|layers| layers.0.iter().any(|m| m.is_broken())) {
+        notes.push(format!(
+            "secret redaction could not be prepared for the configured secrets, so logs and messages show {WITHHELD} in place of their text until it can. Remove or shorten unusually long secret values."
+        ));
+    }
     let short: Vec<String> = REGISTRY
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3792,6 +3879,30 @@ mod tests {
             assert_eq!(m.redact_text(&plain), plain.as_str());
             assert_eq!(m.redact_line(&plain), plain.as_str());
         }
+    }
+
+    #[test]
+    fn a_matcher_that_cannot_be_built_withholds_text_instead_of_passing_it() {
+        FAIL_BUILDS.with(|f| f.set(true));
+        let m = m(&[("KEY", "sk-UnbuiltSecret77")]);
+        FAIL_BUILDS.with(|f| f.set(false));
+        assert!(m.is_broken());
+        let line = "error: sk-UnbuiltSecret77 rejected";
+        assert_eq!(m.redact_text(line), WITHHELD);
+        assert_eq!(m.redact_fragment(line), WITHHELD);
+        assert_eq!(m.redact_line(&format!("{line}\n")), format!("{WITHHELD}\n"));
+        let mut v = serde_json::json!({"text": line, "n": 3});
+        assert!(m.redact_value(&mut v));
+        // Keys can carry a secret too, so they are withheld as well.
+        let out = v.to_string();
+        assert!(
+            out.contains(WITHHELD) && !out.contains("Unbuilt") && !out.contains("rejected"),
+            "{out}"
+        );
+        assert!(m.may_contain("anything"));
+        assert!(!m.truncate_chars(line, 200).contains("Unbuilt"));
+        // A buildable set is unaffected.
+        assert!(!self::m(&[("KEY", "sk-UnbuiltSecret77")]).is_broken());
     }
 
     #[test]
