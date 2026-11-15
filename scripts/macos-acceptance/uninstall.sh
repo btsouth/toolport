@@ -84,22 +84,46 @@ record_rows "uninstall ($LABEL)" "client configs compared after disconnecting" p
 quit_check "app quits"
 daemon_gone_check "no gateway daemon after quitting with no client connected" 15
 
-if [[ $TRASH_LOGIN_CHECK -eq 1 ]]; then
-  # The daemon only runs while a client uses Toolport: start it the way a
-  # client does, through an entry setup wrote, with the app already quit.
-  entry=""
+# The daemon only runs while a client uses Toolport: start it the way a client
+# does, through an entry setup wrote, with the app already quit.
+start_daemon_via_client() { # start_daemon_via_client <check name> <log tag>
+  local entry="" candidate out
   for candidate in "$EVIDENCE/client-entries-$LABEL/claude-code.json" "$EVIDENCE/client-entries-$LABEL"/*.json; do
     [[ -f "$candidate" ]] && { entry="$candidate"; break; }
   done
-  out="$EVIDENCE/logs/tool-call-before-trash-$LABEL.json"
+  out="$EVIDENCE/logs/tool-call-$2-$LABEL.json"
   if [[ -z "$entry" ]]; then
-    fail "a client call starts the daemon before the Trash" "setup wrote no client entry"
+    fail "$1" "setup wrote no client entry"
   elif tool_call "$entry" toolport_status "$out" &&
     wait_for 10 bash -c "ps -axo command= | grep -F 'toolport-gateway --daemon' | grep -vq grep"; then
-    pass "a client call starts the daemon before the Trash" "$(basename "$entry" .json) entry, $TOOL_CALL_DETAIL"
+    pass "$1" "$(basename "$entry" .json) entry, $TOOL_CALL_DETAIL"
   else
-    fail "a client call starts the daemon before the Trash" "${TOOL_CALL_DETAIL:-no call}; daemon: $(pids_of 'toolport-gateway --daemon' | tr '\n' ' ') (logs/$(basename "$out"))"
+    fail "$1" "${TOOL_CALL_DETAIL:-no call}; daemon: $(pids_of 'toolport-gateway --daemon' | tr '\n' ' ') (logs/$(basename "$out"))"
   fi
+}
+
+if [[ $TRASH_LOGIN_CHECK -eq 1 ]]; then
+  # An updater moves the old bundle aside before the new one lands. The daemon
+  # sees its binary gone and exits, but that is not a removal: the LaunchAgent
+  # must survive and still start the app once it is back.
+  start_daemon_via_client "a client call starts the daemon before the app is moved aside" aside
+  aside="$(mktemp -d)/Toolport.app"
+  if mv "$APP_PATH" "$aside"; then
+    daemon_gone_check "the daemon leaves once its app is moved aside" 30
+    if [[ -e "$LOGIN_PLIST" ]]; then
+      pass "the LaunchAgent survives the app being moved aside" "$(login_item_state)"
+    else
+      fail "the LaunchAgent survives the app being moved aside" "removed; gateway.log: $(grep -h 'launch at login\|binary_removed' "$DATA_DIR"/gateway*.log 2>/dev/null | tail -3 | tr '\n' ' ' | cut -c1-300)"
+    fi
+    if mv "$aside" "$APP_PATH"; then
+      pass "the app moved back into place" "$(login_item_state)"
+    else
+      fail "the app moved back into place" "mv $aside $APP_PATH failed"
+    fi
+  else
+    fail "app moved aside like an updater does" "mv $APP_PATH $aside failed"
+  fi
+  start_daemon_via_client "a client call starts the daemon before the Trash" trash
 fi
 
 if [[ $REMOVE_DATA -eq 1 && "$MODE" == "ui" ]]; then

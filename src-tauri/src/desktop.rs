@@ -4595,6 +4595,16 @@ pub fn run() {
             // ephemeral FUSE mount, rewrite Exec to $APPIMAGE (SBS-844).
             #[cfg(target_os = "linux")]
             crate::autostart::repair_linux(&app.package_info().name);
+            // macOS: a launch-at-login plist kept through an update or a move
+            // names a program that is gone, so launchd would fail at the next
+            // login. Register the running app again.
+            #[cfg(target_os = "macos")]
+            if crate::purge::repoint_launch_agent_if_stale(&app.package_info().name) {
+                use tauri_plugin_autostart::ManagerExt;
+                if let Err(error) = app.autolaunch().enable() {
+                    eprintln!("toolport: could not repoint launch at login: {error}");
+                }
+            }
 
             // Build the tray icon, then show the window - unless launched with `--hidden`
             // (auto-start at login), in which case we start straight to the tray. The

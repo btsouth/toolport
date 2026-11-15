@@ -1369,18 +1369,36 @@ fn install_root(exe: &Path) -> &Path {
         .unwrap_or_else(|| exe.parent().unwrap_or(exe))
 }
 
+/// Whether `path` is inside a Trash folder: `~/.Trash`, or a volume's
+/// `.Trashes/<uid>`.
+#[cfg(any(target_os = "macos", test))]
+fn in_trash(path: &Path, home: &Path, uid: u32) -> bool {
+    if path.starts_with(home.join(".Trash")) {
+        return true;
+    }
+    let uid = uid.to_string();
+    let parts: Vec<_> = path.components().map(|part| part.as_os_str()).collect();
+    parts
+        .windows(2)
+        .any(|pair| pair[0] == ".Trashes" && pair[1] == uid.as_str())
+}
+
 /// Whether a daemon whose executable `removed_exe` is gone may remove this
 /// launch-at-login plist. It must be Toolport's own (the uninstaller's
 /// ownership check), start a program inside the same app as that executable,
-/// and that program must no longer exist. Another app's plist, one that starts
-/// a different Toolport install (a second copy in ~/Applications), and one
-/// whose program is back (a reinstall at the same path) are kept. `exists`
-/// should answer true when it cannot tell.
+/// that program must no longer exist, and there must be positive evidence the
+/// app was removed rather than replaced: `now_at`, where the running image is
+/// now (it follows a rename), is inside a Trash folder. An updater or Homebrew
+/// moving the bundle aside, an app that is just missing, or an unknown location
+/// all keep the plist. `exists` should answer true when it cannot tell.
 #[cfg(any(target_os = "macos", test))]
 fn stale_launch_agent(
     contents: &str,
     name: &str,
     removed_exe: &Path,
+    now_at: Option<&Path>,
+    home: &Path,
+    uid: u32,
     exists: impl Fn(&Path) -> bool,
 ) -> bool {
     if !owned_launch_agent(contents, name) {
@@ -1389,26 +1407,61 @@ fn stale_launch_agent(
     let Some(program) = launch_agent_program(contents) else {
         return false;
     };
-    install_root(&program) == install_root(removed_exe) && !exists(&program)
+    install_root(&program) == install_root(removed_exe)
+        && !exists(&program)
+        && now_at.is_some_and(|path| in_trash(path, home, uid))
 }
 
-/// The daemon confirmed its own app is gone (deleted or moved to the Trash):
-/// remove Toolport's launch-at-login LaunchAgent that would start that app, and
-/// unload it if launchd has it loaded, so a drag to the Trash with Launch at
-/// login on leaves nothing behind. Only plists [`stale_launch_agent`] accepts
-/// are touched.
+/// Where this process's executable is now. macOS resolves `proc_pidpath` from the
+/// open image's vnode, so it follows a rename (into the Trash, or aside by an
+/// updater); `current_exe` would keep the launch path. `None` once the file is
+/// deleted or the path cannot be read.
+#[cfg(target_os = "macos")]
+fn running_image_path() -> Option<PathBuf> {
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: buf is valid for writes of buf.len() bytes for the call.
+    let len = unsafe {
+        libc::proc_pidpath(
+            std::process::id() as libc::c_int,
+            buf.as_mut_ptr().cast(),
+            buf.len() as u32,
+        )
+    };
+    if len <= 0 {
+        return None;
+    }
+    buf.truncate(len as usize);
+    use std::os::unix::ffi::OsStringExt;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(buf)))
+}
+
+/// The daemon confirmed its own app is gone: if the app is in the Trash, remove
+/// Toolport's launch-at-login LaunchAgent that would start it, and unload it, so a
+/// drag to the Trash with Launch at login on leaves nothing behind. Only plists
+/// [`stale_launch_agent`] accepts are touched; a bundle moved anywhere else (an
+/// update in progress) keeps its plist, and the app reconciles it on its next
+/// start ([`repoint_launch_agent_if_stale`]).
 #[cfg(target_os = "macos")]
 pub fn remove_stale_launch_agents(removed_exe: &Path) -> Report {
     let mut report = Report::default();
     let Some(home) = home_dir() else {
         return report;
     };
+    let now_at = running_image_path();
+    // SAFETY: getuid has no failure mode.
+    let uid = unsafe { libc::getuid() };
     for (path, name) in autostart_files(&home).iter().zip(AUTOSTART_NAMES) {
         match std::fs::read_to_string(path) {
             Ok(contents)
-                if stale_launch_agent(&contents, name, removed_exe, |program| {
-                    program.try_exists().unwrap_or(true)
-                }) =>
+                if stale_launch_agent(
+                    &contents,
+                    name,
+                    removed_exe,
+                    now_at.as_deref(),
+                    &home,
+                    uid,
+                    |program| program.try_exists().unwrap_or(true),
+                ) =>
             {
                 remove_path(path, &mut report);
                 unload_launch_agent(name);
@@ -1422,6 +1475,40 @@ pub fn remove_stale_launch_agents(removed_exe: &Path) -> Report {
         }
     }
     report
+}
+
+/// Whether Toolport's own LaunchAgent `name` starts a program that no longer
+/// exists while `current_exe` does (the app was updated or moved and a kept plist
+/// still names the old place). The app then registers launch at login again.
+#[cfg(any(target_os = "macos", test))]
+fn launch_agent_needs_repoint(
+    contents: &str,
+    name: &str,
+    current_exe: &Path,
+    exists: impl Fn(&Path) -> bool,
+) -> bool {
+    owned_launch_agent(contents, name)
+        && launch_agent_program(contents)
+            .is_some_and(|program| program != current_exe && !exists(&program))
+}
+
+/// At app start: a kept launch-at-login plist that names a program which is gone
+/// (launchd would fail to start it at the next login) is reported so the app can
+/// register its current executable again.
+#[cfg(target_os = "macos")]
+pub fn repoint_launch_agent_if_stale(name: &str) -> bool {
+    let (Some(home), Ok(current)) = (home_dir(), std::env::current_exe()) else {
+        return false;
+    };
+    let path = home
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{name}.plist"));
+    std::fs::read_to_string(path).is_ok_and(|contents| {
+        launch_agent_needs_repoint(&contents, name, &current, |program| {
+            program.try_exists().unwrap_or(true)
+        })
+    })
 }
 
 /// Best effort `launchctl bootout gui/<uid>/<label>`. A plist that was never
@@ -2089,25 +2176,86 @@ mod tests {
             ),
             ("no program", no_program.into(), &gone, false),
         ];
+        let home = Path::new("/Users/me");
+        let in_trash = Path::new("/Users/me/.Trash/Toolport.app/Contents/MacOS/toolport-gateway");
         for (case, contents, exists, remove) in cases {
             assert_eq!(
-                stale_launch_agent(&contents, "Toolport", trashed, exists),
+                stale_launch_agent(
+                    &contents,
+                    "Toolport",
+                    trashed,
+                    Some(in_trash),
+                    home,
+                    501,
+                    exists
+                ),
                 remove,
                 "{case}"
             );
         }
+        // R2-2: only a running image now inside a Trash folder is evidence of
+        // removal. An updater's or Homebrew's move aside, a missing file and an
+        // unknown location keep the plist.
+        let ours = plist("Toolport", app, true);
+        for (now_at, remove) in [
+            (Some("/Volumes/Data/.Trashes/501/Toolport.app/Contents/MacOS/toolport-gateway"), true),
+            (Some("/Volumes/Data/.Trashes/502/Toolport.app/Contents/MacOS/toolport-gateway"), false),
+            (Some("/Applications/Toolport.app.old/Contents/MacOS/toolport-gateway"), false),
+            (Some("/private/var/folders/xy/T/tauri_updated_app/Toolport.app/Contents/MacOS/toolport-gateway"), false),
+            (Some("/opt/homebrew/Caskroom/toolport/2.3.5/Toolport.app/Contents/MacOS/toolport-gateway"), false),
+            (Some("/Users/me/Downloads/Toolport.app/Contents/MacOS/toolport-gateway"), false),
+            (None, false),
+        ] {
+            assert_eq!(
+                stale_launch_agent(&ours, "Toolport", trashed, now_at.map(Path::new), home, 501, gone),
+                remove,
+                "{now_at:?}"
+            );
+        }
         // A gateway outside any bundle owns only plists in its own folder.
         let loose = Path::new("/opt/toolport/toolport-gateway");
+        let loose_trash = Path::new("/Users/me/.Trash/toolport/toolport-gateway");
         assert!(stale_launch_agent(
             &plist("Toolport", "/opt/toolport/Toolport", true),
             "Toolport",
             loose,
+            Some(loose_trash),
+            home,
+            501,
             gone
         ));
         assert!(!stale_launch_agent(
             &plist("Toolport", app, true),
             "Toolport",
             loose,
+            Some(loose_trash),
+            home,
+            501,
+            gone
+        ));
+        // A kept plist naming a program that is gone is registered again at start.
+        let current = Path::new("/Applications/Toolport.app/Contents/MacOS/Toolport");
+        assert!(!launch_agent_needs_repoint(
+            &ours, "Toolport", current, present
+        ));
+        assert!(!launch_agent_needs_repoint(
+            &ours, "Toolport", current, gone
+        ));
+        let moved = plist(
+            "Toolport",
+            "/Users/me/Downloads/Toolport.app/Contents/MacOS/Toolport",
+            true,
+        );
+        assert!(launch_agent_needs_repoint(
+            &moved, "Toolport", current, gone
+        ));
+        assert!(!launch_agent_needs_repoint(
+            &moved, "Toolport", current, present
+        ));
+        assert!(!launch_agent_needs_repoint(
+            &plist("Other", other, true),
+            "Toolport",
+            current,
             gone
         ));
         assert_eq!(
