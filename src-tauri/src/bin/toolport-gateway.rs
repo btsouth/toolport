@@ -39293,8 +39293,8 @@ mod tests {
         let (stdio, _stdio_rx) = stdio_session_with_progress();
         {
             let (stdio, sessions) = (Arc::clone(&stdio), state.mcp_sessions.clone());
-            routes.lock().unwrap().deliver = Some(Arc::new(move |session: &str, note: &Value| {
-                deliver_progress_to(&stdio, &sessions, session, note);
+            routes.lock().unwrap().deliver = Some(Arc::new(move |session: &str, note: &Value, owner: Option<&downstream::CancelContext>| {
+                deliver_progress_to(&stdio, &sessions, session, note, owner);
             }));
         }
         let (registration, wire) = register_progress(
