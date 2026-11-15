@@ -6328,6 +6328,46 @@ mod tests {
     }
 
     #[test]
+    fn a_text_line_that_starts_with_a_bracket_is_searched_as_text() {
+        let secret = "sk-SECRETVALUE1234";
+        let m = m(&[("TOKEN", secret)]);
+        let stamped = format!("[2026-11-15 10:00:00] upstream said token {secret} rejected\n");
+        for line in [
+            stamped.clone(),
+            format!("{{{secret}}}"),
+            format!("[warn] {secret}"),
+        ] {
+            let out = m.redact_line(&line);
+            assert!(!out.contains(secret), "{line} gave {out}");
+            assert!(out.contains("[secret:TOKEN]"), "{out}");
+        }
+        // JSON is still edited in place.
+        assert_eq!(
+            m.redact_line(&format!(r#"{{"a":[1,true,null,"{secret}"]}}"#)),
+            r#"{"a":[1,true,null,"[secret:TOKEN]"]}"#
+        );
+        // The rewrite scrub and the in-place mask of daemon.log.
+        let mut out = Vec::new();
+        let mut scrub = ScrubLines::new(&m, false);
+        scrub.feed(Some(stamped.as_bytes()), &mut out);
+        scrub.feed(None, &mut out);
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains(secret), "{out}");
+        assert!(out.starts_with("[2026-11-15 10:00:00] upstream"), "{out}");
+        let dir = std::env::temp_dir().join(format!("tp-bracket-mask-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("daemon.log");
+        std::fs::write(&log, &stamped).unwrap();
+        let masked = mask_locked(&m, &dir, &log).unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(masked);
+        assert!(!text.contains(secret), "{text}");
+        assert_eq!(text.len(), stamped.len());
+    }
+
+    #[test]
     fn a_secret_in_a_json_key_is_redacted_whatever_the_values_hold() {
         let m = m(&[("TOKEN", "abababab")]);
         for line in [
