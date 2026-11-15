@@ -453,6 +453,15 @@ pub(crate) fn journal_for_test(dir: &Path, path: &Path, ranges: &[(u64, u64)]) {
     write_journal(&loc, &journal, ident.id, ranges).unwrap();
 }
 
+/// Create an empty marker file at `path`, owner-only, never through a link:
+/// an existing name (a file, or a link planted there) is left as it is.
+pub fn create_marker(path: &Path) -> std::io::Result<()> {
+    match sys::create_private(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        other => other.map(drop),
+    }
+}
+
 fn journal_name(file_name: &std::ffi::OsStr) -> String {
     format!("{JOURNAL_PREFIX}{}", file_name.to_string_lossy())
 }

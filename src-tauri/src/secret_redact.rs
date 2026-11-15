@@ -4446,7 +4446,7 @@ fn schedule_scrub(_id: &str) {
     // Durable until a pass completes, so an exit before then is visible to the
     // next process and to status. Only where there are logs to scrub.
     if persisted_log_files(&dir).iter().any(|path| path.is_file()) {
-        let _ = std::fs::write(dir.join(SCRUB_PENDING_FILE), b"");
+        let _ = crate::scrub_io::create_marker(&dir.join(SCRUB_PENDING_FILE));
     }
     *pending = Some(dir);
     drop(pending);
