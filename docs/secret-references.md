@@ -153,8 +153,9 @@ Known limits:
   hex, encrypted, compressed, reversed) is not matched. Output a hard kill cuts
   off while it is held is lost rather than written unredacted.
 - Every Toolport process (each gateway role and both apps) passes its stderr
-  through the redactor, so a client's own log of the gateway's stderr gets the
-  same markers. That log is outside Toolport's files, so a copy written before
+  through the redactor from the moment its first secret is registered (a
+  process with none keeps its stderr as it is and pays nothing), so a client's
+  own log of the gateway's stderr gets the same markers. That log is outside Toolport's files, so a copy written before
   a secret was configured is not rewritten. If the redactor cannot take over
   stderr, stderr is discarded instead and `toolport_status` says so.
 
