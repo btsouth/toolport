@@ -62,6 +62,32 @@ fn redact(text: &str, secret: &str, marker: &str, depth: usize) -> String {
     let mut key = String::new();
     while index < bytes.len() {
         let quote = bytes[index];
+        // Client JSONC/TOML/YAML comments can repeat a credential. They are
+        // recovery data too, and must not retain an unquoted plaintext copy.
+        let line_comment = quote == b'#' || bytes[index..].starts_with(b"//");
+        let block_comment = bytes[index..].starts_with(b"/*");
+        if line_comment || block_comment {
+            let start = index;
+            if block_comment {
+                index += 2;
+                while index < bytes.len() && !bytes[index..].starts_with(b"*/") {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            } else {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            let comment = &text[start..index];
+            let replacement = comment.replace(secret, marker);
+            if replacement != comment {
+                output.push_str(&text[cursor..start]);
+                output.push_str(&replacement);
+                cursor = index;
+            }
+            continue;
+        }
         if quote != b'"' && quote != b'\'' {
             index += 1;
             continue;
@@ -394,6 +420,21 @@ mod tests {
                 .is_none());
             }
         });
+    }
+    #[test]
+    fn credential_copies_in_comments_are_not_kept_in_plaintext() {
+        for original in [
+            "{ // sk-fake-comment-secret\n \"env\":{\"API_KEY\":\"sk-fake-comment-secret\"}\n}",
+            "# sk-fake-comment-secret\nenv = { API_KEY = 'sk-fake-comment-secret' }\n",
+            "/* sk-fake-comment-secret */ {\"env\":{\"API_KEY\":\"sk-fake-comment-secret\"}}",
+        ] {
+            let result = redact(original, "sk-fake-comment-secret", "missing", 0);
+            assert!(!result.contains("sk-fake-comment-secret"), "{result}");
+            assert_eq!(
+                result,
+                original.replace("sk-fake-comment-secret", "missing")
+            );
+        }
     }
     #[test]
     fn redaction_preserves_syntax_short_values_and_serialized_config_bytes() {
