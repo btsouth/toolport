@@ -47254,6 +47254,7 @@ mod tests {
 
     #[test]
     fn only_handshake_era_requests_fall_back_to_the_initialize_label() {
+        let _env = DataDirTestEnv::new("handshake-era-label-fallback");
         let state = stdio_state();
         let legacy_init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
             "protocolVersion":"2025-06-18","capabilities":{},
