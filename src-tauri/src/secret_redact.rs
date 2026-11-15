@@ -1447,8 +1447,12 @@ fn builder() {
     }
 }
 
+/// What [`rebuild_stale_mains`] reads for one scope: its entry count and
+/// `whole_only` generation at the time, and the pairs and set to build from.
+type MainSnapshot = (Scope, usize, u64, Vec<(String, String)>, HashSet<String>);
+
 fn rebuild_stale_mains() {
-    let stale: Vec<(Scope, usize, u64, Vec<(String, String)>, HashSet<String>)> = REGISTRY
+    let stale: Vec<MainSnapshot> = REGISTRY
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
