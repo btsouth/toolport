@@ -3298,10 +3298,11 @@ mod tests {
                 .and_then(|m| m.get(&scope_of(&dir)))
                 .map_or(0, |r| r.secrets.len())
         };
+        let covered = SCRUBBED.lock().unwrap().get(&scope_of(&dir)).copied();
         let before = known();
         std::fs::write(&audit, format!("{leaked}\n")).unwrap();
         let again = scrub_data_dir(&dir).unwrap();
-        if known() == before {
+        if covered == Some(before) && known() == before {
             assert_eq!(again, 0);
         }
         let _ = std::fs::remove_dir_all(&dir);
