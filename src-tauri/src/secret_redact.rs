@@ -5792,7 +5792,7 @@ mod tests {
                 },
                 crate::secrets::retry_retired_scrubs,
             );
-            assert_eq!(left, 0, "the first value is clean now");
+            assert_eq!(left, 1, "the first value is clean now");
             assert_eq!(
                 crate::secrets::retired_scrubs_pending(),
                 1,

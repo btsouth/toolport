@@ -2085,13 +2085,23 @@ fn retired_save(entries: &[(String, String, String)]) -> Result<(), String> {
     )
 }
 
+/// The cross-process lock every read-modify-write of the retired list holds,
+/// so two processes never save over each other's entries.
+fn retired_lock() -> Result<crate::registry::FileLock, String> {
+    let dir = crate::registry::conduit_dir().ok_or("no data directory")?;
+    crate::registry::lock_at(&dir.join(RETIRED_KEY))
+}
+
 fn retire(server_id: &str, key: &str, value: &str) -> Result<(), String> {
-    let mut entries = retired_load();
-    let entry = (server_id.to_string(), key.to_string(), value.to_string());
-    if !entries.contains(&entry) {
-        entries.push(entry);
-    }
-    retired_save(&entries).map_err(|error| {
+    let saved = retired_lock().and_then(|_lock| {
+        let mut entries = retired_load();
+        let entry = (server_id.to_string(), key.to_string(), value.to_string());
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+        retired_save(&entries)
+    });
+    saved.map_err(|error| {
         eprintln!("toolport: could not keep a retired secret for cleanup: {error}");
         crate::i18n::tr(
             "The old value could not be kept for its log cleanup, so nothing was changed. Try again.",
@@ -2108,14 +2118,28 @@ pub fn retry_retired_scrubs() -> usize {
         crate::secret_redact::RETIRED_PENDING.store(0, std::sync::atomic::Ordering::Relaxed);
         return 0;
     }
-    let remaining: Vec<(String, String, String)> = entries
+    // The scrubs run unlocked (each may wait for a busy scrub); then, under
+    // the lock, only the entries they cleaned are removed from the list as it
+    // is now, so a value another process retired meanwhile is kept.
+    let cleaned: Vec<(String, String, String)> = entries
         .into_iter()
         .filter(|(server, key, value)| {
-            crate::secret_redact::scrub_value_now(server, key, value).is_err()
+            crate::secret_redact::scrub_value_now(server, key, value).is_ok()
         })
         .collect();
     #[cfg(test)]
     tests::run_retry_hook();
+    let _lock = match retired_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("toolport: could not update retired secrets: {error}");
+            return retired_load().len();
+        }
+    };
+    let remaining: Vec<(String, String, String)> = retired_load()
+        .into_iter()
+        .filter(|entry| !cleaned.contains(entry))
+        .collect();
     let left = remaining.len();
     if let Err(error) = retired_save(&remaining) {
         eprintln!("toolport: could not update retired secrets: {error}");
