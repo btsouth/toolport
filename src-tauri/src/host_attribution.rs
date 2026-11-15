@@ -232,6 +232,15 @@ mod tests {
         }
     }
 
+    /// T3 Code's process name on the platform the test runs on.
+    fn t3_code_process() -> &'static str {
+        match this_os() {
+            Os::Linux => "t3code",
+            Os::MacOs => "T3 Code",
+            Os::Windows => "T3 Code.exe",
+        }
+    }
+
     #[test]
     fn claude_code_under_t3_code_carries_its_thread() {
         let host = detect_with(
@@ -240,7 +249,7 @@ mod tests {
                 ("T3CODE_THREAD_ID", "465774fd-c52e-4b7e-9d5c-3f0f3a6f0a11"),
             ]),
             || true,
-            || vec!["claude".into(), "t3code".into()],
+            || vec!["claude".into(), t3_code_process().into()],
         )
         .unwrap();
         assert_eq!(host.host, "t3-code");
@@ -253,7 +262,7 @@ mod tests {
         let host = detect_with(
             env(&[("CLAUDE_CODE_ENTRYPOINT", "t3-code")]),
             || true,
-            || vec!["claude".into(), "t3code".into()],
+            || vec!["claude".into(), t3_code_process().into()],
         )
         .unwrap();
         assert_eq!(host.thread, None);
