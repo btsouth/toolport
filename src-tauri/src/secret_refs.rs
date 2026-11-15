@@ -1101,6 +1101,11 @@ pub fn preload_configured_secrets() {
     };
     for server in &reg.servers {
         register_inline_secrets(server);
+        // A disabled server's values are learned when it is enabled and read;
+        // reading its vault here could only add a keyring prompt at startup.
+        if !server.enabled {
+            continue;
+        }
         let vaulted = |secret: bool, value: &Option<String>, fields| {
             secret && value.is_none() && matches!(source(fields), Ok(None))
         };
