@@ -131,6 +131,11 @@ it("shows the Codex settings Toolport will add before connecting", async () => {
   );
   expect(screen.getByText("supports_parallel_tool_calls = true")).toBeVisible();
   expect(screen.getByText("tool_timeout_sec = 600")).toBeVisible();
+  // A setting line has few spaces; it must break anywhere rather than run out of
+  // the notice at narrow widths.
+  expect(screen.getByText("tool_timeout_sec = 600").closest("ul")).toHaveClass(
+    "wrap-anywhere",
+  );
 });
 
 it("lists no settings for a client that gets none", async () => {
