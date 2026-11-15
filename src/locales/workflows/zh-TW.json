@@ -40,7 +40,7 @@
   "Account": "帳戶",
   "Account status unavailable. Retry sync.": "帳戶狀態不可用。重試同步。",
   "Add a working personal server in Servers first.": "請先在“伺服器”中新增一個可正常工作的個人伺服器。",
-  "Add any API keys each server needs, then enable them.": "新增每個伺服器所需的任何 API 金鑰，然後啟用它們。",
+  "Imported servers stay off. Turn each one on in Servers when you're ready.": "匯入的伺服器保持關閉。準備好後，在「伺服器」中逐一開啟。",
   "Added": "已新增",
   "admin": "管理員",
   "After:": "之後：",

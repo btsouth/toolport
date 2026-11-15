@@ -40,7 +40,7 @@
   "Account": "계정",
   "Account status unavailable. Retry sync.": "계정 상태를 확인할 수 없습니다. 동기화를 다시 시도하세요.",
   "Add a working personal server in Servers first.": "먼저 서버에 작동 중인 개인 서버를 추가하세요.",
-  "Add any API keys each server needs, then enable them.": "각 서버에 필요한 API 키를 추가한 다음 활성화하세요.",
+  "Imported servers stay off. Turn each one on in Servers when you're ready.": "가져온 서버는 꺼진 상태로 유지됩니다. 준비되면 서버에서 하나씩 켜세요.",
   "Added": "추가됨",
   "admin": "관리자",
   "After:": "이후:",

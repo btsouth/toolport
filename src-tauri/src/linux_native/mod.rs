@@ -9195,7 +9195,7 @@ fn show_setup_import_review(
                 })
                 .await;
                 match result {
-                    Ok(Ok((_, added))) => page.show_confirmation(&crate::i18n::trf(if added == 1 { crate::i18n::msg("Imported {value0} server. Review credentials before enabling them.") } else { crate::i18n::msg("Imported {value0} servers. Review credentials before enabling them.") }, &[("value0", &format!("{}", added))])),
+                    Ok(Ok((_, added))) => page.show_confirmation(&crate::i18n::trf(if added == 1 { crate::i18n::msg("Imported {value0} server. It stays off until you turn it on in Servers.") } else { crate::i18n::msg("Imported {value0} servers. They stay off until you turn them on in Servers.") }, &[("value0", &format!("{}", added))])),
                     Ok(Err(error)) => page.show_feedback(&crate::i18n::trf("Import failed: {value0}", &[("value0", &error.to_string())]), true),
                     Err(_) => page.show_feedback(&crate::i18n::tr("The import stopped unexpectedly."), true),
                 }

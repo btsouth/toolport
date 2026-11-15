@@ -40,7 +40,7 @@
   "Account": "アカウント",
   "Account status unavailable. Retry sync.": "アカウントのステータスが利用できません。同期を再試行します。",
   "Add a working personal server in Servers first.": "まず、稼働中の個人サーバーを「サーバー」に追加します。",
-  "Add any API keys each server needs, then enable them.": "各サーバーに必要な API キーを追加し、有効にします。",
+  "Imported servers stay off. Turn each one on in Servers when you're ready.": "インポートしたサーバーはオフのままです。準備ができたら「サーバー」で個別にオンにしてください。",
   "Added": "追加",
   "admin": "管理者",
   "After:": "後:",
