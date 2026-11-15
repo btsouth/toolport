@@ -1335,11 +1335,125 @@ fn remove_empty_dirs(dir: &Path, report: &mut Report) {
     }
 }
 
+/// A LaunchAgent in the shape tauri-plugin-autostart writes for Toolport: its
+/// Label is `name` and it starts the app with `--hidden`.
+#[cfg(any(target_os = "macos", test))]
+fn owned_launch_agent(contents: &str, name: &str) -> bool {
+    contents.contains(&format!("<string>{name}</string>"))
+        && contents.contains("<string>--hidden</string>")
+}
+
+/// The program a LaunchAgent starts: the first `ProgramArguments` string.
+#[cfg(any(target_os = "macos", test))]
+fn launch_agent_program(contents: &str) -> Option<PathBuf> {
+    let (_, after) = contents.split_once("<key>ProgramArguments</key>")?;
+    let array = after.trim_start().strip_prefix("<array>")?;
+    let first = array.trim_start().strip_prefix("<string>")?;
+    let (value, _) = first.split_once("</string>")?;
+    let value = value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&");
+    (!value.is_empty()).then(|| PathBuf::from(value))
+}
+
+/// The installed app an executable belongs to: its outermost `.app` bundle, or
+/// its folder when it is not in one.
+#[cfg(any(target_os = "macos", test))]
+fn install_root(exe: &Path) -> &Path {
+    exe.ancestors()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "app"))
+        .last()
+        .unwrap_or_else(|| exe.parent().unwrap_or(exe))
+}
+
+/// Whether a daemon whose executable `removed_exe` is gone may remove this
+/// launch-at-login plist. It must be Toolport's own (the uninstaller's
+/// ownership check), start a program inside the same app as that executable,
+/// and that program must no longer exist. Another app's plist, one that starts
+/// a different Toolport install (a second copy in ~/Applications), and one
+/// whose program is back (a reinstall at the same path) are kept. `exists`
+/// should answer true when it cannot tell.
+#[cfg(any(target_os = "macos", test))]
+fn stale_launch_agent(
+    contents: &str,
+    name: &str,
+    removed_exe: &Path,
+    exists: impl Fn(&Path) -> bool,
+) -> bool {
+    if !owned_launch_agent(contents, name) {
+        return false;
+    }
+    let Some(program) = launch_agent_program(contents) else {
+        return false;
+    };
+    install_root(&program) == install_root(removed_exe) && !exists(&program)
+}
+
+/// The daemon confirmed its own app is gone (deleted or moved to the Trash):
+/// remove Toolport's launch-at-login LaunchAgent that would start that app, and
+/// unload it if launchd has it loaded, so a drag to the Trash with Launch at
+/// login on leaves nothing behind. Only plists [`stale_launch_agent`] accepts
+/// are touched.
+#[cfg(target_os = "macos")]
+pub fn remove_stale_launch_agents(removed_exe: &Path) -> Report {
+    let mut report = Report::default();
+    let Some(home) = home_dir() else {
+        return report;
+    };
+    for (path, name) in autostart_files(&home).iter().zip(AUTOSTART_NAMES) {
+        match std::fs::read_to_string(path) {
+            Ok(contents)
+                if stale_launch_agent(&contents, name, removed_exe, |program| {
+                    program.try_exists().unwrap_or(true)
+                }) =>
+            {
+                remove_path(path, &mut report);
+                unload_launch_agent(name);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => report.leftovers.push(Leftover {
+                path: path.display().to_string(),
+                error: error.to_string(),
+            }),
+        }
+    }
+    report
+}
+
+/// Best effort `launchctl bootout gui/<uid>/<label>`. A plist that was never
+/// loaded (the usual case before the next login) just makes it fail.
+#[cfg(target_os = "macos")]
+fn unload_launch_agent(label: &str) {
+    let uid = unsafe { libc::getuid() };
+    let Ok(mut child) = std::process::Command::new("/bin/launchctl")
+        .arg("bootout")
+        .arg(format!("gui/{uid}/{label}"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn owned_autostart(contents: &str, name: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
-        contents.contains(&format!("<string>{name}</string>"))
-            && contents.contains("<string>--hidden</string>")
+        owned_launch_agent(contents, name)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1935,6 +2049,79 @@ mod tests {
             .iter()
             .any(|file| file.to_string_lossy().contains("Claude")));
     }
+    #[test]
+    fn a_daemon_removes_only_its_own_launch_agent_once_its_app_is_gone() {
+        fn plist(label: &str, program: &str, hidden: bool) -> String {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n  <dict>\n  \
+                 <key>Label</key>\n  <string>{label}</string>\n  <key>ProgramArguments</key>\n  \
+                 <array><string>{program}</string>{}</array>\n  <key>RunAtLoad</key>\n  <true/>\n  \
+                 </dict>\n</plist>",
+                if hidden {
+                    "<string>--hidden</string>"
+                } else {
+                    ""
+                }
+            )
+        }
+        let trashed = Path::new("/Applications/Toolport.app/Contents/MacOS/toolport-gateway");
+        let app = "/Applications/Toolport.app/Contents/MacOS/Toolport";
+        let second = "/Users/me/Applications/Toolport.app/Contents/MacOS/Toolport";
+        let gone = |_: &Path| false;
+        let present = |_: &Path| true;
+        let only_app_gone = |path: &Path| path != Path::new(app);
+        let other = "/Applications/Other.app/Contents/MacOS/Other";
+        let no_program =
+            "<plist><dict><key>Label</key><string>Toolport</string><string>--hidden</string></dict></plist>";
+        type Exists<'a> = &'a dyn Fn(&Path) -> bool;
+        // (case, plist, does its program exist, remove it)
+        let cases: [(&str, String, Exists, bool); 7] = [
+            ("its app is gone", plist("Toolport", app, true), &gone, true),
+            ("reinstalled", plist("Toolport", app, true), &present, false),
+            ("second copy", plist("Toolport", second, true), &gone, false),
+            ("another app", plist("Other", other, true), &gone, false),
+            ("not hidden", plist("Toolport", app, false), &gone, false),
+            (
+                "only it is gone",
+                plist("Toolport", app, true),
+                &only_app_gone,
+                true,
+            ),
+            ("no program", no_program.into(), &gone, false),
+        ];
+        for (case, contents, exists, remove) in cases {
+            assert_eq!(
+                stale_launch_agent(&contents, "Toolport", trashed, exists),
+                remove,
+                "{case}"
+            );
+        }
+        // A gateway outside any bundle owns only plists in its own folder.
+        let loose = Path::new("/opt/toolport/toolport-gateway");
+        assert!(stale_launch_agent(
+            &plist("Toolport", "/opt/toolport/Toolport", true),
+            "Toolport",
+            loose,
+            gone
+        ));
+        assert!(!stale_launch_agent(
+            &plist("Toolport", app, true),
+            "Toolport",
+            loose,
+            gone
+        ));
+        assert_eq!(
+            launch_agent_program(&plist(
+                "Toolport",
+                "/Applications/A &amp; B.app/Contents/MacOS/Toolport",
+                true
+            )),
+            Some(PathBuf::from(
+                "/Applications/A & B.app/Contents/MacOS/Toolport"
+            ))
+        );
+    }
+
     #[test]
     fn custom_native_directory_is_not_a_toolport_data_directory() {
         let env = crate::registry::DataDirTestEnv::new("purge_ownership");

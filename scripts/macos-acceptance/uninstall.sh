@@ -4,6 +4,11 @@
 # Launch at login, quit, and drag the app to the Trash. Optionally remove
 # Toolport data first. Client configs must come back byte-exact.
 #
+# The UI run that keeps data also covers a user who skips turning Launch at
+# login off: it turns it back on, starts the gateway daemon through a client
+# entry after quitting, and expects the daemon to remove the LaunchAgent once
+# the app is in the Trash. Without a running daemon nothing can clean it up.
+#
 # usage: uninstall.sh <label> <client-manifest.json> <ui|cli> [--remove-data]
 set -uo pipefail
 LABEL="$1"
@@ -11,6 +16,7 @@ MANIFEST="$2"
 MODE="$3"
 REMOVE_DATA=0
 [[ "${4:-}" == "--remove-data" ]] && REMOVE_DATA=1
+TRASH_LOGIN_CHECK=0
 AREA="uninstall ($LABEL)"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=common.sh
@@ -44,6 +50,15 @@ if [[ "$MODE" == "ui" ]]; then
   else
     fail "turning off Launch at login removes the login item" "still there: $(login_item_state)"
   fi
+  # A data-removing run skips this: the client call below would recreate data.
+  if [[ $REMOVE_DATA -eq 0 ]]; then
+    if set_launch_at_login on; then
+      TRASH_LOGIN_CHECK=1
+      pass "Launch at login on again for the Trash check" "$(login_item_state)"
+    else
+      fail "Launch at login on again for the Trash check" "$(login_item_state); see screenshots/fail-*"
+    fi
+  fi
   shot "$LABEL-settings-general-before-uninstall" >/dev/null
 else
   # Left on deliberately: this path records what a user who skips that step
@@ -68,6 +83,24 @@ record_rows "uninstall ($LABEL)" "client configs compared after disconnecting" p
 
 quit_check "app quits"
 daemon_gone_check "no gateway daemon after quitting with no client connected" 15
+
+if [[ $TRASH_LOGIN_CHECK -eq 1 ]]; then
+  # The daemon only runs while a client uses Toolport: start it the way a
+  # client does, through an entry setup wrote, with the app already quit.
+  entry=""
+  for candidate in "$EVIDENCE/client-entries-$LABEL/claude-code.json" "$EVIDENCE/client-entries-$LABEL"/*.json; do
+    [[ -f "$candidate" ]] && { entry="$candidate"; break; }
+  done
+  out="$EVIDENCE/logs/tool-call-before-trash-$LABEL.json"
+  if [[ -z "$entry" ]]; then
+    fail "a client call starts the daemon before the Trash" "setup wrote no client entry"
+  elif tool_call "$entry" toolport_status "$out" &&
+    wait_for 10 bash -c "ps -axo command= | grep -F 'toolport-gateway --daemon' | grep -vq grep"; then
+    pass "a client call starts the daemon before the Trash" "$(basename "$entry" .json) entry, $TOOL_CALL_DETAIL"
+  else
+    fail "a client call starts the daemon before the Trash" "${TOOL_CALL_DETAIL:-no call}; daemon: $(pids_of 'toolport-gateway --daemon' | tr '\n' ' ') (logs/$(basename "$out"))"
+  fi
+fi
 
 if [[ $REMOVE_DATA -eq 1 && "$MODE" == "ui" ]]; then
   # Settings > Help and data > Remove Toolport data closes the app and removes
@@ -121,6 +154,20 @@ fi
 mkdir -p "$HOME/.Trash"
 rm -rf "$HOME/.Trash/Toolport.app"
 if mv "$APP_PATH" "$HOME/.Trash/Toolport.app"; then pass "app moved to the Trash"; else fail "app moved to the Trash"; fi
+if [[ $TRASH_LOGIN_CHECK -eq 1 ]]; then
+  # The daemon notices its app is gone, then removes the LaunchAgent that
+  # would start it at every login, and unloads it.
+  if wait_for 30 test ! -e "$LOGIN_PLIST"; then
+    pass "no LaunchAgent left after the Trash with Launch at login on" "the daemon removed $LOGIN_PLIST"
+  else
+    fail "no LaunchAgent left after the Trash with Launch at login on" "$(login_item_state) after 30s; gateway.log: $(grep -h 'launch at login\|binary_removed\|was removed or replaced' "$DATA_DIR"/gateway*.log 2>/dev/null | tail -3 | tr '\n' ' ' | cut -c1-300)"
+  fi
+  if launchctl print "gui/$(id -u)/Toolport" >/dev/null 2>&1; then
+    fail "the Toolport LaunchAgent is not loaded after the Trash" "launchctl print gui/$(id -u)/Toolport still finds it"
+  else
+    pass "the Toolport LaunchAgent is not loaded after the Trash"
+  fi
+fi
 sleep 5
 daemon_gone_check "no gateway daemon after the app went to the Trash" 15
 finish_step

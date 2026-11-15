@@ -20241,6 +20241,26 @@ fn spawn_daemon_idle_watchdog(
             let _ = conduit_lib::daemon::write_descriptor(&descriptor_path, &descriptor);
             continue;
         }
+        // Dragged to the Trash with Launch at login on: the LaunchAgent would
+        // start a missing app at every login. Done here, after the last client,
+        // because unloading the agent may end processes launchd started from it.
+        #[cfg(target_os = "macos")]
+        if binary_gone {
+            if let Some(path) = executable.path() {
+                let report = conduit_lib::purge::remove_stale_launch_agents(path);
+                for removed in &report.removed {
+                    glog(&format!(
+                        "daemon: removed launch at login {removed}: its app is gone"
+                    ));
+                }
+                for left in &report.leftovers {
+                    glog(&format!(
+                        "daemon: could not remove launch at login {}: {}",
+                        left.path, left.error
+                    ));
+                }
+            }
+        }
         glog(if binary_gone {
             "daemon_exit reason=binary_removed prior=healthy"
         } else if update_requested {
