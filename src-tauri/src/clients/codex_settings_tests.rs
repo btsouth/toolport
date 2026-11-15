@@ -262,6 +262,117 @@ fn an_entry_with_some_settings_and_no_record_keeps_the_rest_removed() {
 }
 
 #[test]
+fn a_stale_command_repair_keeps_the_no_record_safeguard() {
+    // The same partial entry, now pointing at an older gateway binary. The startup
+    // repair rewrites the command, and must not carry the two missing defaults in
+    // with it: without a record, an entry that keeps one setting had the rest
+    // removed on purpose.
+    for with_record in [false, true] {
+        let data = crate::registry::DataDirTestEnv::new("codex-settings-stale");
+        let _env_lock = env_test_lock();
+        let _client_env = isolated_client_env(&data.dir);
+        let _home = TestHome::set(&data.dir);
+        let path = codex_config(&data);
+        let current = data.dir.join("toolport-gateway");
+        let current = current.to_str().unwrap();
+        let stale_dir = data.dir.join("old-release");
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        let stale = stale_dir.join("toolport-gateway");
+        std::fs::write(&stale, "old fixture").unwrap();
+        let stale = stale.to_str().unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "[mcp_servers.toolport]\ncommand = \"{stale}\"\ntool_timeout_sec = 90\n\n\
+                 [mcp_servers.toolport.env]\nTOOLPORT_CLIENT_ID = \"codex\"\n\
+                 TOOLPORT_ATTRIBUTION_ID = \"codex\"\n"
+            ),
+        )
+        .unwrap();
+        let mut managed = HashMap::new();
+        if with_record {
+            let server = read_client(&find_def("codex").unwrap()).servers.remove(0);
+            let record: ManagedEntry = serde_json::from_value(serde_json::json!({
+                "command": stale,
+                "args": server.args,
+                "env": server.env_keys.iter().map(|key| (key.clone(), "codex")).collect::<HashMap<_, _>>(),
+                "updatedAt": 1
+            }))
+            .unwrap();
+            managed.insert("codex".to_string(), record);
+        }
+        launch(current, &mut managed);
+        let entry = codex_entry(&path);
+        if with_record {
+            assert_eq!(
+                entry["command"].as_str(),
+                Some(current),
+                "record={with_record}"
+            );
+        }
+        assert_eq!(
+            entry["tool_timeout_sec"].as_integer(),
+            Some(90),
+            "record={with_record}"
+        );
+        assert!(
+            !entry.contains_key("supports_parallel_tool_calls")
+                && !entry.contains_key("startup_timeout_sec"),
+            "record={with_record}: {entry:?}"
+        );
+        // A later launch with the record now written changes nothing more.
+        let after = std::fs::read_to_string(&path).unwrap();
+        launch(current, &mut managed);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+    }
+}
+
+#[test]
+fn changing_access_keeps_removed_codex_settings_removed() {
+    // Applying an access scope rewrites the entry through install_gateway. It is not
+    // a Connect, so settings the user removed stay removed, with or without a record;
+    // an explicit reset (force) writes the defaults again, as the docs say.
+    for with_record in [false, true] {
+        let data = crate::registry::DataDirTestEnv::new("codex-settings-scope");
+        let _env_lock = env_test_lock();
+        let _client_env = isolated_client_env(&data.dir);
+        let _home = TestHome::set(&data.dir);
+        let path = codex_config(&data);
+        std::fs::write(&path, "model = \"gpt-5\"\n").unwrap();
+        let first = install_gateway_for("codex", None, None).unwrap();
+        let record = first.managed.clone().unwrap();
+        let entry = codex_entry(&path);
+        assert_eq!(entry["supports_parallel_tool_calls"].as_bool(), Some(true));
+        without_line(&path, "supports_parallel_tool_calls");
+        without_line(&path, "startup_timeout_sec");
+        let handled = if with_record {
+            codex_settings_marked("codex", &record)
+                .unwrap_or(record.clone())
+                .codex_settings
+        } else {
+            Vec::new()
+        };
+        install_gateway_for("codex", Some("Work"), Some(&handled)).unwrap();
+        let entry = codex_entry(&path);
+        assert_eq!(
+            entry["tool_timeout_sec"].as_integer(),
+            Some(600),
+            "record={with_record}"
+        );
+        assert!(
+            !entry.contains_key("supports_parallel_tool_calls")
+                && !entry.contains_key("startup_timeout_sec"),
+            "record={with_record}: {entry:?}"
+        );
+        // An explicit reset writes them again.
+        install_gateway_for("codex", Some("Work"), None).unwrap();
+        let entry = codex_entry(&path);
+        assert_eq!(entry["supports_parallel_tool_calls"].as_bool(), Some(true));
+        assert_eq!(entry["startup_timeout_sec"].as_integer(), Some(75));
+    }
+}
+
+#[test]
 fn the_connect_preview_lists_the_codex_settings_it_will_add() {
     let all = codex_gateway_settings_preview("codex", None);
     assert_eq!(

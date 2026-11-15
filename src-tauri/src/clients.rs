@@ -9197,6 +9197,71 @@ pub fn install_gateway(client_id: &str, profile: Option<&str>) -> Result<WriteOu
     Ok(outcome)
 }
 
+/// [`install_gateway`] for a rewrite that is not an explicit Connect or Reset (an
+/// access change): `keep` is the ownership record's handled Codex settings.
+pub fn install_gateway_for(
+    client_id: &str,
+    profile: Option<&str>,
+    keep: Option<&[String]>,
+) -> Result<WriteOutcome, String> {
+    let mut entry = gateway_entry(profile, client_id)?;
+    if let Some(handled) = keep {
+        let def = find_def(client_id).ok_or("Unknown client")?;
+        let path = resolved_definition_path(&def)?;
+        let entry_name = gateway_entry_for_client(client_id, &read_client(&def).servers)
+            .map_or_else(
+                || GATEWAY_ENTRY_NAME.to_string(),
+                |server| server.name.clone(),
+            );
+        let text = read_config_file(&path).ok();
+        keep_only_missing_codex_settings(
+            client_id,
+            &entry_name,
+            text.as_deref(),
+            handled,
+            &mut entry,
+        );
+    }
+    install_or_remove(client_id, Some(&entry))
+}
+
+/// Limit the Codex defaults in a rebuilt gateway `entry` to the ones a rewrite that is
+/// not an explicit Connect may add: every default for an entry that does not exist yet,
+/// otherwise only [`codex_entry_missing_settings`] (never a key Toolport handled, and
+/// nothing when an entry without a record keeps some settings). Other fields are kept.
+fn keep_only_missing_codex_settings(
+    client_id: &str,
+    entry_name: &str,
+    config_text: Option<&str>,
+    handled: &[String],
+    entry: &mut ServerEntry,
+) {
+    if !is_codex_client(client_id) {
+        return;
+    }
+    let exists = config_text
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .is_some_and(|doc| {
+            doc.get("mcp_servers")
+                .and_then(|servers| servers.get(entry_name))
+                .is_some()
+        });
+    if !exists {
+        return;
+    }
+    let missing: Vec<&str> =
+        codex_entry_missing_settings(client_id, entry_name, config_text, handled, false)
+            .iter()
+            .map(|setting| setting.key)
+            .collect();
+    entry.unknown_fields.retain(|key, _| {
+        !CODEX_GATEWAY_SETTINGS
+            .iter()
+            .any(|setting| setting.key == key)
+            || missing.contains(&key.as_str())
+    });
+}
+
 /// Remove Toolport's gateway entry from a client's config, first putting back
 /// any servers "Move into gateway" took out of it (UX-03). Restoring first means
 /// a failure in between leaves the client with both, never with neither.
@@ -10027,10 +10092,16 @@ fn repoint_stale_gateways_in(
                         let mut entry =
                             repair_gateway_entry(def.format, &path, entry_name, &client.id)?;
                         entry.command = Some(current.to_string());
-                        // A Codex setting Toolport handled before stays as the user left it.
-                        entry
-                            .unknown_fields
-                            .retain(|key, _| !handled.iter().any(|done| done == key));
+                        // A repair is not a Connect: it adds only the Codex settings a
+                        // launch would add, so a handled key stays as the user left it
+                        // and an entry without a record keeps its removals.
+                        keep_only_missing_codex_settings(
+                            &client.id,
+                            entry_name,
+                            read_config_file(&path).ok().as_deref(),
+                            handled,
+                            &mut entry,
+                        );
                         install_or_remove(&client.id, Some(&entry))
                     }
                 })
