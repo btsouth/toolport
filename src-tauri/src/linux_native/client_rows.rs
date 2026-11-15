@@ -355,11 +355,6 @@ pub(super) fn client_row(
         account.add_css_class("caption");
         wrap_row_text(&account);
         account.set_valign(gtk::Align::Center);
-        if let Some(text) = &profile.account {
-            account.set_tooltip_text(Some(text));
-        } else {
-            l10n::bind_tooltip(&account, "No claude.ai sign-in");
-        }
         title.append(&account);
     }
     if !client.t3_code.is_empty() {

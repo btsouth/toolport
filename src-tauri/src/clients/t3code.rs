@@ -226,11 +226,14 @@ fn read_contained(path: &Path, userdata: &Path) -> Option<Vec<u8>> {
     if !file.metadata().ok()?.is_file() || !opened_inside(&file, path, &root) {
         return None;
     }
-    let mut bytes = Vec::new();
-    file.take(SETTINGS_READ_LIMIT + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > SETTINGS_READ_LIMIT {
+    // One allocation, so no grown-out copy of the file (and of any key in it) is freed
+    // without being zeroed. A file that grew past its size since is cut at the limit.
+    let size = file.metadata().ok()?.len().min(SETTINGS_READ_LIMIT) as usize;
+    let mut bytes = Vec::with_capacity(size + 1);
+    let read = file
+        .take(size as u64 + 1)
+        .read_to_end(&mut bytes);
+    if read.is_err() || bytes.len() > size || bytes.len() as u64 > SETTINGS_READ_LIMIT {
         bytes.fill(0);
         return None;
     }

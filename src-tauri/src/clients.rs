@@ -4952,12 +4952,19 @@ pub fn detect_clients() -> Vec<DetectedClient> {
 /// lists without saving it yet: a launcher home or a T3 Code home. Connect saves those.
 pub fn detect_client(client_id: &str) -> Option<DetectedClient> {
     let def = find_def(client_id)?;
-    if def
-        .location
-        .as_ref()
-        .is_some_and(|row| locations::validate(row).is_err())
-    {
-        return None;
+    if let Some(row) = &def.location {
+        // The same rules as the page's scan: a valid location, and never a second way
+        // to manage a file a main client row already owns.
+        if locations::validate(row).is_err() {
+            return None;
+        }
+        let id = row.id.clone();
+        let mut definitions = defs();
+        definitions.push(def);
+        return unique_config_definitions(definitions)
+            .into_iter()
+            .find(|def| def.location.as_ref().is_some_and(|row| row.id == id))
+            .map(|def| read_client(&def));
     }
     Some(read_client(&def))
 }

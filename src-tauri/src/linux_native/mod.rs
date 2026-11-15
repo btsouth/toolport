@@ -2121,7 +2121,7 @@ impl T3SettingsWatch {
 }
 
 /// While Clients is visible, rescan quietly when T3 Code's settings change: an instance
-/// added, renamed or turned off moves the row badges and the card. One `stat` when the
+/// added, renamed or turned off moves the row badges. One `stat` when the
 /// page is shown and when the window gets focus, then every five seconds only while T3
 /// Code's settings exist. Nothing runs while the page is hidden.
 fn watch_t3_code_settings(page: &ClientPage) {
