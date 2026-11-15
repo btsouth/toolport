@@ -291,6 +291,15 @@ impl ClientPage {
         }
     }
 
+    fn begin_recovery_action(&self, id: &str) {
+        self.recovery_feedback
+            .borrow_mut()
+            .retain(|(row, _)| row != id);
+        self.recovery_busy.set(true);
+        self.reload_recoveries();
+        self.refresh_open_detail();
+    }
+
     fn retry_recovery(
         &self,
         record: &crate::clients::recovery::ClientRecovery,
@@ -321,9 +330,7 @@ impl ClientPage {
         }
         button.set_sensitive(false);
         self.recovery_expanded.borrow_mut().remove(&record.id);
-        self.recovery_busy.set(true);
-        self.reload_recoveries();
-        self.refresh_open_detail();
+        self.begin_recovery_action(&record.id);
         let page = self.clone();
         let record = record.clone();
         gtk::glib::spawn_future_local(async move {
@@ -407,9 +414,7 @@ impl ClientPage {
 
     fn set_recovery_dismissed(&self, id: &str, dismissed: bool, button: &gtk::Button) {
         button.set_sensitive(false);
-        self.recovery_busy.set(true);
-        self.reload_recoveries();
-        self.refresh_open_detail();
+        self.begin_recovery_action(id);
         let page = self.clone();
         let id = id.to_string();
         let focus_id = id.clone();
@@ -484,7 +489,7 @@ impl ClientPage {
         let page = self.clone();
         let record = record.clone();
         dialog.connect_response(None,move|dialog,response|{dialog.close();if response!="discard"{focus_named(&page.root,&format!("client-recovery-discard:{}",record.id));return;}
-            page.recovery_busy.set(true);page.reload_recoveries();page.refresh_open_detail();
+            page.begin_recovery_action(&record.id);
             let page=page.clone();let record=record.clone();gtk::glib::spawn_future_local(async move{
                 let id=record.id.clone();let result=gtk::gio::spawn_blocking(move||crate::clients::recovery::discard(&id).map_err(|e|crate::clients::recovery::safe_action_error(&id,&e))).await;
                 match result {Ok(Ok(()))=>{page.recovery_busy.set(false);page.recovery_success.borrow_mut().retain(|(id,_)|id!=&record.client_id);page.recovery_success.borrow_mut().push((record.client_id.clone(),crate::i18n::trf("{client}'s saved recovery copies were discarded. The current client config was not changed.",&[("client",&record.client_name)])));page.reload_recoveries();page.refresh_open_detail();focus_named(&page.root,&format!("client-recovery-success:{}",record.client_id));},Ok(Err(e))=>page.recovery_action_error(&record.id,e),Err(_)=>page.recovery_action_error(&record.id,crate::clients::recovery::worker_error())}
@@ -668,6 +673,13 @@ mod tests {
         // A tray/background action has no active parent window. Confirmation
         // must still open, and confirmed deletion must guard every other action.
         assert!(app.active_window().is_none());
+        page.recovery_feedback
+            .borrow_mut()
+            .push((record.id.clone(), "Previous Retry failure".into()));
+        page.recovery_feedback.borrow_mut().push((
+            "other-receipt".into(),
+            "Keep another client's feedback".into(),
+        ));
         page.confirm_discard_recovery(&record);
         let dialog = app
             .windows()
@@ -680,6 +692,21 @@ mod tests {
         assert!(
             page.recovery_busy.get(),
             "Discard must be busy before its worker starts"
+        );
+        assert!(
+            !page
+                .recovery_feedback
+                .borrow()
+                .iter()
+                .any(|(id, _)| id == &record.id),
+            "a new Discard must clear this record's stale Retry failure"
+        );
+        assert!(
+            page.recovery_feedback
+                .borrow()
+                .iter()
+                .any(|(id, _)| id == "other-receipt"),
+            "other records keep their feedback"
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while page.recovery_busy.get() && std::time::Instant::now() < deadline {
@@ -694,5 +721,25 @@ mod tests {
             .borrow()
             .iter()
             .any(|(id, message)| id == &record.id && !message.is_empty()));
+        page.set_recovery_dismissed(&record.id, true, &gtk::Button::new());
+        assert!(page.recovery_busy.get());
+        assert!(
+            !page
+                .recovery_feedback
+                .borrow()
+                .iter()
+                .any(|(id, _)| id == &record.id),
+            "Dismiss must clear the preceding action's feedback too"
+        );
+        assert!(page
+            .recovery_feedback
+            .borrow()
+            .iter()
+            .any(|(id, _)| id == "other-receipt"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while page.recovery_busy.get() && std::time::Instant::now() < deadline {
+            gtk::glib::MainContext::default().iteration(false);
+        }
+        assert!(!page.recovery_busy.get());
     }
 }

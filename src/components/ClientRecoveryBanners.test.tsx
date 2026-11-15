@@ -45,7 +45,7 @@ function result(pending: ClientRecovery | null = null) {
     restored: pending ? 0 : 1,
     accounted: 0,
     remaining: pending ? 1 : 0,
-    message: `Cursor: restored ${pending ? 0 : 1} saved values; 0 were already resolved or removed; ${pending ? 1 : 0} still need attention.`,
+    message: `Cursor: saved values restored: ${pending ? 0 : 1}; already resolved or removed: 0; still missing: ${pending ? 1 : 0}.`,
     pending,
   };
 }
@@ -85,7 +85,7 @@ it("retries only the selected receipt and replaces its warning with success", as
   await userEvent.click(await screen.findByRole("button", { name: "Retry" }));
   expect(api.retryClientRecovery).toHaveBeenCalledWith("receipt-cursor");
   expect(await screen.findByRole("status")).toHaveTextContent(
-    "Cursor: restored 1 saved values; 0 were already resolved or removed; 0 still need attention.",
+    "Cursor: saved values restored: 1; already resolved or removed: 0; still missing: 0.",
   );
   expect(screen.getByRole("status")).toHaveFocus();
   expect(screen.queryByRole("region")).not.toBeInTheDocument();
@@ -97,7 +97,7 @@ it("keeps the recovery visible when retry is still locked", async () => {
   render(<ClientRecoveryBanners refreshKey="initial" />);
   await userEvent.click(await screen.findByRole("button", { name: "Retry" }));
   expect(await screen.findByRole("status")).toHaveTextContent(
-    "Cursor: restored 0 saved values; 0 were already resolved or removed; 1 still need attention.",
+    "Cursor: saved values restored: 0; already resolved or removed: 0; still missing: 1.",
   );
   expect(screen.getByRole("region")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
@@ -295,11 +295,11 @@ it("reports partial success without removing the remaining recovery", async () =
     ...result(recovery()),
     restored: 1,
     message:
-      "Cursor: restored 1 saved values; 0 were already resolved or removed; 1 still need attention.",
+      "Cursor: saved values restored: 1; already resolved or removed: 0; still missing: 1.",
   });
   render(<ClientRecoveryBanners refreshKey="partial" />);
   await userEvent.click(await screen.findByRole("button", { name: "Retry" }));
-  expect(await screen.findByRole("status")).toHaveTextContent("restored 1 saved values");
+  expect(await screen.findByRole("status")).toHaveTextContent("saved values restored: 1");
   expect(screen.getByRole("region")).toBeInTheDocument();
 });
 it("does not display an unexpected worker exception or its credential", async () => {

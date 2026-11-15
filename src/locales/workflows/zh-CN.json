@@ -491,5 +491,6 @@
   "Recovery backup:\n{backup}": "恢复备份：\n{backup}",
   "This recovery belongs to an unsupported client. Use a compatible Toolport version to recover it.": "此恢复属于不受支持的客户端。请使用兼容的 Toolport 版本进行恢复。",
   "{client}: the recovery information can be read again.": "{client}：恢复信息现已可再次读取。",
-  "Saved recovery information:\n{path}": "已保存的恢复信息：\n{path}"
+  "Saved recovery information:\n{path}": "已保存的恢复信息：\n{path}",
+  "{client}: saved values restored: {restored}; already resolved or removed: {accounted}; still missing: {remaining}.": "{client}：已恢复的保存值：{restored}；已解决或移除：{accounted}；仍缺失：{remaining}。"
 }

@@ -491,5 +491,6 @@
   "Recovery backup:\n{backup}": "복구 백업:\n{backup}",
   "This recovery belongs to an unsupported client. Use a compatible Toolport version to recover it.": "이 복구는 지원되지 않는 클라이언트의 것입니다. 호환되는 Toolport 버전을 사용하여 복구하세요.",
   "{client}: the recovery information can be read again.": "{client}: 복구 정보를 다시 읽을 수 있습니다.",
-  "Saved recovery information:\n{path}": "저장된 복구 정보:\n{path}"
+  "Saved recovery information:\n{path}": "저장된 복구 정보:\n{path}",
+  "{client}: saved values restored: {restored}; already resolved or removed: {accounted}; still missing: {remaining}.": "{client}: 복원된 저장 값: {restored}, 이미 해결되었거나 제거된 값: {accounted}, 아직 누락된 값: {remaining}."
 }

@@ -70,7 +70,7 @@ pub(super) fn state_for_instructions(text: &str) -> Option<crate::secrets::Backu
     .find(|&s| text == next_step(s, false))
 }
 fn progress_message(name: &str, restored: usize, accounted: usize, remaining: usize) -> String {
-    crate::i18n::trf("{client}: restored {restored} saved values; {accounted} were already resolved or removed; {remaining} still need attention.",&[("client",name),("restored",&restored.to_string()),("accounted",&accounted.to_string()),("remaining",&remaining.to_string())])
+    crate::i18n::trf("{client}: saved values restored: {restored}; already resolved or removed: {accounted}; still missing: {remaining}.",&[("client",name),("restored",&restored.to_string()),("accounted",&accounted.to_string()),("remaining",&remaining.to_string())])
 }
 pub(super) fn warnings(id: &str, path: &Path) -> Vec<String> {
     let (restored, accounted) = recovery_values::progress();

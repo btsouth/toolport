@@ -491,5 +491,6 @@
   "Recovery backup:\n{backup}": "Wiederherstellungssicherung:\n{backup}",
   "This recovery belongs to an unsupported client. Use a compatible Toolport version to recover it.": "Diese Wiederherstellung gehört zu einem nicht unterstützten Client. Verwenden Sie eine kompatible Toolport-Version, um sie wiederherzustellen.",
   "{client}: the recovery information can be read again.": "{client}: Die Wiederherstellungsinformationen können wieder gelesen werden.",
-  "Saved recovery information:\n{path}": "Gespeicherte Wiederherstellungsinformationen:\n{path}"
+  "Saved recovery information:\n{path}": "Gespeicherte Wiederherstellungsinformationen:\n{path}",
+  "{client}: saved values restored: {restored}; already resolved or removed: {accounted}; still missing: {remaining}.": "{client}: gespeicherte Werte wiederhergestellt: {restored}; bereits ersetzt oder entfernt: {accounted}; noch fehlend: {remaining}."
 }

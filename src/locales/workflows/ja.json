@@ -491,5 +491,6 @@
   "Recovery backup:\n{backup}": "復元用バックアップ：\n{backup}",
   "This recovery belongs to an unsupported client. Use a compatible Toolport version to recover it.": "この復元は未対応のクライアントのものです。互換性のあるバージョンのToolportで復元してください。",
   "{client}: the recovery information can be read again.": "{client}：復元情報を再び読み取れるようになりました。",
-  "Saved recovery information:\n{path}": "保存済みの復元情報：\n{path}"
+  "Saved recovery information:\n{path}": "保存済みの復元情報：\n{path}",
+  "{client}: saved values restored: {restored}; already resolved or removed: {accounted}; still missing: {remaining}.": "{client}: 保存済みの値の復元数: {restored}、解決済みまたは削除済み: {accounted}、未復元: {remaining}。"
 }
