@@ -1441,8 +1441,15 @@ struct ImportedConcurrent(
 struct Redaction(Arc<crate::secret_redact::Matcher>, Vec<String>);
 impl Redaction {
     fn new<N: AsRef<str>, V: AsRef<str>>(values: &[(N, V)], references: Vec<String>) -> Self {
+        // A username is not secret, so it is replaced whole but never by fragment
+        // (an eight-letter piece of it would otherwise vanish from every message).
+        let whole_only = values
+            .iter()
+            .filter(|(name, _)| name.as_ref() == "url_user")
+            .map(|(_, value)| value.as_ref().to_string())
+            .collect();
         Self(
-            Arc::new(crate::secret_redact::Matcher::new(values)),
+            Arc::new(crate::secret_redact::Matcher::new_with(values, &whole_only)),
             references,
         )
     }

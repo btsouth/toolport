@@ -154,9 +154,14 @@ pub const FRAGMENT_MIN_SECRET_CHARS: usize = 12;
 /// messages): adjacent window hits merge into one span covering the whole piece.
 /// Windows of a single character class (`password`, `12345678`) are skipped, since
 /// an ordinary word inside a passphrase must not redact that word everywhere.
+///
+/// Containers are matched whole, never by fragment: a URL, a JSON document (OAuth
+/// state) or an auth header with its scheme would otherwise turn `https://`,
+/// `{"access_` or `Bearer a` into markers everywhere. The secrets inside them are
+/// registered on their own and windowed there.
 fn fragment_windows(value: &str) -> Vec<String> {
     let chars: Vec<char> = value.chars().collect();
-    if chars.len() < FRAGMENT_MIN_SECRET_CHARS {
+    if chars.len() < FRAGMENT_MIN_SECRET_CHARS || is_container(value) {
         return Vec::new();
     }
     chars
@@ -174,6 +179,16 @@ fn fragment_windows(value: &str) -> Vec<String> {
         })
         .map(|window| window.iter().collect())
         .collect()
+}
+
+fn is_container(value: &str) -> bool {
+    let trimmed = value.trim_start();
+    let lower = trimmed.get(..7).unwrap_or(trimmed).to_ascii_lowercase();
+    value.contains("://")
+        || trimmed.starts_with(['{', '['])
+        || ["bearer ", "basic ", "token ", "bot "]
+            .iter()
+            .any(|scheme| lower.starts_with(scheme))
 }
 
 /// Text forms an upstream error formatter realistically applies to a value it
@@ -302,6 +317,17 @@ fn build(patterns: &[String]) -> Option<AhoCorasick> {
 
 impl Matcher {
     pub fn new<N: AsRef<str>, V: AsRef<str>>(secrets: &[(N, V)]) -> Self {
+        Self::new_with(secrets, &HashSet::new())
+    }
+
+    /// Like [`Matcher::new`], with `whole_only` values matched in their whole forms
+    /// but never by fragment: values that are not themselves a secret but contain
+    /// one (a `user:password` pair, a username) whose secret part is registered on
+    /// its own.
+    pub fn new_with<N: AsRef<str>, V: AsRef<str>>(
+        secrets: &[(N, V)],
+        whole_only: &HashSet<String>,
+    ) -> Self {
         let mut names: Vec<String> = Vec::new();
         let mut raw_patterns: Vec<(String, Pattern)> = Vec::new();
         let mut seen = HashSet::new();
@@ -334,7 +360,12 @@ impl Matcher {
                     ));
                 }
             }
-            for window in fragment_windows(value) {
+            let windows = if whole_only.contains(value) {
+                Vec::new()
+            } else {
+                fragment_windows(value)
+            };
+            for window in windows {
                 if seen.insert(window.clone()) {
                     raw_patterns.push((
                         window,
@@ -716,6 +747,8 @@ struct Registry {
     /// (remote servers read their credential from the vault on every call) cost one
     /// read-locked lookup instead of re-deriving forms.
     seen: HashSet<(String, String)>,
+    /// Values matched whole but never by fragment (see [`Matcher::new_with`]).
+    whole_only: HashSet<String>,
 }
 
 /// Which registry a secret belongs to. A shipped process has one data directory,
@@ -797,7 +830,7 @@ fn current_in(scope: &Scope) -> Option<Arc<Matcher>> {
             .iter()
             .map(|(_, n, v)| (n.as_str(), v.as_str()))
             .collect();
-        Arc::new(Matcher::new(&pairs))
+        Arc::new(Matcher::new_with(&pairs, &reg.whole_only))
     });
     Some(Arc::clone(matcher))
 }
@@ -807,6 +840,36 @@ fn current() -> Option<Arc<Matcher>> {
         return None;
     }
     current_in(&scope_now())
+}
+
+/// Match `value` whole only (see [`Matcher::new_with`]). Call before [`add`].
+fn mark_whole_only(scope: &Scope, value: &str) {
+    let mut guard = REGISTRY
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let reg = guard
+        .get_or_insert_with(Default::default)
+        .entry(scope.clone())
+        .or_insert_with(|| Registry {
+            secrets: Vec::new(),
+            matcher: None,
+            seen: HashSet::new(),
+            whole_only: HashSet::new(),
+        });
+    if reg.whole_only.insert(value.to_string()) {
+        reg.matcher = None;
+    }
+}
+
+/// Register a value matched only in its whole forms, never by fragment: text
+/// that contains a secret without being one (the `client_id:client_secret` pair
+/// an HTTP Basic header encodes).
+pub fn register_whole(owner: &str, key: &str, value: &str) {
+    let scope = scope_now();
+    mark_whole_only(&scope, value);
+    if add(&scope, &format!("{owner}/{key}"), key, value) {
+        schedule_scrub(owner);
+    }
 }
 
 fn add(scope: &Scope, id: &str, name: &str, value: &str) -> bool {
@@ -823,6 +886,7 @@ fn add(scope: &Scope, id: &str, name: &str, value: &str) -> bool {
             secrets: Vec::new(),
             matcher: None,
             seen: HashSet::new(),
+            whole_only: HashSet::new(),
         });
     if reg
         .secrets
@@ -916,9 +980,13 @@ fn register_forms(scope: &Scope, id: &str, key: &str, value: &str) -> bool {
                 // The same userinfo sent as HTTP Basic: `base64(user:password)`.
                 let user = url.username();
                 if !user.is_empty() {
-                    added |= add(scope, &id, key, &format!("{user}:{password}"));
+                    let mut pairs = vec![format!("{user}:{password}")];
                     if let (Ok(user), Ok(password)) = (urlencoding::decode(user), &decoded) {
-                        added |= add(scope, &id, key, &format!("{user}:{password}"));
+                        pairs.push(format!("{user}:{password}"));
+                    }
+                    for pair in pairs {
+                        mark_whole_only(scope, &pair);
+                        added |= add(scope, &id, key, &pair);
                     }
                 }
             }
@@ -1548,6 +1616,40 @@ mod tests {
         assert_eq!(out, "line echoed: [secret:PEM]");
         let collapsed = pem.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(!p.redact_text(&collapsed).contains("MIIBVQ"));
+    }
+
+    #[test]
+    fn fragments_of_a_secret_are_redacted_but_not_of_containers() {
+        let m = Matcher::new_with(
+            &[
+                ("TOKEN", "frag-Secret-7Kq2-tail"),
+                (
+                    "URL",
+                    "https://api.example.invalid/mcp?key=frag-Secret-7Kq2-tail",
+                ),
+                ("STATE", r#"{"access_token":"frag-Secret-7Kq2-tail"}"#),
+                ("AUTH", "Bearer frag-Secret-7Kq2-tail"),
+                ("PAIR", "service-user:frag-Secret-7Kq2-tail"),
+            ],
+            &HashSet::from(["service-user:frag-Secret-7Kq2-tail".to_string()]),
+        );
+        // A piece of the secret from the middle of a stderr tail.
+        assert_eq!(
+            m.redact_text("tail: cret-7Kq2-ta]"),
+            "tail: [secret:TOKEN]]"
+        );
+        // Container text stays: other URLs, JSON keys, auth schemes, usernames.
+        for text in [
+            "see https://docs.example.invalid/errors",
+            r#"{"access_token":"unrelated"}"#,
+            "Bearer abcdefgh-unrelated",
+            "service-user lacks scope",
+        ] {
+            assert_eq!(m.redact_text(text), text);
+        }
+        // An all-letters word inside a passphrase is not redacted on its own.
+        let p = Matcher::new(&[("PASS", "correct horse battery staple 42")]);
+        assert_eq!(p.redact_text("the battery is low"), "the battery is low");
     }
 
     #[test]

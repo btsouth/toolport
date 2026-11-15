@@ -1527,7 +1527,7 @@ fn client_secret_basic_header(client_id: &str, client_secret: &str) -> String {
     // The client secret is registered from the vault already; this registers the
     // exact credential string too, so the whole header value redacts as one.
     crate::secret_redact::register(client_id, "client_secret_basic", &header);
-    crate::secret_redact::register(client_id, "client_secret_basic", &credentials);
+    crate::secret_redact::register_whole(client_id, "client_secret_basic", &credentials);
     header
 }
 
