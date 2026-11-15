@@ -35,6 +35,9 @@ use serde_json::Value;
 
 /// Secrets shorter than this (in chars) are redacted only as a whole token.
 pub const SHORT_SECRET_CHARS: usize = 6;
+/// Fewest digits a numeric secret needs before a JSON number equal to it is
+/// replaced (see [`Matcher::numeric_secret`]).
+pub const MIN_NUMERIC_SECRET_DIGITS: usize = 6;
 /// How long the background builder waits after a registration for more to
 /// arrive, so a burst (every server's secrets at startup) costs one main build.
 const MAIN_BUILD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(25);
@@ -341,35 +344,19 @@ fn is_token_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// Largest pattern set (total bytes) compiled to a full DFA. A DFA's memory
-/// grows with its states times the alphabet (about 4.3 GiB for 5,000 secrets),
-/// so past this a contiguous NFA is used: roughly 1.7x the per-line cost, a
-/// fortieth of the memory and a quarter of the build time.
-const DFA_MAX_PATTERN_BYTES: usize = 64 * 1024;
-
+/// Every automaton is a contiguous NFA. A DFA's memory grows with its states
+/// times the alphabet: 940 patterns for 20 secrets took two DFAs of 9.4 MiB
+/// each, against 1 MiB for the contiguous NFAs, for a per-line cost that stays
+/// in the hundreds of nanoseconds either way (see the secret-redact-performance
+/// example).
 fn build(patterns: &[String]) -> Option<AhoCorasick> {
     if patterns.is_empty() {
         return None;
     }
-    if patterns.iter().map(String::len).sum::<usize>() > DFA_MAX_PATTERN_BYTES {
-        return AhoCorasickBuilder::new()
-            .match_kind(MatchKind::Standard)
-            .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
-            .build(patterns)
-            .ok();
-    }
-    // A full DFA: every log line is scanned, and with every form and fragment of
-    // every secret the default NFA would be several times slower. Falls back to
-    // the default if the DFA would exceed the crate's size limit.
     AhoCorasickBuilder::new()
         .match_kind(MatchKind::Standard)
-        .kind(Some(aho_corasick::AhoCorasickKind::DFA))
+        .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
         .build(patterns)
-        .or_else(|_| {
-            AhoCorasickBuilder::new()
-                .match_kind(MatchKind::Standard)
-                .build(patterns)
-        })
         .ok()
 }
 
@@ -492,6 +479,7 @@ impl Matcher {
             .then(|| {
                 AhoCorasickBuilder::new()
                     .match_kind(MatchKind::Standard)
+                    .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
                     .ascii_case_insensitive(true)
                     .build(&ci_texts)
                     .ok()
@@ -810,11 +798,13 @@ impl Matcher {
         &self,
         text: &str,
         fragments: bool,
-        exempt: Option<&HashSet<usize>>,
+        exempt: Option<&HashSet<String>>,
     ) -> Option<String> {
         let mut spans = self.spans_with(text, fragments);
         if let Some(exempt) = exempt {
-            spans.retain(|(_, _, names)| !names.iter().all(|n| exempt.contains(n)));
+            // Exempt only where the exact value the client sent appears whole:
+            // never a different secret that contains it or is contained in it.
+            spans.retain(|(s, e, _)| !exempt.contains(&text[*s..*e]));
         }
         (!spans.is_empty()).then(|| self.apply(text, &spans))
     }
@@ -824,7 +814,7 @@ impl Matcher {
         &self,
         value: &mut Value,
         fragments: bool,
-        exempt: Option<&HashSet<usize>>,
+        exempt: Option<&HashSet<String>>,
     ) -> bool {
         match value {
             Value::String(s) => match self.text_with(s, fragments, exempt) {
@@ -838,7 +828,7 @@ impl Matcher {
             // number) becomes the marker string. Booleans and null carry no value.
             Value::Number(n) => match self
                 .number_secret(n)
-                .filter(|name| !exempt.is_some_and(|e| e.contains(name)))
+                .filter(|_| !exempt.is_some_and(|e| e.contains(&n.to_string())))
             {
                 Some(name) => {
                     *value = Value::String(self.marker(&[name]));
@@ -871,7 +861,7 @@ impl Matcher {
     fn redact_adjacent<'v>(
         &self,
         values: impl Iterator<Item = &'v mut Value>,
-        exempt: Option<&HashSet<usize>>,
+        exempt: Option<&HashSet<String>>,
     ) -> bool {
         let mut changed = false;
         let mut prev: Option<&'v mut String> = None;
@@ -898,7 +888,7 @@ impl Matcher {
         &self,
         a: &str,
         b: &str,
-        exempt: Option<&HashSet<usize>>,
+        exempt: Option<&HashSet<String>>,
     ) -> Option<(String, String)> {
         if a.is_empty() || b.is_empty() {
             return None;
@@ -917,15 +907,43 @@ impl Matcher {
         let (start, end, names) =
             self.spans_with(&joined, false)
                 .into_iter()
-                .find(|(s, e, names)| {
-                    *s < seam
-                        && *e > seam
-                        && !exempt.is_some_and(|x| names.iter().all(|n| x.contains(n)))
+                .find(|(s, e, _)| {
+                    *s < seam && *e > seam && !exempt.is_some_and(|x| x.contains(&joined[*s..*e]))
                 })?;
         Some((
             format!("{}{}", &a[..from + start], self.marker(&names)),
             b[end - seam..].to_string(),
         ))
+    }
+
+    /// The registered values that occur whole, exactly as registered, in the
+    /// strings, numbers and keys of `value` (a client's request): the identity
+    /// of an exemption is the value itself, never its display name, so two
+    /// secrets under one key name never exempt each other.
+    fn values_in(&self, value: &Value, out: &mut HashSet<String>) {
+        let text = |t: &str, out: &mut HashSet<String>| {
+            for (s, e, _) in self.spans_with(t, false) {
+                if self.exact_get(&t[s..e]).is_some() {
+                    out.insert(t[s..e].to_string());
+                }
+            }
+        };
+        match value {
+            Value::String(s) => text(s, out),
+            Value::Number(n) => {
+                if self.exact_get(&n.to_string()).is_some() {
+                    out.insert(n.to_string());
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|v| self.values_in(v, out)),
+            Value::Object(map) => {
+                for (k, v) in map {
+                    text(k, out);
+                    self.values_in(v, out);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// The secrets whose whole forms occur anywhere in `value` (strings, numbers
@@ -1026,12 +1044,23 @@ impl Matcher {
         if !self.has_exact() {
             return None;
         }
-        if let Some(name) = self.exact_get(&n.to_string()) {
+        let text = n.to_string();
+        if let Some(name) = self.numeric_secret(&text) {
             return Some(name);
         }
         let f = n.as_f64()?;
         (f.fract() == 0.0 && f.abs() < 9.0e15)
-            .then(|| self.exact_get(&format!("{}", f as i64)))
+            .then(|| self.numeric_secret(&format!("{}", f as i64)))
+            .flatten()
+    }
+
+    /// A registered value spelled by a JSON number's text, if it has at least
+    /// [`MIN_NUMERIC_SECRET_DIGITS`] digits. A shorter one (a port, a small id)
+    /// would turn ordinary numbers into strings and change the types a model
+    /// reads; those are named in status instead, and still redacted in text.
+    fn numeric_secret(&self, text: &str) -> Option<usize> {
+        (text.bytes().filter(u8::is_ascii_digit).count() >= MIN_NUMERIC_SECRET_DIGITS)
+            .then(|| self.exact_get(text))
             .flatten()
     }
 
@@ -1042,7 +1071,7 @@ impl Matcher {
     fn redact_keys(
         &self,
         map: &mut serde_json::Map<String, Value>,
-        exempt: Option<&HashSet<usize>>,
+        exempt: Option<&HashSet<String>>,
     ) -> bool {
         let renamed: Vec<(String, String)> = map
             .keys()
@@ -1103,7 +1132,7 @@ impl Matcher {
                     i += 1;
                 }
                 let token = &body[start..i];
-                let name = self.exact_get(token).or_else(|| {
+                let name = self.numeric_secret(token).or_else(|| {
                     serde_json::from_str::<serde_json::Number>(token)
                         .ok()
                         .and_then(|n| self.number_secret(&n))
@@ -1245,8 +1274,8 @@ struct Registry {
     /// Never evicted: a value stays redacted for the life of the process, as
     /// long as any log could still hold it.
     secrets: Vec<(String, String, String)>,
-    /// The same triples, for constant-time duplicate checks.
-    known: HashSet<(String, String, String)>,
+    /// The same triples, by index, for constant-time duplicate checks.
+    known: std::collections::HashMap<(String, String, String), usize>,
     /// Matcher over `secrets[..main_len]`, built off the registering thread by
     /// [`builder`] and swapped in whole; readers never wait for it.
     main: Option<Arc<Matcher>>,
@@ -1271,7 +1300,7 @@ impl Registry {
     fn new() -> Self {
         Self {
             secrets: Vec::new(),
-            known: HashSet::new(),
+            known: std::collections::HashMap::new(),
             main: None,
             main_len: 0,
             whole_gen: 0,
@@ -1365,7 +1394,7 @@ impl Layers {
         for m in &self.0 {
             let mut exempt = HashSet::new();
             if let Some(request) = request {
-                m.secrets_in(request, &mut exempt);
+                m.values_in(request, &mut exempt);
             }
             changed |= m.value_with(value, fragments, (!exempt.is_empty()).then_some(&exempt));
         }
@@ -1584,6 +1613,11 @@ fn rebuild_stale_mains() {
 /// Make sure the value at `index` in `scope` is covered before returning: build
 /// a delta matcher over everything the main one lacks (outside the lock) and
 /// install it unless a wider one already was.
+/// Test builds: run inside [`cover`] just before each build, so a test can hold
+/// a registering thread there.
+#[cfg(test)]
+static COVER_HOOK: Mutex<Option<Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+
 fn cover(scope: &Scope, index: usize) {
     loop {
         let (end, pairs, whole_only, main) = {
@@ -1604,6 +1638,11 @@ fn cover(scope: &Scope, index: usize) {
                 .collect();
             (end, pairs, reg.whole_only.clone(), reg.main.clone())
         };
+        #[cfg(test)]
+        let hook = COVER_HOOK.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
         // Searched together with the main matcher it was read with, which covers
         // everything before the delta's first value.
         let built = Arc::new(Matcher::new_with(&pairs, &whole_only).over(main));
@@ -1672,16 +1711,29 @@ fn add(scope: &Scope, id: &str, name: &str, value: &str) -> bool {
             .get_or_insert_with(Default::default)
             .entry(scope.clone())
             .or_insert_with(Registry::new);
-        if !reg.known.insert(triple.clone()) {
-            return false;
+        // Known is not covered: a duplicate (another thread may still be
+        // building for it) waits for the cover of the same index.
+        if let Some(&index) = reg.known.get(&triple) {
+            Err(index)
+        } else {
+            reg.secrets.push(triple.clone());
+            let index = reg.secrets.len() - 1;
+            reg.known.insert(triple, index);
+            ACTIVE.store(true, Ordering::Release);
+            Ok(index)
         }
-        reg.secrets.push(triple);
-        ACTIVE.store(true, Ordering::Release);
-        reg.secrets.len() - 1
     };
-    cover(scope, index);
-    wake_builder();
-    true
+    match index {
+        Ok(index) => {
+            cover(scope, index);
+            wake_builder();
+            true
+        }
+        Err(index) => {
+            cover(scope, index);
+            false
+        }
+    }
 }
 
 /// Register a resolved secret value. `owner` is the server id (or another namespace)
@@ -2689,7 +2741,10 @@ mod tests {
         assert_eq!(d["alt"], "[secret:PIN]");
         assert_eq!(d["f"], "[secret:PIN]");
         assert_eq!(d["list"], serde_json::json!([1, "[secret:PIN]"]));
-        assert_eq!(d["rate"], "[secret:RATE]", "source text of a float");
+        assert_eq!(
+            d["rate"], 1.50,
+            "a numeric secret under six digits leaves numbers alone"
+        );
         assert_eq!(d["other"], 4821930, "a longer number is not the PIN");
         assert_eq!(d["ok"], true);
         assert!(d["none"].is_null());
@@ -2907,6 +2962,101 @@ mod tests {
         assert!(
             results.iter().all(|&c| c),
             "each value is redacted once add returns"
+        );
+    }
+
+    #[test]
+    fn an_exemption_covers_only_the_exact_value_the_client_sent() {
+        use serde_json::json;
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-exempt-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        // Same conventional key name on two servers (or old and new values).
+        register("srv-a", "API_KEY", "sk-AlphaSecret123");
+        register("srv-b", "API_KEY", "sk-BetaHidden456");
+        // A secret that contains the sent value, and one contained in another.
+        register("srv-c", "LONGER", "sk-AlphaSecret123XYZ");
+        register("srv-d", "OUTER", "wrap-InnerValue-889-end");
+        register("srv-d", "INNER", "InnerValue-889");
+        let request =
+            json!({"arguments": {"q": "sk-AlphaSecret123", "w": "wrap-InnerValue-889-end"}});
+        let mut response = json!({"text": "a sk-AlphaSecret123 b sk-BetaHidden456 c sk-AlphaSecret123XYZ d InnerValue-889 e wrap-InnerValue-889-end"});
+        assert!(redact_outgoing(&mut response, Some(&request)));
+        assert_eq!(
+            response["text"],
+            "a sk-AlphaSecret123 b [secret:API_KEY] c [secret:LONGER,API_KEY] d [secret:INNER] e wrap-InnerValue-889-end"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_registration_waits_until_its_value_is_covered() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-dup-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        let scope = scope_now();
+        // Thread A is held inside its first build until B has finished.
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let (g, r) = (Arc::clone(&gate), Arc::clone(&release));
+        let first = Arc::new(AtomicBool::new(true));
+        *COVER_HOOK.lock().unwrap() = Some(Arc::new(move || {
+            if first.swap(false, Ordering::SeqCst) {
+                g.wait();
+                r.wait();
+            }
+        }));
+        let value = "duplicate-value-7Rk2Pq9";
+        let a = {
+            let scope = scope.clone();
+            std::thread::spawn(move || add(&scope, "dup-srv/K", "K", value))
+        };
+        gate.wait();
+        // B registers the same value while A has not built anything yet.
+        add(&scope, "dup-srv/K", "K", value);
+        let covered = current_in(&scope)
+            .is_some_and(|m| !m.redact_text(&format!("x {value}")).contains("7Rk2Pq9"));
+        release.wait();
+        a.join().unwrap();
+        *COVER_HOOK.lock().unwrap() = None;
+        assert!(
+            covered,
+            "a duplicate registration returned before its value was covered"
+        );
+    }
+
+    #[test]
+    fn only_numeric_secrets_of_six_digits_or_more_replace_numbers() {
+        let m = m(&[("PORT", "8443"), ("PIN", "482193"), ("RATE", "1.50")]);
+        let out = m
+            .redact_line(r#"{"port":8443,"pin":482193,"rate":1.50,"text":"pin 482193 port 8443"}"#);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["port"], 8443,
+            "a short numeric secret leaves numbers alone"
+        );
+        assert_eq!(v["rate"], 1.50);
+        assert_eq!(v["pin"], "[secret:PIN]");
+        assert_eq!(
+            v["text"], "pin [secret:PIN] port [secret:PORT]",
+            "text still redacts"
+        );
+    }
+
+    #[test]
+    fn twenty_secrets_fit_in_two_mebibytes() {
+        let set: Vec<(String, String)> = (0..20)
+            .map(|i| {
+                (
+                    format!("KEY_{i}"),
+                    format!("sk-{i:02}-Zq8Lm3Vx7Rt2Pw9Hn4Bc6Jd1Ks5"),
+                )
+            })
+            .collect();
+        let m = Matcher::new(&set);
+        assert!(
+            m.memory_usage() < 2 * 1024 * 1024,
+            "{} bytes",
+            m.memory_usage()
         );
     }
 
