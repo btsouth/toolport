@@ -10819,26 +10819,16 @@ struct ProgressRoute {
     /// own unique token downstream and translates back here, the same way it
     /// namespaces tool names.
     client_token: Value,
-    /// The progress messages of this call are one stream: a secret split over
-    /// any number of notifications is matched whole. A notification whose
-    /// message ends in what may be the start of a secret is held whole and
-    /// merged into the next one (progress is cumulative, so the later values
-    /// stand for both); one still held when the call ends is delivered then,
-    /// before the response, with the end-of-stream rule applied.
-    messages: conduit_lib::secret_redact::Stream,
     /// The registered values the client sent in the request (any spelling):
-    /// echoed in its progress, they are its own and are left as they are.
+    /// echoed in its progress, they are its own and are left as they are. Each
+    /// progress message is redacted whole and on its own, never held or joined
+    /// with another, so its text is delivered as it came, in order.
     exempt: Option<Arc<std::collections::HashSet<String>>>,
-    /// A notification held whole as above, with the message text written so far.
-    held: Option<(Value, String)>,
     /// The request instance that asked for it. Its progress is delivered only while
     /// that instance is live, so a cancelled call's late progress never reaches the
     /// client, which may already have reused the token for its next request.
     owner: Option<downstream::CancelContext>,
 }
-
-/// Hands a finished progress notification to one client session.
-type ProgressDeliver = Arc<dyn Fn(&str, &Value, Option<&downstream::CancelContext>) + Send + Sync>;
 
 /// A stdio progress message and the request instance it belongs to.
 type StdioProgress = (Value, Option<downstream::CancelContext>);
@@ -10861,10 +10851,6 @@ const PROGRESS_STDIO_QUEUE: usize = 256;
 #[derive(Default)]
 struct ProgressRoutes {
     active: HashMap<String, ProgressRoute>,
-    /// Delivers a finished notification to a session: set by
-    /// [`make_progress_sink`], used for a notification still held when its call
-    /// ends.
-    deliver: Option<ProgressDeliver>,
     /// Minting counter for our own progress tokens: monotonic, so a token is never
     /// reused while an earlier call is still in flight. It lives on the table
     /// rather than in a process global because a token is only ever resolved
@@ -10884,27 +10870,11 @@ struct ProgressRegistration {
 
 impl Drop for ProgressRegistration {
     fn drop(&mut self) {
-        let (route, deliver) = {
-            let mut table = self
-                .table
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (table.active.remove(&self.key), table.deliver.clone())
-        };
-        // The call is over: a held notification is delivered now, with what
-        // its stream still held written under the end-of-stream rule.
-        let Some(mut route) = route else { return };
-        let Some((mut note, mut text)) = route.held.take() else {
-            return;
-        };
-        text.push_str(&route.messages.finish());
-        if let Some(message) = note.pointer_mut("/params/message") {
-            *message = Value::String(text);
-        }
-        finish_progress_note(&mut note, &route);
-        if let Some(deliver) = deliver {
-            deliver(&route.session, &note, route.owner.as_ref());
-        }
+        self.table
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .remove(&self.key);
     }
 }
 
@@ -10955,9 +10925,7 @@ fn register_progress(
             session: session.to_string(),
             producer: producer.to_string(),
             client_token,
-            messages: conduit_lib::secret_redact::Stream::whole_for(exempt.clone()),
             exempt,
-            held: None,
             owner: APPROVAL_CANCEL.with(|current| current.borrow().clone()),
         },
     );
@@ -11023,27 +10991,11 @@ fn deliver_progress(
     };
     let mut note = note.clone();
     let (session, owner) = {
-        let mut table = routes
+        let table = routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match table.active.get_mut(&key) {
+        match table.active.get(&key) {
             Some(route) if route.producer == producer => {
-                if let Some(Value::String(message)) = note.pointer_mut("/params/message") {
-                    let ready = route.messages.push(message);
-                    let mut text = route.held.take().map(|(_, t)| t).unwrap_or_default();
-                    text.push_str(&ready);
-                    // Its end may be the start of a secret: only that end is
-                    // held, by the stream (within its cap), and goes out with
-                    // the next notification. A message that is all undecided
-                    // is held whole, merged into the next or delivered when
-                    // the call ends. An end left after a delivered one is
-                    // dropped then, since progress may not repeat.
-                    if text.is_empty() && route.messages.is_holding() {
-                        route.held = Some((note, text));
-                        return;
-                    }
-                    *message = text;
-                }
                 finish_progress_note(&mut note, route);
                 (route.session.clone(), route.owner.clone())
             }
@@ -11131,17 +11083,6 @@ fn make_progress_sink(
     mcp_sessions: McpSessions,
     routes: Arc<Mutex<ProgressRoutes>>,
 ) -> ProgressDispatch {
-    {
-        let (stdio, mcp_sessions) = (Arc::clone(&stdio), mcp_sessions.clone());
-        routes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .deliver = Some(Arc::new(
-            move |session: &str, note: &Value, owner: Option<&downstream::CancelContext>| {
-                deliver_progress_to(&stdio, &mcp_sessions, session, note, owner);
-            },
-        ));
-    }
     Arc::new(move |producer: String, note: Value| {
         deliver_progress(&stdio, &mcp_sessions, &routes, &producer, &note);
     })
