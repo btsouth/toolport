@@ -271,8 +271,10 @@ pub fn retire_dir_for_test(dir: &Path, budget: Duration) -> bool {
 }
 
 /// Drain on orderly gateway exit for at most two seconds. Never joins a writer
-/// stuck in filesystem IO. The OS ends it when the process exits.
+/// stuck in filesystem IO. The OS ends it when the process exits. Every orderly exit
+/// runs this, so it also removes this process's sealed result spills.
 pub fn shutdown() {
+    crate::shaping::release_spills();
     if WRITER
         .get()
         .is_some_and(|writer| !writer.flush(SHUTDOWN_BUDGET))

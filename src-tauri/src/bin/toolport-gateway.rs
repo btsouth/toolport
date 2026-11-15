@@ -23053,6 +23053,8 @@ fn main() {
 
     if let Some(port) = http_port_opt {
         serve_http(state, port);
+        // Land queued telemetry and remove this process's result spills.
+        conduit_lib::telemetry::shutdown();
         return;
     }
 

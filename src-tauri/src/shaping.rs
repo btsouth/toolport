@@ -107,6 +107,12 @@ fn sweep(store: &mut SessionStore<Cached>) {
     spill::reap_expired();
 }
 
+/// Remove this process's spilled results. Every orderly exit runs this through
+/// [`crate::telemetry::shutdown`].
+pub fn release_spills() {
+    spill::release();
+}
+
 /// Called by every gateway runtime's background maintenance tick. Reads never
 /// extend the insertion-based TTL. Trim outside the cache lock and off the request path.
 pub fn maintain_cache(idle_transition: bool) {
@@ -1069,8 +1075,10 @@ fn fetch_result_bounded(
 /// `atomic_write` and sealed with XChaCha20-Poly1305 under a key this process holds
 /// only in memory. A file is unreadable once its process is gone, and nothing in it
 /// is changed, so paging offsets stay exact. Files are removed when their entry
-/// expires (the same 15 minutes as memory), when the disk cap pushes them out, and at
-/// the next start of any gateway for directories whose process has exited.
+/// expires (the same 15 minutes as memory), when the disk cap pushes them out, when
+/// the gateway exits normally, and at the next start of any gateway for directories
+/// whose process has exited. Usage counts what is on disk: a file whose removal
+/// failed keeps its bytes counted until a retry removes it.
 mod spill {
     use super::{Cached, Refusal, CACHE_TTL};
     use base64::Engine;
@@ -1108,6 +1116,29 @@ mod spill {
         FAIL_FOR_TESTS.with(|cell| cell.set(fail));
     }
 
+    #[cfg(test)]
+    thread_local! {
+        static FAIL_REMOVE_FOR_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Make every file removal on this test thread fail, as a locked file would.
+    #[cfg(test)]
+    fn fail_removals_for_tests(fail: bool) {
+        FAIL_REMOVE_FOR_TESTS.with(|cell| cell.set(fail));
+    }
+
+    /// Remove a spill file. True once it is gone, including when it already was.
+    fn remove_file(path: &std::path::Path) -> bool {
+        #[cfg(test)]
+        if FAIL_REMOVE_FOR_TESTS.with(std::cell::Cell::get) {
+            return false;
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => true,
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        }
+    }
+
     fn max_spill_bytes() -> usize {
         #[cfg(test)]
         if let Some(cap) = CAP_FOR_TESTS.with(std::cell::Cell::get) {
@@ -1131,11 +1162,15 @@ mod spill {
         /// None when no key could be generated; spilling is then off.
         cipher: Option<XChaCha20Poly1305>,
         entries: HashMap<String, Spilled>,
+        /// Files of dropped entries whose removal failed. Their bytes stay counted
+        /// against the disk cap until a later try removes them.
+        orphans: Vec<(PathBuf, usize)>,
     }
 
+    static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+
     fn state() -> &'static Mutex<State> {
-        static S: OnceLock<Mutex<State>> = OnceLock::new();
-        S.get_or_init(|| {
+        STATE.get_or_init(|| {
             let mut key = [0u8; 32];
             let key = getrandom::getrandom(&mut key).ok().map(|()| key);
             let state = State::new(spill_root(), key);
@@ -1191,6 +1226,7 @@ mod spill {
                 dir,
                 cipher: key.map(|key| XChaCha20Poly1305::new((&key).into())),
                 entries: HashMap::new(),
+                orphans: Vec::new(),
             }
         }
     }
@@ -1298,10 +1334,8 @@ mod spill {
             if text.len() > max_spill_bytes() {
                 return Err(Refusal::TooLarge);
             }
-            reap(state);
-            while state.entries.values().map(|s| s.bytes).sum::<usize>() + text.len()
-                > max_spill_bytes()
-            {
+            state.reap();
+            while state.used() + text.len() > max_spill_bytes() {
                 let Some(oldest) = state
                     .entries
                     .iter()
@@ -1310,9 +1344,11 @@ mod spill {
                 else {
                     break;
                 };
-                if let Some(gone) = state.entries.remove(&oldest) {
-                    let _ = std::fs::remove_file(gone.path);
-                }
+                state.drop_entry(&oldest);
+            }
+            if state.used() + text.len() > max_spill_bytes() {
+                // Files that would not delete still hold the room this one needs.
+                return Err(Refusal::Unstored);
             }
             if create_private_dir(&dir).is_err() {
                 return Err(Refusal::Unstored);
@@ -1336,6 +1372,57 @@ mod spill {
         }
     }
 
+    impl State {
+        /// Bytes on disk: live entries plus files that would not delete.
+        fn used(&self) -> usize {
+            self.entries.values().map(|s| s.bytes).sum::<usize>()
+                + self.orphans.iter().map(|(_, bytes)| bytes).sum::<usize>()
+        }
+
+        /// Drop `cursor` and its file. A file that will not delete stays counted.
+        fn drop_entry(&mut self, cursor: &str) {
+            if let Some(gone) = self.entries.remove(cursor) {
+                if !remove_file(&gone.path) {
+                    self.orphans.push((gone.path, gone.bytes));
+                }
+            }
+        }
+
+        /// Drop expired entries and retry removing files that would not delete.
+        fn reap(&mut self) {
+            self.orphans.retain(|(path, _)| !remove_file(path));
+            let expired: Vec<String> = self
+                .entries
+                .iter()
+                .filter(|(_, spilled)| spilled.stored.elapsed() >= CACHE_TTL)
+                .map(|(cursor, _)| cursor.clone())
+                .collect();
+            for cursor in expired {
+                self.drop_entry(&cursor);
+            }
+        }
+
+        /// Remove every file of this process and stop spilling: the process is exiting.
+        fn release(&mut self) {
+            let cursors: Vec<String> = self.entries.keys().cloned().collect();
+            for cursor in cursors {
+                self.drop_entry(&cursor);
+            }
+            self.orphans.retain(|(path, _)| !remove_file(path));
+            if let Some(dir) = self.dir.take() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    /// Remove this process's spilled results. A crash leaves them for the next
+    /// gateway's start-up sweep; nothing can read them once this process is gone.
+    pub(super) fn release() {
+        if let Some(state) = STATE.get() {
+            state.lock().unwrap_or_else(|e| e.into_inner()).release();
+        }
+    }
+
     fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
         #[cfg(unix)]
@@ -1351,7 +1438,7 @@ mod spill {
     /// The spilled entry for `cursor`, if it is still live and belongs to `requester`.
     pub(super) fn load(cursor: &str, requester: Option<&str>) -> Option<Cached> {
         let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
-        reap(&mut state);
+        state.reap();
         let spilled = state.entries.get(cursor)?;
         if spilled.owner.as_deref() != requester {
             return None;
@@ -1383,27 +1470,16 @@ mod spill {
         })
     }
 
-    fn reap(state: &mut State) {
-        state.entries.retain(|_, spilled| {
-            let live = spilled.stored.elapsed() < CACHE_TTL;
-            if !live {
-                let _ = std::fs::remove_file(&spilled.path);
-            }
-            live
-        });
-    }
-
     /// Drop a spilled entry and its file (a shape that was declined after storing).
     pub(super) fn forget(cursor: &str) {
-        let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(gone) = state.entries.remove(cursor) {
-            let _ = std::fs::remove_file(gone.path);
-        }
+        state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drop_entry(cursor);
     }
 
     pub(super) fn reap_expired() {
-        let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
-        reap(&mut state);
+        state().lock().unwrap_or_else(|e| e.into_inner()).reap();
     }
 
     #[cfg(test)]
@@ -1423,7 +1499,10 @@ mod spill {
 
         /// A fresh spill root of this test's own, under the test spill root.
         fn case_root(name: &str) -> PathBuf {
-            let root = spill_root().unwrap().join(name);
+            // Outside the shared test root, whose start-up sweep removes what it finds.
+            let root = std::env::temp_dir()
+                .join("toolport-result-spill-cases")
+                .join(name);
             let _ = std::fs::remove_dir_all(&root);
             root
         }
@@ -1456,6 +1535,45 @@ mod spill {
                 .keep("r1", &entry("secret body"), Instant::now())
                 .is_ok());
             assert_eq!(files_under(&root), 1);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn a_spill_that_will_not_delete_keeps_its_bytes_counted() {
+            let root = case_root("undeletable");
+            let mut state = State::new(Some(root.clone()), Some([7; 32]));
+            let body = "a".repeat(1_000);
+            // Room for one sealed entry, not two.
+            set_cap_for_tests(Some(2_000));
+            assert!(state.keep("r1", &entry(&body), Instant::now()).is_ok());
+            fail_removals_for_tests(true);
+            let second = state.keep("r2", &entry(&body), Instant::now());
+            fail_removals_for_tests(false);
+            assert_eq!(
+                second,
+                Err(Refusal::Unstored),
+                "budget freed by a failed delete"
+            );
+            assert_eq!(files_under(&root), 1);
+            // The next spill retries the removal, and the budget comes back.
+            assert!(state.keep("r3", &entry(&body), Instant::now()).is_ok());
+            set_cap_for_tests(None);
+            assert_eq!(files_under(&root), 1);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn release_removes_this_process_spills_and_stops_spilling() {
+            let root = case_root("release");
+            let mut state = State::new(Some(root.clone()), Some([7; 32]));
+            assert!(state.keep("r1", &entry("body"), Instant::now()).is_ok());
+            state.release();
+            assert!(!root.join(std::process::id().to_string()).exists());
+            assert_eq!(
+                state.keep("r2", &entry("body"), Instant::now()),
+                Err(Refusal::Unstored)
+            );
+            assert_eq!(files_under(&root), 0);
             let _ = std::fs::remove_dir_all(&root);
         }
     }

@@ -111,7 +111,9 @@ are sent to every client.
   ones, moves to a file under `result-spill/` in the data directory for the rest of
   its time. Each file is written 0600 and sealed with a key the gateway holds only in
   memory, so it is unreadable once that gateway exits. Files go when their result
-  expires and, for exited gateways, when the next gateway starts. Only a result past
+  expires, when the gateway exits normally, and, for gateways that crashed or were
+  killed, when the next gateway starts. A file that fails to delete still counts
+  against the disk cap until a retry removes it. Only a result past
   the 512 MiB disk cap gets no cursor, and its reply says it was too large and asks
   for a narrower call. A result that cannot be written to disk stays in memory, so a
   cursor already handed out is not lost; memory may then grow to twice the limits
