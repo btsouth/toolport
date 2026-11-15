@@ -39183,6 +39183,37 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_keeps_its_request_id_when_the_id_equals_a_secret() {
+        let _data = DataDirTestEnv::new("reply-id-secret");
+        conduit_lib::secret_redact::register("alpha", "PIN", "482193");
+        conduit_lib::secret_redact::register("alpha", "KEY", "sk-ReplyIdSecret77");
+        let state = http_state(false);
+        for id in [json!(482193), json!("sk-ReplyIdSecret77")] {
+            for req in [
+                json!({"jsonrpc":"2.0","id":id,"method":"ping"}),
+                json!({"jsonrpc":"2.0","id":id,"method":"ping","params":{}}),
+            ] {
+                let reply = process_request_wire(
+                    &state,
+                    &req,
+                    &SearchGuard::default(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    DiscoveryMode::Full,
+                )
+                .expect("a reply")
+                .into_value();
+                assert_eq!(reply["id"], id, "{reply}");
+                assert_eq!(reply["jsonrpc"], "2.0", "{reply}");
+            }
+        }
+    }
+
+    #[test]
     fn without_secret_redaction_clients_get_valid_replies_and_status_says_why() {
         let _data = DataDirTestEnv::new("redaction-unavailable");
         conduit_lib::secret_redact::register("alpha", "KEY", "sk-UnavailableSecret12");
