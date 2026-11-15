@@ -22600,6 +22600,10 @@ fn main() {
     }
     // Persist org rate-limit counters across restarts (SOU-340). Safe if dir missing;
     // counters then stay process-local until the first successful bind.
+    // Sealed result spills of gateways that exited without cleaning up. Their keys
+    // died with them, so the files are unreadable; reclaim the disk now rather than
+    // at this run's first spill.
+    std::thread::spawn(conduit_lib::shaping::remove_stale_spills);
     if let Some(dir) = registry::conduit_dir() {
         conduit_lib::rate_limits::bind_data_dir(&dir);
         // Share downstream 429 backoff windows across gateway processes

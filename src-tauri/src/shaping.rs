@@ -157,6 +157,12 @@ fn sweep_memory(store: &mut SessionStore<Cached>) {
     }
 }
 
+/// Remove sealed result spills left by gateways that have exited. Called once at
+/// gateway start-up, off the request path.
+pub fn remove_stale_spills() {
+    spill::remove_stale_at_startup();
+}
+
 /// Remove this process's spilled results. Every orderly exit runs this through
 /// [`crate::telemetry::shutdown`].
 pub fn release_spills() {
@@ -1401,15 +1407,9 @@ mod spill {
             // A reused pid from an earlier run: its files are not ours to read.
             return false;
         }
-        #[cfg(unix)]
-        {
-            // SAFETY: signal 0 only checks that the process exists.
-            unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-        }
-        #[cfg(not(unix))]
-        {
-            true
-        }
+        // Signal 0 on Unix; on Windows a process handle that is not yet signaled. An
+        // inconclusive answer counts as running.
+        crate::gateway_publish::pid_is_running(pid)
     }
 
     /// Keep `entry` on disk under `cursor`, its TTL running from `touched` (when it was
@@ -1589,7 +1589,10 @@ mod spill {
 
     /// The spilled entry for `cursor`, if it is still live and belongs to `requester`.
     pub(super) fn load(cursor: &str, requester: Option<&str>) -> Option<Cached> {
-        state()
+        // Nothing was spilled yet when the state does not exist: only `keep` opens
+        // the spill directory, so a read never resolves the data directory.
+        STATE
+            .get()?
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .load(cursor, requester)
@@ -1633,14 +1636,26 @@ mod spill {
 
     /// Drop a spilled entry and its file (a shape that was declined after storing).
     pub(super) fn forget(cursor: &str) {
-        state()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drop_entry(cursor);
+        if let Some(state) = STATE.get() {
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .drop_entry(cursor);
+        }
     }
 
     pub(super) fn reap_expired() {
-        state().lock().unwrap_or_else(|e| e.into_inner()).reap();
+        if let Some(state) = STATE.get() {
+            state.lock().unwrap_or_else(|e| e.into_inner()).reap();
+        }
+    }
+
+    /// Remove spill directories that gateways which have exited left behind. The
+    /// gateway runs this at start-up; otherwise the first spill of a run does it.
+    pub(super) fn remove_stale_at_startup() {
+        // Opening the state sweeps the root before this run has a directory there,
+        // under the same once-only step every spill takes.
+        let _ = state();
     }
 
     #[cfg(test)]
