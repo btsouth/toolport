@@ -209,9 +209,10 @@ pub fn apply_import_selected(
         server.unknown_fields.remove("memberSecretRefs");
         server.source = Some("shared".to_string());
         crate::secret_refs::validate_server(&server).map_err(|e| e.to_string())?;
-        if crate::secret_refs::has_references(&server) {
-            server.enabled = false;
-        }
+        // A setup is an untrusted launch proposal. Importing it must never
+        // start a local command or contact a remote server; enabling is a
+        // separate decision, regardless of whether credentials are needed.
+        server.enabled = false;
         to_add.push(server);
     }
     let added = to_add.len();
