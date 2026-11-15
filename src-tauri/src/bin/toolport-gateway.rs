@@ -22839,7 +22839,6 @@ fn gateway_main(cli_args: Vec<String>) {
                 _ => {
                     // Not the value: this runs before the configured
                     // secrets are known, and it may be one.
-                    let _ = value;
                     eprintln!("toolport-gateway: invalid HTTP proxy port");
                     conduit_lib::telemetry::exit_with(1);
                 }
@@ -24465,6 +24464,59 @@ mod tests {
             out["to"], "ada@example.com",
             "resource-minted PII must resolve for a tool on the same server"
         );
+    }
+
+    /// Failure mode: the result was cut and its full body cached before it
+    /// was redacted, so a secret crossing the head boundary left its first
+    /// characters in the reply, and a fetch page starting inside it the rest.
+    #[test]
+    fn a_shaped_result_never_returns_part_of_a_secret() {
+        let _data = DataDirTestEnv::new("a_shaped_result_never_returns_part_of_a_secret");
+        let secret = "shape-secret-7Wq2Kd9Lm4Xp";
+        conduit_lib::secret_redact::register("shape-srv", "SHAPE_KEY", secret);
+        let mut reg = Registry::default();
+        reg.result_budgets.insert("shape-srv".to_string(), 4096);
+        // Copies at every alignment, so the head and any page cut one.
+        let text: String = (0..4000)
+            .map(|i| format!("{}{secret}", "x".repeat(i % 11)))
+            .collect();
+        let result = json!({ "content": [{ "type": "text", "text": text }] });
+        let shaped =
+            defend_and_shape(&reg, "shape-srv", "shape-srv__read", None, result, "", true).result;
+        let head = shaped["content"][0]["text"].as_str().unwrap().to_string();
+        let cursor = head
+            .split("\"cursor\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("a shaped result")
+            .to_string();
+        let mut pages = vec![head];
+        for offset in [0, 3, 1000, 1007, 4096, 4101] {
+            let page = shaping::fetch_result(&cursor, offset, 997, None, None);
+            pages.push(
+                page["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
+        let whole = shaping::fetch_result(&cursor, 0, usize::MAX, None, None);
+        pages.push(
+            whole["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+        for page in pages {
+            for piece in secret.as_bytes().windows(8) {
+                let piece = std::str::from_utf8(piece).unwrap();
+                assert!(
+                    !page.contains(piece),
+                    "{piece} in {}",
+                    &page[..page.len().min(300)]
+                );
+            }
+        }
     }
 
     #[test]
