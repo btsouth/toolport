@@ -64,11 +64,29 @@ pub fn append(dir: &Path, line: &str) {
     }
 }
 
-/// The relay thread that carries this process's stderr into `daemon.log`.
+/// The relay threads that carry this process's stderr into `daemon.log`.
 static STDERR_RELAY: Mutex<Option<Relay>> = Mutex::new(None);
+
+/// How long an unterminated line waits for its newline before it is written
+/// anyway, so a partial write is never held past a crash for long.
+const PARTIAL_FLUSH_AFTER: std::time::Duration = std::time::Duration::from_millis(200);
+/// Longest unterminated run kept back waiting for a newline.
+const MAX_PENDING_BYTES: usize = 64 * 1024;
+const RELAY_THREADS: [&str; 2] = ["toolport-stderr-read", "toolport-stderr-redact"];
+
+enum RelayMsg {
+    Data(Vec<u8>),
+    /// Write everything received so far, partial line included, then ack.
+    Sync(std::sync::mpsc::Sender<()>),
+}
 
 struct Relay {
     done: std::sync::mpsc::Receiver<()>,
+    to_writer: std::sync::mpsc::Sender<RelayMsg>,
+    /// True while the reader holds bytes it has read but not yet handed on.
+    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The pipe's read end, to ask how many bytes are still unread.
+    read: usize,
     /// The pipe's write end that stands in as this process's stderr handle.
     #[cfg(windows)]
     write: usize,
@@ -79,13 +97,18 @@ struct Relay {
 ///
 /// The daemon's stderr is a file the OS writes directly, so every `eprintln!`
 /// and panic report, and the stderr of any child that inherits it, would land on
-/// disk unredacted. Stderr becomes a pipe (fd 2 on Unix, the process's standard
-/// error handle on Windows, which Rust reads on every write and hands to children
-/// that inherit it); one thread reads it line by line, replaces resolved secret
-/// values and writes to the original destination. A failed write is dropped,
-/// never propagated, so stderr itself can never fail.
+/// disk unredacted. Stderr becomes a pipe (fd 2 on Unix; on Windows both the
+/// process's standard error handle, which Rust reads on every write and hands to
+/// children, and the C runtime's fd 2). One thread reads it; another replaces
+/// resolved secret values and writes to the original destination, a line at a
+/// time. An unterminated line is written after [`PARTIAL_FLUSH_AFTER`] or past
+/// [`MAX_PENDING_BYTES`], with a secret cut at its end removed too, and the panic
+/// hook, termination signals, console close events and explicit exits drain the
+/// relay first. A failed write is dropped, never propagated, so stderr itself
+/// can never fail.
 pub fn install_stderr_redactor() {
-    use std::io::{BufRead as _, BufReader};
+    use std::io::Read as _;
+    use std::sync::atomic::Ordering;
 
     let mut guard = STDERR_RELAY
         .lock()
@@ -97,39 +120,281 @@ pub fn install_stderr_redactor() {
         return;
     };
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let (reader, original) = (redirect.reader, redirect.original);
+    let (to_writer, from_reader) = std::sync::mpsc::channel::<RelayMsg>();
+    let busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let read_raw = redirect.read_raw;
+    let (mut reader, original) = (redirect.reader, redirect.original);
     let spawned = std::thread::Builder::new()
-        .name("toolport-stderr-redact".into())
+        .name(RELAY_THREADS[1].into())
+        .spawn(move || relay_writer(from_reader, original, done_tx));
+    if spawned.is_err() {
+        return;
+    }
+    let reader_tx = to_writer.clone();
+    let reader_busy = std::sync::Arc::clone(&busy);
+    let spawned = std::thread::Builder::new()
+        .name(RELAY_THREADS[0].into())
         .spawn(move || {
-            let mut reader = BufReader::new(reader);
-            let mut out = original;
-            let mut line = Vec::new();
+            let mut buf = vec![0u8; 8192];
             loop {
-                line.clear();
-                match reader.read_until(b'\n', &mut line) {
+                match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        let text = String::from_utf8_lossy(&line);
-                        let redacted = crate::secret_redact::redact_text(&text);
-                        let _ = out.write_all(redacted.as_bytes());
+                    Ok(n) => {
+                        reader_busy.store(true, Ordering::SeqCst);
+                        let sent = reader_tx.send(RelayMsg::Data(buf[..n].to_vec()));
+                        reader_busy.store(false, Ordering::SeqCst);
+                        if sent.is_err() {
+                            break;
+                        }
                     }
                 }
             }
-            let _ = out.flush();
-            let _ = done_tx.send(());
         });
     if spawned.is_ok() {
         *guard = Some(Relay {
             done: done_rx,
+            to_writer,
+            busy,
+            read: read_raw,
             #[cfg(windows)]
             write: redirect.write,
         });
+        drop(guard);
+        install_exit_signal_flush();
     }
 }
+
+fn relay_writer(
+    from_reader: std::sync::mpsc::Receiver<RelayMsg>,
+    mut out: std::fs::File,
+    done: std::sync::mpsc::Sender<()>,
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+    let mut pending: Vec<u8> = Vec::new();
+    let out_line = |bytes: &[u8], cut: bool, out: &mut std::fs::File| {
+        let text = String::from_utf8_lossy(bytes);
+        // A cut (not at a newline) may split a secret; the fragment pass also
+        // removes the piece of one left dangling at either edge.
+        let redacted = if cut {
+            crate::secret_redact::redact_fragment(&text)
+        } else {
+            crate::secret_redact::redact_text(&text)
+        };
+        let _ = out.write_all(redacted.as_bytes());
+    };
+    loop {
+        match from_reader.recv_timeout(PARTIAL_FLUSH_AFTER) {
+            Ok(RelayMsg::Data(bytes)) => {
+                pending.extend_from_slice(&bytes);
+                if let Some(last) = pending.iter().rposition(|&b| b == b'\n') {
+                    let rest = pending.split_off(last + 1);
+                    for line in pending.split_inclusive(|&b| b == b'\n') {
+                        out_line(line, false, &mut out);
+                    }
+                    pending = rest;
+                }
+                if pending.len() > MAX_PENDING_BYTES {
+                    out_line(&pending, true, &mut out);
+                    pending.clear();
+                }
+            }
+            Ok(RelayMsg::Sync(ack)) => {
+                if !pending.is_empty() {
+                    out_line(&pending, true, &mut out);
+                    pending.clear();
+                }
+                let _ = out.flush();
+                let _ = ack.send(());
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if !pending.is_empty() {
+                    out_line(&pending, true, &mut out);
+                    pending.clear();
+                    let _ = out.flush();
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    if !pending.is_empty() {
+        out_line(&pending, false, &mut out);
+    }
+    let _ = out.flush();
+    let _ = done.send(());
+}
+
+/// Write out everything this process has put on stderr so far, partial line
+/// included, within `budget`. For the moments just before a process may end
+/// without running destructors: a panic, a termination signal, a console
+/// close. A no-op on the relay's own threads and when no relay is installed.
+pub fn sync_stderr_relay(budget: std::time::Duration) {
+    use std::sync::atomic::Ordering;
+    if std::thread::current()
+        .name()
+        .is_some_and(|name| RELAY_THREADS.contains(&name))
+    {
+        return;
+    }
+    let Some((to_writer, busy, read)) = STDERR_RELAY.try_lock().ok().and_then(|guard| {
+        guard
+            .as_ref()
+            .map(|r| (r.to_writer.clone(), std::sync::Arc::clone(&r.busy), r.read))
+    }) else {
+        return;
+    };
+    let _ = std::io::stderr().flush();
+    #[cfg(windows)]
+    crt_flush();
+    let deadline = std::time::Instant::now() + budget;
+    // Wait until the reader has taken every written byte out of the pipe and
+    // handed it on; then the sync request queues behind all of it.
+    while std::time::Instant::now() < deadline {
+        if pipe_unread(read) == 0 && !busy.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            if pipe_unread(read) == 0 && !busy.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+    if to_writer.send(RelayMsg::Sync(ack_tx)).is_ok() {
+        let _ = ack_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+    }
+}
+
+#[cfg(unix)]
+fn pipe_unread(read: usize) -> usize {
+    let mut n: libc::c_int = 0;
+    // SAFETY: FIONREAD on the relay's own pipe fd, which the reader keeps open.
+    let ok = unsafe { libc::ioctl(read as libc::c_int, libc::FIONREAD, &mut n) } == 0;
+    if ok {
+        n.max(0) as usize
+    } else {
+        0
+    }
+}
+
+#[cfg(windows)]
+fn pipe_unread(read: usize) -> usize {
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+    let mut avail: u32 = 0;
+    // SAFETY: peeks the relay's own pipe handle, which the reader keeps open.
+    let ok = unsafe {
+        PeekNamedPipe(
+            read as _,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut avail,
+            std::ptr::null_mut(),
+        )
+    } != 0;
+    if ok {
+        avail as usize
+    } else {
+        0
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn pipe_unread(_read: usize) -> usize {
+    0
+}
+
+/// Termination signals that would otherwise end the process at once drain the
+/// relay first, then end it the default way. Only signals still at their
+/// default disposition are taken, so a process with its own handlers keeps
+/// them.
+#[cfg(unix)]
+fn install_exit_signal_flush() {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static PIPE_W: AtomicI32 = AtomicI32::new(-1);
+    extern "C" fn on_signal(sig: libc::c_int) {
+        let byte = sig as u8;
+        // SAFETY: write(2) is async-signal-safe; the fd stays open for the process.
+        unsafe {
+            libc::write(
+                PIPE_W.load(Ordering::Relaxed),
+                (&byte as *const u8).cast(),
+                1,
+            );
+        }
+    }
+    if PIPE_W.load(Ordering::SeqCst) >= 0 {
+        return;
+    }
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: plain fd and signal syscalls on fds this function owns.
+    unsafe {
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            return;
+        }
+        libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    PIPE_W.store(fds[1], Ordering::SeqCst);
+    let read_fd = fds[0];
+    let spawned = std::thread::Builder::new()
+        .name("toolport-stderr-signal".into())
+        .spawn(move || loop {
+            let mut byte = 0u8;
+            // SAFETY: reads one byte from this thread's own pipe end.
+            let n = unsafe { libc::read(read_fd, (&mut byte as *mut u8).cast(), 1) };
+            if n != 1 {
+                return;
+            }
+            sync_stderr_relay(std::time::Duration::from_millis(500));
+            // SAFETY: restores the default action and re-raises the same signal.
+            unsafe {
+                libc::signal(byte as libc::c_int, libc::SIG_DFL);
+                libc::raise(byte as libc::c_int);
+            }
+        });
+    if spawned.is_err() {
+        return;
+    }
+    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        // SAFETY: reads the current action, and installs ours only over the default.
+        unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(sig, std::ptr::null(), &mut old) != 0
+                || old.sa_sigaction != libc::SIG_DFL
+            {
+                continue;
+            }
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(sig, &action, std::ptr::null_mut());
+        }
+    }
+}
+
+/// A console close, Ctrl+C or logoff drains the relay, then lets the next
+/// handler (or the default, which ends the process) run.
+#[cfg(windows)]
+fn install_exit_signal_flush() {
+    use windows_sys::core::BOOL;
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    unsafe extern "system" fn on_ctrl(_kind: u32) -> BOOL {
+        sync_stderr_relay(std::time::Duration::from_millis(500));
+        0
+    }
+    // SAFETY: registers a handler that only drains the relay.
+    unsafe {
+        SetConsoleCtrlHandler(Some(on_ctrl), 1);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn install_exit_signal_flush() {}
 
 struct Redirect {
     reader: std::fs::File,
     original: std::fs::File,
+    read_raw: usize,
     #[cfg(windows)]
     write: usize,
 }
@@ -160,16 +425,71 @@ fn redirect_stderr() -> Option<Redirect> {
         Some(Redirect {
             reader: std::fs::File::from_raw_fd(fds[0]),
             original: std::fs::File::from_raw_fd(original),
+            read_raw: fds[0] as usize,
         })
+    }
+}
+
+/// The C runtime keeps its own descriptor table: `fprintf(stderr, ...)` from C
+/// code, and any `_write(2, ...)`, use fd 2's handle captured at startup, not the
+/// process's standard error handle.
+#[cfg(windows)]
+mod crt {
+    extern "C" {
+        pub fn _open_osfhandle(osfhandle: isize, flags: i32) -> i32;
+        pub fn _dup2(fd1: i32, fd2: i32) -> i32;
+        pub fn _close(fd: i32) -> i32;
+        pub fn fflush(stream: *mut std::ffi::c_void) -> i32;
+    }
+    /// `_O_WRONLY | _O_BINARY`: no CRLF translation of what is relayed.
+    pub const WRITE_BINARY: i32 = 0x0001 | 0x8000;
+}
+
+#[cfg(windows)]
+fn crt_flush() {
+    // SAFETY: fflush(NULL) flushes every open C stdio stream.
+    unsafe {
+        crt::fflush(std::ptr::null_mut());
+    }
+}
+
+/// Point the C runtime's fd 2 at a duplicate of `handle`. fd 2 owns the
+/// duplicate (closing fd 2 closes it); the caller keeps `handle`.
+#[cfg(windows)]
+fn crt_point_fd2(handle: windows_sys::Win32::Foundation::HANDLE) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: duplicates a live handle; `_open_osfhandle` takes ownership of the
+    // duplicate, `_dup2` gives fd 2 its own copy, and the temporary fd is closed.
+    unsafe {
+        let mut dup = std::ptr::null_mut();
+        let me = GetCurrentProcess();
+        if DuplicateHandle(me, handle, me, &mut dup, 0, 0, DUPLICATE_SAME_ACCESS) == 0 {
+            return false;
+        }
+        let fd = crt::_open_osfhandle(dup as isize, crt::WRITE_BINARY);
+        if fd < 0 {
+            CloseHandle(dup);
+            return false;
+        }
+        crt_flush();
+        let ok = fd == 2 || crt::_dup2(fd, 2) == 0;
+        if fd != 2 {
+            crt::_close(fd);
+        }
+        ok
     }
 }
 
 #[cfg(windows)]
 fn redirect_stderr() -> Option<Redirect> {
     use std::os::windows::io::FromRawHandle as _;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::System::Console::{GetStdHandle, SetStdHandle, STD_ERROR_HANDLE};
     use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     // SAFETY: Win32 handle calls; every handle is checked before use and owned by
     // exactly one `File` afterwards. The pipe ends are created non-inheritable:
     // a child that inherits stderr gets its own duplicate from `std::process`.
@@ -188,9 +508,24 @@ fn redirect_stderr() -> Option<Redirect> {
             CloseHandle(write);
             return None;
         }
+        // The CRT's fd 2 usually wraps this very handle, and pointing fd 2 at
+        // the pipe closes what it wrapped, so the relay writes through its own
+        // duplicate.
+        let mut kept: HANDLE = std::ptr::null_mut();
+        let me = GetCurrentProcess();
+        if DuplicateHandle(me, original, me, &mut kept, 0, 0, DUPLICATE_SAME_ACCESS) == 0 {
+            SetStdHandle(STD_ERROR_HANDLE, original);
+            CloseHandle(read);
+            CloseHandle(write);
+            return None;
+        }
+        // C code in this process (and `_write(2, ...)`) writes through the CRT's
+        // fd 2, which still names the original file; point it at the pipe too.
+        crt_point_fd2(write);
         Some(Redirect {
             reader: std::fs::File::from_raw_handle(read as _),
-            original: std::fs::File::from_raw_handle(original as _),
+            original: std::fs::File::from_raw_handle(kept as _),
+            read_raw: read as usize,
             write: write as usize,
         })
     }
@@ -221,10 +556,14 @@ fn release_stderr(relay: &Relay) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE};
     // SAFETY: the NUL handle is leaked on purpose: it stays this process's stderr
-    // until exit. The write end was ours alone once stderr no longer names it.
+    // until exit. The write end was ours alone once stderr no longer names it;
+    // the CRT's fd 2 duplicate is replaced (and so closed) by a NUL duplicate.
     unsafe {
+        crt_flush();
         if let Ok(null) = std::fs::OpenOptions::new().write(true).open("NUL") {
-            SetStdHandle(STD_ERROR_HANDLE, null.into_raw_handle() as _);
+            let null = null.into_raw_handle();
+            crt_point_fd2(null as _);
+            SetStdHandle(STD_ERROR_HANDLE, null as _);
         }
         CloseHandle(relay.write as _);
     }
@@ -237,6 +576,8 @@ fn release_stderr(_relay: &Relay) {}
 /// error, a panic report) are not lost with the process. Bounded: a child still
 /// holding the pipe open cannot delay exit past the budget.
 pub fn flush_stderr_relay(budget: std::time::Duration) {
+    let started = std::time::Instant::now();
+    sync_stderr_relay(budget / 2);
     let Some(relay) = STDERR_RELAY
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -245,7 +586,10 @@ pub fn flush_stderr_relay(budget: std::time::Duration) {
         return;
     };
     release_stderr(&relay);
-    let _ = relay.done.recv_timeout(budget);
+    drop(relay.to_writer);
+    let _ = relay
+        .done
+        .recv_timeout(budget.saturating_sub(started.elapsed()));
 }
 
 /// Record every panic, on any thread, with its message and location, then run
@@ -275,6 +619,9 @@ pub fn install_panic_hook(dir: PathBuf) {
             ),
         );
         previous(info);
+        // A panic can end the process (abort, or the last thread) before the
+        // relay writes the report it just received.
+        sync_stderr_relay(std::time::Duration::from_millis(300));
     }));
 }
 
@@ -440,8 +787,78 @@ mod tests {
         let _ = std::process::Command::new("cmd")
             .args(["/C", &format!("echo child echoed {secret} 1>&2")])
             .status();
+        // Native writes to fd 2, bypassing Rust's stderr: libc on Unix, the C
+        // runtime's descriptor table on Windows (what C code in the process uses).
+        let native = format!("native fd2 wrote {secret}\n");
+        #[cfg(unix)]
+        // SAFETY: writes a live buffer to fd 2.
+        unsafe {
+            libc::write(2, native.as_ptr().cast(), native.len());
+        }
+        #[cfg(windows)]
+        {
+            extern "C" {
+                fn _write(fd: i32, buf: *const std::ffi::c_void, count: u32) -> i32;
+            }
+            // SAFETY: writes a live buffer to the CRT's fd 2.
+            unsafe {
+                _write(2, native.as_ptr().cast(), native.len() as u32);
+            }
+        }
         eprint!("partial line without newline {secret}");
         flush_stderr_relay(std::time::Duration::from_secs(5));
+    }
+
+    /// Child half of `stderr_partials_survive_an_abrupt_end`: the process ends
+    /// with `abort`, which runs no exit path, so only the timer and the panic
+    /// hook can have written what it printed.
+    #[test]
+    fn stderr_relay_abort_child() {
+        let Some(secret) = std::env::var_os("TOOLPORT_STDERR_ABORT_CHILD") else {
+            return;
+        };
+        let secret = secret.to_string_lossy().to_string();
+        crate::secret_redact::register("relay-server", "RELAY_TOKEN", &secret);
+        install_stderr_redactor();
+        let dir = std::env::temp_dir().join(format!("tp-abort-child-{}", std::process::id()));
+        install_panic_hook(dir.clone());
+        eprint!("unterminated before a pause {secret}");
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let _ = std::thread::spawn(move || panic!("worker failed holding {secret}")).join();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::process::abort();
+    }
+
+    #[test]
+    fn stderr_partials_survive_an_abrupt_end() {
+        let dir = scratch("stderr-abort");
+        let log = dir.join("daemon.log");
+        let secret = "abort-canary-3Kp8-SECRET";
+        let file = std::fs::File::create(&log).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon_log::tests::stderr_relay_abort_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TOOLPORT_STDERR_ABORT_CHILD", secret)
+            .stdout(std::process::Stdio::null())
+            .stderr(file)
+            .status()
+            .unwrap();
+        assert!(!status.success(), "the child aborts");
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!text.contains(secret), "{text}");
+        assert!(
+            text.contains("unterminated before a pause [secret:RELAY_TOKEN]"),
+            "an unterminated line is written on the timer: {text}"
+        );
+        assert!(
+            text.contains("worker failed holding [secret:RELAY_TOKEN]"),
+            "the panic report is drained before the process can end: {text}"
+        );
     }
 
     /// The detached daemon's stderr is a file the OS writes directly; without the
@@ -474,6 +891,10 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("child echoed [secret:RELAY_TOKEN]"), "{text}");
+        assert!(
+            text.contains("native fd2 wrote [secret:RELAY_TOKEN]"),
+            "native fd 2 writes (the CRT's on Windows) are relayed: {text}"
+        );
         assert!(
             text.contains("partial line without newline [secret:RELAY_TOKEN]"),
             "the last unterminated line is flushed, redacted: {text}"
