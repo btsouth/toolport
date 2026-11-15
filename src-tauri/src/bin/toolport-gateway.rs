@@ -4386,6 +4386,34 @@ fn tool_visible_to_model(
             })
 }
 
+/// Whether search could still return the exposed tool `name` to this caller: it is
+/// in the catalog search reads and passes [`tool_visible_to_model`] under the
+/// current router, registry and scope. Paged definitions are rechecked with it.
+fn discovery_tool_visible(
+    name: &str,
+    cached: &dyn ToolCatalog,
+    router: &Router,
+    reg: &Registry,
+    allowed: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    let live;
+    let base: &dyn ToolCatalog = if cached.is_empty() {
+        live = router.shared_tools();
+        &live
+    } else {
+        cached
+    };
+    let owners = unique_prefix_owners(reg);
+    let route_of = |exposed: &str| owner_of_exposed_tool(Some(router), &owners, exposed);
+    let deny_destructive = reg.deny_destructive_effective();
+    let refused = |tool: &Value| tool_refused(tool, router, deny_destructive);
+    let visible = base
+        .values()
+        .filter(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+        .any(|tool| tool_visible_to_model(tool, allowed, &route_of, &refused));
+    visible
+}
+
 /// Whether the router refuses a catalog entry: blocked by policy (quarantine,
 /// disabled, outside the client's tool allow-list, Strict safety), or destructive
 /// while the destructive gate is on, judged from the entry itself so a cache
@@ -6928,23 +6956,27 @@ fn execute_script_dispatch(
         run()
     });
 
-    // Cursor handoff for any already-shaped result (prior turn, or external cursor in data).
-    let client_for_fetch = client.map(str::to_string);
-    let fetch: codemode::FetchBinding = Arc::new(move |args: codemode::FetchArgs| {
-        shaping::fetch_result(
-            &args.cursor,
-            args.offset,
-            args.len,
-            client_for_fetch.as_deref(),
-            args.projection.as_deref(),
-        )
-    });
-
     // Typed `servers.*` stubs from the client-scoped catalog (meta-tools excluded).
     let owners = unique_prefix_owners(reg);
     let source = script_source(cached, router_arc, reg);
     let catalog = script_catalog_tools(&source, allowed, |name| {
         owner_of_exposed_tool(Some(router_arc.as_ref()), &owners, name)
+    });
+
+    // Cursor handoff for any already-shaped result (prior turn, or external cursor in
+    // data). A paged tool definition is served only while the script could still
+    // see that tool: `catalog` is search's own visibility rule over this catalog.
+    let client_for_fetch = client.map(str::to_string);
+    let fetch_visible: HashSet<String> = catalog.iter().cloned().collect();
+    let fetch: codemode::FetchBinding = Arc::new(move |args: codemode::FetchArgs| {
+        shaping::fetch_result_visible(
+            &args.cursor,
+            args.offset,
+            args.len,
+            client_for_fetch.as_deref(),
+            args.projection.as_deref(),
+            &|name| fetch_visible.contains(name),
+        )
     });
 
     let describe = script_describe_binding(source, &catalog);
@@ -8059,9 +8091,15 @@ fn handle_request_with_cancel(
                 let projection = arguments.get("projection").and_then(|v| v.as_str());
                 // Pass the calling client so a client can only fetch results it stashed
                 // (the stash is process-global in HTTP mode).
+                // A paged tool definition is served only while search would still
+                // return that tool to this caller.
+                let visible =
+                    |name: &str| discovery_tool_visible(name, cached, router, reg, allowed);
                 return Some(success(
                     id,
-                    shaping::fetch_result(cursor, offset, len, client, projection),
+                    shaping::fetch_result_visible(
+                        cursor, offset, len, client, projection, &visible,
+                    ),
                 ));
             }
 
@@ -8069,7 +8107,7 @@ fn handle_request_with_cancel(
                 return Some(success(
                     id,
                     json!({
-                        "content": [{ "type": "text", "text": with_status_notes(enabled_summary(host, reg, cached, profile, allowed)) }],
+                        "content": [{ "type": "text", "text": with_status_notes(enabled_summary_with(host, router, reg, cached, profile, allowed)) }],
                         "isError": false
                     }),
                 ));
@@ -8324,9 +8362,22 @@ fn handle_request_with_cancel(
                 drop(payload);
                 let mut search_result = json!({ "content": [{ "type": "text", "text": text }], "isError": false, "low_confidence": low_confidence });
                 // A menu must keep every selected candidate visible. Only explicit
-                // describe requests page a large complete definition.
+                // describe requests page a large complete definition. Its cursor
+                // remembers the tools it describes, so a later fetch rechecks them.
                 if exact {
-                    shaping::shape_result(&mut search_result, SEARCH_DESCRIBE_BUDGET_BYTES, client);
+                    let describes = pinned
+                        .iter()
+                        .chain(matches.iter())
+                        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+                        .map(str::to_string)
+                        .collect();
+                    shaping::shape_discovery_result(
+                        &mut search_result,
+                        SEARCH_DESCRIBE_BUDGET_BYTES,
+                        client,
+                        describes,
+                        host.discovery_realm(),
+                    );
                 }
                 let response_content_bytes = search_result["content"][0]["text"]
                     .as_str()
@@ -11606,6 +11657,12 @@ fn cached_tool_is_destructive(tool: &Value, exposed: &str, router: &Router) -> b
 }
 
 impl HostState {
+    /// This host's key for its stashed discovery results ([`shaping::forget_discovery`]):
+    /// the address of its registry, which lives as long as the host.
+    fn discovery_realm(&self) -> usize {
+        Arc::as_ptr(&self.registry) as usize
+    }
+
     /// Freeze every access profile before a refresh mutates the shared slots.
     /// A session can initialize during the refresh, so freezing only registered
     /// owners leaves its prior view unavailable at fanout time.
@@ -12343,6 +12400,10 @@ fn watch_tick(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             registry_trusted.store(new_source.is_authoritative(), Ordering::SeqCst);
             *live = new_reg;
+            // Scope, allow-lists and the destructive gate live in the registry: drop
+            // this host's paged definitions stashed under the previous one. Search
+            // makes fresh ones on demand.
+            shaping::forget_discovery(host.discovery_realm(), |_| true);
         };
         // Refresh the live discovery mode from the freshly-loaded registry: a per-client
         // override edit (`client_discovery`) may be the only change, and it isn't
@@ -22470,6 +22531,18 @@ fn main() {
     let _cache_maintenance = spawn_cache_maintenance(cache_interval, move || {
         let idle = cache_host.idle_for() >= Duration::from_secs(30);
         conduit_lib::shaping::maintain_cache(idle && !was_idle);
+        // A tool quarantined, disabled or put outside its allow-list since its
+        // definition was paged: drop that page. Fetch rechecks visibility anyway;
+        // this keeps the text from sitting in memory until the TTL.
+        let live = Arc::clone(
+            &cache_host
+                .router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        conduit_lib::shaping::forget_discovery(cache_host.discovery_realm(), |name| {
+            live.is_blocked(name)
+        });
         was_idle = idle;
         #[cfg(feature = "test-support")]
         if let Some(path) = &probe {

@@ -750,3 +750,275 @@ fn search_cursors_are_distinct_and_page_every_hit_once() {
         }
     }
 }
+
+/// R3-2: a paged tool definition from exact-name search is served only while
+/// search would still return that tool. The traced sequence: search creates the
+/// cursor, policy or scope then refuses the tool, a fresh search filters it, and
+/// the old cursor is refused instead of handing back the schema. Both Code Mode
+/// states, for quarantine, disabling, the tool allow-list and the client scope.
+#[test]
+fn discovery_cursors_follow_tool_visibility() {
+    let _data = DataDirTestEnv::new("discovery-cursor-visibility");
+    let options: serde_json::Map<String, Value> = (0..300)
+        .map(|i| {
+            (
+                format!("option_{i:03}"),
+                json!({"type": "string", "description": format!("Option number {i}.")}),
+            )
+        })
+        .collect();
+    let upstream = vec![
+        json!({"name": "configure", "description": "Configure every option.", "inputSchema": {"type": "object", "properties": options}}),
+        json!({"name": "other", "description": "Another tool.", "inputSchema": {"type": "object"}}),
+    ];
+    let cached: Vec<Value> = upstream
+        .iter()
+        .map(|tool| {
+            let mut tool = tool.clone();
+            tool["name"] = json!(format!("wide__{}", tool["name"].as_str().unwrap()));
+            tool
+        })
+        .collect();
+    let router_with = |policy: ToolPolicy| {
+        let mut router = Router::with_policy(policy);
+        router.add(
+            DownstreamServer::connect(
+                "wide".into(),
+                Box::new(MockRoute {
+                    tools: upstream.clone(),
+                }),
+            )
+            .unwrap(),
+        );
+        router
+    };
+    let open = router_with(ToolPolicy::default());
+    let quarantined = router_with(ToolPolicy {
+        quarantined: ["wide__configure".to_string()].into_iter().collect(),
+        ..Default::default()
+    });
+    let disabled = router_with(ToolPolicy {
+        disabled: [(
+            "wide".to_string(),
+            ["configure".to_string()].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    });
+    let allow_other = router_with(ToolPolicy {
+        allow: [(
+            "wide".to_string(),
+            ["other".to_string()].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    });
+    let other_scope: std::collections::HashSet<String> =
+        ["elsewhere".to_string()].into_iter().collect();
+    let cursor_re = regex::Regex::new(r#""cursor":"(r[0-9]+)""#).unwrap();
+    for code_mode in [false, true] {
+        let reg = Registry {
+            code_mode,
+            ..Default::default()
+        };
+        let host = dispatch_host(true);
+        let call = |router: &Router,
+                    allowed: Option<&std::collections::HashSet<String>>,
+                    name: &str,
+                    arguments: Value| {
+            let resp = handle_request(
+                &host,
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": arguments}}),
+                &reg,
+                router,
+                &cached,
+                true,
+                None,
+                &SearchGuard::default(),
+                allowed,
+                None,
+            )
+            .unwrap();
+            resp["result"].clone()
+        };
+        let describe = || {
+            let found = call(
+                &open,
+                None,
+                "toolport_search_tools",
+                json!({"query": "wide__configure"}),
+            );
+            let text = found["content"][0]["text"].as_str().unwrap().to_string();
+            cursor_re.captures(&text).unwrap()[1].to_string()
+        };
+        // Still visible: the cursor pages.
+        let cursor = describe();
+        let page = call(
+            &open,
+            None,
+            "toolport_fetch_result",
+            json!({"cursor": cursor, "offset": 100}),
+        );
+        assert_eq!(page["isError"], false, "code_mode={code_mode}: {page}");
+        for (case, router, allowed) in [
+            ("quarantined", &quarantined, None),
+            ("disabled", &disabled, None),
+            ("allow-list", &allow_other, None),
+            ("scope", &open, Some(&other_scope)),
+        ] {
+            let cursor = describe();
+            let fresh = call(
+                router,
+                allowed,
+                "toolport_search_tools",
+                json!({"query": "wide__configure"}),
+            );
+            assert!(
+                !fresh.to_string().contains("option_150"),
+                "code_mode={code_mode} {case}: fresh search shows the schema: {fresh}"
+            );
+            let refused = call(
+                router,
+                allowed,
+                "toolport_fetch_result",
+                json!({"cursor": cursor, "offset": 100}),
+            );
+            let text = refused["content"][0]["text"].as_str().unwrap();
+            assert_eq!(
+                refused["isError"], true,
+                "code_mode={code_mode} {case}: {refused}"
+            );
+            assert!(
+                text.contains("no longer available"),
+                "code_mode={code_mode} {case}: {text}"
+            );
+            assert!(
+                !text.contains("option_"),
+                "code_mode={code_mode} {case}: {text}"
+            );
+            // The refused entry is gone, even for the policy it was made under.
+            let again = call(
+                &open,
+                None,
+                "toolport_fetch_result",
+                json!({"cursor": cursor, "offset": 100}),
+            );
+            assert_eq!(
+                again["isError"], true,
+                "code_mode={code_mode} {case}: {again}"
+            );
+        }
+        // A script's fetchResult applies the same rule.
+        if code_mode {
+            let cursor = describe();
+            let script = format!(
+                "var r = toolport.fetchResult({{cursor: '{cursor}', offset: 100}}); return r.content[0].text;"
+            );
+            let router = Arc::new(router_with(ToolPolicy {
+                quarantined: ["wide__configure".to_string()].into_iter().collect(),
+                ..Default::default()
+            }));
+            let result = run_script_dispatch(
+                &reg,
+                Some(&router),
+                &cached,
+                None,
+                None,
+                None,
+                None,
+                &json!({"script": script}),
+                None,
+            );
+            let text = result["structuredContent"]["result"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(text.contains("no longer available"), "{result}");
+        }
+        // A policy or registry change drops every paged definition at once.
+        let cursor = describe();
+        assert!(shaping::forget_discovery(host.discovery_realm(), |_| true) >= 1);
+        let gone = call(
+            &open,
+            None,
+            "toolport_fetch_result",
+            json!({"cursor": cursor, "offset": 100}),
+        );
+        assert!(
+            gone["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("unknown or expired"),
+            "{gone}"
+        );
+    }
+}
+
+/// R3-2: a shaped tool-call result is the output of a call that policy allowed when
+/// it ran, already partly delivered to that caller. Its later pages stay readable
+/// by the same caller after the tool is disabled, and no policy change drops them.
+#[test]
+fn result_cursors_outlive_later_policy_for_their_caller() {
+    let _data = DataDirTestEnv::new("result-cursor-policy");
+    let body = "z".repeat(shaping::DEFAULT_BUDGET_BYTES * 2);
+    let router_with = |policy: ToolPolicy| {
+        let mut router = Router::with_policy(policy);
+        router.add(
+            DownstreamServer::connect("s".into(), Box::new(PagingRoute { body: body.clone() }))
+                .unwrap(),
+        );
+        router
+    };
+    let open = router_with(ToolPolicy::default());
+    let disabled = router_with(ToolPolicy {
+        disabled: [("s".to_string(), ["big".to_string()].into_iter().collect())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    });
+    let reg = Registry::default();
+    let host = dispatch_host(true);
+    let cached = open.aggregated_tools();
+    let call = |router: &Router, name: &str, arguments: Value| {
+        handle_request(
+            &host,
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": arguments}}),
+            &reg,
+            router,
+            &cached,
+            true,
+            None,
+            &SearchGuard::default(),
+            None,
+            None,
+        )
+        .unwrap()["result"]
+            .clone()
+    };
+    let shaped = call(
+        &open,
+        "toolport_call_tool",
+        json!({"name": "s__big", "arguments": {}}),
+    );
+    let text = shaped["content"][0]["text"].as_str().unwrap();
+    let cursor = regex::Regex::new(r#""cursor":"(r[0-9]+)""#)
+        .unwrap()
+        .captures(text)
+        .unwrap()[1]
+        .to_string();
+    shaping::forget_discovery(host.discovery_realm(), |_| true);
+    let page = call(
+        &disabled,
+        "toolport_fetch_result",
+        json!({"cursor": cursor, "offset": 10}),
+    );
+    assert_eq!(page["isError"], false, "{page}");
+    assert!(
+        page["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("zzz"),
+        "{page}"
+    );
+}

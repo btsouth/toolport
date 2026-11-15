@@ -67,6 +67,11 @@ struct Cached {
     /// The client the result belongs to (a registered HTTP client's label), or None
     /// for the single-tenant stdio process. Only this client may fetch it back.
     owner: Option<String>,
+    /// For a discovery result (a tool definition from search), the exposed tool
+    /// names it describes and the gateway host it came from. Fetching it rechecks
+    /// that each tool is still visible.
+    describes: Vec<String>,
+    realm: usize,
 }
 
 /// The bounded stash of shaped results, keyed by cursor. P1.2: the lifetime rules
@@ -207,6 +212,8 @@ pub fn seed_cache_maintenance_probe() {
             projections_unavailable: false,
             size: 1024 * 1024,
             owner: None,
+            describes: Vec::new(),
+            realm: 0,
         },
     );
 }
@@ -332,6 +339,44 @@ pub fn shape_result_preserving_prefix(
     owner: Option<&str>,
     min_head_bytes: usize,
 ) -> bool {
+    shape_inner(result, budget, owner, min_head_bytes, Vec::new(), 0)
+}
+
+/// [`shape_result`] for a discovery result: a definition of the exposed tools in
+/// `describes`, from the gateway host identified by `realm` (any stable nonzero
+/// key). [`fetch_result_visible`] serves its pages only while every one of them is
+/// still visible to the caller, and [`forget_discovery`] drops it when policy or
+/// scope changes.
+pub fn shape_discovery_result(
+    result: &mut Value,
+    budget: usize,
+    owner: Option<&str>,
+    describes: Vec<String>,
+    realm: usize,
+) -> bool {
+    shape_inner(result, budget, owner, 0, describes, realm)
+}
+
+/// Drop the discovery results of host `realm` that describe a tool `stale` names,
+/// so a definition the caller can no longer see does not stay in memory until the
+/// TTL. Search makes a fresh one on demand. Returns how many were dropped.
+pub fn forget_discovery(realm: usize, stale: impl Fn(&str) -> bool) -> usize {
+    let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
+    store.remove_where(|_, cached| {
+        cached.realm == realm
+            && !cached.describes.is_empty()
+            && cached.describes.iter().any(|tool| stale(tool))
+    })
+}
+
+fn shape_inner(
+    result: &mut Value,
+    budget: usize,
+    owner: Option<&str>,
+    min_head_bytes: usize,
+    describes: Vec<String>,
+    realm: usize,
+) -> bool {
     if budget == 0 {
         return false;
     }
@@ -408,6 +453,8 @@ pub fn shape_result_preserving_prefix(
             projections_unavailable: false,
             size: new_entry_size,
             owner: owner.map(str::to_string),
+            describes,
+            realm,
         },
     );
 
@@ -516,6 +563,8 @@ pub fn stash_payload(
             projections_unavailable: false,
             size,
             owner: owner.map(str::to_string),
+            describes: Vec::new(),
+            realm: 0,
         },
     );
     retained.then_some(cursor)
@@ -529,6 +578,21 @@ pub fn fetch_result(
     len: usize,
     requester: Option<&str>,
     projection: Option<&str>,
+) -> Value {
+    fetch_result_visible(cursor, offset, len, requester, projection, &|_| true)
+}
+
+/// [`fetch_result`], refusing a discovery result whose tool `visible` no longer
+/// admits (quarantined, disabled, or outside the caller's scope since it was
+/// stashed). The refused entry is dropped. Results of tool calls carry no tool
+/// list and page as before: the caller already received that output.
+pub fn fetch_result_visible(
+    cursor: &str,
+    offset: usize,
+    len: usize,
+    requester: Option<&str>,
+    projection: Option<&str>,
+    visible: &dyn Fn(&str) -> bool,
 ) -> Value {
     let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
     sweep(&mut store);
@@ -550,6 +614,16 @@ pub fn fetch_result(
             );
         }
     };
+    if !c.describes.iter().all(|tool| visible(tool)) {
+        store.remove(cursor);
+        return text_result(
+            format!(
+                "[Toolport: cursor \"{cursor}\" describes a tool that is no longer available \
+                 to this client. Search again for the current tools.]"
+            ),
+            true,
+        );
+    }
     if let Some(path) = projection {
         let structured = match &c.structured {
             Some(value) => value,
@@ -1148,6 +1222,8 @@ mod tests {
             projections_unavailable: false,
             size,
             owner: None,
+            describes: Vec::new(),
+            realm: 0,
         }
     }
 
