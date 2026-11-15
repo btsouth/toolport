@@ -1318,17 +1318,64 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tp-inline-args-{}", std::process::id()));
         let _data = crate::registry::DataDirOverride::set(&dir);
         let server: crate::registry::ServerEntry = serde_json::from_str(
-            r#"{"id":"inline-args","name":"Inline","source":"fixture","transport":"stdio","command":"node","args":["server.js","--token","abcDEF9split","--api-key=abcDEF9joined","--token=","abcDEF9empty","--verbose"],"inheritEnv":false,"env":[]}"#,
+            r#"{"id":"inline-args","name":"Inline","source":"fixture","transport":"stdio","command":"node","args":["server.js","--token","abcDEF9split","--api-key=abcDEF9joined","--token=","abcDEF9empty","--verbose","--header","Authorization: Bearer hdrSplit7Qx2Lm","--header=X-Api-Key: hdrJoined4Rt8Wn"],"inheritEnv":false,"env":[]}"#,
         )
         .unwrap();
         super::register_inline_secrets(&server);
         let out = crate::secret_redact::redact_text(
             "split abcDEF9split joined abcDEF9joined empty abcDEF9empty --token= --verbose server.js",
         );
+        // A header argument registers its credential, never its header name:
+        // a window of the name would replace that ordinary word everywhere.
+        let headers = crate::secret_redact::redact_text(
+            "bare hdrSplit7Qx2Lm and hdrJoined4Rt8Wn; Authorization required, X-Api-Key missing",
+        );
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             out,
             "split [secret:arg] joined [secret:arg] empty [secret:arg] --token= --verbose server.js"
+        );
+        assert_eq!(
+            headers,
+            "bare [secret:arg] and [secret:arg]; Authorization required, X-Api-Key missing"
+        );
+    }
+
+    /// Failure mode: an unflagged env value was registered by its name alone,
+    /// and a name such as `AUTH_ENABLED` carries ordinary settings: `true`,
+    /// `3600` or `8` was then replaced wherever it appeared in a result.
+    #[test]
+    fn ordinary_settings_with_credential_names_are_not_registered() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-inline-env-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        let server: crate::registry::ServerEntry = serde_json::from_str(
+            r#"{"id":"inline-env","name":"Inline","source":"fixture","transport":"stdio","command":"node","args":[],"inheritEnv":false,"env":[
+                {"key":"AUTH_ENABLED","value":"true"},
+                {"key":"TOKEN_TTL","value":"3600"},
+                {"key":"PASSWORD_MIN","value":"8"},
+                {"key":"USE_API_KEY","value":"1"},
+                {"key":"TOKEN_CACHE_DIR","value":"/var/cache/tokens"},
+                {"key":"AUTH_URL","value":"https://auth.example.invalid/login"},
+                {"key":"TOKEN_TIMEOUT","value":"1500ms"},
+                {"key":"API_KEY","value":"abcd1234efgh"},
+                {"key":"DB_PASSWORD","value":"postgres://app:pw-Zx81kq@db.example.invalid/app"},
+                {"key":"PIN","value":"4821","secret":true}
+            ]}"#,
+        )
+        .unwrap();
+        super::register_inline_secrets(&server);
+        let ordinary = r#"{"enabled": true, "ttl": 3600, "min": 8, "use": 1} /var/cache/tokens https://auth.example.invalid/login 1500ms"#;
+        let kept = crate::secret_redact::redact_text(ordinary).into_owned();
+        let secrets = crate::secret_redact::redact_text(
+            "key abcd1234efgh pass postgres://app:pw-Zx81kq@db.example.invalid/app pin 4821",
+        )
+        .into_owned();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(kept, ordinary);
+        assert_eq!(
+            secrets,
+            "key [secret:API_KEY] pass [secret:DB_PASSWORD] pin [secret:PIN]"
         );
     }
 
