@@ -6336,10 +6336,7 @@ mod apps {
     }
 
     pub fn launch(_: &str, path: &Path) -> Result<(), String> {
-        std::process::Command::new("open")
-            .arg("-t")
-            .arg(path)
-            .spawn()
+        crate::hostenv::spawn_reaped(std::process::Command::new("open").arg("-t").arg(path))
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
