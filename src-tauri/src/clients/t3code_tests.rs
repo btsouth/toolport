@@ -1071,6 +1071,89 @@ fn a_hand_added_folder_and_a_t3_home_are_one_row() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Paths are compared as text with the platform's rules: on Windows the verbatim form
+/// canonicalizing gives (`\\?\C:\`, `\\?\UNC\`) matches the ordinary form a Clients row
+/// shows, and case does not matter. Nothing on disk is looked at (S4).
+#[test]
+fn verbatim_and_ordinary_windows_paths_compare_equal_as_text() {
+    let key = |text: &str| path_key(text, true);
+    for (a, b) in [
+        (
+            r"\\?\C:\Users\N\agents\cx\config.toml",
+            r"C:\Users\N\agents\cx\config.toml",
+        ),
+        (
+            r"\\?\C:\Users\N\agents\cx\config.toml",
+            "c:/users/n/agents/cx/config.toml",
+        ),
+        (
+            r"\\?\UNC\srv\share\N\.codex\config.toml",
+            r"\\srv\share\N\.codex\config.toml",
+        ),
+        (r"C:\Users\N\cx\", r"C:\Users\N\cx"),
+    ] {
+        assert_eq!(key(a), key(b), "{a} and {b}");
+    }
+    for (a, b) in [
+        (r"\\?\C:\Users\N\cx", r"D:\Users\N\cx"),
+        (r"\\srv\share\x", r"\srv\share\x"),
+        (r"\\?\UNC\srv\share\x", r"C:\srv\share\x"),
+        (r"C:\Users\N\cx", r"C:\Users\N\cx2"),
+    ] {
+        assert_ne!(key(a), key(b), "{a} and {b}");
+    }
+    // Unix keeps case and is not changed by a doubled or trailing slash.
+    assert_eq!(
+        path_key("/home/n//cx/", false),
+        path_key("/home/n/cx", false)
+    );
+    assert_ne!(path_key("/home/n/CX", false), path_key("/home/n/cx", false));
+}
+
+/// A newly found T3 Code row is labelled with its instance, whether its config is written
+/// yet or not. On Windows this goes through a verbatim path on one side and the ordinary
+/// path the row shows on the other (S4).
+#[test]
+fn a_new_t3_code_row_is_labelled_with_its_instance() {
+    let _lock = crate::registry::data_dir_test_lock();
+    let root = std::env::temp_dir().join(format!(
+        "toolport-t3-rowlabel-{}-{}",
+        std::process::id(),
+        epoch_millis()
+    ));
+    let home = root.join("home");
+    std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+    std::fs::create_dir_all(home.join("agents/cx")).unwrap();
+    std::fs::create_dir_all(home.join("agents/cc")).unwrap();
+    std::fs::write(home.join("agents/cc/.claude.json"), "{}").unwrap();
+    std::fs::write(
+        home.join(".t3/userdata/settings.json"),
+        r#"{"providerInstances": {
+            "cx": {"driver": "codex", "displayName": "Unwritten", "config": {"homePath": "~/agents/cx"}},
+            "cc": {"driver": "claudeAgent", "displayName": "Written", "config": {"homePath": "~/agents/cc"}}}}"#,
+    )
+    .unwrap();
+    let _data = crate::registry::DataDirOverride::set(root.join("data"));
+    let _home = TestHome::set(&home);
+    let clients = detect_clients_for_skills();
+    for (kind, name) in [("codex@t3-", "Unwritten"), ("claude-code@t3-", "Written")] {
+        let row = clients
+            .iter()
+            .find(|client| client.id.starts_with(kind))
+            .unwrap_or_else(|| panic!("{kind} row"));
+        assert_eq!(
+            row.t3_code
+                .iter()
+                .map(|use_| use_.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec![name],
+            "{}",
+            row.config_path
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A link below home is not followed into a row, even to a folder inside home.
 #[cfg(unix)]
 #[test]

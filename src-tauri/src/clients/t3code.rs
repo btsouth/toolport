@@ -171,12 +171,47 @@ pub(super) fn inside_by_text(path: &Path, home: &Path, ignore_case: bool) -> boo
     }) && parts.next().is_some()
 }
 
-/// Two path texts name the same place, by the platform's case rule.
+/// Two path texts name the same place, by the platform's rules and by text alone: on
+/// Windows without regard to case, and with a verbatim prefix (`\\?\C:\`,
+/// `\\?\UNC\host\`, what canonicalizing gives) the same as the ordinary one the
+/// Clients rows show. Nothing on disk is looked at.
 pub(super) fn same_text(a: &Path, b: &Path) -> bool {
-    a.components().count() == b.components().count()
-        && a.components()
-            .zip(b.components())
-            .all(|(a, b)| same_name(a.as_os_str(), b.as_os_str(), cfg!(windows)))
+    let windows = cfg!(windows);
+    path_key(&a.to_string_lossy(), windows) == path_key(&b.to_string_lossy(), windows)
+}
+
+/// The text [`same_text`] compares, with Windows rules when `windows` (so both rules run
+/// in tests on any OS).
+pub(super) fn path_key(text: &str, windows: bool) -> String {
+    if !windows {
+        let rooted = text.starts_with('/');
+        let names: Vec<&str> = text.split('/').filter(|name| !name.is_empty()).collect();
+        return format!("{}{}", if rooted { "/" } else { "" }, names.join("/"));
+    }
+    let text = text.replace('/', "\\");
+    let ordinary = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\").filter(|rest| {
+        let bytes = rest.as_bytes();
+        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+    }) {
+        rest.to_string()
+    } else {
+        text
+    };
+    let lead = if ordinary.starts_with(r"\\") {
+        r"\\"
+    } else if ordinary.starts_with('\\') {
+        "\\"
+    } else {
+        ""
+    };
+    let names: Vec<String> = ordinary
+        .split('\\')
+        .filter(|name| !name.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    format!("{lead}{}", names.join("\\"))
 }
 
 fn same_name(a: &std::ffi::OsStr, b: &std::ffi::OsStr, ignore_case: bool) -> bool {
