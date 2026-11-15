@@ -1295,6 +1295,31 @@ mod tests {
 
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Failure mode: a credential passed as `--token` `value` was not
+    /// registered (the value entry looks like nothing on its own), and one
+    /// passed as `--token=value` was registered only with its flag, so the
+    /// value echoed alone was written in clear.
+    #[test]
+    fn inline_credential_flags_register_the_value_split_or_joined() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-inline-args-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        let server: crate::registry::ServerEntry = serde_json::from_str(
+            r#"{"id":"inline-args","name":"Inline","source":"fixture","transport":"stdio","command":"node","args":["server.js","--token","abcDEF9split","--api-key=abcDEF9joined","--token=","abcDEF9empty","--verbose"],"inheritEnv":false,"env":[]}"#,
+        )
+        .unwrap();
+        super::register_inline_secrets(&server);
+        let out = crate::secret_redact::redact_text(
+            "split abcDEF9split joined abcDEF9joined empty abcDEF9empty --token= --verbose server.js",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            out,
+            "split [secret:arg] joined [secret:arg] empty [secret:arg] --token= --verbose server.js"
+        );
+    }
+
     struct Scratch(PathBuf);
     impl Scratch {
         fn new() -> Self {
