@@ -5996,7 +5996,7 @@ mod tests {
                 redact_text("x preload-inline-6Vb3Nk"),
                 "x preload-inline-6Vb3Nk"
             );
-            crate::secret_refs::preload_configured_secrets();
+            crate::secret_refs::preload_inline_secrets();
             assert_eq!(
                 redact_text("x preload-inline-6Vb3Nk"),
                 "x [secret:INLINE_PRELOAD]"

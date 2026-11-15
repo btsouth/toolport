@@ -1083,16 +1083,11 @@ fn resolved_server_with_values(
     Ok(resolved)
 }
 
-/// Register every secret value a server entry carries itself (inline `secret`
-/// env values and launch inputs, and references once resolved) with the
-/// redactor, before anything is launched or sent with them. Vault reads register
-/// on their own ([`crate::secrets`]); this covers the values that never pass
-/// through the vault. Every stdio launch resolves through [`resolve_server`],
-/// and remote connects call this directly.
-/// The desktop shells' startup preload: inline values only, for every server.
-/// It reads no vault value, so a hidden start can never raise an unlock
-/// prompt and the app reads no credential it does not need; a vault value is
-/// registered when it is first read for real use (editing, a test, a start).
+/// The startup preload of the desktop shells and of every gateway role:
+/// inline values only, for every server. It reads no vault value, so a start
+/// can never raise or wait on an unlock prompt, and no process reads a
+/// credential it does not need. A vault value is registered when it is first
+/// read for real use (editing, a test, the launch of its server).
 pub fn preload_inline_secrets() {
     let Ok(reg) = crate::registry::load_resolved() else {
         return;
@@ -1102,49 +1097,12 @@ pub fn preload_inline_secrets() {
     }
 }
 
-/// Register every configured secret this process can read without prompting:
-/// inline values, vaulted env values and stored HTTP and OAuth credentials, for
-/// every server. The gateway calls this before it replays or writes any
-/// diagnostic text, so nothing reaches a sink before the redactor knows the
-/// values. References to external managers (which can prompt) are resolved
-/// at launch as before; text from them can only appear after that launch.
-pub fn preload_configured_secrets() {
-    let Ok(reg) = crate::registry::load_resolved() else {
-        return;
-    };
-    for server in &reg.servers {
-        register_inline_secrets(server);
-        // A disabled server's values are learned when it is enabled and read;
-        // reading its vault here could only add a keyring prompt at startup.
-        if !server.enabled {
-            continue;
-        }
-        let vaulted = |secret: bool, value: &Option<String>, fields| {
-            secret && value.is_none() && matches!(source(fields), Ok(None))
-        };
-        for e in &server.env {
-            if vaulted(e.secret, &e.value, &e.unknown_fields) {
-                let _ = crate::secrets::get_secret_result(&server.id, &e.key);
-            }
-        }
-        for i in server.launch.iter().flat_map(|l| &l.inputs) {
-            if vaulted(i.secret, &i.value, &i.unknown_fields) {
-                let _ = crate::secrets::get_secret_result(&server.id, &i.key);
-            }
-        }
-        if server.url.is_some() {
-            for key in [
-                crate::secrets::HTTP_AUTH_KEY,
-                crate::secrets::CLIENT_SECRET_KEY,
-                crate::remote::OAUTH_STATE_KEY,
-                crate::remote::CC_STATE_KEY,
-            ] {
-                let _ = crate::secrets::get_secret_result(&server.id, key);
-            }
-        }
-    }
-}
-
+/// Register every secret value a server entry carries itself (inline `secret`
+/// env values and launch inputs, and references once resolved) with the
+/// redactor, before anything is launched or sent with them. Vault reads register
+/// on their own ([`crate::secrets`]); this covers the values that never pass
+/// through the vault. Every stdio launch resolves through [`resolve_server`],
+/// and remote connects call this directly.
 pub fn register_inline_secrets(server: &ServerEntry) {
     for e in &server.env {
         let Some(value) = &e.value else { continue };
