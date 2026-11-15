@@ -36,31 +36,46 @@ pub fn log_path(dir: &Path) -> PathBuf {
     dir.join(LOG_FILE)
 }
 
-/// Move a full log aside, replacing the previous one.
+/// Move a full log aside, replacing the previous one. The caller holds the
+/// `daemon.log` lock; the rename also replaces `daemon.log.1`, so it takes that
+/// file's lock too (always after `daemon.log`'s; the scrub holds one at a time),
+/// and never renames over a file the scrub is masking.
 fn rotate_if_full(dir: &Path) {
     let path = log_path(dir);
     if std::fs::metadata(&path).is_ok_and(|meta| meta.len() >= MAX_LOG_BYTES) {
-        let _ = std::fs::rename(&path, dir.join(format!("{LOG_FILE}.1")));
+        let previous = dir.join(format!("{LOG_FILE}.1"));
+        if let Ok(_previous) = crate::registry::lock_at(&previous) {
+            let _ = std::fs::rename(&path, previous);
+        }
     }
 }
 
-fn open_for_append(dir: &Path) -> Option<std::fs::File> {
+/// `daemon.log`, rotated if full and opened for append, with its lock: the one
+/// the secret scrub holds while it masks the file. `None` when the lock or the
+/// file is unavailable; no caller writes without both.
+fn open_for_append(dir: &Path) -> Option<(crate::registry::FileLock, std::fs::File)> {
     let _ = std::fs::create_dir_all(dir);
+    let lock = crate::registry::lock_at(&log_path(dir)).ok()?;
     rotate_if_full(dir);
-    crate::registry::open_append_private(&log_path(dir)).ok()
+    let file = crate::registry::open_append_private(&log_path(dir)).ok()?;
+    Some((lock, file))
 }
 
 /// The file a newly spawned daemon writes its stderr to. Rotated before each
-/// start, so the cap holds across runs.
+/// start, so the cap holds across runs. The daemon writes it as its stderr
+/// handle, without this lock; the scrub masks it in place for that reason.
 pub fn stderr_file(dir: &Path) -> Option<std::fs::File> {
-    open_for_append(dir)
+    open_for_append(dir).map(|(_lock, file)| file)
 }
 
-/// Append one line stamped with the time and this process id.
+/// Append one line stamped with the time and this process id. Redacted under
+/// the log's lock, so a secret learned while a scrub masks the file is caught.
 pub fn append(dir: &Path, line: &str) {
-    let line = crate::secret_redact::redact_log_text(line);
-    if let Some(mut file) = open_for_append(dir) {
-        let _ = writeln!(file, "{} pid={} {line}", now_ms(), std::process::id());
+    if let Some((_lock, mut file)) = open_for_append(dir) {
+        let line = crate::secret_redact::redact_log_text(line);
+        let _ = file.write_all(
+            format!("{} pid={} {line}\n", now_ms(), std::process::id()).as_bytes(),
+        );
     }
 }
 
@@ -803,9 +818,15 @@ pub fn begin_run(dir: &Path) -> Option<PreviousExit> {
             });
         }
     }
-    if let Some(exit) = &found {
-        if let Ok(raw) = serde_json::to_string_pretty(exit) {
-            let _ = crate::registry::atomic_write(&dir.join(LAST_EXIT_FILE), &raw);
+    if let Some(exit) = &mut found {
+        // The reason is copied from the log, so it is redacted like a log line,
+        // under the lock the scrub rewrites this file with: a secret learned
+        // while a scrub runs is still caught, and nothing is written unlocked.
+        let path = dir.join(LAST_EXIT_FILE);
+        let lock = crate::registry::lock_at(&path);
+        exit.reason = crate::secret_redact::redact_log_text(&exit.reason).into_owned();
+        if let (Ok(raw), Ok(_lock)) = (serde_json::to_string_pretty(&*exit), lock) {
+            let _ = crate::registry::atomic_write(&path, &raw);
         }
         append(
             dir,
@@ -1166,5 +1187,98 @@ mod tests {
             MAX_LOG_BYTES
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Failure mode: `append` redacts and writes without the log's lock, so a
+    /// line written while a scrub masks `daemon.log` keeps a secret the scrub
+    /// just learned.
+    #[test]
+    fn append_waits_for_the_scrub_lock_and_redacts_inside_it() {
+        let _data_lock = crate::registry::data_dir_test_lock();
+        let dir = scratch("scrub-append");
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        let target = dir.clone();
+        let text = crate::secret_redact::append_during_scrub_for_test(
+            &log_path(&dir),
+            ("daemon-log-lock", "TOKEN", "daemon-late-token-R7wQ4zNc"),
+            move || append(&target, "relay saw daemon-late-token-R7wQ4zNc"),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(text.contains("relay saw "), "{text}");
+        assert!(!text.contains("daemon-late-token-R7wQ4zNc"), "{text}");
+    }
+
+    /// Failure mode: rotation renames `daemon.log` over `daemon.log.1` while a
+    /// scrub holds `daemon.log.1`, so the scrub masks a file that is then
+    /// replaced by one it never saw.
+    #[test]
+    fn rotation_waits_for_both_log_locks() {
+        let dir = scratch("rotate-lock");
+        let previous = dir.join(format!("{LOG_FILE}.1"));
+        std::fs::write(&previous, "OLD PREVIOUS\n").unwrap();
+        std::fs::write(log_path(&dir), vec![b'x'; MAX_LOG_BYTES as usize]).unwrap();
+        let held = crate::registry::lock_at(&previous).unwrap();
+        let target = dir.clone();
+        let writer = std::thread::spawn(move || append(&target, "after the cap"));
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let during = std::fs::read_to_string(&previous).unwrap();
+        drop(held);
+        writer.join().unwrap();
+        let after = std::fs::metadata(&previous).unwrap().len();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            during == "OLD PREVIOUS\n",
+            "rotated under a held lock ({} bytes)",
+            during.len()
+        );
+        assert_eq!(after, MAX_LOG_BYTES, "rotated once the lock freed");
+    }
+
+    /// Failure mode: `last-daemon-exit.json` copies a panic line from the log and
+    /// is written without the scrub's lock or redaction, so a secret in that
+    /// line (learned while the file is scrubbed) stays in the clear.
+    #[test]
+    fn last_exit_record_waits_for_the_scrub_lock_and_is_redacted() {
+        let _run = RUN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _data_lock = crate::registry::data_dir_test_lock();
+        let dir = scratch("exit-lock");
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        let me = ProcessId::of(std::process::id()).unwrap();
+        let dead = ProcessId {
+            pid: me.pid + 1_000_000,
+            start: 1,
+        };
+        std::fs::create_dir_all(dir.join(RUNS_DIR)).unwrap();
+        std::fs::write(
+            marker_path(&dir, dead.pid),
+            serde_json::to_string(&RunMarker {
+                process: dead,
+                started_at_ms: 5,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            log_path(&dir),
+            format!(
+                "1 pid={} panic in thread 'router' at src/router.rs:1:2: bad exit-late-key-M2xP8vKs\n",
+                dead.pid
+            ),
+        )
+        .unwrap();
+        let target = dir.clone();
+        let text = crate::secret_redact::append_during_scrub_for_test(
+            &dir.join(LAST_EXIT_FILE),
+            ("daemon-exit-lock", "KEY", "exit-late-key-M2xP8vKs"),
+            move || {
+                begin_run(&target).expect("the unclean run is found");
+            },
+        );
+        end_run_cleanly(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(text.contains("src/router.rs:1:2: bad "), "{text}");
+        assert!(!text.contains("exit-late-key-M2xP8vKs"), "{text}");
     }
 }
