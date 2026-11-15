@@ -10829,9 +10829,7 @@ struct ProgressRoute {
     /// The registered values the client sent in the request (any spelling):
     /// echoed in its progress, they are its own and are left as they are.
     exempt: Option<Arc<std::collections::HashSet<String>>>,
-    /// The fields of the last notification while its stream holds an
-    /// undecided end (delivered with that end when the call ends), with any
-    /// message text written so far that is not yet delivered.
+    /// A notification held whole as above, with the message text written so far.
     held: Option<(Value, String)>,
     /// The request instance that asked for it. Its progress is delivered only while
     /// that instance is live, so a cancelled call's late progress never reaches the
@@ -11035,25 +11033,16 @@ fn deliver_progress(
                     let ready = route.messages.push(message);
                     let mut text = route.held.take().map(|(_, t)| t).unwrap_or_default();
                     text.push_str(&ready);
-                    if route.messages.is_holding() {
-                        // Its end may be the start of a secret. Only that end
-                        // is held (by the stream, within its cap), with this
-                        // notification's fields to deliver it with when the
-                        // call ends; it goes out with the next one otherwise.
-                        // A message that is all undecided is held whole.
-                        if text.is_empty() {
-                            route.held = Some((note, text));
-                            return;
-                        }
-                        let mut fields = note.clone();
-                        if let Some(m) = fields.pointer_mut("/params/message") {
-                            *m = Value::String(String::new());
-                        }
-                        route.held = Some((fields, String::new()));
+                    // Its end may be the start of a secret: only that end is
+                    // held, by the stream (within its cap), and goes out with
+                    // the next notification. A message that is all undecided
+                    // is held whole, merged into the next or delivered when
+                    // the call ends. An end left after a delivered one is
+                    // dropped then, since progress may not repeat.
+                    if text.is_empty() && route.messages.is_holding() {
+                        route.held = Some((note, text));
+                        return;
                     }
-                    let Some(Value::String(message)) = note.pointer_mut("/params/message") else {
-                        unreachable!("matched above");
-                    };
                     *message = text;
                 }
                 finish_progress_note(&mut note, route);
@@ -39259,10 +39248,7 @@ mod tests {
                 "params": {"progressToken": wire, "progress": progress, "message": message}
             })
         };
-        for (tail, expected) in [
-            ("almost sk-Ot", "\"sk-Ot\""),
-            ("almost sk-OtherP", "\"[secret:OTHER]\""),
-        ] {
+        for (tail, expected) in [("sk-Ot", "\"sk-Ot\""), ("sk-OtherP", "\"[secret:OTHER]\"")] {
             let (registration, wire) = register_progress(
                 &routes,
                 Some(&json!({ "progressToken": "tok-own" })),
@@ -39281,16 +39267,14 @@ mod tests {
                 );
             }
             let got = drain_session(&state, &s1);
-            assert_eq!(got.len(), 2, "{got:?}");
+            assert_eq!(got.len(), 1, "{got:?}");
             // The client sent this value: its echo is its own.
             assert!(
                 got[0].contains("\"echo sk-OwnProgress789 ok\""),
                 "{}",
                 got[0]
             );
-            // The decided part goes out now; only the undecided end waits.
-            assert!(got[1].contains("\"almost \""), "{}", got[1]);
-            // The call ends: the held end is delivered, under the end rule.
+            // The call ends: the held note is delivered, under the end rule.
             drop(registration);
             let got = drain_session(&state, &s1);
             assert_eq!(got.len(), 1, "{got:?}");
@@ -39352,10 +39336,9 @@ mod tests {
             "every notification goes out when it arrives"
         );
         assert!(most_held < 1024, "held {most_held} bytes");
+        // The last undecided end is dropped: progress 255 went out already.
         drop(registration);
-        let got = drain_session(&state, &s1);
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert!(got[0].contains("\"s\""), "{}", got[0]);
+        assert!(drain_session(&state, &s1).is_empty());
     }
 
     #[test]
