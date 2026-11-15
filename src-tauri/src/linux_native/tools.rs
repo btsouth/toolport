@@ -1164,6 +1164,7 @@ fn build_form_row(field: &FormField) -> (gtk::Box, FormWidget) {
             let mut items = vec!["(unset)"];
             items.extend(options.iter().map(String::as_str));
             let dropdown = gtk::DropDown::from_strings(&items);
+            super::quiet_tooltips::guard_dropdown(&dropdown);
             let default_index = field
                 .default
                 .as_ref()

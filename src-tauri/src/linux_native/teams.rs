@@ -767,6 +767,7 @@ impl TeamsPage {
             ),
         ));
         let new_servers = gtk::DropDown::new(None::<gtk::StringList>, gtk::Expression::NONE);
+        super::quiet_tooltips::guard_dropdown(&new_servers);
         l10n::bind_dropdown_choices(&new_servers, SYNC_DESTINATIONS);
         new_servers.add_css_class("toolport-compact-select");
         new_servers.set_selected(u32::from(sync.new_servers_local_only));

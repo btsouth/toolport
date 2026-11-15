@@ -381,6 +381,7 @@ pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
     let profiles = page.profiles.borrow().clone();
     let names = profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>();
     let scope = gtk::DropDown::from_strings(&names);
+    super::quiet_tooltips::guard_dropdown(&scope);
     scope.set_selected(
         profiles
             .iter()
@@ -593,6 +594,7 @@ fn discovery_picker(
         &crate::i18n::tr("Grouped · per-server"),
         &crate::i18n::tr("Full · every tool"),
     ]);
+    super::quiet_tooltips::guard_dropdown(&mode);
     bound_dropdown(&mode);
     l10n::bind_dropdown_choices(
         &mode,

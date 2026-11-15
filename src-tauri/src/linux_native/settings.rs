@@ -233,6 +233,7 @@ impl SettingsPage {
         let safety = gtk::Box::new(gtk::Orientation::Vertical, 0);
         safety.add_css_class("toolport-settings-group");
         let safety_level = gtk::DropDown::new(None::<gtk::StringList>, gtk::Expression::NONE);
+        super::quiet_tooltips::guard_dropdown(&safety_level);
         l10n::bind_dropdown_choices(&safety_level, SAFETY_ALL);
         l10n::bind_tooltip(&safety_level, msg("Ask holds destructive calls. Strict also blocks destructive tools, risky drift and high-confidence injection, and asks before untrusted calls. Labeling and integrity recording stay on."));
         safety_level.set_visible(false);
@@ -670,6 +671,7 @@ l10n::bind_dialog_heading(&error_dialog, msg("Could not start data removal"));
         language_label.set_xalign(0.0);
         language_row.append(&language_label);
         let language_picker = gtk::DropDown::new(None::<gtk::StringList>, gtk::Expression::NONE);
+        super::quiet_tooltips::guard_dropdown(&language_picker);
         l10n::bind_language_choices(&language_picker);
         let choice = crate::i18n::language();
         let selected = crate::ui_settings::LANGUAGES
@@ -1162,6 +1164,7 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
         labels.extend(registry.profiles.iter().map(|p| p.name.clone()));
         let default =
             gtk::DropDown::from_strings(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+        super::quiet_tooltips::guard_dropdown(&default);
         default.set_valign(gtk::Align::Center);
         default.update_property(&[gtk::accessible::Property::Label(&tr("Default access"))]);
         default.set_selected(
@@ -1591,6 +1594,7 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
             .collect::<Vec<_>>();
         let dropdown =
             gtk::DropDown::new(Some(gtk::StringList::new(&names)), gtk::Expression::NONE);
+        super::quiet_tooltips::guard_dropdown(&dropdown);
         dropdown.set_margin_top(8);
         dropdown.set_margin_bottom(8);
         dialog.set_extra_child(Some(&dropdown));
@@ -1826,6 +1830,7 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
                 )),
                 gtk::Expression::NONE,
             );
+            super::quiet_tooltips::guard_dropdown(&profile);
             form.append(&profile);
             dialog.set_extra_child(Some(&form));
             let profiles = settings.profiles;
