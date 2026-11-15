@@ -4,9 +4,13 @@ use super::*;
 use serde_json::json;
 
 #[test]
-fn vscode_and_cursor_entries_carry_type_stdio_and_old_entries_gain_only_that_field() {
+fn vscode_cursor_and_copilot_entries_carry_type_and_old_entries_gain_only_that_field() {
     let fixture = Fixture::new("typed-entries");
-    for (client, key) in [("vscode", "servers"), ("cursor", "mcpServers")] {
+    for (client, key, kind) in [
+        ("vscode", "servers", "stdio"),
+        ("cursor", "mcpServers", "stdio"),
+        ("github-copilot-cli", "mcpServers", "local"),
+    ] {
         let path = client_config_path(client).unwrap();
         // Toolport's old entry, with a user's extra env var and a comment.
         let text = format!(
@@ -15,8 +19,8 @@ fn vscode_and_cursor_entries_carry_type_stdio_and_old_entries_gain_only_that_fie
         );
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &text).unwrap();
-        if client == "cursor" {
-            // Cursor needs strict JSON; drop the comment for it.
+        if client != "vscode" {
+            // Cursor and Copilot need strict JSON; drop the comment for them.
             std::fs::write(&path, text.replace("  // keep this comment\n", "")).unwrap();
         }
         let before = read(&path);
@@ -28,7 +32,7 @@ fn vscode_and_cursor_entries_carry_type_stdio_and_old_entries_gain_only_that_fie
         assert!(outcome.failed.is_empty(), "{client}: {:?}", outcome.failed);
         let after = read(&path);
         let mut expected = before.clone();
-        expected[key]["toolport"]["type"] = json!("stdio");
+        expected[key]["toolport"]["type"] = json!(kind);
         assert_eq!(after, expected, "{client}: only `type` is added");
         if client == "vscode" {
             assert!(std::fs::read_to_string(&path)
@@ -58,7 +62,7 @@ fn vscode_and_cursor_entries_carry_type_stdio_and_old_entries_gain_only_that_fie
         std::fs::remove_file(&path).unwrap();
         install_gateway(client, None).unwrap();
         let written = read(&path);
-        assert_eq!(written[key]["toolport"]["type"], "stdio", "{client}");
+        assert_eq!(written[key]["toolport"]["type"], kind, "{client}");
     }
     // A remote entry keeps its own transport type, and other formats get none.
     let remote: ServerEntry = serde_json::from_value(

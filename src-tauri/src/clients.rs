@@ -5588,22 +5588,37 @@ fn entry_to_typed_json(entry: &ServerEntry) -> serde_json::Value {
     value
 }
 
+/// [`entry_to_json`] with `"type": "local"` on a local command. Every GitHub
+/// Copilot CLI example carries it and newer releases expect it.
+fn entry_to_copilot_json(entry: &ServerEntry) -> serde_json::Value {
+    let mut value = entry_to_json(entry);
+    if entry.command.is_some() {
+        if let Some(fields) = value.as_object_mut() {
+            fields.insert("type".into(), serde_json::Value::String("local".into()));
+        }
+    }
+    value
+}
+
 /// Fields a format requires that an older Toolport entry may lack, as
-/// `(field, value)` to add. Only VS Code and Cursor have one: `type` on a local
-/// command. A field the entry already has, whatever its value, is never touched.
+/// `(field, value)` to add: `type` on a local command for VS Code and Cursor
+/// (`stdio`) and GitHub Copilot CLI (`local`). A field the entry already has,
+/// whatever its value, is never touched.
 fn missing_required_fields(
     format: Format,
     entry: &serde_json::Value,
 ) -> Vec<(&'static str, serde_json::Value)> {
+    let local_without_type = entry
+        .get("command")
+        .is_some_and(serde_json::Value::is_string)
+        && entry.get("type").is_none()
+        && entry.get("url").is_none();
     match format {
-        Format::JsonServers | Format::JsonCursorMcpServers
-            if entry
-                .get("command")
-                .is_some_and(serde_json::Value::is_string)
-                && entry.get("type").is_none()
-                && entry.get("url").is_none() =>
-        {
+        Format::JsonServers | Format::JsonCursorMcpServers if local_without_type => {
             vec![("type", serde_json::Value::String("stdio".into()))]
+        }
+        Format::JsonCopilotMcpServers if local_without_type => {
+            vec![("type", serde_json::Value::String("local".into()))]
         }
         _ => Vec::new(),
     }
@@ -5614,7 +5629,7 @@ fn missing_required_fields(
 fn backfill_required_fields(format: Format, path: &Path, name: &str) -> Result<bool, String> {
     let key = match format {
         Format::JsonServers => "servers",
-        Format::JsonCursorMcpServers => "mcpServers",
+        Format::JsonCursorMcpServers | Format::JsonCopilotMcpServers => "mcpServers",
         _ => return Ok(false),
     };
     let original = read_config_file(path)?;
@@ -6935,7 +6950,7 @@ fn write_copilot_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String
         "mcpServers",
         servers,
         false,
-        entry_to_json,
+        entry_to_copilot_json,
         false,
         true,
     )
@@ -8462,7 +8477,15 @@ fn edit_crush_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), St
 }
 
 fn edit_copilot_json_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
-    edit_json_gateway_with(path, "mcpServers", entry, false, None, false, true)
+    edit_json_gateway_with(
+        path,
+        "mcpServers",
+        entry,
+        false,
+        Some(entry_to_copilot_json),
+        false,
+        true,
+    )
 }
 
 fn edit_droid_json_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
@@ -15467,6 +15490,10 @@ command = "npx"
         assert_eq!(
             installed_json["mcpServers"][GATEWAY_ENTRY_NAME]["tools"],
             serde_json::json!(["*"])
+        );
+        assert_eq!(
+            installed_json["mcpServers"][GATEWAY_ENTRY_NAME]["type"],
+            serde_json::json!("local")
         );
 
         edit_copilot_json_gateway(&path, None).unwrap();
