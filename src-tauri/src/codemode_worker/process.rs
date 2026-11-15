@@ -120,6 +120,29 @@ fn exit_reason(child: &mut Child) -> (codemode::FailureKind, String) {
     }
 }
 
+/// Room the reply frame needs around a describe result.
+const DESCRIBE_FRAME_MARGIN: usize = 4096;
+
+/// A describe result too large for one worker frame comes back to the script as an
+/// error object for that one call, so the rest of the script still runs. The schema
+/// is the large part, and `toolport_search_tools` can still page it.
+fn bounded_describe(name: &str, result: Value) -> Value {
+    let limit = super::MAX_FRAME_BYTES - DESCRIBE_FRAME_MARGIN;
+    if super::json_size(&result, limit).is_some() {
+        return result;
+    }
+    let size = serde_json::to_vec(&result).map_or(usize::MAX, |bytes| bytes.len());
+    json!({
+        "name": name,
+        "error": format!(
+            "toolport.describe: the description of this tool is {size} bytes, over the \
+             {limit}-byte code mode frame limit; search its exact name instead"
+        ),
+        "size": size,
+        "limit": limit,
+    })
+}
+
 fn error_result(error: &str) -> Value {
     json!({ "content": [{ "type": "text", "text": error }], "isError": true })
 }
@@ -386,7 +409,7 @@ pub fn run_script(
                                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
                                         .unwrap_or(Value::Null);
                                 describing = true;
-                                (None, result)
+                                (None, bounded_describe(&name, result))
                             }
                             _ => unreachable!(),
                         };
@@ -693,4 +716,37 @@ fn worker_run() {
         let _ = super::write_frame(&mut *writer, &Frame::Outcome { outcome });
     }
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_describe_becomes_an_error_object_for_that_call() {
+        let small = json!({"name": "s__t", "signature": "x", "inputSchema": {}});
+        assert_eq!(bounded_describe("s__t", small.clone()), small);
+        let huge = json!({
+            "name": "s__t",
+            "inputSchema": {"description": "x".repeat(super::super::MAX_FRAME_BYTES)}
+        });
+        let bounded = bounded_describe("s__t", huge);
+        assert_eq!(bounded["name"], "s__t");
+        let size = bounded["size"].as_u64().unwrap() as usize;
+        assert!(size > super::super::MAX_FRAME_BYTES);
+        assert_eq!(
+            bounded["limit"].as_u64().unwrap() as usize,
+            super::super::MAX_FRAME_BYTES - DESCRIBE_FRAME_MARGIN
+        );
+        assert!(bounded["error"]
+            .as_str()
+            .unwrap()
+            .contains(&size.to_string()));
+        // The reply fits a frame.
+        let reply = Frame::DescribeResult {
+            id: 1,
+            result: bounded,
+        };
+        assert!(super::super::json_size(&reply, super::super::MAX_FRAME_BYTES).is_some());
+    }
 }
