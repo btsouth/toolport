@@ -3670,6 +3670,47 @@ impl Router {
         self.rebuild_preserving_restored();
     }
 
+    /// Whether this router's policy would refuse `tool` on `server_id` even before
+    /// the server publishes a catalog. A demand start by server and tool name checks
+    /// this first, so a start that can only end in a refusal never happens. It errs
+    /// toward refusing: any quarantined alias that may be this tool counts.
+    pub fn refuses_before_catalog(&self, server_id: &str, tool: &str) -> bool {
+        let policy = &self.policy;
+        if !policy.allows_server(server_id) || policy.fail_closed_catalog {
+            return true;
+        }
+        if policy
+            .allow
+            .get(server_id)
+            .is_some_and(|set| !set.contains(tool))
+            || policy
+                .disabled
+                .get(server_id)
+                .is_some_and(|set| set.contains(tool))
+        {
+            return true;
+        }
+        if self
+            .policy_by_original
+            .get(server_id)
+            .and_then(|tools| tools.get(tool))
+            .is_some_and(|name| policy.quarantined.contains(name))
+        {
+            return true;
+        }
+        // `<server>__<tool>`, or `<server>-<tool>` in a dashed client view. The
+        // separator keeps server `gh` from matching `gh_api__...`.
+        let prefix = sanitize_segment(server_id).to_lowercase();
+        let suffix = sanitize_segment(tool).to_lowercase();
+        policy.quarantined.iter().any(|name| {
+            let name = name.to_lowercase();
+            let rest = name
+                .strip_prefix(&format!("{prefix}__"))
+                .or_else(|| name.strip_prefix(&format!("{prefix}-")));
+            rest.is_some_and(|rest| rest.replace('-', "_").ends_with(&suffix))
+        })
+    }
+
     /// True when this router is hiding the whole catalog because the quarantine
     /// store could not be read and there was no prior live set to keep (SBS-871).
     pub fn catalog_fail_closed(&self) -> bool {
