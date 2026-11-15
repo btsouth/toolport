@@ -117,6 +117,12 @@ has no trusted name. A handshake-era request without one uses the label its
 connection's `initialize` reported. Approvals and Activity show labels the same way
 as a legacy client's `clientInfo`.
 
+A request the client cancels gets no reply, on the plain stdio loop and through the
+stdio adapter alike, in both protocol eras: the handshake-era spec says a receiver
+should not answer a cancelled request, and the `2026-07-28` stdio transport forbids
+further messages for it. A cancellation that arrives after the reply changes nothing.
+A cancelled call that is waiting on an approval prompt withdraws the prompt.
+
 Codex config keys Toolport writes for its own entry are listed in
 [docs/clients.md](clients.md#codex-setup-walkthrough). Every Toolport meta-tool input
 schema stays under Codex's default 5,000-byte `tool_input_schema_max_bytes`, so Codex

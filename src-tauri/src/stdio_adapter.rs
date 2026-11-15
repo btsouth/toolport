@@ -512,6 +512,11 @@ struct Session {
     /// Open `subscriptions/listen` requests by id, each with the flag the
     /// client's cancellation sets.
     subscriptions: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// The client's requests still open on this connection, by id, each with whether
+    /// the client cancelled it. A cancelled request gets no further message: the
+    /// handshake-era spec says a receiver should not answer it and the 2026-07-28
+    /// stdio transport forbids it, and the plain stdio loop already complies.
+    open_requests: Mutex<HashMap<String, bool>>,
     instance: String,
     stopping: AtomicBool,
     closed: Arc<AtomicBool>,
@@ -590,6 +595,7 @@ impl Session {
             declared_root: Mutex::new(None),
             roots_request_ids: Mutex::new(HashSet::new()),
             subscriptions: Mutex::new(HashMap::new()),
+            open_requests: Mutex::new(HashMap::new()),
             instance: crate::approval::new_correlation_id(),
             stopping: AtomicBool::new(false),
             closed: Arc::new(AtomicBool::new(false)),
@@ -713,12 +719,73 @@ impl Session {
     /// Write one already-serialized JSON-RPC message to stdout. The newline is the
     /// frame boundary a stdio MCP client reads.
     fn write_message(&self, message: &str) -> Result<(), String> {
+        if self.answers_a_cancelled_request(message) {
+            return Ok(());
+        }
         let mut out = self
             .stdout
             .lock()
             .map_err(|_| "stdout lock poisoned".to_string())?;
         writeln!(out, "{message}").map_err(|error| error.to_string())?;
         out.flush().map_err(|error| error.to_string())
+    }
+
+    /// Note a client request as open until its handling ends.
+    fn open_request(&self, request: &serde_json::Value) -> Option<String> {
+        let key = request
+            .get("id")
+            .filter(|id| !id.is_null() && request.get("method").is_some())?
+            .to_string();
+        self.open_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.clone(), false);
+        Some(key)
+    }
+
+    fn close_request(&self, key: Option<String>) {
+        if let Some(key) = key {
+            self.open_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&key);
+        }
+    }
+
+    /// Mark an open request the client cancelled. A cancellation for a request that
+    /// already finished, or one this connection never saw, changes nothing.
+    fn note_cancellation(&self, message: &serde_json::Value) {
+        if message["method"] != "notifications/cancelled" {
+            return;
+        }
+        let Some(id) = message["params"].get("requestId") else {
+            return;
+        };
+        if let Some(cancelled) = self
+            .open_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&id.to_string())
+        {
+            *cancelled = true;
+        }
+    }
+
+    /// Whether `message` is a response to a request the client cancelled.
+    fn answers_a_cancelled_request(&self, message: &str) -> bool {
+        let open = self
+            .open_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !open.values().any(|cancelled| *cancelled) {
+            return false;
+        }
+        serde_json::from_str::<serde_json::Value>(message).is_ok_and(|value| {
+            value.get("method").is_none()
+                && value
+                    .get("id")
+                    .is_some_and(|id| open.get(&id.to_string()) == Some(&true))
+        })
     }
 
     /// Remember the client's handshake so a replacement daemon can be given an
@@ -1632,6 +1699,7 @@ fn proxy_stdio(
                 if let Err(error) = session.exchange(&body) {
                     report_request_error(&session, &request, &error);
                 }
+                session.close_request(request_key(&request));
             })
         },
         MAX_INFLIGHT,
@@ -1676,19 +1744,32 @@ fn proxy_stdio(
         };
         session.remember_roots_response(&request);
         session.cancel_subscription(&request);
+        session.note_cancellation(&request);
         let is_request = request.get("id").map(|id| !id.is_null()).unwrap_or(false);
+        let open = session.open_request(&request);
         // A modern request carries everything it needs, so it runs as soon as it
         // is read. A legacy one waits for `initialize` to open the session.
         if is_request && (session.session_id().is_some() || declared_version(&request).is_some()) {
             dispatcher.dispatch(trimmed.to_string());
-        } else if let Err(error) = session.exchange(trimmed) {
-            report_request_error(&session, &request, &error);
+        } else {
+            if let Err(error) = session.exchange(trimmed) {
+                report_request_error(&session, &request, &error);
+            }
+            session.close_request(open);
         }
     }
     session.stopping.store(true, Ordering::SeqCst);
     dispatcher.drain(EOF_GRACE);
     session.close();
     Ok(())
+}
+
+/// The key [`Session::open_request`] used for a client request.
+fn request_key(request: &serde_json::Value) -> Option<String> {
+    request
+        .get("id")
+        .filter(|id| !id.is_null() && request.get("method").is_some())
+        .map(serde_json::Value::to_string)
 }
 
 /// Surface a failed daemon exchange to the client. A request with an id gets a

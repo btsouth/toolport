@@ -219,6 +219,7 @@ async function replay(profile) {
     pass(`${profile.id}: resource and prompt contracts (synthetic requests)`);
 
     const slowId = "slow-cancel";
+    const slowStarted = Date.now();
     const slow = client.call("mock__sleep", { ms: 5_000 }, false, slowId);
     let slowPending = true;
     void slow.then(
@@ -237,13 +238,14 @@ async function replay(profile) {
     success(fast);
     assert(textOf(fast).includes("concurrent fast"));
     assert(slowPending, "slow call completed before concurrent fast call");
-    client.send({
-      jsonrpc: "2.0",
-      method: "notifications/cancelled",
-      params: { requestId: slowId, reason: "fixture done" },
-    });
-    assert(failed(await slow), "cancelled call succeeded");
+    client.cancel(slowId, "fixture done");
+    assert((await slow).cancelled, "cancelled call was answered");
     await fixture.dispatched((r) => r.method === "notifications/cancelled");
+    // Outlast the server's own answer: nothing may arrive for the cancelled ID
+    // (the client asserts that on every message it reads).
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.max(0, slowStarted + 5_500 - Date.now())),
+    );
     pass(
       `${profile.id}: long call, concurrent fast call, downstream cancellation (synthetic requests)`,
     );

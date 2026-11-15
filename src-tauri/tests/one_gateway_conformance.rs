@@ -4900,10 +4900,10 @@ fn matrix_overlapping_calls_through_one_adapter_keep_their_answers() {
 }
 
 /// Two overlapping calls down one stdio adapter, one cancelled while both are parked
-/// at the server. The other answers under its own id. The cancelled one gets exactly
-/// one answer, Toolport's own cancellation error, and never the server's late result
-/// (the server still finishes it, so a leak would show up as a second answer). The
-/// session keeps serving afterwards.
+/// at the server. The other answers under its own id. The cancelled one gets no
+/// message at all afterwards (MCP: receivers do not answer a cancelled request), even
+/// though the gateway and the server both finish it. A cancellation that arrives after
+/// its answer is harmless, and the session keeps serving.
 #[test]
 fn matrix_cancelling_one_of_two_overlapping_calls_leaks_no_late_answer() {
     let _guard = CASE_LOCK
@@ -4930,6 +4930,12 @@ fn matrix_cancelling_one_of_two_overlapping_calls_leaks_no_late_answer() {
             "params": { "name": sleep, "arguments": { "ms": ms } }
         })
     };
+    let cancel = |id: i64| {
+        json!({
+            "jsonrpc": "2.0", "method": "notifications/cancelled",
+            "params": { "requestId": id, "reason": "user cancelled" }
+        })
+    };
     let before = transcript_method_count(&transcript, "tools/call");
     client.send(call(200, 3_000));
     client.send(call(201, 1_500));
@@ -4938,45 +4944,30 @@ fn matrix_cancelling_one_of_two_overlapping_calls_leaks_no_late_answer() {
         "both calls reached the server",
         Duration::from_secs(20),
     );
-    client.send(json!({
-        "jsonrpc": "2.0", "method": "notifications/cancelled",
-        "params": { "requestId": 200, "reason": "user cancelled" }
-    }));
+    client.send(cancel(200));
 
-    // Both answers arrive, in either order: 201 its result, 200 a cancellation error.
-    let mut answers = std::collections::BTreeMap::new();
-    while answers.len() < 2 {
+    // Only 201 answers; nothing ever arrives for 200.
+    loop {
         let message = client.next_message();
-        match message["id"].as_i64() {
-            Some(id @ (200 | 201)) => {
-                assert!(
-                    answers.insert(id, message.clone()).is_none(),
-                    "second answer: {message}"
-                );
-            }
-            Some(other) => panic!("unexpected answer {other}: {message}"),
-            None => assert!(message.get("method").is_some(), "{message}"),
+        assert_ne!(message["id"], 200, "answer after cancellation: {message}");
+        if message["id"] == 201 {
+            assert_eq!(text_of(&message["result"]), "slept 1500 ms", "{message}");
+            break;
         }
+        assert!(message.get("method").is_some(), "{message}");
     }
-    assert_eq!(
-        text_of(&answers[&201]["result"]),
-        "slept 1500 ms",
-        "{answers:?}\n{}",
-        client.diagnostics()
-    );
-    assert_eq!(answers[&200]["result"]["isError"], true, "{answers:?}");
-    assert!(
-        text_of(&answers[&200]["result"]).contains("cancelled"),
-        "{answers:?}"
-    );
     wait_until(
         || transcript_method_count(&transcript, "notifications/cancelled") >= 1,
         "the cancellation reached the server",
         Duration::from_secs(10),
     );
-    // The session still serves, and its answer is the next message with an id.
+    // A cancellation for a call that already answered changes nothing.
     client.send(call(202, 10));
-    let next = client.response_to(202);
+    let done = client.response_to(202);
+    assert_eq!(text_of(&done["result"]), "slept 10 ms", "{done}");
+    client.send(cancel(202));
+    client.send(call(203, 10));
+    let next = client.response_to(203);
     assert_eq!(text_of(&next["result"]), "slept 10 ms", "{next}");
     // Past the point where the server answered the cancelled call, nothing more.
     let quiet_until = Instant::now() + Duration::from_secs(4);
@@ -4988,6 +4979,117 @@ fn matrix_cancelling_one_of_two_overlapping_calls_leaks_no_late_answer() {
             "late answer after cancellation: {message}\n{}",
             client.diagnostics()
         );
+    }
+}
+
+/// Hold one approval request open like the app's prompt does, and report how long
+/// after the request the gateway withdrew it by closing the connection.
+fn approval_broker_holding(
+    dir: &Path,
+) -> (
+    mpsc::Receiver<approval::ApprovalRequest>,
+    std::thread::JoinHandle<Option<Instant>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("approval listener");
+    let token = "matrix-approval-token".to_string();
+    let descriptor = EndpointDescriptor {
+        endpoint: listener.local_addr().unwrap().to_string(),
+        unix_endpoint: None,
+        token: token.clone(),
+    };
+    std::fs::write(
+        dir.join(approval::ENDPOINT_FILE),
+        serde_json::to_vec(&descriptor).unwrap(),
+    )
+    .expect("approval descriptor");
+    let (pending, requests) = mpsc::channel();
+    let held = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("approval connection");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("approval challenge");
+        let challenge: BrokerChallenge = serde_json::from_str(&line).expect("valid challenge");
+        let proof = BrokerProof {
+            toolport_approval_proof: approval::challenge_proof(
+                &token,
+                &challenge.toolport_approval_challenge,
+            ),
+        };
+        writeln!(stream, "{}", serde_json::to_string(&proof).unwrap()).expect("approval proof");
+        line.clear();
+        reader.read_line(&mut line).expect("approval request");
+        pending
+            .send(serde_json::from_str(&line).expect("valid approval request"))
+            .unwrap();
+        // The app withdraws its prompt when the caller disconnects; so do we.
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => Some(Instant::now()),
+            Ok(_) => None,
+        }
+    });
+    (requests, held)
+}
+
+/// A call waiting on a human approval is cancelled: the prompt is withdrawn (the
+/// gateway hangs up on the broker, which is what dismisses it in the app), the call
+/// never answers, and the next call is served.
+#[test]
+fn matrix_cancelling_a_call_waiting_on_approval_withdraws_the_prompt() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("adapter-cancel-approval");
+    let transcript = dir.join("approval.jsonl");
+    let mut server = mock_server_entry("gate", &transcript, None);
+    server.source = Some("shared".to_string());
+    write_registry(&dir, vec![server], vec![]);
+    let registry_path = dir.join("registry.json");
+    let mut reg = registry::load_from(&registry_path).expect("load registry");
+    reg.set_safety_level(registry::SafetyLevel::Strict);
+    registry::save_to(&registry_path, &reg).expect("enable approval");
+    let (requests, held) = approval_broker_holding(&dir);
+
+    let mut client = spawn_adapter(&dir, &AdapterOptions::default());
+    client.initialize("matrix-adapter-cancel-approval");
+    let echo = client.wait_for_tool("__echo", Duration::from_secs(30));
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 300, "method": "tools/call",
+        "params": { "name": echo, "arguments": { "text": "held" } }
+    }));
+    let request = requests
+        .recv_timeout(RESPONSE_TIMEOUT)
+        .expect("the approval prompt opened");
+    assert_eq!(request.server, "gate");
+    let cancelled_at = Instant::now();
+    client.send(json!({
+        "jsonrpc": "2.0", "method": "notifications/cancelled",
+        "params": { "requestId": 300, "reason": "user cancelled" }
+    }));
+    let withdrawn = held
+        .join()
+        .expect("approval broker")
+        .expect("the gateway withdrew the prompt");
+    assert!(
+        withdrawn.duration_since(cancelled_at) < Duration::from_secs(10),
+        "the prompt stayed open"
+    );
+    assert_eq!(
+        transcript_method_count(&transcript, "tools/call"),
+        0,
+        "a withdrawn approval must not run the call"
+    );
+    // Nothing for the cancelled id, and the session still answers.
+    let ping = client.request("ping", json!({}));
+    assert!(ping.get("result").is_some(), "{ping}");
+    let quiet_until = Instant::now() + Duration::from_secs(2);
+    while let Some(message) =
+        client.observed_message(quiet_until.saturating_duration_since(Instant::now()))
+    {
+        assert_ne!(message["id"], 300, "answer after cancellation: {message}");
     }
 }
 
