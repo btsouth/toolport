@@ -1153,6 +1153,7 @@ impl SkillsPage {
             .always_show_arrow(true)
             .valign(gtk::Align::Center)
             .build();
+        super::quiet_tooltips::guard_menu(&project_menu);
         project_menu.set_tooltip_text(Some(&crate::i18n::tr(
             "Also show the rules and skills a project folder adds",
         )));
@@ -2977,6 +2978,7 @@ impl SkillsPage {
             .tooltip_text(&label)
             .css_classes(["flat", "toolport-row-more"])
             .build();
+        super::quiet_tooltips::guard_menu(&button);
         button.update_property(&[gtk::accessible::Property::Label(&label)]);
         let slot = format!("{}#menu", agent.id);
         self.controls

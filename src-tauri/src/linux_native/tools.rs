@@ -622,6 +622,7 @@ fn tool_row(
         .valign(gtk::Align::Center)
         .css_classes(["flat"])
         .build();
+    super::quiet_tooltips::guard_menu(&menu);
 
     let is_pinned = Rc::new(Cell::new(pinned));
     let page_for_pin = page.clone();
