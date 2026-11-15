@@ -1165,7 +1165,13 @@ mod spill {
         /// Files of dropped entries whose removal failed. Their bytes stay counted
         /// against the disk cap until a later try removes them.
         orphans: Vec<(PathBuf, usize)>,
+        /// [`LOCK_FILE`] in `dir`, held while this process may have files there.
+        lock: Option<std::fs::File>,
     }
+
+    /// Held (flock on Unix, LockFileEx on Windows) by the gateway that owns its
+    /// directory. The start-up sweep never removes a directory whose lock is held.
+    pub(super) const LOCK_FILE: &str = "owner.lock";
 
     static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 
@@ -1227,6 +1233,7 @@ mod spill {
                 cipher: key.map(|key| XChaCha20Poly1305::new((&key).into())),
                 entries: HashMap::new(),
                 orphans: Vec::new(),
+                lock: None,
             }
         }
     }
@@ -1240,14 +1247,36 @@ mod spill {
     }
 
     /// At start: remove the spill directories of gateways that have exited (their key
-    /// died with them), and any file older than the TTL, which no gateway still
-    /// serves. On Windows, where a pid check is not available here, the age rule
-    /// alone clears them.
+    /// died with them). A gateway holds [`LOCK_FILE`] in its directory for as long as
+    /// it runs, and the OS releases it when the process ends, so a directory whose
+    /// lock can be taken is dead and one whose lock is held is left to its owner, which
+    /// reaps its own files. This holds on Windows too, where no pid check is done.
+    ///
+    /// A directory with no lock file comes from an older gateway. It is removed when
+    /// its pid is gone (Unix) and otherwise loses each file whose age, its last
+    /// modified time, has passed the TTL. That gateway never extends a file's time.
     fn remove_stale(root: &std::path::Path) {
         let Ok(dirs) = std::fs::read_dir(root) else {
             return;
         };
         for dir in dirs.flatten() {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(dir.path().join(LOCK_FILE))
+            {
+                Ok(lock) => {
+                    if lock.try_lock().is_ok() {
+                        drop(lock);
+                        let _ = std::fs::remove_dir_all(dir.path());
+                    }
+                    // Held, or not lockable at all: its owner may still be serving it.
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                // Present but unopenable (on Windows, a sharing violation): leave it.
+                Err(_) => continue,
+            }
             let pid = dir
                 .file_name()
                 .to_str()
@@ -1350,7 +1379,7 @@ mod spill {
                 // Files that would not delete still hold the room this one needs.
                 return Err(Refusal::Unstored);
             }
-            if create_private_dir(&dir).is_err() {
+            if state.claim_dir(&dir).is_err() {
                 return Err(Refusal::Unstored);
             }
             let path = dir.join(format!("{cursor}.sealed"));
@@ -1409,6 +1438,7 @@ mod spill {
                 self.drop_entry(&cursor);
             }
             self.orphans.retain(|(path, _)| !remove_file(path));
+            self.lock = None;
             if let Some(dir) = self.dir.take() {
                 let _ = std::fs::remove_dir_all(dir);
             }
@@ -1423,6 +1453,28 @@ mod spill {
         }
     }
 
+    impl State {
+        /// Create `dir` for this user only and take its lock, once per process.
+        fn claim_dir(&mut self, dir: &std::path::Path) -> std::io::Result<()> {
+            if self.lock.is_some() && dir.is_dir() {
+                return Ok(());
+            }
+            create_private_dir(dir)?;
+            // Lock under a temporary name, then move it into place: a sweep that
+            // found an unlocked `owner.lock` here would take this directory for dead.
+            let staged = dir.join(format!("{LOCK_FILE}.{}", std::process::id()));
+            let lock = std::fs::File::create(&staged)?;
+            lock.try_lock().map_err(std::io::Error::from)?;
+            std::fs::rename(&staged, dir.join(LOCK_FILE))?;
+            self.lock = Some(lock);
+            Ok(())
+        }
+    }
+
+    /// Create `dir` and its parent readable by this user only. On Unix they are 0700
+    /// (files are 0600 through `atomic_write`). On Windows each gets a protected DACL
+    /// granting only the current user, inherited by every file created inside, so a
+    /// spill never takes the data dir's broader ACL.
     fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
         #[cfg(unix)]
@@ -1430,6 +1482,12 @@ mod spill {
             use std::os::unix::fs::PermissionsExt;
             for path in [dir, dir.parent().unwrap_or(dir)] {
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        #[cfg(windows)]
+        {
+            for path in [dir.parent().unwrap_or(dir), dir] {
+                crate::clients::backup_permissions::secure(path).map_err(std::io::Error::other)?;
             }
         }
         Ok(())
@@ -1507,13 +1565,20 @@ mod spill {
             root
         }
 
+        /// Sealed spill files under `root`, lock files aside.
         fn files_under(root: &std::path::Path) -> usize {
             std::fs::read_dir(root)
                 .into_iter()
                 .flatten()
                 .flatten()
-                .map(|dir| std::fs::read_dir(dir.path()).map_or(0, |files| files.count()))
-                .sum()
+                .flat_map(|dir| {
+                    std::fs::read_dir(dir.path())
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                })
+                .filter(|file| file.path().extension().is_some_and(|ext| ext == "sealed"))
+                .count()
         }
 
         #[test]
@@ -1567,6 +1632,11 @@ mod spill {
             let root = case_root("release");
             let mut state = State::new(Some(root.clone()), Some([7; 32]));
             assert!(state.keep("r1", &entry("body"), Instant::now()).is_ok());
+            let dir = root.join(std::process::id().to_string());
+            // A spill takes the directory's lock, so another gateway's sweep keeps it.
+            remove_stale(&root);
+            assert_eq!(files_under(&root), 1);
+            assert!(dir.join(LOCK_FILE).exists());
             state.release();
             assert!(!root.join(std::process::id().to_string()).exists());
             assert_eq!(
@@ -1576,11 +1646,6 @@ mod spill {
             assert_eq!(files_under(&root), 0);
             let _ = std::fs::remove_dir_all(&root);
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn root_for_tests() -> PathBuf {
-        spill_root().unwrap()
     }
 
     #[cfg(test)]
@@ -2690,7 +2755,9 @@ mod tests {
 
     #[test]
     fn startup_removes_spills_of_exited_gateways_and_expired_files() {
-        let root = spill::root_for_tests().join("startup-case");
+        let root = std::env::temp_dir()
+            .join("toolport-result-spill-cases")
+            .join("startup");
         let dead = root.join("4294967294");
         let named = root.join("not-a-pid");
         let live = root.join(std::process::id().to_string());
@@ -2702,6 +2769,38 @@ mod tests {
         assert!(!dead.exists() && !named.exists());
         // This process's pid from an earlier run is not ours either.
         assert!(!live.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn startup_keeps_the_spills_of_a_gateway_that_holds_its_lock() {
+        let root = std::env::temp_dir()
+            .join("toolport-result-spill-cases")
+            .join("held-lock");
+        let _ = std::fs::remove_dir_all(&root);
+        // A pid that no longer exists here (or, on Windows, is not checked), with a file
+        // older than the TTL: only the lock says the gateway is still serving it.
+        let held = root.join("4294967293");
+        let released = root.join("4294967292");
+        let mut locks = Vec::new();
+        for dir in [&held, &released] {
+            std::fs::create_dir_all(dir).unwrap();
+            let file = std::fs::File::create(dir.join("r1.sealed")).unwrap();
+            file.set_modified(std::time::SystemTime::now() - 2 * CACHE_TTL)
+                .unwrap();
+            let lock = std::fs::File::create(dir.join("owner.lock")).unwrap();
+            locks.push(lock);
+        }
+        locks[0].try_lock().unwrap();
+        assert_eq!(spill::LOCK_FILE, "owner.lock");
+        drop(locks.pop());
+        spill::remove_stale_for_tests(&root);
+        assert!(
+            held.join("r1.sealed").exists(),
+            "a live gateway's spill was reaped"
+        );
+        assert!(!released.exists());
+        drop(locks);
         let _ = std::fs::remove_dir_all(&root);
     }
 

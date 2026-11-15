@@ -109,8 +109,10 @@ are sent to every client.
   A cursor stays fetchable for 15 minutes. The most recent results (up to 64, and
   64 MiB) are held in memory; a result too large for that, or pushed out by newer
   ones, moves to a file under `result-spill/` in the data directory for the rest of
-  its time. Each file is written 0600 and sealed with a key the gateway holds only in
-  memory, so it is unreadable once that gateway exits. Files go when their result
+  its time. Each file is readable only by the current user (0600 on Unix, an
+  owner-only ACL on Windows) and sealed with a key the gateway holds only in memory,
+  so it is unreadable once that gateway exits. Each gateway holds a lock file in its
+  spill directory, and a starting gateway removes only directories whose lock is free. Files go when their result
   expires, when the gateway exits normally, and, for gateways that crashed or were
   killed, when the next gateway starts. A file that fails to delete still counts
   against the disk cap until a retry removes it. Only a result past

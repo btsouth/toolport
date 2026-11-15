@@ -16,7 +16,7 @@ use serde::Serialize;
 use crate::registry::{ManagedEntry, ServerEntry};
 
 #[cfg(windows)]
-mod backup_permissions;
+pub(crate) mod backup_permissions;
 mod claude_profiles;
 pub use claude_profiles::ClaudeProfile;
 mod disconnect;
