@@ -133,6 +133,12 @@ impl VaultWrites {
         crate::clients::backup_storage::register(id, key, value);
         Ok(())
     }
+    /// Lets other credential edits proceed once the registry commit that
+    /// needed the locks is done. Rollback stays available.
+    pub(crate) fn release_locks(&mut self) {
+        self.auth_locks.clear();
+        self.owner_pins.clear();
+    }
     pub(crate) fn keep(&mut self) {
         self.receipts.clear();
     }

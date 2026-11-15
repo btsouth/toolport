@@ -28,12 +28,17 @@ const AUTH_LOCK_POLL_MS: u64 = 250;
 
 pub(crate) struct AuthMutationLock {
     path: std::path::PathBuf,
+    /// What this process wrote. Past the lease another process may take the
+    /// lock over; its file is then left alone.
+    contents: String,
     _personal_owner: Option<crate::local_auth::OwnerPin>,
 }
 
 impl Drop for AuthMutationLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if std::fs::read_to_string(&self.path).is_ok_and(|current| current == self.contents) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -103,6 +108,7 @@ fn try_acquire_auth_lock(path: &Path) -> Result<Option<AuthMutationLock>, String
                 .map_err(|error| format!("could not write auth mutation lock file: {error}"))?;
             Ok(Some(AuthMutationLock {
                 path: path.to_path_buf(),
+                contents,
                 _personal_owner: None,
             }))
         }
@@ -135,6 +141,7 @@ fn try_acquire_auth_lock(path: &Path) -> Result<Option<AuthMutationLock>, String
                 .map_err(|error| format!("could not flush auth mutation lock file: {error}"))?;
             Ok(Some(AuthMutationLock {
                 path: path.to_path_buf(),
+                contents,
                 _personal_owner: None,
             }))
         }
@@ -1428,16 +1435,25 @@ pub fn update_server_entry_with<T>(
     changes: &SecretKeyChanges,
     write: impl FnOnce(ServerEntry) -> Result<T, String>,
 ) -> Result<T, String> {
-    let _auth = acquire_auth_lock(&entry.id)?;
-    let previous = read_registry_exact_or_default()?;
-    let mut plan = match previous.servers.iter().find(|server| server.id == entry.id) {
-        Some(old) => {
-            plan_vault_changes(&previous, old, &entry.env, entry.launch.as_ref(), changes)?
-        }
-        None => VaultPlan::default(),
-    };
     let mut entry = entry;
     rename_required_env(entry.launch.as_mut(), changes);
+    let plan_now = || -> Result<VaultPlan, String> {
+        let previous = read_registry_exact_or_default()?;
+        match previous.servers.iter().find(|server| server.id == entry.id) {
+            Some(old) => {
+                plan_vault_changes(&previous, old, &entry.env, entry.launch.as_ref(), changes)
+            }
+            None => Ok(VaultPlan::default()),
+        }
+    };
+    // A save that removes or renames no keychain variable touches no stored
+    // value, so it needs no credential lock; it is still checked.
+    if changes.removed.is_empty() && changes.renamed.is_empty() {
+        plan_now()?;
+        return write(entry);
+    }
+    let _auth = acquire_auth_lock(&entry.id)?;
+    let mut plan = plan_now()?;
     let id = entry.id.clone();
     let saved = crate::import_credentials::transaction(|writes| {
         plan.write_moves(&id, writes)?;
@@ -2973,6 +2989,11 @@ fn migrate_client_reviewed_inputs_with(
                 crate::clients::backup_storage::protect_existing()?;
                 commit_imports(&current, prepared)
             })?;
+            // Verifying probes every server and starts the gateway, which can
+            // outlast the credential lock lease. The servers are committed, so
+            // edits to them may go ahead; a rollback below only restores
+            // values nobody has changed since.
+            writes.release_locks();
             let attempt = (|| {
                 let verification = verify(&staged, &moved, client_id, profile)?;
                 let outcome =
@@ -4762,6 +4783,55 @@ API_KEY = "synthetic-first-origin"
                 .is_some_and(|fields| fields.iter().any(|f| f == "Environment")),
             "changed environment must be disclosed: {review}"
         );
+    }
+
+    #[test]
+    fn an_import_can_release_its_credential_locks_once_committed() {
+        let _fixture = MoveFixture::new(&Registry::default());
+        let import = crate::import_credentials::Import::prepare(
+            server("one"),
+            Some(&serde_json::json!({"env":{"PAT":"synthetic-new"}})),
+        )
+        .unwrap();
+        let path = auth_lock_path("one").unwrap();
+        crate::import_credentials::transaction(|writes| {
+            import.transfer_into("one", writes, false)?;
+            assert!(try_acquire_auth_lock(&path)?.is_none());
+            writes.release_locks();
+            assert!(try_acquire_auth_lock(&path)?.is_some());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_lock_taken_over_by_another_process_is_not_deleted() {
+        let _fixture = MoveFixture::new(&Registry::default());
+        let path = auth_lock_path("taken-over").unwrap();
+        let ours = try_acquire_auth_lock(&path).unwrap().unwrap();
+        // Past the lease another process rewrites the file as its own.
+        std::fs::write(&path, "mutation_id=other\n").unwrap();
+        drop(ours);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "mutation_id=other\n"
+        );
+        std::fs::remove_file(&path).unwrap();
+        let ours = try_acquire_auth_lock(&path).unwrap().unwrap();
+        drop(ours);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_save_that_removes_no_stored_value_does_not_wait_for_the_credential_lock() {
+        let (initial, entry) = stored_server(&[("TOKEN", "t")]);
+        let _fixture = MoveFixture::new(&initial);
+        let _held = acquire_auth_lock("srv").unwrap();
+        let started = std::time::Instant::now();
+        let mut renamed = entry;
+        renamed.name = "renamed".into();
+        update_server_entry_with(renamed, &SecretKeyChanges::default(), save_registry).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(AUTH_LOCK_WAIT_SECS / 2));
     }
 
     #[test]

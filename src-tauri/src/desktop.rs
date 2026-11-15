@@ -395,22 +395,29 @@ fn prewarm_launcher(server: &ServerEntry) {
     });
 }
 
+/// Off the main thread: a save may wait for another credential edit and reads
+/// and writes the keychain.
 #[tauri::command]
-fn update_server(
-    state: State<RegistryState>,
+async fn update_server(
+    app: AppHandle,
     entry: ServerEntry,
     removed_secret_keys: Option<Vec<String>>,
     renamed_secret_keys: Option<Vec<(String, String)>>,
 ) -> Result<Registry, String> {
-    update_server_in(
-        state.inner(),
-        entry,
-        &crate::registry_controller::SecretKeyChanges {
-            removed: removed_secret_keys.unwrap_or_default(),
-            renamed: renamed_secret_keys.unwrap_or_default(),
-            opened_with: None,
-        },
-    )
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<RegistryState>();
+        update_server_in(
+            state.inner(),
+            entry,
+            &crate::registry_controller::SecretKeyChanges {
+                removed: removed_secret_keys.unwrap_or_default(),
+                renamed: renamed_secret_keys.unwrap_or_default(),
+                opened_with: None,
+            },
+        )
+    })
+    .await
+    .map_err(|e| format!("server update task join failed: {e}"))?
 }
 
 /// A variable removed from the keychain in the editor is deleted from it too,
