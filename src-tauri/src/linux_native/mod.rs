@@ -6863,14 +6863,22 @@ fn activity_detail(activity: &state::ActivityView) -> String {
     }
     detail.join(" · ")
 }
+/// The detail line's tooltip: the full line first, which ellipsizes at narrow
+/// widths, then the raw client id and the call's diagnostics, as React's does.
 fn activity_detail_tooltip(activity: &state::ActivityView) -> String {
+    let client = if activity_client_name(activity) == "Unrecorded client" {
+        Some(unrecorded_client_tooltip())
+    } else {
+        activity
+            .client_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(|id| crate::i18n::trf("Client: {value}", &[("value", id)]))
+    };
     format!(
-        "{}{}{}{}",
-        if activity_client_name(activity) == "Unrecorded client" {
-            unrecorded_client_tooltip()
-        } else {
-            activity.client_id.as_deref().unwrap_or_default().to_owned()
-        },
+        "{}{}{}{}{}",
+        activity_detail(activity),
+        client.map(|line| format!("\n{line}")).unwrap_or_default(),
         activity
             .run_id
             .as_ref()
@@ -14569,7 +14577,12 @@ mod tests {
             );
             assert_eq!(
                 activity_detail.tooltip_text().as_deref(),
-                Some("\nRun: 0123456789abcdef0123456789abcdef\nWarm catalog\nDispatch: 3 ms")
+                Some(
+                    format!(
+                    "{detail}\nRun: 0123456789abcdef0123456789abcdef\nWarm catalog\nDispatch: 3 ms"
+                )
+                    .as_str()
+                )
             );
             let session_row = recent.child().unwrap().first_child().unwrap();
             let session_name = session_row
@@ -16965,6 +16978,47 @@ mod p10c_r1_presentation_tests {
         assert!(activity_detail(&row).starts_with("Claude Code · reports \"Someone else\" · "));
         row.client_label = None;
         assert_eq!(activity_client_segments(&row), ["Claude Code"]);
+    }
+
+    #[test]
+    fn activity_tooltip_carries_the_full_caller_text() {
+        let mut row = state::ActivityView {
+            internal: false,
+            timestamp_ms: 0,
+            server: "team_slack".into(),
+            tool: "delete".into(),
+            client: Some("Codex".into()),
+            client_id: Some("adapter:codex".into()),
+            client_label: Some("Name 2.1.290 with a long build tag".into()),
+            host: None,
+            host_thread: None,
+            cold: Some(false),
+            dispatch_ms: None,
+            failure_kind: None,
+            run_id: None,
+            approval_decision: None,
+            ok: true,
+            held: false,
+            duration_ms: Some(12),
+            error: None,
+            pii_replaced: None,
+            pii_incomplete: false,
+        };
+        let tooltip = activity_detail_tooltip(&row);
+        let mut lines = tooltip.lines();
+        assert_eq!(lines.next(), Some(activity_detail(&row).as_str()));
+        assert!(activity_detail(&row)
+            .starts_with("Codex · reports \"Name 2.1.290 with a long build tag\" · "));
+        assert_eq!(lines.next(), Some("Client: adapter:codex"));
+        assert_eq!(lines.next(), Some("Warm catalog"));
+        assert_eq!(lines.next(), None);
+
+        row.client = None;
+        row.client_label = None;
+        row.client_id = None;
+        let tooltip = activity_detail_tooltip(&row);
+        assert!(tooltip.starts_with("Unrecorded client · "), "{tooltip}");
+        assert!(tooltip.contains("\nOlder Toolport versions did not record callers"));
     }
 }
 
