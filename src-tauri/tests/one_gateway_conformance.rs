@@ -4899,6 +4899,98 @@ fn matrix_overlapping_calls_through_one_adapter_keep_their_answers() {
     assert_eq!(approved, vec!["legacy_elicitation", "sleep", "sleep"]);
 }
 
+/// Two overlapping calls down one stdio adapter, one cancelled while both are parked
+/// at the server. The other answers under its own id. The cancelled one gets exactly
+/// one answer, Toolport's own cancellation error, and never the server's late result
+/// (the server still finishes it, so a leak would show up as a second answer). The
+/// session keeps serving afterwards.
+#[test]
+fn matrix_cancelling_one_of_two_overlapping_calls_leaks_no_late_answer() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("adapter-overlap-cancel");
+    let transcript = dir.join("cancel.jsonl");
+    let mut server = mock_server_entry("par", &transcript, None);
+    server.source = Some("shared".to_string());
+    server.env.push(EnvVar {
+        key: "MOCK_MCP_CONCURRENT".to_string(),
+        value: Some("1".to_string()),
+        secret: false,
+        unknown_fields: Default::default(),
+    });
+    write_registry(&dir, vec![server], vec![]);
+
+    let mut client = spawn_adapter(&dir, &AdapterOptions::default());
+    client.initialize("matrix-adapter-overlap-cancel");
+    let sleep = client.wait_for_tool("__sleep", Duration::from_secs(30));
+    let call = |id: i64, ms: u64| {
+        json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": sleep, "arguments": { "ms": ms } }
+        })
+    };
+    let before = transcript_method_count(&transcript, "tools/call");
+    client.send(call(200, 3_000));
+    client.send(call(201, 1_500));
+    wait_until(
+        || transcript_method_count(&transcript, "tools/call") >= before + 2,
+        "both calls reached the server",
+        Duration::from_secs(20),
+    );
+    client.send(json!({
+        "jsonrpc": "2.0", "method": "notifications/cancelled",
+        "params": { "requestId": 200, "reason": "user cancelled" }
+    }));
+
+    // Both answers arrive, in either order: 201 its result, 200 a cancellation error.
+    let mut answers = std::collections::BTreeMap::new();
+    while answers.len() < 2 {
+        let message = client.next_message();
+        match message["id"].as_i64() {
+            Some(id @ (200 | 201)) => {
+                assert!(
+                    answers.insert(id, message.clone()).is_none(),
+                    "second answer: {message}"
+                );
+            }
+            Some(other) => panic!("unexpected answer {other}: {message}"),
+            None => assert!(message.get("method").is_some(), "{message}"),
+        }
+    }
+    assert_eq!(
+        text_of(&answers[&201]["result"]),
+        "slept 1500 ms",
+        "{answers:?}\n{}",
+        client.diagnostics()
+    );
+    assert_eq!(answers[&200]["result"]["isError"], true, "{answers:?}");
+    assert!(
+        text_of(&answers[&200]["result"]).contains("cancelled"),
+        "{answers:?}"
+    );
+    wait_until(
+        || transcript_method_count(&transcript, "notifications/cancelled") >= 1,
+        "the cancellation reached the server",
+        Duration::from_secs(10),
+    );
+    // The session still serves, and its answer is the next message with an id.
+    client.send(call(202, 10));
+    let next = client.response_to(202);
+    assert_eq!(text_of(&next["result"]), "slept 10 ms", "{next}");
+    // Past the point where the server answered the cancelled call, nothing more.
+    let quiet_until = Instant::now() + Duration::from_secs(4);
+    while let Some(message) =
+        client.observed_message(quiet_until.saturating_duration_since(Instant::now()))
+    {
+        assert!(
+            message.get("id").is_none() || message.get("method").is_some(),
+            "late answer after cancellation: {message}\n{}",
+            client.diagnostics()
+        );
+    }
+}
+
 #[test]
 fn matrix_pooling_approved_rooted_call_rebinds_to_its_root_view() {
     let _guard = CASE_LOCK
