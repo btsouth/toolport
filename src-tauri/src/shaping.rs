@@ -1454,7 +1454,15 @@ mod spill {
             if touched.elapsed() >= spill_ttl() || entry.past_lifetime() {
                 return Err(Refusal::Expired);
             }
-            let plain = json!({ "body": entry.body, "structured": entry.structured }).to_string();
+            // No secret reaches the disk, sealed or not: the result is redacted with
+            // every server's secrets first, so a fetch from disk returns it redacted.
+            // Without a working matcher the result stays in memory.
+            if crate::secret_redact::unavailable_reason().is_some() {
+                return Err(Refusal::Unstored);
+            }
+            let mut plain = json!({ "body": entry.body, "structured": entry.structured });
+            crate::secret_redact::redact_outgoing(&mut plain, None);
+            let plain = plain.to_string();
             // Base64 of the sealed text is a third larger; check before sealing.
             if plain.len() / 3 * 4 > max_spill_bytes() {
                 return Err(Refusal::TooLarge);
@@ -1718,6 +1726,22 @@ mod spill {
                 describes: Vec::new(),
                 realm: 0,
             }
+        }
+
+        #[test]
+        fn a_spilled_result_is_redacted_before_it_is_sealed() {
+            let _data = crate::registry::DataDirTestEnv::new("spill-redact");
+            let secret = "sk-SpilledResultSecret64";
+            crate::secret_redact::register("spill-srv", "KEY", secret);
+            let root = case_root("redact");
+            let mut state = State::new(Some(root.clone()), Some([7; 32]));
+            let mut item = entry(&format!("token {secret} end"));
+            item.structured = Some(json!({ "k": secret }));
+            assert!(state.keep("r1", &item, Instant::now()).is_ok());
+            let loaded = state.load("r1", None).expect("kept on disk");
+            let _ = std::fs::remove_dir_all(&root);
+            assert_eq!(loaded.body, "token [secret:KEY] end");
+            assert_eq!(loaded.structured, Some(json!({ "k": "[secret:KEY]" })));
         }
 
         /// A fresh spill root of this test's own, under the test spill root.
