@@ -6508,6 +6508,35 @@ mod tests {
     }
 
     #[test]
+    fn the_held_tail_of_a_long_secret_is_found_in_linear_work() {
+        // No secret in the text: every char of the window is a candidate tail.
+        let text: String = (0..65_536)
+            .map(|i| {
+                if i % 61 == 60 {
+                    ' '
+                } else {
+                    (b'a' + (i % 26) as u8) as char
+                }
+            })
+            .collect();
+        let secret = |n: usize| -> String {
+            (0..n)
+                .map(|i| b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[(i * 7 + 3) % 36] as char)
+                .collect()
+        };
+        let cost = |n: usize| {
+            let m = Matcher::new(&[("K", secret(n).as_str())]);
+            best_of_three(|| {
+                std::hint::black_box(m.hold_from(&text));
+            })
+        };
+        // The window grows with the secret: linear is ten times, a copy of
+        // each tail a hundred.
+        let (a, b) = (cost(1_000), cost(10_000));
+        assert!(b < a * 40, "1,000 chars {a:?}, 10,000 chars {b:?}");
+    }
+
+    #[test]
     fn many_leaves_holding_a_secret_cost_linear_work() {
         let m = m(&[("TOKEN", "sk-SECRETVALUE1234")]);
         let doc = |n: usize| {
