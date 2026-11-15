@@ -58,7 +58,7 @@ pub fn stderr_file(dir: &Path) -> Option<std::fs::File> {
 
 /// Append one line stamped with the time and this process id.
 pub fn append(dir: &Path, line: &str) {
-    let line = crate::secret_redact::redact_text(line);
+    let line = crate::secret_redact::redact_log_text(line);
     if let Some(mut file) = open_for_append(dir) {
         let _ = writeln!(file, "{} pid={} {line}", now_ms(), std::process::id());
     }

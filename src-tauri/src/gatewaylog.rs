@@ -45,9 +45,7 @@ pub fn set_role(role: Role) {
 
 fn format_line(msg: &str, millis: u64, pid: u32, role: &str) -> String {
     let seconds = millis / 1000 % 86_400;
-    let msg = crate::secret_redact::redact_text(msg);
-    let msg = crate::registry::redact_secret_text(&crate::redact_url_userinfo(&msg))
-        .replace(['\n', '\r'], " ");
+    let msg = crate::secret_redact::redact_log_text(msg).replace(['\n', '\r'], " ");
     format!(
         "{}T{:02}:{:02}:{:02}.{:03}Z pid={pid} role={role} {msg}",
         crate::usage_report::utc_day(millis),

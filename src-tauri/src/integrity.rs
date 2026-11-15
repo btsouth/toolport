@@ -1930,6 +1930,8 @@ fn save_quarantine_with(
     })?;
     let serialized = serde_json::to_string(q)
         .map_err(|e| format!("Could not serialize the quarantine store at {path:?}: {e}"))?;
+    // Held definitions are upstream text; screen them like the live catalog.
+    let serialized = crate::secret_redact::redact_definition_line(&serialized);
     write(&path, &serialized)
         .map_err(|e| format!("Could not persist the quarantine store at {path:?}: {e}"))?;
     // Invalidate the mtime cache only after the new contents are durable (SOU-303).

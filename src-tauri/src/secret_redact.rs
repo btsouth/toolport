@@ -1412,6 +1412,19 @@ pub fn upstream_arguments(server_id: &str, arguments: Value) -> Value {
     walk(server_id, arguments)
 }
 
+/// Text for a diagnostic log: registered secrets, URL userinfo and
+/// credential-shaped strings (a key typed straight into a URL or argument) are
+/// all removed. Every log Toolport writes goes through this.
+pub fn redact_log_text(text: &str) -> Cow<'_, str> {
+    let redacted = redact_text(text);
+    let stripped = crate::registry::redact_secret_text(&crate::redact_url_userinfo(&redacted));
+    if stripped == text {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(stripped)
+    }
+}
+
 /// [`Matcher::redact_definition_line`] against every registered secret.
 pub fn redact_definition_line(line: &str) -> Cow<'_, str> {
     match current() {
@@ -1473,8 +1486,8 @@ pub fn persisted_log_files(dir: &Path) -> Vec<PathBuf> {
         "savings-v2.jsonl",
         "savings-v3.jsonl",
         "savings-v4.jsonl",
-        "team-activity.jsonl",
         "gateway.log",
+        "oauth-debug.log",
         "daemon.log",
         "daemon.log.1",
         "last-daemon-exit.json",
@@ -1494,8 +1507,11 @@ pub fn persisted_log_files(dir: &Path) -> Vec<PathBuf> {
                 "security.jsonl.",
                 "gateway.log.",
                 "inspect.jsonl.",
-                // Tool catalogs, which hold upstream definition text.
+                // Tool catalogs and held (quarantined) definitions, which hold
+                // upstream definition text.
                 "tool-cache",
+                "quarantine",
+                "team-activity-",
             ]
             .iter()
             .any(|prefix| name.starts_with(prefix) && !name.ends_with(".lock"));
@@ -1608,7 +1624,7 @@ fn scrub_file_with(matcher: &Matcher, path: &Path) -> std::io::Result<bool> {
     let catalog = path
         .file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with("tool-cache"));
+        .is_some_and(|n| n.starts_with("tool-cache") || n.starts_with("quarantine"));
     let mut changed = false;
     let mut out = String::with_capacity(text.len());
     for line in text.split_inclusive('\n') {
@@ -2312,8 +2328,29 @@ mod tests {
                 .to_string(),
         )
         .unwrap();
+        // The OAuth debug log and a held definition in the quarantine store.
+        std::fs::write(dir.join("oauth-debug.log"), format!("url ?key={secret}\n")).unwrap();
+        let quarantine = dir.join("quarantine-v2-work.json");
+        std::fs::write(
+            &quarantine,
+            serde_json::json!({"s__scrub-unit":{"definition":{"name":"scrub-unit","description":format!("k {secret}")}}})
+                .to_string(),
+        )
+        .unwrap();
         register("unit-scrub-server", "SCRUB_KEY", secret);
-        assert_eq!(scrub_data_dir(&dir).unwrap(), 4);
+        assert_eq!(scrub_data_dir(&dir).unwrap(), 6);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("oauth-debug.log")).unwrap(),
+            "url ?key=[secret:SCRUB_KEY]\n"
+        );
+        let held_defs: Value =
+            serde_json::from_str(&std::fs::read_to_string(&quarantine).unwrap()).unwrap();
+        let def = &held_defs["s__scrub-unit"]["definition"];
+        assert_eq!(def["description"], "k [secret:SCRUB_KEY]");
+        assert_eq!(
+            def["name"], "scrub-unit",
+            "a piece of a secret in a name is not redacted"
+        );
         let cached: Value =
             serde_json::from_str(&std::fs::read_to_string(&cache).unwrap()).unwrap();
         assert_eq!(cached["tools"][0]["description"], "uses [secret:SCRUB_KEY]");

@@ -237,13 +237,19 @@ fn debug_log(msg: &str) {
         return;
     }
     if let Some(path) = crate::registry::conduit_dir().map(|d| d.join("oauth-debug.log")) {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        // Owner-only from creation (SBS-868).
-        if let Ok(mut f) = crate::registry::open_append_private(&path) {
-            let _ = writeln!(f, "{msg}");
-        }
+        debug_log_to(&path, msg);
+    }
+}
+
+fn debug_log_to(path: &std::path::Path, msg: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Owner-only from creation (SBS-868). URLs here come from the user's
+    // config and upstream metadata, so they get the gateway.log treatment.
+    let msg = crate::secret_redact::redact_log_text(msg);
+    if let Ok(mut f) = crate::registry::open_append_private(path) {
+        let _ = writeln!(f, "{msg}");
     }
 }
 
@@ -1909,6 +1915,24 @@ pub(crate) fn authenticate_cancellable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_log_redacts_secrets_and_url_credentials() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-oauth-debug-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        crate::secret_redact::register("oauth-srv", "API_KEY", "oauth-query-key-77Zq");
+        let path = dir.join("oauth-debug.log");
+        debug_log_to(
+            &path,
+            "discovering https://svc:typed-pass-9x@mcp.example.invalid/mcp?api_key=oauth-query-key-77Zq",
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!text.contains("oauth-query-key-77Zq"), "{text}");
+        assert!(!text.contains("typed-pass-9x"), "{text}");
+        assert!(text.starts_with("discovering "), "{text}");
+    }
 
     /// The vectors are lifted from `src/lib/openUrl.test.ts`. Keeping them
     /// identical is the point: this guard exists so a compromised renderer
