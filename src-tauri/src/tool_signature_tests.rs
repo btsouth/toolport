@@ -997,11 +997,22 @@ fn r3_1_contradictions_rule_out_one_kind() {
     }
 }
 
-/// Compile `signatures` with `tsc --strict --noEmit` when the repository's
-/// TypeScript is installed. Each signature's last line starts with its callee.
+/// Compile `signatures` with `tsc --strict --noEmit` with the repository's
+/// TypeScript. Each signature's last line starts with its callee. Without
+/// `node_modules` the check is skipped locally and fails in CI (`CI` set).
 fn tsc_strict(signatures: &[String], callees: &[&str]) {
-    let tsc = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../node_modules/.bin/tsc");
+    let bin = if cfg!(windows) { "tsc.cmd" } else { "tsc" };
+    let tsc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../node_modules/.bin")
+        .join(bin);
     if !tsc.exists() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "{} is missing: CI must run `npm ci` before the Rust tests so the strict \
+             compile of {} signatures runs",
+            tsc.display(),
+            signatures.len()
+        );
         eprintln!(
             "tsc not installed; skipping the strict compile of {} signatures",
             signatures.len()
@@ -1021,10 +1032,11 @@ fn tsc_strict(signatures: &[String], callees: &[&str]) {
             "namespace N{index} {{\n{declarations}\ndeclare function f({rest};\n}}\n"
         ));
     }
+    static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "toolport-tsc-{}-{}",
         std::process::id(),
-        signatures.len()
+        RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("signatures.ts");
