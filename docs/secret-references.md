@@ -133,8 +133,11 @@ Known limits:
   The held ending of a progress stream is dropped when its call ends; it is at
   most the start of a registered value. Output a hard kill cuts off while it
   is held is lost rather than written unredacted.
-- Text that reaches a client's own log through the gateway's stderr outside the
-  daemon is outside Toolport's files and is not rewritten.
+- Every Toolport process (each gateway role and both apps) passes its stderr
+  through the redactor, so a client's own log of the gateway's stderr gets the
+  same markers. That log is outside Toolport's files, so a copy written before
+  a secret was configured is not rewritten. If the redactor cannot take over
+  stderr, stderr is discarded instead and `toolport_status` says so.
 
 When a stored secret is replaced or deleted, Toolport first scrubs its data
 directory for the old value. If that cleanup fails, the old value stays in the
