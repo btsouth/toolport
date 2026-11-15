@@ -116,6 +116,10 @@ fn off_identity_sha256(text: &str) -> String {
 /// exact-name definitions trimmed by the describe budget, raised limits, server
 /// listings and grouped `help_<server>`) are the bytes origin/main (95d5ca6db)
 /// produced for this same test body, in every listing mode.
+///
+/// Updated once for this branch's own changes, both deliberate: Toolport's meta-tools
+/// carry `anthropic/alwaysLoad` for Claude Code, and a shaped result's head fills the
+/// budget by calculation (7044 characters here instead of 6970). Nothing else differs.
 #[test]
 fn code_mode_off_is_unchanged_in_every_listing_mode() {
     let _data = DataDirTestEnv::new("code-mode-off-identity");
@@ -138,9 +142,9 @@ fn code_mode_off_is_unchanged_in_every_listing_mode() {
     assert_eq!(
         digests,
         [
-            "7dfdfc00cdc6df6e610ec1fd8e7dd4d760e86c6a70ef57ac417e100f60a87238".to_string(),
-            "5359fe3ed17cf102e8d424a770b7d5ec616d22d4b62012549902c58e183115c7".to_string(),
-            "ebee2a7ae5280d932646c86c14a328f4f7ae0579d1a1ea060fa29fa68b4ad07c".to_string(),
+            "f82a18586c8e33a6cdd617d1f7c1ede1e6fa3906a72ecfeffa257cc1949fcf15".to_string(),
+            "c42a8575699db61a6a8c5b307bc83a0228a6b2b781310f3322ea03e71248bcdc".to_string(),
+            "cd64fb222adfcb9a4f212f5976cc695eb98c78a804cb572db57be6924dc3954b".to_string(),
         ],
         "Code Mode off output changed"
     );
