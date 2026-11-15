@@ -484,9 +484,10 @@ impl ClientPage {
         let page = self.clone();
         let record = record.clone();
         dialog.connect_response(None,move|dialog,response|{dialog.close();if response!="discard"{focus_named(&page.root,&format!("client-recovery-discard:{}",record.id));return;}
+            page.recovery_busy.set(true);page.reload_recoveries();page.refresh_open_detail();
             let page=page.clone();let record=record.clone();gtk::glib::spawn_future_local(async move{
                 let id=record.id.clone();let result=gtk::gio::spawn_blocking(move||crate::clients::recovery::discard(&id).map_err(|e|crate::clients::recovery::safe_action_error(&id,&e))).await;
-                match result {Ok(Ok(()))=>{page.recovery_success.borrow_mut().retain(|(id,_)|id!=&record.client_id);page.recovery_success.borrow_mut().push((record.client_id.clone(),crate::i18n::trf("{client}'s saved recovery copies were discarded. The current client config was not changed.",&[("client",&record.client_name)])));page.reload_recoveries();page.refresh_open_detail();focus_named(&page.root,&format!("client-recovery-success:{}",record.client_id));},Ok(Err(e))=>page.recovery_action_error(&record.id,e),Err(_)=>page.recovery_action_error(&record.id,crate::clients::recovery::worker_error())}
+                match result {Ok(Ok(()))=>{page.recovery_busy.set(false);page.recovery_success.borrow_mut().retain(|(id,_)|id!=&record.client_id);page.recovery_success.borrow_mut().push((record.client_id.clone(),crate::i18n::trf("{client}'s saved recovery copies were discarded. The current client config was not changed.",&[("client",&record.client_name)])));page.reload_recoveries();page.refresh_open_detail();focus_named(&page.root,&format!("client-recovery-success:{}",record.client_id));},Ok(Err(e))=>page.recovery_action_error(&record.id,e),Err(_)=>page.recovery_action_error(&record.id,crate::clients::recovery::worker_error())}
             });
         });
         dialog.present();
@@ -663,5 +664,35 @@ mod tests {
             .unwrap()
             .text()
             .contains("Recovery notice dismissed"));
+
+        // A tray/background action has no active parent window. Confirmation
+        // must still open, and confirmed deletion must guard every other action.
+        assert!(app.active_window().is_none());
+        page.confirm_discard_recovery(&record);
+        let dialog = app
+            .windows()
+            .into_iter()
+            .find_map(|window| window.downcast::<adw::MessageDialog>().ok())
+            .expect("parentless Discard confirmation");
+        assert!(dialog.transient_for().is_none());
+        assert_eq!(dialog.default_response().as_deref(), Some("cancel"));
+        dialog.response("discard");
+        assert!(
+            page.recovery_busy.get(),
+            "Discard must be busy before its worker starts"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while page.recovery_busy.get() && std::time::Instant::now() < deadline {
+            gtk::glib::MainContext::default().iteration(false);
+        }
+        assert!(
+            !page.recovery_busy.get(),
+            "failed Discard must release the busy guard"
+        );
+        assert!(page
+            .recovery_feedback
+            .borrow()
+            .iter()
+            .any(|(id, message)| id == &record.id && !message.is_empty()));
     }
 }
