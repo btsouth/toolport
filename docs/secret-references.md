@@ -81,10 +81,28 @@ OAuth debug log) and in every message sent to a client: responses, notifications
 progress and server requests. It matches the value as written and trimmed, in
 upper and lower case, NFC and NFKC, percent and form encoding, hex (in any case),
 JSON escaped once or twice, base64 in four alphabets, base64 inside a longer
-blob, and PEM lines. A value that is itself hex or base32 matches in any case. A
-JSON number or object key that is a registered value is replaced too. In error
-text and stderr, an 8-character piece of a secret (12 characters or longer) is
-redacted as well, and so is the piece of one at the edge of a cut.
+blob, and PEM lines. It also decodes text that uses JSON `\u` escapes, percent
+encoding or HTML entities (numeric or named, with or without `;`), mixed
+character by character and nested one level, and replaces the encoded text
+where it is written. A value that is itself hex or base32 matches in any case.
+An object key that is a registered value is replaced too, and so is a JSON
+number that is a numeric secret of 6 or more digits. In error text and stderr,
+an 8-character piece of a secret (12 characters or longer) is redacted as well,
+and so is the piece of one at the edge of a cut.
+
+Each Activity row for a tool call records which secrets the result carried, by
+name and count (`secretsReplaced`), never the values.
+
+Text written in pieces is checked as one stream. The gateway's stderr, a
+server's stderr tail in an error, and the progress messages of one call hold
+back any ending that could be the start of a secret until the next piece shows
+whether the rest follows. A secret split across the text fields of one message
+is matched however the fields are nested.
+
+If the redactor cannot be built for the configured secrets, Toolport does not
+fall back to writing text as is: logs and messages show
+`[withheld: secret redaction unavailable]` in place of their text, and
+`toolport_status` says why.
 
 Some things are deliberately left alone:
 
@@ -93,8 +111,11 @@ Some things are deliberately left alone:
   such as a file it read.
 - Tool, prompt and resource definitions are matched by whole value only, so an
   ordinary name that shares a few characters with a secret is never renamed. A
-  name that is a secret is shown with the marker and still reaches the server
-  under its real name.
+  name or argument name that holds a secret is advertised with a marker that
+  carries a short keyed hash, such as `[secret:API_KEY~3f9a0c12]`. The hash is
+  the same on every start for the same name, so integrity pins, quarantine and
+  Activity (which all use the advertised name) stay stable, and two different
+  names never share one. Calls still reach the server under its real name.
 - The registry and client config backups hold inline values the way you typed
   them. They are your configuration, not logs.
 
@@ -102,13 +123,16 @@ Known limits:
 
 - A secret shorter than 6 characters is matched only as a whole word. A copy
   run into other text can be written. `toolport_status` names each one (by
-  server and key, never the value) so you can use a longer one.
-- A secret split across two adjacent JSON strings, or across consecutive lines
-  of stderr, is matched. A secret split any other way is not: across two
-  separate log records, mixed with other text at the break, or transformed in
-  a way not listed above (encrypted, compressed, reversed). A stderr line is
-  held up to 200 ms for this; output a hard kill cuts off in that window is
-  lost rather than written unredacted.
+  server and key, never the value) so you can use a longer one. A numeric
+  secret under 6 digits is not replaced where it appears as a JSON number,
+  because ports and counts would be replaced too; status names those as well.
+- Streams are checked within one stream only: one stderr, one server's tail,
+  the progress messages of one call. A secret split across two different calls,
+  servers or log records, mixed with other text at the break, or transformed
+  in a way not listed above (encrypted, compressed, reversed) is not matched.
+  The held ending of a progress stream is dropped when its call ends; it is at
+  most the start of a registered value. Output a hard kill cuts off while it
+  is held is lost rather than written unredacted.
 - Text that reaches a client's own log through the gateway's stderr outside the
   daemon is outside Toolport's files and is not rewritten.
 
