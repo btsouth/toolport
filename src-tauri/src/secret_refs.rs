@@ -1440,11 +1440,12 @@ mod tests {
         );
     }
 
-    /// Failure mode: the desktop shells' startup preload read the vault of
-    /// every server, so a locked keyring could raise an unlock prompt during a
-    /// hidden start, for credentials the app did not need.
+    /// Failure mode: the startup preload (the shells' and every gateway
+    /// role's) read the vault of every server, so a locked keyring could raise
+    /// an unlock prompt at start, or hold a gateway start on an unanswered one,
+    /// for credentials the process did not need.
     #[test]
-    fn the_desktop_preload_reads_no_vault_value() {
+    fn no_startup_preload_reads_a_vault_value() {
         crate::secrets::tests::with_isolated_vault(|| {
             let registry = crate::registry::Registry {
                 servers: serde_json::from_value(serde_json::json!([
@@ -1461,13 +1462,6 @@ mod tests {
             assert_eq!(
                 crate::secret_redact::redact_text("got pre-inline-value-6Tz1"),
                 "got [secret:INLINE_TOKEN]"
-            );
-            // The gateway's own preload reads enabled servers' values only.
-            let reads = crate::secrets::tests::reads_during(super::preload_configured_secrets);
-            assert!(reads.contains(&"pre-on/ON_TOKEN".to_string()), "{reads:?}");
-            assert!(
-                !reads.iter().any(|r| r.starts_with("pre-off/")),
-                "{reads:?}"
             );
         });
     }

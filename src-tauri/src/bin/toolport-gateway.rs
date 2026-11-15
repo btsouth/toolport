@@ -20895,6 +20895,11 @@ fn insecure_loopback_requested(args: &[String]) -> bool {
 /// Whether the operator asked this process to be the host daemon (`--daemon`).
 /// Phase 2: the daemon role currently serves the internal identity handshake and
 /// exits after an idle grace; it does not own a router yet.
+/// The secrets a gateway learns at start, in every role.
+fn learn_startup_secrets() {
+    conduit_lib::secret_refs::preload_configured_secrets();
+}
+
 fn daemon_requested(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "--daemon")
 }
@@ -22962,7 +22967,7 @@ fn gateway_main(cli_args: Vec<String>) {
         // Every configured secret (and any value retired while a log could
         // still hold it) is known to the redactor before this process replays
         // or writes diagnostic text.
-        conduit_lib::secret_refs::preload_configured_secrets();
+        learn_startup_secrets();
         let retired = conduit_lib::secrets::retry_retired_scrubs();
         if retired > 0 {
             glog(&format!(
@@ -23590,6 +23595,45 @@ mod tests {
         // An invalid port is reported before the configured secrets are
         // preloaded, so the value may be a secret the redactor does not know.
         super::gateway_main(vec!["--http-proxy".into(), secret]);
+    }
+
+    /// Failure mode: no role learns a stored value at start any more, so the
+    /// read that launches a server must register it before the server can echo
+    /// it: here the server's first (and only) output line quotes its token.
+    #[cfg(unix)]
+    #[test]
+    fn a_value_read_at_launch_is_redacted_from_the_servers_first_output() {
+        let _data = DataDirTestEnv::new("a_value_read_at_launch_is_redacted");
+        let secret = "launch-only-secret-4Wd8Qm";
+        std::env::set_var("TOOLPORT_SECRET_LAUNCH_ONLY_TOKEN", secret);
+        let server: ServerEntry = serde_json::from_value(json!({
+            "id": "launch-srv", "name": "Launch", "enabled": true, "source": "fixture",
+            "transport": "stdio", "command": "/bin/sh",
+            "args": ["-c", "echo \"server says $LAUNCH_ONLY_TOKEN\" >&2; exit 3"],
+            "inheritEnv": false,
+            "env": [{"key": "LAUNCH_ONLY_TOKEN", "secret": true}]
+        }))
+        .unwrap();
+        let mut reg = Registry::default();
+        reg.servers.push(server.clone());
+        registry::save(&reg).unwrap();
+        // What every role runs at start reads no stored value.
+        super::learn_startup_secrets();
+        let at_start = conduit_lib::secret_redact::redact_text(secret).into_owned();
+        let dirty = Arc::new(AtomicU8::new(0));
+        let handler: ServerRequestHandler = Arc::new(|_| None);
+        let failure = match connect_one_result(&server, &dirty, handler, None, None) {
+            Err(failure) => failure.message,
+            Ok(_) => panic!("the server exits at once"),
+        };
+        // The launch read registers the value before the child is spawned, so
+        // the line the server writes first is already covered.
+        let first_line =
+            conduit_lib::secret_redact::redact_text(&format!("server says {secret}")).into_owned();
+        std::env::remove_var("TOOLPORT_SECRET_LAUNCH_ONLY_TOKEN");
+        assert_eq!(at_start, secret, "a stored value was learned at start");
+        assert!(!failure.contains(secret), "{failure}");
+        assert_eq!(first_line, "server says [secret:LAUNCH_ONLY_TOKEN]");
     }
 
     /// Before the relay was installed for every role, only the daemon's stderr
