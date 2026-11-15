@@ -189,8 +189,12 @@ pub fn recover_masks(dir: &Path) -> std::io::Result<usize> {
             remove_if_present(&journal)?;
             continue;
         }
-        if let Some((file_name, id, ranges)) = read_journal(&canonical, &journal)? {
-            if file_name == target && apply_recovered(&canonical, &file_name, id, &ranges)? {
+        // Validate the whole journal first so a torn or foreign one changes
+        // nothing, then stream its ranges again to apply them. The journal is
+        // only removed after the masks are synced, so a crash here is finished
+        // by the next start.
+        if let Some((file_name, id)) = validate_journal(&canonical, &journal)? {
+            if file_name == target && apply_recovered(&canonical, &journal, &file_name, id)? {
                 completed += 1;
             }
         }
@@ -354,80 +358,128 @@ fn write_journal(
     id: (u64, u64),
     ranges: &[(u64, u64)],
 ) -> std::io::Result<()> {
-    let mut text = format!(
-        "{JOURNAL_HEADER}\n{}\n{} {}\n",
-        loc.name.to_string_lossy(),
-        id.0,
-        id.1
-    );
-    for (offset, len) in ranges {
-        text.push_str(&format!("{offset} {len}\n"));
-    }
-    text.push_str(JOURNAL_END);
-    text.push('\n');
     let tmp = PathBuf::from(format!("{}{JOURNAL_TMP_SUFFIX}", journal.display()));
     remove_if_present(&tmp)?;
     let mut guard = TempGuard {
         path: Some(tmp.clone()),
     };
     {
-        let mut file = sys::create_private(&tmp)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
+        let mut out = BufWriter::with_capacity(64 * 1024, sys::create_private(&tmp)?);
+        write!(
+            out,
+            "{JOURNAL_HEADER}\n{}\n{} {}\n",
+            loc.name.to_string_lossy(),
+            id.0,
+            id.1
+        )?;
+        for (offset, len) in ranges {
+            writeln!(out, "{offset} {len}")?;
+        }
+        writeln!(out, "{JOURNAL_END}")?;
+        out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
     }
     std::fs::rename(&tmp, journal)?;
     guard.path = None;
     sync_dir(&loc.dir)
 }
 
-type Journal = (String, (u64, u64), Vec<(u64, u64)>);
+/// Longest journal line accepted; real lines are a file name or two numbers.
+const JOURNAL_LINE_MAX: u64 = 64 * 1024;
 
-/// Parse a journal; a torn or foreign one yields `None`.
-fn read_journal(dir: &Path, journal: &Path) -> std::io::Result<Option<Journal>> {
-    let file = match open_inside(dir, journal)? {
-        Ok(file) => file,
-        Err(_) => return Ok(None),
-    };
-    // Journals are small; refuse anything that is not.
-    if file.metadata()?.len() > 16 * 1024 * 1024 {
-        return Ok(None);
-    }
-    let mut text = String::new();
-    if std::io::Read::read_to_string(&mut &file, &mut text).is_err() {
-        return Ok(None);
-    }
-    let mut lines = text.lines();
-    if lines.next() != Some(JOURNAL_HEADER) {
-        return Ok(None);
-    }
-    let Some(name) = lines.next() else {
-        return Ok(None);
-    };
-    let pair = |line: &str| -> Option<(u64, u64)> {
-        let (a, b) = line.split_once(' ')?;
-        Some((a.parse().ok()?, b.parse().ok()?))
-    };
-    let Some(id) = lines.next().and_then(pair) else {
-        return Ok(None);
-    };
-    let mut ranges = Vec::new();
-    for line in lines {
-        if line == JOURNAL_END {
-            return Ok(Some((name.to_string(), id, ranges)));
-        }
-        let Some(range) = pair(line) else {
-            return Ok(None);
-        };
-        ranges.push(range);
-    }
-    Ok(None)
+/// A journal's file name and the identity of the file it masks.
+type JournalHeader = (String, (u64, u64));
+
+enum JournalEntry {
+    Range(u64, u64),
+    End,
 }
 
+/// Streams a journal line by line so recovery memory does not grow with it.
+struct JournalReader {
+    reader: BufReader<File>,
+    line: Vec<u8>,
+}
+
+impl JournalReader {
+    /// Open a journal and parse its header (file name and identity). A torn or
+    /// foreign header yields `None`.
+    fn open(dir: &Path, journal: &Path) -> std::io::Result<Option<(Self, JournalHeader)>> {
+        let file = match open_inside(dir, journal)? {
+            Ok(file) => file,
+            Err(_) => return Ok(None),
+        };
+        let mut reader = JournalReader {
+            reader: BufReader::with_capacity(64 * 1024, file),
+            line: Vec::new(),
+        };
+        if reader.next_line()? != Some(JOURNAL_HEADER) {
+            return Ok(None);
+        }
+        let Some(name) = reader.next_line()?.map(str::to_string) else {
+            return Ok(None);
+        };
+        let Some(id) = reader.next_line()?.and_then(parse_pair) else {
+            return Ok(None);
+        };
+        Ok(Some((reader, (name, id))))
+    }
+
+    /// The next entry, or `None` when the journal is torn or malformed.
+    fn next_entry(&mut self) -> std::io::Result<Option<JournalEntry>> {
+        Ok(match self.next_line()? {
+            Some(JOURNAL_END) => Some(JournalEntry::End),
+            Some(line) => parse_pair(line).map(|(a, b)| JournalEntry::Range(a, b)),
+            None => None,
+        })
+    }
+
+    /// The next line without its line ending; `None` at end of file or for a
+    /// line that is overlong or not UTF-8.
+    fn next_line(&mut self) -> std::io::Result<Option<&str>> {
+        self.line.clear();
+        let n = std::io::Read::take(&mut self.reader, JOURNAL_LINE_MAX)
+            .read_until(b'\n', &mut self.line)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let mut line = self.line.as_slice();
+        if let Some(rest) = line.strip_suffix(b"\n") {
+            line = rest.strip_suffix(b"\r").unwrap_or(rest);
+        } else if n as u64 == JOURNAL_LINE_MAX {
+            return Ok(None);
+        }
+        Ok(std::str::from_utf8(line).ok())
+    }
+}
+
+fn parse_pair(line: &str) -> Option<(u64, u64)> {
+    let (a, b) = line.split_once(' ')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+/// Check a whole journal parses through its end marker without holding its
+/// ranges; a torn or foreign one yields `None`.
+fn validate_journal(dir: &Path, journal: &Path) -> std::io::Result<Option<JournalHeader>> {
+    let Some((mut reader, (name, id))) = JournalReader::open(dir, journal)? else {
+        return Ok(None);
+    };
+    loop {
+        match reader.next_entry()? {
+            Some(JournalEntry::Range(..)) => {}
+            Some(JournalEntry::End) => return Ok(Some((name, id))),
+            None => return Ok(None),
+        }
+    }
+}
+
+/// Re-apply a validated journal's ranges to `file_name` with `*` bytes,
+/// streaming them from the journal. Nothing is written unless the file still
+/// has the journaled identity.
 fn apply_recovered(
     dir: &Path,
+    journal: &Path,
     file_name: &str,
     id: (u64, u64),
-    ranges: &[(u64, u64)],
 ) -> std::io::Result<bool> {
     let loc = match locate(dir, &dir.join(file_name))? {
         Ok(loc) => loc,
@@ -442,18 +494,34 @@ fn apply_recovered(
     if ident.id != id {
         return Ok(false);
     }
-    for &(offset, len) in ranges {
-        let Some(end) = offset.checked_add(len) else {
-            continue;
-        };
-        if len == 0 || end > ident.size {
-            continue;
-        }
-        let len = usize::try_from(len).map_err(std::io::Error::other)?;
-        write_at(&file, &vec![b'*'; len], offset)?;
+    let Some((mut reader, (name, journal_id))) = JournalReader::open(dir, journal)? else {
+        return Ok(false);
+    };
+    if name != file_name || journal_id != id {
+        return Ok(false);
     }
+    let mut mask = Vec::new();
+    let complete = loop {
+        match reader.next_entry()? {
+            Some(JournalEntry::Range(offset, len)) => {
+                let Some(end) = offset.checked_add(len) else {
+                    continue;
+                };
+                if len == 0 || end > ident.size {
+                    continue;
+                }
+                let len = usize::try_from(len).map_err(std::io::Error::other)?;
+                if mask.len() < len {
+                    mask.resize(len, b'*');
+                }
+                write_at(&file, &mask[..len], offset)?;
+            }
+            Some(JournalEntry::End) => break true,
+            None => break false,
+        }
+    };
     file.sync_all()?;
-    Ok(true)
+    Ok(complete)
 }
 
 #[cfg(unix)]
