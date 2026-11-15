@@ -40,6 +40,8 @@ struct Envelope {
     generations: Vec<(String, usize)>,
     fallback: String,
     references: Vec<Reference>,
+    #[serde(default)]
+    reference_markers: Vec<usize>,
 }
 fn envelope(text: &str) -> Option<Envelope> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
@@ -197,6 +199,9 @@ fn redact(text: &str, secret: &str, marker: &str, depth: usize) -> String {
 
 pub(super) fn encode(path: &Path, text: &str) -> Result<String, String> {
     let mut values = IMPORTS.with(|v| v.borrow().clone());
+    if !missing() || !mutation::is_disconnecting() {
+        values.extend(vaulted_credentials(text)?);
+    }
     let mut generations = Vec::new();
     // Rewrites of an existing snapshot must retain its protection even outside
     // the original import transaction.
@@ -227,11 +232,28 @@ pub(super) fn encode(path: &Path, text: &str) -> Result<String, String> {
     let mut fallback = text.to_string();
     let mut references = Vec::new();
     let mut retained_values = Vec::new();
+    let mut reference_markers = Vec::new();
     for (reference, value) in values {
         if value.is_empty() {
             continue;
         }
-        let marker = format!("TOOLPORT_MISSING_CREDENTIAL_{}", references.len());
+        if references.iter().zip(&retained_values).any(
+            |(saved, saved_value): (&Reference, &String)| {
+                saved.server == reference.server
+                    && saved.key == reference.key
+                    && saved_value == &value
+            },
+        ) {
+            continue;
+        }
+        if let Some(index) = retained_values.iter().position(|saved| saved == &value) {
+            reference_markers.push(reference_markers[index]);
+            references.push(reference);
+            retained_values.push(value);
+            continue;
+        }
+        let marker_index = references.len();
+        let marker = format!("TOOLPORT_MISSING_CREDENTIAL_{marker_index}");
         let before = fallback.clone();
         fallback = redact(&fallback, &value, &marker, 0);
         if value.len() >= 8
@@ -243,6 +265,7 @@ pub(super) fn encode(path: &Path, text: &str) -> Result<String, String> {
         if before != fallback {
             references.push(reference);
             retained_values.push(value);
+            reference_markers.push(marker_index);
         }
     }
     if references.is_empty() {
@@ -276,6 +299,7 @@ pub(super) fn encode(path: &Path, text: &str) -> Result<String, String> {
         generations,
         fallback,
         references,
+        reference_markers,
     })
     .map_err(|e| e.to_string())
 }
@@ -289,6 +313,7 @@ pub(super) fn decode(text: &str) -> Result<String, String> {
         _ => {
             MISSING.with(|v| *v.borrow_mut() = true);
             for (index, reference) in saved.references.iter().enumerate() {
+                let index = saved.reference_markers.get(index).copied().unwrap_or(index);
                 let warning = format!("Client config recovery: could not re-insert {}:{}; left TOOLPORT_MISSING_CREDENTIAL_{index}. Unlock the original vault and retry. Recovery backup retained.", reference.server, reference.key);
                 WARNINGS.with(|v| {
                     let mut v = v.borrow_mut();
@@ -544,6 +569,61 @@ fn legacy_credentials(text: &str, client: &str) -> Vec<(Reference, String)> {
     values
 }
 
+// Import transactions register new values before the registry is saved. Later
+// connects must also protect credentials already moved into this install's vault.
+fn vaulted_credentials(text: &str) -> Result<Vec<(Reference, String)>, String> {
+    let registry = crate::registry::resolved_path()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|raw| serde_json::from_slice::<crate::registry::Registry>(&raw).ok());
+    let mut values = Vec::new();
+    let credentials_visible = !legacy_credentials(text, "client").is_empty();
+    for server in registry.into_iter().flat_map(|registry| registry.servers) {
+        let keys = server
+            .env
+            .iter()
+            .filter(|env| env.secret)
+            .map(|env| &env.key)
+            .chain(
+                server
+                    .launch
+                    .iter()
+                    .flat_map(|launch| &launch.inputs)
+                    .filter(|input| input.secret)
+                    .map(|input| &input.key),
+            );
+        for key in keys {
+            if !text.contains(key) && !credentials_visible {
+                continue;
+            }
+            if let Some(value) = crate::secrets::get_vault_secret_result(&server.id, key)? {
+                values.push((
+                    Reference {
+                        server: server.id.clone(),
+                        key: key.clone(),
+                    },
+                    value,
+                ));
+            }
+        }
+    }
+    Ok(values)
+}
+
+fn discovered_credentials(text: &str, client: &str) -> Vec<(Reference, String)> {
+    let nonsecret_values: std::collections::HashSet<String> = crate::registry::resolved_path()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|raw| serde_json::from_slice::<crate::registry::Registry>(&raw).ok())
+        .into_iter()
+        .flat_map(|registry| registry.servers)
+        .flat_map(|server| server.env)
+        .filter(|env| !env.secret)
+        .filter_map(|env| env.value)
+        .collect();
+    let mut values = legacy_credentials(text, client);
+    values.retain(|(_, value)| !nonsecret_values.contains(value));
+    values
+}
+
 /// Upgrade old plaintext recovery files before either desktop shell repoints
 /// clients. Publish only after verified vault storage; an unavailable vault
 /// leaves the original recovery copy untouched and surfaces a startup failure.
@@ -559,15 +639,6 @@ pub(crate) fn upgrade_legacy() -> Result<usize, String> {
             IMPORTS.with(|slot| *slot.borrow_mut() = std::mem::take(&mut self.0));
         }
     }
-    let nonsecret_values: std::collections::HashSet<String> = crate::registry::resolved_path()
-        .and_then(|path| std::fs::read(path).ok())
-        .and_then(|raw| serde_json::from_slice::<crate::registry::Registry>(&raw).ok())
-        .into_iter()
-        .flat_map(|registry| registry.servers)
-        .flat_map(|server| server.env)
-        .filter(|env| !env.secret)
-        .filter_map(|env| env.value)
-        .collect();
     let mut upgraded = 0;
     for path in owned_backup_paths()? {
         let raw = std::fs::read_to_string(&path)
@@ -580,8 +651,7 @@ pub(crate) fn upgrade_legacy() -> Result<usize, String> {
             .and_then(Path::file_name)
             .and_then(|s| s.to_str())
             .unwrap_or("client");
-        let mut values = legacy_credentials(&raw, client);
-        values.retain(|(_, value)| !nonsecret_values.contains(value));
+        let values = discovered_credentials(&raw, client);
         if values.is_empty() {
             continue;
         }
@@ -616,6 +686,90 @@ pub(crate) fn protect_existing() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fresh_backups_protect_credentials_after_import_context_is_cleared() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            clear();
+            let root = crate::registry::conduit_dir().unwrap();
+            let path = root.join("backups/cursor/1-mcp.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let original =
+                r#"{"mcpServers":{"native":{"env":{"API_KEY":"sk-reconnect-fixture"}}}}"#;
+            let registry = serde_json::from_value(serde_json::json!({"version":3,"profiles":[],"servers":[{"id":"native","name":"Native","transport":"stdio","env":[{"key":"API_KEY","secret":true}]}]})).unwrap();
+            crate::registry::save(&registry).unwrap();
+            crate::secrets::set_secret("native", "API_KEY", "sk-reconnect-fixture").unwrap();
+            let raw = encode(&path, original).unwrap();
+            assert!(!raw.contains("sk-reconnect-fixture"));
+            assert_eq!(decode(&raw).unwrap(), original);
+        });
+    }
+    #[test]
+    fn shared_credentials_report_every_missing_reference_with_the_same_marker() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            clear();
+            reset_missing();
+            let path = crate::registry::conduit_dir()
+                .unwrap()
+                .join("backups/cursor/1-mcp.json");
+            let original = r#"{"mcpServers":{"a":{"env":{"API_KEY":"sk-shared-fixture"}},"b":{"env":{"API_KEY":"sk-shared-fixture"}}}}"#;
+            register("a", "API_KEY", "sk-shared-fixture");
+            register("b", "API_KEY", "sk-shared-fixture");
+            let raw = encode(&path, original).unwrap();
+            clear();
+            std::env::set_var("TOOLPORT_SECRET_KEY", "locked-backup-vault");
+            assert_eq!(
+                decode(&raw).unwrap(),
+                original.replace("sk-shared-fixture", "TOOLPORT_MISSING_CREDENTIAL_0")
+            );
+            let warnings = warnings().join("\n");
+            assert!(warnings.contains("a:API_KEY"));
+            assert!(warnings.contains("b:API_KEY"));
+            assert!(!warnings.contains("CREDENTIAL_1"));
+            reset_missing();
+        });
+    }
+    #[test]
+    fn pruning_releases_vaulted_payloads_and_keeps_envelopes_when_locked() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            clear();
+            let dir = crate::registry::conduit_dir()
+                .unwrap()
+                .join("backups/cursor");
+            std::fs::create_dir_all(&dir).unwrap();
+            let original = r#"{"env":{"API_KEY":"sk-pruning-fixture"}}"#;
+            register("native", "API_KEY", "sk-pruning-fixture");
+            let mut first = None;
+            for index in 0..=CONFIG_BACKUP_GENERATIONS {
+                let path = dir.join(format!("{index}-mcp.json"));
+                let raw = encode(&path, original).unwrap();
+                if index == 0 {
+                    first = envelope(&raw);
+                }
+                std::fs::write(path, raw).unwrap();
+            }
+            clear();
+            std::env::set_var("TOOLPORT_SECRET_KEY", "locked-backup-vault");
+            prune_backups(&dir, "mcp.json");
+            assert!(dir.join("0-mcp.json").exists());
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            prune_backups(&dir, "mcp.json");
+            assert!(!dir.join("0-mcp.json").exists());
+            let saved = first.unwrap();
+            assert!(
+                crate::secrets::get_vault_secret_result(&saved.account, &saved.key)
+                    .unwrap()
+                    .is_none()
+            );
+            for index in 0..saved.references.len() {
+                assert!(crate::secrets::get_vault_secret_result(
+                    &saved.account,
+                    &format!("{}-credential-{index}", saved.key)
+                )
+                .unwrap()
+                .is_none());
+            }
+        });
+    }
     #[test]
     fn copied_backups_do_not_delete_the_source_vault_payload() {
         crate::secrets::tests::with_isolated_vault(|| {

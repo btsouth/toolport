@@ -11,7 +11,7 @@
 # just made will not reach anyone using the short URL.
 #
 # Installs the latest signed release for your OS/arch:
-#   - Linux (x86_64): the GTK .deb on supported Debian/Ubuntu, else the Tauri AppImage
+#   - Linux (x86_64): native GTK packages on compatible Debian/Ubuntu, RPM and Arch systems, else the Tauri AppImage
 #     into ~/.local/bin with a desktop entry.
 #   - macOS: copies Toolport.app from the signed .dmg into /Applications (Homebrew is
 #     the cleaner path, and this script points you there).
@@ -35,7 +35,7 @@ EXPECTED_TEAM_ID="V4YZPC7T6G"
 
 say() { printf '\033[1;36m>\033[0m %s\n' "$*"; }
 err() {
-  printf '\033[1;31mx\033[0m %s\n' "$*" >&2
+  printf '\033[1;31mx\033[0m %s\n' "$@" >&2
   exit 1
 }
 need() { command -v "$1" >/dev/null 2>&1 || err "This installer needs '$1' on your PATH."; }

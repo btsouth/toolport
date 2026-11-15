@@ -228,6 +228,14 @@ run_check "reports truncation" "Treating it as truncated" 1 "$(fake_release "sha
 echo "non-https URL (refused before download)"
 run_check "refuses a non-https URL" "non-https URL" 1 "$(fake_release "sha256:$fake_sha256" 64 "http://example.invalid/Toolport_1.13.0_amd64.AppImage")"
 
+echo "multi-line verification errors preserve each instruction"
+error_output="$(bash -c 'source <(sed -n "/^err() {/,/^}/p" "$1"); err first second third' _ "$INSTALL_SH" 2>&1 || true)"
+if [ "$(printf '%s\n' "$error_output" | wc -l)" -eq 3 ]; then
+  echo "  ok: each error instruction has a separate line"; pass=$((pass + 1))
+else
+  echo "  FAIL: error instructions were joined"; fail=$((fail + 1))
+fi
+
 echo "empty download (rejected, destination removed)"
 run_check "rejects the empty download" "empty file" 1 "$(fake_release "sha256:$fake_sha256" 64)" TOOLPORT_TEST_EMPTY_DOWNLOAD=1
 

@@ -5839,7 +5839,9 @@ fn prune_backups(dir: &Path, name: &str) {
     mine.sort_by_key(|(stamp, _)| *stamp);
     let excess = mine.len() - CONFIG_BACKUP_GENERATIONS;
     for (_, stale) in mine.into_iter().take(excess) {
-        let _ = std::fs::remove_file(stale);
+        if backup_storage::release(&stale).is_ok() {
+            let _ = std::fs::remove_file(stale);
+        }
     }
 }
 

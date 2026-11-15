@@ -144,6 +144,14 @@ pub(super) fn write(path: &Path, contents: &str) -> Result<(), String> {
     }
 }
 
+pub(super) fn is_disconnecting() -> bool {
+    PENDING.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|pending| pending.disconnecting)
+    })
+}
+
 pub(super) fn disconnecting() {
     PENDING.with(|slot| {
         if let Some(pending) = slot.borrow_mut().as_mut() {
