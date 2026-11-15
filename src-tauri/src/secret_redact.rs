@@ -1970,8 +1970,10 @@ struct JsonTokens<'a> {
     numbers: Vec<(usize, usize)>,
 }
 
-/// [`JsonTokens`] of `body`, or `None` when its brackets or strings do not
-/// close (a torn line), which is then redacted as text.
+/// [`JsonTokens`] of `body`, or `None` when it is not one JSON text (a torn
+/// line, or a text line that starts with a bracket), which is then redacted
+/// as text: nothing outside its strings is searched, so anything else between
+/// them would never be.
 fn json_tokens(body: &str) -> Option<JsonTokens<'_>> {
     let b = body.as_bytes();
     let mut out = JsonTokens {
@@ -2039,10 +2041,18 @@ fn json_tokens(body: &str) -> Option<JsonTokens<'_>> {
                 }
                 out.numbers.push((start, i));
             }
-            _ => i += 1,
+            b' ' | b'\t' | b'\n' | b'\r' | b':' => i += 1,
+            _ => {
+                let literal = ["true", "false", "null"]
+                    .iter()
+                    .find(|word| b[i..].starts_with(word.as_bytes()))?;
+                i += literal.len();
+            }
         }
     }
-    stack.is_empty().then_some(out)
+    // The bytes above are only tokens; the whole must also be valid JSON.
+    let valid = serde_json::from_str::<serde::de::IgnoredAny>(body).is_ok();
+    (stack.is_empty() && valid).then_some(out)
 }
 
 /// `ranges` of `body` joined, with each one's start in the joined text.
