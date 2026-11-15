@@ -56,6 +56,11 @@ const MALFORMED_RECEIPT: &str =
 const NO_CONFIG_PATH: &str = crate::i18n::msg(
     "This recovery file has no valid config path. Its saved values have been kept.",
 );
+const NEWER_RECEIPT: &str = crate::i18n::msg(
+    "A newer Toolport wrote this recovery file. Open it with that version; this version will not change or discard it.",
+);
+const MALFORMED_MOVED: &str =
+    crate::i18n::msg("Toolport's record of the servers it moved from this client is damaged.");
 pub(super) const DISCARD_FILE_ACTION: &str = crate::i18n::msg("Discard recovery file");
 /// A receipt whose content cannot be parsed blocks every later write to its
 /// config, so it must stay removable. Links, permission errors, newer formats
@@ -67,9 +72,16 @@ fn unreadable_receipt(
     format: Format,
     reason: &str,
 ) -> Receipt {
+    let moved_record = file
+        .file_name()
+        .is_some_and(|name| name == moved::RECORD_NAME);
     let mut receipt = error_receipt(client_id, name, file, format, reason);
-    if [MALFORMED_RECEIPT, NO_CONFIG_PATH].contains(&reason) {
-        let next = crate::i18n::tr("Toolport cannot read this recovery file, so it cannot put its saved values back. Choose Discard recovery file to delete it; the client config will not change.");
+    if [MALFORMED_RECEIPT, NO_CONFIG_PATH, MALFORMED_MOVED].contains(&reason) {
+        let next = if moved_record {
+            crate::i18n::tr("Toolport cannot read its record of the servers it moved from this client, so Disconnect cannot put them back in the client config. Choose Discard recovery file to delete the record; the servers stay in Toolport.")
+        } else {
+            crate::i18n::tr("Toolport cannot read this recovery file, so it cannot put its saved values back. Choose Discard recovery file to delete it; the client config will not change.")
+        };
         let notice = &mut receipt.notice;
         notice.details = notice.details.replace(&notice.instructions, &next);
         notice.instructions = next;
@@ -257,6 +269,14 @@ fn read_receipt(id: &str, name: &str, file: &Path) -> Result<Option<Receipt>, &'
         }
     })?;
     let (record, _) = backup_storage::raw_metadata(&raw).map_err(|_| MALFORMED_RECEIPT)?;
+    // A wrapper this version could not open (a newer version, or fields it does
+    // not know) is someone's data, never "unreadable": it is not discardable.
+    if ["toolportBackupVersion", "toolportPlainBackupVersion"]
+        .iter()
+        .any(|key| record.get(*key).is_some())
+    {
+        return Err(NEWER_RECEIPT);
+    }
     let path = record["configPath"].as_str().ok_or(NO_CONFIG_PATH)?;
     if record["version"] != 1 {
         return Err(crate::i18n::msg("This recovery file uses an unsupported version. Open it with a compatible Toolport version."));
@@ -574,6 +594,26 @@ fn receipts() -> Result<Vec<Receipt>, String> {
                     continue;
                 }
             };
+            if entry.file_name() == moved::RECORD_NAME {
+                // Disconnect, Retry and Connect all read this record, so a
+                // damaged one needs its own row and a way to remove it.
+                let reason = match moved::check_record(&entry.path()) {
+                    Ok(()) => continue,
+                    Err(moved::RecordProblem::Damaged) => MALFORMED_MOVED,
+                    Err(moved::RecordProblem::Newer) => NEWER_RECEIPT,
+                    Err(moved::RecordProblem::Unreadable) => crate::i18n::msg(
+                        "Toolport could not read this recovery file. Check its permissions.",
+                    ),
+                };
+                records.push(unreadable_receipt(
+                    &id,
+                    base.name,
+                    entry.path(),
+                    base.format,
+                    reason,
+                ));
+                continue;
+            }
             if !entry.file_name().to_string_lossy().starts_with("original-") {
                 continue;
             }
@@ -846,6 +886,39 @@ mod tests {
                 .contains("sk-recovery-state-fixture"));
         });
     }
+    /// F3 and F4: a receipt this version cannot open because a newer Toolport
+    /// wrote it is never offered for discard, and a receipt that is valid JSON
+    /// but not an object lists as unreadable instead of panicking.
+    #[test]
+    fn newer_wrappers_stay_and_non_object_receipts_list_as_unreadable() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let dir = backup_dir("cursor").unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            let newer = [
+                r#"{"toolportBackupVersion":2,"account":"x"}"#,
+                r#"{"toolportBackupVersion":1,"account":"x"}"#,
+                r#"{"toolportPlainBackupVersion":2,"text":"{}"}"#,
+            ];
+            let damaged = ["[]", "1", "\"x\""];
+            for (index, text) in newer.iter().chain(damaged.iter()).enumerate() {
+                std::fs::write(dir.join(format!("original-{index}.json")), text).unwrap();
+            }
+            let rows = list().unwrap();
+            for (index, text) in newer.iter().chain(damaged.iter()).enumerate() {
+                let row = rows
+                    .iter()
+                    .find(|r| r.backup_path.ends_with(&format!("original-{index}.json")))
+                    .unwrap_or_else(|| panic!("{text} is listed"));
+                assert!(row.error.is_some() && !row.can_discard, "{text}");
+                assert_eq!(row.can_discard_file, index >= newer.len(), "{text}");
+                if index < newer.len() {
+                    assert!(row.description.contains("newer Toolport"), "{text}");
+                    assert!(prepare_discard(&row.id).is_err(), "{text}");
+                }
+            }
+        });
+    }
+
     #[test]
     fn bad_recovery_records_and_saved_locations_do_not_hide_good_records() {
         crate::secrets::tests::with_isolated_vault(|| {

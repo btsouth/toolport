@@ -5385,13 +5385,20 @@ pub struct WriteOutcome {
     pub revision: Option<String>,
     #[serde(skip)]
     pub recovery_path: Option<PathBuf>,
+    /// The client config existed before this operation. Without a backup,
+    /// rollback may only remove a file this operation created.
+    #[serde(skip)]
+    pub existed_before: bool,
 }
 
 fn revision_outcome(
     client_id: &str,
-    result: Result<WriteOutcome, String>,
+    path: &Path,
+    write: impl FnOnce() -> Result<WriteOutcome, String>,
 ) -> Result<WriteOutcome, String> {
-    let mut outcome = result?;
+    let existed_before = mutation::exists(path);
+    let mut outcome = write()?;
+    outcome.existed_before = existed_before;
     let path = Path::new(&outcome.path);
     outcome.recovery_path = Some(restore::record_path(client_id, path)?);
     outcome.revision = if mutation::exists(path) {
@@ -8273,7 +8280,7 @@ pub fn write_servers(client_id: &str, servers: &[ServerEntry]) -> Result<WriteOu
         locations::remember(location)?;
     }
     mutation::run(client_id, &path, def.format, || {
-        revision_outcome(client_id, write_servers_inner(client_id, servers))
+        revision_outcome(client_id, &path, || write_servers_inner(client_id, servers))
     })
 }
 
@@ -8291,6 +8298,7 @@ fn write_servers_inner(client_id: &str, servers: &[ServerEntry]) -> Result<Write
         .map(ManagedEntry::from_gateway_entry);
 
     Ok(WriteOutcome {
+        existed_before: true,
         path: path.display().to_string(),
         backup: backup.map(|b| b.display().to_string()),
         managed,
@@ -9137,7 +9145,9 @@ fn install_or_remove(client_id: &str, entry: Option<&ServerEntry>) -> Result<Wri
         locations::remember(location)?;
     }
     mutation::run(client_id, &path, def.format, || {
-        revision_outcome(client_id, install_or_remove_inner(client_id, entry))
+        revision_outcome(client_id, &path, || {
+            install_or_remove_inner(client_id, entry)
+        })
     })
 }
 
@@ -9159,6 +9169,7 @@ fn install_or_remove_inner(
     }
     edit_format(def.format, &path, entry, lenient)?;
     Ok(WriteOutcome {
+        existed_before: true,
         path: path.display().to_string(),
         backup: backup.map(|b| b.display().to_string()),
         managed,
@@ -9320,7 +9331,8 @@ pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
         locations::remember(location)?;
     }
     let mut outcome = mutation::run(client_id, &path, def.format, || {
-        let mut outcome = revision_outcome(client_id, uninstall_gateway_inner(client_id))?;
+        let mut outcome =
+            revision_outcome(client_id, &path, || uninstall_gateway_inner(client_id))?;
         outcome
             .warnings
             .extend(disconnect_warnings(def.format, &path)?);
@@ -9336,11 +9348,9 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
     restore::prepare_disconnect(client_id, &path)?;
-    let backup = if restore::pending_values(client_id, &path)? {
-        None
-    } else {
-        backup_file(client_id, &path)?
-    };
+    // A retry with values still owed takes a backup too: rollback without
+    // one could only delete a config that existed before this operation.
+    let backup = backup_file(client_id, &path)?;
     let mut restored_names = moved::missing_names(client_id, def.format, &path)?;
     if restore::apply(client_id, def.format, &path)? {
         if restore::needs_moved(client_id, &path)? {
@@ -9353,6 +9363,7 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
                 .any(|server| server.name.eq_ignore_ascii_case(name))
         });
         return Ok(WriteOutcome {
+            existed_before: true,
             path: path.display().to_string(),
             backup: backup.map(|p| p.display().to_string()),
             managed: None,
@@ -9372,6 +9383,7 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
     let restored = moved::restore(client_id, def.format, &path)?;
     if restored.is_none() && (!mutation::exists(&path) || !read_client(&def).gateway_installed) {
         return Ok(WriteOutcome {
+            existed_before: true,
             path: path.display().to_string(),
             backup: backup.map(|p| p.display().to_string()),
             managed: None,
@@ -9482,19 +9494,19 @@ pub(crate) fn migrate_reviewed(
             );
         }
         prepare()?;
-        let backup = backup_file(client_id, &path)?;
-        moved::record_selected(client_id, def.format, &path, names)?;
-        moved::remove_selected(def.format, &path, names)?;
-        let entry = gateway_entry(profile, client_id)?;
-        edit_format(
-            def.format,
-            &path,
-            Some(&entry),
-            config_is_whole_app_state(client_id),
-        )?;
-        revision_outcome(
-            client_id,
+        revision_outcome(client_id, &path, || {
+            let backup = backup_file(client_id, &path)?;
+            moved::record_selected(client_id, def.format, &path, names)?;
+            moved::remove_selected(def.format, &path, names)?;
+            let entry = gateway_entry(profile, client_id)?;
+            edit_format(
+                def.format,
+                &path,
+                Some(&entry),
+                config_is_whole_app_state(client_id),
+            )?;
             Ok(WriteOutcome {
+                existed_before: true,
                 path: path.display().to_string(),
                 backup: backup.map(|p| p.display().to_string()),
                 managed: Some(ManagedEntry::from_gateway_entry(&entry)),
@@ -9503,8 +9515,8 @@ pub(crate) fn migrate_reviewed(
                 revision: None,
                 warnings: Vec::new(),
                 recovery_path: None,
-            }),
-        )
+            })
+        })
     })
 }
 
@@ -10148,6 +10160,7 @@ fn repoint_stale_gateways_in(
                         }
 
                         Ok(WriteOutcome {
+                            existed_before: true,
                             path: path.display().to_string(),
                             backup: None,
                             managed: Some(managed),

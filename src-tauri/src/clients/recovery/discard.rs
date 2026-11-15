@@ -313,6 +313,19 @@ fn prepare_file_discard(receipt: &Receipt) -> Result<DiscardConfirmation, String
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
+    if file == moved::RECORD_NAME {
+        return Ok(DiscardConfirmation {
+            manifest,
+            heading: crate::i18n::trf("Discard the unreadable record of servers moved from {client}?", &[("client", name)]),
+            description: crate::i18n::trf("Toolport cannot read its record of the servers it moved from {client} into Toolport. Without it, Disconnect cannot put those servers back in the client config. Discard deletes only this record. The servers stay in Toolport; to use one in {client} without Toolport, add it there again.\n\nThe client config will not change.", &[("client", name)]),
+            lines: vec![crate::i18n::trf("Backup file: {file}", &[("file", &file)])],
+            location: crate::i18n::format_message(
+                DISCARD_LOCATION,
+                &[("path", &folder(receipt).to_string_lossy())],
+            ),
+            action_label: crate::i18n::format_message(DISCARD_FILE_ACTION, &[]),
+        });
+    }
     Ok(DiscardConfirmation {
         manifest,
         heading: crate::i18n::trf("Discard the unreadable recovery file for {client}?", &[("client", name)]),

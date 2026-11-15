@@ -196,6 +196,47 @@ pub(super) fn has_record(client_id: &str) -> bool {
     record_path(client_id).is_ok_and(|path| path.exists())
 }
 
+/// Why a move record on disk cannot be used, for the recovery list.
+pub(super) enum RecordProblem {
+    /// Damaged bytes: the record can be discarded.
+    Damaged,
+    /// A wrapper this version cannot open, written by a newer Toolport.
+    Newer,
+    /// Permissions or another I/O failure: repair, never discard.
+    Unreadable,
+}
+pub(super) const RECORD_NAME: &str = RECORD_FILE;
+/// Checks a move record exactly as [`load`] reads it.
+pub(super) fn check_record(file: &Path) -> Result<(), RecordProblem> {
+    let raw = match std::fs::read_to_string(file) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            return Err(RecordProblem::Damaged)
+        }
+        Err(_) => return Err(RecordProblem::Unreadable),
+    };
+    let decoded = backup_storage::decode(&raw);
+    if decoded
+        .as_deref()
+        .ok()
+        .and_then(|text| serde_json::from_str::<Record>(text).ok())
+        .is_some()
+    {
+        return Ok(());
+    }
+    let wrapped = serde_json::from_str::<serde_json::Value>(&raw).is_ok_and(|value| {
+        ["toolportBackupVersion", "toolportPlainBackupVersion"]
+            .iter()
+            .any(|key| value.get(*key).is_some())
+    });
+    Err(if wrapped {
+        RecordProblem::Newer
+    } else {
+        RecordProblem::Damaged
+    })
+}
+
 fn load(client_id: &str) -> Result<Option<Record>, String> {
     let path = record_path(client_id)?;
     let text = match mutation::read(&path) {

@@ -540,5 +540,10 @@
   "Toolport cannot read this recovery file, so it cannot put its saved values back. Choose Discard recovery file to delete it; the client config will not change.": "Toolport 无法读取此恢复文件，因此无法放回其中保存的值。选择“丢弃恢复文件”将其删除；客户端配置不会改变。",
   "Discard the unreadable recovery file for {client}?": "要丢弃 {client} 无法读取的恢复文件吗？",
   "Toolport cannot read this recovery file, so it cannot put its saved values back. Discard deletes only this file. Saved values it referred to stay in Toolport's credential store until you remove Toolport's data.\n\nThe client config will not change. Any temporary text for missing values will stay there; re-enter those values in the client if needed.": "Toolport 无法读取此恢复文件，因此无法放回其中保存的值。丢弃只会删除此文件。它引用的已保存值会保留在 Toolport 的凭据存储中，直到你移除 Toolport 的数据。\n\n客户端配置不会改变。缺失值的临时文本会保留在那里；如有需要，请在客户端中重新输入这些值。",
-  "{client}'s unreadable recovery file was deleted. The client config was not changed.": "{client} 无法读取的恢复文件已删除。客户端配置未被更改。"
+  "{client}'s unreadable recovery file was deleted. The client config was not changed.": "{client} 无法读取的恢复文件已删除。客户端配置未被更改。",
+  "A newer Toolport wrote this recovery file. Open it with that version; this version will not change or discard it.": "此恢复文件由更新版本的 Toolport 写入。请用那个版本打开；此版本不会更改或丢弃它。",
+  "Toolport's record of the servers it moved from this client is damaged.": "Toolport 关于从此客户端移出的服务器的记录已损坏。",
+  "Toolport cannot read its record of the servers it moved from this client, so Disconnect cannot put them back in the client config. Choose Discard recovery file to delete the record; the servers stay in Toolport.": "Toolport 无法读取它从此客户端移出的服务器记录，因此断开连接时无法把这些服务器放回客户端配置。选择“丢弃恢复文件”删除该记录；这些服务器仍保留在 Toolport 中。",
+  "Discard the unreadable record of servers moved from {client}?": "要丢弃从 {client} 移出的服务器的不可读记录吗？",
+  "Toolport cannot read its record of the servers it moved from {client} into Toolport. Without it, Disconnect cannot put those servers back in the client config. Discard deletes only this record. The servers stay in Toolport; to use one in {client} without Toolport, add it there again.\n\nThe client config will not change.": "Toolport 无法读取它从 {client} 移入 Toolport 的服务器记录。没有这份记录，断开连接时就无法把这些服务器放回客户端配置。丢弃只会删除这份记录。这些服务器仍保留在 Toolport 中；如需在不使用 Toolport 的情况下在 {client} 中使用，请在那里重新添加。\n\n客户端配置不会改变。"
 }

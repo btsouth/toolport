@@ -198,6 +198,7 @@ pub(super) fn restore_path(
     let recovery_warnings = finish_uninstall_with_warnings(
         id,
         &WriteOutcome {
+            existed_before: true,
             path: path.to_string_lossy().into_owned(),
             backup: None,
             managed: None,

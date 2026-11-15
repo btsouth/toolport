@@ -475,6 +475,10 @@ pub(super) fn raw_metadata(text: &str) -> Result<(serde_json::Value, Vec<Referen
         }
         let mut value: serde_json::Value =
             serde_json::from_str(&text).map_err(|e| diagnostics::json(&e))?;
+        // Status fields are written by key, which only an object accepts.
+        if !value.is_object() {
+            return Err("Client recovery metadata is not a JSON object".into());
+        }
         dismissed = dismissed.or(value["recoveryDismissed"].as_bool());
         if let Some(recovery) = value["vaultRecovery"].as_str() {
             if let Some(saved) = envelope(recovery) {
@@ -807,8 +811,12 @@ fn release_owned(path: &Path, discard_all: bool) -> Result<(), String> {
     if !metadata.is_file() || crate::purge::is_link(&metadata) {
         return Err("Recovery file is not a regular file; saved copies retained".into());
     }
-    let text = std::fs::read_to_string(path)
-        .map_err(|_| "Could not read the recovery file; saved copies retained")?;
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        // Bytes that are not text name no vault entry Toolport could release.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return Ok(()),
+        Err(_) => return Err("Could not read the recovery file; saved copies retained".into()),
+    };
     fn release_text(
         path: &Path,
         text: &str,
@@ -1106,8 +1114,17 @@ pub(crate) fn upgrade_legacy() -> Result<usize, String> {
     }
     let mut upgraded = 0;
     for path in owned_backup_paths()? {
-        let raw = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Could not inspect recovery file {}: {e}", path.display()))?;
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            // Not text, so not a config Toolport could seal: left untouched.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(e) => {
+                return Err(format!(
+                    "Could not inspect recovery file {}: {e}",
+                    path.display()
+                ))
+            }
+        };
         if envelope(&raw).is_some() {
             continue;
         }
@@ -1145,7 +1162,12 @@ pub(crate) fn upgrade_legacy() -> Result<usize, String> {
 
 pub(crate) fn protect_existing() -> Result<(), String> {
     for path in owned_backup_paths()? {
-        let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            // Not text, so not a config Toolport could seal: left untouched.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(e) => return Err(e.to_string()),
+        };
         // Refuse a future or malformed wrapper before any rewrite.
         let plain = plain_backup(&raw)?;
         let payload = match envelope(&raw) {
@@ -1819,6 +1841,27 @@ mod tests {
         });
     }
 
+    /// F2: a timestamped backup cut inside a multibyte character is not text.
+    /// The startup upgrade and the import guard skip it untouched instead of
+    /// aborting every Connect, and Discard treats it as an unbound copy.
+    #[test]
+    fn backups_that_are_not_text_are_skipped_not_fatal() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let dir = crate::registry::conduit_dir()
+                .unwrap()
+                .join("backups/cursor");
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("1-mcp.json");
+            let bytes = b"{\"mcpServers\":{\"a\":\"\xc3";
+            std::fs::write(&file, bytes).unwrap();
+            protect_existing().unwrap();
+            upgrade_legacy().unwrap();
+            assert_eq!(std::fs::read(&file).unwrap(), bytes);
+            assert_eq!(source_path(&file).unwrap(), None);
+            release_for_discard(&file).unwrap();
+        });
+    }
+
     #[test]
     fn legacy_upgrade_honors_explicit_nonsecret_settings() {
         crate::secrets::tests::with_isolated_vault(|| {
@@ -2251,7 +2294,12 @@ pub(super) fn test_recovery_key(path: &Path) -> (String, String, usize) {
 }
 
 pub(super) fn source_path(path: &Path) -> Result<Option<String>, String> {
-    let raw = std::fs::read_to_string(path).map_err(|_| "Could not inspect saved recovery copy")?;
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        // Damaged bytes carry no provenance: treated as an unbound copy.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return Ok(None),
+        Err(_) => return Err("Could not inspect saved recovery copy".into()),
+    };
     source_path_in(path, &raw)
 }
 fn source_path_in(path: &Path, raw: &str) -> Result<Option<String>, String> {
