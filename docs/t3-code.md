@@ -36,7 +36,7 @@ elsewhere is never read.
   relative path labels no row: Toolport can't tell which config it reads.
 - When you add, remove or switch on an instance in T3 Code, the open Clients page
   updates within a few seconds while Toolport's window is in front, or as soon as
-  you switch back to it. Without T3 Code, Toolport checks for it only when the page
+  you switch back to it or return from a client's details. Without T3 Code, Toolport checks for it only when the page
   opens and when you switch back to Toolport.
 - A connected T3 Code home whose folder is deleted moves to **Not installed**, and
   Toolport never recreates the folder. Once its folder is gone or T3 Code no longer
