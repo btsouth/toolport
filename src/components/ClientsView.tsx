@@ -23,14 +23,13 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { t3CodeBadge } from "@/lib/t3Code";
 import { useWindowVisible } from "@/lib/windowVisible";
 import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/ui/empty-state";
 import { SectionHeader } from "@/components/ui/section-header";
 import { SkeletonRows } from "@/components/ui/skeleton";
 import { clientDiscovery } from "@/lib/clientDiscovery";
-import { t3CodeActivitySegment } from "@/lib/hostAttribution";
+import { t3CodeActivitySegment, t3CodeBadge } from "@/lib/hostAttribution";
 import {
   importableServers,
   isGatewayDetected,
