@@ -298,7 +298,7 @@ pub fn sync_stderr_relay(budget: std::time::Duration) {
     // handed it on; then the sync request queues behind all of it.
     while std::time::Instant::now() < deadline {
         if pipe_unread(read) == 0 && !busy.load(Ordering::SeqCst) {
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            std::thread::sleep(SYNC_QUIET);
             if pipe_unread(read) == 0 && !busy.load(Ordering::SeqCst) {
                 break;
             }
@@ -310,6 +310,13 @@ pub fn sync_stderr_relay(budget: std::time::Duration) {
         let _ = ack_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
     }
 }
+
+/// How long the pipe must look drained (and the reader idle) before a sync
+/// request is queued behind what it read.
+#[cfg(not(windows))]
+const SYNC_QUIET: std::time::Duration = std::time::Duration::from_millis(2);
+#[cfg(windows)]
+const SYNC_QUIET: std::time::Duration = std::time::Duration::from_millis(20);
 
 #[cfg(unix)]
 fn pipe_unread(read: usize) -> usize {
@@ -323,26 +330,12 @@ fn pipe_unread(read: usize) -> usize {
     }
 }
 
+/// Unknown on Windows: `PeekNamedPipe` waits behind the reader's synchronous
+/// `ReadFile` on the same pipe, so it cannot be asked. The reader takes bytes
+/// as soon as they are written; [`SYNC_QUIET`] gives it the time to.
 #[cfg(windows)]
-fn pipe_unread(read: usize) -> usize {
-    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
-    let mut avail: u32 = 0;
-    // SAFETY: peeks the relay's own pipe handle, which the reader keeps open.
-    let ok = unsafe {
-        PeekNamedPipe(
-            read as _,
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null_mut(),
-            &mut avail,
-            std::ptr::null_mut(),
-        )
-    } != 0;
-    if ok {
-        avail as usize
-    } else {
-        0
-    }
+fn pipe_unread(_read: usize) -> usize {
+    0
 }
 
 #[cfg(not(any(unix, windows)))]
