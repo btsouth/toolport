@@ -41,10 +41,10 @@ printf '%s\n' "$accounts" | while IFS=: read -r user _password uid _gid _gecos h
   if command -v runuser >/dev/null 2>&1; then
     timeout -k 2 30 runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" \
       PATH=/usr/bin:/bin XDG_CONFIG_HOME="$home/.config" \
-      /usr/bin/toolport-gateway --disconnect-all </dev/null || manual "cleanup failed for $user"
+      /usr/bin/toolport-gateway --disconnect-all --uninstall </dev/null || manual "cleanup failed for $user"
   elif command -v su >/dev/null 2>&1; then
     # shellcheck disable=SC2016 # Positional args expand in the user shell.
-    timeout -k 2 30 su -s /bin/sh -c 'exec env -i HOME="$1" USER="$2" LOGNAME="$2" PATH=/usr/bin:/bin XDG_CONFIG_HOME="$1/.config" /usr/bin/toolport-gateway --disconnect-all' \
+    timeout -k 2 30 su -s /bin/sh -c 'exec env -i HOME="$1" USER="$2" LOGNAME="$2" PATH=/usr/bin:/bin XDG_CONFIG_HOME="$1/.config" /usr/bin/toolport-gateway --disconnect-all --uninstall' \
       -- "$user" sh "$home" "$user" </dev/null || manual "cleanup failed for $user"
   else
     manual "runuser and su are unavailable; cleanup skipped for $user"
