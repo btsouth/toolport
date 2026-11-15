@@ -1538,15 +1538,28 @@ fn redact_secret(text: &str, secret: &str) -> String {
     text.replace(secret, "***")
 }
 
+// A launcher may exit immediately or stay alive with the browser. Wait off the UI
+// thread in either case: dropping std::process::Child leaves exited launchers as
+// zombies on Unix. Dropping this join handle detaches the reaper, not the child.
+fn reap_browser_child(
+    mut child: std::process::Child,
+) -> std::thread::JoinHandle<std::io::Result<std::process::ExitStatus>> {
+    std::thread::spawn(move || child.wait())
+}
+
 pub(crate) fn open_browser(url: &str) {
     // NOT `cmd /C start` on Windows: cmd treats `&` in the URL as a command
     // separator and truncates it. rundll32 passes the URL through verbatim.
     #[cfg(windows)]
     let _ = std::process::Command::new("rundll32")
         .args(["url.dll,FileProtocolHandler", url])
-        .spawn();
+        .spawn()
+        .map(reap_browser_child);
     #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(url).spawn();
+    let _ = std::process::Command::new("open")
+        .arg(url)
+        .spawn()
+        .map(reap_browser_child);
     // xdg-open is a host binary, and so is the browser it goes on to exec, so
     // neither may inherit an AppImage's bundled library paths - it makes the
     // browser die on `undefined symbol` and the sign-in silently never opens.
@@ -1554,7 +1567,7 @@ pub(crate) fn open_browser(url: &str) {
     {
         let mut cmd = std::process::Command::new("xdg-open");
         crate::hostenv::strip_bundled_env(&mut cmd);
-        let _ = cmd.arg(url).spawn();
+        let _ = cmd.arg(url).spawn().map(reap_browser_child);
     }
 }
 
@@ -1904,6 +1917,21 @@ pub(crate) fn authenticate_cancellable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn browser_launcher_is_reaped_after_it_exits() {
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .unwrap();
+        #[cfg(target_os = "linux")]
+        let pid = child.id();
+        let status = super::reap_browser_child(child).join().unwrap().unwrap();
+        assert_eq!(status.code(), Some(7));
+        #[cfg(target_os = "linux")]
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
 
     /// The vectors are lifted from `src/lib/openUrl.test.ts`. Keeping them
     /// identical is the point: this guard exists so a compromised renderer
