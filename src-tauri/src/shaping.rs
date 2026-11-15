@@ -2,8 +2,9 @@
 //! within a byte budget. Retained bodies can be paged with `toolport_fetch_result`
 //! until they expire. Memory holds the recent ones; an entry too large for memory,
 //! or pushed out by newer ones, moves to an encrypted file in the data dir and stays
-//! fetchable there for the rest of its time. Only a result too large for the disk
-//! cap too gets no cursor, and the truncated reply then asks for a narrower call.
+//! fetchable there for the rest of its time. Each read extends that time, up to a
+//! fixed lifetime. Only a result too large for the disk cap too, or one that could
+//! not be stored, gets no cursor, and the truncated reply then says which.
 //!
 //! This is the "other half" of the token story: lazy discovery trims tool
 //! DEFINITION bloat; this trims tool RESULT bloat (a 10k-row response that would
@@ -22,8 +23,13 @@ use std::time::{Duration, Instant};
 /// (bytes); set it to 0 to disable shaping entirely.
 pub const DEFAULT_BUDGET_BYTES: usize = 48 * 1024;
 
-/// How long a cached full result stays fetchable.
+/// How long a cached full result stays fetchable after it was stored or last read.
+/// Each fetch starts the clock again, so a model paging a large result keeps it.
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// The longest a result stays fetchable from when it was first stored, however often
+/// it is read.
+const MAX_RESULT_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// Cap on the number of cached shaped results. A burst of large tool calls would
 /// otherwise grow process memory without bound between TTL sweeps. Oldest
@@ -79,11 +85,50 @@ struct Cached {
     /// that each tool is still visible.
     describes: Vec<String>,
     realm: usize,
+    /// When the result was first stored; [`MAX_RESULT_LIFETIME`] runs from here.
+    first_stored: Instant,
+}
+
+impl Cached {
+    fn past_lifetime(&self) -> bool {
+        self.first_stored.elapsed() >= max_result_lifetime()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static LIFETIMES_FOR_TESTS: std::cell::Cell<Option<(Duration, Duration)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Shorten the spill TTL and the lifetime cap on this test thread, so their clocks
+/// run in milliseconds.
+#[cfg(test)]
+fn set_lifetimes_for_tests(lifetimes: Option<(Duration, Duration)>) {
+    LIFETIMES_FOR_TESTS.with(|cell| cell.set(lifetimes));
+}
+
+/// [`CACHE_TTL`], for spilled results.
+fn spill_ttl() -> Duration {
+    #[cfg(test)]
+    if let Some((ttl, _)) = LIFETIMES_FOR_TESTS.with(std::cell::Cell::get) {
+        return ttl;
+    }
+    CACHE_TTL
+}
+
+fn max_result_lifetime() -> Duration {
+    #[cfg(test)]
+    if let Some((_, max)) = LIFETIMES_FOR_TESTS.with(std::cell::Cell::get) {
+        return max;
+    }
+    MAX_RESULT_LIFETIME
 }
 
 /// The bounded stash of shaped results, keyed by cursor. P1.2: the lifetime rules
 /// live on a [`SessionStore`] rather than a bare `HashMap` -- entries expire
-/// `CACHE_TTL` after they were stashed, and an arrival past `MAX_CACHE_ENTRIES` or
+/// `CACHE_TTL` after they were stashed or last read (and never later than
+/// `MAX_RESULT_LIFETIME` after they were stashed), and an arrival past `MAX_CACHE_ENTRIES` or
 /// `MAX_CACHE_BYTES` evicts the oldest.
 fn cache() -> &'static Mutex<SessionStore<Cached>> {
     static C: OnceLock<Mutex<SessionStore<Cached>>> = OnceLock::new();
@@ -100,11 +145,16 @@ fn next_cursor() -> String {
 static TRIM_PENDING: AtomicBool = AtomicBool::new(false);
 
 fn sweep(store: &mut SessionStore<Cached>) {
+    sweep_memory(store);
+    spill::reap_expired();
+}
+
+fn sweep_memory(store: &mut SessionStore<Cached>) {
     let before = store.weight(|c| c.size);
-    if store.reap_expired() > 0 && before >= 1024 * 1024 {
+    let removed = store.reap_expired() + store.remove_where(|_, c| c.past_lifetime());
+    if removed > 0 && before >= 1024 * 1024 {
         TRIM_PENDING.store(true, Ordering::Relaxed);
     }
-    spill::reap_expired();
 }
 
 /// Remove this process's spilled results. Every orderly exit runs this through
@@ -113,8 +163,8 @@ pub fn release_spills() {
     spill::release();
 }
 
-/// Called by every gateway runtime's background maintenance tick. Reads never
-/// extend the insertion-based TTL. Trim outside the cache lock and off the request path.
+/// Called by every gateway runtime's background maintenance tick. Trim outside the
+/// cache lock and off the request path.
 pub fn maintain_cache(idle_transition: bool) {
     {
         let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
@@ -268,6 +318,7 @@ pub fn seed_cache_maintenance_probe() {
             owner: None,
             describes: Vec::new(),
             realm: 0,
+            first_stored: Instant::now(),
         },
     );
 }
@@ -412,7 +463,7 @@ fn is_text_representable(result: &Value) -> bool {
 /// If `result` serializes to more than `budget` bytes, attempt to retain its body,
 /// replace it with a truncated head and retention notice, and return `true` (shaped).
 /// A `budget` of 0 disables shaping. The full body stays fetchable via
-/// [`fetch_result`] while retained within the memory cap and insertion TTL.
+/// [`fetch_result`] until it expires (see [`CACHE_TTL`] and [`MAX_RESULT_LIFETIME`]).
 pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> bool {
     shape_result_preserving_prefix(result, budget, owner, 0)
 }
@@ -531,6 +582,7 @@ fn shape_inner(
             owner: owner.map(str::to_string),
             describes,
             realm,
+            first_stored: Instant::now(),
         },
     );
     let marker = |head_chars: usize| -> String {
@@ -772,6 +824,7 @@ pub fn stash_payload(
             owner: owner.map(str::to_string),
             describes: Vec::new(),
             realm: 0,
+            first_stored: Instant::now(),
         },
     );
     retained.is_ok().then_some(cursor)
@@ -888,6 +941,27 @@ fn unknown_cursor(cursor: &str) -> Value {
     )
 }
 
+enum Read {
+    /// In memory for this requester; its TTL starts again.
+    Found,
+    /// In memory but not readable: another owner's, or past its lifetime.
+    Refused,
+    /// Not in memory; it may be on disk.
+    Absent,
+}
+
+/// Look `cursor` up in memory for `requester`. A read extends the entry's TTL, up to
+/// [`MAX_RESULT_LIFETIME`] from when it was first stored.
+fn read_in(store: &mut SessionStore<Cached>, cursor: &str, requester: Option<&str>) -> Read {
+    match store.get(cursor) {
+        Some(c) if c.owner.as_deref() == requester && !c.past_lifetime() => {}
+        Some(_) => return Read::Refused,
+        None => return Read::Absent,
+    }
+    store.with(cursor, |_| ());
+    Read::Found
+}
+
 fn fetch_result_bounded(
     cursor: &str,
     offset: usize,
@@ -932,11 +1006,18 @@ fn fetch_result_bounded(
             true,
         );
     }
-    let store = cache().lock().unwrap_or_else(|e| e.into_inner());
+    let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
     let spilled;
-    let c = match store.get(cursor) {
-        Some(c) if owned(c) && c.describes == describes => c,
-        None if describes.is_empty() => match spill::load(cursor, requester) {
+    let c = match read_in(&mut store, cursor, requester) {
+        Read::Found
+            if store
+                .peek(cursor, |c| c.describes == describes)
+                .unwrap_or(false) =>
+        {
+            store.get(cursor).expect("read_in found it")
+        }
+        Read::Found | Read::Refused => return unknown_cursor(cursor),
+        Read::Absent if describes.is_empty() => match spill::load(cursor, requester) {
             Some(entry) => {
                 spilled = entry;
                 &spilled
@@ -1075,12 +1156,13 @@ fn fetch_result_bounded(
 /// `atomic_write` and sealed with XChaCha20-Poly1305 under a key this process holds
 /// only in memory. A file is unreadable once its process is gone, and nothing in it
 /// is changed, so paging offsets stay exact. Files are removed when their entry
-/// expires (the same 15 minutes as memory), when the disk cap pushes them out, when
+/// expires (the same rules as memory: 15 minutes from storing or the last read, two
+/// hours at most), when the disk cap pushes them out, when
 /// the gateway exits normally, and at the next start of any gateway for directories
 /// whose process has exited. Usage counts what is on disk: a file whose removal
 /// failed keeps its bytes counted until a retry removes it.
 mod spill {
-    use super::{Cached, Refusal, CACHE_TTL};
+    use super::{max_result_lifetime, spill_ttl, Cached, Refusal, CACHE_TTL};
     use base64::Engine;
     use chacha20poly1305::aead::{Aead, KeyInit};
     use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -1088,6 +1170,8 @@ mod spill {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
+    #[cfg(test)]
+    use std::time::Duration;
     use std::time::Instant;
 
     /// Disk held by one gateway process's spilled results.
@@ -1154,7 +1238,16 @@ mod spill {
         owner: Option<String>,
         projections_unavailable: bool,
         bytes: usize,
-        stored: Instant,
+        first_stored: Instant,
+        /// Stored or last read; the TTL runs from here.
+        touched: Instant,
+    }
+
+    impl Spilled {
+        fn expired(&self) -> bool {
+            self.touched.elapsed() >= spill_ttl()
+                || self.first_stored.elapsed() >= max_result_lifetime()
+        }
     }
 
     struct State {
@@ -1319,9 +1412,9 @@ mod spill {
         }
     }
 
-    /// Keep `entry` on disk under `cursor` until `stored + CACHE_TTL`, or say why it
-    /// cannot be kept.
-    pub(super) fn keep(cursor: &str, entry: &Cached, stored: Instant) -> Result<(), Refusal> {
+    /// Keep `entry` on disk under `cursor`, its TTL running from `touched` (when it was
+    /// stored or last read), or say why it cannot be kept.
+    pub(super) fn keep(cursor: &str, entry: &Cached, touched: Instant) -> Result<(), Refusal> {
         // A discovery result stays in memory, where its visibility is checked on
         // every fetch and `forget_discovery` drops it. Pushed out of memory it is
         // dropped, and one too large for memory is not kept: search makes a fresh one.
@@ -1329,17 +1422,17 @@ mod spill {
             return Err(Refusal::TooLarge);
         }
         let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
-        state.keep(cursor, entry, stored)
+        state.keep(cursor, entry, touched)
     }
 
     impl State {
-        fn keep(&mut self, cursor: &str, entry: &Cached, stored: Instant) -> Result<(), Refusal> {
+        fn keep(&mut self, cursor: &str, entry: &Cached, touched: Instant) -> Result<(), Refusal> {
             let state = self;
             #[cfg(test)]
             if FAIL_FOR_TESTS.with(std::cell::Cell::get) {
                 return Err(Refusal::Unstored);
             }
-            if stored.elapsed() >= CACHE_TTL {
+            if touched.elapsed() >= spill_ttl() || entry.past_lifetime() {
                 return Err(Refusal::Expired);
             }
             let plain = json!({ "body": entry.body, "structured": entry.structured }).to_string();
@@ -1368,7 +1461,7 @@ mod spill {
                 let Some(oldest) = state
                     .entries
                     .iter()
-                    .min_by_key(|(_, s)| s.stored)
+                    .min_by_key(|(_, s)| s.touched)
                     .map(|(cursor, _)| cursor.clone())
                 else {
                     break;
@@ -1394,7 +1487,8 @@ mod spill {
                     owner: entry.owner.clone(),
                     projections_unavailable: entry.projections_unavailable,
                     bytes: text.len(),
-                    stored,
+                    first_stored: entry.first_stored,
+                    touched,
                 },
             );
             Ok(())
@@ -1423,7 +1517,7 @@ mod spill {
             let expired: Vec<String> = self
                 .entries
                 .iter()
-                .filter(|(_, spilled)| spilled.stored.elapsed() >= CACHE_TTL)
+                .filter(|(_, spilled)| spilled.expired())
                 .map(|(cursor, _)| cursor.clone())
                 .collect();
             for cursor in expired {
@@ -1495,37 +1589,46 @@ mod spill {
 
     /// The spilled entry for `cursor`, if it is still live and belongs to `requester`.
     pub(super) fn load(cursor: &str, requester: Option<&str>) -> Option<Cached> {
-        let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
-        state.reap();
-        let spilled = state.entries.get(cursor)?;
-        if spilled.owner.as_deref() != requester {
-            return None;
+        state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .load(cursor, requester)
+    }
+
+    impl State {
+        /// Read `cursor` back for `requester`. A read starts its TTL again, up to
+        /// `MAX_RESULT_LIFETIME` from when it was first stored.
+        fn load(&mut self, cursor: &str, requester: Option<&str>) -> Option<Cached> {
+            self.reap();
+            let cipher = self.cipher.as_ref()?;
+            let spilled = self.entries.get_mut(cursor)?;
+            if spilled.owner.as_deref() != requester {
+                return None;
+            }
+            let text = std::fs::read_to_string(&spilled.path).ok()?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .ok()?;
+            if bytes.len() < NONCE_LEN {
+                return None;
+            }
+            let (nonce, sealed) = bytes.split_at(NONCE_LEN);
+            let plain = cipher.decrypt(XNonce::from_slice(nonce), sealed).ok()?;
+            let value: Value = serde_json::from_slice(&plain).ok()?;
+            let structured = value.get("structured").filter(|v| !v.is_null()).cloned();
+            spilled.touched = Instant::now();
+            Some(Cached {
+                server: spilled.server.clone(),
+                body: value.get("body")?.as_str()?.to_string(),
+                size: 0,
+                structured,
+                projections_unavailable: spilled.projections_unavailable,
+                owner: spilled.owner.clone(),
+                first_stored: spilled.first_stored,
+                describes: Vec::new(),
+                realm: 0,
+            })
         }
-        let text = std::fs::read_to_string(&spilled.path).ok()?;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(text)
-            .ok()?;
-        if bytes.len() < NONCE_LEN {
-            return None;
-        }
-        let (nonce, sealed) = bytes.split_at(NONCE_LEN);
-        let plain = state
-            .cipher
-            .as_ref()?
-            .decrypt(XNonce::from_slice(nonce), sealed)
-            .ok()?;
-        let value: Value = serde_json::from_slice(&plain).ok()?;
-        let structured = value.get("structured").filter(|v| !v.is_null()).cloned();
-        Some(Cached {
-            server: spilled.server.clone(),
-            body: value.get("body")?.as_str()?.to_string(),
-            size: 0,
-            structured,
-            projections_unavailable: spilled.projections_unavailable,
-            owner: spilled.owner.clone(),
-            describes: Vec::new(),
-            realm: 0,
-        })
     }
 
     /// Drop a spilled entry and its file (a shape that was declined after storing).
@@ -1552,6 +1655,9 @@ mod spill {
                 projections_unavailable: false,
                 size: 0,
                 owner: None,
+                first_stored: Instant::now(),
+                describes: Vec::new(),
+                realm: 0,
             }
         }
 
@@ -1624,6 +1730,28 @@ mod spill {
             assert!(state.keep("r3", &entry(&body), Instant::now()).is_ok());
             set_cap_for_tests(None);
             assert_eq!(files_under(&root), 1);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn a_read_from_disk_extends_its_time_up_to_the_lifetime_cap() {
+            let root = case_root("extend");
+            let mut state = State::new(Some(root.clone()), Some([7; 32]));
+            let ms = Duration::from_millis;
+            super::super::set_lifetimes_for_tests(Some((ms(600), ms(1_000))));
+            assert!(state.keep("r1", &entry("body"), Instant::now()).is_ok());
+            std::thread::sleep(ms(400));
+            let first = state.load("r1", None).is_some();
+            std::thread::sleep(ms(400));
+            // Past the TTL from storing, inside it from the read.
+            let second = state.load("r1", None).is_some();
+            std::thread::sleep(ms(300));
+            // Inside the TTL from the last read, past the lifetime cap.
+            let third = state.load("r1", None).is_some();
+            super::super::set_lifetimes_for_tests(None);
+            assert!(first);
+            assert!(second, "a read did not extend it");
+            assert!(!third, "a read extended it past the lifetime cap");
             let _ = std::fs::remove_dir_all(&root);
         }
 
@@ -2172,6 +2300,7 @@ mod tests {
             owner: None,
             describes: Vec::new(),
             realm: 0,
+            first_stored: Instant::now(),
         }
     }
 
@@ -2460,6 +2589,32 @@ mod tests {
         assert!(
             store.is_empty(),
             "the retained buffer must trigger eviction"
+        );
+    }
+
+    #[test]
+    fn a_read_from_memory_extends_its_time_up_to_the_lifetime_cap() {
+        let ms = Duration::from_millis;
+        let mut store = SessionStore::new(ms(600), MAX_CACHE_ENTRIES);
+        set_lifetimes_for_tests(Some((ms(600), ms(1_000))));
+        store.insert("paged", cached_entry(1));
+        std::thread::sleep(ms(400));
+        let first = matches!(read_in(&mut store, "paged", None), Read::Found);
+        std::thread::sleep(ms(400));
+        // Past the TTL from storing, inside it from the read.
+        let second = matches!(read_in(&mut store, "paged", None), Read::Found);
+        std::thread::sleep(ms(300));
+        // Inside the TTL from the last read, past the lifetime cap.
+        let third = matches!(read_in(&mut store, "paged", None), Read::Refused);
+        // Memory only: the shortened clocks must not reach the shared spill store.
+        sweep_memory(&mut store);
+        set_lifetimes_for_tests(None);
+        assert!(first);
+        assert!(second, "a read did not extend it");
+        assert!(third, "a read extended it past the lifetime cap");
+        assert!(
+            store.is_empty(),
+            "the sweep kept a result past its lifetime"
         );
     }
 

@@ -106,22 +106,24 @@ are sent to every client.
   alone cannot fit the budget; it is then not budget-bound, and Claude's own file
   fallback applies above the advertised size.
 
-  A cursor stays fetchable for 15 minutes. The most recent results (up to 64, and
-  64 MiB) are held in memory; a result too large for that, or pushed out by newer
-  ones, moves to a file under `result-spill/` in the data directory for the rest of
-  its time. Each file is readable only by the current user (0600 on Unix, an
-  owner-only ACL on Windows) and sealed with a key the gateway holds only in memory,
-  so it is unreadable once that gateway exits. Each gateway holds a lock file in its
-  spill directory, and a starting gateway removes only directories whose lock is free. Files go when their result
+  A cursor stays fetchable for 15 minutes after it was issued or last fetched, so a
+  model paging a large result keeps it while it reads, but never more than 2 hours
+  after it was issued. The most recent results (up to 64, and 64 MiB) are held in
+  memory; a result too large for that, or pushed out by newer ones, moves to a file
+  under `result-spill/` in the data directory for the rest of its time. Each file is
+  readable only by the current user (0600 on Unix, an owner-only ACL on Windows) and
+  sealed with a key the gateway holds only in memory, so it is unreadable once that
+  gateway exits. Each gateway holds a lock file in its spill directory, and a starting
+  gateway removes only directories whose lock is free. Files go when their result
   expires, when the gateway exits normally, and, for gateways that crashed or were
   killed, when the next gateway starts. A file that fails to delete still counts
-  against the disk cap until a retry removes it. Only a result past
-  the 512 MiB disk cap gets no cursor, and its reply says it was too large and asks
-  for a narrower call. A result that cannot be written to disk stays in memory, so a
-  cursor already handed out is not lost; memory may then grow to twice the limits
-  above, and past that a new result gets no cursor and its reply says it could not be
-  stored. If the gateway cannot generate its sealing key, nothing
-  is written to disk. Both cases are noted in `toolport_status`.
+  against the disk cap until a retry removes it. Only a result past the 512 MiB disk
+  cap gets no cursor, and its reply says it was too large and asks for a narrower
+  call. A result that cannot be written to disk stays in memory, so a cursor already
+  handed out is not lost; memory may then grow to twice the limits above, and past
+  that a new result gets no cursor and its reply says it could not be stored. If the
+  gateway cannot generate its sealing key, nothing is written to disk. Both cases are
+  noted in `toolport_status`.
 
 Drift fingerprints and the listed-catalog digest do not cover `_meta`, so these keys
 never cause drift warnings or extra list notifications.
