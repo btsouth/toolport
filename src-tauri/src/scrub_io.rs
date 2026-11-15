@@ -32,7 +32,7 @@ static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// and confirm the opened file is a regular file whose canonical parent is `dir`
 /// (canonicalized).
 pub fn open_inside(dir: &Path, path: &Path) -> std::io::Result<Result<File, Skip>> {
-    Ok(locate(dir, path)?.and_then_io(|loc| open_located(&loc, false))?)
+    locate(dir, path)?.and_then_io(|loc| open_located(&loc, false))
 }
 
 /// Stream `path` line by line through `redact` into a temp file and publish it
@@ -520,8 +520,7 @@ mod sys {
         let access = if write { libc::O_RDWR } else { libc::O_RDONLY };
         // O_NONBLOCK keeps a FIFO from blocking the open; it has no effect on
         // regular files, which are the only ones kept.
-        let flags =
-            access | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOCTTY | libc::O_NONBLOCK;
+        let flags = access | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOCTTY | libc::O_NONBLOCK;
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
         // SAFETY: `dir` is an open directory descriptor and `name` a valid
         // NUL-terminated string, both alive for the call. openat does not retain
@@ -580,11 +579,8 @@ mod sys {
         if now.gid() != meta.gid() {
             mode &= !0o070;
         }
-        if now.uid() != meta.uid() {
-            // Our own uid already could read the original; others keep only
-            // what they had, so drop nothing more than group bits above.
-        }
-        std::fs::Permissions::from(std::os::unix::fs::PermissionsExt::from_mode(mode));
+        // If the owner could not be matched the temp belongs to us, and we
+        // could already read the original, so the owner bits widen nothing.
         tmp.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
         Ok(tmp)
     }
@@ -606,19 +602,19 @@ mod sys {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
     use std::os::windows::io::AsRawHandle as _;
     use std::path::{Path, PathBuf};
-    use windows_sys::Win32::Foundation::{GENERIC_WRITE, LocalFree};
+    use windows_sys::Win32::Foundation::{LocalFree, GENERIC_WRITE};
     use windows_sys::Win32::Security::Authorization::{
-        GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+        GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl,
+        GetSecurityDescriptorControl, ACL, DACL_SECURITY_INFORMATION,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
         UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_NAME_NORMALIZED, GetFileInformationByHandle, GetFinalPathNameByHandleW, READ_CONTROL,
-        VOLUME_NAME_DOS, WRITE_DAC,
+        GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED,
+        READ_CONTROL, VOLUME_NAME_DOS, WRITE_DAC,
     };
 
     const FILE_SHARE_READ: u32 = 0x1;
@@ -813,6 +809,11 @@ mod tests {
         }
     }
 
+    /// Pins a closure to the higher-ranked signature `rewrite_lines` takes.
+    fn higher_ranked<F: FnMut(&str) -> Cow<'_, str>>(f: F) -> F {
+        f
+    }
+
     fn rewrite(dir: &Path, path: &Path) -> (std::io::Result<bool>, Vec<Skip>, usize) {
         let mut skips = Vec::new();
         let mut multi = 0;
@@ -887,7 +888,10 @@ mod tests {
         let (result, skips, _) = rewrite(&dir.0, &link);
         assert!(!result.unwrap());
         assert_eq!(skips, vec![Skip::Symlink]);
-        assert!(matches!(open_inside(&dir.0, &link).unwrap(), Err(Skip::Symlink)));
+        assert!(matches!(
+            open_inside(&dir.0, &link).unwrap(),
+            Err(Skip::Symlink)
+        ));
         assert!(!mask_ranges(&dir.0, &link, &[(0, 3)], &|n| vec![b'#'; n]).unwrap());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "SECRET\n");
     }
@@ -901,8 +905,15 @@ mod tests {
         let (result, skips, _) = rewrite(&dir.0, &path);
         assert!(!result.unwrap());
         assert_eq!(skips, vec![Skip::Outside]);
-        let dotted = dir.0.join("..").join(other.0.file_name().unwrap()).join("a.log");
-        assert!(matches!(open_inside(&dir.0, &dotted).unwrap(), Err(Skip::Outside)));
+        let dotted = dir
+            .0
+            .join("..")
+            .join(other.0.file_name().unwrap())
+            .join("a.log");
+        assert!(matches!(
+            open_inside(&dir.0, &dotted).unwrap(),
+            Err(Skip::Outside)
+        ));
         assert!(matches!(
             for_each_line(&dir.0, &path, &mut |_, _| {}).unwrap(),
             Err(Skip::Outside)
@@ -953,14 +964,20 @@ mod tests {
         let path = dir.0.join("a.log");
         std::fs::write(&path, "SECRET\n").unwrap();
         let appender = path.clone();
-        let mut redact = |line: &str| -> Cow<'_, str> {
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&appender)
-                .unwrap();
-            f.write_all(b"appended\n").unwrap();
+        // Append once: the streaming reader sees the appended line too, so
+        // appending on every call would never reach the end of the file.
+        let mut appended = false;
+        let mut redact = higher_ranked(|line: &str| {
+            if !appended {
+                appended = true;
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&appender)
+                    .unwrap();
+                f.write_all(b"appended\n").unwrap();
+            }
             Cow::Owned(line.replace("SECRET", "x"))
-        };
+        });
         let result = rewrite_lines(&dir.0, &path, &mut redact, &mut |_| {}, &mut || Ok(true));
         assert!(!result.unwrap());
         let text = std::fs::read_to_string(&path).unwrap();
@@ -1025,7 +1042,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recover_masks(&dir.0).unwrap(), 1);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "key=******* tail\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "key=******* tail\n"
+        );
         assert!(leftovers(&dir.0).is_empty());
         assert_eq!(recover_masks(&dir.0).unwrap(), 0);
     }
@@ -1074,10 +1094,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(lines, 200_000);
-        assert_eq!(
-            last_offset + 100,
-            std::fs::metadata(&path).unwrap().len()
-        );
+        assert_eq!(last_offset + 100, std::fs::metadata(&path).unwrap().len());
         assert!(rewrite(&dir.0, &path).0.unwrap());
         assert!(std::fs::read(&path).unwrap() == expected);
     }

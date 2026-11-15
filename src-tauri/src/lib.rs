@@ -56,6 +56,7 @@ pub mod router;
 pub mod savings;
 pub(crate) mod schema_compat;
 pub mod searchtrace;
+pub mod scrub_io;
 pub mod secret_normalize;
 pub mod secret_redact;
 pub mod secret_refs;

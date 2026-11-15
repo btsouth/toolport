@@ -2959,110 +2959,146 @@ fn held_open(path: &Path) -> bool {
 
 /// Overwrite each secret occurrence with a same-length mask (the marker when it
 /// fits, padded with `*`), so concurrent `O_APPEND` writers and open descriptors
-/// are unaffected: nothing moves and the file is never replaced.
-fn mask_in_place(matcher: &Matcher, path: &Path) -> std::io::Result<bool> {
+/// are unaffected: nothing moves and the file is never replaced. The file is
+/// opened without following a link and must be a regular file in `dir`; the
+/// ranges are journaled first, so a crash mid-mask is finished at the next start
+/// ([`crate::scrub_io::recover_masks`]).
+fn mask_in_place(matcher: &Matcher, dir: &Path, path: &Path) -> std::io::Result<bool> {
     // The daemon's own stderr writes take no lock; this one keeps two scrubbers
     // (or a scrub and a delete-time scrub) from masking the same file at once.
     let _lock = crate::registry::lock_at(path).map_err(std::io::Error::other)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true);
-    // The live daemon holds this file as its stderr handle (append access, the
-    // default read/write/delete sharing). Share all three so neither side blocks
-    // the other; same-length writes never move what the daemon appends.
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_SHARE_READ: u32 = 0x1;
-        const FILE_SHARE_WRITE: u32 = 0x2;
-        const FILE_SHARE_DELETE: u32 = 0x4;
-        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
-    }
-    let file = match options.open(path) {
+    mask_locked(matcher, dir, path)
+}
+
+/// [`mask_in_place`] for a caller that already holds the file's lock.
+fn mask_locked(matcher: &Matcher, dir: &Path, path: &Path) -> std::io::Result<bool> {
+    let file = match crate::scrub_io::open_inside(dir, path)? {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
+        Err(skip) => return skipped(path, skip),
     };
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut &file, &mut bytes)?;
+    drop(file);
     let spans = matcher.byte_spans(&bytes);
+    if spans.is_empty() {
+        return Ok(false);
+    }
+    // One journaled pass per distinct marker, each range masked with it.
+    let mut groups: Vec<(String, Vec<(u64, u64)>)> = Vec::new();
     for (start, end, names) in &spans {
-        let len = end - start;
         let marker = matcher.marker(names);
-        let mut mask: Vec<u8> = if marker.len() <= len {
-            marker.into_bytes()
-        } else {
-            Vec::new()
-        };
-        mask.resize(len, b'*');
-        write_at(&file, &mask, *start as u64)?;
-    }
-    if !spans.is_empty() {
-        file.sync_all()?;
-    }
-    Ok(!spans.is_empty())
-}
-
-#[cfg(unix)]
-fn write_at(file: &std::fs::File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
-    std::os::unix::fs::FileExt::write_all_at(file, bytes, offset)
-}
-
-#[cfg(windows)]
-fn write_at(file: &std::fs::File, mut bytes: &[u8], mut offset: u64) -> std::io::Result<()> {
-    while !bytes.is_empty() {
-        let n = std::os::windows::fs::FileExt::seek_write(file, bytes, offset)?;
-        if n == 0 {
-            return Err(std::io::ErrorKind::WriteZero.into());
+        let range = (*start as u64, (end - start) as u64);
+        match groups.iter_mut().find(|(m, _)| *m == marker) {
+            Some((_, ranges)) => ranges.push(range),
+            None => groups.push((marker, vec![range])),
         }
-        bytes = &bytes[n..];
-        offset += n as u64;
     }
-    Ok(())
+    let mut masked = false;
+    for (marker, ranges) in groups {
+        let mask = |len: usize| -> Vec<u8> {
+            if marker.len() <= len {
+                marker.as_bytes().to_vec()
+            } else {
+                Vec::new()
+            }
+        };
+        masked |= crate::scrub_io::mask_ranges(dir, path, &ranges, &mask)?;
+    }
+    Ok(masked)
+}
+
+/// A file the scrub would not touch: a link, a reparse point, something that is
+/// not a regular file, or one outside the data directory. Named (never its
+/// content) so the skip is visible.
+fn skipped(path: &Path, skip: crate::scrub_io::Skip) -> std::io::Result<bool> {
+    if skip == crate::scrub_io::Skip::NotFound {
+        return Ok(false);
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    // Not a clean result: whatever the link or entry points at may hold a copy,
+    // so a retired value stays recoverable and status keeps saying so.
+    Err(std::io::Error::other(format!(
+        "secret scrub skipped {name} ({skip:?}): not a regular file inside the data directory"
+    )))
 }
 
 fn scrub_file_with(matcher: &Matcher, path: &Path) -> std::io::Result<bool> {
+    let Some(dir) = path.parent() else {
+        return Ok(false);
+    };
     if held_open(path) {
-        return mask_in_place(matcher, path);
+        return mask_in_place(matcher, dir, path);
     }
     let _lock = crate::registry::lock_at(path).map_err(std::io::Error::other)?;
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
-    };
-    let text = String::from_utf8_lossy(&bytes);
-    if !matcher.may_contain(&text) {
-        return Ok(false);
-    }
     // A tool catalog is screened like a live one (whole forms only) so a cached
     // identifier never differs from the advertised one.
     let catalog = path
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.starts_with("tool-cache") || n.starts_with("quarantine"));
-    let mut changed = false;
-    let mut out = String::with_capacity(text.len());
-    for line in text.split_inclusive('\n') {
-        let redacted = if catalog {
+    // One streaming read decides whether a rewrite is needed at all, so an
+    // unchanged log costs a read and no write.
+    let mut hit = false;
+    let read = crate::scrub_io::for_each_line(dir, path, &mut |_, bytes| {
+        hit = hit || matcher.may_contain(&String::from_utf8_lossy(bytes));
+    })?;
+    if let Err(skip) = read {
+        return skipped(path, skip);
+    }
+    if !hit {
+        return Ok(false);
+    }
+    let mut redact = scrub_line(matcher, catalog);
+    // Streamed into a temp file that is never more permissive than the original
+    // and keeps its owner; published by rename only if the file did not change
+    // meanwhile. A file with other hard links is masked in place instead, so no
+    // other name keeps the old content.
+    let mut skip = None;
+    let rewritten = crate::scrub_io::rewrite_lines(
+        dir,
+        path,
+        &mut redact,
+        &mut |s| skip = Some(s),
+        &mut || mask_locked(matcher, dir, path),
+    )?;
+    match skip {
+        Some(s) => skipped(path, s),
+        None => Ok(rewritten),
+    }
+}
+
+/// [`scrub_file_with`] over every log in `dir`. Every file is attempted; the
+/// first error (including a file the scrub had to skip) is returned after the
+/// rest are done, so the caller does not record the directory as clean.
+fn scrub_each(matcher: &Matcher, dir: &Path, mut changed: impl FnMut(bool)) -> std::io::Result<()> {
+    let mut first_error = None;
+    for path in persisted_log_files(dir) {
+        match scrub_file_with(matcher, &path) {
+            Ok(c) => changed(c),
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// The per-line redaction for [`scrub_file_with`], with the signature
+/// [`crate::scrub_io::rewrite_lines`] takes.
+fn scrub_line(
+    matcher: &Matcher,
+    catalog: bool,
+) -> impl for<'l> FnMut(&'l str) -> Cow<'l, str> + '_ {
+    move |line| {
+        if catalog {
             matcher.redact_definition_line(line)
         } else {
             matcher.redact_line(line)
-        };
-        changed |= matches!(redacted, Cow::Owned(_));
-        out.push_str(&redacted);
+        }
     }
-    if !changed {
-        return Ok(false);
-    }
-    // Every current writer takes this lock, but an older build may still replace
-    // a tool catalog whole without it. If the file changed since the read, the
-    // newer one came from a build that already redacts, so keep it rather than
-    // put back an older catalog.
-    if std::fs::read(path).map(|now| now != bytes).unwrap_or(true) {
-        return Ok(false);
-    }
-    crate::registry::atomic_write(path, &out).map_err(std::io::Error::other)?;
-    Ok(true)
 }
 
 /// Scrub every log file in `dir` for secrets not yet scrubbed there, then record
@@ -3079,6 +3115,8 @@ pub fn scrub_data_dir(dir: &Path) -> std::io::Result<usize> {
     // a different value under the same id) scrubs for everything it knows.
     let _scrub = crate::registry::lock_at_for(&dir.join("secret-scrub"), SCRUB_LOCK_WAIT)
         .map_err(std::io::Error::other)?;
+    // A mask a crash interrupted is finished before anything else.
+    crate::scrub_io::recover_masks(dir)?;
     let scope = scope_of(dir);
     let from = SCRUBBED
         .lock()
@@ -3116,11 +3154,7 @@ pub fn scrub_data_dir(dir: &Path) -> std::io::Result<usize> {
         return Ok(0);
     };
     let mut rewritten = 0;
-    for path in persisted_log_files(dir) {
-        if scrub_file_with(&matcher, &path)? {
-            rewritten += 1;
-        }
-    }
+    scrub_each(&matcher, dir, |changed| rewritten += usize::from(changed))?;
     let mut ids: Vec<String> = done.into_iter().collect();
     ids.extend(pending.into_iter().map(|(id, _, _)| id));
     ids.sort();
@@ -3243,12 +3277,7 @@ pub fn scrub_value_now(owner: &str, key: &str, value: &str) -> Result<(), String
     let matcher = Matcher::new(&pairs);
     let result = crate::registry::lock_at_for(&dir.join("secret-scrub"), SCRUB_LOCK_WAIT)
         .map_err(std::io::Error::other)
-        .and_then(|_scrub| {
-            for path in persisted_log_files(&dir) {
-                scrub_file_with(&matcher, &path)?;
-            }
-            Ok(())
-        });
+        .and_then(|_scrub| scrub_each(&matcher, &dir, |_| {}));
     result.map_err(|error| format!("scrub before retiring secret '{key}' failed: {error}"))
 }
 
@@ -4118,6 +4147,67 @@ mod tests {
             let out = m.redact_text(&line);
             assert!(out.contains("[secret:PASS]"), "{user}: {out}");
         }
+    }
+
+    /// The scrub never follows a link out of the data directory, leaves no
+    /// hard-linked copy holding the old text, and never widens a file's mode.
+    #[cfg(unix)]
+    #[test]
+    fn the_scrub_stays_inside_the_data_dir_and_never_widens_a_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _lock = crate::registry::data_dir_test_lock();
+        let root = std::env::temp_dir().join(format!("tp-scrub-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("data");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let secret = "sk-LinkedScrubSecret55";
+        let m = Matcher::new(&[("KEY", secret)]);
+        // gateway.log is a symlink to a file outside the data directory.
+        let target = outside.join("notes.txt");
+        std::fs::write(&target, format!("mine {secret}\n")).unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("gateway.log")).unwrap();
+        // audit.jsonl has a second hard link elsewhere.
+        let audit = dir.join("audit.jsonl");
+        std::fs::write(&audit, format!("{{\"error\":\"{secret}\"}}\n")).unwrap();
+        let other_name = outside.join("audit-copy.jsonl");
+        std::fs::hard_link(&audit, &other_name).unwrap();
+        // security.jsonl is read-only for its owner.
+        let security = dir.join("security.jsonl");
+        std::fs::write(&security, format!("{{\"detail\":\"{secret}\"}}\n")).unwrap();
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        let skipped_link = scrub_file_with(&m, &dir.join("gateway.log"));
+        let result = scrub_each(&m, &dir, |_| {});
+        let target_text = std::fs::read_to_string(&target).unwrap();
+        let link_kept = std::fs::symlink_metadata(dir.join("gateway.log"))
+            .unwrap()
+            .file_type()
+            .is_symlink();
+        let copy = std::fs::read_to_string(&other_name).unwrap();
+        let audit_text = std::fs::read_to_string(&audit).unwrap();
+        let mode = std::fs::metadata(&security).unwrap().permissions().mode() & 0o777;
+        let security_text = std::fs::read_to_string(&security).unwrap();
+        let _ = std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            skipped_link.is_err() && result.is_err(),
+            "a skipped link is not a clean scrub"
+        );
+        assert_eq!(
+            target_text,
+            format!("mine {secret}\n"),
+            "a file outside was rewritten"
+        );
+        assert!(link_kept, "the link was replaced");
+        assert!(!audit_text.contains(secret), "{audit_text}");
+        assert!(
+            !copy.contains(secret),
+            "the other hard link kept the secret: {copy}"
+        );
+        assert!(!security_text.contains(secret), "{security_text}");
+        assert_eq!(mode, 0o400, "mode changed to {mode:o}");
     }
 
     #[test]
