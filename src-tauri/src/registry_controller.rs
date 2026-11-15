@@ -5582,8 +5582,9 @@ API_KEY = "synthetic-first-origin"
         let _data_lock = registry::data_dir_test_lock();
         let _data_dir = registry::DataDirOverride::set(dir.join("data"));
         let target = dir.join("client.json");
-        let backup = dir.join("backup.json");
-        std::fs::write(&backup, "original config").unwrap();
+        // Rollback reads only backups written by `backup_config`, never raw files.
+        std::fs::write(&target, "original config").unwrap();
+        let backup = clients::backup_config("cursor", &target).unwrap().unwrap();
         std::fs::write(&target, "connected config").unwrap();
         let outcome = WriteOutcome {
             path: target.display().to_string(),
