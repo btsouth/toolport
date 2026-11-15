@@ -727,6 +727,7 @@ mod caption_tests {
             config_error: false,
             location_removable: false,
             claude_profile: None,
+            t3_code: Vec::new(),
         };
         for style in [RowStyle::Line, RowStyle::Profile] {
             let (text, tooltip) = client_detail(&client, style);

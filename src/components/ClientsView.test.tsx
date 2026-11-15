@@ -5,6 +5,7 @@ import type { DetectedClient, McpServer } from "@/lib/types";
 import { ClientsView } from "./ClientsView";
 import {
   getClientSessions,
+  listClientRecoveries,
   refreshClientRecoveryStatus,
   t3CodeRevision,
 } from "@/lib/api";
@@ -742,4 +743,65 @@ describe("ClientsView", () => {
       expect(t3CodeRevision).toHaveBeenCalledTimes(calls);
     });
   });
+});
+
+it("keeps a T3 Code home row's label beside its recovery cards", async () => {
+  const id = "codex@t3-0123456789abcdef";
+  const name = "Codex (~/.t3/cx/codex)";
+  const base = {
+    clientId: id,
+    clientName: name,
+    path: "/fixture/.t3/cx/codex/config.toml",
+    backupPath: "/fixture/backups/codex/original.toml",
+    dismissed: false,
+    discardValues: [],
+    discardStarted: false,
+    discardAction: "Discard these saved values",
+    cleanup: false,
+    instructions: "Unlock your keyring, then choose Retry.",
+    retention: "The recovery backup does not expire.",
+    details: "fixture",
+  };
+  vi.mocked(listClientRecoveries).mockResolvedValueOnce([
+    {
+      ...base,
+      id: "owed",
+      missing: [{ server: "server-a", key: "API_KEY" }],
+      message: `${name} is disconnected.\n\nThe config has placeholders for these values for now.`,
+      description: "Its original config is back. These values still have placeholders:",
+      valueLines: ["API_KEY for server-a: keyring locked"],
+      error: null,
+      canDiscard: true,
+      canRetry: true,
+    },
+    {
+      ...base,
+      id: "receipt",
+      missing: [],
+      message: `${name} recovery needs attention.\n\nToolport could not read this recovery file.`,
+      description: "Toolport could not read this recovery file. Check its permissions.",
+      valueLines: [],
+      error: "Toolport could not read this recovery file. Check its permissions.",
+      canDiscard: false,
+      canRetry: true,
+    },
+  ] as Awaited<ReturnType<typeof listClientRecoveries>>);
+  render(
+    <ClientsView
+      clients={[
+        client({
+          id,
+          name,
+          t3Code: [{ instanceId: "cx", displayName: "Codex Extra", enabled: false }],
+        }),
+      ]}
+      registry={null}
+      onSelectClient={vi.fn()}
+      onChanged={vi.fn(async () => {})}
+    />,
+  );
+  expect(await screen.findAllByRole("region")).toHaveLength(2);
+  expect(screen.getByText(`${name} is disconnected.`)).toBeInTheDocument();
+  expect(screen.getByText(`${name} recovery needs attention.`)).toBeInTheDocument();
+  expect(screen.getByText("Used by T3 Code: Codex Extra (off)")).toBeInTheDocument();
 });

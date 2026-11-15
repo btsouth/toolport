@@ -1584,6 +1584,97 @@ mod tests {
 
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn a_t3_code_home_row_keeps_its_label_and_recovery_cards() {
+        let _data = crate::registry::DataDirTestEnv::new("t3-home-recovery");
+        let app = app();
+        let (_, servers, _) = build_content(&app, crate::approval_broker::start_native());
+        let page = ClientPage::new(&app, servers);
+        let window = adw::ApplicationWindow::builder()
+            .application(&app)
+            .content(&page.root)
+            .default_width(1024)
+            .default_height(700)
+            .build();
+        let id = "codex@t3-0123456789abcdef";
+        let mut home = fixture_client(id);
+        home.name = "Codex (~/.t3/cx/codex)".into();
+        home.t3_code = vec![crate::clients::T3CodeUse {
+            instance_id: "cx".into(),
+            display_name: "Codex Extra".into(),
+            enabled: false,
+        }];
+        let record = |rid: &str, message: &str, error: Option<&str>| {
+            crate::clients::recovery::ClientRecovery {
+                id: rid.into(),
+                client_id: id.into(),
+                client_name: home.name.clone(),
+                path: "/fixture/.t3/cx/codex/config.toml".into(),
+                backup_path: "/fixture/original.toml".into(),
+                missing: Vec::new(),
+                dismissed: false,
+                message: message.into(),
+                description: message.into(),
+                value_lines: vec!["API_KEY for server-a".into()],
+                discard_values: vec!["• API_KEY for server-a".into()],
+                error: error.map(Into::into),
+                can_discard: error.is_none(),
+                can_discard_file: error.is_some(),
+                can_retry: error.is_none(),
+                discard_started: false,
+                discard_action: "Discard these saved values".into(),
+                cleanup: false,
+                instructions: "Unlock your keyring, then choose Retry.".into(),
+                retention: "The recovery backup does not expire automatically.".into(),
+                details: "fixture".into(),
+            }
+        };
+        page.render(snapshot(vec![home.clone()]));
+        // Set after render, which reloads the (empty) recoveries from the data folder.
+        page.recoveries.borrow_mut().extend([
+            record("owed", "Codex (~/.t3/cx/codex) is disconnected.", None),
+            record(
+                "receipt",
+                "Toolport can't read the recovery receipt for Codex (~/.t3/cx/codex).",
+                Some("The receipt cannot be parsed."),
+            ),
+        ]);
+        page.append_recoveries(&page.recovery_box, None);
+        window.present();
+        let labels = |root: &gtk::Widget| -> Vec<String> {
+            widgets(root)
+                .iter()
+                .filter_map(|w| w.downcast_ref::<gtk::Label>().map(|l| l.text().to_string()))
+                .collect()
+        };
+        let list = page.details.stack.child_by_name("list").unwrap();
+        assert!(
+            labels(&list)
+                .iter()
+                .any(|text| text == "Used by T3 Code: Codex Extra (off)"),
+            "the T3 Code home row keeps its label"
+        );
+        for rid in ["owed", "receipt"] {
+            assert!(
+                widgets(page.recovery_box.upcast_ref())
+                    .iter()
+                    .any(|w| w.widget_name() == format!("client-recovery:{rid}")),
+                "the page shows the {rid} card"
+            );
+        }
+        client(&home, &page);
+        let detail = page.details.stack.child_by_name("detail").unwrap();
+        for rid in ["owed", "receipt"] {
+            assert!(
+                widgets(&detail)
+                    .iter()
+                    .any(|w| w.widget_name() == format!("client-recovery:{rid}")),
+                "the T3 Code home's detail shows the {rid} card"
+            );
+        }
+        window.close();
+    }
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn b5_same_detail_refresh_preserves_external_focus() {
         let _data = crate::registry::DataDirTestEnv::new("b5-external-focus");
         let app = app();
