@@ -17868,11 +17868,14 @@ fn write_stdio_response_then(
     true
 }
 
-fn handle_stdio_request(state: GatewayState, req: Value, request_key: String) {
+fn handle_stdio_request(
+    state: GatewayState,
+    req: Value,
+    cancel_context: downstream::CancelContext,
+) {
     // The connection's own registry, so a cancel carries the reason to the worker
-    // that is running this request and nothing else.
-    let cancel_registry = state.stdio_upstream.cancellations();
-    let cancel_context = cancel_registry.context(request_key.clone());
+    // that is running this request instance and nothing else.
+    let request_key = cancel_context.request_key();
     // The guards are the stdio session's own: one connection, one search streak (P1.2).
     let guards = state.stdio_upstream.guards();
     // A panic in a handler must not kill the gateway: catch it, log it, and
@@ -17886,7 +17889,7 @@ fn handle_stdio_request(state: GatewayState, req: Value, request_key: String) {
             None,
             None,
             None,
-            Some(cancel_context),
+            Some(cancel_context.clone()),
             None,
             None,
             state.discovery_mode(),
@@ -17898,14 +17901,14 @@ fn handle_stdio_request(state: GatewayState, req: Value, request_key: String) {
         Some(error(id, -32603, "internal error").into())
     });
 
-    if cancel_registry.is_cancelled(&request_key) {
+    if cancel_context.is_cancelled() {
         glog(&format!(
             "suppressing response for cancelled request {request_key}"
         ));
-        cancel_registry.finish_client_request(&request_key);
+        cancel_context.finish();
         return;
     }
-    cancel_registry.finish_client_request(&request_key);
+    cancel_context.finish();
 
     if let Some(resp) = response {
         // The peer has an answer on the wire now, so anything the catalog
@@ -18986,11 +18989,10 @@ fn handle_mcp_http(
                     );
                 }
             }
-            let _request_end = HttpRequestEnd {
-                cancellations: cancellations.clone(),
-                key: request_key.clone(),
-            };
             let cancel = request_key.map(|key| cancellations.context(key));
+            let _request_end = HttpRequestEnd {
+                cancel: cancel.clone(),
+            };
             let _connection_cancel = HTTP_CONNECTION_CANCEL.with(|current| {
                 current.borrow().as_ref().map(|connection| {
                     let owned = cancellations.clone();
@@ -19941,13 +19943,12 @@ impl Drop for AdapterHostScope {
     }
 }
 struct HttpRequestEnd {
-    cancellations: downstream::CancelRegistry,
-    key: Option<String>,
+    cancel: Option<downstream::CancelContext>,
 }
 impl Drop for HttpRequestEnd {
     fn drop(&mut self) {
-        if let Some(key) = &self.key {
-            self.cancellations.finish_client_request(key);
+        if let Some(cancel) = &self.cancel {
+            cancel.finish();
         }
     }
 }
@@ -23030,9 +23031,11 @@ fn main() {
             continue;
         }
 
+        // Capture this instance now: a reused id begins a new one.
+        let cancel_context = state.stdio_upstream.cancellations().context(request_key);
         let state = state.clone();
         let job = move || {
-            handle_stdio_request(state, req, request_key);
+            handle_stdio_request(state, req, cancel_context);
         };
         if let Some(handle) = spawn_or_run_stdio_inflight(&stdio_inflight, job) {
             stdio_workers.push(handle);

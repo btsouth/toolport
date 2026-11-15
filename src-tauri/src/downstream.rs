@@ -1099,14 +1099,43 @@ pub struct CancelRegistry {
 
 type CancelCallback = Arc<dyn Fn(Option<String>) + Send + Sync>;
 
+/// One request instance: its client request id and the generation it began with.
+/// A client may reuse an id it cancelled before the old exchange has unwound, so the
+/// id alone does not name one request.
+type Slot = (String, u64);
+
 #[derive(Default)]
 struct CancelState {
-    active: HashSet<String>,
-    cancelled: HashMap<String, Option<String>>,
-    hooks: HashMap<String, HashMap<u64, CancelCallback>>,
+    /// The newest instance of each id that has begun and not yet been cleaned up.
+    generations: HashMap<String, u64>,
+    next_generation: u64,
+    active: HashSet<Slot>,
+    cancelled: HashMap<Slot, Option<String>>,
+    hooks: HashMap<Slot, HashMap<u64, CancelCallback>>,
     next_hook: u64,
     closed: bool,
     finished: bool,
+}
+
+impl CancelState {
+    /// The newest instance of `id`; generation 0 when none has begun.
+    fn current(&self, id: &str) -> Slot {
+        (
+            id.to_string(),
+            self.generations.get(id).copied().unwrap_or(0),
+        )
+    }
+
+    /// Drop what a finished instance left behind once nothing refers to it.
+    fn settle(&mut self, slot: &Slot) {
+        if self.active.contains(slot) || self.hooks.contains_key(slot) {
+            return;
+        }
+        self.cancelled.remove(slot);
+        if self.generations.get(&slot.0) == Some(&slot.1) {
+            self.generations.remove(&slot.0);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1125,6 +1154,7 @@ struct CancelEntry {
 #[derive(Clone)]
 pub struct CancelContext {
     client_request_id: String,
+    generation: u64,
     registry: CancelRegistry,
 }
 
@@ -1132,8 +1162,27 @@ impl CancelContext {
     pub fn request_key(&self) -> String {
         self.client_request_id.clone()
     }
+    fn slot(&self) -> Slot {
+        (self.client_request_id.clone(), self.generation)
+    }
+
     pub fn is_cancelled(&self) -> bool {
-        self.registry.is_cancelled(&self.client_request_id)
+        let state = self
+            .registry
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.closed || state.cancelled.contains_key(&self.slot())
+    }
+
+    /// Forward a cancellation of this instance to the downstream request.
+    fn register(&self, entry: CancelEntry) -> CancelGuard {
+        self.on_cancel(Arc::new(move |reason| entry.send_cancel_async(reason)))
+    }
+
+    /// This instance's request is done; a reused id's newer instance is untouched.
+    pub fn finish(&self) {
+        self.registry.finish_slot(&self.slot());
     }
 
     fn reason(&self) -> Option<String> {
@@ -1142,13 +1191,14 @@ impl CancelContext {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .cancelled
-            .get(&self.client_request_id)
+            .get(&self.slot())
             .cloned()
             .flatten()
     }
 
     /// Keep an owned resource cancellable after its upstream round returns.
     pub fn on_cancel(&self, callback: CancelCallback) -> CancelGuard {
+        let slot = self.slot();
         let (key, cancelled) = {
             let mut state = self
                 .registry
@@ -1157,21 +1207,14 @@ impl CancelContext {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.next_hook += 1;
             let key = state.next_hook;
-            let cancelled = if state.closed || state.cancelled.contains_key(&self.client_request_id)
-            {
-                Some(
-                    state
-                        .cancelled
-                        .get(&self.client_request_id)
-                        .cloned()
-                        .flatten(),
-                )
+            let cancelled = if state.closed || state.cancelled.contains_key(&slot) {
+                Some(state.cancelled.get(&slot).cloned().flatten())
             } else {
                 None
             };
             state
                 .hooks
-                .entry(self.client_request_id.clone())
+                .entry(slot.clone())
                 .or_default()
                 .insert(key, callback.clone());
             (key, cancelled)
@@ -1180,7 +1223,7 @@ impl CancelContext {
             callback(reason);
         }
         CancelGuard {
-            client_request_id: self.client_request_id.clone(),
+            slot,
             registry: self.registry.clone(),
             key,
         }
@@ -1188,7 +1231,7 @@ impl CancelContext {
 }
 
 pub struct CancelGuard {
-    client_request_id: String,
+    slot: Slot,
     registry: CancelRegistry,
     key: u64,
 }
@@ -1198,58 +1241,83 @@ impl CancelRegistry {
         Self::default()
     }
 
+    /// Begin a request instance. A live id is a duplicate; an id whose newest
+    /// instance the client already cancelled may be reused at once, as a new instance
+    /// with its own state, even while the cancelled one is still unwinding.
     pub fn begin_client_request(&self, client_request_id: String) -> bool {
         let mut state = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.closed || state.active.contains(&client_request_id) {
+        let current = state.current(&client_request_id);
+        if state.closed
+            || (state.active.contains(&current) && !state.cancelled.contains_key(&current))
+        {
             return false;
         }
-        state.cancelled.remove(&client_request_id);
-        state.active.insert(client_request_id);
+        state.next_generation += 1;
+        let generation = state.next_generation;
+        state
+            .generations
+            .insert(client_request_id.clone(), generation);
+        state.active.insert((client_request_id, generation));
         true
     }
 
+    /// Finish the newest instance of an id. Workers that may outlive a reuse finish
+    /// through their own [`CancelContext::finish`].
     pub fn finish_client_request(&self, client_request_id: &str) {
+        let slot = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current(client_request_id);
+        self.finish_slot(&slot);
+    }
+
+    fn finish_slot(&self, slot: &Slot) {
         let mut state = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.active.remove(client_request_id);
-        if !state.hooks.contains_key(client_request_id) {
-            state.cancelled.remove(client_request_id);
-        }
+        state.active.remove(slot);
+        state.settle(slot);
     }
 
+    /// The context of the newest instance of `client_request_id`.
     pub fn context(&self, client_request_id: String) -> CancelContext {
+        let generation = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current(&client_request_id)
+            .1;
         CancelContext {
             client_request_id,
+            generation,
             registry: self.clone(),
         }
     }
 
+    /// Cancel the newest instance of an id: the one the client means.
     pub fn cancel(&self, client_request_id: &str, reason: Option<&str>) -> bool {
         let (hooks, reason) = {
             let mut state = self
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !state.active.contains(client_request_id)
-                && !state.hooks.contains_key(client_request_id)
-            {
+            let slot = state.current(client_request_id);
+            if !state.active.contains(&slot) && !state.hooks.contains_key(&slot) {
                 return false;
             }
-            if state.cancelled.contains_key(client_request_id) {
+            if state.cancelled.contains_key(&slot) {
                 return true;
             }
             let reason = normalize_cancel_reason(reason);
-            state
-                .cancelled
-                .insert(client_request_id.to_string(), reason.clone());
+            state.cancelled.insert(slot.clone(), reason.clone());
             let hooks = state
                 .hooks
-                .get(client_request_id)
+                .get(&slot)
                 .map(|hooks| hooks.values().cloned().collect::<Vec<_>>())
                 .unwrap_or_default();
             (hooks, reason)
@@ -1285,7 +1353,7 @@ impl CancelRegistry {
                 .iter()
                 .chain(state.hooks.keys())
                 .cloned()
-                .collect::<HashSet<_>>();
+                .collect::<HashSet<Slot>>();
             let mut hooks = Vec::new();
             for id in ids {
                 if state.cancelled.contains_key(&id) {
@@ -1305,14 +1373,19 @@ impl CancelRegistry {
         }
     }
 
+    /// Whether the newest instance of an id is cancelled.
     pub fn is_cancelled(&self, client_request_id: &str) -> bool {
         let state = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.closed || state.cancelled.contains_key(client_request_id)
+        state.closed
+            || state
+                .cancelled
+                .contains_key(&state.current(client_request_id))
     }
 
+    #[cfg(test)]
     fn register(&self, client_request_id: String, entry: CancelEntry) -> CancelGuard {
         self.context(client_request_id)
             .on_cancel(Arc::new(move |reason| entry.send_cancel_async(reason)))
@@ -1417,17 +1490,13 @@ impl Drop for CancelGuard {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(hooks) = state.hooks.get_mut(&self.client_request_id) {
+        if let Some(hooks) = state.hooks.get_mut(&self.slot) {
             hooks.remove(&self.key);
             if hooks.is_empty() {
-                state.hooks.remove(&self.client_request_id);
+                state.hooks.remove(&self.slot);
             }
         }
-        if !state.active.contains(&self.client_request_id)
-            && !state.hooks.contains_key(&self.client_request_id)
-        {
-            state.cancelled.remove(&self.client_request_id);
-        }
+        state.settle(&self.slot);
     }
 }
 
@@ -3856,16 +3925,13 @@ impl StdioCore {
                 .map_err(|e| TransportError::Unavailable(e.to_string()))?;
         }
         let cancel_guard = cancel.map(|ctx| {
-            ctx.registry.register(
-                ctx.client_request_id.clone(),
-                CancelEntry {
-                    stdin: Arc::clone(&self.stdin),
-                    forwarder: self.forwarder.clone(),
-                    downstream_id: downstream_id.clone(),
-                    waiter: Some(Arc::downgrade(self)),
-                    forwarded: forwarded.clone(),
-                },
-            )
+            ctx.register(CancelEntry {
+                stdin: Arc::clone(&self.stdin),
+                forwarder: self.forwarder.clone(),
+                downstream_id: downstream_id.clone(),
+                waiter: Some(Arc::downgrade(self)),
+                forwarded: forwarded.clone(),
+            })
         });
         self.wait(
             waiter,
@@ -12317,6 +12383,37 @@ mod tests {
     }
 
     #[test]
+    fn a_cancelled_id_can_be_reused_before_its_request_finishes() {
+        // A client that cancelled 7 no longer has 7 in flight and may send a new 7
+        // while the old exchange is still unwinding. Each instance keeps its own
+        // state: the old one stays cancelled and finishes only itself.
+        let registry = CancelRegistry::new();
+        assert!(registry.begin_client_request("7".to_string()));
+        let old = registry.context("7".to_string());
+        assert!(registry.cancel("7", Some("user")));
+        assert!(registry.begin_client_request("7".to_string()));
+        let new = registry.context("7".to_string());
+        assert!(old.is_cancelled());
+        assert!(!new.is_cancelled());
+        // A live, uncancelled 7 is still a duplicate.
+        assert!(!registry.begin_client_request("7".to_string()));
+        // The old worker finishing does not end the replacement.
+        old.finish();
+        assert!(!registry.begin_client_request("7".to_string()));
+        // A cancel for 7 now reaches the replacement, and only it.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fired = Arc::new(AtomicBool::new(false));
+        let seen = fired.clone();
+        let _hook = new.on_cancel(Arc::new(move |_| seen.store(true, Ordering::SeqCst)));
+        assert!(registry.cancel("7", None));
+        assert!(new.is_cancelled());
+        assert!(fired.load(Ordering::SeqCst));
+        new.finish();
+        assert!(registry.begin_client_request("7".to_string()));
+        assert!(!registry.context("7".to_string()).is_cancelled());
+    }
+
+    #[test]
     fn cancel_registry_persists_reason_for_deferred_forward() {
         let registry = CancelRegistry::new();
         assert!(registry.begin_client_request("7".to_string()));
@@ -12326,7 +12423,10 @@ mod tests {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cancelled = state.cancelled.get("7").expect("cancelled state");
+        let cancelled = state
+            .cancelled
+            .get(&state.current("7"))
+            .expect("cancelled state");
         assert_eq!(cancelled.as_deref(), Some("too slow"));
     }
 
