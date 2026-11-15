@@ -2417,7 +2417,8 @@ impl CatalogIds {
 struct IdBuilder {
     server: String,
     catalog: Catalog,
-    key: [u8; 32],
+    /// Read on the first alias: most catalogs hold no secret and never need it.
+    key: Option<[u8; 32]>,
     ids: CatalogIds,
     /// Each alias marker handed out, with the identifier and span it stands for.
     owners: HashMap<String, (Part, String, usize)>,
@@ -2428,7 +2429,7 @@ impl IdBuilder {
         Self {
             server: server.to_string(),
             catalog,
-            key: alias_key(),
+            key: None,
             ids: CatalogIds::default(),
             owners: HashMap::new(),
         }
@@ -2441,8 +2442,9 @@ impl IdBuilder {
     /// the rare clash within this catalog.
     fn alias(&mut self, part: Part, original: &str, index: usize, base: &str) -> String {
         use hmac::{Hmac, Mac};
+        let key = *self.key.get_or_insert_with(alias_key);
         let mut mac =
-            Hmac::<sha2::Sha256>::new_from_slice(&self.key).expect("HMAC takes any key length");
+            Hmac::<sha2::Sha256>::new_from_slice(&key).expect("HMAC takes any key length");
         for field in [
             self.server.as_bytes(),
             self.catalog.as_str().as_bytes(),
