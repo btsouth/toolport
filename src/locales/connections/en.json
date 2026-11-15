@@ -421,6 +421,7 @@
   "Enter the URL of your self-hosted instance. For example:{value1}{value2}": "Enter the URL of your self-hosted instance. For example:{value1}{value2}",
   "Enter the value for this machine": "Enter the value for this machine",
   "Enter value": "Enter value",
+  "Enter {value0} or deselect {value1}": "Enter {value0} or deselect {value1}",
   "ENV_NAME": "ENV_NAME",
   "Environment variables": "Environment variables",
   "Ephemeral, local, opt-in. While live inspection is on, Toolport keeps the last 50 tool calls' arguments and results here so you can inspect them. This buffer is separate from the audit log, never leaves your machine, and clears when you turn inspection off or restart the gateway.": "Ephemeral, local, opt-in. While live inspection is on, Toolport keeps the last 50 tool calls' arguments and results here so you can inspect them. This buffer is separate from the audit log, never leaves your machine, and clears when you turn inspection off or restart the gateway.",

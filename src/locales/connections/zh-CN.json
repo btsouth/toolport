@@ -421,6 +421,7 @@
   "Enter the URL of your self-hosted instance. For example:{value1}{value2}": "输入您的自托管实例的 URL。例如：{value1}{value2}",
   "Enter the value for this machine": "输入该机器的值",
   "Enter value": "输入值",
+  "Enter {value0} or deselect {value1}": "输入{value0}或取消选择{value1}",
   "ENV_NAME": "ENV_NAME",
   "Environment variables": "环境变量",
   "Ephemeral, local, opt-in. While live inspection is on, Toolport keeps the last 50 tool calls' arguments and results here so you can inspect them. This buffer is separate from the audit log, never leaves your machine, and clears when you turn inspection off or restart the gateway.": "仅在启用实时检查时，本地保存最近50次工具调用的参数和结果。缓冲区独立于审计日志，不离开本机，关闭检查或重启网关时清空。",

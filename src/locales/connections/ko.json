@@ -421,6 +421,7 @@
   "Enter the URL of your self-hosted instance. For example:{value1}{value2}": "자체 호스팅 인스턴스의 URL을 입력하세요. 예:{value1}{value2}",
   "Enter the value for this machine": "이 기기에서 사용할 값 입력",
   "Enter value": "값을 입력하세요",
+  "Enter {value0} or deselect {value1}": "{value0} 값을 입력하거나 {value1} 선택을 해제하세요",
   "ENV_NAME": "ENV_NAME",
   "Environment variables": "환경변수",
   "Ephemeral, local, opt-in. While live inspection is on, Toolport keeps the last 50 tool calls' arguments and results here so you can inspect them. This buffer is separate from the audit log, never leaves your machine, and clears when you turn inspection off or restart the gateway.": "실시간 검사를 켠 동안 최근 50회 호출의 인수와 결과를 로컬에 보관합니다. 감사 로그와 별개이며 기기 밖으로 전송되지 않고 검사를 끄거나 게이트웨이를 재시작하면 지워집니다.",

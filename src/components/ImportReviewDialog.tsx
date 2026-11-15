@@ -143,7 +143,12 @@ function ImportReviewContent({
                   !env.present &&
                   !credentialInputs[item.name]?.[env.key]?.trim(),
               )
-              .map((env) => `Enter ${env.key} or deselect ${item.name}`)
+              .map((env) =>
+                t("Enter {value0} or deselect {value1}", {
+                  value0: env.key,
+                  value1: item.name,
+                }),
+              )
           : [],
       )
     : [];

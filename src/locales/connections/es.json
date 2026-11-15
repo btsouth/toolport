@@ -421,6 +421,7 @@
   "Enter the URL of your self-hosted instance. For example:{value1}{value2}": "Ingrese la URL de su instancia autohospedada. Por ejemplo:{value1}{value2}",
   "Enter the value for this machine": "Introduzca el valor para esta máquina",
   "Enter value": "Introducir valor",
+  "Enter {value0} or deselect {value1}": "Ingrese {value0} o anule la selección de {value1}",
   "ENV_NAME": "ENV_NAME",
   "Environment variables": "Variables de entorno",
   "Ephemeral, local, opt-in. While live inspection is on, Toolport keeps the last 50 tool calls' arguments and results here so you can inspect them. This buffer is separate from the audit log, never leaves your machine, and clears when you turn inspection off or restart the gateway.": "Solo al activarlo, conserva localmente argumentos y resultados de las últimas 50 llamadas. El búfer es independiente del registro de auditoría, no sale del equipo y se borra al desactivar o reiniciar el gateway.",
