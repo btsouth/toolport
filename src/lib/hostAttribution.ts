@@ -245,10 +245,10 @@ export function t3CodeGapLines(others: T3CodeOther[]): string[] {
       translate(
         outsideHome.length === 1
           ? msg(
-              "Toolport won't use the home folder {names} uses: it isn't inside your home folder. Toolport only manages configs inside it; add it by hand as a client location if you trust it.",
+              "Toolport won't use the home folder {names} uses: it isn't written as a plain folder inside your home folder. Toolport only manages configs inside it; add it by hand as a client location if you trust it.",
             )
           : msg(
-              "Toolport won't use the home folders {names} use: they aren't inside your home folder. Toolport only manages configs inside it; add each by hand as a client location if you trust it.",
+              "Toolport won't use the home folders {names} use: they aren't written as plain folders inside your home folder. Toolport only manages configs inside it; add each by hand as a client location if you trust it.",
             ),
         { names: names("outsideHome") },
       ),
@@ -259,10 +259,10 @@ export function t3CodeGapLines(others: T3CodeOther[]): string[] {
       translate(
         linkedHome.length === 1
           ? msg(
-              "Toolport won't use the home folder {names} uses: it, or its config file, is a link or not a plain folder or file. Point it at the real folder in T3 Code's provider settings, or add it by hand as a client location if you trust it.",
+              "Toolport won't use the home folder {names} uses: it, or its config file, is a link or not a plain folder or file. Point it at the real folder in T3 Code's provider settings.",
             )
           : msg(
-              "Toolport won't use the home folders {names} use: they, or their config files, are links or not plain folders or files. Point each at the real folder in T3 Code's provider settings, or add it by hand as a client location if you trust it.",
+              "Toolport won't use the home folders {names} use: they, or their config files, are links or not plain folders or files. Point each at the real folder in T3 Code's provider settings.",
             ),
         { names: names("linkedHome") },
       ),
@@ -293,6 +293,20 @@ export function t3CodeGapLines(others: T3CodeOther[]): string[] {
               "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once the home folders {names} use exist, add each by hand as a client location to connect it.",
             ),
         { names: names("unlistedHome") },
+      ),
+    );
+  const unlistedOpenCodeHome = of("unlistedOpenCodeHome");
+  if (unlistedOpenCodeHome.length > 0)
+    lines.push(
+      translate(
+        unlistedOpenCodeHome.length === 1
+          ? msg(
+              "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once {names}'s config folder exists, add the opencode folder inside it by hand as a client location to connect it.",
+            )
+          : msg(
+              "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once the config folders {names} use exist, add the opencode folder inside each by hand as a client location to connect it.",
+            ),
+        { names: names("unlistedOpenCodeHome") },
       ),
     );
   const unreadable = others.find((other) => other.gap === "unreadable");

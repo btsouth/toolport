@@ -822,9 +822,9 @@ pub(super) fn t3_code_gap_lines(others: &[crate::clients::T3CodeOther]) -> Vec<S
     if outside_home > 0 {
         lines.push(crate::i18n::trf(
             if outside_home == 1 {
-                "Toolport won't use the home folder {names} uses: it isn't inside your home folder. Toolport only manages configs inside it; add it by hand as a client location if you trust it."
+                "Toolport won't use the home folder {names} uses: it isn't written as a plain folder inside your home folder. Toolport only manages configs inside it; add it by hand as a client location if you trust it."
             } else {
-                "Toolport won't use the home folders {names} use: they aren't inside your home folder. Toolport only manages configs inside it; add each by hand as a client location if you trust it."
+                "Toolport won't use the home folders {names} use: they aren't written as plain folders inside your home folder. Toolport only manages configs inside it; add each by hand as a client location if you trust it."
             },
             &[("names", &names(crate::clients::T3CodeGap::OutsideHome))],
         ));
@@ -833,9 +833,9 @@ pub(super) fn t3_code_gap_lines(others: &[crate::clients::T3CodeOther]) -> Vec<S
     if linked_home > 0 {
         lines.push(crate::i18n::trf(
             if linked_home == 1 {
-                "Toolport won't use the home folder {names} uses: it, or its config file, is a link or not a plain folder or file. Point it at the real folder in T3 Code's provider settings, or add it by hand as a client location if you trust it."
+                "Toolport won't use the home folder {names} uses: it, or its config file, is a link or not a plain folder or file. Point it at the real folder in T3 Code's provider settings."
             } else {
-                "Toolport won't use the home folders {names} use: they, or their config files, are links or not plain folders or files. Point each at the real folder in T3 Code's provider settings, or add it by hand as a client location if you trust it."
+                "Toolport won't use the home folders {names} use: they, or their config files, are links or not plain folders or files. Point each at the real folder in T3 Code's provider settings."
             },
             &[("names", &names(crate::clients::T3CodeGap::LinkedHome))],
         ));
@@ -860,6 +860,17 @@ pub(super) fn t3_code_gap_lines(others: &[crate::clients::T3CodeOther]) -> Vec<S
                 "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once the home folders {names} use exist, add each by hand as a client location to connect it."
             },
             &[("names", &names(crate::clients::T3CodeGap::UnlistedHome))],
+        ));
+    }
+    let unlisted_opencode_home = count(crate::clients::T3CodeGap::UnlistedOpenCodeHome);
+    if unlisted_opencode_home > 0 {
+        lines.push(crate::i18n::trf(
+            if unlisted_opencode_home == 1 {
+                "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once {names}'s config folder exists, add the opencode folder inside it by hand as a client location to connect it."
+            } else {
+                "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once the config folders {names} use exist, add the opencode folder inside each by hand as a client location to connect it."
+            },
+            &[("names", &names(crate::clients::T3CodeGap::UnlistedOpenCodeHome))],
         ));
     }
     if let Some(file) = others
@@ -1391,14 +1402,14 @@ mod tests {
                 other("Linked", "Claude", false, T3CodeGap::LinkedHome),
                 other("Work", "Claude", true, T3CodeGap::MissingHome),
                 other("Grok", "Grok", true, T3CodeGap::RelativeHome),
-                other("Notes", "OpenCode", true, T3CodeGap::UnlistedHome),
+                other("Notes", "OpenCode", true, T3CodeGap::UnlistedOpenCodeHome),
             ]),
             [
                 "Toolport can't tell which home folder Grok uses: it is a relative path. Set it to a full path in T3 Code's provider settings.",
-                "Toolport won't use the home folder Away (Codex) uses: it isn't inside your home folder. Toolport only manages configs inside it; add it by hand as a client location if you trust it.",
-                "Toolport won't use the home folder Linked (Claude) (off) uses: it, or its config file, is a link or not a plain folder or file. Point it at the real folder in T3 Code's provider settings, or add it by hand as a client location if you trust it.",
+                "Toolport won't use the home folder Away (Codex) uses: it isn't written as a plain folder inside your home folder. Toolport only manages configs inside it; add it by hand as a client location if you trust it.",
+                "Toolport won't use the home folder Linked (Claude) (off) uses: it, or its config file, is a link or not a plain folder or file. Point it at the real folder in T3 Code's provider settings.",
                 "Toolport can't connect Work (Claude) yet: its home folder doesn't exist yet. Start it once in T3 Code, then refresh Clients.",
-                "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once Notes (OpenCode)'s home folder exists, add it by hand as a client location to connect it.",
+                "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once Notes (OpenCode)'s config folder exists, add the opencode folder inside it by hand as a client location to connect it.",
             ]
         );
         assert_eq!(
@@ -1409,14 +1420,17 @@ mod tests {
                 other("D", "Pi", true, T3CodeGap::LinkedHome),
                 other("E", "Grok", true, T3CodeGap::MissingHome),
                 other("F", "Codex", false, T3CodeGap::MissingHome),
-                other("G", "OpenCode", true, T3CodeGap::UnlistedHome),
+                other("G", "OpenCode", true, T3CodeGap::UnlistedOpenCodeHome),
                 other("H", "Pi", false, T3CodeGap::UnlistedHome),
+                other("I", "Grok", true, T3CodeGap::UnlistedHome),
+                other("J", "OpenCode", false, T3CodeGap::UnlistedOpenCodeHome),
             ]),
             [
-                "Toolport won't use the home folders A (Codex), B (Claude) use: they aren't inside your home folder. Toolport only manages configs inside it; add each by hand as a client location if you trust it.",
-                "Toolport won't use the home folders C (Claude), D (Pi) use: they, or their config files, are links or not plain folders or files. Point each at the real folder in T3 Code's provider settings, or add it by hand as a client location if you trust it.",
+                "Toolport won't use the home folders A (Codex), B (Claude) use: they aren't written as plain folders inside your home folder. Toolport only manages configs inside it; add each by hand as a client location if you trust it.",
+                "Toolport won't use the home folders C (Claude), D (Pi) use: they, or their config files, are links or not plain folders or files. Point each at the real folder in T3 Code's provider settings.",
                 "Toolport can't connect E (Grok), F (Codex) (off) yet: their home folders don't exist yet. Start each once in T3 Code, then refresh Clients.",
-                "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once the home folders G (OpenCode), H (Pi) (off) use exist, add each by hand as a client location to connect it.",
+                "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once the home folders H (Pi) (off), I (Grok) use exist, add each by hand as a client location to connect it.",
+                "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once the config folders G (OpenCode), J (OpenCode) (off) use exist, add the opencode folder inside each by hand as a client location to connect it.",
             ]
         );
         // Every enabled one counts as not connected; an off one does not.

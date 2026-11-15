@@ -63,15 +63,21 @@ as it is, with why and what to do:
 - A home folder outside your home folder, written with `.`, `..` or `//`, or on a
   network or device path.
   Toolport judges it by its text alone and never opens it. Add it by hand as a client
-  location if you trust it.
+  location if you trust it. Once a saved location names the same config, by its text,
+  the card stops listing it.
 - A home folder with a link anywhere below your home folder
   (the home itself, a folder above it, or its config file), or something that isn't a
-  plain folder or file. Point the instance at the real folder, or add it by hand.
+  plain folder or file. Point the instance at the real folder in T3 Code's provider
+  settings.
 - A Claude Code or Codex home folder that doesn't exist yet. Start the instance once in T3 Code, then
   refresh Clients.
-- An OpenCode, Grok or Pi home folder that no row on the page covers. Toolport makes
-  rows only for Claude Code and Codex homes, so once the folder exists, add it by hand
-  as a client location to connect it.
+- A Grok or Pi home folder that no row on the page covers. Toolport makes rows only
+  for Claude Code and Codex homes, so once the folder exists, add it by hand as a
+  client location to connect it. Toolport's own Grok and Pi rows follow `GROK_HOME`
+  and `PI_CODING_AGENT_DIR` as Toolport sees them, so a home that is one of those
+  already has a row.
+- An OpenCode config folder (its `XDG_CONFIG_HOME`) that no row covers. Once it
+  exists, add the `opencode` folder inside it by hand as a client location.
 - An entry in `settings.json` Toolport can't read, or a settings file it can't read
   at all, named by its path with `~` for your home folder.
 

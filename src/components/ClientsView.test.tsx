@@ -863,14 +863,14 @@ describe("ClientsView", () => {
       vi.useFakeTimers();
       vi.mocked(t3CodeRevision).mockResolvedValue("a");
       vi.mocked(t3CodeOtherInstances).mockResolvedValue([
-        other("notes", "OpenCode", "Notes", "unlistedHome"),
+        other("notes", "OpenCode", "Notes", "unlistedOpenCodeHome"),
       ]);
       render(
         <ClientsView clients={[client()]} registry={null} onSelectClient={vi.fn()} />,
       );
       await act(() => vi.advanceTimersByTimeAsync(0));
       expect(card()).toHaveTextContent(
-        "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once Notes (OpenCode)'s home folder exists, add it by hand as a client location to connect it.",
+        "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once Notes (OpenCode)'s config folder exists, add the opencode folder inside it by hand as a client location to connect it.",
       );
     });
 
@@ -983,7 +983,7 @@ describe("ClientsView", () => {
         "Toolport can't see which home folder Pi Hidden (Pi) uses: it is marked sensitive or isn't plain text. Set its home folder as plain text in T3 Code's provider settings.",
       );
       expect(card()).toHaveTextContent(
-        "Toolport won't use the home folder Away (Codex) uses: it isn't inside your home folder. Toolport only manages configs inside it; add it by hand as a client location if you trust it.",
+        "Toolport won't use the home folder Away (Codex) uses: it isn't written as a plain folder inside your home folder. Toolport only manages configs inside it; add it by hand as a client location if you trust it.",
       );
       expect(card()).toHaveTextContent(
         "Toolport won't use the home folder Linked (Claude) (off) uses: it, or its config file, is a link or not a plain folder or file.",
