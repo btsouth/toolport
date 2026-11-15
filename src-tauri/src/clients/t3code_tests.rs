@@ -114,14 +114,14 @@ fn fixture_home() -> PathBuf {
 
 fn instances_of(reading: Reading) -> Vec<Instance> {
     match reading {
-        Reading::Instances(instances, _) => instances,
+        Reading::Instances(instances, _, _) => instances,
         other => panic!("expected instances, got {other:?}"),
     }
 }
 
 fn others_of(reading: Reading) -> Vec<T3CodeOther> {
     match reading {
-        Reading::Instances(_, others) => others,
+        Reading::Instances(_, others, _) => others,
         other => panic!("expected instances, got {other:?}"),
     }
 }
@@ -724,6 +724,7 @@ fn location_ids_are_stable_and_recognised() {
 
 #[test]
 fn t3_homes_without_launchers_become_locations_once() {
+    let _lock = crate::registry::data_dir_test_lock();
     let root = std::env::temp_dir().join(format!(
         "toolport-t3-rows-{}-{}",
         std::process::id(),
@@ -748,8 +749,6 @@ fn t3_homes_without_launchers_become_locations_once() {
         ),
     )
     .unwrap();
-    // `automatic` reads the saved locations, so the data folder must be a scratch one.
-    let _lock = crate::registry::data_dir_test_lock();
     let _data = crate::registry::DataDirOverride::set(root.join("data"));
     let _home = TestHome::set(&home);
     let real = std::fs::canonicalize(&home).unwrap();
@@ -1013,7 +1012,7 @@ fn every_home_toolport_will_not_use_is_listed_with_why() {
             "OpenCode",
             "Plain OC",
             true,
-            "unlistedHome".to_string(),
+            "unlistedOpenCodeHome".to_string(),
         ),
         (
             "off_missing",
@@ -1655,7 +1654,7 @@ fn hostile_settings_cannot_reach_outside_home_or_t3_codes_folder() {
         "]".repeat(200_000)
     ));
     match &*current() {
-        Reading::Instances(found, others) => {
+        Reading::Instances(found, others, _) => {
             assert!(found.iter().all(|i| i.id != "x"));
             assert_eq!(
                 others
@@ -1698,7 +1697,7 @@ fn hostile_settings_cannot_reach_outside_home_or_t3_codes_folder() {
         std::fs::remove_file(&settings).unwrap();
         std::os::unix::fs::symlink(home.join(".t3/userdata/real.json"), &settings).unwrap();
         assert!(
-            matches!(&*current(), Reading::Instances(found, _) if found.iter().any(|i| i.display_name == "Inside"))
+            matches!(&*current(), Reading::Instances(found, _, _) if found.iter().any(|i| i.display_name == "Inside"))
         );
         // A dangling link is unreadable, not "no settings yet".
         std::fs::remove_file(&settings).unwrap();
@@ -1734,7 +1733,7 @@ fn a_swap_between_the_check_and_the_open_is_not_read() {
     let _data = crate::registry::DataDirOverride::set(root.join("data"));
     let _home = TestHome::set(&home);
     let reads_outside = || match &*current() {
-        Reading::Instances(found, _) => found.iter().any(|i| i.display_name == "Outside"),
+        Reading::Instances(found, _, _) => found.iter().any(|i| i.display_name == "Outside"),
         _ => false,
     };
     let inside = |padding: usize| {
@@ -1975,5 +1974,142 @@ fn an_opencode_home_with_only_jsonc_labels_its_row() {
         annotate(&mut clients);
         assert!(clients[0].t3_code.is_empty(), "{:?}", clients[0].t3_code);
     }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The card compares a Grok, OpenCode or Pi home with the path that client's own row
+/// uses, which honors Toolport's `GROK_HOME`, `XDG_CONFIG_HOME` and
+/// `PI_CODING_AGENT_DIR`. A T3 Code instance naming that same folder has a row.
+#[test]
+fn a_home_that_is_the_clients_own_row_is_not_listed() {
+    let _lock = crate::registry::data_dir_test_lock();
+    let root = std::env::temp_dir().join(format!(
+        "toolport-t3-own-row-{}-{}",
+        std::process::id(),
+        epoch_millis()
+    ));
+    let home = root.join("home");
+    std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+    for folder in [".grok-mine", ".xdg-mine/opencode", ".pi-mine"] {
+        std::fs::create_dir_all(home.join(folder)).unwrap();
+    }
+    std::fs::write(
+        home.join(".t3/userdata/settings.json"),
+        r#"{"providerInstances": {
+            "g": {"driver": "grok", "displayName": "G", "enabled": true,
+              "environment": [{"name": "GROK_HOME", "value": "~/.grok-mine"}]},
+            "o": {"driver": "opencode", "displayName": "O", "enabled": true,
+              "environment": [{"name": "XDG_CONFIG_HOME", "value": "~/.xdg-mine"}]},
+            "p": {"driver": "pi", "displayName": "P", "enabled": true,
+              "environment": [{"name": "PI_CODING_AGENT_DIR", "value": "~/.pi-mine"}]}
+        }}"#,
+    )
+    .unwrap();
+    let _data = crate::registry::DataDirOverride::set(root.join("data"));
+    let _home = TestHome::set(&home);
+    // Without Toolport's variables each home is one to add by hand.
+    assert_eq!(other_instances().len(), 3, "{:?}", other_instances());
+    let _grok = EnvRestore::set("GROK_HOME", &home.join(".grok-mine"));
+    let _xdg = EnvRestore::set("XDG_CONFIG_HOME", &home.join(".xdg-mine"));
+    let _pi = EnvRestore::set("PI_CODING_AGENT_DIR", &home.join(".pi-mine"));
+    assert_eq!(other_instances(), Vec::new());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A home T3 Code names outside home is listed until a saved location covers it, matched
+/// by text only: the outside folder is never opened (here it does not even exist). A
+/// home spelled with `//` matches the plain spelling. One spelled with `.` keeps its line,
+/// since a hand-added folder is saved resolved and text alone cannot tell they are one.
+#[test]
+fn an_outside_home_added_by_hand_is_no_longer_listed() {
+    let _lock = crate::registry::data_dir_test_lock();
+    let root = std::env::temp_dir().join(format!(
+        "toolport-t3-outside-added-{}-{}",
+        std::process::id(),
+        epoch_millis()
+    ));
+    let home = root.join("home");
+    let outside = root.join("not-created");
+    std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+    let o = json_path(&outside);
+    std::fs::write(
+        home.join(".t3/userdata/settings.json"),
+        format!(
+            r#"{{"providerInstances": {{
+            "away": {{"driver": "codex", "displayName": "Away", "config": {{"homePath": "{o}"}}}},
+            "slashes": {{"driver": "claudeAgent", "displayName": "Slashes", "config": {{"homePath": "~//cc"}}}},
+            "dot": {{"driver": "claudeAgent", "displayName": "Dot", "config": {{"homePath": "~/./dd"}}}},
+            "oc": {{"driver": "opencode", "displayName": "OC", "enabled": true,
+              "environment": [{{"name": "XDG_CONFIG_HOME", "value": "{o}/xdg"}}]}}
+        }}}}"#
+        ),
+    )
+    .unwrap();
+    let _data = crate::registry::DataDirOverride::set(root.join("data"));
+    let _home = TestHome::set(&home);
+    let listed = || {
+        let mut ids: Vec<String> = other_instances()
+            .into_iter()
+            .filter(|other| other.gap == T3CodeGap::OutsideHome)
+            .map(|other| other.instance_id)
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(listed(), ["away", "dot", "oc", "slashes"]);
+    let manual = |client_type: &str, config_path: PathBuf| locations::ClientLocation {
+        id: format!(
+            "{client_type}@{}",
+            &crate::registry::sha256_hex(&config_path.to_string_lossy())[..16]
+        ),
+        manual: true,
+        client_type: client_type.into(),
+        name: client_type.into(),
+        config_path,
+    };
+    for row in [
+        manual("codex", outside.join("config.toml")),
+        manual("claude-code", home.join("cc/.claude.json")),
+        manual("claude-code", home.join("dd/.claude.json")),
+        manual("opencode", outside.join("xdg/opencode/opencode.json")),
+    ] {
+        locations::remember(&row).unwrap();
+    }
+    assert!(!outside.exists());
+    assert_eq!(listed(), ["dot"]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A settings file that is a link to nothing still gives a revision, so the page asks
+/// for the card's lines and shows that T3 Code's settings can't be read. Nothing is
+/// read through the link.
+#[cfg(unix)]
+#[test]
+fn a_broken_settings_link_still_has_a_revision() {
+    let _lock = crate::registry::data_dir_test_lock();
+    let root = std::env::temp_dir().join(format!(
+        "toolport-t3-broken-rev-{}-{}",
+        std::process::id(),
+        epoch_millis()
+    ));
+    let home = root.join("home");
+    std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+    let _data = crate::registry::DataDirOverride::set(root.join("data"));
+    let _home = TestHome::set(&home);
+    assert_eq!(revision(), None, "no settings file yet");
+    std::os::unix::fs::symlink(
+        root.join("nothing"),
+        home.join(".t3/userdata/settings.json"),
+    )
+    .unwrap();
+    assert!(revision().is_some());
+    assert_eq!(*current(), Reading::Unreadable);
+    assert_eq!(
+        other_instances()
+            .iter()
+            .map(|other| other.gap)
+            .collect::<Vec<_>>(),
+        [T3CodeGap::Unreadable]
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -130,10 +130,13 @@ pub enum T3CodeGap {
     LinkedHome,
     /// This instance's home folder does not exist yet.
     MissingHome,
-    /// An OpenCode, Grok or Pi instance's home folder, existing or not yet, that no Clients
-    /// row covers. Toolport makes rows only for Claude Code and Codex homes, so this one
-    /// has to be added by hand as a client location.
+    /// A Grok or Pi instance's home folder, existing or not yet, that no Clients row
+    /// covers. Toolport makes rows only for Claude Code and Codex homes, so this one has
+    /// to be added by hand as a client location.
     UnlistedHome,
+    /// [`T3CodeGap::UnlistedHome`] for OpenCode, whose home is its `XDG_CONFIG_HOME`: the
+    /// location added by hand is the `opencode` folder inside it.
+    UnlistedOpenCodeHome,
 }
 
 /// A T3 Code instance Toolport cannot connect, shown on the T3 Code card.
@@ -165,10 +168,21 @@ fn other_driver(driver: &str) -> Option<(&'static str, T3CodeGap, bool)> {
 pub(super) enum Reading {
     /// T3 Code is not installed here: no data folder.
     Absent,
-    /// The instances Toolport can match, in instance id order, and the ones it cannot.
-    Instances(Vec<Instance>, Vec<T3CodeOther>),
+    /// The instances Toolport can match, in instance id order, and the ones it cannot,
+    /// with the config each [`T3CodeGap::OutsideHome`] one names.
+    Instances(Vec<Instance>, Vec<T3CodeOther>, Vec<Outside>),
     /// The file exists but could not be read as T3 Code settings.
     Unreadable,
+}
+
+/// The config a [`T3CodeGap::OutsideHome`] instance names, kept as text only: it is
+/// compared with saved locations by [`same_text`] and never opened, resolved or shown.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Outside {
+    /// Its entry in the reading's list of instances Toolport cannot connect.
+    pub index: usize,
+    pub client_type: &'static str,
+    pub config: PathBuf,
 }
 
 /// T3 Code's data folder: `T3CODE_HOME` (with `~` expanded) or `<home>/.t3`.
@@ -205,6 +219,23 @@ fn expand(raw: &str, home: &Path) -> Option<PathBuf> {
         return Some(home.join(rest));
     }
     Some(PathBuf::from(raw))
+}
+
+/// [`expand`] by text alone, for a home that is not plain text: `~//x` stays below home
+/// (as Node's `path.join` reads it) rather than becoming `/x`. Only ever compared.
+fn expand_text(raw: &str, home: &Path) -> PathBuf {
+    let raw = raw.trim();
+    if raw == "~" {
+        return home.to_path_buf();
+    }
+    match raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        Some(rest) => PathBuf::from(format!(
+            "{}{}{rest}",
+            home.display(),
+            std::path::MAIN_SEPARATOR
+        )),
+        None => PathBuf::from(raw),
+    }
 }
 
 /// Whether `path` is inside `home` by its text: absolute, no `.` or `..`, and below
@@ -402,7 +433,12 @@ fn checked_canonical(instance: &Instance) -> Option<PathBuf> {
 /// A cheap token that changes when T3 Code's settings change, for the Clients page to
 /// notice an edit while it is open. `None` when there is no settings file.
 pub fn revision() -> Option<String> {
-    let meta = std::fs::metadata(settings_path()?).ok()?;
+    let path = settings_path()?;
+    // A link to nothing still counts, so the page asks why it can't be read. Neither
+    // call reads the file.
+    let meta = std::fs::metadata(&path)
+        .or_else(|_| std::fs::symlink_metadata(&path))
+        .ok()?;
     let modified = meta
         .modified()
         .ok()
@@ -447,7 +483,7 @@ pub(super) fn current() -> Arc<Reading> {
         // T3 Code writes settings.json only after a setting changes. Until then its two
         // default instances are on, with their default homes.
         None if std::fs::symlink_metadata(&path).is_err() => {
-            Reading::Instances(with_defaults(BTreeMap::new()), Vec::new())
+            Reading::Instances(with_defaults(BTreeMap::new()), Vec::new(), Vec::new())
         }
         // A link to nothing.
         None => Reading::Unreadable,
@@ -710,6 +746,7 @@ fn parse_text(text: &str, home: &Path) -> Reading {
     };
     let mut found = BTreeMap::new();
     let mut others = Vec::new();
+    let mut outside = Vec::new();
     for (id, raw) in settings.provider_instances.unwrap_or_default() {
         // One odd instance must not hide the rest. T3 Code keeps unknown-driver configs
         // verbatim, so shapes Toolport does not know are expected.
@@ -717,13 +754,25 @@ fn parse_text(text: &str, home: &Path) -> Reading {
         // T3 Code's default for that id from standing in for it.
         let instance = match RawInstance::of(raw) {
             Some(raw) => match Provider::of(raw.driver.trim()) {
-                Some(provider) => match instance_of(&id, provider, raw, home) {
-                    Ok(instance) => Some(instance),
-                    Err(other) => {
-                        others.push(other);
-                        None
+                Some(provider) => {
+                    let mut named = None;
+                    match instance_of(&id, provider, raw, home, &mut named) {
+                        Ok(instance) => Some(instance),
+                        Err(other) => {
+                            if let Some(config) =
+                                named.filter(|_| other.gap == T3CodeGap::OutsideHome)
+                            {
+                                outside.push(Outside {
+                                    index: others.len(),
+                                    client_type: provider.client_type(),
+                                    config,
+                                });
+                            }
+                            others.push(other);
+                            None
+                        }
                     }
-                },
+                }
                 None => {
                     others.push(other_of(&id, raw));
                     None
@@ -736,7 +785,7 @@ fn parse_text(text: &str, home: &Path) -> Reading {
         };
         found.insert(id.clone(), instance);
     }
-    Reading::Instances(with_defaults(found), others)
+    Reading::Instances(with_defaults(found), others, outside)
 }
 
 /// The enabled rule T3 Code's `resolveProviderInstanceEnabled` applies: either flag off
@@ -875,12 +924,14 @@ fn config_of(config: &RawValue) -> Option<RawConfig> {
     serde_json::from_str(config.get()).ok()
 }
 
-/// The instance, or why Toolport cannot tell which config it reads.
+/// The instance, or why Toolport cannot tell which config it reads. For a home that is
+/// not plainly inside `home`, `named` gets the config it names, as text only.
 fn instance_of(
     id: &str,
     provider: Provider,
     raw: RawInstance,
     home: &Path,
+    named: &mut Option<PathBuf>,
 ) -> Result<Instance, T3CodeOther> {
     let display_name = raw
         .display_name
@@ -910,6 +961,9 @@ fn instance_of(
         None => RawConfig::default(),
     };
     let enabled = resolve_enabled(raw.enabled, config.enabled, default_on);
+    // Set when the home is not plain text. It is still worked out, by text, so a location
+    // added by hand can be matched with it; the instance is listed as outside home.
+    let not_plain = std::cell::Cell::new(false);
     let folder = |value: Result<Option<String>, ()>| -> Result<Option<PathBuf>, T3CodeOther> {
         let value = value.map_err(|()| gap(T3CodeGap::HiddenHome, enabled))?;
         match value
@@ -919,7 +973,8 @@ fn instance_of(
         {
             None => Ok(None),
             Some(value) if !plain_path_text(value, cfg!(windows)) => {
-                Err(gap(T3CodeGap::OutsideHome, enabled))
+                not_plain.set(true);
+                Ok(Some(expand_text(value, home)))
             }
             Some(value) => match expand(value, home) {
                 Some(path) if path.is_absolute() => Ok(Some(path)),
@@ -940,7 +995,8 @@ fn instance_of(
         match value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
             None => Ok(None),
             Some(value) if !plain_path_text(value, cfg!(windows)) => {
-                Err(gap(T3CodeGap::OutsideHome, enabled))
+                not_plain.set(true);
+                Ok(Some(PathBuf::from(value)))
             }
             Some(value) if Path::new(value).is_absolute() => Ok(Some(PathBuf::from(value))),
             Some(_) => Err(gap(T3CodeGap::RelativeHome, enabled)),
@@ -969,10 +1025,12 @@ fn instance_of(
     // Checked by its text alone, before anything touches the file system: a network or
     // device path, `..`, or a folder outside the user's home is never opened, resolved or
     // listed. The card still lists the instance, by its name only.
-    if config_path
-        .as_deref()
-        .is_some_and(|path| !lexically_inside(path, home))
+    if not_plain.get()
+        || config_path
+            .as_deref()
+            .is_some_and(|path| !lexically_inside(path, home))
     {
+        *named = config_path;
         return Err(gap(T3CodeGap::OutsideHome, enabled));
     }
     Ok(Instance {
@@ -1024,7 +1082,7 @@ fn display_name(raw: &str) -> String {
 /// The instances, or nothing when T3 Code is absent or its settings are unreadable.
 pub(super) fn instances() -> Vec<Instance> {
     match &*current() {
-        Reading::Instances(instances, _) => instances.clone(),
+        Reading::Instances(instances, _, _) => instances.clone(),
         _ => Vec::new(),
     }
 }
@@ -1033,8 +1091,14 @@ pub(super) fn instances() -> Vec<Instance> {
 /// absent or its settings are unreadable.
 pub fn other_instances() -> Vec<T3CodeOther> {
     match &*current() {
-        Reading::Instances(instances, others) => {
-            let mut others = others.clone();
+        Reading::Instances(instances, others, outside) => {
+            let covered = outside_covered(outside);
+            let mut others: Vec<T3CodeOther> = others
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !covered.contains(index))
+                .map(|(_, other)| other.clone())
+                .collect();
             others.extend(home_gaps(instances));
             others.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
             others
@@ -1058,6 +1122,28 @@ pub fn other_instances() -> Vec<T3CodeOther> {
         }
         Reading::Absent => Vec::new(),
     }
+}
+
+/// The outside homes a saved location (or the client's own row) covers, compared by
+/// their text only, so the folder T3 Code names is never opened. The location's config
+/// is the file its client type names in the folder added, which is the config T3 Code's
+/// instance reads.
+fn outside_covered(outside: &[Outside]) -> Vec<usize> {
+    if outside.is_empty() {
+        return Vec::new();
+    }
+    let saved = locations::saved().unwrap_or_default();
+    outside
+        .iter()
+        .filter(|home| {
+            client_config_path_for_type(home.client_type)
+                .is_some_and(|main| same_text(&main, &home.config))
+                || saved.iter().any(|row| {
+                    row.client_type == home.client_type && same_text(&row.config_path, &home.config)
+                })
+        })
+        .map(|home| home.index)
+        .collect()
 }
 
 /// Instances with a home of their own that no Clients row covers, with why. For Claude
@@ -1091,6 +1177,11 @@ fn home_gaps(instances: &[Instance]) -> Vec<T3CodeOther> {
                 // These homes only label rows that already exist, so one with no row is
                 // listed whether its folder exists or not.
                 match walk {
+                    HomeWalk::Plain | HomeWalk::Missing
+                        if instance.provider == Provider::OpenCode =>
+                    {
+                        T3CodeGap::UnlistedOpenCodeHome
+                    }
                     HomeWalk::Plain | HomeWalk::Missing => T3CodeGap::UnlistedHome,
                     HomeWalk::Link | HomeWalk::NotPlain => T3CodeGap::LinkedHome,
                 }
@@ -1231,11 +1322,17 @@ fn row_has_path(row: &locations::ClientLocation, config: &Path) -> bool {
     locations::same_path(&row.config_path, config)
 }
 
-/// The config path Toolport's own row for a client type uses.
+/// The config path Toolport's own row for a client type uses, as its definition resolves
+/// it (Toolport's `GROK_HOME`, `XDG_CONFIG_HOME`, `OPENCODE_CONFIG_DIR` and
+/// `PI_CODING_AGENT_DIR` included). OpenCode's is the `opencode.json` spelling, as T3
+/// Code's homes and hand-added locations name it.
 fn client_config_path_for_type(client_type: &str) -> Option<PathBuf> {
     match client_type {
         "claude-code" => client_config_path("claude-code"),
         "codex" => codex_path(),
+        "grok" => grok_path(),
+        "opencode" => opencode_path(),
+        "pi" => pi_path(),
         other => client_config_path(other),
     }
 }
