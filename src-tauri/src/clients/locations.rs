@@ -64,6 +64,7 @@ fn location_name(kind: &str, folder: &str) -> String {
 }
 
 pub fn remove_client_location(id: &str) -> Result<(), String> {
+    let _auth = crate::registry_controller::acquire_auth_lock(&format!("client-config:{id}"))?;
     let store = store_path()?;
     let _lock = crate::registry::lock_at(&store)?;
     let mut rows = saved()?;
@@ -76,6 +77,12 @@ pub fn remove_client_location(id: &str) -> Result<(), String> {
     let client = read_client(&find_def(id).ok_or("Unknown client location")?);
     if client.error.is_some() || client.gateway_installed {
         return Err("Disconnect this client location before removing it".into());
+    }
+    if let Some(pending) = recovery::list()?
+        .into_iter()
+        .find(|row| row.client_id == id)
+    {
+        return Err(crate::i18n::trf("{client} still has saved recovery values. Choose Retry to restore them, or Discard these saved values to remove their copies, before removing this location.", &[("client", &pending.client_name)]));
     }
     rows.retain(|row| row.id != id);
     crate::registry::atomic_write(
@@ -183,7 +190,7 @@ pub(super) fn store_display_path() -> String {
         .unwrap_or_default()
 }
 
-fn valid_id(id: &str) -> bool {
+pub(super) fn valid_id(id: &str) -> bool {
     id.split_once('@')
         .is_some_and(|(kind, key)| !kind.is_empty() && !key.is_empty() && key != "." && key != "..")
         && id

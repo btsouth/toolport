@@ -1186,5 +1186,10 @@
   "in Toolport": "dans Toolport",
   "Pinned": "Épinglé",
   "Renamed": "Renommé",
-  "Read-only": "Lecture seule"
+  "Read-only": "Lecture seule",
+  "Imported {value0} server. Check its status under Servers.": "{value0} serveur importé. Vérifiez son état dans Serveurs.",
+  "Imported {value0} server. Needs input: {value1}": "{value0} serveur importé. Saisie requise : {value1}",
+  "\n{value0} baseline tokens − {value1} catalog response tokens − {value2} search response tokens = {value3} net token change. A negative change means responses used more tokens than the baseline.\n{value4} client sessions; {value5} catalog responses; {value6} search responses.\n{value7} baseline catalog text; {value8} catalog text sent; {value9} search text sent.": "\n{value0} tokens de référence − {value1} tokens de réponse du catalogue − {value2} tokens de réponse de recherche = variation nette de {value3} tokens. Une variation négative signifie que les réponses ont utilisé plus de tokens que la référence.\n{value4} sessions client ; {value5} réponses du catalogue ; {value6} réponses de recherche.\n{value7} texte du catalogue de référence ; {value8} texte du catalogue envoyé ; {value9} texte de recherche envoyé.",
+  "{value0} extra tokens": "{value0} tokens supplémentaires",
+  "Toolport recorded a net token change of -{value1}. Full catalog baselines minus all catalog and search responses; counted locally with cl100k_base, not a billing figure. toolport.app": "Toolport a mesuré une variation nette de -{value1} tokens. Références de catalogue complet moins toutes les réponses de catalogue et de recherche ; calcul local avec cl100k_base, ce n'est pas un montant facturé. toolport.app"
 }

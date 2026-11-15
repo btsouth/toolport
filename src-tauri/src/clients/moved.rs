@@ -196,20 +196,61 @@ pub(super) fn has_record(client_id: &str) -> bool {
     record_path(client_id).is_ok_and(|path| path.exists())
 }
 
+/// Why a move record on disk cannot be used, for the recovery list.
+pub(super) enum RecordProblem {
+    /// Damaged bytes: the record can be discarded.
+    Damaged,
+    /// A wrapper this version cannot open, written by a newer Toolport.
+    Newer,
+    /// Permissions or another I/O failure: repair, never discard.
+    Unreadable,
+}
+pub(super) const RECORD_NAME: &str = RECORD_FILE;
+/// Checks a move record exactly as [`load`] reads it.
+pub(super) fn check_record(file: &Path) -> Result<(), RecordProblem> {
+    let raw = match std::fs::read_to_string(file) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            return Err(RecordProblem::Damaged)
+        }
+        Err(_) => return Err(RecordProblem::Unreadable),
+    };
+    let decoded = backup_storage::decode(&raw);
+    if decoded
+        .as_deref()
+        .ok()
+        .and_then(|text| serde_json::from_str::<Record>(text).ok())
+        .is_some()
+    {
+        return Ok(());
+    }
+    let wrapped = serde_json::from_str::<serde_json::Value>(&raw).is_ok_and(|value| {
+        ["toolportBackupVersion", "toolportPlainBackupVersion"]
+            .iter()
+            .any(|key| value.get(*key).is_some())
+    });
+    Err(if wrapped {
+        RecordProblem::Newer
+    } else {
+        RecordProblem::Damaged
+    })
+}
+
 fn load(client_id: &str) -> Result<Option<Record>, String> {
     let path = record_path(client_id)?;
     let text = match mutation::read(&path) {
         Some(value) => value,
-        None => match std::fs::read_to_string(&path) {
+        None => match backup_storage::read(&path) {
             Ok(text) => Some(text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(format!("could not read {}: {e}", path.display())),
         },
     };
     match text {
-        Some(text) => serde_json::from_str(&text)
+        Some(text) => serde_json::from_str(&backup_storage::decode(&text)?)
             .map(Some)
-            .map_err(|e| format!("could not read {}: {e}", path.display())),
+            .map_err(|e| diagnostics::at(&path, diagnostics::json(&e))),
         None => Ok(None),
     }
 }
@@ -525,7 +566,7 @@ pub(super) fn record_selected(
     // including its live witnesses, rather than the older copy still on disk.
     let previous = match mutation::read(&record_file) {
         Some(value) => value,
-        None => match std::fs::read_to_string(&record_file) {
+        None => match backup_storage::read(&record_file) {
             Ok(bytes) => Some(bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(format!("could not read {}: {e}", record_file.display())),
@@ -539,7 +580,7 @@ pub(super) fn record_selected(
     let config_path = path.display().to_string();
     let mut record = match previous.as_deref() {
         Some(text) => serde_json::from_str::<Record>(text)
-            .map_err(|e| format!("could not read {}: {e}", record_file.display()))?,
+            .map_err(|e| diagnostics::at(&record_file, diagnostics::json(&e)))?,
         None => Record::default(),
     };
     if record.config_path != config_path {
@@ -565,7 +606,7 @@ pub(super) fn record_selected(
         if let (Some(doc), Raw::Toml { text, capture }) = (&current, &mut entry.raw) {
             let single: toml_edit::DocumentMut = text
                 .parse()
-                .map_err(|e: toml_edit::TomlError| e.to_string())?;
+                .map_err(|e: toml_edit::TomlError| diagnostics::offset("TOML", text, e.span()))?;
             if let Some((key, item)) = toml_preservation::raw_entry(&single, &entry.name) {
                 let prefix = toml_preservation::capture_prefix(&key, &item);
                 let destination = toml_preservation::source_destination(&entry.name, &item);
@@ -860,7 +901,7 @@ pub(super) fn toml_entry(
     };
     let doc = text
         .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| diagnostics::offset("TOML", text, e.span()))?;
     Ok(toml_preservation::raw_entry(&doc, name).map(|(key, item)| (key, item, index)))
 }
 
@@ -974,6 +1015,10 @@ pub(super) fn restore(
 /// Drop the client's record once Disconnect has finished with it.
 pub(super) fn forget(client_id: &str) -> Result<(), String> {
     let path = record_path(client_id)?;
+    if backup_storage::missing() {
+        return Ok(());
+    }
+    backup_storage::release(&path)?;
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1045,7 +1090,7 @@ fn extract(format: Format, text: &str) -> Result<Vec<Moved>, String> {
             read_existing_toml(text)?;
             let doc = text
                 .parse::<toml_edit::DocumentMut>()
-                .map_err(|e| format!("Could not parse the existing config ({e})"))?;
+                .map_err(|e| diagnostics::offset("TOML", text, e.span()))?;
             let Some(servers) = doc.get("mcp_servers").and_then(|item| item.as_table_like()) else {
                 return Ok(out);
             };
@@ -1200,7 +1245,7 @@ fn insert_missing(
                 }
                 let single = text
                     .parse::<toml_edit::DocumentMut>()
-                    .map_err(|e| format!("could not read the recorded {}: {e}", entry.name))?;
+                    .map_err(|e| diagnostics::offset("TOML", text, e.span()))?;
                 let Some((key, item)) = toml_preservation::raw_entry(&single, &entry.name) else {
                     continue;
                 };
@@ -1244,8 +1289,8 @@ fn insert_missing(
                 let Raw::Yaml { text } = &entry.raw else {
                     continue;
                 };
-                let value: serde_yaml::Value = serde_yaml::from_str(text)
-                    .map_err(|e| format!("could not read the recorded {}: {e}", entry.name))?;
+                let value: serde_yaml::Value =
+                    serde_yaml::from_str(text).map_err(|e| diagnostics::yaml(&e))?;
                 let inserted = if list {
                     let servers = continue_servers_mut(&mut root);
                     let present = has_name(
@@ -1308,4 +1353,15 @@ fn insert_missing(
             Ok((names, backup))
         }
     }
+}
+
+pub(super) fn recovery_copy(client_id: &str, config: &Path) -> Result<Option<PathBuf>, String> {
+    let path = record_path(client_id)?;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("Could not read the saved move record".into()),
+    };
+    let (value, _) = backup_storage::raw_metadata(&raw)?;
+    Ok((value["configPath"].as_str() == Some(config.to_string_lossy().as_ref())).then_some(path))
 }

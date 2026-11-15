@@ -120,8 +120,8 @@ fn unmark(text: &str) -> String {
     text.replace(JS_LOCAL, JS_TAG)
 }
 
-fn yaml_from<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, serde_yaml::Error> {
-    serde_yaml::from_str(&mark_tags(text))
+fn yaml_from<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
+    serde_yaml::from_str(&mark_tags(text)).map_err(|error| super::diagnostics::yaml(&error))
 }
 
 /// YAML text with `!!js` tags as dsh writes them.

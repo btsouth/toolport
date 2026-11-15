@@ -683,6 +683,99 @@ export function installGateway(
   });
 }
 
+export interface ClientRecovery {
+  id: string;
+  clientId: string;
+  clientName: string;
+  path: string;
+  backupPath: string;
+  missing: { server: string; key: string }[];
+  dismissed: boolean;
+  message: string;
+  description: string;
+  valueLines: string[];
+  discardValues: string[];
+  error: string | null;
+  canDiscard: boolean;
+  /** The recovery file itself cannot be read; Discard deletes only that file. */
+  canDiscardFile?: boolean;
+  /** False while a started Discard must be finished; restoration is refused then. */
+  canRetry: boolean;
+  /** A confirmed Discard already started; only "Finish discarding" is offered. */
+  discardStarted: boolean;
+  /** Backend label for the Discard action ("Discard these saved values" or "Finish discarding"). */
+  discardAction: string;
+  cleanup: boolean;
+  instructions: string;
+  retention: string;
+  details: string;
+}
+
+/** Exact inventory the user confirms. The manifest token is compared before deletion. */
+export interface DiscardConfirmation {
+  manifest: string;
+  heading: string;
+  description: string;
+  /** One bounded list: "Value: …" and "Backup file: …" lines. */
+  lines: string[];
+  location: string;
+  actionLabel: string;
+}
+
+/** Read-only inventory after an error row's Retry, classified by the backend. */
+export interface RecoveryListingUpdate {
+  rows: ClientRecovery[];
+  /** Row whose Retry receives focus (the same error, or its replacement). */
+  focusId: string | null;
+  /** Neutral result only when the old record is truly gone with no related error. */
+  message: string | null;
+}
+
+export function listClientRecoveries(): Promise<ClientRecovery[]> {
+  return invoke<ClientRecovery[]>("list_client_recoveries");
+}
+
+export interface RecoveryAttempt {
+  id: string;
+  clientId: string;
+  clientName: string;
+  restored: number;
+  accounted: number;
+  remaining: number;
+  message: string;
+  pending: ClientRecovery | null;
+}
+export function retryClientRecovery(id: string): Promise<RecoveryAttempt> {
+  return invoke<RecoveryAttempt>("retry_client_recovery", { id });
+}
+/** Lazy: reads recovery files only, never the credential store. */
+export function prepareClientRecoveryDiscard(id: string): Promise<DiscardConfirmation> {
+  return invoke<DiscardConfirmation>("prepare_client_recovery_discard", { id });
+}
+/** Deletes only the confirmed manifest; resolves with the shared success message. */
+export function discardClientRecovery(id: string, manifest: string): Promise<string> {
+  return invoke<string>("discard_client_recovery", { id, manifest });
+}
+export function refreshClientRecoveryNotice(
+  previousId: string,
+  clientId: string,
+  backupPath: string,
+): Promise<RecoveryListingUpdate> {
+  return invoke<RecoveryListingUpdate>("refresh_client_recovery_notice", {
+    previousId,
+    clientId,
+    backupPath,
+  });
+}
+/** Explicit Scan: noninteractive credential checks, status metadata only. */
+export function refreshClientRecoveryStatus(): Promise<void> {
+  return invoke<void>("refresh_client_recovery_status");
+}
+
+export function dismissClientRecovery(id: string, dismissed: boolean): Promise<void> {
+  return invoke<void>("dismiss_client_recovery", { id, dismissed });
+}
+
 /** Remove the Toolport gateway from a client's config. */
 export function uninstallGateway(clientId: string): Promise<WriteOutcome> {
   return invoke<WriteOutcome>("uninstall_gateway", { clientId });

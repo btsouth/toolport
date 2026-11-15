@@ -1186,5 +1186,10 @@
   "in Toolport": "已在 Toolport 中",
   "Pinned": "已固定",
   "Renamed": "已重命名",
-  "Read-only": "只读"
+  "Read-only": "只读",
+  "Imported {value0} server. Check its status under Servers.": "已导入 {value0} 个服务器。可在“服务器”中查看其状态。",
+  "Imported {value0} server. Needs input: {value1}": "已导入 {value0} 个服务器。需要填写：{value1}",
+  "\n{value0} baseline tokens − {value1} catalog response tokens − {value2} search response tokens = {value3} net token change. A negative change means responses used more tokens than the baseline.\n{value4} client sessions; {value5} catalog responses; {value6} search responses.\n{value7} baseline catalog text; {value8} catalog text sent; {value9} search text sent.": "\n{value0} 个基线 Token − {value1} 个目录响应 Token − {value2} 个搜索响应 Token = Token 净变化 {value3}。负值表示响应使用的 Token 多于基线。\n{value4} 个客户端会话；{value5} 次目录响应；{value6} 次搜索响应。\n{value7} 基线目录文本；{value8} 已发送的目录文本；{value9} 已发送的搜索文本。",
+  "{value0} extra tokens": "额外 {value0} 个 Token",
+  "Toolport recorded a net token change of -{value1}. Full catalog baselines minus all catalog and search responses; counted locally with cl100k_base, not a billing figure. toolport.app": "Toolport 记录的 Token 净变化为 -{value1}。以完整工具目录为基线，减去所有目录和搜索响应；使用 cl100k_base 在本机计数，不代表账单用量。toolport.app"
 }

@@ -273,6 +273,7 @@ pub enum EssentialSetting {
 struct ClientConfigReceipt {
     target: PathBuf,
     backup: Option<PathBuf>,
+    existed_before: bool,
     written: Option<Vec<u8>>,
     recovery_path: Option<PathBuf>,
     exact_rollback: bool,
@@ -294,6 +295,7 @@ impl ClientConfigReceipt {
         Ok(Self {
             target,
             backup: outcome.backup.as_deref().map(PathBuf::from),
+            existed_before: outcome.existed_before,
             written,
             recovery_path: outcome.recovery_path.clone(),
             exact_rollback,
@@ -303,6 +305,14 @@ impl ClientConfigReceipt {
     fn rollback(&self) -> Result<(), String> {
         if !self.exact_rollback {
             return Err("exact rollback is unavailable because the client saved after this operation; newer edits were left untouched".into());
+        }
+        if self.backup.is_none() && self.existed_before {
+            // Without a backup, the only rollback is removing the file, which is
+            // right only for a config this operation created.
+            return Err(format!(
+                "there is no backup of {}, so Toolport left it as it wrote it",
+                self.target.display()
+            ));
         }
         let dir = registry::conduit_dir().ok_or("Could not resolve mutation lock dir")?;
         let _lock = registry::lock_at(&dir.join("client-config-mutation"))?;
@@ -315,9 +325,8 @@ impl ClientConfigReceipt {
         let original = self
             .backup
             .as_ref()
-            .map(std::fs::read_to_string)
-            .transpose()
-            .map_err(|e| e.to_string())?;
+            .map(|path| clients::read_client_backup(path, &self.target))
+            .transpose()?;
         registry::client_file::commit(&self.target, &revision, original.as_deref())?;
         if let Some(file) = &self.recovery_path {
             clients::record_config_rollback(file, &self.target, original.as_deref())?;
@@ -1376,8 +1385,9 @@ pub fn disconnect_client_stdio_with(
     }
     let _lock = acquire_auth_lock(&format!("client-config:{client_id}"))?;
     let outcome = clients::uninstall_gateway(client_id)?;
-    let result = finish_client_config_mutation(outcome, write_registry)?;
-    clients::finish_uninstall(client_id, &result.outcome)?;
+    let mut result = finish_client_config_mutation(outcome, write_registry)?;
+    let warnings = clients::finish_uninstall_with_warnings(client_id, &result.outcome)?;
+    result.outcome.warnings.extend(warnings);
     Ok(result)
 }
 
@@ -2333,6 +2343,7 @@ fn migrate_client_reviewed_inputs_with(
             // Only staged registry writes run under the client mutation lock. Vault and
             // transport work can prompt or block and must run without either lock.
             let staged = clients::stage_reviewed(client_id, revision, || {
+                crate::clients::backup_storage::protect_existing()?;
                 commit_imports(&current, prepared)
             })?;
             let attempt = (|| {
@@ -2554,7 +2565,8 @@ fn finish_http_disconnect(
     result: &mut ClientMutationResult,
     revoke: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    clients::finish_uninstall(client_id, &result.outcome)?;
+    let warnings = clients::finish_uninstall_with_warnings(client_id, &result.outcome)?;
+    result.outcome.warnings.extend(warnings);
     if let Err(error) = revoke() {
         result.outcome.warnings.push(format!(
             "config restored; could not remove the revoked keychain token: {error}"
@@ -5580,10 +5592,12 @@ API_KEY = "synthetic-first-origin"
         let _data_lock = registry::data_dir_test_lock();
         let _data_dir = registry::DataDirOverride::set(dir.join("data"));
         let target = dir.join("client.json");
-        let backup = dir.join("backup.json");
-        std::fs::write(&backup, "original config").unwrap();
+        // Rollback reads only backups written by `backup_config`, never raw files.
+        std::fs::write(&target, "original config").unwrap();
+        let backup = clients::backup_config("cursor", &target).unwrap().unwrap();
         std::fs::write(&target, "connected config").unwrap();
         let outcome = WriteOutcome {
+            existed_before: true,
             path: target.display().to_string(),
             backup: Some(backup.display().to_string()),
             managed: None,
@@ -5616,6 +5630,7 @@ API_KEY = "synthetic-first-origin"
         let target = dir.join("client.json");
         std::fs::write(&target, "connected config").unwrap();
         let outcome = WriteOutcome {
+            existed_before: false,
             path: target.display().to_string(),
             backup: None,
             managed: None,
@@ -5650,6 +5665,7 @@ API_KEY = "synthetic-first-origin"
         std::fs::write(&backup, "original config").unwrap();
         std::fs::write(&target, "connected config").unwrap();
         let outcome = WriteOutcome {
+            existed_before: true,
             path: target.display().to_string(),
             backup: Some(backup.display().to_string()),
             managed: None,
@@ -6078,11 +6094,15 @@ API_KEY = "synthetic-first-origin"
             let snapshot = std::fs::read_dir(record)
                 .unwrap()
                 .filter_map(Result::ok)
-                .find(|entry| entry.file_name().to_string_lossy().starts_with("original-"))
+                .find(|entry| entry.file_name().to_string_lossy().starts_with("released-"))
                 .unwrap();
             let record: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(snapshot.path()).unwrap()).unwrap();
             assert_eq!(record["disconnected"], true);
+            assert!(
+                record["original"].is_null(),
+                "verified recovery payload must be released"
+            );
             assert!(record["disconnectBefore"].is_null());
             assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
             Err("keychain unreachable".into())
@@ -6116,6 +6136,51 @@ API_KEY = "synthetic-first-origin"
     /// UX-02 and UX-03 for Claude Code: a move turns the servers on (including one
     /// Toolport already had, disabled), and Disconnect puts the original entries
     /// back, secrets and unknown fields included, without touching app state.
+    /// F1: a retried Disconnect while values are still owed must never delete a
+    /// config that existed before it when the registry write then fails. It
+    /// takes a backup, and without one rollback refuses instead of removing.
+    #[test]
+    fn failed_registry_write_on_pending_retry_keeps_the_existing_config() {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"memory":{"command":"npx","args":["-y","server-memory"],"env":{"API_KEY":"sk-pending-retry-fixture"}}}}"#,
+        )
+        .unwrap();
+        connect_fixture("claude-code", None, false).unwrap();
+        std::env::set_var("TOOLPORT_SECRET_KEY", "locked-pending-retry");
+        disconnect_client("claude-code").unwrap();
+        let pending = std::fs::read_to_string(fixture.claude()).unwrap();
+        assert!(
+            pending.contains("TOOLPORT_MISSING_CREDENTIAL_"),
+            "{pending}"
+        );
+        assert!(fixture.move_record("claude-code").exists());
+        let error =
+            disconnect_client_stdio_with("claude-code", false, |_| Err("registry full".into()))
+                .unwrap_err();
+        assert!(fixture.claude().exists(), "{error}");
+        assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), pending);
+
+        // Rollback without a backup removes only a config this operation made.
+        let outcome = WriteOutcome {
+            existed_before: true,
+            path: fixture.claude().display().to_string(),
+            backup: None,
+            managed: None,
+            restored: Vec::new(),
+            used_move_record: false,
+            revision: None,
+            warnings: Vec::new(),
+            recovery_path: None,
+        };
+        let error =
+            finish_client_config_mutation(outcome, |_| Err("registry full".into())).unwrap_err();
+        assert!(!error.contains("rolled back"), "{error}");
+        assert!(error.contains("no backup"), "{error}");
+        assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), pending);
+    }
+
     #[test]
     fn move_enables_servers_and_disconnect_restores_claude_code() {
         let mut existing = server("seq-thinking");
@@ -6213,6 +6278,236 @@ API_KEY = "synthetic-first-origin"
         disconnect_client("claude-code").unwrap();
         assert_eq!(json_file(&fixture.claude())["mcpServers"], servers);
         assert!(!fixture.move_record("claude-code").exists());
+    }
+
+    /// Rollback reads the backup through its wrapper. A vaulted backup restores
+    /// the exact native bytes, a locked vault refuses without touching the config,
+    /// and a raw file in the backup slot is refused (rollback has no raw fallback).
+    #[test]
+    fn rollback_decodes_vaulted_backups_and_refuses_raw_ones() {
+        let fixture = MoveFixture::new(&Registry::default());
+        let target = fixture.claude();
+        let secret = "sk-rollback-wrapper-fixture";
+        let original = format!(
+            "{{\n  \"mcpServers\": {{\"native\": {{\"command\": \"echo\", \"env\": {{\"API_KEY\": \"{secret}\"}}}}}},\n  \"numStartups\": 3\n}}\r\n"
+        );
+        let connected = "{\"mcpServers\":{\"toolport\":{\"command\":\"toolport-gateway\"}}}";
+        let outcome = |backup: &std::path::Path| WriteOutcome {
+            existed_before: true,
+            path: target.display().to_string(),
+            backup: Some(backup.display().to_string()),
+            managed: None,
+            restored: Vec::new(),
+            used_move_record: false,
+            revision: None,
+            warnings: Vec::new(),
+            recovery_path: None,
+        };
+
+        std::fs::write(&target, &original).unwrap();
+        clients::backup_storage::register("native", "API_KEY", secret);
+        let backup = clients::backup_config("claude-code", &target)
+            .unwrap()
+            .unwrap();
+        clients::backup_storage::clear();
+        let stored = std::fs::read_to_string(&backup).unwrap();
+        assert!(stored.contains("toolportBackupVersion"), "{stored}");
+        assert!(
+            !stored.contains(secret),
+            "the backup itself holds no plaintext"
+        );
+
+        std::fs::write(&target, connected).unwrap();
+        let error =
+            finish_client_config_mutation(outcome(&backup), |_| Err("registry full".into()))
+                .unwrap_err();
+        assert!(error.contains("rolled back"), "{error}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+
+        // Locked vault: the native config keeps Toolport's write, never the
+        // wrapper or a template with missing-value markers.
+        std::fs::write(&target, connected).unwrap();
+        let unlock = std::env::var("TOOLPORT_SECRET_KEY").unwrap();
+        std::env::set_var("TOOLPORT_SECRET_KEY", "locked-rollback-fixture");
+        let error =
+            finish_client_config_mutation(outcome(&backup), |_| Err("registry full".into()))
+                .unwrap_err();
+        std::env::set_var("TOOLPORT_SECRET_KEY", &unlock);
+        assert!(error.contains("rollback"), "{error}");
+        assert!(!error.contains(secret), "{error}");
+        assert!(!error.contains("TOOLPORT_MISSING_CREDENTIAL_"), "{error}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), connected);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), stored);
+
+        // Rollback only ever names a backup this process just wrapped, so a raw
+        // file there is refused, never written over the config.
+        let legacy = backup.with_file_name("1700000000000-.claude.json");
+        std::fs::write(&legacy, &original).unwrap();
+        std::fs::write(&target, connected).unwrap();
+        finish_client_config_mutation(outcome(&legacy), |_| Err("registry full".into()))
+            .unwrap_err();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), connected);
+    }
+
+    /// Rollback reads with a wrapper required: a wrapper cut anywhere (Sol's
+    /// three truncations included), an empty file, or raw config bytes in the
+    /// backup slot are refused and the client config is left as it is.
+    #[test]
+    fn rollback_refuses_truncated_backup_wrappers() {
+        let fixture = MoveFixture::new(&Registry::default());
+        let target = fixture.claude();
+        let connected = "{\"mcpServers\":{\"toolport\":{\"command\":\"toolport-gateway\"}}}";
+        let outcome = |backup: &std::path::Path| WriteOutcome {
+            existed_before: true,
+            path: target.display().to_string(),
+            backup: Some(backup.display().to_string()),
+            managed: None,
+            restored: Vec::new(),
+            used_move_record: false,
+            revision: None,
+            warnings: Vec::new(),
+            recovery_path: None,
+        };
+        let secret = "sk-truncated-wrapper-fixture";
+        let original = format!(
+            "{{\"mcpServers\":{{\"native\":{{\"command\":\"echo\",\"env\":{{\"API_KEY\":\"{secret}\"}}}}}}}}"
+        );
+        std::fs::write(&target, &original).unwrap();
+        clients::backup_storage::register("native", "API_KEY", secret);
+        let vaulted = clients::backup_config("claude-code", &target)
+            .unwrap()
+            .unwrap();
+        clients::backup_storage::clear();
+        std::fs::write(&target, "{\"plain\":true}").unwrap();
+        let plain = clients::backup_config("claude-code", &target)
+            .unwrap()
+            .unwrap();
+        for backup in [&vaulted, &plain] {
+            let full = std::fs::read_to_string(backup).unwrap();
+            assert!(full.starts_with("{\"toolport"), "{full}");
+            let key = if backup == &vaulted {
+                "toolportBackupVersion"
+            } else {
+                "toolportPlainBackupVersion"
+            };
+            let cut = full
+                .find("\"account\":")
+                .or_else(|| full.find("\"sourceConfigPath\":"))
+                .unwrap();
+            for damaged in [
+                full[..cut + 10].to_string(),
+                format!("{{\"{}", &key[..key.len() - 4]),
+                format!("{{\n  \"{key}\":1,"),
+                String::new(),
+                "{".into(),
+                "{\"".into(),
+                // A raw config in the backup slot: rollback has no raw fallback.
+                "{\"note\":\"toolportBackupVersion\",\"mcpServers\":{}}".into(),
+                "{}".into(),
+            ] {
+                std::fs::write(backup, &damaged).unwrap();
+                std::fs::write(&target, connected).unwrap();
+                let error =
+                    finish_client_config_mutation(outcome(backup), |_| Err("registry full".into()))
+                        .unwrap_err();
+                assert!(error.contains("rollback"), "{damaged:?}: {error}");
+                assert_eq!(
+                    std::fs::read_to_string(&target).unwrap(),
+                    connected,
+                    "{damaged:?}"
+                );
+            }
+        }
+    }
+
+    /// A moved-servers record cut to zero bytes or inside its first key is never
+    /// read as a record: Disconnect refuses and leaves the client config as it is.
+    #[test]
+    fn damaged_move_record_refuses_disconnect_without_touching_the_config() {
+        for damaged in ["", "{\"toolportBackupVer"] {
+            let fixture = MoveFixture::new(&Registry::default());
+            std::fs::write(
+                fixture.claude(),
+                r#"{"mcpServers":{"memory":{"command":"npx","args":["-y","server-memory"]}}}"#,
+            )
+            .unwrap();
+            connect_fixture("claude-code", None, false).unwrap();
+            let record = fixture.move_record("claude-code");
+            assert!(record.exists());
+            std::fs::write(&record, damaged).unwrap();
+            let connected = std::fs::read_to_string(fixture.claude()).unwrap();
+            assert!(disconnect_client("claude-code").is_err(), "{damaged:?}");
+            assert_eq!(
+                std::fs::read_to_string(fixture.claude()).unwrap(),
+                connected,
+                "{damaged:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&record).unwrap(), damaged);
+        }
+    }
+
+    /// F2: a damaged moved-servers record gets its own recovery row with
+    /// Discard recovery file, whose review says what the record held. After
+    /// it is discarded, Disconnect works again and the servers stay in Toolport.
+    /// A record a newer Toolport wrote is listed but never discardable.
+    #[test]
+    fn damaged_move_record_lists_and_can_be_discarded_alone() {
+        for damaged in [&b"{\"configPath\":\"/tmp"[..], &[0xff, 0xfe][..]] {
+            let fixture = MoveFixture::new(&Registry::default());
+            std::fs::write(
+                fixture.claude(),
+                r#"{"mcpServers":{"memory":{"command":"npx","args":["-y","server-memory"]}}}"#,
+            )
+            .unwrap();
+            connect_fixture("claude-code", None, false).unwrap();
+            let record = fixture.move_record("claude-code");
+            std::fs::write(&record, damaged).unwrap();
+            assert!(disconnect_client("claude-code").is_err());
+            let row = clients::recovery::list()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.backup_path == record.to_string_lossy())
+                .expect("the damaged move record is listed");
+            assert!(row.can_discard_file && !row.can_discard);
+            let review = clients::recovery::prepare_discard(&row.id).unwrap();
+            assert!(
+                review.description.contains("servers stay in Toolport"),
+                "{}",
+                review.description
+            );
+            assert_eq!(review.lines, ["Backup file: moved-servers.json"]);
+            let others: Vec<_> = std::fs::read_dir(record.parent().unwrap())
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| *p != record)
+                .collect();
+            clients::recovery::discard_confirmed(&row.id, &review.manifest).unwrap();
+            assert!(!record.exists());
+            for other in &others {
+                assert!(other.exists(), "{}", other.display());
+            }
+            disconnect_client("claude-code").unwrap();
+            assert!(registry::load()
+                .unwrap()
+                .servers
+                .iter()
+                .any(|server| server.name == "memory"));
+        }
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"memory":{"command":"npx","args":["-y","server-memory"]}}}"#,
+        )
+        .unwrap();
+        connect_fixture("claude-code", None, false).unwrap();
+        let record = fixture.move_record("claude-code");
+        std::fs::write(&record, r#"{"toolportBackupVersion":2,"account":"x"}"#).unwrap();
+        let row = clients::recovery::list()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.backup_path == record.to_string_lossy())
+            .expect("a newer move record is listed");
+        assert!(!row.can_discard_file && !row.can_discard);
     }
 
     #[test]

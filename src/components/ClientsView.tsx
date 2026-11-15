@@ -14,6 +14,8 @@ import {
   Puzzle,
   RefreshCw,
 } from "lucide-react";
+import { ClientRecoveryBanners } from "@/components/ClientRecoveryBanners";
+import { requestClientRecoveryScan } from "@/lib/clientRecoveryEvents";
 import { ClientLogo } from "@/components/ClientLogo";
 import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/ui/empty-state";
@@ -440,6 +442,7 @@ export function ClientsView({
     setSessionRetry((value) => value + 1);
     setRefreshing(true);
     try {
+      await requestClientRecoveryScan();
       await onChanged?.();
     } finally {
       setRefreshing(false);
@@ -529,7 +532,11 @@ export function ClientsView({
   }
 
   return (
-    <div className="flex w-full flex-col gap-6">
+    <div className="flex w-full min-w-0 flex-col gap-6">
+      <ClientRecoveryBanners
+        refreshKey={clients}
+        onRecovered={() => void onChanged?.()}
+      />
       {sessionError && (
         <ErrorCallout
           title={translate("Client session history could not be read.")}

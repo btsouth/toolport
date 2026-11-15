@@ -8,7 +8,7 @@ for name in ("toolport-remove-a", "toolport-remove-b"):
     home = Path("/home") / name
     path = home / ".cursor/mcp.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    original = '{\r\n  "mcpServers" : {"native":{"command":"original"}},\r\n  "theme" : "user formatting"\r\n}\r\n'
+    original = '{\r\n  "mcpServers" : {"native":{"command":"original","env":{"API_KEY":"sk-hc-fix-install-fake"}}},\r\n  "theme" : "user formatting"\r\n}\r\n'
     written = json.loads(original)
     written["mcpServers"]["toolport"] = {"command": "/usr/bin/toolport-gateway"}
     written = json.dumps(written, indent=2) + "\n"
@@ -26,3 +26,5 @@ for name in ("toolport-remove-a", "toolport-remove-b"):
     data = home / ".config/Toolport/backups/cursor"
     data.mkdir(parents=True, exist_ok=True)
     (data / f"original-{sha(str(path))}.json").write_text(json.dumps(record))
+
+    (data / "1-mcp.json").write_bytes(original.encode())

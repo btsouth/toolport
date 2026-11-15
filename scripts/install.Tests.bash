@@ -16,6 +16,10 @@
 
 set -euo pipefail
 
+# Each mutation case supplies a temporary HOME or explicit XDG paths. Inherited
+# desktop overrides must not redirect a fixture into the caller's real files.
+unset XDG_BIN_HOME XDG_DATA_HOME XDG_CONFIG_HOME
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_SH="$SCRIPT_DIR/install.sh"
 
@@ -228,6 +232,14 @@ run_check "reports truncation" "Treating it as truncated" 1 "$(fake_release "sha
 echo "non-https URL (refused before download)"
 run_check "refuses a non-https URL" "non-https URL" 1 "$(fake_release "sha256:$fake_sha256" 64 "http://example.invalid/Toolport_1.13.0_amd64.AppImage")"
 
+echo "multi-line verification errors preserve each instruction"
+error_output="$(bash -c 'source <(sed -n "/^err() {/,/^}/p" "$1"); err first second third' _ "$INSTALL_SH" 2>&1 || true)"
+if [ "$(printf '%s\n' "$error_output" | wc -l)" -eq 3 ]; then
+  echo "  ok: each error instruction has a separate line"; pass=$((pass + 1))
+else
+  echo "  FAIL: error instructions were joined"; fail=$((fail + 1))
+fi
+
 echo "empty download (rejected, destination removed)"
 run_check "rejects the empty download" "empty file" 1 "$(fake_release "sha256:$fake_sha256" 64)" TOOLPORT_TEST_EMPTY_DOWNLOAD=1
 
@@ -273,6 +285,7 @@ arch_conf="$arch_workdir/pacman.conf"
 cat > "$arch_shim/pacman-key" <<EOF
 #!/usr/bin/env bash
 printf 'pacman-key %s\n' "\$*" >> "$arch_shim/pacman-key.log"
+if [ "\${1:-}" = --list-secret-keys ]; then echo 'sec   rsa4096'; fi
 EOF
 cat > "$arch_shim/sudo" <<'EOF'
 #!/usr/bin/env bash
@@ -346,6 +359,14 @@ if [ "$(grep -c '^\[toolport\]' "$arch_conf")" = "1" ]; then
 else
   echo "  FAIL: pacman.conf gained a duplicate [toolport] section"; fail=$((fail + 1))
 fi
+if grep -q -- '--init' "$arch_shim/pacman-key.log"; then pass=$((pass+1)); else fail=$((fail+1)); fi
+printf '#!/bin/sh\nexit 1\n' > "$arch_shim/pacman-key"
+set +e
+result="$(PATH="$arch_shim:$PATH" HOME="$arch_home" TOOLPORT_OS_RELEASE="$arch_shim/os-release-arch" TOOLPORT_PACMAN_CONF="$arch_conf" bash "$INSTALL_SH" 2>&1)"
+rc=$?
+set -e
+check "keyring failure gives initialization commands" "sudo pacman-key --init; sudo pacman-key --populate archlinux" "$result"
+if [ "$rc" != 0 ] && ! [[ "$result" == *"not the one this installer expects"* ]]; then pass=$((pass+1)); else fail=$((fail+1)); fi
 rm -rf "$arch_workdir"
 
 echo "Debian: verifies the .deb and installs it with apt"
@@ -455,5 +476,88 @@ CASES
 rm -rf "$compat_dir"
 
 echo
+echo "Fedora RPM: checksum and native install"
+rpm_dir="$(mktemp -d)"
+make_shim "$rpm_dir/shim" "$(fake_release "sha256:$fake_sha256" 64 | sed 's/amd64[.]AppImage/x86_64.rpm/g')"
+printf 'ID=fedora\nVERSION_ID=42\n' > "$rpm_dir/os-release"
+printf '#!/bin/sh\nprintf "%%s\n" "$*" > "%s"\n' "$rpm_dir/dnf.log" > "$rpm_dir/shim/dnf"
+printf '#!/bin/sh\nexec "$@"\n' > "$rpm_dir/shim/sudo"
+chmod +x "$rpm_dir/shim/dnf" "$rpm_dir/shim/sudo"
+result="$(PATH="$rpm_dir/shim:$PATH" HOME="$rpm_dir/home" TOOLPORT_OS_RELEASE="$rpm_dir/os-release" bash "$INSTALL_SH" 2>&1)"
+check "RPM checksum verified" "sha256 verified: $fake_sha256" "$result"
+if grep -q 'install -y .*toolport.rpm' "$rpm_dir/dnf.log"; then pass=$((pass+1)); else fail=$((fail+1)); fi
+
+# A compatible derivative uses cached metadata without a network refresh.
+printf 'ID=example\nID_LIKE=rhel\nVERSION_ID=10\n' > "$rpm_dir/os-release"
+printf '#!/bin/sh\nexit 1\n' > "$rpm_dir/shim/rpm"
+cat > "$rpm_dir/shim/dnf" <<'RPMQUERY'
+#!/bin/sh
+case "$*" in
+  *--cacheonly*repoquery*gtk4) echo 4.14.5 ;;
+  *--cacheonly*repoquery*libadwaita) echo 1.5.0 ;;
+  *--cacheonly*repoquery*glib2) echo 2.80.0 ;;
+  *--cacheonly*repoquery*glibc) echo 2.39 ;;
+  *) exit 99 ;;
+esac
+RPMQUERY
+chmod +x "$rpm_dir/shim/rpm" "$rpm_dir/shim/dnf"
+result="$(PATH="$rpm_dir/shim:$PATH" TOOLPORT_OS_RELEASE="$rpm_dir/os-release" bash "$INSTALL_SH" --print-plan)"
+check "compatible RPM derivative uses cached ABI evidence" "package=rpm" "$result"
+
+echo "openSUSE: shared RPM through zypper and explicit Leap fallback"
+cat > "$rpm_dir/shim/zypper" <<'ZYPPER'
+#!/bin/sh
+printf '%s\n' "$*" >> "$TOOLPORT_TEST_ZYPPER_LOG"
+case "$*" in
+  *info*libgtk-4-1) echo 'Version : 4.12.5-1.1' ;;
+  *info*libadwaita-1-0) echo 'Version : 1.4.3-1.1' ;;
+  *info*libglib-2_0-0) echo 'Version : 2.78.6-1.1' ;;
+  *info*glibc) echo 'Version : 2.38-1.1' ;;
+  '--non-interactive refresh') exit "${TOOLPORT_TEST_ZYPPER_REFRESH_FAIL:-0}" ;;
+  *'install --allow-unsigned-rpm '*) exit 0 ;;
+  *) exit 99 ;;
+esac
+ZYPPER
+chmod +x "$rpm_dir/shim/zypper"
+export TOOLPORT_TEST_ZYPPER_LOG="$rpm_dir/zypper.log"
+printf 'ID=opensuse-tumbleweed\nVERSION_ID=20261111\n' > "$rpm_dir/os-release"
+result="$(PATH="$rpm_dir/shim:$PATH" HOME="$rpm_dir/home" TOOLPORT_OS_RELEASE="$rpm_dir/os-release" bash "$INSTALL_SH" 2>&1)"
+check "Tumbleweed RPM checksum verified" "sha256 verified: $fake_sha256" "$result"
+if grep -q -- '--non-interactive install --allow-unsigned-rpm .*toolport.rpm' "$rpm_dir/zypper.log" && ! grep -q -- '--no-gpg-checks' "$rpm_dir/zypper.log"; then pass=$((pass+1)); else fail=$((fail+1)); fi
+: > "$rpm_dir/zypper.log"
+printf 'ID=opensuse-leap\nID_LIKE="suse opensuse"\nVERSION_ID=15.6\n' > "$rpm_dir/os-release"
+result="$(PATH="$rpm_dir/shim:$PATH" TOOLPORT_OS_RELEASE="$rpm_dir/os-release" bash "$INSTALL_SH" --print-plan)"
+check "Leap portable fallback" "package=appimage" "$result"
+for unmet in 'gtk4 4.12.5 (requires 4.14+)' 'libadwaita 1.4.3 (requires 1.5+)' 'glib2 2.78.6 (requires 2.80+)' 'glibc 2.38 (requires 2.39+)'; do
+  check "Leap identifies unmet $unmet" "$unmet" "$result"
+done
+if grep -v -- '--no-refresh' "$rpm_dir/zypper.log" | grep -q .; then fail=$((fail+1)); else pass=$((pass+1)); fi
+# Supported Leap uses the same RPM after reading its own cached providers.
+sed -i 's/4.12.5/4.18.6/g; s/1.4.3/1.7.5/g; s/2.78.6/2.84.4/g; s/2.38/2.40/g' "$rpm_dir/shim/zypper"
+printf 'ID=opensuse-leap\nID_LIKE="suse opensuse"\nVERSION_ID=16.0\n' > "$rpm_dir/os-release"
+result="$(PATH="$rpm_dir/shim:$PATH" TOOLPORT_OS_RELEASE="$rpm_dir/os-release" bash "$INSTALL_SH" --print-plan)"
+check "Leap 16 cached provider floors select RPM" "package=rpm" "$result"
+# A repository outage must not prevent the portable route or bypass checksums.
+make_shim "$rpm_dir/shim" "$(fake_release "sha256:$fake_sha256" 64)
+$(fake_release "sha256:$fake_sha256" 64 | sed 's/amd64[.]AppImage/x86_64.rpm/g')"
+result="$(PATH="$rpm_dir/shim:$PATH" HOME="$rpm_dir/home" TOOLPORT_OS_RELEASE="$rpm_dir/os-release" TOOLPORT_TEST_ZYPPER_REFRESH_FAIL=106 bash "$INSTALL_SH" 2>&1)"
+check "failed zypper refresh keeps portable installation" "could not be refreshed; using the verified AppImage" "$result"
+check "portable fallback still verifies checksum" "sha256 verified: $fake_sha256" "$result"
+# A user denied privileged metadata access can still install in their own HOME.
+printf '#!/bin/sh\necho 1001\n' > "$rpm_dir/shim/id"
+printf '#!/bin/sh\nexit 1\n' > "$rpm_dir/shim/sudo"
+chmod +x "$rpm_dir/shim/id" "$rpm_dir/shim/sudo"
+result="$(PATH="$rpm_dir/shim:$PATH" HOME="$rpm_dir/home" TOOLPORT_OS_RELEASE="$rpm_dir/os-release" bash "$INSTALL_SH" 2>&1)"
+check "denied sudo keeps portable installation" "could not be refreshed; using the verified AppImage" "$result"
+check "unprivileged fallback verifies checksum" "sha256 verified: $fake_sha256" "$result"
+unset TOOLPORT_TEST_ZYPPER_LOG
+
+# Cleanup is offline and honors the same XDG paths as installation.
+mkdir -p "$rpm_dir/home/.local/bin" "$rpm_dir/home/.local/share/applications" "$rpm_dir/home/.config/autostart" "$rpm_dir/home/.config/Toolport"
+touch "$rpm_dir/home/.local/bin/toolport" "$rpm_dir/home/.local/share/applications/toolport.desktop" "$rpm_dir/home/.config/autostart/Toolport.desktop" "$rpm_dir/home/.config/Toolport/http-bridge-update-resume.json"
+HOME="$rpm_dir/home" bash "$INSTALL_SH" --uninstall-appimage
+if [ -z "$(find "$rpm_dir/home" -type f -print -quit)" ]; then pass=$((pass+1)); else fail=$((fail+1)); fi
+rm -rf "$rpm_dir"
+
 echo "$pass passed, $fail failed"
 [ "$fail" = "0" ]

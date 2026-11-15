@@ -1,11 +1,43 @@
-import { render, screen } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DetectedClient, McpServer } from "@/lib/types";
 import { ClientsView } from "./ClientsView";
-import { getClientSessions } from "@/lib/api";
-vi.mock("@/lib/api", () => ({ getClientSessions: vi.fn() }));
+import { getClientSessions, refreshClientRecoveryStatus } from "@/lib/api";
+vi.mock("@/lib/api", () => ({
+  getClientSessions: vi.fn(),
+  listClientRecoveries: vi.fn().mockResolvedValue([]),
+  retryClientRecovery: vi.fn(),
+  dismissClientRecovery: vi.fn(),
+  discardClientRecovery: vi.fn(),
+  refreshClientRecoveryStatus: vi.fn().mockResolvedValue(undefined),
+}));
 beforeEach(() => vi.mocked(getClientSessions).mockResolvedValue([]));
+
+it("waits for the saved-value check before completing an explicit refresh", async () => {
+  let finish!: () => void;
+  vi.mocked(refreshClientRecoveryStatus).mockClear();
+  vi.mocked(refreshClientRecoveryStatus).mockImplementationOnce(
+    () => new Promise<void>((resolve) => (finish = resolve)),
+  );
+  const changed = vi.fn().mockResolvedValue(undefined);
+  render(
+    <ClientsView
+      clients={[]}
+      registry={null}
+      onSelectClient={vi.fn()}
+      onChanged={changed}
+    />,
+  );
+  const refresh = await screen.findByRole("button", { name: "Refresh" });
+  await userEvent.click(refresh);
+  await waitFor(() => expect(refreshClientRecoveryStatus).toHaveBeenCalledTimes(1));
+  expect(refresh).toBeDisabled();
+  expect(changed).not.toHaveBeenCalled();
+  await act(async () => finish());
+  await waitFor(() => expect(changed).toHaveBeenCalledTimes(1));
+  expect(refresh).toBeEnabled();
+});
 
 function client(overrides: Partial<DetectedClient> = {}): DetectedClient {
   return {

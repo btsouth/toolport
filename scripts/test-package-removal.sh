@@ -32,6 +32,7 @@ else
 fi
 for user in toolport-remove-a toolport-remove-b; do
   cmp "/tmp/$user-original" "/home/$user/.cursor/mcp.json"
+  ! grep -r -l 'sk-hc-fix-install-fake' "/home/$user/.config/Toolport/backups"
   test "$(stat -c %U "/home/$user/.cursor/mcp.json")" = "$user"
 done
 test ! -e /home/toolport-remove-empty/.config/Toolport

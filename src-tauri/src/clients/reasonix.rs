@@ -26,7 +26,7 @@ fn document(text: &str) -> Result<DocumentMut, String> {
         return Ok(DocumentMut::new());
     }
     text.parse::<DocumentMut>()
-        .map_err(|e| format!("Could not parse the Reasonix config ({e}); {UNTOUCHED}."))
+        .map_err(|e| super::diagnostics::offset("TOML", text, e.span()))
 }
 
 /// The `[[plugins]]` tables, or `None` when the key holds something else.
@@ -73,8 +73,8 @@ fn rest(text: &str) -> Result<Json, String> {
     if text.trim().is_empty() {
         return Ok(Json::Object(serde_json::Map::new()));
     }
-    let mut value: toml::Value = toml::from_str(text)
-        .map_err(|e| format!("Could not parse the Reasonix config ({e}); {UNTOUCHED}."))?;
+    let mut value: toml::Value =
+        toml::from_str(text).map_err(|e| super::diagnostics::offset("TOML", text, e.span()))?;
     if let Some(table) = value.as_table_mut() {
         table.remove("plugins");
     }

@@ -16,6 +16,8 @@ struct Snapshot {
     toolport_version: String,
     last_written: Option<String>,
     last_written_hash: Option<String>,
+    #[serde(default)]
+    published_hash: Option<String>,
     created_parents: Vec<PathBuf>,
     exact_eligible: bool,
     preexisting_gateways: Vec<String>,
@@ -25,6 +27,12 @@ struct Snapshot {
     jsonc_settings: bool,
     #[serde(default)]
     disconnect_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vault_recovery: Option<String>,
+    #[serde(skip)]
+    recovered_vault: bool,
+    #[serde(default)]
+    recovery_dismissed: bool,
 }
 
 /// Read only valid writer provenance when a forgotten location has no store row.
@@ -36,7 +44,10 @@ pub(super) fn purge_backup_config_paths(dir: &Path) -> Vec<String> {
         .filter_map(|entry| {
             let path = entry.path();
             let name = path.file_name()?.to_str()?;
-            let hash = name.strip_prefix("original-")?.strip_suffix(".json")?;
+            let hash = name
+                .strip_prefix("original-")
+                .or_else(|| name.strip_prefix("released-"))?
+                .strip_suffix(".json")?;
             if hash.len() != 64
                 || !hash
                     .bytes()
@@ -48,7 +59,7 @@ pub(super) fn purge_backup_config_paths(dir: &Path) -> Vec<String> {
             if !metadata.is_file() || crate::purge::is_link(&metadata) {
                 return None;
             }
-            let record: Snapshot = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+            let record: Snapshot = serde_json::from_str(&backup_storage::read(&path).ok()?).ok()?;
             if record.version != 1
                 || !matches!(record.format, Format::JsonMcpServers)
                 || crate::registry::sha256_hex(&record.config_path) != hash
@@ -74,16 +85,64 @@ pub(super) fn record_path(client_id: &str, path: &Path) -> Result<PathBuf, Strin
         .join(format!("original-{hash}.json")))
 }
 
+fn released_path(client_id: &str, path: &Path) -> Result<PathBuf, String> {
+    let original = record_path(client_id, path)?;
+    Ok(
+        original.with_file_name(original.file_name().unwrap().to_string_lossy().replacen(
+            "original-",
+            "released-",
+            1,
+        )),
+    )
+}
+
+/// A started Discard may have released some values, so nothing may restore,
+/// recapture or re-encode this receipt (which would also drop its phase). The
+/// phase never authorizes deletion itself; read-only inventory still lists it.
+fn refuse_started(file: &Path) -> Result<(), String> {
+    match std::fs::read_to_string(file) {
+        Ok(raw) if backup_storage::discard_phase(&raw).is_some() => {
+            Err(recovery::discard_started_refusal())
+        }
+        _ => Ok(()),
+    }
+}
+
+// Every caller of `load` is part of a restore, Connect, reconnect, uninstall
+// or move path. Read-only listing (`recorded_paths`, recovery inventory) checks
+// the phase itself and never reaches this refusal.
 fn load(client_id: &str, path: &Path) -> Result<Option<Snapshot>, String> {
     let file = record_path(client_id, path)?;
-    let text = match std::fs::read_to_string(&file) {
+    refuse_started(&file)?;
+    let text = match backup_storage::read(&file) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("could not read {}: {e}", file.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match backup_storage::read(&released_path(client_id, path)?) {
+                Ok(text) => text,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Err(e) => return Err(format!("Could not read {}: {e}", file.display())),
     };
-    let record: Snapshot = serde_json::from_str(&text)
-        .map_err(|e| format!("could not read {}: {e}", file.display()))?;
+    let mut record: Snapshot =
+        serde_json::from_str(&text).map_err(|e| diagnostics::at(&file, diagnostics::json(&e)))?;
+    if let Some(recovery) = record.vault_recovery.as_deref() {
+        let recovered: Snapshot = serde_json::from_str(&backup_storage::decode(recovery)?)
+            .map_err(|e| diagnostics::json(&e))?;
+        if recovered.vault_recovery.is_none() {
+            record.original = recovered.original;
+            record.original_hash = recovered.original_hash;
+            record.baseline = recovered.baseline;
+            record.vault_recovery = None;
+            record.recovered_vault = true;
+        }
+    }
     if record.version != 1
+        || record
+            .published_hash
+            .as_ref()
+            .is_some_and(|hash| hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()))
         || record.config_path != path.to_string_lossy()
         || record.original.as_deref().map(crate::registry::sha256_hex) != record.original_hash
         || record
@@ -97,6 +156,22 @@ fn load(client_id: &str, path: &Path) -> Result<Option<Snapshot>, String> {
         );
     }
     Ok(Some(record))
+}
+
+// Prime missing-value context before rotating the current config on a retry.
+// The current file can already contain placeholders and credential field names.
+pub(super) fn pending_values(client_id: &str, path: &Path) -> Result<bool, String> {
+    let raw = match std::fs::read_to_string(record_path(client_id, path)?) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err("Could not inspect saved recovery".into()),
+    };
+    let (record, refs) = backup_storage::raw_metadata(&raw)?;
+    Ok(record["disconnected"] == true && !refs.is_empty())
+}
+
+pub(super) fn prepare_disconnect(client_id: &str, path: &Path) -> Result<(), String> {
+    load(client_id, path).map(|_| ())
 }
 
 pub(super) struct Receipt {
@@ -185,6 +260,19 @@ pub(super) fn remember(
         Err(e) => return Err(e.to_string()),
     };
     let loaded = load(client_id, path)?;
+    // A new snapshot would take the placeholders as the original and drop
+    // the owed values. Only Retry, Discard or another disconnect may proceed.
+    if !disconnecting
+        && loaded.as_ref().is_some_and(|record| record.disconnected)
+        && previous
+            .as_deref()
+            .is_some_and(|raw| backup_storage::raw_markers(raw).is_ok_and(|refs| !refs.is_empty()))
+    {
+        let name = find_def(client_id)
+            .map(|def| def.name.to_string())
+            .unwrap_or_else(|| client_id.into());
+        return Err(crate::i18n::trf("{client} still has saved recovery values. Choose Retry to restore them, or Discard these saved values to remove their copies, before connecting it again.", &[("client", &name)]));
+    }
     let fresh = loaded.as_ref().is_none_or(|record| {
         record.disconnected && record.disconnect_before.is_none() && !disconnecting
     });
@@ -204,15 +292,38 @@ pub(super) fn remember(
                 toolport_version: env!("CARGO_PKG_VERSION").into(),
                 last_written: None,
                 last_written_hash: None,
+                published_hash: None,
                 created_parents,
                 exact_eligible: preexisting_gateways.is_empty(),
                 preexisting_gateways,
                 disconnected: false,
                 jsonc_settings,
                 disconnect_before: None,
+                vault_recovery: None,
+                recovered_vault: false,
+                recovery_dismissed: false,
             }
         }
     };
+    if disconnecting && record.disconnected {
+        if let Some(raw) = previous
+            .as_deref()
+            .filter(|raw| backup_storage::raw_markers(raw).is_ok_and(|refs| !refs.is_empty()))
+        {
+            let eligible = record.exact_eligible
+                && before.map(crate::registry::sha256_hex).as_deref()
+                    == record
+                        .published_hash
+                        .as_deref()
+                        .or(record.last_written_hash.as_deref());
+            let published = after.map(crate::registry::sha256_hex);
+            backup_storage::remember_pending_revision(&file, raw, published.as_deref(), eligible)?;
+            return Ok(Receipt {
+                path: file,
+                previous,
+            });
+        }
+    }
     let released = record.disconnected && record.disconnect_before.is_none();
     if released && !disconnecting {
         record.created_parents = missing_parents(path);
@@ -243,11 +354,16 @@ pub(super) fn remember(
     record.disconnected = disconnecting;
     record.last_written = after.map(str::to_string);
     record.last_written_hash = after.map(crate::registry::sha256_hex);
+    record.published_hash = record.last_written_hash.clone();
     let file = record_path(client_id, path)?;
     secure_backup_dir(file.parent().ok_or("Could not resolve snapshot parent")?)?;
     crate::registry::atomic_write(
         &file,
-        &serde_json::to_string(&record).map_err(|e| e.to_string())?,
+        &backup_storage::encode_recovery(
+            &file,
+            &serde_json::to_string(&record).map_err(|e| e.to_string())?,
+            disconnecting,
+        )?,
     )?;
     Ok(Receipt {
         path: file,
@@ -532,16 +648,14 @@ pub(super) fn toml_prefix_provenance(
     } else {
         record.last_written.as_deref()
     };
-    let original = record
-        .original
-        .as_deref()
-        .unwrap_or("")
+    let original_text = record.original.as_deref().unwrap_or("");
+    let original = original_text
         .parse()
-        .map_err(|e: toml_edit::TomlError| e.to_string())?;
-    let written = written
-        .unwrap_or("")
+        .map_err(|e: toml_edit::TomlError| diagnostics::offset("TOML", original_text, e.span()))?;
+    let written_text = written.unwrap_or("");
+    let written = written_text
         .parse()
-        .map_err(|e: toml_edit::TomlError| e.to_string())?;
+        .map_err(|e: toml_edit::TomlError| diagnostics::offset("TOML", written_text, e.span()))?;
     Ok(Some((original, written)))
 }
 
@@ -550,15 +664,66 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
         return Ok(false);
     };
     mutation::disconnecting();
-    if record.disconnected && record.disconnect_before.is_none() {
-        return Ok(true);
-    }
     let current = if mutation::exists(path) {
         Some(read_config_file(path)?)
     } else {
         None
     };
     if record.disconnected
+        && record.original.is_none()
+        && record.vault_recovery.is_none()
+        && record.disconnect_before.is_none()
+    {
+        return Ok(true);
+    }
+    if record.disconnected {
+        let receipt = record_path(client_id, path)?;
+        let raw = std::fs::read_to_string(&receipt)
+            .map_err(|_| "Could not read the saved recovery file")?;
+        if !backup_storage::raw_markers(&raw)?.is_empty() {
+            // This config was already disconnected. Restore only the owed
+            // placeholder leaves; do not run the server-entry undo merge again.
+            let values = backup_storage::recovery_values(&receipt)?;
+            if record.recovered_vault
+                && record.exact_eligible
+                && current
+                    .as_deref()
+                    .map(crate::registry::sha256_hex)
+                    .as_deref()
+                    == record
+                        .published_hash
+                        .as_deref()
+                        .or(record.last_written_hash.as_deref())
+            {
+                if let Some(original) = record.original.as_deref() {
+                    atomic_write(path, original)?;
+                }
+            } else if let Some(current) = current.as_deref() {
+                let replacements = values
+                    .iter()
+                    .filter_map(|v| Some((v.marker.clone(), v.secret.clone()?)))
+                    .collect::<Vec<_>>();
+                let patched = recovery_values::patch(format, current, &replacements)?;
+                if patched != current {
+                    atomic_write(path, &patched)?;
+                }
+            }
+            let after = mutation::read(path).flatten();
+            recovery_values::remember_progress(
+                format,
+                current.as_deref(),
+                after.as_deref(),
+                &values,
+                &backup_storage::resolved_markers(&raw),
+            )?;
+            return Ok(true);
+        }
+        if record.disconnect_before.is_none() {
+            return Ok(true);
+        }
+    }
+    if record.disconnected
+        && !record.recovered_vault
         && current.as_deref().map(crate::registry::sha256_hex) == record.last_written_hash
     {
         return Ok(true);
@@ -693,11 +858,15 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
                 .as_deref()
                 .unwrap_or("")
                 .parse::<toml_edit::DocumentMut>()
-                .map_err(|e| e.to_string())?;
+                .map_err(|e: toml_edit::TomlError| {
+                    diagnostics::offset("TOML", record.original.as_deref().unwrap_or(""), e.span())
+                })?;
             let written_doc = written_text
                 .unwrap_or("")
                 .parse::<toml_edit::DocumentMut>()
-                .map_err(|e| e.to_string())?;
+                .map_err(|e: toml_edit::TomlError| {
+                    diagnostics::offset("TOML", written_text.unwrap_or(""), e.span())
+                })?;
             let mut restore_entries = Vec::new();
             let mut recorded_order = std::collections::HashMap::new();
             let desired = latest.get(key).and_then(Value::as_object);
@@ -746,8 +915,8 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
                                 }
                             }
                         } else {
-                            let value: toml::Value =
-                                serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+                            let value: toml::Value = serde_json::from_value(value.clone())
+                                .map_err(|e| diagnostics::json(&e))?;
                             restore_entries
                                 .push((toml_edit::Key::new(name), toml_value_to_item(&value)));
                         }
@@ -866,7 +1035,12 @@ pub(super) fn check_finished(
     expected: Option<&str>,
 ) -> Result<(), String> {
     if load(client_id, path)?.is_some_and(|record| {
-        record.last_written_hash.as_deref() != expected || !record.disconnected
+        record
+            .published_hash
+            .as_deref()
+            .or(record.last_written_hash.as_deref())
+            != expected
+            || !record.disconnected
     }) {
         return Err("Client was changed by another Toolport operation before disconnect finished; recovery retained".into());
     }
@@ -879,14 +1053,20 @@ pub(super) fn run<T>(
     format: Format,
     edit: impl FnMut() -> Result<T, String>,
 ) -> Result<T, String> {
-    if load(client_id, path)?.is_some_and(|record| record.jsonc_settings) {
-        mutation::settings(client_id, path, edit)
-    } else {
-        mutation::run(client_id, path, format, edit)
-    }
+    // Every restore caller shares one bounded, noninteractive store session.
+    crate::secrets::with_backup_batch(|| {
+        if load(client_id, path)?.is_some_and(|record| record.jsonc_settings) {
+            mutation::settings(client_id, path, edit)
+        } else {
+            mutation::run(client_id, path, format, edit)
+        }
+    })
 }
 
 pub(super) fn finish(client_id: &str, path: &Path, expected: Option<&str>) -> Result<(), String> {
+    crate::secrets::with_backup_batch(|| finish_batched(client_id, path, expected))
+}
+fn finish_batched(client_id: &str, path: &Path, expected: Option<&str>) -> Result<(), String> {
     check_finished(client_id, path, expected)?;
     if let Some(mut record) = load(client_id, path)? {
         for parent in &record.created_parents {
@@ -905,16 +1085,235 @@ pub(super) fn finish(client_id: &str, path: &Path, expected: Option<&str>) -> Re
                 }
             }
         }
-        // Keep immutable original provenance and a completed-removal marker.
-        // A later uninstaller/retry must not claim the restored native entries.
+        // Completion is about the committed native file, not vault availability.
+        // Recheck every owed marker after the optimistic write and before any
+        // payload/receipt deletion. Removed or user-replaced leaves are accounted.
+        let receipt = record_path(client_id, path)?;
+        let has_values = std::fs::read_to_string(&receipt)
+            .ok()
+            .map(|raw| backup_storage::raw_markers(&raw))
+            .transpose()?
+            .is_some_and(|values| !values.is_empty());
+        if has_values {
+            let current = match std::fs::read_to_string(path) {
+                Ok(text) => Some(text),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => {
+                    return Err(
+                        "Could not verify the restored client config; recovery retained".into(),
+                    )
+                }
+            };
+            if current
+                .as_deref()
+                .map(crate::registry::sha256_hex)
+                .as_deref()
+                != expected
+            {
+                return Err(
+                    "Client config changed before recovery was verified; recovery retained".into(),
+                );
+            }
+            let values = backup_storage::recovery_values(&receipt)?;
+            let mut pending = Vec::new();
+            let mut resolved = Vec::new();
+            for value in values {
+                if current
+                    .as_deref()
+                    .map(|text| recovery_values::present(record.format, text, &value.marker))
+                    .transpose()?
+                    .unwrap_or(false)
+                {
+                    pending.push(backup_storage::RecoveryIssue {
+                        reference: value.reference,
+                        marker: value.marker,
+                        state: value.state,
+                    });
+                } else if !resolved.contains(&value.marker) {
+                    resolved.push(value.marker);
+                }
+            }
+            if !pending.is_empty() {
+                backup_storage::set_issues(&receipt, &pending, &resolved)?;
+                return Ok(());
+            }
+        }
+        // Keep only an ownership tombstone; release original config payloads
+        // after the committed revision was checked against the actual file.
+        record.original = None;
+        record.vault_recovery = None;
+        record.original_hash = None;
+        record.baseline = Value::Null;
+        record.last_written = None;
+        record.last_written_hash = None;
+        record.published_hash = None;
         record.disconnected = true;
         record.disconnect_before = None;
+        let copies = recovery_copies(client_id, path)?;
+        // Release every owned payload before unlinking even one envelope. If a
+        // later release fails, the complete inventory survives for an idempotent retry.
+        for copy in &copies {
+            if let Err(error) = backup_storage::release(copy) {
+                if let Some(state) = recovery::state_for_instructions(&error) {
+                    backup_storage::set_cleanup_state(&record_path(client_id, path)?, state)?;
+                }
+                return Err(error);
+            }
+        }
         crate::registry::atomic_write(
-            &record_path(client_id, path)?,
+            &released_path(client_id, path)?,
             &serde_json::to_string(&record).map_err(|e| e.to_string())?,
         )?;
+        for copy in copies {
+            match std::fs::remove_file(copy) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
     }
     Ok(())
+}
+
+fn backup_names(path: &Path) -> [String; 3] {
+    [
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("config")
+            .to_string(),
+        claude_settings_backup_name(path),
+        secondary_claude_backup_name(path),
+    ]
+}
+/// Backup names another recorded config in this folder can also produce. A
+/// plain (unvaulted) timestamped copy has no source binding, so it belongs to
+/// this config only when no other recorded config shares its name. An
+/// unreadable receipt could belong to any config, so it makes every name shared.
+fn shared_backup_names(dir: &Path, path: &Path, own: &[PathBuf]) -> Vec<String> {
+    let names = backup_names(path);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return names.to_vec();
+    };
+    let mut shared = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return names.to_vec();
+        };
+        let file = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if own.contains(&file)
+            || !(name.starts_with("original-") || name.starts_with("released-"))
+            || !name.ends_with(".json")
+        {
+            continue;
+        }
+        let other = std::fs::symlink_metadata(&file)
+            .ok()
+            .filter(|meta| meta.is_file() && !crate::purge::is_link(meta))
+            .and_then(|_| std::fs::read_to_string(&file).ok())
+            .and_then(|raw| backup_storage::raw_metadata(&raw).ok())
+            .and_then(|(record, _)| record["configPath"].as_str().map(PathBuf::from));
+        let Some(other) = other else {
+            return names.to_vec();
+        };
+        if other == path {
+            continue;
+        }
+        let theirs = backup_names(&other);
+        shared.extend(names.iter().filter(|n| theirs.contains(n)).cloned());
+    }
+    shared
+}
+
+/// Keep only path provenance when explicitly discarding a disconnected record.
+/// Without it, another same-named location could claim an ambiguous legacy copy
+/// after this receipt disappears. This tombstone contains no config or values.
+pub(super) fn remember_discarded_path(
+    client_id: &str,
+    path: &Path,
+    format: Format,
+) -> Result<(), String> {
+    let record = Snapshot {
+        version: 1,
+        format,
+        config_path: path.to_string_lossy().into_owned(),
+        original: None,
+        original_hash: None,
+        baseline: Value::Null,
+        captured_at: 0,
+        toolport_version: env!("CARGO_PKG_VERSION").into(),
+        last_written: None,
+        last_written_hash: None,
+        published_hash: None,
+        created_parents: Vec::new(),
+        exact_eligible: false,
+        preexisting_gateways: Vec::new(),
+        disconnected: true,
+        jsonc_settings: false,
+        disconnect_before: None,
+        vault_recovery: None,
+        recovered_vault: false,
+        recovery_dismissed: false,
+    };
+    crate::registry::atomic_write(
+        &released_path(client_id, path)?,
+        &serde_json::to_string(&record).map_err(|e| diagnostics::json(&e))?,
+    )
+}
+
+pub(super) fn recovery_copies(client_id: &str, path: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut copies = Vec::new();
+    let original = record_path(client_id, path)?;
+    let names = backup_names(path);
+    if let Some(dir) = backup_dir(client_id) {
+        let shared = shared_backup_names(
+            &dir,
+            path,
+            &[original.clone(), released_path(client_id, path)?],
+        );
+        for entry in
+            std::fs::read_dir(dir).map_err(|_| "Could not inventory saved recovery copies")?
+        {
+            let entry = entry.map_err(|_| "Could not inventory a saved recovery copy")?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.path() == original
+                || name.split_once('-').is_some_and(|(stamp, suffix)| {
+                    stamp.parse::<u128>().is_ok() && names.iter().any(|n| n == suffix)
+                })
+            {
+                let meta = std::fs::symlink_metadata(entry.path())
+                    .map_err(|_| "Could not inspect a saved recovery copy")?;
+                if !meta.is_file() || crate::purge::is_link(&meta) {
+                    return Err(
+                        "Saved recovery copy is not a regular file; recovery retained".into(),
+                    );
+                }
+                if entry.path() != original {
+                    match backup_storage::source_path(&entry.path())? {
+                        Some(source) if source != path.to_string_lossy() => continue,
+                        Some(_) => {}
+                        // Unbound copies are claimed only when unambiguous;
+                        // never delete another config's history by basename.
+                        None if name
+                            .split_once('-')
+                            .is_some_and(|(_, suffix)| shared.iter().any(|n| n == suffix)) =>
+                        {
+                            continue
+                        }
+                        None => {}
+                    }
+                }
+                copies.push(entry.path());
+            }
+        }
+    }
+    if let Some(moved) = moved::recovery_copy(client_id, path)? {
+        if !copies.contains(&moved) {
+            copies.push(moved);
+        }
+    }
+    copies.sort();
+    Ok(copies)
 }
 
 pub(crate) fn after_capture_conflict(
@@ -924,18 +1323,27 @@ pub(crate) fn after_capture_conflict(
 ) -> Result<(), String> {
     let dir = crate::registry::conduit_dir().ok_or("Could not resolve mutation lock dir")?;
     let _lock = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
+    refuse_started(file)?;
     let mut record: Snapshot =
-        serde_json::from_str(&std::fs::read_to_string(file).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        serde_json::from_str(&backup_storage::read(file).map_err(|e| e.to_string())?)
+            .map_err(|e| diagnostics::at(file, diagnostics::json(&e)))?;
     if record.config_path != target.to_string_lossy() {
         return Err("Client receipt recovery path mismatch".into());
     }
     // A newer Toolport generation owns its own eligibility decision.
-    if record.last_written_hash.as_deref() == expected {
+    if record
+        .published_hash
+        .as_deref()
+        .or(record.last_written_hash.as_deref())
+        == expected
+    {
         record.exact_eligible = false;
         crate::registry::atomic_write(
             file,
-            &serde_json::to_string(&record).map_err(|e| e.to_string())?,
+            &backup_storage::encode(
+                file,
+                &serde_json::to_string(&record).map_err(|e| e.to_string())?,
+            )?,
         )?;
     }
     Ok(())
@@ -946,13 +1354,19 @@ pub(crate) fn after_rollback(
     target: &Path,
     written: Option<&str>,
 ) -> Result<(), String> {
+    refuse_started(file)?;
     let mut record: Snapshot =
-        serde_json::from_str(&std::fs::read_to_string(file).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        serde_json::from_str(&backup_storage::read(file).map_err(|e| e.to_string())?)
+            .map_err(|e| diagnostics::at(file, diagnostics::json(&e)))?;
     if record.config_path != target.to_string_lossy() {
         return Err("Client rollback recovery path mismatch".into());
     }
-    if written.map(crate::registry::sha256_hex) != record.last_written_hash {
+    if written.map(crate::registry::sha256_hex).as_deref()
+        != record
+            .published_hash
+            .as_deref()
+            .or(record.last_written_hash.as_deref())
+    {
         record.disconnected = false;
         record.disconnect_before = None;
     }
@@ -960,7 +1374,10 @@ pub(crate) fn after_rollback(
     record.last_written_hash = written.map(crate::registry::sha256_hex);
     crate::registry::atomic_write(
         file,
-        &serde_json::to_string(&record).map_err(|e| e.to_string())?,
+        &backup_storage::encode(
+            file,
+            &serde_json::to_string(&record).map_err(|e| e.to_string())?,
+        )?,
     )
 }
 
@@ -993,13 +1410,26 @@ pub(super) fn recorded_paths() -> Vec<(String, PathBuf, Result<Format, String>)>
             {
                 continue;
             }
-            let parsed = std::fs::read_to_string(&file)
+            let parsed = backup_storage::read(&file)
                 .map_err(|e| e.to_string())
                 .and_then(|text| {
                     serde_json::from_str::<Snapshot>(&text)
                         .map_err(|_| "Client recovery record is invalid".to_string())
                 });
             match parsed {
+                // Listing stays read-only and complete: a started Discard is
+                // still a recorded path, so `disconnect --all` reports the
+                // shared refusal for that config instead of a receipt error.
+                Ok(record)
+                    if std::fs::read_to_string(&file)
+                        .is_ok_and(|raw| backup_storage::discard_phase(&raw).is_some()) =>
+                {
+                    paths.push((
+                        def.client_id().into(),
+                        PathBuf::from(record.config_path),
+                        Ok(record.format),
+                    ))
+                }
                 Ok(record) => {
                     let path = PathBuf::from(record.config_path);
                     match released(def.client_id(), &path) {
@@ -1062,6 +1492,878 @@ mod tests {
         };
         finish(id, path, revision.as_deref())
     }
+    #[test]
+    fn plain_backups_of_same_named_configs_are_cleaned_only_by_their_owner() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let a = data.join("a").join("mcp.json");
+            let b = data.join("b").join("mcp.json");
+            let original = "{ \"mcpServers\": {\"native\":{\"command\":\"native\"}} }\r\n";
+            for path in [&a, &b] {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, original).unwrap();
+                mutation::run("cursor", path, Format::JsonMcpServers, || {
+                    backup_file("cursor", path)?;
+                    edit_format(Format::JsonMcpServers, path, Some(&entry()), true)
+                })
+                .unwrap();
+            }
+            let dir = backup_dir("cursor").unwrap();
+            // A legacy unbound copy stays ambiguous and belongs to neither.
+            let legacy = dir.join("5-mcp.json");
+            std::fs::write(&legacy, original).unwrap();
+            let timestamped = |path: &Path| {
+                recovery_copies("cursor", path)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|f| {
+                        f.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .split_once('-')
+                            .is_some_and(|(stamp, _)| stamp.parse::<u128>().is_ok())
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let (a_copies, b_copies) = (timestamped(&a), timestamped(&b));
+            assert!(!a_copies.is_empty() && !b_copies.is_empty());
+            assert!(a_copies.iter().all(|f| !b_copies.contains(f)));
+            assert!(!a_copies.contains(&legacy) && !b_copies.contains(&legacy));
+            for (copies, path) in [(&a_copies, &a), (&b_copies, &b)] {
+                for file in copies {
+                    assert_eq!(
+                        backup_storage::source_path(file).unwrap().as_deref(),
+                        Some(path.to_string_lossy().as_ref()),
+                        "every new timestamped copy is bound to its config"
+                    );
+                    assert_eq!(read_config_file(file).unwrap(), original);
+                }
+            }
+            disconnect("cursor", &a, Format::JsonMcpServers).unwrap();
+            assert_eq!(std::fs::read_to_string(&a).unwrap(), original);
+            for file in &a_copies {
+                assert!(!file.exists(), "owner cleanup removes {}", file.display());
+            }
+            for file in &b_copies {
+                assert!(file.exists(), "another config kept {}", file.display());
+            }
+            assert!(legacy.exists());
+            disconnect("cursor", &b, Format::JsonMcpServers).unwrap();
+            assert_eq!(std::fs::read_to_string(&b).unwrap(), original);
+            for file in &b_copies {
+                assert!(!file.exists());
+            }
+            assert!(legacy.exists(), "ambiguous legacy history is never claimed");
+        });
+    }
+    #[test]
+    fn legacy_plaintext_upgrade_seals_backups_without_reimport_and_keeps_locked_recovery() {
+        for available in [true, false] {
+            crate::secrets::tests::with_isolated_vault(|| {
+                backup_storage::reset_missing();
+                let data = crate::registry::conduit_dir().unwrap();
+                let path = data.join("mcp.json");
+                let original = "{\r\n \"mcpServers\":{\"native\":{\"command\":\"echo\",\"env\":{\"API_KEY\":\"sk-fake-legacy-secret\"}}}\r\n}\r\n";
+                std::fs::write(&path, original).unwrap();
+                crate::secrets::set_secret("old-import", "API_KEY", "sk-fake-legacy-secret")
+                    .unwrap();
+                mutation::run("cursor", &path, Format::JsonMcpServers, || {
+                    backup_file("cursor", &path)?;
+                    moved::record("cursor", Format::JsonMcpServers, &path)?;
+                    write_format(Format::JsonMcpServers, &path, &[entry()], true)
+                })
+                .unwrap();
+                let dir = backup_dir("cursor").unwrap();
+                let before: Vec<_> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .flatten()
+                    .map(|file| (file.path(), std::fs::read(file.path()).unwrap()))
+                    .collect();
+                assert!(
+                    before
+                        .iter()
+                        .any(|(_, raw)| String::from_utf8_lossy(raw)
+                            .contains("sk-fake-legacy-secret"))
+                );
+                if !available {
+                    std::env::set_var("TOOLPORT_SECRET_KEY", "wrong-original-vault-key");
+                }
+                let upgraded = backup_storage::upgrade_legacy();
+                if available {
+                    assert!(upgraded.unwrap() >= 3);
+                    assert_eq!(backup_storage::upgrade_legacy().unwrap(), 0);
+                    for file in std::fs::read_dir(&dir).unwrap().flatten() {
+                        assert!(!std::fs::read_to_string(file.path())
+                            .unwrap()
+                            .contains("sk-fake-legacy-secret"));
+                    }
+                } else {
+                    assert!(upgraded.unwrap_err().contains("Original retained"));
+                    for (path, raw) in before {
+                        assert_eq!(std::fs::read(path).unwrap(), raw);
+                    }
+                }
+                disconnect("cursor", &path, Format::JsonMcpServers).unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+            });
+        }
+    }
+    #[test]
+    fn vaulted_backup_restores_exact_bytes_and_recovers_without_vault() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            for available in [true, false] {
+                backup_storage::reset_missing();
+                let id = if available {
+                    "vault-present"
+                } else {
+                    "vault-missing"
+                };
+                let path = data.join(format!("{id}-config.json"));
+                let original = "{\r\n  \"mcpServers\" : {\"native\":{\"command\":\"echo\",\"env\":{\"API_KEY\":\"sk-fake-hc-install-secret\"}}}, \"theme\": \"dark\"\r\n}\r\n";
+                std::fs::write(&path, original).unwrap();
+                crate::secrets::set_secret(id, "API_KEY", "sk-fake-hc-install-secret").unwrap();
+                let registry = serde_json::from_value(serde_json::json!({"version":3,"profiles":[],"servers":[{"id":id,"name":"Native","transport":"stdio","env":[{"key":"API_KEY","secret":true}]}]})).unwrap();
+                crate::registry::save(&registry).unwrap();
+                backup_storage::register(id, "API_KEY", "sk-fake-hc-install-secret");
+                mutation::run(id, &path, Format::JsonMcpServers, || {
+                    backup_file(id, &path)?;
+                    moved::record(id, Format::JsonMcpServers, &path)?;
+                    write_format(Format::JsonMcpServers, &path, &[entry()], true)
+                })
+                .unwrap();
+                backup_storage::clear();
+                let dir = backup_dir(id).unwrap();
+                for file in std::fs::read_dir(&dir).unwrap().flatten() {
+                    assert!(
+                        !std::fs::read_to_string(file.path())
+                            .unwrap()
+                            .contains("sk-fake-hc-install-secret"),
+                        "{}",
+                        file.path().display()
+                    );
+                }
+                if !available {
+                    // A different key simulates a locked/lost original vault.
+                    std::env::set_var("TOOLPORT_SECRET_KEY", "unavailable-original-vault");
+                }
+                disconnect(id, &path, Format::JsonMcpServers).unwrap();
+                let restored = std::fs::read_to_string(&path).unwrap();
+                if available {
+                    assert_eq!(restored.as_bytes(), original.as_bytes());
+                    for file in std::fs::read_dir(&dir).unwrap().flatten() {
+                        assert!(!std::fs::read_to_string(file.path())
+                            .unwrap()
+                            .contains("sk-fake-hc-install-secret"));
+                    }
+                } else {
+                    assert_eq!(
+                        restored,
+                        original
+                            .replace("sk-fake-hc-install-secret", "TOOLPORT_MISSING_CREDENTIAL_0")
+                    );
+                    assert!(backup_storage::missing());
+                    assert!(
+                        std::fs::read_dir(&dir).unwrap().count() >= 2,
+                        "recovery retained"
+                    );
+                    std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+                    backup_storage::reset_missing();
+                    disconnect(id, &path, Format::JsonMcpServers).unwrap();
+                    assert_eq!(
+                        std::fs::read(&path).unwrap(),
+                        original.as_bytes(),
+                        "unlock and retry restores every original byte"
+                    );
+                }
+            }
+        });
+    }
+    #[test]
+    fn pending_notices_are_vault_free_path_specific_and_keep_dismissal() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let registry = serde_json::from_value(serde_json::json!({"version":3,"profiles":[],"servers":[{"id":"native","name":"Native","transport":"stdio","env":[{"key":"API_KEY","secret":true}]}]})).unwrap();
+            crate::registry::save(&registry).unwrap();
+            crate::secrets::set_secret("native", "API_KEY", "sk-recovery-notice-fixture").unwrap();
+            let original = "{\r\n  \"mcpServers\":{\"native\":{\"command\":\"echo\",\"env\":{\"API_KEY\":\"sk-recovery-notice-fixture\"}}}\r\n}\r\n";
+            let paths = [
+                data.join("historical-a.json"),
+                data.join("historical-b.json"),
+            ];
+            for path in &paths {
+                std::fs::write(path, original).unwrap();
+                backup_storage::register("native", "API_KEY", "sk-recovery-notice-fixture");
+                mutation::run("cursor", path, Format::JsonMcpServers, || {
+                    backup_file("cursor", path)?;
+                    write_format(Format::JsonMcpServers, path, &[entry()], true)
+                })
+                .unwrap();
+                backup_storage::clear();
+            }
+            std::env::set_var("TOOLPORT_SECRET_KEY", "locked-recovery-notices");
+            for path in &paths {
+                disconnect("cursor", path, Format::JsonMcpServers).unwrap();
+            }
+            let cli = recovery::warnings("cursor", &paths[1]);
+            backup_storage::reset_missing();
+            assert_eq!(
+                backup_storage::upgrade_legacy().unwrap(),
+                0,
+                "pending placeholders are not legacy secrets"
+            );
+            let pending = recovery::list().unwrap();
+            assert_eq!(pending.len(), 2);
+            let notice = pending
+                .iter()
+                .find(|row| row.path == paths[1].to_string_lossy())
+                .unwrap();
+            assert_eq!(
+                cli,
+                vec![format!(
+                    "{}\n\n{}\n\n{}\n\n{}",
+                    notice.message,
+                    notice.instructions,
+                    notice.retention,
+                    crate::i18n::tr(
+                        "To put the saved values back from a terminal:\ntoolport-gateway --disconnect-all"
+                    )
+                )],
+                "CLI and both shell DTOs share exact prose and retention"
+            );
+            assert!(
+                !backup_storage::missing(),
+                "listing must not decode the vault"
+            );
+            assert!(backup_storage::warnings().is_empty());
+            assert!(pending[0].message.contains("Cursor"));
+            assert!(pending[0].message.contains("API_KEY for native"));
+            assert!(!pending[0].message.contains("TOOLPORT_MISSING"));
+            let first = &pending[0];
+            let config_before = std::fs::read(&first.path).unwrap();
+            let receipt_before: Value =
+                serde_json::from_slice(&std::fs::read(&first.backup_path).unwrap()).unwrap();
+            recovery::dismiss(&first.id, true).unwrap();
+            assert_eq!(std::fs::read(&first.path).unwrap(), config_before);
+            let mut receipt_after: Value =
+                serde_json::from_slice(&std::fs::read(&first.backup_path).unwrap()).unwrap();
+            receipt_after
+                .as_object_mut()
+                .unwrap()
+                .remove("recoveryDismissed");
+            let mut receipt_before = receipt_before;
+            receipt_before
+                .as_object_mut()
+                .unwrap()
+                .remove("recoveryDismissed");
+            assert_eq!(
+                receipt_before, receipt_after,
+                "dismiss only changes notice metadata"
+            );
+            assert!(
+                recovery::list()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r.id == first.id)
+                    .unwrap()
+                    .dismissed
+            );
+            assert!(
+                !backup_storage::missing(),
+                "dismiss/show must not decode the vault"
+            );
+            let still_locked = recovery::retry(&first.id).unwrap().unwrap();
+            assert!(
+                still_locked.dismissed,
+                "retry must retain knowing dismissal"
+            );
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            assert!(
+                recovery::list()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r.id == first.id)
+                    .unwrap()
+                    .dismissed,
+                "unlock/reopen does not consume recovery or reset dismissal"
+            );
+            recovery::dismiss(&first.id, false).unwrap();
+            let second_before = std::fs::read(&pending[1].path).unwrap();
+            assert!(recovery::retry(&first.id).unwrap().is_none());
+            assert_eq!(std::fs::read(&first.path).unwrap(), original.as_bytes());
+            assert_eq!(
+                std::fs::read(&pending[1].path).unwrap(),
+                second_before,
+                "retry must not touch another historical config"
+            );
+            assert_eq!(recovery::list().unwrap().len(), 1);
+            // Native edits made while recovery is pending must survive retry.
+            let edited = std::fs::read_to_string(&pending[1].path).unwrap().replacen(
+                "{",
+                "{\n  \"userSetting\": 42,",
+                1,
+            );
+            std::fs::write(&pending[1].path, &edited).unwrap();
+            recovery::retry(&pending[1].id).unwrap();
+            let restored = std::fs::read_to_string(&pending[1].path).unwrap();
+            assert!(restored.contains("\"userSetting\": 42"));
+            assert!(
+                restored.contains("sk-recovery-notice-fixture"),
+                "edited config must recover its owed credential"
+            );
+            assert!(!restored.contains("TOOLPORT_MISSING_CREDENTIAL_"));
+            assert!(
+                !Path::new(&pending[1].backup_path).exists(),
+                "only verified complete recovery releases the receipt"
+            );
+        });
+    }
+
+    #[test]
+    fn eleven_edited_credentials_recover_exact_values_and_retain_partial_ten() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let env = (0..11)
+                .map(|i| {
+                    (
+                        format!("API_{i:02}"),
+                        Value::String(format!("sk-eleven-original-value-{i:02}")),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            let registry = serde_json::from_value(serde_json::json!({"version":3,"profiles":[],"servers":[{"id":"native","name":"Native","transport":"stdio","env":env.keys().map(|key|serde_json::json!({"key":key,"secret":true})).collect::<Vec<_>>()}]})).unwrap();
+            crate::registry::save(&registry).unwrap();
+            for partial in [false, true] {
+                let path = data.join(format!("eleven-{partial}.json"));
+                let original=serde_json::json!({"mcpServers":{"native":{"command":"echo","env":env}},"keepSetting":41}).to_string();
+                std::fs::write(&path, &original).unwrap();
+                for (key, value) in &env {
+                    let value = value.as_str().unwrap();
+                    crate::secrets::set_secret("native", key, value).unwrap();
+                    backup_storage::register("native", key, value);
+                }
+                mutation::run("cursor", &path, Format::JsonMcpServers, || {
+                    backup_file("cursor", &path)?;
+                    write_format(Format::JsonMcpServers, &path, &[entry()], true)
+                })
+                .unwrap();
+                backup_storage::clear();
+                std::env::set_var("TOOLPORT_SECRET_KEY", "eleven-locked");
+                disconnect("cursor", &path, Format::JsonMcpServers).unwrap();
+                let row = recovery::list()
+                    .unwrap()
+                    .into_iter()
+                    .find(|r| r.path == path.to_string_lossy())
+                    .unwrap();
+                let current = std::fs::read_to_string(&path).unwrap().replace("41", "42");
+                std::fs::write(&path, current).unwrap();
+                std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+                let (account, key, _) =
+                    backup_storage::test_recovery_key(Path::new(&row.backup_path));
+                if partial {
+                    crate::secrets::delete_backup_secret(&account, &key).unwrap();
+                    crate::secrets::delete_backup_secret(&account, &format!("{key}-credential-10"))
+                        .unwrap();
+                    crate::secrets::delete_secret("native", "API_10").unwrap();
+                }
+                let result = recovery::retry_with_report(&row.id).unwrap();
+                let current: Value =
+                    serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                assert_eq!(current["keepSetting"], 42);
+                for (key, value) in &env {
+                    if partial && key == "API_10" {
+                        continue;
+                    }
+                    assert_eq!(
+                        &current["mcpServers"]["native"]["env"][key], value,
+                        "{key} must recover its own authenticated value"
+                    );
+                }
+                if partial {
+                    assert_eq!(
+                        current["mcpServers"]["native"]["env"]["API_10"],
+                        "TOOLPORT_MISSING_CREDENTIAL_10"
+                    );
+                    assert_eq!((result.restored, result.remaining), (10, 1));
+                    assert!(result.pending.is_some());
+                    assert!(Path::new(&row.backup_path).exists());
+                    assert!(crate::secrets::backup_secret_status(
+                        &account,
+                        &format!("{key}-credential-0")
+                    )
+                    .unwrap()
+                    .is_some());
+                    crate::secrets::set_secret("native", "API_10", env["API_10"].as_str().unwrap())
+                        .unwrap();
+                    let second = recovery::retry_with_report(&row.id).unwrap();
+                    assert!(second.pending.is_none());
+                    assert_eq!(
+                        (second.restored, second.accounted, second.remaining),
+                        (1, 0, 0),
+                        "{}",
+                        second.message
+                    );
+                    let final_config: Value =
+                        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                    assert_eq!(
+                        final_config["mcpServers"]["native"]["env"]["API_10"],
+                        env["API_10"]
+                    );
+                } else {
+                    assert_eq!((result.restored, result.remaining), (11, 0));
+                    assert!(result.pending.is_none());
+                }
+                assert!(!Path::new(&row.backup_path).exists());
+            }
+        });
+    }
+    /// D2: a credential pasted into a config with a syntax error never reaches
+    /// a Retry error, the UI-safe error, the listed rows or the receipt.
+    #[test]
+    fn retry_on_broken_config_never_echoes_a_pasted_credential() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let registry=serde_json::from_value(serde_json::json!({"version":3,"profiles":[],"servers":[{"id":"native","name":"Native","transport":"stdio","env":[{"key":"API_ONE","secret":true}]}]})).unwrap();
+            crate::registry::save(&registry).unwrap();
+            let one = "sk-d2-saved-original-value";
+            let pasted = "sk-d2-pasted-credential-text";
+            let formats = [
+                (Format::JsonMcpServers, "json", "cursor", format!("{{\n  \"mcpServers\":{{\"native\":{{\"command\":\"echo\",\"env\":{{\"API_ONE\":\"{one}\"}}}}}}\n}}\n")),
+                (Format::JsonServers, "jsonc", "vscode", format!("// keep\n{{\n  \"servers\":{{\"native\":{{\"command\":\"echo\",\"env\":{{\"API_ONE\":\"{one}\"}}}}}},\n}}\n")),
+                (Format::TomlMcpServers, "toml", "cursor", format!("[mcp_servers.native]\ncommand = 'echo'\n[mcp_servers.native.env]\nAPI_ONE = '{one}'\n")),
+                (Format::YamlMcpServers, "yaml", "cursor", format!("mcp_servers:\n  native:\n    command: echo\n    env:\n      API_ONE: '{one}'\n")),
+            ];
+            for (format, extension, client, original) in formats {
+                backup_storage::reset_missing();
+                let path = data.join(format!("d2-broken.{extension}"));
+                std::fs::write(&path, &original).unwrap();
+                crate::secrets::set_secret("native", "API_ONE", one).unwrap();
+                backup_storage::register("native", "API_ONE", one);
+                mutation::run(client, &path, format, || {
+                    backup_file(client, &path)?;
+                    write_format(format, &path, &[entry()], true)
+                })
+                .unwrap();
+                backup_storage::clear();
+                std::env::set_var("TOOLPORT_SECRET_KEY", "d2-locked");
+                disconnect(client, &path, format).unwrap();
+                let row = recovery::list()
+                    .unwrap()
+                    .into_iter()
+                    .find(|r| r.path == path.to_string_lossy())
+                    .unwrap();
+                // The user pastes a key over the placeholder and breaks the syntax.
+                let broken = std::fs::read_to_string(&path).unwrap().replacen(
+                    "TOOLPORT_MISSING_CREDENTIAL_0",
+                    pasted,
+                    1,
+                ) + &format!("{{{{{{ {pasted}\n");
+                std::fs::write(&path, &broken).unwrap();
+                std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+                let error = match recovery::retry_with_report(&row.id) {
+                    Err(error) => error,
+                    Ok(attempt) => {
+                        panic!("{extension}: broken config retried: {}", attempt.message)
+                    }
+                };
+                assert!(!error.contains(pasted), "{extension}: {error}");
+                assert!(error.contains("line"), "{extension}: {error}");
+                let shown = recovery::safe_action_error(&row.id, &error);
+                assert!(!shown.contains(pasted), "{extension}: {shown}");
+                assert!(
+                    shown.contains("line") && shown.contains("Retry"),
+                    "{extension}: {shown}"
+                );
+                let rows = serde_json::to_string(&recovery::list().unwrap()).unwrap();
+                assert!(!rows.contains(pasted), "{extension}: {rows}");
+                assert!(
+                    rows.contains(&row.id),
+                    "the receipt stays listed: {extension}"
+                );
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+                for file in std::fs::read_dir(backup_dir(client).unwrap()).unwrap() {
+                    let text = std::fs::read_to_string(file.unwrap().path()).unwrap_or_default();
+                    assert!(
+                        !text.contains(pasted),
+                        "{extension}: backup holds the pasted key"
+                    );
+                }
+                std::fs::remove_file(&path).unwrap();
+            }
+            // Anything the allow-list does not recognize becomes generic text.
+            let unknown = format!("unexpected error near `API_ONE = \"{pasted}\"`");
+            let shown = recovery::safe_action_error("no-such-recovery", &unknown);
+            assert!(!shown.contains(pasted), "{shown}");
+            assert!(shown.contains("Retry"), "{shown}");
+        });
+    }
+    /// Connecting again while values are still owed would snapshot the
+    /// placeholders as the new original and drop the saved values.
+    #[test]
+    fn connect_during_pending_recovery_is_refused_and_keeps_owed_values() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let path = data.join("reconnect-pending.json");
+            let secret = "sk-reconnect-pending-fixture";
+            let original = format!(
+                r#"{{"mcpServers":{{"native":{{"command":"echo","env":{{"API_KEY":"{secret}"}}}}}}}}"#
+            );
+            std::fs::write(&path, &original).unwrap();
+            crate::secrets::set_secret("native", "API_KEY", secret).unwrap();
+            backup_storage::register("native", "API_KEY", secret);
+            mutation::run("cursor", &path, Format::JsonMcpServers, || {
+                backup_file("cursor", &path)?;
+                write_format(Format::JsonMcpServers, &path, &[entry()], true)
+            })
+            .unwrap();
+            backup_storage::clear();
+            std::env::set_var("TOOLPORT_SECRET_KEY", "locked-reconnect-pending");
+            disconnect("cursor", &path, Format::JsonMcpServers).unwrap();
+            let pending = std::fs::read_to_string(&path).unwrap();
+            assert!(pending.contains("TOOLPORT_MISSING_CREDENTIAL_0"));
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            let error = mutation::run("cursor", &path, Format::JsonMcpServers, || {
+                backup_file("cursor", &path)?;
+                write_format(Format::JsonMcpServers, &path, &[entry()], true)
+            })
+            .unwrap_err();
+            assert!(error.contains("Choose Retry"), "{error}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), pending);
+            let row = recovery::list()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.path == path.to_string_lossy())
+                .expect("the owed value stays listed");
+            assert!(recovery::retry(&row.id).unwrap().is_none());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        });
+    }
+    /// A receipt cut to zero bytes or inside its first key is never read as a
+    /// record: Connect is refused with the config unchanged, the recovery list
+    /// offers Discard recovery file, and Discard deletes only that file.
+    #[test]
+    fn unreadable_receipt_blocks_writes_and_can_be_discarded_alone() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let secret = "sk-unreadable-receipt-fixture";
+            crate::secrets::set_secret("native", "API_KEY", secret).unwrap();
+            let connect = |path: &Path| {
+                mutation::run("cursor", path, Format::JsonMcpServers, || {
+                    backup_file("cursor", path)?;
+                    write_format(Format::JsonMcpServers, path, &[entry()], true)
+                })
+            };
+            let mut pending = Vec::new();
+            for name in ["damaged.json", "kept.json"] {
+                let path = data.join(name);
+                std::fs::write(
+                    &path,
+                    format!(r#"{{"mcpServers":{{"native":{{"command":"echo","env":{{"API_KEY":"{secret}"}}}}}}}}"#),
+                )
+                .unwrap();
+                backup_storage::register("native", "API_KEY", secret);
+                connect(&path).unwrap();
+                backup_storage::clear();
+                pending.push(path);
+            }
+            std::env::set_var("TOOLPORT_SECRET_KEY", "locked-unreadable-receipt");
+            for path in &pending {
+                disconnect("cursor", path, Format::JsonMcpServers).unwrap();
+            }
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            let (path, kept) = (&pending[0], &pending[1]);
+            let file = record_path("cursor", path).unwrap();
+            let kept_file = record_path("cursor", kept).unwrap();
+            let kept_raw = std::fs::read_to_string(&kept_file).unwrap();
+            let (account, key, _) = backup_storage::test_recovery_key(&kept_file);
+            let folder: Vec<_> = std::fs::read_dir(file.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|other| *other != file)
+                .collect();
+            let config = std::fs::read_to_string(path).unwrap();
+            assert!(config.contains("TOOLPORT_MISSING_CREDENTIAL_0"));
+            let mut row = None;
+            for damaged in ["", "{\"toolportBackupVer"] {
+                std::fs::write(&file, damaged).unwrap();
+                assert!(connect(path).is_err(), "{damaged:?}");
+                assert_eq!(std::fs::read_to_string(path).unwrap(), config);
+                let rows = recovery::list().unwrap();
+                let found = rows
+                    .iter()
+                    .find(|r| r.backup_path == file.to_string_lossy())
+                    .expect("the damaged receipt is listed")
+                    .clone();
+                assert!(found.error.is_some(), "{damaged:?}");
+                assert!(found.can_discard_file && !found.can_discard, "{damaged:?}");
+                assert!(rows
+                    .iter()
+                    .any(|r| r.path == kept.to_string_lossy() && r.can_discard));
+                row = Some(found);
+            }
+            let row = row.unwrap();
+            let review = recovery::prepare_discard(&row.id).unwrap();
+            assert_eq!(
+                review.lines,
+                [format!(
+                    "Backup file: {}",
+                    file.file_name().unwrap().to_string_lossy()
+                )]
+            );
+            recovery::discard_confirmed(&row.id, &review.manifest).unwrap();
+            assert!(!file.exists());
+            assert_eq!(std::fs::read_to_string(&kept_file).unwrap(), kept_raw);
+            assert!(crate::secrets::get_backup_secret_result(&account, &key)
+                .unwrap()
+                .is_some());
+            for other in &folder {
+                assert!(other.exists(), "{}", other.display());
+            }
+            assert_eq!(std::fs::read_to_string(path).unwrap(), config);
+            connect(path).unwrap();
+        });
+    }
+    #[test]
+    fn edited_recovery_accounts_for_each_leaf_without_losing_user_edits() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let registry=serde_json::from_value(serde_json::json!({"version":3,"profiles":[],"servers":[{"id":"native","name":"Native","transport":"stdio","env":[{"key":"API_ONE","secret":true},{"key":"API_TWO","secret":true}]}]})).unwrap();
+            crate::registry::save(&registry).unwrap();
+            let one = "sk-d1-one-original-value";
+            let two = "sk-d1-two-original-value";
+            let formats=[
+                (Format::JsonMcpServers,"json",format!("{{\n  \"mcpServers\":{{\"native\":{{\"command\":\"echo\",\"env\":{{\"API_ONE\":\"{one}\",\"API_TWO\":\"{two}\"}}}}}},\n  \"userSetting\":41\n}}\n")),
+                (Format::JsonServers,"jsonc",format!("// keep first\n{{\n  \"mcpServers\":{{\"native\":{{\"command\":\"echo\",\"env\":{{\"API_ONE\":\"{one}\",\"API_TWO\":\"{two}\"}}}}}},\n  // keep setting order\n  \"userSetting\":41,\n}}\n")),
+                (Format::TomlMcpServers,"toml",format!("# keep first\nuserSetting = 41\n[mcp_servers.native] # keep entry\ncommand = 'echo'\n[mcp_servers.native.env]\nAPI_ONE = '{one}' # keep value\nAPI_TWO = '{two}'\n")),
+                (Format::YamlMcpServers,"yaml",format!("# keep first\nuserSetting: 41\nmcp_servers:\n  native: # keep entry\n    command: echo\n    env:\n      API_ONE: '{one}' # keep value\n      API_TWO: '{two}'\n")),
+            ];
+            for (format, extension, original) in formats {
+                let client = if extension == "jsonc" {
+                    "vscode"
+                } else {
+                    "cursor"
+                };
+                let original = if extension == "jsonc" {
+                    original.replace("mcpServers", "servers")
+                } else {
+                    original
+                };
+                for variant in ["edited", "partial", "deleted", "replaced", "moved"] {
+                    backup_storage::reset_missing();
+                    let path = data.join(format!("d1-{extension}-{variant}.{extension}"));
+                    std::fs::write(&path, &original).unwrap();
+                    for (key, value) in [("API_ONE", one), ("API_TWO", two)] {
+                        crate::secrets::set_secret("native", key, value).unwrap();
+                        backup_storage::register("native", key, value);
+                    }
+                    mutation::run(client, &path, format, || {
+                        backup_file(client, &path)?;
+                        write_format(format, &path, &[entry()], true)
+                    })
+                    .unwrap();
+                    backup_storage::clear();
+                    std::env::set_var("TOOLPORT_SECRET_KEY", "d1-locked");
+                    disconnect(client, &path, format).unwrap();
+                    let row = recovery::list()
+                        .unwrap()
+                        .into_iter()
+                        .find(|r| r.path == path.to_string_lossy())
+                        .unwrap();
+                    let raw = std::fs::read_to_string(&path).unwrap();
+                    let mut edited = raw.replace("41", "42");
+                    match variant {
+                        "deleted" => {
+                            edited = match extension {
+                                "json" | "jsonc" => {
+                                    "{\"mcpServers\":{},\"userSetting\":42}\n".into()
+                                }
+                                "toml" => "# deleted server\nuserSetting = 42\n".into(),
+                                _ => "# deleted server\nuserSetting: 42\nmcp_servers: {}\n".into(),
+                            };
+                        }
+                        "replaced" => {
+                            edited = edited.replace(
+                                "TOOLPORT_MISSING_CREDENTIAL_0",
+                                "sk-user-replaced-keep-this",
+                            )
+                        }
+                        "moved" => edited = edited.replace("native", "renamed"),
+                        _ => {}
+                    }
+                    std::fs::write(&path, &edited).unwrap();
+                    // Edited config plus a still-locked retry must retain the receipt.
+                    let locked_retry = recovery::retry(&row.id);
+                    if variant == "deleted" {
+                        assert!(
+                            locked_retry.is_err(),
+                            "locked cleanup must keep the receipt"
+                        );
+                    } else {
+                        assert!(locked_retry.unwrap().is_some());
+                        // The locked attempt already counts the user's own replacement.
+                        let accounted = usize::from(variant == "replaced");
+                        assert_eq!(
+                            recovery_values::progress(),
+                            (0, accounted),
+                            "{extension}/{variant}"
+                        );
+                    }
+                    assert!(Path::new(&row.backup_path).exists());
+                    for file in std::fs::read_dir(backup_dir(client).unwrap())
+                        .unwrap()
+                        .flatten()
+                    {
+                        let backup = std::fs::read_to_string(file.path()).unwrap();
+                        assert!(
+                            !backup.contains(one)
+                                && !backup.contains(two)
+                                && !backup.contains("sk-user-replaced-keep-this"),
+                            "pending retries must not persist plaintext values"
+                        );
+                    }
+                    std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+                    let mut lost = None;
+                    if variant == "partial" {
+                        let (account, key, _) =
+                            backup_storage::test_recovery_key(Path::new(&row.backup_path));
+                        crate::secrets::delete_backup_secret(&account, &key).unwrap();
+                        crate::secrets::delete_backup_secret(
+                            &account,
+                            &format!("{key}-credential-1"),
+                        )
+                        .unwrap();
+                        crate::secrets::delete_secret("native", "API_TWO").unwrap();
+                        lost = Some((account, key));
+                    }
+                    let attempt = recovery::retry_with_report(&row.id).unwrap();
+                    let pending = attempt.pending.clone();
+                    let counts = (attempt.restored, attempt.accounted, attempt.remaining);
+                    let expected = match variant {
+                        "partial" => (1, 0, 1),
+                        // Counted once, by the earlier locked attempt.
+                        "replaced" => (1, 0, 0),
+                        "deleted" => (0, 2, 0),
+                        _ => (2, 0, 0),
+                    };
+                    assert_eq!(
+                        counts, expected,
+                        "{extension}/{variant}: {}",
+                        attempt.message
+                    );
+                    let output = std::fs::read_to_string(&path).unwrap();
+                    assert!(output.contains("42"));
+                    if variant == "partial" {
+                        assert!(
+                            pending.is_some(),
+                            "partial recovery must remain pending: {extension}"
+                        );
+                        assert!(Path::new(&row.backup_path).exists());
+                        assert!(output.contains(one));
+                        assert!(!output.contains(two));
+                        assert!(output.contains("TOOLPORT_MISSING_CREDENTIAL_1"));
+                        let (account, key) = lost.unwrap();
+                        crate::secrets::set_secret(&account, &format!("{key}-credential-1"), two)
+                            .unwrap();
+                        let second = recovery::retry_with_report(&row.id).unwrap();
+                        assert!(second.pending.is_none());
+                        // The value put back by the first Retry is not recounted.
+                        assert_eq!(
+                            (second.restored, second.accounted, second.remaining),
+                            (1, 0, 0),
+                            "{extension}: {}",
+                            second.message
+                        );
+                    } else {
+                        assert!(
+                            pending.is_none(),
+                            "completed {extension}/{variant} must release receipt"
+                        );
+                    }
+                    let output = std::fs::read_to_string(&path).unwrap();
+                    if variant == "deleted" {
+                        assert_eq!(output, edited, "never resurrect removed entries");
+                    } else {
+                        assert!(!output.contains("TOOLPORT_MISSING_CREDENTIAL_"));
+                        assert!(output.contains(two));
+                        if variant == "replaced" {
+                            assert!(output.contains("sk-user-replaced-keep-this"));
+                            assert!(!output.contains(one));
+                        } else {
+                            assert!(output.contains(one));
+                        }
+                        if extension != "json" {
+                            assert!(output.contains("keep first"));
+                            assert!(output.contains("keep setting order") || extension != "jsonc");
+                        }
+                        if variant == "moved" {
+                            assert!(output.contains("renamed"));
+                            assert!(!output.contains("native"));
+                        }
+                    }
+                    assert!(!Path::new(&row.backup_path).exists());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn pending_locations_cannot_be_forgotten_and_stale_retry_cannot_disconnect() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let folder = crate::registry::conduit_dir()
+                .unwrap()
+                .join("manual-cursor");
+            std::fs::create_dir_all(&folder).unwrap();
+            let path = folder.join("mcp.json");
+            let original = r#"{"mcpServers":{"native":{"command":"echo","env":{"API_KEY":"sk-pending-location-fixture"}}}}"#;
+            std::fs::write(&path, original).unwrap();
+            let id = locations::add_client_location("cursor", folder.to_str().unwrap()).unwrap();
+            backup_storage::register("native", "API_KEY", "sk-pending-location-fixture");
+            mutation::run(&id, &path, Format::JsonMcpServers, || {
+                backup_file(&id, &path)?;
+                write_format(Format::JsonMcpServers, &path, &[entry()], true)
+            })
+            .unwrap();
+            backup_storage::clear();
+            std::env::set_var("TOOLPORT_SECRET_KEY", "locked-pending-location");
+            disconnect::restore_path(&id, &path, Format::JsonMcpServers, None).unwrap();
+            let notice = recovery::list()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.client_id == id)
+                .unwrap();
+            assert!(locations::remove_client_location(&id)
+                .unwrap_err()
+                .contains("Choose Retry"));
+            recovery::dismiss(&notice.id, true).unwrap();
+            assert!(
+                locations::remove_client_location(&id).is_err(),
+                "dismissal never forgets recovery"
+            );
+            assert!(recovery::list().unwrap().iter().any(|r| r.id == notice.id));
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            let reconnect_id = id.clone();
+            let reconnect_path = path.clone();
+            recovery::BEFORE_RETRY_LOCK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    // A reconnect racing Retry is refused while values are owed.
+                    assert!(mutation::run(
+                        &reconnect_id,
+                        &reconnect_path,
+                        Format::JsonMcpServers,
+                        || write_format(Format::JsonMcpServers, &reconnect_path, &[entry()], true),
+                    )
+                    .unwrap_err()
+                    .contains("Choose Retry"));
+                }))
+            });
+            assert!(recovery::retry(&notice.id).unwrap().is_none());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            assert!(locations::lookup(&id).is_some());
+            locations::remove_client_location(&id).unwrap();
+            assert!(locations::lookup(&id).is_none());
+        });
+    }
+
     #[test]
     fn every_writer_import_connect_move_disconnect_restores_exact_bytes() {
         let _lock = crate::registry::data_dir_test_lock();
@@ -1453,7 +2755,7 @@ mod tests {
             assert_eq!(read_config_file(&path).unwrap(), restored);
             assert_eq!(
                 load("fixture", &path).unwrap().unwrap().original.as_deref(),
-                Some(original)
+                None, // Successful disconnect must release the original payload.
             );
             if edited {
                 let root = parse_json_value(&restored).unwrap();
@@ -1678,7 +2980,7 @@ mod tests {
             0o644
         );
         assert_eq!(
-            std::fs::metadata(record_path("fixture", &path).unwrap())
+            std::fs::metadata(released_path("fixture", &path).unwrap())
                 .unwrap()
                 .permissions()
                 .mode()

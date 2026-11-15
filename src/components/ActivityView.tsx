@@ -488,6 +488,8 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
   const { t: tr, locale } = useI18n();
   const hasCatalog = (savings.tokenizedLoads ?? 0) > 0;
   const discovered = (savings.discoveryCount ?? 0) > 0;
+  // The signed formula stays exact; a negative result is labeled as a change, not savings.
+  const negative = savings.tokensSaved < 0;
   const method = tr(
     "The baseline is the full-mode tools array for the same allowed servers and policies at the first tools/list in each session. We count compact JSON and search response text with cl100k_base, then subtract every tools/list and search response. Sessionless HTTP, initial catalogs above known client limits, and older records are excluded. Client caching and formatting may change model usage; this is not a billing figure.",
   );
@@ -496,7 +498,9 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
     try {
       await navigator.clipboard.writeText(
         tr(
-          "Toolport measured {tokens} net tokens saved across {sessions} client sessions. Full catalog baselines minus all catalog and search responses, counted locally with cl100k_base; not a billing figure. toolport.app",
+          negative
+            ? "Toolport measured a net token change of {tokens} across {sessions} client sessions. Full catalog baselines minus all catalog and search responses, counted locally with cl100k_base; not a billing figure. toolport.app"
+            : "Toolport measured {tokens} net tokens saved across {sessions} client sessions. Full catalog baselines minus all catalog and search responses, counted locally with cl100k_base; not a billing figure. toolport.app",
           {
             tokens: fmtTokens(savings.tokensSaved),
             sessions: savings.tokenizedLoads ?? 0,
@@ -528,7 +532,13 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
               ? fmtBytes(savings.discoveryResponseBytes ?? 0)
               : tr("Not measured yet")}{" "}
           <span className="text-base font-normal text-muted-foreground">
-            {hasCatalog ? tr("net tokens saved") : discovered ? tr("discovery text") : ""}
+            {hasCatalog
+              ? negative
+                ? tr("net token change")
+                : tr("net tokens saved")
+              : discovered
+                ? tr("discovery text")
+                : ""}
           </span>
         </span>
       </div>
@@ -571,7 +581,9 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
           {hasCatalog && (
             <p>
               {tr(
-                "{baseline} baseline tokens − {catalog} catalog response tokens − {search} search response tokens = {net} net tokens saved.",
+                negative
+                  ? "{baseline} baseline tokens − {catalog} catalog response tokens − {search} search response tokens = {net} net token change. A negative change means responses used more tokens than the baseline."
+                  : "{baseline} baseline tokens − {catalog} catalog response tokens − {search} search response tokens = {net} net tokens saved.",
                 {
                   baseline: exact(savings.fullTokens),
                   catalog: exact(savings.exposedTokens),

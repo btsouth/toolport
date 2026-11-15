@@ -372,6 +372,9 @@ fn credential_scope(
             ids.remove(&id);
         }
     }
+    // Every backup generation uses one namespace bound to this data directory.
+    // Inventory it even after backup files were removed or a write was interrupted.
+    ids.insert(crate::clients::backup_storage::install_account(dir));
     Ok(crate::secrets::purge::Scope {
         all_installs,
         server_ids: ids,
@@ -489,7 +492,6 @@ pub fn plan_with_scope(all_installs: bool) -> Result<Plan, String> {
     })
 }
 
-#[cfg(any(feature = "desktop", feature = "gtk-desktop", test))]
 fn open_removal_report(report_path: &Path) -> Result<std::fs::File, String> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -567,6 +569,18 @@ pub fn launch_after_exit(report_path: &Path) -> Result<(), String> {
         std::mem::forget(pipe);
     }
     Ok(())
+}
+
+pub fn write_report(path: &Path, report: &Report) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = open_removal_report(path)?;
+    file.write_all(
+        serde_json::to_string_pretty(report)
+            .map_err(|e| e.to_string())?
+            .as_bytes(),
+    )
+    .map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())
 }
 
 pub fn run() -> Result<Report, String> {
@@ -842,6 +856,8 @@ fn remove_path(path: &Path, report: &mut Report) {
 // Names come from registry/profile stores, clients, telemetry, daemon/broker,
 // secrets, Teams, native-shell state and the gateway's persisted caches.
 const DATA_FILES: &[&str] = &[
+    "ui-settings.json",
+    "ui-settings.lock",
     "client-locations.json",
     "registry.json",
     "registry-recovery.json",
@@ -874,6 +890,7 @@ const DATA_FILES: &[&str] = &[
     "http-bridge-update-resume.json",
     "gtk-security-dismissed.json",
     "gtk-window-state.json",
+    "gtk-skills-project.json",
     ".secrets-file-migrated",
     ".keychain-dpk-migrated",
     ".tray-hint-shown",
@@ -938,6 +955,21 @@ fn owned_data_name(name: &str, legacy: &std::collections::HashSet<String>) -> bo
 }
 
 fn owned_data_file(name: &str) -> bool {
+    if name.strip_suffix(".bak").is_some_and(|base| {
+        base == "tool-pins.json"
+            || base
+                .strip_prefix("tool-pins-v2-")
+                .and_then(|s| s.strip_suffix(".json"))
+                .is_some_and(|s| hex_name(s, 64))
+    }) || name
+        .strip_prefix("ui-settings.json.corrupt-")
+        .is_some_and(|suffix| {
+            let parts: Vec<_> = suffix.split('-').collect();
+            parts.len() == 3 && parts.iter().all(|part| decimal(part))
+        })
+    {
+        return true;
+    }
     if DATA_FILES.contains(&name)
         || matches!(
             name,
@@ -1048,10 +1080,15 @@ fn bin_file(name: &str) -> bool {
         .is_some_and(|(base, id)| hex_name(id, 32) && gateway_file(base))
 }
 
+pub(crate) fn owned_backup_file(client: &crate::clients::PurgeBackupClient, name: &str) -> bool {
+    generated_file_name(name, |name| backup_file(client, name))
+}
+
 fn backup_file(client: &crate::clients::PurgeBackupClient, name: &str) -> bool {
     name == "moved-servers.json"
         || name
             .strip_prefix("original-")
+            .or_else(|| name.strip_prefix("released-"))
             .and_then(|s| s.strip_suffix(".json"))
             .is_some_and(|s| hex_name(s, 64))
         || name.split_once('-').is_some_and(|(stamp, basename)| {
@@ -1168,8 +1205,9 @@ fn owned_data_entry_with_backups(
         ["backups", client] if backup_client(client).is_some() => {
             return Some(DataEntry::Directory)
         }
-        ["backups", client, name] => backup_client(client)
-            .is_some_and(|client| generated_file_name(name, |name| backup_file(&client, name))),
+        ["backups", client, name] => {
+            backup_client(client).is_some_and(|client| owned_backup_file(&client, name))
+        }
         ["exports", name] => generated_file_name(name, export_file),
         ["children" | "daemon-runs", name] => generated_file_name(name, pid_json),
         ["oauth-locks", name] => oauth_file(name),
@@ -1579,6 +1617,28 @@ fn startup_files(files: Vec<PathBuf>, remove: bool, report: &mut Report) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn recognizes_ui_settings_and_pin_recovery_files() {
+        let legacy = Default::default();
+        for name in [
+            "ui-settings.json",
+            "ui-settings.lock",
+            "gtk-skills-project.json",
+            "ui-settings.json.123.1.conduit-tmp",
+            "ui-settings.json.corrupt-123-12-0",
+            "tool-pins.json.bak",
+            &format!("tool-pins-v2-{}.json.bak", "a".repeat(64)),
+        ] {
+            assert!(owned_data_name(name, &legacy), "{name}");
+        }
+        for name in [
+            "ui-settings-notes.json",
+            "tool-pins-custom.json.bak",
+            "ui-settings.json.corrupt-notes",
+        ] {
+            assert!(!owned_data_name(name, &legacy), "{name}");
+        }
+    }
     #[test]
     fn review_r4_purge_removes_only_exact_unreadable_pin_copies() {
         let env = crate::registry::DataDirTestEnv::new("purge-unreadable-pins");
@@ -2402,14 +2462,21 @@ mod tests {
         let scope = credential_scope(&dev, &others, false).unwrap();
         assert_eq!(
             scope.server_ids,
-            std::collections::HashSet::from(["dev-only".into()])
+            std::collections::HashSet::from([
+                "dev-only".into(),
+                crate::clients::backup_storage::install_account(&dev)
+            ])
         );
         assert!(!scope.all_installs);
         let scope = credential_scope(&dev, &[], false).unwrap();
         assert!(!scope.all_installs);
         assert_eq!(
             scope.server_ids,
-            std::collections::HashSet::from(["shared".into(), "dev-only".into()])
+            std::collections::HashSet::from([
+                "shared".into(),
+                "dev-only".into(),
+                crate::clients::backup_storage::install_account(&dev)
+            ])
         );
         assert!(credential_scope(&dev, &others, true).unwrap().all_installs);
         std::fs::remove_file(main.join("registry.json")).unwrap();
@@ -2459,6 +2526,7 @@ mod tests {
         std::fs::create_dir_all(env.dir.join("documents/broker")).unwrap();
         std::fs::write(env.dir.join("documents/broker/notes"), "keep nested").unwrap();
         for name in [
+            "gtk-skills-project.json",
             "registry.json.bak",
             "registry.json.bak.123",
             "registry.json.v2-123.bak",
@@ -2593,7 +2661,10 @@ mod tests {
         assert!(!scope.all_installs, "discovery cannot prove sole ownership");
         assert_eq!(
             scope.server_ids,
-            std::collections::HashSet::from(["mine".into()])
+            std::collections::HashSet::from([
+                "mine".into(),
+                crate::clients::backup_storage::install_account(&selected)
+            ])
         );
     }
 
@@ -3195,7 +3266,10 @@ mod tests {
             "select the settings copy, not the original recovery snapshot"
         );
         let backup = &backups[0];
-        assert_eq!(std::fs::read_to_string(backup).unwrap(), original);
+        assert_eq!(
+            crate::clients::read_client_backup(backup, &config).unwrap(),
+            original
+        );
         assert!(
             owned_data_entry(backup.strip_prefix(&env.dir).unwrap()).is_some(),
             "{}",

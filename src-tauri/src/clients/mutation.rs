@@ -144,6 +144,14 @@ pub(super) fn write(path: &Path, contents: &str) -> Result<(), String> {
     }
 }
 
+pub(super) fn is_disconnecting() -> bool {
+    PENDING.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|pending| pending.disconnecting)
+    })
+}
+
 pub(super) fn disconnecting() {
     PENDING.with(|slot| {
         if let Some(pending) = slot.borrow_mut().as_mut() {
@@ -236,7 +244,7 @@ pub(super) fn run<T>(
     format: Format,
     edit: impl FnMut() -> Result<T, String>,
 ) -> Result<T, String> {
-    run_inner(client_id, path, format, false, edit)
+    run_inner(client_id, path, format, false, edit).map_err(|error| diagnostics::at(path, error))
 }
 
 pub(super) fn settings<T>(
@@ -245,6 +253,7 @@ pub(super) fn settings<T>(
     mut edit: impl FnMut() -> Result<T, String>,
 ) -> Result<T, String> {
     run_inner(client_id, path, Format::JsonMcpServers, true, &mut edit)
+        .map_err(|error| diagnostics::at(path, error))
 }
 
 fn run_inner<T>(
@@ -352,7 +361,10 @@ fn run_inner<T>(
         let commit = (|| {
             for (auxiliary, text) in pending.auxiliary {
                 auxiliary_recovery.push(super::restore::checkpoint(&auxiliary)?);
-                crate::registry::atomic_write(&auxiliary, &text)?;
+                crate::registry::atomic_write(
+                    &auxiliary,
+                    &backup_storage::encode_recovery(&auxiliary, &text, pending.disconnecting)?,
+                )?;
             }
             let recovery = super::restore::remember(
                 client_id,

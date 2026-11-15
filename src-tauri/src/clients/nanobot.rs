@@ -79,9 +79,7 @@ fn json_object_from_content(content: &str) -> Result<Value, String> {
     let root: Value = if content.trim().is_empty() {
         serde_json::json!({})
     } else {
-        serde_json::from_str(content).map_err(|error| {
-            format!("Could not parse the nanobot config: {error}; leaving it untouched.")
-        })?
+        serde_json::from_str(content).map_err(|error| super::diagnostics::json(&error))?
     };
     if !root.is_object() {
         return Err("The nanobot config root must be an object; leaving it untouched.".into());
@@ -96,7 +94,7 @@ pub(crate) fn root_for_skill_edit(content: &str) -> Result<Value, String> {
     if !content.trim().is_empty() {
         let cst =
             jsonc_parser::cst::CstRootNode::parse(content, &jsonc_parser::ParseOptions::default())
-                .map_err(|error| format!("Could not parse the nanobot config: {error}"))?;
+                .map_err(|error| super::diagnostics::jsonc(&error))?;
         if let Some(object) = cst.object_value() {
             zcode::duplicate_keys(&object, "", CLIENT)?;
         }

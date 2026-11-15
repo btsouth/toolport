@@ -8,7 +8,7 @@
   "state mismatch" on the next try.
 - **A client reports the gateway "was not found" (running from source).** Build
   the gateway binary once: `npm run build:gateway` (or
-  `cargo build --no-default-features --bin toolport-gateway --manifest-path src-tauri/Cargo.toml`).
+  `cargo build --locked --no-default-features --features search-static --bin toolport-gateway --manifest-path src-tauri/Cargo.toml`).
   `npm run tauri dev` builds the app but not this separate binary; packaged
   releases bundle it, so installed users never hit this.
 - **An npx/uvx server shows "Error" then works on retry.** On a cold npm/PyPI cache
@@ -22,9 +22,11 @@
   so the gateway reads them with no prompt. This is a dev-only artifact.
 - **"could not read/store secret" on Linux.** Secret storage uses the freedesktop
   Secret Service (libsecret), provided by GNOME Keyring, KWallet, or similar. A
-  headless box or a session without a running keyring daemon has nowhere to store
-  secrets. Run Toolport in a desktop session, or install and unlock a keyring
-  (e.g. `gnome-keyring`).
+  desktop session needs an installed, unlocked keyring (for example,
+  `gnome-keyring`). For a headless machine, use the encrypted file vault with
+  `TOOLPORT_SECRET_KEY` or supported environment references instead; see
+  [Headless secrets](headless.md). Keep the original vault/key available to restore
+  imported client credentials.
 - **macOS keychain and the gateway (v0.9.3+).** The app and the separately-signed
   gateway share a team-scoped keychain access group, so the gateway reads the
   secrets the app saved with no prompt, even across app updates. (Earlier releases

@@ -48,6 +48,8 @@ package() {
     "$pkgdir/usr/bin/toolport-gtk"
   install -Dm755 src-tauri/target/release/toolport-gateway \
     "$pkgdir/usr/bin/toolport-gateway"
+  ln -s toolport-gtk "$pkgdir/usr/bin/toolport"
+  ln -s toolport-gtk "$pkgdir/usr/bin/conduit"
   install -Dm644 packaging/linux/native/com.tsout.Toolport.desktop \
     "$pkgdir/usr/share/applications/com.tsout.Toolport.desktop"
   install -Dm644 packaging/linux/native/com.tsout.Toolport.metainfo.xml \

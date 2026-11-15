@@ -25,6 +25,7 @@ vi.mock("@/lib/api", async (importOriginal) => ({
   probeServers: vi.fn(() => Promise.resolve([])),
   uninstallGateway: (...a: unknown[]) => uninstallGateway(...a),
   recentClientActivity: vi.fn(() => Promise.resolve([])),
+  listClientRecoveries: vi.fn(() => Promise.resolve([])),
   removeServer: (...a: unknown[]) => removeServer(...a),
   setAllEnabled: vi.fn(),
   setSecret: vi.fn(),

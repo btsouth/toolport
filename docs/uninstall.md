@@ -2,7 +2,7 @@
 
 Toolport installs a gateway entry into each AI client's own config file and keeps
 its state in a per-user data directory. A clean removal has two parts: disconnect
-the clients while Toolport is still installed, then remove the app. Normal uninstall and upgrades keep your data and credentials.
+the clients while Toolport is still installed, then remove the app. Normal uninstall keeps your registry and credentials. Verified client recovery releases backup payloads; upgrades keep connections and recovery data.
 
 ## 1. Disconnect your clients
 
@@ -19,6 +19,63 @@ disconnects; the daemon then exits at once instead of waiting out its idle time.
 The same happens when you quit Toolport. A daemon whose app was deleted, moved to
 the Trash or replaced by a package upgrade notices within a few seconds and exits
 as soon as no client is connected.
+
+Backups of imported credentials are stored in the vault with a recovery copy
+that omits secret values. At desktop startup, Toolport also seals older plaintext
+backups before updating client gateway paths. If that migration cannot use the
+vault, it retains the original backup and reports the failure; unlock the vault
+and restart Toolport to retry. If a saved value cannot be read, restoration still recovers the config and
+keeps a placeholder for that value. **Clients** lists each server and key with
+its reason and next step. A locked keyring needs unlocking; an unavailable store
+needs starting or reconnecting; duplicate matches need resolving. A missing or
+damaged saved value can be re-entered in the client, or entered in Toolport before
+choosing **Retry**. Access rejection and cancellation have their own messages.
+Technical placeholder names appear only in **Details**.
+
+Retry restores unchanged placeholder leaves, including entries you moved, while
+preserving your edits, comments and ordering. A value you replaced yourself or a
+server entry you deleted is accounted for without being overwritten or restored.
+Results state how many values were restored and how many still need attention.
+The receipt and saved values are retained until the committed file has no owed
+placeholders. Partial recovery never removes its receipt. Recovery also works
+from `toolport-gateway --disconnect-all`, even for an already disconnected client.
+
+Pending notices survive restarting either shell. **Dismiss** only hides a notice;
+**Show recovery** brings it back. The notice and confirmation show the backup path
+and explain that it does not expire automatically. **Discard these saved values**
+is separate and permanent: its confirmation lists the saved values and every
+backup file it will delete, including older snapshots and the matching move
+record. The current client config and server credentials do not change; temporary
+text for missing values stays until you replace it yourself. If deletion starts
+but cannot finish, the notice says which material may already be gone and offers
+**Finish discarding** with a fresh list of remaining files. Restoration is blocked
+for that receipt once deletion has started. **Scan clients again** and Ctrl+R
+check saved-value availability without an unlock prompt or changing the client
+config; available values are marked ready for **Retry**. Malformed or untrusted receipts are
+listed separately with a repair reason and cannot authorize unsafe writes or
+deletion. One bad receipt does not hide other recoveries.
+
+Linux backup reads and deletion never open keyring unlock prompts. macOS backup
+queries use `kSecUseAuthenticationUIFail`: interaction-not-allowed, authentication
+failure and cancellation map to separate states. Credential Manager maps reported
+Windows access, authentication, cancellation, missing and corrupt-data errors.
+Windows has no separately lockable generic-credential vault, so normal reads do
+not produce a keyring-locked state or an unlock prompt to cancel. Its unique
+credential target names also do not produce Secret Service's duplicate-match
+state. Keychain's service/account/access-group query does not report that Linux
+match-cardinality state either. Payload integrity failures are checked by
+Toolport on every platform.
+
+Status mapping and backup round-trip tests run in **Headless Rust tests
+(macos-latest, core)** and **Headless Rust tests (windows-latest, core)** in
+`.github/workflows/ci.yml`. Unsigned macOS runners assert the production Keychain
+entitlement refusal instead of publishing an unprotected backup; real Keychain
+round-trip acceptance needs the signed app with its provisioning profile.
+
+Data removal refuses to discard incomplete recovery.
+After verified restoration, historical backup payloads are deleted and only
+empty ownership metadata remains, so a later uninstall cannot claim native entries.
+Turn off **Launch at login** in Settings.
 
 Windows NSIS and native GTK deb/rpm/Arch packages attempt the same operation before
 removing their gateway (`--disconnect-all --uninstall`), which also removes
@@ -65,7 +122,13 @@ distinct from the Tauri .deb. On macOS the CLI is
     [Arch and Omarchy](arch-pacman-repo.md) for removing the repo and key.
   - `.deb`: `sudo apt remove toolport` (or `sudo dpkg -r toolport`).
   - Native GTK `.rpm`: `sudo dnf remove toolport`.
-  - AppImage: quit Toolport and delete the `.AppImage` file.
+  - AppImage: disconnect clients, quit Toolport, then run the installer cleanup as
+    your normal user: `bash install.sh --uninstall-appimage` (download
+    [install.sh](https://toolport.app/install.sh) first). This removes the actual
+    extensionless `$XDG_BIN_HOME/toolport` (default `~/.local/bin/toolport`),
+    desktop launcher, icons, autostart entries and update resume state.
+    Use the same XDG paths as installation. For a manually downloaded AppImage,
+    also delete that file.
 
 ## Optional: remove Toolport data
 
@@ -173,6 +236,8 @@ existing `Conduit` directory or the separate `Toolport-dev` directory.
 ## Keeping Toolport
 
 To move a client off Toolport without uninstalling, use **Disconnect** on that
-client only. To keep a client connected but stop sending its tool definitions, set
-`TOOLPORT_DISCOVERY=full` on that client's gateway entry; see
-[Configuration](configuration.md).
+client only. To keep a client connected while finding tools on demand instead
+of sending the full tool list, choose lazy discovery for that client on the
+**Clients** page. `TOOLPORT_DISCOVERY=full` sends every definition and is only a
+standalone process default; shared daemon sessions use the saved client setting.
+See [Configuration](configuration.md).

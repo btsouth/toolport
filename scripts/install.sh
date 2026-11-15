@@ -11,7 +11,7 @@
 # just made will not reach anyone using the short URL.
 #
 # Installs the latest signed release for your OS/arch:
-#   - Linux (x86_64): the GTK .deb on supported Debian/Ubuntu, else the Tauri AppImage
+#   - Linux (x86_64): native GTK packages on compatible Debian/Ubuntu, RPM and Arch systems, else the Tauri AppImage
 #     into ~/.local/bin with a desktop entry.
 #   - macOS: copies Toolport.app from the signed .dmg into /Applications (Homebrew is
 #     the cleaner path, and this script points you there).
@@ -35,7 +35,7 @@ EXPECTED_TEAM_ID="V4YZPC7T6G"
 
 say() { printf '\033[1;36m>\033[0m %s\n' "$*"; }
 err() {
-  printf '\033[1;31mx\033[0m %s\n' "$*" >&2
+  printf '\033[1;31mx\033[0m %s\n' "$@" >&2
   exit 1
 }
 need() { command -v "$1" >/dev/null 2>&1 || err "This installer needs '$1' on your PATH."; }
@@ -91,6 +91,45 @@ deb_supported() {
   done
 }
 
+rpm_supported() {
+  local distro version
+  rpm_missing=""
+  distro="$(os_value ID)"; version="$(os_value VERSION_ID)"
+  case "$distro" in
+    fedora) version_at_least "$version" 40; return ;;
+    opensuse-tumbleweed)
+      # Snapshot releases after April 2024 meet the Ubuntu 24.04 ABI floor.
+      if [[ "$version" =~ ^[0-9]{8}$ ]] && [ "$version" -ge 20240401 ]; then return 0; fi ;;
+  esac
+  # Installed libraries or cached metadata are read-only evidence;
+  # never refresh repositories just to print an installation plan.
+  local package floor candidate provider
+  for package in gtk4 libadwaita glib2 glibc; do
+    case "$package" in
+      gtk4) floor=4.14 ;; libadwaita) floor=1.5 ;;
+      glib2) floor=2.80 ;; glibc) floor=2.39 ;;
+    esac
+    provider="$package"
+    if command -v zypper >/dev/null 2>&1; then
+      case "$package" in
+        gtk4) provider=libgtk-4-1 ;; libadwaita) provider=libadwaita-1-0 ;; glib2) provider=libglib-2_0-0 ;;
+      esac
+    fi
+    candidate="$(rpm -q --qf '%{VERSION}\n' "$provider" 2>/dev/null || true)"
+    if ! version_at_least "$candidate" "$floor"; then
+      if command -v zypper >/dev/null 2>&1; then
+        candidate="$(LC_ALL=C zypper --no-refresh --no-color info --type package "$provider" 2>/dev/null | awk '$1 == "Version" && $2 == ":" {print $3}' | sed 's/-.*//' | sort -V | tail -n1)"
+      else
+        candidate="$(dnf -q --cacheonly repoquery --latest-limit=1 --qf '%{version}' "$package" 2>/dev/null | sort -V | tail -n1)" || candidate=""
+      fi
+    fi
+    if ! version_at_least "$candidate" "$floor"; then
+      rpm_missing="${rpm_missing}${rpm_missing:+; }$package ${candidate:-not detected} (requires $floor+)"
+    fi
+  done
+  [ -z "$rpm_missing" ]
+}
+
 linux_plan() {
   linux_package=appimage
   linux_reason=""
@@ -105,13 +144,34 @@ linux_plan() {
   elif command -v pacman >/dev/null 2>&1 &&
     grep -qE '^(ID|ID_LIKE)=.*\barch\b' "$os_release" 2>/dev/null; then
     linux_package=pacman
-  elif grep -qE '^(ID|ID_LIKE)=.*\b(fedora|rhel|centos)\b' "$os_release" 2>/dev/null; then
-    linux_reason="Using AppImage on this RPM distro; the manual GTK RPM needs GTK 4.14+, libadwaita 1.5+, GLib 2.80+ and glibc 2.39+ (older Fedora/RHEL do not meet these requirements)."
+  elif grep -qE '^(ID|ID_LIKE)=.*\b(fedora|rhel|centos|opensuse|suse)\b' "$os_release" 2>/dev/null; then
+    if { command -v dnf >/dev/null 2>&1 || command -v zypper >/dev/null 2>&1; } && rpm_supported; then
+      linux_package=rpm
+      return
+    fi
+    linux_reason="Using AppImage: the GTK RPM needs GTK 4.14+, libadwaita 1.5+, GLib 2.80+ and glibc 2.39+. ${rpm_missing:-This system does not meet the detected requirements.}"
   fi
+}
+
+# Run after disconnecting clients, as the user who installed the AppImage.
+uninstall_appimage() {
+  local bindir="${XDG_BIN_HOME:-$HOME/.local/bin}"
+  local data="${XDG_DATA_HOME:-$HOME/.local/share}"
+  local config="${XDG_CONFIG_HOME:-$HOME/.config}"
+  rm -f -- "$bindir/toolport" "$data/applications/toolport.desktop"
+  for name in Toolport Conduit conduit ToolportNativePreview; do
+    rm -f -- "$config/autostart/$name.desktop"
+  done
+  for size in 32x32 128x128 256x256 512x512 scalable; do
+    rm -f -- "$data/icons/hicolor/$size/apps/toolport.png" "$data/icons/hicolor/$size/apps/conduit.png"
+  done
+  rm -f -- "$config/Toolport/http-bridge-update-resume.json"
+  say "Removed the AppImage, launcher, icons, autostart entries and update state. Client configs must be disconnected first; other Toolport data is retained."
 }
 
 # Offline and read-only: useful before installing and in minimal distro containers.
 case "${1:-}" in
+  --uninstall-appimage) uninstall_appimage; exit 0 ;;
   --print-plan)
     [ "$os" = Linux ] && [ "$arch" = x86_64 ] || err "Print-plan supports Linux x86_64 only."
     linux_plan
@@ -120,7 +180,7 @@ case "${1:-}" in
     exit 0
     ;;
   "") ;;
-  *) err "Usage: bash install.sh [--print-plan]" ;;
+  *) err "Usage: bash install.sh [--print-plan|--uninstall-appimage]" ;;
 esac
 
 need curl
@@ -297,6 +357,9 @@ install_arch_repo() {
       ;;
   esac
 
+  say "Initializing the local pacman keyring if needed"
+  $sudo pacman-key --init ||
+    err "The local pacman keyring could not be initialized. Run: sudo pacman-key --init; sudo pacman-key --populate archlinux. Then retry this installer."
   say "Importing the Toolport signing key"
   tmpkey="$tmp/toolport.gpg"
   curl -fsSL "$keyring_url" -o "$tmpkey" ||
@@ -304,7 +367,7 @@ install_arch_repo() {
   $sudo pacman-key --add "$tmpkey" ||
     err "pacman-key could not import the Toolport signing key."
   $sudo pacman-key --lsign-key "$repo_key_id" ||
-    err "pacman-key could not trust $repo_key_id. The key served by $keyring_url is not the one this installer expects."
+    err "pacman-key could not trust $repo_key_id. Check the pacman-key output above. Run: sudo pacman-key --init; sudo pacman-key --populate archlinux. If the key is missing, retry the download from $keyring_url."
 
   if grep -q '^\[toolport\]' "$pacman_conf" 2>/dev/null; then
     say "Toolport repository already configured"
@@ -329,7 +392,30 @@ install_linux() {
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
 
+  local portable_reason=""
+  if command -v zypper >/dev/null 2>&1 &&
+    grep -qE '^(ID|ID_LIKE)=.*\b(opensuse|suse)\b' "${TOOLPORT_OS_RELEASE:-/etc/os-release}" 2>/dev/null; then
+    sudo=""
+    if [ "$(id -u)" -ne 0 ]; then
+      if command -v sudo >/dev/null 2>&1; then
+        sudo=sudo
+      else
+        portable_reason="Native openSUSE package metadata needs root or sudo; using the verified AppImage instead."
+      fi
+    fi
+    if [ -z "$portable_reason" ] && ! $sudo zypper --non-interactive refresh; then
+      portable_reason="openSUSE package metadata could not be refreshed; using the verified AppImage instead."
+    fi
+    if [ -z "$portable_reason" ] && ! command -v awk >/dev/null 2>&1; then
+      $sudo zypper --non-interactive install --no-recommends gawk
+    fi
+  fi
+  need awk
   linux_plan
+  if [ -n "$portable_reason" ]; then
+    linux_package=appimage
+    linux_reason="$portable_reason"
+  fi
   [ -z "$linux_reason" ] || say "$linux_reason"
   if [ "$linux_package" = deb ]; then
     url="$(asset_url '_amd64[.]deb')"
@@ -346,6 +432,25 @@ install_linux() {
     say "Installing with apt${sudo:+ (you may be prompted for your password)}"
     $sudo apt-get install -y "$tmp/toolport.deb"
     # The GTK package keeps toolport/conduit CLI aliases for existing installs.
+    say "Installed. Launch Toolport from your app menu, or run: toolport"
+    return
+  fi
+
+  if [ "$linux_package" = rpm ]; then
+    url="$(asset_url '_x86_64[.]rpm')"
+    [ -n "$url" ] || err "No RPM found in $tag_name."
+    download_and_verify "$url" "$tmp/toolport.rpm" "$(asset_field '_x86_64[.]rpm' digest)" "$(asset_field '_x86_64[.]rpm' size)"
+    sudo=""
+    if [ "$(id -u)" -ne 0 ]; then
+      command -v sudo >/dev/null 2>&1 && sudo="sudo" || err "Installing the RPM needs root: re-run as root or install sudo."
+    fi
+    if command -v zypper >/dev/null 2>&1; then
+      # Only this local, checksum-verified RPM is unsigned. Repository signature
+      # checks stay enabled; release RPM signing is a separate publishing task.
+      $sudo zypper --non-interactive install --allow-unsigned-rpm "$tmp/toolport.rpm"
+    else
+      $sudo dnf install -y "$tmp/toolport.rpm"
+    fi
     say "Installed. Launch Toolport from your app menu, or run: toolport"
     return
   fi
@@ -368,7 +473,7 @@ install_linux() {
   mv "$tmp/toolport.AppImage" "$bindir/toolport"
   chmod +x "$bindir/toolport"
 
-  apps="$HOME/.local/share/applications"
+  apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
   mkdir -p "$apps"
   cat >"$apps/toolport.desktop" <<EOF
 [Desktop Entry]

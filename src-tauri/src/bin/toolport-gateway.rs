@@ -22304,7 +22304,7 @@ fn run_code_mode_isolated(
 fn usage() -> String {
     format!(
         "toolport-gateway {version}\n\
-         Local-first MCP gateway - see docs/headless.md for the full guide.\n\
+         Local-first MCP gateway - https://github.com/btsouth/toolport/blob/main/docs/headless.md\n\
          \n\
          USAGE:\n    toolport-gateway [FLAGS]\n\
          \n\
@@ -22312,11 +22312,11 @@ fn usage() -> String {
          \x20   --http [port]         Serve over HTTP instead of stdio (default port 8765, 0 picks a free port)\n\
          \x20   --http-proxy [port]   Desktop HTTP bridge to the host daemon (internal)\n\
          \x20   {insecure}   Allow unauthenticated HTTP access on a loopback bind\n\
-         \x20   --daemon             Run as the host daemon for this host (Phase 2;\n\
+         \x20   --daemon             Run as the host daemon for this host (\n\
          \x20                        internal rendezvous endpoint, not the user HTTP\n\
          \x20                        surface)\n\
          \x20   --stdio-adapter      Proxy stdio to the host daemon instead of running\n\
-         \x20                        the in-process gateway (Phase 2; opt-in)\n\
+         \x20                        the in-process gateway (internal)\n\
          \x20   --private-gateway    One adapter's own gateway while the host daemon is\n\
          \x20                        unresponsive (internal)\n\
          \x20   --installer-preflight <absolute-install-dir> Defer installation while client gateways are open\n\
@@ -22453,26 +22453,46 @@ fn main() {
                 }
                 conduit_lib::purge::exit_after_removal(if dry_run { 0 } else { 2 });
             }
-            match conduit_lib::purge::run_with_scope(all_installs) {
-                Ok(report) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&report).expect("serializable removal report")
-                    );
-                    conduit_lib::purge::exit_after_removal(if report.leftovers.is_empty() {
-                        0
-                    } else {
-                        1
-                    });
-                }
+            let report_path = match conduit_lib::purge::plan_with_scope(all_installs) {
+                Ok(plan) => std::path::PathBuf::from(plan.report_path),
                 Err(error) => {
                     println!(
                         "{}",
-                        json!({"removed":[], "leftovers":[{"path":conduit_lib::registry::conduit_dir().map(|path| path.display().to_string()), "error":error}]})
+                        json!({"clients":[], "removed":[], "leftovers":[{"path":conduit_lib::registry::conduit_dir().map(|path| path.display().to_string()), "error":error}]})
                     );
                     conduit_lib::purge::exit_after_removal(1);
                 }
+            };
+            let mut report =
+                conduit_lib::purge::run_with_scope(all_installs).unwrap_or_else(|error| {
+                    let mut report = conduit_lib::purge::Report::default();
+                    report.leftovers.push(conduit_lib::purge::Leftover {
+                        path: conduit_lib::registry::conduit_dir()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default(),
+                        error,
+                    });
+                    report
+                });
+            if !after_exit {
+                if let Err(error) = conduit_lib::purge::write_report(&report_path, &report) {
+                    eprintln!(
+                        "Could not write removal report {}: {error}",
+                        report_path.display()
+                    );
+                    report.leftovers.push(conduit_lib::purge::Leftover {
+                        path: report_path.display().to_string(),
+                        error: format!("Could not write removal report: {error}"),
+                    });
+                } else {
+                    eprintln!("Removal report: {}", report_path.display());
+                }
             }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).expect("serializable removal report")
+            );
+            conduit_lib::purge::exit_after_removal(if report.leftovers.is_empty() { 0 } else { 1 });
         }
         ArgAction::DisconnectAll { dry_run, uninstall } => {
             if conduit_lib::registry::conduit_dir().is_none_or(|dir| !dir.exists()) {

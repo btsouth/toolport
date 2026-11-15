@@ -20,6 +20,13 @@ threads-required = "num-test-threads"
 filter = "binary_id(conduit::installer_preflight) or (binary_id(conduit::one_gateway_conformance) and test(=an_installer_stopping_the_daemon_mid_call_fails_that_call_and_the_client_recovers))"
 threads-required = "num-test-threads"
 
+# Confirmed data removal runs the same preflight against the real process list,
+# so a gateway another test has up makes it refuse. purge_cli runs the CLI
+# (--remove-data --confirm) as a separate binary, so every case there runs alone.
+[[profile.default.overrides]]
+filter = "binary_id(conduit::purge_cli)"
+threads-required = "num-test-threads"
+
 # These secrets tests use the real per-user Windows Credential Manager. ENV_LOCK
 # serialized them under cargo test, but not across nextest processes. The
 # generation-swap case rewrites credentials as fast as it can, which can make
@@ -32,6 +39,11 @@ threads-required = "num-test-threads"
 [[profile.default.overrides]]
 platform = 'cfg(target_os = "windows")'
 filter = "binary_id(conduit) and test(/^secrets::tests::(windows_|set_get_delete_round_trip$)/)"
+test-group = "windows-credential-manager"
+
+[[profile.default.overrides]]
+platform = 'cfg(target_os = "windows")'
+filter = "binary_id(conduit) and test(=clients::backup_storage::tests::platform_native_backup_vault_round_trip)"
 test-group = "windows-credential-manager"
 
 [[profile.default.overrides]]

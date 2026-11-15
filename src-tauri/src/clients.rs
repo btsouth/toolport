@@ -17,9 +17,12 @@ use crate::registry::{ManagedEntry, ServerEntry};
 
 #[cfg(windows)]
 pub(crate) mod backup_permissions;
+pub(crate) mod backup_storage;
 mod claude_profiles;
 pub use claude_profiles::ClaudeProfile;
+mod diagnostics;
 mod disconnect;
+mod recovery_values;
 pub(crate) use disconnect::for_purge as disconnect_all_for_purge;
 pub use disconnect::{all as disconnect_all, ClientResult as DisconnectResult};
 mod codewhale;
@@ -42,6 +45,7 @@ mod moved;
 mod mutation;
 #[cfg(test)]
 mod paths_tests;
+pub mod recovery;
 mod relocate;
 mod restore;
 mod toml_preservation;
@@ -3774,12 +3778,7 @@ fn parse_json_value(content: &str) -> Result<serde_json::Value, String> {
         return Ok(v);
     }
     let err = serde_json::from_str::<serde_json::Value>(content).unwrap_err();
-    Err(format!(
-        "JSON syntax error at line {} column {}: {}",
-        err.line(),
-        err.column(),
-        err
-    ))
+    Err(diagnostics::json(&err))
 }
 
 /// Extract a server definition from a `claude mcp add-json` CLI invocation.
@@ -3861,8 +3860,8 @@ pub fn parse_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String> 
 
     // 1. Claude Code CLI: `claude mcp add-json ... <name> '{...}'`
     if let Some((name, json_str)) = extract_claude_cli(trimmed) {
-        let value: serde_json::Value = serde_json::from_str(&json_str)
-            .map_err(|e| format!("Invalid JSON in CLI command: {e}"))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&json_str).map_err(|e| diagnostics::json(&e))?;
         // Bare server object (the common case from the CLI).
         if value.is_object() && (value.get("command").is_some() || value.get("url").is_some()) {
             return Ok(vec![json_server_with_values(&name, &value)]);
@@ -4172,7 +4171,8 @@ fn parse_json_snippet(
 
 /// Parse a TOML snippet with `[mcp_servers.<name>]` tables.
 fn parse_toml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String> {
-    let value: toml::Value = toml::from_str(content).map_err(|e| e.to_string())?;
+    let value: toml::Value = toml::from_str(content)
+        .map_err(|e: toml::de::Error| diagnostics::offset("TOML", content, e.span()))?;
     let table = value
         .get("mcp_servers")
         .and_then(|v| v.as_table())
@@ -4247,7 +4247,8 @@ fn yaml_value_to_string(v: &serde_yaml::Value) -> Option<String> {
 
 /// Parse a YAML snippet (Hermes `mcp_servers:`, Goose `extensions:`, or Continue `mcpServers:`).
 fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String> {
-    let value: serde_yaml::Value = serde_yaml::from_str(content).map_err(|e| e.to_string())?;
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(content).map_err(|e| diagnostics::yaml(&e))?;
 
     // Try Hermes format: `mcp_servers:` map.
     if let Some(servers_map) = value.get("mcp_servers").and_then(|v| v.as_mapping()) {
@@ -4402,7 +4403,7 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
 
 /// Parse YAML, preserving serde_yaml's line/column in the error text.
 fn parse_yaml_value(content: &str) -> Result<serde_yaml::Value, String> {
-    serde_yaml::from_str(content).map_err(|e| format!("YAML syntax error: {e}"))
+    serde_yaml::from_str(content).map_err(|e| diagnostics::yaml(&e))
 }
 
 /// Read an existing JSON config we're about to modify. Tolerant of JSONC/JSON5. A
@@ -4433,7 +4434,7 @@ fn read_existing_toml(content: &str) -> Result<toml::Value, String> {
         return Ok(toml::Value::Table(toml::map::Map::new()));
     }
     toml::from_str::<toml::Value>(content)
-        .map_err(|e| format!("Could not parse the existing config ({e}); leaving it untouched."))
+        .map_err(|e: toml::de::Error| diagnostics::offset("TOML", content, e.span()))
 }
 
 fn parse_json(content: &str, key: &str) -> Result<Vec<McpServer>, String> {
@@ -4633,8 +4634,8 @@ fn parse_opencode_json(content: &str) -> Result<Vec<McpServer>, String> {
 }
 
 fn parse_toml(content: &str) -> Result<Vec<McpServer>, String> {
-    let value: toml::Value =
-        toml::from_str(content).map_err(|e| format!("TOML syntax error: {e}"))?;
+    let value: toml::Value = toml::from_str(content)
+        .map_err(|e: toml::de::Error| diagnostics::offset("TOML", content, e.span()))?;
     let table = match value.get("mcp_servers") {
         None => return Ok(Vec::new()),
         Some(v) if v.is_table() => v.as_table().unwrap(),
@@ -5384,13 +5385,20 @@ pub struct WriteOutcome {
     pub revision: Option<String>,
     #[serde(skip)]
     pub recovery_path: Option<PathBuf>,
+    /// The client config existed before this operation. Without a backup,
+    /// rollback may only remove a file this operation created.
+    #[serde(skip)]
+    pub existed_before: bool,
 }
 
 fn revision_outcome(
     client_id: &str,
-    result: Result<WriteOutcome, String>,
+    path: &Path,
+    write: impl FnOnce() -> Result<WriteOutcome, String>,
 ) -> Result<WriteOutcome, String> {
-    let mut outcome = result?;
+    let existed_before = mutation::exists(path);
+    let mut outcome = write()?;
+    outcome.existed_before = existed_before;
     let path = Path::new(&outcome.path);
     outcome.recovery_path = Some(restore::record_path(client_id, path)?);
     outcome.revision = if mutation::exists(path) {
@@ -5656,6 +5664,11 @@ fn epoch_millis() -> u128 {
 /// check, so this only guards against an abnormally huge regular file.
 pub(crate) const MAX_CONFIG_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Read authenticated, byte-exact rollback data bound to this client config.
+pub(crate) fn read_client_backup(path: &Path, source: &Path) -> Result<String, String> {
+    backup_storage::read_exact(path, source)
+}
+
 /// Read a client config to a string, refusing anything that isn't a regular file
 /// (after following symlinks, so a benign symlinked dotfile still works but a
 /// link to a device/FIFO/directory does not) and capping the size. Returns the
@@ -5667,6 +5680,22 @@ fn read_config_file(path: &Path) -> Result<String, String> {
         return text.ok_or_else(|| format!("{} does not exist", path.display()));
     }
     read_config_file_disk(path)
+}
+
+/// A copy in `<data dir>/backups/<client>/`, never a user config that merely
+/// sits under some other folder named `backups`.
+fn is_toolport_backup(path: &Path) -> bool {
+    let Some(parent) = path.parent().and_then(Path::parent) else {
+        return false;
+    };
+    if parent.file_name().is_none_or(|name| name != "backups") {
+        return false;
+    }
+    let Some(root) = crate::registry::conduit_dir().map(|dir| dir.join("backups")) else {
+        return false;
+    };
+    let canonical = |dir: &Path| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.into());
+    canonical(parent) == canonical(&root)
 }
 
 fn read_config_file_disk(path: &Path) -> Result<String, String> {
@@ -5686,7 +5715,12 @@ fn read_config_file_disk(path: &Path) -> Result<String, String> {
             MAX_CONFIG_BYTES
         ));
     }
-    std::fs::read_to_string(path).map_err(|e| e.to_string())
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    if is_toolport_backup(path) {
+        backup_storage::decode(&text)
+    } else {
+        Ok(text)
+    }
 }
 
 /// Copy a client's config to a timestamped backup. No-op (Ok(None)) if it doesn't
@@ -5760,7 +5794,15 @@ fn backup_file_named(
         }
         stamp += 1;
     };
-    crate::registry::atomic_write(&dest, &read_config_file(path)?)?;
+    crate::registry::atomic_write(
+        &dest,
+        &backup_storage::encode_backup(
+            &dest,
+            &read_config_file(path)?,
+            mutation::is_disconnecting(),
+            path,
+        )?,
+    )?;
     prune_backups(&dir, backup_name);
     Ok(Some(dest))
 }
@@ -5825,7 +5867,9 @@ fn prune_backups(dir: &Path, name: &str) {
     mine.sort_by_key(|(stamp, _)| *stamp);
     let excess = mine.len() - CONFIG_BACKUP_GENERATIONS;
     for (_, stale) in mine.into_iter().take(excess) {
-        let _ = std::fs::remove_file(stale);
+        if backup_storage::release(&stale).is_ok() {
+            let _ = std::fs::remove_file(stale);
+        }
     }
 }
 
@@ -6092,7 +6136,12 @@ fn entry_to_toml(entry: &ServerEntry) -> toml::Value {
 /// [`registry::atomic_write`], which uses a unique temp name so two writers to
 /// the same config can't clobber each other.
 fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
-    mutation::write(path, contents)
+    let protected = if is_toolport_backup(path) {
+        backup_storage::encode(path, contents)?
+    } else {
+        contents.to_string()
+    };
+    mutation::write(path, &protected)
 }
 
 /// Convert a `serde_json::Value` into a `jsonc-parser` CST input so we can splice
@@ -6137,7 +6186,8 @@ fn reject_duplicate_top_level_key(original: &str, key: &str) -> Result<(), Strin
     use jsonc_parser::cst::CstRootNode;
     use jsonc_parser::ParseOptions;
 
-    let root = CstRootNode::parse(original, &ParseOptions::default()).map_err(|e| e.to_string())?;
+    let root = CstRootNode::parse(original, &ParseOptions::default())
+        .map_err(|e| diagnostics::jsonc(&e))?;
     let Some(obj) = root.object_value() else {
         return Ok(());
     };
@@ -6163,7 +6213,8 @@ fn rewrite_json_key_preserving(
     use jsonc_parser::cst::CstRootNode;
     use jsonc_parser::ParseOptions;
 
-    let root = CstRootNode::parse(original, &ParseOptions::default()).map_err(|e| e.to_string())?;
+    let root = CstRootNode::parse(original, &ParseOptions::default())
+        .map_err(|e| diagnostics::jsonc(&e))?;
     // Client configs we edit are always root objects. Non-objects fall through
     // to the pretty-print path via the caller.
     let Some(obj) = root.object_value() else {
@@ -6243,7 +6294,8 @@ fn remove_json_key_preserving(original: &str, key: &str) -> Result<String, Strin
     use jsonc_parser::cst::CstRootNode;
     use jsonc_parser::ParseOptions;
 
-    let root = CstRootNode::parse(original, &ParseOptions::default()).map_err(|e| e.to_string())?;
+    let root = CstRootNode::parse(original, &ParseOptions::default())
+        .map_err(|e| diagnostics::jsonc(&e))?;
     let Some(obj) = root.object_value() else {
         return Err("JSONC root is not an object".into());
     };
@@ -6384,7 +6436,9 @@ fn load_toml_document(path: &Path) -> Result<toml_edit::DocumentMut, String> {
     }
     content
         .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| format!("Could not parse the existing config ({e}); leaving it untouched."))
+        .map_err(|e: toml_edit::TomlError| {
+            diagnostics::at(path, diagnostics::offset("TOML", &content, e.span()))
+        })
 }
 
 /// Guarantee `item` is a standard table. Inline tables and non-table values
@@ -7181,9 +7235,7 @@ fn parse_existing_yaml_content(content: &str) -> Result<serde_yaml::Value, Strin
     if content.trim().is_empty() {
         return Ok(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
     }
-    serde_yaml::from_str(content).map_err(|e| {
-        format!("Could not parse the existing config.yaml ({e}); leaving it untouched.")
-    })
+    serde_yaml::from_str(content).map_err(|e| diagnostics::yaml(&e))
 }
 
 /// Read an existing YAML config and keep the original text so the write can
@@ -7774,7 +7826,8 @@ fn parse_continue_yaml_servers(content: &str) -> Result<Vec<McpServer>, String> 
         return Ok(Vec::new());
     }
 
-    let value: serde_yaml::Value = serde_yaml::from_str(content).map_err(|e| e.to_string())?;
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(content).map_err(|e| diagnostics::yaml(&e))?;
 
     let entries = match value.get("mcpServers") {
         None => return Ok(Vec::new()),
@@ -8227,7 +8280,7 @@ pub fn write_servers(client_id: &str, servers: &[ServerEntry]) -> Result<WriteOu
         locations::remember(location)?;
     }
     mutation::run(client_id, &path, def.format, || {
-        revision_outcome(client_id, write_servers_inner(client_id, servers))
+        revision_outcome(client_id, &path, || write_servers_inner(client_id, servers))
     })
 }
 
@@ -8245,6 +8298,7 @@ fn write_servers_inner(client_id: &str, servers: &[ServerEntry]) -> Result<Write
         .map(ManagedEntry::from_gateway_entry);
 
     Ok(WriteOutcome {
+        existed_before: true,
         path: path.display().to_string(),
         backup: backup.map(|b| b.display().to_string()),
         managed,
@@ -9091,7 +9145,9 @@ fn install_or_remove(client_id: &str, entry: Option<&ServerEntry>) -> Result<Wri
         locations::remember(location)?;
     }
     mutation::run(client_id, &path, def.format, || {
-        revision_outcome(client_id, install_or_remove_inner(client_id, entry))
+        revision_outcome(client_id, &path, || {
+            install_or_remove_inner(client_id, entry)
+        })
     })
 }
 
@@ -9113,6 +9169,7 @@ fn install_or_remove_inner(
     }
     edit_format(def.format, &path, entry, lenient)?;
     Ok(WriteOutcome {
+        existed_before: true,
         path: path.display().to_string(),
         backup: backup.map(|b| b.display().to_string()),
         managed,
@@ -9266,13 +9323,16 @@ fn keep_only_missing_codex_settings(
 /// any servers "Move into gateway" took out of it (UX-03). Restoring first means
 /// a failure in between leaves the client with both, never with neither.
 pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
+    backup_storage::reset_missing();
+    recovery_values::reset_progress();
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
     if let Some(location) = &def.location {
         locations::remember(location)?;
     }
     let mut outcome = mutation::run(client_id, &path, def.format, || {
-        let mut outcome = revision_outcome(client_id, uninstall_gateway_inner(client_id))?;
+        let mut outcome =
+            revision_outcome(client_id, &path, || uninstall_gateway_inner(client_id))?;
         outcome
             .warnings
             .extend(disconnect_warnings(def.format, &path)?);
@@ -9287,6 +9347,9 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
     mutation::disconnecting();
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
+    restore::prepare_disconnect(client_id, &path)?;
+    // A retry with values still owed takes a backup too: rollback without
+    // one could only delete a config that existed before this operation.
     let backup = backup_file(client_id, &path)?;
     let mut restored_names = moved::missing_names(client_id, def.format, &path)?;
     if restore::apply(client_id, def.format, &path)? {
@@ -9300,6 +9363,7 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
                 .any(|server| server.name.eq_ignore_ascii_case(name))
         });
         return Ok(WriteOutcome {
+            existed_before: true,
             path: path.display().to_string(),
             backup: backup.map(|p| p.display().to_string()),
             managed: None,
@@ -9319,6 +9383,7 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
     let restored = moved::restore(client_id, def.format, &path)?;
     if restored.is_none() && (!mutation::exists(&path) || !read_client(&def).gateway_installed) {
         return Ok(WriteOutcome {
+            existed_before: true,
             path: path.display().to_string(),
             backup: backup.map(|p| p.display().to_string()),
             managed: None,
@@ -9361,6 +9426,14 @@ pub fn finish_uninstall(client_id: &str, outcome: &WriteOutcome) -> Result<(), S
         outcome.revision.as_deref(),
     )?;
     Ok(())
+}
+
+pub fn finish_uninstall_with_warnings(
+    client_id: &str,
+    outcome: &WriteOutcome,
+) -> Result<Vec<String>, String> {
+    finish_uninstall(client_id, outcome)?;
+    Ok(recovery::warnings(client_id, Path::new(&outcome.path)))
 }
 
 /// Snapshot token binds review to the server container, including credential changes.
@@ -9421,19 +9494,19 @@ pub(crate) fn migrate_reviewed(
             );
         }
         prepare()?;
-        let backup = backup_file(client_id, &path)?;
-        moved::record_selected(client_id, def.format, &path, names)?;
-        moved::remove_selected(def.format, &path, names)?;
-        let entry = gateway_entry(profile, client_id)?;
-        edit_format(
-            def.format,
-            &path,
-            Some(&entry),
-            config_is_whole_app_state(client_id),
-        )?;
-        revision_outcome(
-            client_id,
+        revision_outcome(client_id, &path, || {
+            let backup = backup_file(client_id, &path)?;
+            moved::record_selected(client_id, def.format, &path, names)?;
+            moved::remove_selected(def.format, &path, names)?;
+            let entry = gateway_entry(profile, client_id)?;
+            edit_format(
+                def.format,
+                &path,
+                Some(&entry),
+                config_is_whole_app_state(client_id),
+            )?;
             Ok(WriteOutcome {
+                existed_before: true,
                 path: path.display().to_string(),
                 backup: backup.map(|p| p.display().to_string()),
                 managed: Some(ManagedEntry::from_gateway_entry(&entry)),
@@ -9442,8 +9515,8 @@ pub(crate) fn migrate_reviewed(
                 revision: None,
                 warnings: Vec::new(),
                 recovery_path: None,
-            }),
-        )
+            })
+        })
     })
 }
 
@@ -9695,6 +9768,11 @@ fn referenced_gateway_paths_in(clients: &[DetectedClient]) -> Option<Vec<PathBuf
 
 pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> RepointOutcome {
     let mut outcome = RepointOutcome::default();
+    if let Err(error) = backup_storage::upgrade_legacy() {
+        outcome
+            .failed
+            .push(("client recovery backups".into(), error));
+    }
     let current = match resolve_gateway_path() {
         Ok(path) => path,
         Err(error) => {
@@ -9720,7 +9798,10 @@ pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> Repoin
     for (id, entry) in &relocated.repointed {
         managed.insert(id.clone(), entry.clone());
     }
-    let mut outcome = repoint_stale_gateways_in(&current, detect_clients(), &managed);
+    let mut repoint = repoint_stale_gateways_in(&current, detect_clients(), &managed);
+    // Keep the earlier legacy-backup upgrade failure in the result.
+    repoint.failed.extend(outcome.failed);
+    let mut outcome = repoint;
     // A client the pass below rewrote again keeps that later ownership snapshot.
     let mut moved = relocated.repointed;
     moved.retain(|(id, _)| !outcome.repointed.iter().any(|(later, _)| later == id));
@@ -10079,6 +10160,7 @@ fn repoint_stale_gateways_in(
                         }
 
                         Ok(WriteOutcome {
+                            existed_before: true,
                             path: path.display().to_string(),
                             backup: None,
                             managed: Some(managed),
@@ -10576,6 +10658,64 @@ mod tests {
     }
 
     use super::*;
+
+    /// Only Toolport's own backups folder holds wrapped copies. A user config
+    /// that happens to live under some other folder named `backups` is native.
+    #[test]
+    fn configs_under_a_foreign_backups_folder_stay_native() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let root = std::env::temp_dir().join(format!(
+                "toolport-foreign-backups-{}-{}",
+                std::process::id(),
+                epoch_millis()
+            ));
+            let path = root.join("backups/.codex/config.toml");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let secret = "sk-foreign-backups-folder-fixture";
+            let text = format!("[mcp_servers.native.env]\nAPI_KEY = \"{secret}\"\n");
+            backup_storage::register("native", "API_KEY", secret);
+            let written = atomic_write(&path, &text);
+            backup_storage::clear();
+            written.unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+            assert_eq!(read_config_file_disk(&path).unwrap(), text);
+            std::fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    #[test]
+    fn client_parse_diagnostics_never_expose_credential_source() {
+        let _data = crate::registry::DataDirTestEnv::new("client-safe-parse-errors");
+        let log = crate::registry::conduit_dir()
+            .unwrap()
+            .join("safe-error.log");
+        let credential = "sk-d2-private-fixture-never-display";
+        let toml = format!("[mcp_servers.native.env]\nAPI_KEY = \"{credential}\" invalid\n");
+        let json = format!("{{\"mcpServers\":{{}},\"{credential}\":invalid}}");
+        for (format, text) in [
+            (Format::TomlMcpServers, toml),
+            (Format::JsonMcpServers, json),
+        ] {
+            let error = parse_client_content(format, &text).unwrap_err();
+            assert!(
+                !error.contains(credential),
+                "diagnostic leaked a config value: {error}"
+            );
+            crate::gatewaylog::append_to(&log, &error);
+            assert!(!std::fs::read_to_string(&log).unwrap().contains(credential));
+            let event = serde_json::to_value(disconnect::ClientResult {
+                client_id: "codex".into(),
+                path: "config.toml".into(),
+                dry_run: false,
+                error: Some(error.clone()),
+                warnings: Vec::new(),
+            })
+            .unwrap();
+            assert!(!event.to_string().contains(credential));
+            assert!(error.contains("line") && error.contains("column"));
+        }
+    }
+
     use crate::registry::EnvVar;
 
     #[test]

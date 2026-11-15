@@ -155,7 +155,8 @@ fn client_detail(client: &state::ClientView, style: RowStyle) -> (String, String
         }
     } else if client.uses_connectors {
         parts.push(crate::i18n::tr("Uses account connectors"));
-    } else if style != RowStyle::Profile {
+    } else if style != RowStyle::Profile || client.server_count > 0 {
+        // A profile row omits the empty case; its group header already names it.
         parts.push(if client.server_count == 0 {
             crate::i18n::tr("No local MCP servers")
         } else {
@@ -169,12 +170,9 @@ fn client_detail(client: &state::ClientView, style: RowStyle) -> (String, String
             )
         });
     }
-    if client.movable_server_count > 0 && !client.uses_connectors {
-        parts.push(crate::i18n::trf(
-            "{value0} to import",
-            &[("value0", &client.movable_server_count.to_string())],
-        ));
-    }
+    // No "to import" caption: Import intentionally leaves native entries in
+    // place, so the native count is not what remains to import. The local
+    // count above (and Connect's move count) stays accurate.
     if connected {
         if client.shared_http {
             parts.push("Shared HTTP".into());
@@ -623,4 +621,65 @@ fn copies_note(
         l10n::bind_button(toggle, if show { "Hide" } else { "Show" });
     });
     note
+}
+
+#[cfg(test)]
+mod caption_tests {
+    use super::*;
+
+    #[test]
+    fn already_imported_native_entries_are_not_reported_as_still_to_import() {
+        // Codex after importing its firstuser-added server: both native entries
+        // stay in config.toml, so movable_server_count is still 2.
+        let mut client = state::ClientView {
+            detected: None,
+            imported_names: vec!["firstuser-added".into(), "keyring-many".into()],
+            id: "codex".into(),
+            name: "Codex".into(),
+            app_present: true,
+            config_exists: true,
+            uses_connectors: false,
+            server_count: 2,
+            movable_server_count: 2,
+            other_server_count: 2,
+            gateway_state: state::ClientGatewayState::Disconnected,
+            shared_http: false,
+            legacy_bearer_argv: false,
+            scope_id: None,
+            scope_name: None,
+            discovery_mode: None,
+            inherited_discovery: None,
+            config_error: false,
+            location_removable: false,
+            claude_profile: None,
+        };
+        for style in [RowStyle::Line, RowStyle::Profile] {
+            let (text, tooltip) = client_detail(&client, style);
+            assert!(text.contains("2 local MCP servers"), "{style:?}: {text}");
+            assert!(!text.contains("to import"), "{style:?}: {text}");
+            assert!(!tooltip.contains("to import"), "{style:?}: {tooltip}");
+        }
+        client.server_count = 0;
+        client.movable_server_count = 0;
+        client.other_server_count = 0;
+        assert_eq!(
+            client_detail(&client, RowStyle::Line).0,
+            "No local MCP servers"
+        );
+        assert!(!client_detail(&client, RowStyle::Profile)
+            .0
+            .contains("local MCP"));
+        client.server_count = 1;
+        assert_eq!(
+            client_detail(&client, RowStyle::Line).0,
+            "1 local MCP server"
+        );
+        // Connected clients keep their other-server inventory.
+        client.gateway_state = state::ClientGatewayState::Connected;
+        client.other_server_count = 3;
+        client.movable_server_count = 3;
+        let (text, _) = client_detail(&client, RowStyle::Line);
+        assert!(text.contains("3 other servers"), "{text}");
+        assert!(!text.contains("to import"), "{text}");
+    }
 }
