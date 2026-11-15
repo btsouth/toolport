@@ -267,7 +267,7 @@ fn purge_global_option_proceeds_with_corrupt_registry() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn purge_missing_desktop_bus_keeps_registry_for_credential_retry() {
+fn purge_missing_desktop_bus_keeps_only_the_registry_for_credential_retry() {
     let env = conduit_lib::registry::DataDirTestEnv::new("purge_cli_bus_retry");
     let data = env.dir.join("Toolport");
     let runtime = env.dir.join("runtime");
@@ -275,8 +275,8 @@ fn purge_missing_desktop_bus_keeps_registry_for_credential_retry() {
     std::fs::create_dir(&runtime).unwrap();
     let registry = serde_json::to_vec(&conduit_lib::registry::Registry::default()).unwrap();
     std::fs::write(data.join("registry.json"), &registry).unwrap();
-    std::fs::write(data.join("secrets.enc"), "fixture").unwrap();
     for key in ["", "selected-file-backend"] {
+        std::fs::write(data.join("secrets.enc"), "fixture").unwrap();
         let output = isolated_command(&env.dir, &data)
             .env("XDG_RUNTIME_DIR", &runtime)
             .env("TOOLPORT_SECRET_KEY", key)
@@ -289,8 +289,10 @@ fn purge_missing_desktop_bus_keeps_registry_for_credential_retry() {
             .as_str()
             .unwrap()
             .contains("credential cleanup not done"));
+        // The keyring could not be checked, so the registry stays for a retry.
+        // Everything else that is Toolport's goes, the file secrets included.
         assert_eq!(std::fs::read(data.join("registry.json")).unwrap(), registry);
-        assert!(data.join("secrets.enc").exists());
+        assert!(!data.join("secrets.enc").exists());
     }
     std::fs::remove_dir(runtime).unwrap();
     let output = isolated_command(&env.dir, &data)
