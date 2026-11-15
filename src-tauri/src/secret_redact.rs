@@ -1143,19 +1143,20 @@ impl Matcher {
                 .take_while(|p| p.starts_with(tail))
                 .any(|p| p.len() > tail.len())
         };
-        let mut lowered = String::new();
+        // ASCII lowercasing keeps every byte offset: lower the window once
+        // and slice it, rather than copy each tail.
+        let lowered = if self.ci_prefixes.is_empty() {
+            String::new()
+        } else {
+            text[from..].to_ascii_lowercase()
+        };
         for (i, _) in text[from..].char_indices() {
             let tail = &text[from + i..];
             if live(&self.prefixes, tail) {
                 return from + i;
             }
-            if !self.ci_prefixes.is_empty() {
-                lowered.clear();
-                lowered.push_str(tail);
-                lowered.make_ascii_lowercase();
-                if live(&self.ci_prefixes, &lowered) {
-                    return from + i;
-                }
+            if !self.ci_prefixes.is_empty() && live(&self.ci_prefixes, &lowered[i..]) {
+                return from + i;
             }
         }
         text.len()
