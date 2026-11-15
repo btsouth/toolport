@@ -10,9 +10,8 @@
 //! the data directory may contain either value or its common encodings. A leaked
 //! line an older build left in `audit.jsonl` must be scrubbed too.
 //!
-//! Unix only: cleanup kills the daemon the adapter detached into its own group.
-
-#![cfg(unix)]
+//! Cleanup kills the daemon the adapter detached (`kill -9` on Unix, `taskkill`
+//! on Windows), so the test runs on every CI OS.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -206,7 +205,14 @@ impl Drop for Gateway {
                 .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
                 .and_then(|v| v["pid"].as_u64())
             {
+                #[cfg(unix)]
                 let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+                #[cfg(windows)]
+                let _ = Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
             }
         }
         let _ = self.child.kill();
