@@ -52,6 +52,9 @@ Current streamable-HTTP scope:
   receive `405 Method Not Allowed`.
 - `POST /mcp` returns JSON-RPC responses as JSON by default.
 - If `Accept` prefers `text/event-stream`, `POST /mcp` returns a single SSE `message` event and closes.
+- MCP Skills (`skills/list`, `skills/get`, `resources/directory/read`) are relayed
+  from servers that declare the extension, with `skill://` URIs prefixed by the
+  server id. See [client conformance](client-conformance.md#mcp-skills).
 - **Server-initiated RPC passthrough** (#167): legacy clients use the session listen stream;
   modern clients receive input requests through MRTR `input_required` results and retry with
   `inputResponses` plus `requestState`.

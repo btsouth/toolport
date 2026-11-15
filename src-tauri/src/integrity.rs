@@ -4625,6 +4625,21 @@ pub fn record_sync_refusal(server: &str, detail: &str) {
     }));
 }
 
+/// An MCP Skills file read Toolport refused (it forged Toolport's voice or
+/// content defense blocked it). Skill files are never altered, so a refusal is
+/// the only outcome and it is recorded as a finding.
+pub fn record_skill_file_refusal(server: &str, file: &str, reason: &str) {
+    record_event(&json!({
+        "ts": epoch_millis(),
+        "type": "skill_file_refused",
+        "server": server,
+        "tool": "",
+        "change": "result",
+        "detail": format!("{file}: {reason}"),
+        "severity": SEV_HIGH,
+    }));
+}
+
 fn record_definition_change(event: &Value, path: &Path) -> Result<(), String> {
     let _lock = crate::registry::lock_at(path)?;
     let content = match std::fs::read_to_string(path) {
