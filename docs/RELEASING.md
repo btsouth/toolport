@@ -135,12 +135,14 @@ automatic. `brew install --cask btsouth/toolport/toolport` and
 `brew upgrade --cask toolport` install the version + sha256 pinned in
 [`btsouth/homebrew-toolport`](https://github.com/btsouth/homebrew-toolport)
 `Casks/toolport.rb`. The `livecheck` / `github_latest` block in that cask only
-feeds `brew livecheck`; it does not move the pin. The copy at
-`packaging/homebrew/toolport.rb` in this repo is a snapshot `brew install` does
-not read.
+feeds `brew livecheck`; it does not move the pin. `packaging/homebrew/toolport.rb`
+in this repo is the only source of that cask: change uninstall, zap or caveats
+here, never in the tap.
 
-That tap's own `bump.yml` workflow tracks the latest published release, computes
-both digests from the DMGs GitHub actually serves, and commits the result. It
+That tap's own `bump.yml` workflow tracks the latest published release, copies
+`packaging/homebrew/toolport.rb` from that release tag, fills in the version and
+both digests from the DMGs GitHub actually serves, and commits the result when it
+differs from the tap. A cask change therefore reaches users with the next release. It
 runs every six hours, so it lands on its own; to have it immediately after a
 release, dispatch it:
 
