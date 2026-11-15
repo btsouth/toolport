@@ -509,6 +509,20 @@ pub(super) fn set_dismissed(path: &Path, dismissed: bool) -> Result<(), String> 
     )
 }
 
+/// Toolport's wrappers are serialized with their version key first. A file
+/// that starts like one but does not parse as a complete, supported wrapper
+/// (for example a truncated copy) is never config bytes. A native config that
+/// only mentions the key inside a value does not start this way.
+fn wrapper_marked(text: &str) -> bool {
+    let text = text.trim_start();
+    [
+        "{\"toolportBackupVersion\":",
+        "{\"toolportPlainBackupVersion\":",
+    ]
+    .iter()
+    .any(|marker| text.starts_with(marker))
+}
+
 pub(super) fn decode(text: &str) -> Result<String, String> {
     if let Some(plain) = plain_backup(text)? {
         // Path ownership is checked by `source_path`, like an Envelope's key;
@@ -520,6 +534,11 @@ pub(super) fn decode(text: &str) -> Result<String, String> {
         return Ok(plain.text);
     }
     let Some(saved) = envelope(text) else {
+        if wrapper_marked(text) {
+            return Err(crate::i18n::tr(
+                "This recovery file is malformed. Its saved values have been kept.",
+            ));
+        }
         return Ok(text.into());
     };
     match crate::secrets::get_backup_secret_result(&saved.account, &saved.key) {
