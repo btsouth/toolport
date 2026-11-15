@@ -1511,6 +1511,12 @@ mod tests {
             }
         });
         std::thread::sleep(std::time::Duration::from_secs(2));
+        if std::env::var_os("TOOLPORT_STDERR_BLOCKED_SYNC").is_some() {
+            // The writer above holds Rust's stderr lock in a blocked write.
+            let started = std::time::Instant::now();
+            sync_stderr_relay(std::time::Duration::from_millis(500));
+            println!("sync-ms={}", started.elapsed().as_millis());
+        }
         println!("rss-growth-kb={}", rss_kb().saturating_sub(before));
         std::io::Write::flush(&mut std::io::stdout()).unwrap();
         // The writer is blocked on stderr for good: end without draining it.
@@ -1546,6 +1552,45 @@ mod tests {
             .unwrap_or_else(|| panic!("{stdout}"));
         // 64 MiB was written; the queue holds at most 64 chunks of 8 KiB.
         assert!(growth < 16 * 1024, "grew {growth} KiB");
+    }
+
+    /// Failure mode: with stderr's destination stalled and another thread
+    /// holding Rust's stderr lock in a blocked write, a sync (a panic, a
+    /// signal, an exit) flushed stderr first and so waited on that lock for
+    /// good, past its budget, and the signal was never re-raised.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sync_returns_within_its_budget_while_a_blocked_writer_holds_stderr() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon_log::tests::stderr_blocked_destination_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TOOLPORT_STDERR_BLOCKED_CHILD", "1")
+            .env("TOOLPORT_STDERR_BLOCKED_SYNC", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut out = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut stdout = String::new();
+            let _ = std::io::Read::read_to_string(&mut out, &mut stdout);
+            let _ = tx.send(stdout);
+        });
+        let stdout = rx.recv_timeout(std::time::Duration::from_secs(20));
+        let _ = child.kill();
+        let _ = child.wait();
+        let stdout = stdout.expect("the sync never returned");
+        let ms: u64 = stdout
+            .lines()
+            .find_map(|l| l.split_once("sync-ms=").map(|(_, v)| v))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{stdout}"));
+        assert!(ms < 2000, "the sync took {ms} ms");
     }
 
     /// Child half of the in-flight-write test: a thread holds Rust's stderr
