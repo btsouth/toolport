@@ -361,8 +361,9 @@ pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
     header.add_leading(&branding::client_logo(&client.id));
     let refresh = header_icon_button("view-refresh-symbolic");
     l10n::bind_tooltip(&refresh, "Scan clients again");
+    refresh.set_widget_name("client-detail-refresh");
     let p = page.clone();
-    refresh.connect_clicked(move |_| p.refresh());
+    refresh.connect_clicked(move |_| p.scan());
     header.add_action(&refresh);
     root.append(&header.root);
     let body = page_body(24);

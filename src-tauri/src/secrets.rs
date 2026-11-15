@@ -771,6 +771,121 @@ mod platform {
     /// so the serialization has to be explicit now.
     static SERVICE_LOCK: Mutex<()> = Mutex::new(());
 
+    const BACKUP_BATCH_TIMEOUT: Duration = Duration::from_secs(15);
+    struct BackupBatch {
+        deadline: std::time::Instant,
+        service: Option<std::rc::Rc<dbus_secret_service::SecretService>>,
+        failure: Option<super::BackupSecretError>,
+        reads: std::collections::HashMap<String, Result<Option<String>, super::BackupSecretError>>,
+        #[cfg(test)]
+        connection_attempts: usize,
+    }
+    thread_local! {
+        static BACKUP_BATCH: std::cell::RefCell<Option<BackupBatch>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn with_backup_batch<T>(f: impl FnOnce() -> T) -> T {
+        if BACKUP_BATCH.with(|slot| slot.borrow().is_some()) {
+            return f();
+        }
+        BACKUP_BATCH.with(|slot| {
+            *slot.borrow_mut() = Some(BackupBatch {
+                deadline: std::time::Instant::now() + BACKUP_BATCH_TIMEOUT,
+                service: None,
+                failure: None,
+                reads: Default::default(),
+                #[cfg(test)]
+                connection_attempts: 0,
+            })
+        });
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                BACKUP_BATCH.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        let _clear = Clear;
+        f()
+    }
+
+    fn invalidate_backup_read(server_id: &str, key: &str) {
+        BACKUP_BATCH.with(|slot| {
+            if let Some(batch) = slot.borrow_mut().as_mut() {
+                batch.reads.remove(&account(server_id, key));
+            }
+        });
+    }
+
+    fn backup_deadline() -> Result<std::time::Instant, super::BackupSecretError> {
+        let deadline = BACKUP_BATCH
+            .with(|slot| slot.borrow().as_ref().map(|batch| batch.deadline))
+            .ok_or(super::BackupSecretError::Unavailable)?;
+        if std::time::Instant::now() >= deadline {
+            return Err(super::BackupSecretError::Unavailable);
+        }
+        Ok(deadline)
+    }
+
+    /// Reuse one encrypted session for a bounded recovery operation. Retain the
+    /// existing process/file serialization, but never queue behind an unrelated
+    /// unlock prompt indefinitely. No operation in this path invokes Unlock.
+    fn with_backup_service<T>(
+        op: impl FnOnce(&dbus_secret_service::SecretService) -> Result<T, super::BackupSecretError>,
+    ) -> Result<T, super::BackupSecretError> {
+        use super::BackupSecretError as State;
+        let deadline = backup_deadline()?;
+        let _serialized = loop {
+            match SERVICE_LOCK.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    backup_deadline()?;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        };
+        let dir = crate::registry::conduit_dir().ok_or(State::Unavailable)?;
+        let _across_processes = crate::registry::lock_at_for(
+            &dir.join("secret-service"),
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(LOCK_TIMEOUT),
+        )
+        .map_err(|_| State::Unavailable)?;
+        backup_deadline()?;
+        let service = BACKUP_BATCH.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let batch = slot.as_mut().ok_or(State::Unavailable)?;
+            if let Some(failure) = batch.failure {
+                return Err(failure);
+            }
+            if let Some(service) = &batch.service {
+                return Ok(service.clone());
+            }
+            #[cfg(test)]
+            {
+                batch.connection_attempts += 1;
+            }
+            match dbus_secret_service::SecretService::connect_with_max_prompt_timeout(
+                dbus_secret_service::EncryptionType::Dh,
+                0,
+            ) {
+                Ok(service) => {
+                    let service = std::rc::Rc::new(service);
+                    batch.service = Some(service.clone());
+                    Ok(service)
+                }
+                Err(error) => {
+                    let state = classify(&error);
+                    batch.failure = Some(state);
+                    Err(state)
+                }
+            }
+        })?;
+        backup_deadline()?;
+        op(&service)
+    }
+
     /// Base wait before the single retry in `with_service`. systemd brings the
     /// daemon back within ~1s of an abort, so one pause slightly longer than that
     /// turns a crash into a recovered operation.
@@ -909,6 +1024,7 @@ mod platform {
     }
 
     pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+        invalidate_backup_read(server_id, key);
         with_service(|| Entry::new(SERVICE, &account(server_id, key))?.set_password(value))
             .map_err(|e| e.to_string())
     }
@@ -982,84 +1098,96 @@ mod platform {
         key: &str,
     ) -> Result<Option<String>, super::BackupSecretError> {
         use super::BackupSecretError as State;
-        use dbus_secret_service::{EncryptionType, SecretService};
-        with_service(|| {
-            let failure = |error: dbus_secret_service::Error| {
-                keyring::Error::PlatformFailure(Box::new(classify(&error)))
-            };
-            let service = SecretService::connect_with_max_prompt_timeout(EncryptionType::Dh, 0)
-                .map_err(&failure)?;
-            let account = account(server_id, key);
+        if !BACKUP_BATCH.with(|slot| slot.borrow().is_some()) {
+            return with_backup_batch(|| get_backup_secret_status(server_id, key));
+        }
+        let account = account(server_id, key);
+        if let Some(cached) = BACKUP_BATCH.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .and_then(|batch| batch.reads.get(&account).cloned())
+        }) {
+            return cached;
+        }
+        let result = with_backup_service(|service| {
             let entries = service
                 .search_items(std::collections::HashMap::from([
                     ("service", SERVICE),
                     ("username", account.as_str()),
                 ]))
-                .map_err(&failure)?;
+                .map_err(|error| classify(&error))?;
             if entries.unlocked.len() + entries.locked.len() > 1 {
-                return Err(keyring::Error::NoStorageAccess(Box::new(State::Ambiguous)));
+                return Err(State::Ambiguous);
             }
             if !entries.locked.is_empty() {
-                return Err(keyring::Error::NoStorageAccess(Box::new(State::Locked)));
+                return Err(State::Locked);
             }
             let Some(item) = entries.unlocked.first() else {
                 return Ok(None);
             };
-            let bytes = item.get_secret().map_err(&failure)?;
+            backup_deadline()?;
+            let bytes = item.get_secret().map_err(|error| classify(&error))?;
             String::from_utf8(bytes)
                 .map(Some)
-                .map_err(|_| keyring::Error::BadEncoding(Vec::new()))
-        })
-        .map_err(|error| match error {
-            keyring::Error::PlatformFailure(e) | keyring::Error::NoStorageAccess(e) => e
-                .downcast_ref::<State>()
-                .copied()
-                .unwrap_or(State::Unavailable),
-            keyring::Error::BadEncoding(_) => State::Corrupt,
-            _ => State::Unavailable,
-        })
+                .map_err(|_| State::Corrupt)
+        });
+        BACKUP_BATCH.with(|slot| {
+            if let Some(batch) = slot.borrow_mut().as_mut() {
+                batch.reads.insert(account, result.clone());
+            }
+        });
+        result
     }
 
-    /// Backup rotation and recovery cleanup must never ask to unlock a vault.
-    /// The zero prompt timeout also prevents Prompt if the item locks after SearchItems.
+    /// Never prompt, even if an item locks between SearchItems and Delete.
     pub fn delete_backup_secret_status(
         server_id: &str,
         key: &str,
         discard_all: bool,
     ) -> Result<(), super::BackupSecretError> {
-        use dbus_secret_service::{EncryptionType, SecretService};
-        with_service(|| {
-            let failure = |error| keyring::Error::PlatformFailure(Box::new(error));
-            let service = SecretService::connect_with_max_prompt_timeout(EncryptionType::Dh, 0)
-                .map_err(failure)?;
-            let account = account(server_id, key);
+        use super::BackupSecretError as State;
+        if !BACKUP_BATCH.with(|slot| slot.borrow().is_some()) {
+            return with_backup_batch(|| delete_backup_secret_status(server_id, key, discard_all));
+        }
+        let account = account(server_id, key);
+        // A failed partial deletion must not leave a cached credential behind.
+        BACKUP_BATCH.with(|slot| {
+            if let Some(batch) = slot.borrow_mut().as_mut() {
+                batch.reads.remove(&account);
+            }
+        });
+        with_backup_service(|service| {
             let entries = service
                 .search_items(std::collections::HashMap::from([
                     ("service", SERVICE),
                     ("username", account.as_str()),
                 ]))
-                .map_err(failure)?;
+                .map_err(|error| classify(&error))?;
             if discard_all {
                 if !entries.locked.is_empty() {
-                    return Err(keyring::Error::NoStorageAccess(Box::new(
-                        super::BackupSecretError::Locked,
-                    )));
+                    return Err(State::Locked);
                 }
                 for item in entries.unlocked {
-                    item.delete().map_err(failure)?;
+                    backup_deadline()?;
+                    item.delete().map_err(|error| classify(&error))?;
                 }
                 Ok(())
             } else {
                 read_backup_item(entries.unlocked.len(), entries.locked.len(), || {
-                    entries.unlocked[0].delete().map_err(failure)
+                    backup_deadline()
+                        .map_err(|state| keyring::Error::NoStorageAccess(Box::new(state)))?;
+                    entries.unlocked[0].delete().map_err(|error| {
+                        keyring::Error::PlatformFailure(Box::new(classify(&error)))
+                    })
                 })
                 .map(|_| ())
+                .map_err(backup_keyring_error)
             }
         })
-        .map_err(backup_keyring_error)
     }
 
     pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
+        invalidate_backup_read(server_id, key);
         match with_service(|| Entry::new(SERVICE, &account(server_id, key))?.delete_credential()) {
             Ok(()) => Ok(()),
             Err(keyring::Error::NoEntry) => Ok(()),
@@ -1070,6 +1198,146 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn backup_batch_cache_is_scoped_and_cleared_even_after_panic() {
+            with_backup_batch(|| {
+                BACKUP_BATCH.with(|slot| {
+                    slot.borrow_mut()
+                        .as_mut()
+                        .unwrap()
+                        .reads
+                        .insert("fixture".into(), Ok(Some("private value".into())))
+                });
+                with_backup_batch(|| {
+                    assert!(BACKUP_BATCH.with(|slot| slot
+                        .borrow()
+                        .as_ref()
+                        .unwrap()
+                        .reads
+                        .contains_key("fixture")));
+                });
+            });
+            assert!(BACKUP_BATCH.with(|slot| slot.borrow().is_none()));
+            let result = std::panic::catch_unwind(|| {
+                with_backup_batch(|| {
+                    BACKUP_BATCH.with(|slot| {
+                        slot.borrow_mut()
+                            .as_mut()
+                            .unwrap()
+                            .reads
+                            .insert("fixture".into(), Ok(Some("private value".into())))
+                    });
+                    panic!("test unwind");
+                })
+            });
+            assert!(result.is_err());
+            assert!(BACKUP_BATCH.with(|slot| slot.borrow().is_none()));
+        }
+
+        #[test]
+        fn backup_batch_deadline_cancels_before_opening_the_vault() {
+            with_backup_batch(|| {
+                BACKUP_BATCH.with(|slot| {
+                    slot.borrow_mut().as_mut().unwrap().deadline = std::time::Instant::now()
+                });
+                assert_eq!(
+                    get_backup_secret_status("fixture", "key"),
+                    Err(super::super::BackupSecretError::Unavailable)
+                );
+                assert_eq!(
+                    BACKUP_BATCH.with(|slot| slot.borrow().as_ref().unwrap().connection_attempts),
+                    0
+                );
+            });
+        }
+
+        #[test]
+        fn backup_batch_does_not_wait_indefinitely_for_another_keyring_operation() {
+            let _held = SERVICE_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            with_backup_batch(|| {
+                BACKUP_BATCH.with(|slot| {
+                    slot.borrow_mut().as_mut().unwrap().deadline =
+                        std::time::Instant::now() + Duration::from_millis(40)
+                });
+                let started = std::time::Instant::now();
+                assert_eq!(
+                    get_backup_secret_status("fixture", "key"),
+                    Err(super::super::BackupSecretError::Unavailable)
+                );
+                assert!(started.elapsed() < Duration::from_secs(2));
+                assert_eq!(
+                    BACKUP_BATCH.with(|slot| slot.borrow().as_ref().unwrap().connection_attempts),
+                    0
+                );
+            });
+        }
+
+        #[test]
+        #[ignore = "requires an isolated unlocked Secret Service"]
+        fn native_backup_batch_reuses_one_encrypted_session_and_invalidates_deleted_values() {
+            let _data = crate::registry::DataDirTestEnv::new("native-backup-batch");
+            let server = "toolport-native-backup-batch-fixture";
+            struct Cleanup(&'static str);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    for i in 0..21 {
+                        let _ = delete_secret(self.0, &format!("KEY_{i}"));
+                    }
+                }
+            }
+            let _cleanup = Cleanup(server);
+            for i in 0..20 {
+                set_secret(
+                    server,
+                    &format!("KEY_{i}"),
+                    &format!("native-private-value-{i}"),
+                )
+                .unwrap();
+            }
+            with_backup_batch(|| {
+                for i in 0..20 {
+                    for _ in 0..2 {
+                        assert_eq!(
+                            get_backup_secret_status(server, &format!("KEY_{i}")).unwrap(),
+                            Some(format!("native-private-value-{i}"))
+                        );
+                    }
+                }
+                set_secret(server, "KEY_0", "updated-native-private-value").unwrap();
+                assert_eq!(
+                    get_backup_secret_status(server, "KEY_0")
+                        .unwrap()
+                        .as_deref(),
+                    Some("updated-native-private-value")
+                );
+                assert_eq!(get_backup_secret_status(server, "KEY_20").unwrap(), None);
+                set_secret(server, "KEY_20", "new-native-private-value").unwrap();
+                assert_eq!(
+                    get_backup_secret_status(server, "KEY_20")
+                        .unwrap()
+                        .as_deref(),
+                    Some("new-native-private-value")
+                );
+                delete_secret(server, "KEY_20").unwrap();
+                assert_eq!(get_backup_secret_status(server, "KEY_20").unwrap(), None);
+                for i in 0..20 {
+                    delete_backup_secret_status(server, &format!("KEY_{i}"), false).unwrap();
+                    assert_eq!(
+                        get_backup_secret_status(server, &format!("KEY_{i}")).unwrap(),
+                        None
+                    );
+                    delete_backup_secret_status(server, &format!("KEY_{i}"), true).unwrap();
+                }
+                assert_eq!(
+                    BACKUP_BATCH.with(|slot| slot.borrow().as_ref().unwrap().connection_attempts),
+                    1
+                );
+            });
+            assert!(BACKUP_BATCH.with(|slot| slot.borrow().is_none()));
+        }
 
         #[test]
         fn backup_recovery_never_reads_locked_or_ambiguous_items() {
@@ -1589,6 +1857,19 @@ pub(crate) enum BackupSecretError {
     Cancelled,
     AccessDenied,
     Unchecked,
+}
+
+/// A recovery/cleanup batch never keeps a credential cache after it returns.
+/// Linux shares a noninteractive DH session; other native APIs do not prompt.
+pub(crate) fn with_backup_batch<T>(f: impl FnOnce() -> T) -> T {
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        platform::with_backup_batch(f)
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        f()
+    }
 }
 impl std::fmt::Display for BackupSecretError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -1077,5 +1077,9 @@
   "Copy thread id {id}": "Copiar el id del hilo {id}",
   "Copied thread id": "Id del hilo copiado",
   "{client} via T3 Code, thread {thread}": "{client} vía T3 Code, hilo {thread}",
-  "Toolport also adds these settings to its {client} entry, each only if it is not set. A setting you delete stays deleted until you connect again.": "Toolport también añade estos ajustes a su entrada de {client}, cada uno solo si no está definido. Un ajuste que elimines seguirá eliminado hasta que vuelvas a conectar."
+  "Toolport also adds these settings to its {client} entry, each only if it is not set. A setting you delete stays deleted until you connect again.": "Toolport también añade estos ajustes a su entrada de {client}, cada uno solo si no está definido. Un ajuste que elimines seguirá eliminado hasta que vuelvas a conectar.",
+  "net token change": "cambio neto de tokens",
+  "extra tokens": "tokens adicionales",
+  "Toolport measured a net token change of {tokens} across {sessions} client sessions. Full catalog baselines minus all catalog and search responses, counted locally with cl100k_base; not a billing figure. toolport.app": "Toolport midió un cambio neto de {tokens} tokens en {sessions} sesiones de cliente. Referencias del catálogo completo menos todas las respuestas de catálogo y de búsqueda, contadas localmente con cl100k_base; no es una cifra de facturación. toolport.app",
+  "{baseline} baseline tokens − {catalog} catalog response tokens − {search} search response tokens = {net} net token change. A negative change means responses used more tokens than the baseline.": "{baseline} tokens de referencia − {catalog} tokens de respuesta del catálogo − {search} tokens de respuesta de búsqueda = cambio neto de {net} tokens. Un cambio negativo significa que las respuestas usaron más tokens que la referencia."
 }

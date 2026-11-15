@@ -1,16 +1,35 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Check, TriangleAlert } from "lucide-react";
+import { Check, Info, Loader2, TriangleAlert } from "lucide-react";
 import {
   dismissClientRecovery,
   discardClientRecovery,
   listClientRecoveries,
+  prepareClientRecoveryDiscard,
+  refreshClientRecoveryNotice,
+  refreshClientRecoveryStatus,
   retryClientRecovery,
   type ClientRecovery,
-  type RecoveryAttempt,
+  type DiscardConfirmation,
 } from "@/lib/api";
 import { awaitLanguagePersistence, useI18n } from "@/lib/i18n";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { CLIENT_RECOVERY_SCAN_EVENT } from "@/lib/clientRecoveryEvents";
+
+/** Dispatch on `window` for an explicit Scan (Ctrl+R or the Clients refresh button).
+ * Only this event checks saved values; ordinary listing never opens the credential store. */
+export { CLIENT_RECOVERY_SCAN_EVENT } from "@/lib/clientRecoveryEvents";
+
+/** One latest result in the whole shell. A new action replaces it. */
+interface RecoveryResult {
+  clientId: string;
+  message: string;
+  tone: "success" | "info";
+}
+
+type Confirmation =
+  | { kind: "dismiss"; row: ClientRecovery }
+  | { kind: "discard"; row: ClientRecovery; prepared: DiscardConfirmation };
 
 /** Native receipts are authoritative; notice reads never open the credential store. */
 export function ClientRecoveryBanners({
@@ -24,19 +43,22 @@ export function ClientRecoveryBanners({
 }) {
   const { t, locale } = useI18n();
   const root = useRef<HTMLDivElement>(null);
-  const focusTarget = useRef<string | null>(null);
+  // Candidates in order; the first one that exists after the rebuild gets focus.
+  const focusTargets = useRef<string[]>([]);
   const details = useRef(new Map<string, HTMLDetailsElement>());
   const confirmationSubmitted = useRef(false);
+  const busyRef = useRef<string | null>(null);
   const [rows, setRows] = useState<ClientRecovery[]>([]);
   const [error, setError] = useState("");
   const [messages, setMessages] = useState<Record<string, string>>({});
-  const [successes, setSuccesses] = useState<RecoveryAttempt[]>([]);
-  const [busy, setBusy] = useState<string | null>(null);
+  const [result, setResult] = useState<RecoveryResult | null>(null);
+  const [busy, setBusyState] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
-  const [confirmation, setConfirmation] = useState<{
-    row: ClientRecovery;
-    kind: "dismiss" | "discard";
-  } | null>(null);
+  const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
+  const setBusy = (value: string | null) => {
+    busyRef.current = value;
+    setBusyState(value);
+  };
   const safeError = useCallback(
     (cause: unknown) =>
       typeof cause === "string"
@@ -64,126 +86,172 @@ export function ClientRecoveryBanners({
     };
   }, [locale, refreshKey, attempt, safeError]);
   useEffect(() => {
-    if (!busy && !confirmation && focusTarget.current) {
-      root.current
-        ?.querySelector<HTMLElement>(`[data-recovery-focus="${focusTarget.current}"]`)
-        ?.focus();
-      focusTarget.current = null;
+    // Scan leaves actions enabled so a focused button keeps focus; the backend
+    // serializes it with recovery actions under the same locks.
+    let scanning = false;
+    function scan(event: Event) {
+      event.preventDefault();
+      const done = (event as CustomEvent<{ done?: () => void }>).detail?.done;
+      if (scanning || busyRef.current) {
+        done?.();
+        return;
+      }
+      scanning = true;
+      const focused = (document.activeElement as HTMLElement | null)?.dataset
+        .recoveryFocus;
+      void awaitLanguagePersistence()
+        .then(refreshClientRecoveryStatus)
+        .then(listClientRecoveries)
+        .then((next) => {
+          if (focused && !busyRef.current) focusTargets.current = [focused];
+          setRows(next);
+          setError("");
+        })
+        .catch((cause: unknown) => setError(safeError(cause)))
+        .finally(() => {
+          scanning = false;
+          done?.();
+        });
     }
-  }, [busy, rows, successes, confirmation]);
-  function openConfirmation(row: ClientRecovery, kind: "dismiss" | "discard") {
-    confirmationSubmitted.current = false;
-    setConfirmation({ row, kind });
+    window.addEventListener(CLIENT_RECOVERY_SCAN_EVENT, scan);
+    return () => window.removeEventListener(CLIENT_RECOVERY_SCAN_EVENT, scan);
+  }, [safeError]);
+  useEffect(() => {
+    if (busy || confirmation || !focusTargets.current.length) return;
+    for (const target of focusTargets.current) {
+      const element = root.current?.querySelector<HTMLElement>(
+        `[data-recovery-focus="${target}"]`,
+      );
+      if (element) {
+        element.focus();
+        element.scrollIntoView?.({ block: "nearest" });
+        break;
+      }
+    }
+    focusTargets.current = [];
+  }, [busy, rows, result, messages, confirmation]);
+  /** Every new action supersedes the shown result, and this row's old feedback only. */
+  function begin(row: ClientRecovery) {
+    setBusy(row.id);
+    setResult(null);
+    setMessages((previous) => {
+      const next = { ...previous };
+      delete next[row.id];
+      return next;
+    });
+  }
+  function fail(row: ClientRecovery, cause: unknown, focus: string[]) {
+    setMessages((previous) => ({ ...previous, [row.id]: safeError(cause) }));
+    focusTargets.current = focus;
+  }
+  async function relist(removed?: string) {
+    try {
+      setRows(await listClientRecoveries());
+    } catch {
+      if (removed) setRows((previous) => previous.filter((item) => item.id !== removed));
+    }
   }
   async function retry(row: ClientRecovery) {
     const expanded = details.current.get(row.id);
     if (expanded) expanded.open = false;
+    begin(row);
     if (!row.canDiscard) {
-      setBusy(row.id);
+      // An unreadable or untrusted record. The backend reclassifies the full
+      // inventory; a replacement error keeps focus and never reports success.
       try {
-        const next = await listClientRecoveries();
-        setRows(next);
-        if (next.some((item) => item.id === row.id)) {
-          focusTarget.current = `retry-${row.id}`;
+        const update = await refreshClientRecoveryNotice(
+          row.id,
+          row.clientId,
+          row.backupPath,
+        );
+        setRows(update.rows);
+        if (update.message) {
+          setResult({ clientId: row.clientId, message: update.message, tone: "info" });
+          focusTargets.current = ["result"];
         } else {
-          setSuccesses((previous) => [
-            ...previous.filter((item) => item.clientId !== row.clientId),
-            {
-              id: row.id,
-              clientId: row.clientId,
-              clientName: row.clientName,
-              restored: 0,
-              accounted: 0,
-              remaining: 0,
-              pending: null,
-              message: t("{client}: the recovery information can be read again.", {
-                client: row.clientName,
-              }),
-            },
-          ]);
-          focusTarget.current = `success-${row.clientId}`;
+          focusTargets.current = [
+            ...(update.focusId ? [`retry-${update.focusId}`] : []),
+            `retry-${row.id}`,
+          ];
         }
       } catch (cause) {
-        setMessages((previous) => ({ ...previous, [row.id]: safeError(cause) }));
-        focusTarget.current = `retry-${row.id}`;
+        fail(row, cause, [`retry-${row.id}`]);
       } finally {
         setBusy(null);
       }
       return;
     }
-    setBusy(row.id);
-    setMessages((previous) => ({ ...previous, [row.id]: "" }));
     try {
       await awaitLanguagePersistence();
-      const result = await retryClientRecovery(row.id);
+      const outcome = await retryClientRecovery(row.id);
       setRows((previous) =>
-        result.pending
-          ? previous.map((item) => (item.id === row.id ? result.pending! : item))
+        outcome.pending
+          ? previous.map((item) => (item.id === row.id ? outcome.pending! : item))
           : previous.filter((item) => item.id !== row.id),
       );
-      setMessages((previous) => ({ ...previous, [row.id]: result.message }));
-      focusTarget.current = result.pending
-        ? `retry-${row.id}`
-        : `success-${row.clientId}`;
-      if (!result.pending) {
-        setSuccesses((previous) => [
-          ...previous.filter((item) => item.clientId !== row.clientId),
-          result,
-        ]);
+      if (outcome.pending) {
+        setMessages((previous) => ({ ...previous, [row.id]: outcome.message }));
+        focusTargets.current = [`retry-${row.id}`];
+      } else {
+        setResult({ clientId: row.clientId, message: outcome.message, tone: "success" });
+        focusTargets.current = ["result"];
         onRecovered?.();
       }
     } catch (cause) {
-      setMessages((previous) => ({ ...previous, [row.id]: safeError(cause) }));
+      fail(row, cause, [`retry-${row.id}`]);
       setAttempt((value) => value + 1);
-      focusTarget.current = `retry-${row.id}`;
     } finally {
       setBusy(null);
     }
   }
-  async function action(row: ClientRecovery, kind: "dismiss" | "show" | "discard") {
-    setBusy(row.id);
-    setMessages((previous) => ({ ...previous, [row.id]: "" }));
+  async function prepareDiscard(row: ClientRecovery) {
+    begin(row);
     try {
-      if (kind === "discard") {
-        await discardClientRecovery(row.id);
-        setRows((previous) => previous.filter((item) => item.id !== row.id));
-        const result: RecoveryAttempt = {
-          id: row.id,
-          clientId: row.clientId,
-          clientName: row.clientName,
-          restored: 0,
-          accounted: 0,
-          remaining: 0,
-          pending: null,
-          message: t(
-            "{client}'s saved recovery copies were discarded. The current client config was not changed.",
-            { client: row.clientName },
-          ),
-        };
-        setSuccesses((previous) => [
-          ...previous.filter((item) => item.clientId !== row.clientId),
-          result,
-        ]);
-        focusTarget.current = `success-${row.clientId}`;
-        onRecovered?.();
-      } else {
-        const dismissed = kind === "dismiss";
-        await dismissClientRecovery(row.id, dismissed);
-        setRows((previous) =>
-          previous.map((item) => (item.id === row.id ? { ...item, dismissed } : item)),
-        );
-        focusTarget.current = `${dismissed ? "show" : "retry"}-${row.id}`;
-      }
+      await awaitLanguagePersistence();
+      const prepared = await prepareClientRecoveryDiscard(row.id);
+      confirmationSubmitted.current = false;
+      setConfirmation({ kind: "discard", row, prepared });
     } catch (cause) {
-      setMessages((previous) => ({ ...previous, [row.id]: safeError(cause) }));
-      focusTarget.current = `${kind === "show" ? "show" : "retry"}-${row.id}`;
+      fail(row, cause, [`discard-${row.id}`, `retry-${row.id}`]);
+      await relist();
+    } finally {
+      setBusy(null);
+    }
+  }
+  async function discard(row: ClientRecovery, prepared: DiscardConfirmation) {
+    begin(row);
+    try {
+      const message = await discardClientRecovery(row.id, prepared.manifest);
+      await relist(row.id);
+      setResult({ clientId: row.clientId, message, tone: "success" });
+      focusTargets.current = ["result"];
+      onRecovered?.();
+    } catch (cause) {
+      // A failed Discard can leave a started phase; show the current row state.
+      fail(row, cause, [`discard-${row.id}`, `retry-${row.id}`]);
+      await relist();
+    } finally {
+      setBusy(null);
+    }
+  }
+  async function setDismissed(row: ClientRecovery, dismissed: boolean) {
+    begin(row);
+    try {
+      await dismissClientRecovery(row.id, dismissed);
+      setRows((previous) =>
+        previous.map((item) => (item.id === row.id ? { ...item, dismissed } : item)),
+      );
+      focusTargets.current = [`${dismissed ? "show" : "retry"}-${row.id}`];
+    } catch (cause) {
+      fail(row, cause, [`${dismissed ? "retry" : "show"}-${row.id}`]);
     } finally {
       setBusy(null);
     }
   }
   const visible = rows.filter((row) => !clientId || row.clientId === clientId);
-  const results = successes.filter((row) => !clientId || row.clientId === clientId);
-  if (!visible.length && !error && !results.length) return null;
+  const shownResult =
+    result && (!clientId || result.clientId === clientId) ? result : null;
+  if (!visible.length && !error && !shownResult) return null;
   // Keyboard focus is required to scroll this bounded list without a pointer.
   /* eslint-disable jsx-a11y/no-noninteractive-tabindex */
   const values = (lines: string[], label: string) => (
@@ -203,6 +271,12 @@ export function ClientRecoveryBanners({
     </ul>
   );
   /* eslint-enable jsx-a11y/no-noninteractive-tabindex */
+  const working = (
+    <p aria-live="polite" className="mt-3 flex items-center gap-2" data-recovery-busy>
+      <Loader2 className="size-4 shrink-0 animate-spin" aria-hidden="true" />
+      {t("Working on this recovery…")}
+    </p>
+  );
   return (
     <div ref={root} className="flex min-w-0 flex-col gap-3" data-client-recoveries>
       {error && (
@@ -216,22 +290,26 @@ export function ClientRecoveryBanners({
           </Button>
         </div>
       )}
-      {results.map((result) => (
+      {shownResult && (
         <p
-          key={result.clientId}
           role="status"
           tabIndex={-1}
-          data-recovery-focus={`success-${result.clientId}`}
-          className="toolport-alert flex select-text items-start gap-2 break-words border-success p-3 text-sm"
+          data-recovery-focus="result"
+          className={`toolport-alert flex select-text items-start gap-2 whitespace-pre-wrap break-words p-3 text-sm [overflow-wrap:anywhere] ${shownResult.tone === "success" ? "border-success" : "border-border"}`}
         >
-          <Check className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-          {result.message}
+          {shownResult.tone === "success" ? (
+            <Check className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+          ) : (
+            <Info className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+          )}
+          {shownResult.message}
         </p>
-      ))}
+      )}
       {visible.map((row) => (
         <section
           key={row.id}
           aria-label={`${t("Client config recovery")}: ${row.clientName}`}
+          aria-busy={busy === row.id || undefined}
           className="toolport-alert min-w-0 select-text border-warning bg-warning/5 p-4 text-sm"
         >
           {row.dismissed ? (
@@ -245,12 +323,13 @@ export function ClientRecoveryBanners({
                   {messages[row.id]}
                 </p>
               )}
+              {busy === row.id && working}
               <Button
                 data-recovery-focus={`show-${row.id}`}
                 className="mt-3"
                 variant="outline"
                 disabled={!!busy}
-                onClick={() => void action(row, "show")}
+                onClick={() => void setDismissed(row, false)}
               >
                 {t("Show recovery")}
               </Button>
@@ -289,31 +368,39 @@ export function ClientRecoveryBanners({
                   {messages[row.id]}
                 </p>
               )}
+              {busy === row.id && working}
               <div className="mt-3 flex flex-wrap gap-2">
-                <Button
-                  data-recovery-focus={`retry-${row.id}`}
-                  disabled={!!busy}
-                  onClick={() => void retry(row)}
-                >
-                  {t("Retry")}
-                </Button>
+                {row.canRetry && (
+                  <Button
+                    data-recovery-focus={`retry-${row.id}`}
+                    disabled={!!busy}
+                    onClick={() => void retry(row)}
+                  >
+                    {t("Retry")}
+                  </Button>
+                )}
                 {row.canDiscard && (
                   <>
-                    <Button
-                      data-recovery-focus={`dismiss-${row.id}`}
-                      variant="outline"
-                      disabled={!!busy}
-                      onClick={() => openConfirmation(row, "dismiss")}
-                    >
-                      {t("Dismiss")}
-                    </Button>
+                    {!row.discardStarted && (
+                      <Button
+                        data-recovery-focus={`dismiss-${row.id}`}
+                        variant="outline"
+                        disabled={!!busy}
+                        onClick={() => {
+                          confirmationSubmitted.current = false;
+                          setConfirmation({ kind: "dismiss", row });
+                        }}
+                      >
+                        {t("Dismiss")}
+                      </Button>
+                    )}
                     <Button
                       data-recovery-focus={`discard-${row.id}`}
-                      variant="outline"
+                      variant={row.discardStarted ? "default" : "outline"}
                       disabled={!!busy}
-                      onClick={() => openConfirmation(row, "discard")}
+                      onClick={() => void prepareDiscard(row)}
                     >
-                      {t("Discard these saved values")}
+                      {row.discardAction || t("Discard these saved values")}
                     </Button>
                   </>
                 )}
@@ -346,43 +433,46 @@ export function ClientRecoveryBanners({
           onOpenChange={(open) => {
             if (!open) {
               if (!confirmationSubmitted.current)
-                focusTarget.current = `${confirmation.kind}-${confirmation.row.id}`;
+                focusTargets.current = [`${confirmation.kind}-${confirmation.row.id}`];
               setConfirmation(null);
             }
           }}
-          title={t(
-            confirmation.kind === "dismiss"
-              ? "Dismiss recovery notice?"
-              : "Discard these saved values?",
-          )}
+          title={
+            confirmation.kind === "discard"
+              ? confirmation.prepared.heading
+              : t("Dismiss recovery notice?")
+          }
           destructive={confirmation.kind === "discard"}
-          confirmLabel={t(
-            confirmation.kind === "dismiss" ? "Dismiss" : "Discard these saved values",
-          )}
+          confirmLabel={
+            confirmation.kind === "discard"
+              ? confirmation.prepared.actionLabel
+              : t("Dismiss")
+          }
           description={
             <div className="select-text whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
-              {confirmation.kind === "discard" && (
+              {confirmation.kind === "discard" ? (
                 <>
-                  <p>
-                    {t(
-                      "Toolport will permanently delete the saved original config and its recovery copies for {client} at {path}. The saved copies of the values listed below will be lost. The current client config and Toolport's server credentials will not change.",
-                      {
-                        client: confirmation.row.clientName,
-                        path: confirmation.row.path,
-                      },
+                  <p>{confirmation.prepared.description}</p>
+                  {!!confirmation.prepared.lines.length &&
+                    values(
+                      confirmation.prepared.lines,
+                      t("Saved values and files to delete"),
                     )}
-                  </p>
-                  {values(confirmation.row.discardValues, t("Saved values to discard"))}
+                  {confirmation.prepared.location && (
+                    <p className="mt-3">{confirmation.prepared.location}</p>
+                  )}
                 </>
+              ) : (
+                <p>{confirmation.row.retention}</p>
               )}
-              <p className="mt-3">{confirmation.row.retention}</p>
             </div>
           }
           onConfirm={() => {
             const chosen = confirmation;
             confirmationSubmitted.current = true;
             setConfirmation(null);
-            void action(chosen.row, chosen.kind);
+            if (chosen.kind === "discard") void discard(chosen.row, chosen.prepared);
+            else void setDismissed(chosen.row, true);
           }}
         />
       )}

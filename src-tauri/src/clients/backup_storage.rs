@@ -61,6 +61,55 @@ fn envelope(text: &str) -> Option<Envelope> {
     serde_json::from_value(value).ok()
 }
 
+/// A timestamped backup with nothing to vault. Its text is the exact config
+/// bytes that were already written unvaulted; the wrapper only adds the same
+/// path provenance an Envelope has, so two same-named configs never share it.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlainBackup {
+    toolport_plain_backup_version: u32,
+    source_config_path: String,
+    binding: String,
+    text: String,
+}
+fn plain_binding(path: &Path, source: &str, text: &str) -> String {
+    format!(
+        "{}-{}-{}",
+        crate::registry::sha256_hex(&path.to_string_lossy()),
+        crate::registry::sha256_hex(source),
+        crate::registry::sha256_hex(text)
+    )
+}
+const PLAIN_UNSUPPORTED: &str =
+    "This backup uses an unsupported format. Open it with a compatible Toolport version; it was left unchanged.";
+const PLAIN_MALFORMED: &str = "This backup file is malformed. Toolport left it unchanged.";
+/// `Ok(None)` only for unmarked text (legacy raw backups and native configs).
+/// Anything carrying the wrapper marker is either a valid version 1 wrapper
+/// or refused: a future or damaged wrapper is never treated as config bytes.
+fn plain_backup(text: &str) -> Result<Option<PlainBackup>, String> {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Ok(None);
+    };
+    let Some(version) = map.get("toolportPlainBackupVersion") else {
+        return Ok(None);
+    };
+    if version.as_u64() != Some(1) {
+        return Err(PLAIN_UNSUPPORTED.into());
+    }
+    serde_json::from_value(serde_json::Value::Object(map))
+        .map(Some)
+        .map_err(|_| PLAIN_MALFORMED.into())
+}
+fn wrap_plain(path: &Path, source: &str, text: &str) -> Result<String, String> {
+    serde_json::to_string(&PlainBackup {
+        toolport_plain_backup_version: 1,
+        source_config_path: source.into(),
+        binding: plain_binding(path, source, text),
+        text: text.into(),
+    })
+    .map_err(|e| diagnostics::json(&e))
+}
+
 // Rewrite string values, never syntax, field names, hashes or recovery paths.
 // Recurse through serialized config strings without reformatting their bytes.
 fn substitute(text: &str, from: &str, to: &str) -> String {
@@ -319,7 +368,10 @@ fn encode_internal(
         }
     }
     if references.is_empty() {
-        return Ok(text.into());
+        return match source {
+            Some(source) => wrap_plain(path, &source.to_string_lossy(), text),
+            None => Ok(text.into()),
+        };
     }
     let hash = crate::registry::sha256_hex(text);
     let account = install_account(
@@ -373,10 +425,14 @@ pub(super) fn raw_metadata(text: &str) -> Result<(serde_json::Value, Vec<Referen
     let mut dismissed = None;
     let mut issues = None;
     let mut cleanup_state = None;
+    let mut available = None;
+    let mut phase = None;
     for _ in 0..8 {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
             issues = issues.or_else(|| value.get("recoveryIssues").cloned());
             cleanup_state = cleanup_state.or_else(|| value.get("recoveryCleanupState").cloned());
+            available = available.or_else(|| value.get("recoveryAvailable").cloned());
+            phase = phase.or_else(|| value.get("discardPhase").cloned());
         }
         if let Some(saved) = envelope(&text) {
             dismissed = dismissed.or(saved.recovery_dismissed);
@@ -398,6 +454,12 @@ pub(super) fn raw_metadata(text: &str) -> Result<(serde_json::Value, Vec<Referen
         }
         if let Some(state) = cleanup_state {
             value["recoveryCleanupState"] = state;
+        }
+        if let Some(available) = available {
+            value["recoveryAvailable"] = available;
+        }
+        if let Some(phase) = phase {
+            value["discardPhase"] = phase;
         }
         refs.sort_by(|a, b| (&a.server, &a.key).cmp(&(&b.server, &b.key)));
         refs.dedup_by(|a, b| a.server == b.server && a.key == b.key);
@@ -443,6 +505,15 @@ pub(super) fn set_dismissed(path: &Path, dismissed: bool) -> Result<(), String> 
 }
 
 pub(super) fn decode(text: &str) -> Result<String, String> {
+    if let Some(plain) = plain_backup(text)? {
+        // Path ownership is checked by `source_path`, like an Envelope's key;
+        // reading only requires the stored bytes to be the ones recorded.
+        let hash = format!("-{}", crate::registry::sha256_hex(&plain.text));
+        if !plain.binding.ends_with(&hash) {
+            return Err("Saved backup copy failed its integrity check".into());
+        }
+        return Ok(plain.text);
+    }
     let Some(saved) = envelope(text) else {
         return Ok(text.into());
     };
@@ -619,14 +690,14 @@ fn release_owned(path: &Path, discard_all: bool) -> Result<(), String> {
                     &key,
                     discard_all,
                 )
-                .map_err(|e| recovery::next_step(e, false))?;
+                .map_err(|e| recovery::next_step(e, discard_all))?;
                 for index in 0..count {
                     crate::secrets::delete_backup_secret_copies_status(
                         &saved.account,
                         &format!("{key}-credential-{index}"),
                         discard_all,
                     )
-                    .map_err(|e| recovery::next_step(e, false))?;
+                    .map_err(|e| recovery::next_step(e, discard_all))?;
                 }
             }
             release_text(path, &fallback, depth + 1, discard_all)?;
@@ -884,18 +955,28 @@ pub(crate) fn upgrade_legacy() -> Result<usize, String> {
         if envelope(&raw).is_some() {
             continue;
         }
+        // A plain wrapper's credential scan and re-encode use its exact config
+        // text. Only a binding that validates for this path is kept; a moved or
+        // copied file is re-encoded unbound rather than gaining provenance.
+        // Refuse a future or malformed wrapper before any scan or rewrite.
+        let plain = plain_backup(&raw).map_err(|e| format!("{e} ({})", path.display()))?;
+        let source = source_path(&path).ok().flatten();
+        let text = match plain {
+            Some(_) => decode(&raw)?,
+            None => raw.clone(),
+        };
         let client = path
             .parent()
             .and_then(Path::file_name)
             .and_then(|s| s.to_str())
             .unwrap_or("client");
-        let values = discovered_credentials(&raw, client);
+        let values = discovered_credentials(&text, client);
         if values.is_empty() {
             continue;
         }
         let _restore =
             RestoreImports(IMPORTS.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), values)));
-        let encoded = encode(&path, &raw).map_err(|e| format!("Could not secure legacy recovery file {}: {e}. Original retained; unlock the vault and restart Toolport.", path.display()))?;
+        let encoded = encode_internal(&path, &text, false, source.as_deref().map(Path::new)).map_err(|e| format!("Could not secure legacy recovery file {}: {e}. Original retained; unlock the vault and restart Toolport.", path.display()))?;
         if encoded != raw {
             crate::registry::atomic_write(&path, &encoded)?;
             upgraded += 1;
@@ -907,13 +988,19 @@ pub(crate) fn upgrade_legacy() -> Result<usize, String> {
 pub(crate) fn protect_existing() -> Result<(), String> {
     for path in owned_backup_paths()? {
         let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        // Refuse a future or malformed wrapper before any rewrite.
+        let plain = plain_backup(&raw)?;
         let payload = match envelope(&raw) {
             Some(saved) => crate::secrets::get_backup_secret_result(&saved.account, &saved.key)?
                 .filter(|payload| crate::registry::sha256_hex(payload) == saved.hash)
                 .ok_or("Unlock the original backup vault before importing more credentials. Client config unchanged.")?,
+            None if plain.is_some() => decode(&raw)?,
             None => raw.clone(),
         };
-        let encoded = encode(&path, &payload)?;
+        // Re-encoding keeps a backup's validated path provenance, never a
+        // binding copied from another path.
+        let source = source_path(&path).ok().flatten();
+        let encoded = encode_internal(&path, &payload, false, source.as_deref().map(Path::new))?;
         if encoded != raw {
             crate::registry::atomic_write(&path, &encoded)?;
         }
@@ -924,6 +1011,124 @@ pub(crate) fn protect_existing() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn future_or_malformed_plain_wrappers_are_refused_and_never_rewritten() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            clear();
+            reset_missing();
+            std::env::set_var("TOOLPORT_SECRET_KEY", "locked-plain-backup-fixture");
+            let dir = crate::registry::conduit_dir()
+                .unwrap()
+                .join("backups")
+                .join("cursor");
+            std::fs::create_dir_all(&dir).unwrap();
+            let source = Path::new("/fixture/a/mcp.json");
+            let valid_path = dir.join("1-mcp.json");
+            let valid: serde_json::Value = serde_json::from_str(
+                &encode_backup(&valid_path, "{\"mcpServers\":{}}", false, source).unwrap(),
+            )
+            .unwrap();
+            let mut future = valid.clone();
+            future["toolportPlainBackupVersion"] = 2.into();
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove("binding");
+            let mut wrong_type = valid.clone();
+            wrong_type["text"] = 7.into();
+            let mut text_version = valid.clone();
+            text_version["toolportPlainBackupVersion"] = "1".into();
+            for (name, value, expected) in [
+                ("2-mcp.json", future, PLAIN_UNSUPPORTED),
+                ("3-mcp.json", text_version, PLAIN_UNSUPPORTED),
+                ("4-mcp.json", missing, PLAIN_MALFORMED),
+                ("5-mcp.json", wrong_type, PLAIN_MALFORMED),
+            ] {
+                let raw = value.to_string();
+                let file = dir.join(name);
+                std::fs::write(&file, &raw).unwrap();
+                assert_eq!(decode(&raw).unwrap_err(), expected, "{name}");
+                assert!(read(&file).is_err(), "{name}: never read as config");
+                assert!(read_config_file(&file).is_err());
+                assert_eq!(
+                    source_path(&file).unwrap_err(),
+                    expected,
+                    "{name}: no ownership"
+                );
+                assert!(protect_existing().is_err(), "{name}: never reprotected");
+                // A credential-looking import must not turn it into a sealed config.
+                register("native", "API_KEY", "sk-plain-wrapper-fixture-value");
+                assert!(upgrade_legacy().is_err(), "{name}: never upgraded");
+                clear();
+                assert_eq!(
+                    std::fs::read_to_string(&file).unwrap(),
+                    raw,
+                    "{name}: untouched"
+                );
+                std::fs::remove_file(&file).unwrap();
+            }
+            // Unmarked legacy raw backups stay supported byte for byte.
+            let legacy = dir.join("6-mcp.json");
+            let raw = "{ \"mcpServers\": {} , \"note\": \"keep\" }\r\n";
+            std::fs::write(&legacy, raw).unwrap();
+            assert_eq!(read(&legacy).unwrap(), raw);
+            assert_eq!(source_path(&legacy).unwrap(), None);
+            assert!(plain_backup("[1,2]").unwrap().is_none());
+            assert!(plain_backup("not json").unwrap().is_none());
+            protect_existing().unwrap();
+            assert_eq!(std::fs::read_to_string(&legacy).unwrap(), raw);
+        });
+    }
+    #[test]
+    fn plain_backups_round_trip_exact_bytes_without_a_vault_and_bind_their_source() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            clear();
+            reset_missing();
+            // No vault is usable: plain backups must never need one.
+            std::env::set_var("TOOLPORT_SECRET_KEY", "locked-plain-backup-fixture");
+            let dir = crate::registry::conduit_dir()
+                .unwrap()
+                .join("backups")
+                .join("cursor");
+            std::fs::create_dir_all(&dir).unwrap();
+            let source = Path::new("/fixture/a/mcp.json");
+            for text in [
+                "{ // é comment\r\n \"mcpServers\": {\"native\":{\"command\":\"native\"}},\r\n\t\"recoveryIssues\": [1] \r\n}\r\n",
+                "# toml \u{1F600}\n[mcp_servers.native]\ncommand = 'native'   ",
+                "",
+            ] {
+                let dest = dir.join("1-mcp.json");
+                let encoded = encode_backup(&dest, text, false, source).unwrap();
+                assert!(
+                    plain_backup(&encoded).unwrap().is_some(),
+                    "new plain backups are bound"
+                );
+                assert!(envelope(&encoded).is_none());
+                std::fs::write(&dest, &encoded).unwrap();
+                assert_eq!(decode(&encoded).unwrap(), text, "byte-exact");
+                assert_eq!(read(&dest).unwrap(), text);
+                assert_eq!(read_config_file(&dest).unwrap(), text);
+                assert_eq!(
+                    source_path(&dest).unwrap().as_deref(),
+                    Some("/fixture/a/mcp.json")
+                );
+                assert!(raw_markers(&encoded).unwrap().is_empty());
+                release_for_discard(&dest).unwrap();
+                // Toolport's own re-encode keeps the same bytes and binding.
+                protect_existing().unwrap();
+                assert_eq!(std::fs::read_to_string(&dest).unwrap(), encoded);
+                // A copy at another path never claims the original's provenance.
+                let copy = dir.join("2-mcp.json");
+                std::fs::write(&copy, &encoded).unwrap();
+                assert!(source_path(&copy).is_err());
+                std::fs::remove_file(&copy).unwrap();
+                // Tampered text is refused, never returned as wrapper JSON.
+                let mut value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+                value["text"] = "tampered".into();
+                assert!(decode(&value.to_string()).is_err());
+                // Snapshots and move records (no source) keep their spelling.
+                assert_eq!(encode(&dir.join("moved-servers.json"), text).unwrap(), text);
+            }
+        });
+    }
     // Runs in Headless Rust tests (macos-latest, core) and
     // Headless Rust tests (windows-latest, core), ci.yml. The portable
     // vault checks backup byte spelling on both; Windows also uses Credential
@@ -1465,10 +1670,72 @@ pub(super) fn recovery_values(path: &Path) -> Result<Vec<RecoveryValue>, String>
     Ok(values)
 }
 pub(super) fn set_issues(path: &Path, issues: &[RecoveryIssue]) -> Result<(), String> {
+    // A restore attempt checked every remaining value, so an older Scan's
+    // "ready" result no longer describes them.
+    set_status(path, issues, &[])
+}
+/// A value a noninteractive Scan authenticated. Never contains value text.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryReady {
+    pub reference: Reference,
+    pub marker: String,
+}
+/// Status-only receipt update. Captured content, hashes and provenance stay as written.
+pub(super) fn set_status(
+    path: &Path,
+    issues: &[RecoveryIssue],
+    ready: &[RecoveryReady],
+) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|_| "Could not update recovery status")?;
     let mut value: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| diagnostics::json(&e))?;
     value["recoveryIssues"] = serde_json::to_value(issues).map_err(|e| diagnostics::json(&e))?;
+    if ready.is_empty() {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("recoveryAvailable");
+        }
+    } else {
+        value["recoveryAvailable"] =
+            serde_json::to_value(ready).map_err(|e| diagnostics::json(&e))?;
+    }
+    crate::registry::atomic_write(
+        path,
+        &serde_json::to_string(&value).map_err(|e| diagnostics::json(&e))?,
+    )
+}
+
+/// Explicit Discard progress. It only restricts restoration and display; it
+/// never authorizes deleting anything without a confirmed Discard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum DiscardPhase {
+    Started,
+    ValuesRemoved,
+}
+/// Reads the phase from any metadata layer without contacting a vault. An
+/// unrecognized phase (for example from a newer Toolport) counts as started.
+pub(super) fn discard_phase(raw: &str) -> Option<DiscardPhase> {
+    let mut text = raw.to_owned();
+    for _ in 0..8 {
+        let value = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+        if let Some(phase) = value.get("discardPhase").filter(|v| !v.is_null()) {
+            return Some(serde_json::from_value(phase.clone()).unwrap_or(DiscardPhase::Started));
+        }
+        if let Some(saved) = envelope(&text) {
+            text = saved.fallback;
+            continue;
+        }
+        let inner = value["vaultRecovery"].as_str()?;
+        text = inner.to_owned();
+    }
+    None
+}
+pub(super) fn set_discard_phase(path: &Path, phase: DiscardPhase) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|_| "Could not update recovery status")?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|_| "Could not update recovery status")?;
+    value["discardPhase"] = serde_json::to_value(phase).map_err(|e| diagnostics::json(&e))?;
     crate::registry::atomic_write(
         path,
         &serde_json::to_string(&value).map_err(|e| diagnostics::json(&e))?,
@@ -1490,6 +1757,12 @@ pub(super) fn test_recovery_key(path: &Path) -> (String, String, usize) {
 
 pub(super) fn source_path(path: &Path) -> Result<Option<String>, String> {
     let raw = std::fs::read_to_string(path).map_err(|_| "Could not inspect saved recovery copy")?;
+    if let Some(plain) = plain_backup(&raw)? {
+        if plain.binding != plain_binding(path, &plain.source_config_path, &plain.text) {
+            return Err("Saved recovery copy has conflicting path provenance".into());
+        }
+        return Ok(Some(plain.source_config_path));
+    }
     let Some(saved) = envelope(&raw) else {
         return Ok(None);
     };

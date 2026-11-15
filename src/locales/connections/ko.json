@@ -1077,5 +1077,9 @@
   "Copy thread id {id}": "스레드 ID {id} 복사",
   "Copied thread id": "스레드 ID를 복사했습니다",
   "{client} via T3 Code, thread {thread}": "{client}(T3 Code 경유, 스레드 {thread})",
-  "Toolport also adds these settings to its {client} entry, each only if it is not set. A setting you delete stays deleted until you connect again.": "Toolport는 {client} 설정에 있는 Toolport 항목에 이 설정들도 추가하며, 각 설정은 지정되지 않은 경우에만 추가합니다. 삭제한 설정은 다시 연결할 때까지 삭제된 상태로 유지됩니다."
+  "Toolport also adds these settings to its {client} entry, each only if it is not set. A setting you delete stays deleted until you connect again.": "Toolport는 {client} 설정에 있는 Toolport 항목에 이 설정들도 추가하며, 각 설정은 지정되지 않은 경우에만 추가합니다. 삭제한 설정은 다시 연결할 때까지 삭제된 상태로 유지됩니다.",
+  "net token change": "순 Token 변화",
+  "extra tokens": "추가 Token",
+  "Toolport measured a net token change of {tokens} across {sessions} client sessions. Full catalog baselines minus all catalog and search responses, counted locally with cl100k_base; not a billing figure. toolport.app": "Toolport가 클라이언트 세션 {sessions}개에서 순 Token 변화 {tokens}을(를) 측정했습니다. 전체 카탈로그 기준에서 모든 카탈로그 및 검색 응답을 뺀 값이며 cl100k_base로 로컬에서 계산합니다. 청구 수치가 아닙니다. toolport.app",
+  "{baseline} baseline tokens − {catalog} catalog response tokens − {search} search response tokens = {net} net token change. A negative change means responses used more tokens than the baseline.": "기준 Token {baseline} − 카탈로그 응답 Token {catalog} − 검색 응답 Token {search} = 순 Token 변화 {net}. 음수이면 응답에 기준보다 많은 Token이 사용되었다는 뜻입니다."
 }

@@ -644,7 +644,9 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                     }
                     feedback.set_visible(false);
                     let status = adw::StatusPage::builder()
-                        .icon_name("emblem-ok-symbolic")
+                        // GTK's built-in check icon; emblem-ok is missing from
+                        // some themes and rendered as a grey missing-image page.
+                        .icon_name("object-select-symbolic")
                         .title(
                             outcome
                                 .message
@@ -724,6 +726,8 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                         content.append(&label);
                         body.append(&detail);
                     }
+                    // Return activates Done without first tabbing through the results.
+                    button.grab_focus();
                     finished();
                 }
                 result => {
@@ -745,6 +749,7 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                         }
                     }
                     feedback.set_visible(!has_row_error);
+                    button.grab_focus();
                 }
             }
         });

@@ -96,8 +96,24 @@ fn released_path(client_id: &str, path: &Path) -> Result<PathBuf, String> {
     )
 }
 
+/// A started Discard may have released some values, so nothing may restore,
+/// recapture or re-encode this receipt (which would also drop its phase). The
+/// phase never authorizes deletion itself; read-only inventory still lists it.
+fn refuse_started(file: &Path) -> Result<(), String> {
+    match std::fs::read_to_string(file) {
+        Ok(raw) if backup_storage::discard_phase(&raw).is_some() => {
+            Err(recovery::discard_started_refusal())
+        }
+        _ => Ok(()),
+    }
+}
+
+// Every caller of `load` is part of a restore, Connect, reconnect, uninstall
+// or move path. Read-only listing (`recorded_paths`, recovery inventory) checks
+// the phase itself and never reaches this refusal.
 fn load(client_id: &str, path: &Path) -> Result<Option<Snapshot>, String> {
     let file = record_path(client_id, path)?;
+    refuse_started(&file)?;
     let text = match backup_storage::read(&file) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1023,14 +1039,20 @@ pub(super) fn run<T>(
     format: Format,
     edit: impl FnMut() -> Result<T, String>,
 ) -> Result<T, String> {
-    if load(client_id, path)?.is_some_and(|record| record.jsonc_settings) {
-        mutation::settings(client_id, path, edit)
-    } else {
-        mutation::run(client_id, path, format, edit)
-    }
+    // Every restore caller shares one bounded, noninteractive store session.
+    crate::secrets::with_backup_batch(|| {
+        if load(client_id, path)?.is_some_and(|record| record.jsonc_settings) {
+            mutation::settings(client_id, path, edit)
+        } else {
+            mutation::run(client_id, path, format, edit)
+        }
+    })
 }
 
 pub(super) fn finish(client_id: &str, path: &Path, expected: Option<&str>) -> Result<(), String> {
+    crate::secrets::with_backup_batch(|| finish_batched(client_id, path, expected))
+}
+fn finish_batched(client_id: &str, path: &Path, expected: Option<&str>) -> Result<(), String> {
     check_finished(client_id, path, expected)?;
     if let Some(mut record) = load(client_id, path)? {
         for parent in &record.created_parents {
@@ -1136,18 +1158,102 @@ pub(super) fn finish(client_id: &str, path: &Path, expected: Option<&str>) -> Re
     Ok(())
 }
 
-pub(super) fn recovery_copies(client_id: &str, path: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut copies = Vec::new();
-    let original = record_path(client_id, path)?;
-    let names = [
+fn backup_names(path: &Path) -> [String; 3] {
+    [
         path.file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("config")
             .to_string(),
         claude_settings_backup_name(path),
         secondary_claude_backup_name(path),
-    ];
+    ]
+}
+/// Backup names another recorded config in this folder can also produce. A
+/// plain (unvaulted) timestamped copy has no source binding, so it belongs to
+/// this config only when no other recorded config shares its name. An
+/// unreadable receipt could belong to any config, so it makes every name shared.
+fn shared_backup_names(dir: &Path, path: &Path, own: &[PathBuf]) -> Vec<String> {
+    let names = backup_names(path);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return names.to_vec();
+    };
+    let mut shared = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return names.to_vec();
+        };
+        let file = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if own.contains(&file)
+            || !(name.starts_with("original-") || name.starts_with("released-"))
+            || !name.ends_with(".json")
+        {
+            continue;
+        }
+        let other = std::fs::symlink_metadata(&file)
+            .ok()
+            .filter(|meta| meta.is_file() && !crate::purge::is_link(meta))
+            .and_then(|_| std::fs::read_to_string(&file).ok())
+            .and_then(|raw| backup_storage::raw_metadata(&raw).ok())
+            .and_then(|(record, _)| record["configPath"].as_str().map(PathBuf::from));
+        let Some(other) = other else {
+            return names.to_vec();
+        };
+        if other == path {
+            continue;
+        }
+        let theirs = backup_names(&other);
+        shared.extend(names.iter().filter(|n| theirs.contains(n)).cloned());
+    }
+    shared
+}
+
+/// Keep only path provenance when explicitly discarding a disconnected record.
+/// Without it, another same-named location could claim an ambiguous legacy copy
+/// after this receipt disappears. This tombstone contains no config or values.
+pub(super) fn remember_discarded_path(
+    client_id: &str,
+    path: &Path,
+    format: Format,
+) -> Result<(), String> {
+    let record = Snapshot {
+        version: 1,
+        format,
+        config_path: path.to_string_lossy().into_owned(),
+        original: None,
+        original_hash: None,
+        baseline: Value::Null,
+        captured_at: 0,
+        toolport_version: env!("CARGO_PKG_VERSION").into(),
+        last_written: None,
+        last_written_hash: None,
+        published_hash: None,
+        created_parents: Vec::new(),
+        exact_eligible: false,
+        preexisting_gateways: Vec::new(),
+        disconnected: true,
+        jsonc_settings: false,
+        disconnect_before: None,
+        vault_recovery: None,
+        recovered_vault: false,
+        recovery_dismissed: false,
+    };
+    crate::registry::atomic_write(
+        &released_path(client_id, path)?,
+        &serde_json::to_string(&record).map_err(|e| diagnostics::json(&e))?,
+    )
+}
+
+pub(super) fn recovery_copies(client_id: &str, path: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut copies = Vec::new();
+    let original = record_path(client_id, path)?;
+    let names = backup_names(path);
     if let Some(dir) = backup_dir(client_id) {
+        let shared = shared_backup_names(
+            &dir,
+            path,
+            &[original.clone(), released_path(client_id, path)?],
+        );
         for entry in
             std::fs::read_dir(dir).map_err(|_| "Could not inventory saved recovery copies")?
         {
@@ -1166,10 +1272,18 @@ pub(super) fn recovery_copies(client_id: &str, path: &Path) -> Result<Vec<PathBu
                     );
                 }
                 if entry.path() != original {
-                    if let Some(source) = backup_storage::source_path(&entry.path())? {
-                        if source != path.to_string_lossy() {
-                            continue;
+                    match backup_storage::source_path(&entry.path())? {
+                        Some(source) if source != path.to_string_lossy() => continue,
+                        Some(_) => {}
+                        // Unbound copies are claimed only when unambiguous;
+                        // never delete another config's history by basename.
+                        None if name
+                            .split_once('-')
+                            .is_some_and(|(_, suffix)| shared.iter().any(|n| n == suffix)) =>
+                        {
+                            continue
                         }
+                        None => {}
                     }
                 }
                 copies.push(entry.path());
@@ -1192,6 +1306,7 @@ pub(crate) fn after_capture_conflict(
 ) -> Result<(), String> {
     let dir = crate::registry::conduit_dir().ok_or("Could not resolve mutation lock dir")?;
     let _lock = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
+    refuse_started(file)?;
     let mut record: Snapshot =
         serde_json::from_str(&backup_storage::read(file).map_err(|e| e.to_string())?)
             .map_err(|e| diagnostics::at(file, diagnostics::json(&e)))?;
@@ -1222,6 +1337,7 @@ pub(crate) fn after_rollback(
     target: &Path,
     written: Option<&str>,
 ) -> Result<(), String> {
+    refuse_started(file)?;
     let mut record: Snapshot =
         serde_json::from_str(&backup_storage::read(file).map_err(|e| e.to_string())?)
             .map_err(|e| diagnostics::at(file, diagnostics::json(&e)))?;
@@ -1284,6 +1400,19 @@ pub(super) fn recorded_paths() -> Vec<(String, PathBuf, Result<Format, String>)>
                         .map_err(|_| "Client recovery record is invalid".to_string())
                 });
             match parsed {
+                // Listing stays read-only and complete: a started Discard is
+                // still a recorded path, so `disconnect --all` reports the
+                // shared refusal for that config instead of a receipt error.
+                Ok(record)
+                    if std::fs::read_to_string(&file)
+                        .is_ok_and(|raw| backup_storage::discard_phase(&raw).is_some()) =>
+                {
+                    paths.push((
+                        def.client_id().into(),
+                        PathBuf::from(record.config_path),
+                        Ok(record.format),
+                    ))
+                }
                 Ok(record) => {
                     let path = PathBuf::from(record.config_path);
                     match released(def.client_id(), &path) {
@@ -1345,6 +1474,70 @@ mod tests {
             None
         };
         finish(id, path, revision.as_deref())
+    }
+    #[test]
+    fn plain_backups_of_same_named_configs_are_cleaned_only_by_their_owner() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let a = data.join("a").join("mcp.json");
+            let b = data.join("b").join("mcp.json");
+            let original = "{ \"mcpServers\": {\"native\":{\"command\":\"native\"}} }\r\n";
+            for path in [&a, &b] {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, original).unwrap();
+                mutation::run("cursor", path, Format::JsonMcpServers, || {
+                    backup_file("cursor", path)?;
+                    edit_format(Format::JsonMcpServers, path, Some(&entry()), true)
+                })
+                .unwrap();
+            }
+            let dir = backup_dir("cursor").unwrap();
+            // A legacy unbound copy stays ambiguous and belongs to neither.
+            let legacy = dir.join("5-mcp.json");
+            std::fs::write(&legacy, original).unwrap();
+            let timestamped = |path: &Path| {
+                recovery_copies("cursor", path)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|f| {
+                        f.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .split_once('-')
+                            .is_some_and(|(stamp, _)| stamp.parse::<u128>().is_ok())
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let (a_copies, b_copies) = (timestamped(&a), timestamped(&b));
+            assert!(!a_copies.is_empty() && !b_copies.is_empty());
+            assert!(a_copies.iter().all(|f| !b_copies.contains(f)));
+            assert!(!a_copies.contains(&legacy) && !b_copies.contains(&legacy));
+            for (copies, path) in [(&a_copies, &a), (&b_copies, &b)] {
+                for file in copies {
+                    assert_eq!(
+                        backup_storage::source_path(file).unwrap().as_deref(),
+                        Some(path.to_string_lossy().as_ref()),
+                        "every new timestamped copy is bound to its config"
+                    );
+                    assert_eq!(read_config_file(file).unwrap(), original);
+                }
+            }
+            disconnect("cursor", &a, Format::JsonMcpServers).unwrap();
+            assert_eq!(std::fs::read_to_string(&a).unwrap(), original);
+            for file in &a_copies {
+                assert!(!file.exists(), "owner cleanup removes {}", file.display());
+            }
+            for file in &b_copies {
+                assert!(file.exists(), "another config kept {}", file.display());
+            }
+            assert!(legacy.exists());
+            disconnect("cursor", &b, Format::JsonMcpServers).unwrap();
+            assert_eq!(std::fs::read_to_string(&b).unwrap(), original);
+            for file in &b_copies {
+                assert!(!file.exists());
+            }
+            assert!(legacy.exists(), "ambiguous legacy history is never claimed");
+        });
     }
     #[test]
     fn legacy_plaintext_upgrade_seals_backups_without_reimport_and_keeps_locked_recovery() {
@@ -1511,8 +1704,13 @@ mod tests {
             assert_eq!(
                 cli,
                 vec![format!(
-                    "{}\n\n{}\n\n{}",
-                    notice.message, notice.instructions, notice.retention
+                    "{}\n\n{}\n\n{}\n\n{}",
+                    notice.message,
+                    notice.instructions,
+                    notice.retention,
+                    crate::i18n::tr(
+                        "To put the saved values back from a terminal:\ntoolport-gateway --disconnect-all"
+                    )
                 )],
                 "CLI and both shell DTOs share exact prose and retention"
             );

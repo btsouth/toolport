@@ -43,10 +43,15 @@ from `toolport-gateway --disconnect-all`, even for an already disconnected clien
 Pending notices survive restarting either shell. **Dismiss** only hides a notice;
 **Show recovery** brings it back. The notice and confirmation show the backup path
 and explain that it does not expire automatically. **Discard these saved values**
-is separate and permanent: its confirmation names the config and saved-value
-names. It removes that config's owned recovery copies and their vaulted payloads,
-without changing the current client config or server credentials. Failed cleanup
-keeps the inventory for another attempt. Malformed or untrusted receipts are
+is separate and permanent: its confirmation lists the saved values and every
+backup file it will delete, including older snapshots and the matching move
+record. The current client config and server credentials do not change; temporary
+text for missing values stays until you replace it yourself. If deletion starts
+but cannot finish, the notice says which material may already be gone and offers
+**Finish discarding** with a fresh list of remaining files. Restoration is blocked
+for that receipt once deletion has started. **Scan clients again** and Ctrl+R
+check saved-value availability without an unlock prompt or changing the client
+config; available values are marked ready for **Retry**. Malformed or untrusted receipts are
 listed separately with a repair reason and cannot authorize unsafe writes or
 deletion. One bad receipt does not hide other recoveries.
 

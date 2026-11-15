@@ -1077,5 +1077,9 @@
   "Copy thread id {id}": "复制线程 ID {id}",
   "Copied thread id": "已复制线程 ID",
   "{client} via T3 Code, thread {thread}": "{client}（通过 T3 Code，线程 {thread}）",
-  "Toolport also adds these settings to its {client} entry, each only if it is not set. A setting you delete stays deleted until you connect again.": "Toolport 还会把这些设置添加到它在 {client} 中的条目，每项仅在未设置时添加。你删除的设置会一直保持删除，直到你重新连接。"
+  "Toolport also adds these settings to its {client} entry, each only if it is not set. A setting you delete stays deleted until you connect again.": "Toolport 还会把这些设置添加到它在 {client} 中的条目，每项仅在未设置时添加。你删除的设置会一直保持删除，直到你重新连接。",
+  "net token change": "Token 净变化",
+  "extra tokens": "额外的 Token",
+  "Toolport measured a net token change of {tokens} across {sessions} client sessions. Full catalog baselines minus all catalog and search responses, counted locally with cl100k_base; not a billing figure. toolport.app": "Toolport 测得，在 {sessions} 个客户端会话中 Token 净变化为 {tokens}。以完整工具目录为基线，减去所有目录和搜索响应，使用 cl100k_base 在本机计数；此数值不代表账单用量。toolport.app",
+  "{baseline} baseline tokens − {catalog} catalog response tokens − {search} search response tokens = {net} net token change. A negative change means responses used more tokens than the baseline.": "{baseline} 个基线 Token − {catalog} 个目录响应 Token − {search} 个搜索响应 Token = Token 净变化 {net}。负值表示响应使用的 Token 多于基线。"
 }

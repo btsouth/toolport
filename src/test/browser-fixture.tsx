@@ -1026,8 +1026,21 @@ mockIPC(
       case "retry_client_recovery":
         return null;
       case "dismiss_client_recovery":
-      case "discard_client_recovery":
+      case "refresh_client_recovery_status":
         return null;
+      case "refresh_client_recovery_notice":
+        return { rows: [], focusId: null, message: null };
+      case "prepare_client_recovery_discard":
+        return {
+          manifest: "fixture-manifest",
+          heading: "Discard these saved values?",
+          description: "Fixture recovery discard.",
+          lines: [],
+          location: "",
+          actionLabel: "Discard these saved values",
+        };
+      case "discard_client_recovery":
+        return "Fixture recovery copies were deleted.";
       case "detect_clients":
         return [
           ...fixtureLocations,

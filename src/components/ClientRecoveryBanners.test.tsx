@@ -1,14 +1,20 @@
 import { beforeEach, expect, it, vi } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { ClientRecoveryBanners } from "./ClientRecoveryBanners";
-import type { ClientRecovery } from "@/lib/api";
+import {
+  CLIENT_RECOVERY_SCAN_EVENT,
+  ClientRecoveryBanners,
+} from "./ClientRecoveryBanners";
+import type { ClientRecovery, DiscardConfirmation } from "@/lib/api";
 
 const api = vi.hoisted(() => ({
   listClientRecoveries: vi.fn(),
   retryClientRecovery: vi.fn(),
   dismissClientRecovery: vi.fn(),
   discardClientRecovery: vi.fn(),
+  prepareClientRecoveryDiscard: vi.fn(),
+  refreshClientRecoveryNotice: vi.fn(),
+  refreshClientRecoveryStatus: vi.fn(),
 }));
 vi.mock("@/lib/api", () => api);
 
@@ -28,6 +34,9 @@ function recovery(overrides: Partial<ClientRecovery> = {}): ClientRecovery {
     discardValues: ["API_KEY for keyring-echo"],
     error: null,
     canDiscard: true,
+    canRetry: true,
+    discardStarted: false,
+    discardAction: "Discard these saved values",
     cleanup: false,
     instructions: "Unlock your keyring, then choose Retry.",
     retention:
@@ -50,12 +59,39 @@ function result(pending: ClientRecovery | null = null) {
   };
 }
 
+const DISCARD_SUCCESS =
+  "Cursor's saved recovery copies were deleted. The current config at /fixture/.cursor/mcp.json was not changed. Any temporary text for missing values is still there; re-enter those values in the client if needed.";
+
+function prepared(overrides: Partial<DiscardConfirmation> = {}): DiscardConfirmation {
+  return {
+    manifest: "manifest-1",
+    heading: "Discard these saved values?",
+    description:
+      "Toolport will permanently delete recovery copies for Cursor. Saved values: 1. Backup files: 2.\n\nThe current client config at /fixture/.cursor/mcp.json will not change. Any temporary text for missing values will stay there; re-enter those values in the client if needed. Toolport's server credentials will not change.",
+    lines: [
+      "Value: API_KEY for keyring-echo",
+      "Backup file: original-1111.json",
+      "Backup file: 1794746461499-mcp.json",
+    ],
+    location: "Recovery files to delete:\n/fixture/backups/cursor",
+    actionLabel: "Discard these saved values",
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   api.listClientRecoveries.mockResolvedValue([recovery()]);
   api.retryClientRecovery.mockResolvedValue(result());
   api.dismissClientRecovery.mockResolvedValue(undefined);
-  api.discardClientRecovery.mockResolvedValue(undefined);
+  api.prepareClientRecoveryDiscard.mockResolvedValue(prepared());
+  api.discardClientRecovery.mockResolvedValue(DISCARD_SUCCESS);
+  api.refreshClientRecoveryNotice.mockResolvedValue({
+    rows: [],
+    focusId: null,
+    message: null,
+  });
+  api.refreshClientRecoveryStatus.mockResolvedValue(undefined);
 });
 
 it("shows one complete selectable inline message, keeping markers in expandable details", async () => {
@@ -206,47 +242,140 @@ it("closes only the retried receipt's details while preserving the other receipt
   expect(notices[1].querySelector("details")).toHaveAttribute("open");
 });
 
-it("requires explicit loss confirmation before discarding and preserves the native config", async () => {
-  render(<ClientRecoveryBanners refreshKey="discard" />);
+it("confirms the exact prepared Discard inventory in one bounded list and sends its manifest", async () => {
+  const onRecovered = vi.fn();
+  render(<ClientRecoveryBanners refreshKey="discard" onRecovered={onRecovered} />);
   await userEvent.click(
     await screen.findByRole("button", { name: "Discard these saved values" }),
   );
-  const dialog = screen.getByRole("dialog");
-  expect(dialog).toHaveTextContent("API_KEY for keyring-echo");
-  expect(dialog).toHaveTextContent("/fixture/.cursor/mcp.json");
-  expect(dialog).toHaveTextContent("current client config");
+  expect(api.prepareClientRecoveryDiscard).toHaveBeenCalledWith("receipt-cursor");
+  const dialog = await screen.findByRole("dialog");
+  expect(dialog).toHaveTextContent("Discard these saved values?");
+  expect(dialog).toHaveTextContent("Saved values: 1. Backup files: 2.");
+  expect(dialog).toHaveTextContent(
+    "Any temporary text for missing values will stay there",
+  );
+  expect(dialog).toHaveTextContent("Recovery files to delete:");
+  expect(dialog).toHaveTextContent("/fixture/backups/cursor");
+  // Discard must never reuse the Dismiss retention promise.
+  expect(dialog).not.toHaveTextContent("It does not expire");
+  expect(dialog).not.toHaveTextContent("until recovery succeeds");
+  const lists = within(dialog).getAllByRole("list");
+  expect(lists).toHaveLength(1);
+  expect(lists[0]).toHaveAccessibleName("Saved values and files to delete");
+  expect(lists[0]).toHaveClass("max-h-[240px]", "overflow-y-auto");
+  expect(
+    within(lists[0])
+      .getAllByRole("listitem")
+      .map((item) => item.textContent),
+  ).toEqual(prepared().lines);
   expect(api.discardClientRecovery).not.toHaveBeenCalled();
+  api.listClientRecoveries.mockResolvedValue([]);
   await userEvent.click(
     within(dialog).getByRole("button", { name: "Discard these saved values" }),
   );
-  expect(api.discardClientRecovery).toHaveBeenCalledWith("receipt-cursor");
-  expect(await screen.findByRole("status")).toHaveTextContent(
-    "current client config was not changed",
-  );
+  expect(api.discardClientRecovery).toHaveBeenCalledWith("receipt-cursor", "manifest-1");
+  const status = await screen.findByText(DISCARD_SUCCESS);
+  expect(status).toHaveAttribute("role", "status");
+  await waitFor(() => expect(status).toHaveFocus());
   expect(screen.queryByRole("region")).not.toBeInTheDocument();
+  expect(onRecovered).toHaveBeenCalledOnce();
 });
-it("shows a failed Discard once on its own banner and retains Retry", async () => {
-  api.discardClientRecovery.mockRejectedValue(
-    "Unlock your credential store, then try Discard again.",
+
+it("cancelling a prepared Discard deletes nothing and returns focus to Discard", async () => {
+  render(<ClientRecoveryBanners refreshKey="discard-cancel" />);
+  await userEvent.click(
+    await screen.findByRole("button", { name: "Discard these saved values" }),
   );
+  const dialog = await screen.findByRole("dialog");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  expect(api.discardClientRecovery).not.toHaveBeenCalled();
+  await waitFor(() =>
+    expect(
+      screen.getByRole("button", { name: "Discard these saved values" }),
+    ).toHaveFocus(),
+  );
+});
+
+it("shows a failed Discard once on its own banner and focuses the refreshed Finish action", async () => {
+  const error =
+    "Discard needs to finish. Some saved copies may already be gone. Choose Finish discarding.";
+  api.discardClientRecovery.mockRejectedValue(error);
   render(<ClientRecoveryBanners refreshKey="discard-error" />);
   await userEvent.click(
     await screen.findByRole("button", { name: "Discard these saved values" }),
   );
+  api.listClientRecoveries.mockResolvedValue([
+    recovery({
+      canRetry: false,
+      discardStarted: true,
+      discardAction: "Finish discarding",
+    }),
+  ]);
   await userEvent.click(
-    within(screen.getByRole("dialog")).getByRole("button", {
+    within(await screen.findByRole("dialog")).getByRole("button", {
       name: "Discard these saved values",
     }),
   );
-  expect(await screen.findByRole("status")).toHaveTextContent(
-    "Unlock your credential store",
-  );
+  expect(await screen.findByText(error)).toHaveAttribute("role", "status");
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-  expect(
-    screen.getAllByText("Unlock your credential store, then try Discard again."),
-  ).toHaveLength(1);
-  expect(screen.getByRole("button", { name: "Retry" })).toHaveFocus();
+  expect(screen.getAllByText(error)).toHaveLength(1);
+  const finish = await screen.findByRole("button", { name: "Finish discarding" });
+  await waitFor(() => expect(finish).toHaveFocus());
+  // A started Discard refuses restoration and cannot be merely dismissed.
+  expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Dismiss" })).not.toBeInTheDocument();
 });
+
+it("Finish discarding prepares a fresh manifest of the remaining files", async () => {
+  api.listClientRecoveries.mockResolvedValue([
+    recovery({
+      canRetry: false,
+      discardStarted: true,
+      discardAction: "Finish discarding",
+    }),
+  ]);
+  api.prepareClientRecoveryDiscard.mockResolvedValue(
+    prepared({
+      manifest: "manifest-remaining",
+      heading: "Finish discarding?",
+      actionLabel: "Finish discarding",
+      lines: ["Backup file: original-1111.json"],
+    }),
+  );
+  render(<ClientRecoveryBanners refreshKey="finish" />);
+  await userEvent.click(await screen.findByRole("button", { name: "Finish discarding" }));
+  const dialog = await screen.findByRole("dialog");
+  expect(dialog).toHaveTextContent("Finish discarding?");
+  expect(within(dialog).getAllByRole("listitem")).toHaveLength(1);
+  await userEvent.click(
+    within(dialog).getByRole("button", { name: "Finish discarding" }),
+  );
+  expect(api.discardClientRecovery).toHaveBeenCalledWith(
+    "receipt-cursor",
+    "manifest-remaining",
+  );
+});
+
+it("a failed Discard preparation keeps the row and focuses its Discard action", async () => {
+  api.prepareClientRecoveryDiscard.mockRejectedValue(
+    "Toolport could not read the recovery folder. Check its permissions, then choose Discard these saved values.",
+  );
+  render(<ClientRecoveryBanners refreshKey="prepare-error" />);
+  const discard = await screen.findByRole("button", {
+    name: "Discard these saved values",
+  });
+  await userEvent.click(discard);
+  expect(await screen.findByText(/could not read the recovery folder/)).toBeVisible();
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(api.discardClientRecovery).not.toHaveBeenCalled();
+  await waitFor(() =>
+    expect(
+      screen.getByRole("button", { name: "Discard these saved values" }),
+    ).toHaveFocus(),
+  );
+});
+
 it("replaces the saved diagnostic with the latest Retry error, matching GTK", async () => {
   api.listClientRecoveries.mockResolvedValue([
     recovery({ error: "Previous config diagnostic" }),
@@ -264,32 +393,100 @@ it("replaces the saved diagnostic with the latest Retry error, matching GTK", as
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
 
-it("keeps good recoveries beside a per-record error and can refresh that row", async () => {
-  const bad = recovery({
+function errorRow(overrides: Partial<ClientRecovery> = {}): ClientRecovery {
+  const description =
+    overrides.description ??
+    "Toolport could not read this recovery file. Check its permissions.";
+  return recovery({
     id: "bad",
-    clientName: "Saved client locations",
-    clientId: "saved-locations",
-    message: "Saved locations need attention.",
-    description: "Repair the saved locations file.",
-    error: "Repair the saved locations file.",
+    clientName: "Devin Desktop (Cascade)",
+    clientId: "windsurf",
+    backupPath: "/fixture/backups/windsurf/original-2222.json",
+    message: `Devin Desktop (Cascade) recovery needs attention.\n\n${description}`,
+    description: "Toolport could not read this recovery file. Check its permissions.",
+    error: "Toolport could not read this recovery file. Check its permissions.",
     canDiscard: false,
     valueLines: [],
     missing: [],
+    ...overrides,
   });
-  api.listClientRecoveries.mockResolvedValue([bad, recovery()]);
+}
+
+it("keeps good recoveries beside a per-record error and refreshes that row through the backend", async () => {
+  api.listClientRecoveries.mockResolvedValue([errorRow(), recovery()]);
   render(<ClientRecoveryBanners refreshKey="bad-row" />);
   const notices = await screen.findAllByRole("region");
   expect(notices).toHaveLength(2);
+  // Untrusted rows cannot be dismissed or discarded; their provenance guard stays.
   expect(
     within(notices[0]).queryByRole("button", { name: "Discard these saved values" }),
   ).not.toBeInTheDocument();
-  api.listClientRecoveries.mockResolvedValue([recovery()]);
+  expect(
+    within(notices[0]).queryByRole("button", { name: "Dismiss" }),
+  ).not.toBeInTheDocument();
+  api.refreshClientRecoveryNotice.mockResolvedValue({
+    rows: [errorRow(), recovery()],
+    focusId: "bad",
+    message: null,
+  });
   await userEvent.click(within(notices[0]).getByRole("button", { name: "Retry" }));
-  expect(await screen.findByRole("region")).toHaveAccessibleName(
-    "Client config recovery: Cursor",
+  expect(api.refreshClientRecoveryNotice).toHaveBeenCalledWith(
+    "bad",
+    "windsurf",
+    "/fixture/backups/windsurf/original-2222.json",
   );
   expect(api.retryClientRecovery).not.toHaveBeenCalled();
+  await waitFor(() =>
+    expect(
+      within(screen.getAllByRole("region")[0]).getByRole("button", { name: "Retry" }),
+    ).toHaveFocus(),
+  );
+  expect(screen.queryByText(/can be read again|refreshed/)).not.toBeInTheDocument();
 });
+
+it("a file error replaced by a folder error focuses the replacement and reports no success", async () => {
+  api.listClientRecoveries.mockResolvedValue([errorRow()]);
+  render(<ClientRecoveryBanners refreshKey="replacement" />);
+  await screen.findByRole("region");
+  const folder = errorRow({
+    id: "folder-windsurf",
+    backupPath: "/fixture/backups/windsurf",
+    description: "Toolport could not read the recovery folder. Check its permissions.",
+    error: "Toolport could not read the recovery folder. Check its permissions.",
+  });
+  api.refreshClientRecoveryNotice.mockResolvedValue({
+    rows: [folder],
+    focusId: "folder-windsurf",
+    message: null,
+  });
+  await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+  const notice = await screen.findByRole("region");
+  expect(notice).toHaveTextContent("could not read the recovery folder");
+  await waitFor(() =>
+    expect(within(notice).getByRole("button", { name: "Retry" })).toHaveFocus(),
+  );
+  expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  expect(document.body.textContent).not.toMatch(/can be read again|refreshed/);
+});
+
+it("a genuinely removed error record gets the neutral backend message, not a read claim", async () => {
+  api.listClientRecoveries.mockResolvedValue([errorRow(), recovery()]);
+  render(<ClientRecoveryBanners refreshKey="removed" />);
+  const notices = await screen.findAllByRole("region");
+  api.refreshClientRecoveryNotice.mockResolvedValue({
+    rows: [recovery()],
+    focusId: null,
+    message: "Devin Desktop (Cascade): recovery listing refreshed.",
+  });
+  await userEvent.click(within(notices[0]).getByRole("button", { name: "Retry" }));
+  const status = await screen.findByText(
+    "Devin Desktop (Cascade): recovery listing refreshed.",
+  );
+  await waitFor(() => expect(status).toHaveFocus());
+  expect(screen.getAllByRole("region")).toHaveLength(1);
+  expect(document.body.textContent).not.toContain("can be read again");
+});
+
 it("reports partial success without removing the remaining recovery", async () => {
   api.retryClientRecovery.mockResolvedValue({
     ...result(recovery()),
@@ -315,32 +512,90 @@ it("does not display an unexpected worker exception or its credential", async ()
     "sk-credential-in-panic-must-stay-private",
   );
 });
-it("keeps one latest success per client in both-client recovery", async () => {
+it("keeps one latest result in total; a new action clears it but not other rows' errors", async () => {
   const claude = recovery({
     id: "claude",
     clientId: "claude-code",
     clientName: "Claude Code",
   });
-  api.listClientRecoveries.mockResolvedValue([recovery(), claude]);
-  api.retryClientRecovery.mockImplementation(async (id: string) =>
-    id === "claude"
+  const codex = recovery({ id: "codex", clientId: "codex", clientName: "Codex" });
+  api.listClientRecoveries.mockResolvedValue([recovery(), claude, codex]);
+  api.retryClientRecovery.mockImplementation(async (id: string) => {
+    if (id === "codex") throw "Codex Retry diagnostic";
+    return id === "claude"
       ? {
           ...result(),
           id,
           clientId: "claude-code",
           clientName: "Claude Code",
-          message: "Claude Code restored 1 saved value.",
+          message: "Claude Code: values put back: 1.",
         }
-      : result(),
-  );
+      : result();
+  });
   render(<ClientRecoveryBanners refreshKey="two-successes" />);
-  const notices = await screen.findAllByRole("region");
-  await userEvent.click(within(notices[0]).getByRole("button", { name: "Retry" }));
+  const codexNotice = (await screen.findAllByRole("region"))[2];
+  await userEvent.click(within(codexNotice).getByRole("button", { name: "Retry" }));
+  expect(await screen.findByText("Codex Retry diagnostic")).toBeVisible();
   await userEvent.click(
-    within(screen.getByRole("region")).getByRole("button", { name: "Retry" }),
+    within(screen.getAllByRole("region")[0]).getByRole("button", { name: "Retry" }),
   );
-  expect(await screen.findAllByRole("status")).toHaveLength(2);
-  expect(screen.queryByRole("region")).not.toBeInTheDocument();
+  expect(
+    await screen.findByText(
+      "Cursor: saved values restored: 1; already resolved or removed: 0; still missing: 0.",
+    ),
+  ).toBeVisible();
+  await userEvent.click(
+    within(screen.getAllByRole("region")[0]).getByRole("button", { name: "Retry" }),
+  );
+  expect(await screen.findByText("Claude Code: values put back: 1.")).toBeVisible();
+  expect(screen.queryByText(/Cursor: saved values restored/)).not.toBeInTheDocument();
+  expect(document.querySelectorAll('[data-recovery-focus="result"]')).toHaveLength(1);
+  // The other pending row keeps its own error feedback.
+  expect(screen.getByText("Codex Retry diagnostic")).toBeVisible();
+  expect(screen.getAllByRole("region")).toHaveLength(1);
+});
+
+it("shows a working status with a spinner in the active row and disables every row's actions", async () => {
+  let finish!: (value: ReturnType<typeof result>) => void;
+  api.retryClientRecovery.mockReturnValue(
+    new Promise((resolve) => {
+      finish = resolve;
+    }),
+  );
+  api.listClientRecoveries.mockResolvedValue([
+    recovery(),
+    recovery({ id: "claude", clientId: "claude-code", clientName: "Claude Code" }),
+  ]);
+  render(<ClientRecoveryBanners refreshKey="busy" />);
+  const [cursor, claude] = await screen.findAllByRole("region");
+  await userEvent.click(within(cursor).getByRole("button", { name: "Retry" }));
+  expect(await within(cursor).findByText("Working on this recovery…")).toBeVisible();
+  expect(cursor).toHaveAttribute("aria-busy", "true");
+  expect(within(claude).queryByText("Working on this recovery…")).not.toBeInTheDocument();
+  for (const button of screen.getAllByRole("button").filter((b) => b.closest("section")))
+    expect(button).toBeDisabled();
+  await act(async () => finish(result(recovery())));
+  expect(screen.queryByText("Working on this recovery…")).not.toBeInTheDocument();
+  expect(within(cursor).getByRole("button", { name: "Retry" })).toBeEnabled();
+});
+
+it("an explicit Scan checks saved values, then relists without moving focus", async () => {
+  api.listClientRecoveries.mockResolvedValue([recovery()]);
+  render(<ClientRecoveryBanners refreshKey="scan" />);
+  const retry = await screen.findByRole("button", { name: "Retry" });
+  retry.focus();
+  api.listClientRecoveries.mockResolvedValue([
+    recovery({
+      valueLines: ["API_KEY for keyring-echo: ready to put back"],
+      instructions: "Choose Retry to put these values back in the client config.",
+    }),
+  ]);
+  await act(async () => {
+    window.dispatchEvent(new Event(CLIENT_RECOVERY_SCAN_EVENT));
+  });
+  expect(api.refreshClientRecoveryStatus).toHaveBeenCalledOnce();
+  expect(await screen.findByText(/ready to put back/)).toBeVisible();
+  expect(screen.getByRole("button", { name: "Retry" })).toHaveFocus();
 });
 
 it("shows a failed Show recovery action on the dismissed card and restores focus", async () => {

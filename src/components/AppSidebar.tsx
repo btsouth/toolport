@@ -683,10 +683,11 @@ export function AppSidebar({
           >
             <Zap className="size-3.5 shrink-0 text-success" />
             <span className="text-muted-foreground">
+              {/* A negative net saving is overhead: show its size as extra tokens. */}
               <span className="font-semibold text-foreground">
-                {fmtTokens(savings.tokensSaved)}
+                {fmtTokens(Math.abs(savings.tokensSaved))}
               </span>{" "}
-              {t("tokens saved")}
+              {savings.tokensSaved < 0 ? t("extra tokens") : t("tokens saved")}
               {savingsStale ? t(" (stale)") : ""}
             </span>
           </button>

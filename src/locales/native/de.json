@@ -1186,5 +1186,10 @@
   "in Toolport": "in Toolport",
   "Pinned": "Angeheftet",
   "Renamed": "Umbenannt",
-  "Read-only": "Nur lesen"
+  "Read-only": "Nur lesen",
+  "Imported {value0} server. Check its status under Servers.": "{value0} Server importiert. Überprüfen Sie seinen Status unter Server.",
+  "Imported {value0} server. Needs input: {value1}": "{value0} Server importiert. Eingabe erforderlich: {value1}",
+  "\n{value0} baseline tokens − {value1} catalog response tokens − {value2} search response tokens = {value3} net token change. A negative change means responses used more tokens than the baseline.\n{value4} client sessions; {value5} catalog responses; {value6} search responses.\n{value7} baseline catalog text; {value8} catalog text sent; {value9} search text sent.": "\n{value0} Baseline-Token − {value1} Token aus Katalogantworten − {value2} Token aus Suchantworten = Netto-Token-Änderung von {value3}. Eine negative Änderung bedeutet, dass die Antworten mehr Token als die Baseline verbraucht haben.\n{value4} Client-Sitzungen; {value5} Katalogantworten; {value6} Suchantworten.\n{value7} Baseline-Katalogtext; {value8} gesendeter Katalogtext; {value9} gesendeter Suchtext.",
+  "{value0} extra tokens": "{value0} zusätzliche Token",
+  "Toolport recorded a net token change of -{value1}. Full catalog baselines minus all catalog and search responses; counted locally with cl100k_base, not a billing figure. toolport.app": "Toolport hat eine Netto-Token-Änderung von -{value1} erfasst. Vollständige Katalog-Baselines abzüglich aller Katalog- und Suchantworten; lokal mit cl100k_base gezählt, keine Abrechnungszahl. toolport.app"
 }

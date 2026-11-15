@@ -15,6 +15,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { ClientRecoveryBanners } from "@/components/ClientRecoveryBanners";
+import { requestClientRecoveryScan } from "@/lib/clientRecoveryEvents";
 import { ClientLogo } from "@/components/ClientLogo";
 import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/ui/empty-state";
@@ -441,6 +442,7 @@ export function ClientsView({
     setSessionRetry((value) => value + 1);
     setRefreshing(true);
     try {
+      await requestClientRecoveryScan();
       await onChanged?.();
     } finally {
       setRefreshing(false);

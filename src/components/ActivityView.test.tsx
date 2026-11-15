@@ -786,8 +786,12 @@ it("keeps contradictory pre-session history outside all measured totals", async 
   render(<ActivityView refreshKey={0} registry={null} />);
   await act(async () => {});
   expect(screen.getByText(/100 baseline tokens/)).toHaveTextContent(
-    "100 baseline tokens − 50 catalog response tokens − 60 search response tokens = -10 net tokens saved.",
+    "100 baseline tokens − 50 catalog response tokens − 60 search response tokens = -10 net token change. A negative change means responses used more tokens than the baseline.",
   );
+  expect(screen.getByText(/-10/, { selector: "span.text-3xl" })).toHaveTextContent(
+    "-10 net token change",
+  );
+  expect(screen.queryByText("net tokens saved")).not.toBeInTheDocument();
   expect(screen.getByText(/1 client sessions/)).toHaveTextContent("2 catalog responses");
   expect(screen.getByText(/1.2 KB baseline catalog text/)).toHaveTextContent(
     "2.4 KB catalog text sent",
@@ -819,6 +823,28 @@ it("shows preserved history without a shareable savings headline", async () => {
   expect(screen.getByText(/Old estimate:/)).toBeVisible();
   expect(screen.getByText(/Old estimate:/)).toHaveTextContent("195,640,064 tokens");
   expect(screen.queryByRole("button", { name: "Share" })).not.toBeInTheDocument();
+});
+
+it("labels zero measured savings as savings, not as a change", async () => {
+  getSavingsSummary.mockResolvedValue({
+    tokensSaved: 0,
+    fullTokens: 50,
+    exposedTokens: 40,
+    discoveryTokens: 10,
+    tokenizedLoads: 1,
+    listLoads: 1,
+    peakCatalog: 1,
+    sinceTs: 1,
+  });
+  render(<ActivityView refreshKey={0} registry={null} />);
+  await act(async () => {});
+  expect(screen.getByText(/^0/, { selector: "span.text-3xl" })).toHaveTextContent(
+    "0 net tokens saved",
+  );
+  expect(screen.getByText(/50 baseline tokens/)).toHaveTextContent(
+    "= 0 net tokens saved.",
+  );
+  expect(screen.queryByText(/net token change/)).not.toBeInTheDocument();
 });
 
 it("preserves a negative old estimate separately from new measured savings", async () => {
@@ -862,8 +888,9 @@ it("shares a token savings statement without a billing claim", async () => {
   await act(async () => {});
   await user.click(screen.getByRole("button", { name: "Share" }));
   expect(writeText).toHaveBeenCalledWith(
-    expect.stringContaining("-123 net tokens saved"),
+    expect.stringContaining("a net token change of -123 across 1 client sessions"),
   );
+  expect(writeText.mock.calls[0][0]).not.toContain("tokens saved");
   expect(writeText.mock.calls[0][0]).toContain("not a billing figure");
   expect(writeText.mock.calls[0][0]).toContain("cl100k_base");
   expect(writeText.mock.calls[0][0]).not.toMatch(

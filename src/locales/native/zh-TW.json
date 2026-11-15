@@ -1186,5 +1186,10 @@
   "in Toolport": "已在 Toolport 中",
   "Pinned": "已釘選",
   "Renamed": "已重新命名",
-  "Read-only": "唯讀"
+  "Read-only": "唯讀",
+  "Imported {value0} server. Check its status under Servers.": "已匯入 {value0} 個伺服器。可在“伺服器”中檢視其狀態。",
+  "Imported {value0} server. Needs input: {value1}": "已匯入 {value0} 個伺服器。需要填寫：{value1}",
+  "\n{value0} baseline tokens − {value1} catalog response tokens − {value2} search response tokens = {value3} net token change. A negative change means responses used more tokens than the baseline.\n{value4} client sessions; {value5} catalog responses; {value6} search responses.\n{value7} baseline catalog text; {value8} catalog text sent; {value9} search text sent.": "\n{value0} 個基線 Token − {value1} 個目錄響應 Token − {value2} 個搜尋響應 Token = Token 淨變化 {value3}。負值表示響應使用的 Token 多於基線。\n{value4} 個用戶端會話；{value5} 次目錄響應；{value6} 次搜尋響應。\n{value7} 基線目錄文本；{value8} 已傳送的目錄文本；{value9} 已傳送的搜尋文本。",
+  "{value0} extra tokens": "額外 {value0} 個 Token",
+  "Toolport recorded a net token change of -{value1}. Full catalog baselines minus all catalog and search responses; counted locally with cl100k_base, not a billing figure. toolport.app": "Toolport 記錄的 Token 淨變化為 -{value1}。以完整工具目錄為基線，減去所有目錄和搜尋響應；使用 cl100k_base 在本機計數，不代表賬單用量。toolport.app"
 }

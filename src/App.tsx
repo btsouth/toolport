@@ -6,6 +6,7 @@ import { serverPostureCopy } from "@/lib/serverPosture";
 import { type SettingsSubpage } from "@/lib/settingsPages";
 import { visibleExecutionText } from "@/lib/visibleExecutionText";
 import { isPersonalSync } from "@/lib/personalSync";
+import { requestClientRecoveryScan } from "@/lib/clientRecoveryEvents";
 import {
   lazy,
   Suspense,
@@ -176,6 +177,8 @@ function App() {
   const [query, setQuery] = useState("");
   const [headerActionsSlot, setHeaderActionsSlot] = useState<HTMLElement | null>(null);
   const [addingLocation, setAddingLocation] = useState(false);
+  const [checkingClientRecoveries, setCheckingClientRecoveries] = useState(false);
+  const clientScanPending = useRef(false);
   // Keyboard shortcuts (SBS-143). The app had none, which for a developer tool means
   // every interaction is mouse-only.
   const searchRef = useRef<HTMLInputElement>(null);
@@ -420,6 +423,34 @@ function App() {
     load();
   }, [load]);
 
+  const manualRefresh = useCallback(async () => {
+    if (viewRef.current !== "clients") return load(true);
+    if (clientScanPending.current) return;
+    clientScanPending.current = true;
+    setCheckingClientRecoveries(true);
+    const focused = document.activeElement as HTMLElement | null;
+    try {
+      await Promise.all([requestClientRecoveryScan(), load(false)]);
+    } catch (cause: unknown) {
+      toastError(
+        typeof cause === "string"
+          ? cause
+          : translate(
+              "Recovery did not finish reporting its result. Choose Retry to check the current status.",
+            ),
+      );
+    } finally {
+      clientScanPending.current = false;
+      setCheckingClientRecoveries(false);
+      // Preserve a keyboard refresh trigger; never steal focus the user moved.
+      requestAnimationFrame(() => {
+        if (document.activeElement !== document.body) return;
+        if (focused?.isConnected) focused.focus();
+        else document.querySelector<HTMLButtonElement>("[data-client-refresh]")?.focus();
+      });
+    }
+  }, [load]);
+
   useEffect(() => {
     if (view !== "clients") return;
     let active = true;
@@ -652,7 +683,7 @@ function App() {
           e.preventDefault();
           if (viewRef.current === "skills")
             window.dispatchEvent(new Event(SKILLS_REFRESH_EVENT));
-          else void load(true);
+          else void manualRefresh();
           break;
         case "help":
           e.preventDefault();
@@ -667,7 +698,7 @@ function App() {
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [load]);
+  }, [load, manualRefresh]);
 
   const profileId = registry
     ? (registry.defaultAccessProfileId ?? registry.profiles[0]?.id)
@@ -1158,16 +1189,17 @@ function App() {
                     variant="ghost"
                     size="icon"
                     aria-label={t("Refresh")}
+                    data-client-refresh={view === "clients" ? "" : undefined}
                     title={
                       isMac
                         ? t("Reload servers, clients, and health (⌘R)")
                         : t("Reload servers, clients, and health (CtrlR)")
                     }
-                    onClick={() => load(true)}
-                    disabled={loading}
+                    onClick={() => void manualRefresh()}
+                    disabled={loading || checkingClientRecoveries}
                   >
                     <RefreshCw
-                      className={`size-4 ${String(loading || probing ? "animate-spin" : "")}`}
+                      className={`size-4 ${String(loading || probing || checkingClientRecoveries ? "animate-spin" : "")}`}
                     />
                   </Button>
                 )}

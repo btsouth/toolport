@@ -510,8 +510,9 @@ fn build_window(
     }
     {
         // Ctrl+F searches the Skills page when it is open, and the servers list elsewhere;
-        // Ctrl+R scans skills again, as in the React app, and rechecks servers on
-        // the Servers page, as its refresh button's tooltip says.
+        // Ctrl+R scans skills again, as in the React app, rechecks servers on
+        // the Servers page, as its refresh button's tooltip says, and runs the
+        // explicit Clients scan (including saved recovery values) on Clients.
         let find = gtk::gio::SimpleAction::new("find", None);
         let (stack_ref, skills, app_ref) = (stack.clone(), skills_page.clone(), app.clone());
         find.connect_activate(move |_, _| {
@@ -525,12 +526,17 @@ fn build_window(
         app.set_accels_for_action("app.search-servers", &[]);
         app.set_accels_for_action("app.find", &["<Primary>f"]);
         let refresh = gtk::gio::SimpleAction::new("refresh-page", None);
-        let (stack_ref, skills, servers) =
-            (stack.clone(), skills_page.clone(), server_page.clone());
+        let (stack_ref, skills, servers, clients) = (
+            stack.clone(),
+            skills_page.clone(),
+            server_page.clone(),
+            client_page.clone(),
+        );
         refresh.connect_activate(
             move |_, _| match stack_ref.visible_child_name().as_deref() {
                 Some("skills") => skills.refresh(),
                 Some("servers") => servers.probe_servers(health::ProbeReason::Refresh),
+                Some("clients") => clients.scan(),
                 _ => {}
             },
         );
@@ -1341,13 +1347,10 @@ fn install_sidebar_footer(root: &gtk::Box, nav: &gtk::Box, page: &ServerPage) {
                     Ok(Ok(summary)) => {
                         let loads = summary["tokenizedLoads"].as_u64().unwrap_or(0);
                         let tokens = summary["tokensSaved"].as_i64().unwrap_or(0);
-                        let text = format_saved_tokens(tokens);
                         let Some(label) = label.upgrade() else {
                             return;
                         };
-                        l10n::bind_label_with(&label, move || {
-                            crate::i18n::trf("{value0} tokens saved", &[("value0", &text)])
-                        });
+                        l10n::bind_label_with(&label, move || sidebar_savings_text(tokens));
                         button.set_visible(loads > 0);
                     }
                     _ => button.set_visible(false),
@@ -2647,9 +2650,14 @@ struct ClientPage {
     recoveries: std::rc::Rc<std::cell::RefCell<Vec<crate::clients::recovery::ClientRecovery>>>,
     recovery_feedback: std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>,
     recovery_busy: std::rc::Rc<std::cell::Cell<bool>>,
+    /// The record whose action is running; it shows the working status.
+    recovery_active: std::rc::Rc<std::cell::RefCell<Option<String>>>,
     recovery_expanded: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
-    recovery_success: std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>,
+    /// One latest recovery result for the whole shell; a new action replaces it.
+    recovery_success: std::rc::Rc<std::cell::RefCell<Option<client_recovery::RecoveryResult>>>,
     recovery_box: gtk::Box,
+    /// Widget name focused before a scan, restored after the list is rebuilt.
+    restore_focus: std::rc::Rc<std::cell::RefCell<Option<String>>>,
     credential_page: ServerPage,
     app: adw::Application,
     root: gtk::Box,
@@ -2681,6 +2689,7 @@ impl ClientPage {
         );
         let refresh_button = header_icon_button("view-refresh-symbolic");
         l10n::bind_tooltip(&refresh_button, "Scan clients again");
+        refresh_button.set_widget_name("clients-refresh");
         let add_location =
             header_button("list-add-symbolic", crate::i18n::msg("Add client location"));
         l10n::bind_tooltip(&add_location, "Toolport reads each client's local MCP configuration. Existing Toolport entries in extra locations are adopted with a backup.");
@@ -2716,6 +2725,10 @@ impl ClientPage {
         let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
         page.append(&list);
         scroller.set_child(Some(&page));
+        // Programmatic focus after a rebuild or dialog must bring its target into view.
+        if let Some(viewport) = scroller.child().and_downcast::<gtk::Viewport>() {
+            viewport.set_scroll_to_focus(true);
+        }
         root.append(&scroller);
 
         let details = details::DetailHost::default();
@@ -2727,9 +2740,11 @@ impl ClientPage {
             recoveries: Default::default(),
             recovery_feedback: Default::default(),
             recovery_busy: Default::default(),
+            recovery_active: Default::default(),
             recovery_expanded: Default::default(),
             recovery_success: Default::default(),
             recovery_box,
+            restore_focus: Default::default(),
             credential_page,
             app: app.clone(),
             root,
@@ -2751,7 +2766,7 @@ impl ClientPage {
         let page_for_refresh = client_page.clone();
         client_page
             .refresh_button
-            .connect_clicked(move |_| page_for_refresh.refresh());
+            .connect_clicked(move |_| page_for_refresh.scan());
         let page_for_import = client_page.clone();
         client_page
             .import_button
@@ -2929,16 +2944,43 @@ impl ClientPage {
         setup::review(&parent, &crate::i18n::tr("Review servers to import"), items,
             &crate::i18n::tr("Review each command and URL. Values are saved using your keychain choices. Missing inputs stay off."),
             crate::i18n::msg("Import selected servers"), false, move |selected, choices, inputs| {
+                // Servers this Import adds; older disabled imports are not this result.
+                let previous = crate::registry::load()
+                    .map(|registry| registry.servers.iter().map(|server| server.id.clone()).collect())
+                    .unwrap_or_default();
                 let (registry, added) = crate::registry_controller::import_client_servers_inputs(selected, &choices, &inputs)?;
-                let missing = registry.servers.iter().filter(|server| !server.enabled && server.source.as_deref().is_some_and(|source| source.starts_with("imported:"))).map(|server| server.name.clone()).collect::<Vec<_>>();
-                let message = if missing.is_empty() { crate::i18n::trf("Imported {value0} servers. Check their status under Servers.", &[("value0", &format!("{}", added))]) } else { crate::i18n::trf("Imported {value0} servers. Needs input: {value1}", &[("value0", &format!("{}", added)), ("value1", &missing.join(", ").to_string())]) };
-                Ok(message.into())
+                Ok(import_result_message(&registry, added, &previous).into())
             }, move || page.refresh(), Some(self.credential_page.clone()));
     }
 
     fn refresh(&self) {
+        self.refresh_with(false);
+    }
+
+    /// The explicit scan (refresh button, Ctrl+R): also checks saved recovery
+    /// values without prompting, then keeps keyboard focus where it was.
+    fn scan(&self) {
+        self.refresh_with(true);
+    }
+
+    fn refresh_with(&self, probe: bool) {
         if self.scanning.replace(true) {
             return;
+        }
+        // A running recovery action already holds the recovery locks; scan the
+        // clients now and leave the saved-value check for the next explicit scan.
+        let probe = probe && !self.recovery_busy.get();
+        if probe {
+            // Disabling the refresh button drops its focus; put focus back after
+            // the rebuild instead of leaving it at the window (the next Tab
+            // would otherwise jump to the sidebar).
+            *self.restore_focus.borrow_mut() = self
+                .root
+                .root()
+                .and_then(|root| root.focus())
+                .filter(|widget| widget.is_ancestor(&self.root))
+                .map(|widget| widget.widget_name().to_string())
+                .filter(|name| name.starts_with("client"));
         }
         self.refresh_button.set_sensitive(false);
         self.import_button.set_sensitive(false);
@@ -2948,12 +2990,27 @@ impl ClientPage {
         }
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
+            let status = if probe {
+                gtk::gio::spawn_blocking(crate::clients::recovery::refresh_status)
+                    .await
+                    .unwrap_or_else(|_| Err(crate::clients::recovery::worker_error()))
+            } else {
+                Ok(())
+            };
             let result = gtk::gio::spawn_blocking(state::detect_client_views).await;
             page.scanning.set(false);
             page.refresh_button.set_sensitive(true);
             page.import_button.set_sensitive(true);
             match result {
-                Ok(Ok(snapshot)) => page.render(snapshot),
+                Ok(Ok(snapshot)) => {
+                    page.render(snapshot);
+                    if let Err(error) = status {
+                        page.show_error(&error);
+                    }
+                    if let Some(name) = page.restore_focus.borrow_mut().take() {
+                        client_recovery::focus_first_later(&page.root, vec![name]);
+                    }
+                }
                 Ok(Err(error)) => page.show_scan_error(
                     &crate::i18n::trf(
                         "Could not scan clients: {value0}",
@@ -3289,7 +3346,7 @@ impl ClientPage {
     }
 
     fn refresh_with_confirmation(&self, message: String) {
-        self.recovery_success.borrow_mut().clear();
+        self.recovery_success.borrow_mut().take();
         if let Some(id) = self.details.selected.borrow().clone() {
             *self.detail_notice.borrow_mut() = Some((id, message.clone()));
         }
@@ -3544,6 +3601,47 @@ fn toolport_menu_choice_button(label: &'static str, selected: bool) -> gtk::Butt
         .child(&content)
         .css_classes(["flat", "toolport-menu-item"])
         .build()
+}
+
+/// Result text for one Import: singular/plural count, and "Needs input" only
+/// for servers this Import added (ids absent from `previous`).
+fn import_result_message(
+    registry: &crate::registry::Registry,
+    added: usize,
+    previous: &std::collections::HashSet<String>,
+) -> String {
+    let missing = registry
+        .servers
+        .iter()
+        .filter(|server| {
+            !server.enabled
+                && !previous.contains(&server.id)
+                && server
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| source.starts_with("imported:"))
+        })
+        .map(|server| server.name.clone())
+        .collect::<Vec<_>>();
+    let count = added.to_string();
+    match (missing.is_empty(), added == 1) {
+        (true, true) => crate::i18n::trf(
+            "Imported {value0} server. Check its status under Servers.",
+            &[("value0", &count)],
+        ),
+        (true, false) => crate::i18n::trf(
+            "Imported {value0} servers. Check their status under Servers.",
+            &[("value0", &count)],
+        ),
+        (false, true) => crate::i18n::trf(
+            "Imported {value0} server. Needs input: {value1}",
+            &[("value0", &count), ("value1", &missing.join(", "))],
+        ),
+        (false, false) => crate::i18n::trf(
+            "Imported {value0} servers. Needs input: {value1}",
+            &[("value0", &count), ("value1", &missing.join(", "))],
+        ),
+    }
 }
 
 fn wrapping_actions() -> gtk::FlowBox {
@@ -5341,7 +5439,44 @@ impl ActivityPage {
             .set_label(old.as_deref().unwrap_or(""));
         let mut detail = crate::i18n::tr("The baseline is the full-mode tools array for the same allowed servers and policies at the first tools/list in each session. We count compact JSON and search response text with cl100k_base, then subtract every tools/list and search response. Sessionless HTTP, initial catalogs above known client limits, and older records are excluded. Client caching and formatting may change model usage; this is not a billing figure.");
         if has_catalog || discovered {
-            detail.push_str(&crate::i18n::trf("\n{value0} baseline tokens − {value1} catalog response tokens − {value2} search response tokens = {value3} net tokens saved.\n{value4} client sessions; {value5} catalog responses; {value6} search responses.\n{value7} baseline catalog text; {value8} catalog text sent; {value9} search text sent.", &[("value0", &grouped_number(snapshot.savings_full_tokens).to_string()), ("value1", &grouped_number(snapshot.savings_exposed_tokens).to_string()), ("value2", &grouped_number(snapshot.savings_discovery_tokens).to_string()), ("value3", &format!("{}", snapshot.tokens_saved)), ("value4", &format!("{}", snapshot.savings_tokenized_loads)), ("value5", &format!("{}", snapshot.savings_list_loads)), ("value6", &format!("{}", snapshot.savings_discovery_count)), ("value7", &format_byte_count(snapshot.savings_full_bytes).to_string()), ("value8", &format_byte_count(snapshot.savings_exposed_bytes).to_string()), ("value9", &format_byte_count(snapshot.savings_discovery_bytes).to_string())]));
+            let formula = if snapshot.tokens_saved < 0 {
+                crate::i18n::msg("\n{value0} baseline tokens − {value1} catalog response tokens − {value2} search response tokens = {value3} net token change. A negative change means responses used more tokens than the baseline.\n{value4} client sessions; {value5} catalog responses; {value6} search responses.\n{value7} baseline catalog text; {value8} catalog text sent; {value9} search text sent.")
+            } else {
+                crate::i18n::msg("\n{value0} baseline tokens − {value1} catalog response tokens − {value2} search response tokens = {value3} net tokens saved.\n{value4} client sessions; {value5} catalog responses; {value6} search responses.\n{value7} baseline catalog text; {value8} catalog text sent; {value9} search text sent.")
+            };
+            detail.push_str(&crate::i18n::format_message(
+                formula,
+                &[
+                    (
+                        "value0",
+                        &grouped_number(snapshot.savings_full_tokens).to_string(),
+                    ),
+                    (
+                        "value1",
+                        &grouped_number(snapshot.savings_exposed_tokens).to_string(),
+                    ),
+                    (
+                        "value2",
+                        &grouped_number(snapshot.savings_discovery_tokens).to_string(),
+                    ),
+                    ("value3", &format!("{}", snapshot.tokens_saved)),
+                    ("value4", &format!("{}", snapshot.savings_tokenized_loads)),
+                    ("value5", &format!("{}", snapshot.savings_list_loads)),
+                    ("value6", &format!("{}", snapshot.savings_discovery_count)),
+                    (
+                        "value7",
+                        &format_byte_count(snapshot.savings_full_bytes).to_string(),
+                    ),
+                    (
+                        "value8",
+                        &format_byte_count(snapshot.savings_exposed_bytes).to_string(),
+                    ),
+                    (
+                        "value9",
+                        &format_byte_count(snapshot.savings_discovery_bytes).to_string(),
+                    ),
+                ],
+            ));
         }
         if snapshot.savings_historical_loads > 0 {
             detail.push_str(&crate::i18n::trf("\nExcluded history: {value0} catalog records ({value1} with byte measurements). Session identity and repeat loads cannot be verified.", &[("value0", &grouped_number(snapshot.savings_historical_loads).to_string()), ("value1", &grouped_number(snapshot.savings_historical_measured).to_string())]));
@@ -6624,6 +6759,17 @@ fn format_saved_tokens(tokens_saved: i64) -> String {
     )
 }
 
+/// A negative net saving is overhead. The sidebar shows its absolute size as
+/// extra tokens, never "-256 tokens saved". Activity keeps the signed figure.
+fn sidebar_savings_text(tokens_saved: i64) -> String {
+    let value = state::format_token_count(tokens_saved.unsigned_abs());
+    if tokens_saved < 0 {
+        crate::i18n::trf("{value0} extra tokens", &[("value0", &value)])
+    } else {
+        crate::i18n::trf("{value0} tokens saved", &[("value0", &value)])
+    }
+}
+
 fn savings_old_estimate_display(tokens: i64) -> Option<String> {
     (tokens != 0).then(|| {
         let sign = if tokens < 0 { "-" } else { "" };
@@ -6644,7 +6790,11 @@ fn savings_primary_display(
     }
     (
         format_saved_tokens(tokens_saved),
-        crate::i18n::msg("net tokens saved"),
+        if tokens_saved < 0 {
+            crate::i18n::msg("net token change")
+        } else {
+            crate::i18n::msg("net tokens saved")
+        },
     )
 }
 
@@ -6654,7 +6804,7 @@ fn savings_share_line(tokens_saved: i64, loads: u64, searches: u64, bytes: u64) 
     }
     crate::i18n::trf(
         if tokens_saved < 0 {
-            crate::i18n::msg("Toolport recorded -{value1} net tokens saved. Full catalog baselines minus all catalog and search responses; counted locally with cl100k_base, not a billing figure. toolport.app")
+            crate::i18n::msg("Toolport recorded a net token change of -{value1}. Full catalog baselines minus all catalog and search responses; counted locally with cl100k_base, not a billing figure. toolport.app")
         } else {
             crate::i18n::msg("Toolport recorded {value1} net tokens saved. Full catalog baselines minus all catalog and search responses; counted locally with cl100k_base, not a billing figure. toolport.app")
         },
@@ -15869,11 +16019,55 @@ mod tests {
     }
 
     #[test]
+    fn import_result_counts_and_names_only_this_imports_missing_inputs() {
+        let server = |id: &str, enabled: bool| -> crate::registry::ServerEntry {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "name": id, "transport": "stdio", "command": "fixture",
+                "env": [], "enabled": enabled, "source": "imported:codex"
+            }))
+            .unwrap()
+        };
+        let mut registry = crate::registry::Registry::default();
+        registry.servers.push(server("keyring-many", false));
+        registry.servers.push(server("firstuser-added", true));
+        let previous = std::collections::HashSet::from(["keyring-many".to_string()]);
+        // An older disabled import is not part of this Import's result.
+        assert_eq!(
+            import_result_message(&registry, 1, &previous),
+            "Imported 1 server. Check its status under Servers."
+        );
+        registry.servers.push(server("new-needs-input", false));
+        assert_eq!(
+            import_result_message(&registry, 2, &previous),
+            "Imported 2 servers. Needs input: new-needs-input"
+        );
+        assert_eq!(
+            import_result_message(&registry, 1, &previous),
+            "Imported 1 server. Needs input: new-needs-input"
+        );
+        registry.servers.pop();
+        assert_eq!(
+            import_result_message(&registry, 3, &previous),
+            "Imported 3 servers. Check their status under Servers."
+        );
+    }
+
+    #[test]
     fn savings_detail_and_share_describe_net_tokenized_exposure() {
+        // Activity keeps the signed figure but never calls a negative result savings.
         assert_eq!(
             savings_primary_display(-123, 1, 0),
-            ("-123".into(), "net tokens saved")
+            ("-123".into(), "net token change")
         );
+        assert_eq!(
+            savings_primary_display(0, 1, 0),
+            ("0".into(), "net tokens saved")
+        );
+        assert_eq!(sidebar_savings_text(-256), "256 extra tokens");
+        assert_eq!(sidebar_savings_text(-12_340), "12.3k extra tokens");
+        assert_eq!(sidebar_savings_text(0), "0 tokens saved");
+        assert_eq!(sidebar_savings_text(41_100), "41.1k tokens saved");
+        assert!(!sidebar_savings_text(i64::MIN).contains('-'));
         assert!(!savings_banner_visible(0, 0));
         assert!(
             savings_banner_visible(0, 1),
@@ -15903,6 +16097,10 @@ mod tests {
         assert_eq!(
             savings_share_line(41_100, 12, 0, 0),
             "Toolport recorded 41.1k net tokens saved. Full catalog baselines minus all catalog and search responses; counted locally with cl100k_base, not a billing figure. toolport.app"
+        );
+        assert_eq!(
+            savings_share_line(-123, 1, 0, 0),
+            "Toolport recorded a net token change of -123. Full catalog baselines minus all catalog and search responses; counted locally with cl100k_base, not a billing figure. toolport.app"
         );
         assert_eq!(savings_share_line(0, 0, 3, 12_340), "Toolport recorded 3 discovery searches returning 12.3 KB of text at its MCP boundary. toolport.app");
     }

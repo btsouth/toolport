@@ -1539,6 +1539,10 @@ button.toolport-skill-chip:hover {{ background-color: alpha(@toolport_fg, 0.13);
   color: @toolport_fg;
 }}
 .toolport-feedback .heading {{ color: @toolport_fg; }}
+.toolport-recovery-values {{ border-radius: 6px; }}
+.toolport-recovery-values:focus-within {{ outline: 2px solid alpha(@toolport_accent, 0.50); outline-offset: 2px; }}
+.toolport-recovery-values textview,
+.toolport-recovery-values textview text {{ background-color: transparent; color: @toolport_fg; }}
 .toolport-feedback + .toolport-feedback {{
   border-top: 1px solid @toolport_border;
 }}

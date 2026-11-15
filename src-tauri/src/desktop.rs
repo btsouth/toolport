@@ -629,13 +629,44 @@ async fn retry_client_recovery(id: String) -> Result<clients::recovery::Recovery
     .map_err(|_| clients::recovery::worker_error())?
 }
 #[tauri::command]
-async fn discard_client_recovery(id: String) -> Result<(), String> {
+async fn prepare_client_recovery_discard(
+    id: String,
+) -> Result<clients::recovery::DiscardConfirmation, String> {
+    let worker_id = id.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        clients::recovery::discard(&id)
-            .map_err(|error| clients::recovery::safe_action_error(&id, &error))
+        clients::recovery::prepare_discard(&id)
+            .map_err(|error| clients::recovery::safe_discard_error(&id, &error))
+    })
+    .await
+    .map_err(|_| clients::recovery::discard_worker_error(&worker_id))?
+}
+#[tauri::command]
+async fn discard_client_recovery(id: String, manifest: String) -> Result<String, String> {
+    let worker_id = id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        clients::recovery::discard_confirmed(&id, &manifest)
+            .map_err(|error| clients::recovery::safe_discard_error(&id, &error))
+    })
+    .await
+    .map_err(|_| clients::recovery::discard_worker_error(&worker_id))?
+}
+#[tauri::command]
+async fn refresh_client_recovery_notice(
+    previous_id: String,
+    client_id: String,
+    backup_path: String,
+) -> Result<clients::recovery::RecoveryListingUpdate, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        clients::recovery::refresh_notice(&previous_id, &client_id, &backup_path)
     })
     .await
     .map_err(|_| clients::recovery::worker_error())?
+}
+#[tauri::command]
+async fn refresh_client_recovery_status() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(clients::recovery::refresh_status)
+        .await
+        .map_err(|_| clients::recovery::worker_error())?
 }
 #[tauri::command]
 async fn dismiss_client_recovery(id: String, dismissed: bool) -> Result<(), String> {
@@ -4467,7 +4498,10 @@ pub fn run() {
             detect_clients,
             list_client_recoveries,
             retry_client_recovery,
+            prepare_client_recovery_discard,
             discard_client_recovery,
+            refresh_client_recovery_notice,
+            refresh_client_recovery_status,
             dismiss_client_recovery,
             client_location_types,
             add_client_location,

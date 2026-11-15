@@ -675,9 +675,12 @@ it("shows negative net savings with the tokenizer method and excludes legacy est
       />
     </TooltipProvider>,
   );
+  // A negative net saving is overhead, shown as its absolute size.
   const badge = await screen.findByRole("button", {
-    name: "-12.3k tokens saved",
+    name: "12.3k extra tokens",
   });
+  expect(badge).not.toHaveTextContent("-");
+  expect(badge).not.toHaveTextContent("tokens saved");
   expect(badge).toHaveAttribute("title", expect.stringContaining("cl100k_base"));
   expect(badge).toHaveAttribute(
     "title",
@@ -688,6 +691,33 @@ it("shows negative net savings with the tokenizer method and excludes legacy est
     expect.stringContaining("one full catalog baseline per client session"),
   );
   expect(badge).not.toHaveTextContent("1.0M");
+});
+
+it.each([
+  [0, "0 tokens saved"],
+  [12_340, "12.3k tokens saved"],
+  [-256, "256 extra tokens"],
+])("labels %i net tokens as %s", async (tokensSaved, name) => {
+  getSavingsSummary.mockResolvedValue({
+    tokensSaved,
+    tokenizedLoads: 1,
+    listLoads: 1,
+    peakCatalog: 1,
+    sinceTs: 0,
+  });
+  render(
+    <TooltipProvider>
+      <AppSidebar
+        registry={null}
+        onRegistryChange={vi.fn()}
+        view="servers"
+        onSelectView={vi.fn()}
+        onShortcuts={vi.fn()}
+        onReplayOnboarding={vi.fn()}
+      />
+    </TooltipProvider>,
+  );
+  expect(await screen.findByRole("button", { name })).toBeInTheDocument();
 });
 
 it("shows indented settings pages with an active row and pending count", async () => {
