@@ -84,12 +84,22 @@ impl<V> SessionStore<V> {
     /// Run `f` on the entry for `key`, refreshing its TTL. `None` when the key is
     /// absent or already expired.
     pub fn with<R>(&mut self, key: &str, f: impl FnOnce(&mut V) -> R) -> Option<R> {
-        if self.is_expired(key) {
+        self.with_at(key, Instant::now(), f)
+    }
+
+    /// [`with`](Self::with) as of `now`, so a caller can pass its clock in.
+    pub fn with_at<R>(
+        &mut self,
+        key: &str,
+        now: Instant,
+        f: impl FnOnce(&mut V) -> R,
+    ) -> Option<R> {
+        if self.is_expired_at(key, now) {
             self.entries.remove(key);
             return None;
         }
         let entry = self.entries.get_mut(key)?;
-        entry.last_seen = Instant::now();
+        entry.last_seen = now;
         Some(f(&mut entry.value))
     }
 
@@ -129,7 +139,12 @@ impl<V> SessionStore<V> {
     /// absent or already expired. For callers that need several reads in one lock,
     /// where [`peek`](Self::peek)'s closure would fight the borrow checker.
     pub fn get(&self, key: &str) -> Option<&V> {
-        if self.is_expired(key) {
+        self.get_at(key, Instant::now())
+    }
+
+    /// [`get`](Self::get) as of `now`.
+    pub fn get_at(&self, key: &str, now: Instant) -> Option<&V> {
+        if self.is_expired_at(key, now) {
             return None;
         }
         self.entries.get(key).map(|entry| &entry.value)
@@ -216,17 +231,26 @@ impl<V> SessionStore<V> {
 
     /// Drop every expired entry, returning how many were removed.
     pub fn reap_expired(&mut self) -> usize {
+        self.reap_expired_at(Instant::now())
+    }
+
+    /// [`reap_expired`](Self::reap_expired) as of `now`.
+    pub fn reap_expired_at(&mut self, now: Instant) -> usize {
         let ttl = self.ttl;
         let before = self.entries.len();
         self.entries
-            .retain(|_, entry| entry.last_seen.elapsed() < ttl);
+            .retain(|_, entry| now.saturating_duration_since(entry.last_seen) < ttl);
         before - self.entries.len()
     }
 
     fn is_expired(&self, key: &str) -> bool {
+        self.is_expired_at(key, Instant::now())
+    }
+
+    fn is_expired_at(&self, key: &str, now: Instant) -> bool {
         self.entries
             .get(key)
-            .is_some_and(|entry| entry.last_seen.elapsed() >= self.ttl)
+            .is_some_and(|entry| now.saturating_duration_since(entry.last_seen) >= self.ttl)
     }
 }
 
@@ -234,13 +258,15 @@ impl<V> SessionStore<V> {
 mod tests {
     use super::*;
 
-    fn short_ttl() -> Duration {
-        Duration::from_millis(40)
+    /// Long enough that no test run reaches it by itself; tests that need an
+    /// entry expired pass a later time in.
+    fn long_ttl() -> Duration {
+        Duration::from_secs(60)
     }
 
     #[test]
     fn an_inserted_value_is_found_and_refreshes_its_ttl() {
-        let mut store = SessionStore::new(short_ttl(), 8);
+        let mut store = SessionStore::new(long_ttl(), 8);
         store.insert("session-a", 1);
         assert_eq!(store.len(), 1);
         assert_eq!(store.with("session-a", |value| *value), Some(1));
@@ -251,22 +277,27 @@ mod tests {
 
     #[test]
     fn a_value_expires_with_its_ttl() {
-        let mut store = SessionStore::new(short_ttl(), 8);
+        let mut store = SessionStore::new(long_ttl(), 8);
+        let inserted = Instant::now();
         store.insert("session-a", 1);
-        std::thread::sleep(short_ttl() + Duration::from_millis(20));
-        assert_eq!(store.with("session-a", |value| *value), None);
+        assert_eq!(
+            store.with_at("session-a", inserted, |value| *value),
+            Some(1)
+        );
+        let later = inserted + 2 * long_ttl();
+        assert_eq!(store.with_at("session-a", later, |value| *value), None);
         // Reading an expired key drops it rather than leaving it for a later sweep.
         assert_eq!(store.len(), 0);
     }
 
     #[test]
     fn reap_expired_reports_what_it_removed() {
-        let mut store = SessionStore::new(short_ttl(), 8);
+        let mut store = SessionStore::new(long_ttl(), 8);
+        let inserted = Instant::now();
         store.insert("a", 1);
         store.insert("b", 2);
-        assert_eq!(store.reap_expired(), 0, "nothing is expired yet");
-        std::thread::sleep(short_ttl() + Duration::from_millis(20));
-        assert_eq!(store.reap_expired(), 2);
+        assert_eq!(store.reap_expired_at(inserted), 0, "nothing is expired yet");
+        assert_eq!(store.reap_expired_at(inserted + 2 * long_ttl()), 2);
         assert!(store.is_empty());
     }
 

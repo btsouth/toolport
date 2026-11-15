@@ -91,7 +91,11 @@ struct Cached {
 
 impl Cached {
     fn past_lifetime(&self) -> bool {
-        self.first_stored.elapsed() >= max_result_lifetime()
+        self.past_lifetime_at(Instant::now())
+    }
+
+    fn past_lifetime_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.first_stored) >= max_result_lifetime()
     }
 }
 
@@ -150,8 +154,13 @@ fn sweep(store: &mut SessionStore<Cached>) {
 }
 
 fn sweep_memory(store: &mut SessionStore<Cached>) {
+    sweep_memory_at(store, Instant::now());
+}
+
+/// [`sweep_memory`] as of `now`.
+fn sweep_memory_at(store: &mut SessionStore<Cached>, now: Instant) {
     let before = store.weight(|c| c.size);
-    let removed = store.reap_expired() + store.remove_where(|_, c| c.past_lifetime());
+    let removed = store.reap_expired_at(now) + store.remove_where(|_, c| c.past_lifetime_at(now));
     if removed > 0 && before >= 1024 * 1024 {
         TRIM_PENDING.store(true, Ordering::Relaxed);
     }
@@ -959,12 +968,22 @@ enum Read {
 /// Look `cursor` up in memory for `requester`. A read extends the entry's TTL, up to
 /// [`MAX_RESULT_LIFETIME`] from when it was first stored.
 fn read_in(store: &mut SessionStore<Cached>, cursor: &str, requester: Option<&str>) -> Read {
-    match store.get(cursor) {
-        Some(c) if c.owner.as_deref() == requester && !c.past_lifetime() => {}
+    read_in_at(store, cursor, requester, Instant::now())
+}
+
+/// [`read_in`] as of `now`.
+fn read_in_at(
+    store: &mut SessionStore<Cached>,
+    cursor: &str,
+    requester: Option<&str>,
+    now: Instant,
+) -> Read {
+    match store.get_at(cursor, now) {
+        Some(c) if c.owner.as_deref() == requester && !c.past_lifetime_at(now) => {}
         Some(_) => return Read::Refused,
         None => return Read::Absent,
     }
-    store.with(cursor, |_| ());
+    store.with_at(cursor, now, |_| ());
     Read::Found
 }
 
@@ -1250,9 +1269,9 @@ mod spill {
     }
 
     impl Spilled {
-        fn expired(&self) -> bool {
-            self.touched.elapsed() >= spill_ttl()
-                || self.first_stored.elapsed() >= max_result_lifetime()
+        fn expired_at(&self, now: Instant) -> bool {
+            now.saturating_duration_since(self.touched) >= spill_ttl()
+                || now.saturating_duration_since(self.first_stored) >= max_result_lifetime()
         }
     }
 
@@ -1513,11 +1532,15 @@ mod spill {
 
         /// Drop expired entries and retry removing files that would not delete.
         fn reap(&mut self) {
+            self.reap_at(Instant::now());
+        }
+
+        fn reap_at(&mut self, now: Instant) {
             self.orphans.retain(|(path, _)| !remove_file(path));
             let expired: Vec<String> = self
                 .entries
                 .iter()
-                .filter(|(_, spilled)| spilled.expired())
+                .filter(|(_, spilled)| spilled.expired_at(now))
                 .map(|(cursor, _)| cursor.clone())
                 .collect();
             for cursor in expired {
@@ -1602,7 +1625,17 @@ mod spill {
         /// Read `cursor` back for `requester`. A read starts its TTL again, up to
         /// `MAX_RESULT_LIFETIME` from when it was first stored.
         fn load(&mut self, cursor: &str, requester: Option<&str>) -> Option<Cached> {
-            self.reap();
+            self.load_at(cursor, requester, Instant::now())
+        }
+
+        /// [`State::load`] as of `now`.
+        fn load_at(
+            &mut self,
+            cursor: &str,
+            requester: Option<&str>,
+            now: Instant,
+        ) -> Option<Cached> {
+            self.reap_at(now);
             let cipher = self.cipher.as_ref()?;
             let spilled = self.entries.get_mut(cursor)?;
             if spilled.owner.as_deref() != requester {
@@ -1619,7 +1652,7 @@ mod spill {
             let plain = cipher.decrypt(XNonce::from_slice(nonce), sealed).ok()?;
             let value: Value = serde_json::from_slice(&plain).ok()?;
             let structured = value.get("structured").filter(|v| !v.is_null()).cloned();
-            spilled.touched = Instant::now();
+            spilled.touched = now;
             Some(Cached {
                 server: spilled.server.clone(),
                 body: value.get("body")?.as_str()?.to_string(),
@@ -1763,17 +1796,19 @@ mod spill {
         fn a_read_from_disk_extends_its_time_up_to_the_lifetime_cap() {
             let root = case_root("extend");
             let mut state = State::new(Some(root.clone()), Some([7; 32]));
-            let ms = Duration::from_millis;
-            super::super::set_lifetimes_for_tests(Some((ms(600), ms(1_000))));
-            assert!(state.keep("r1", &entry("body"), Instant::now()).is_ok());
-            std::thread::sleep(ms(400));
-            let first = state.load("r1", None).is_some();
-            std::thread::sleep(ms(400));
+            let secs = Duration::from_secs;
+            super::super::set_lifetimes_for_tests(Some((secs(60), secs(100))));
+            // The clock is passed in: each read happens at an exact time after storing,
+            // so no read depends on how fast the test runs.
+            let stored = Instant::now();
+            let mut item = entry("body");
+            item.first_stored = stored;
+            assert!(state.keep("r1", &item, stored).is_ok());
+            let first = state.load_at("r1", None, stored + secs(40)).is_some();
             // Past the TTL from storing, inside it from the read.
-            let second = state.load("r1", None).is_some();
-            std::thread::sleep(ms(300));
+            let second = state.load_at("r1", None, stored + secs(80)).is_some();
             // Inside the TTL from the last read, past the lifetime cap.
-            let third = state.load("r1", None).is_some();
+            let third = state.load_at("r1", None, stored + secs(110)).is_some();
             super::super::set_lifetimes_for_tests(None);
             assert!(first);
             assert!(second, "a read did not extend it");
@@ -2609,20 +2644,22 @@ mod tests {
 
     #[test]
     fn a_read_from_memory_extends_its_time_up_to_the_lifetime_cap() {
-        let ms = Duration::from_millis;
-        let mut store = SessionStore::new(ms(600), MAX_CACHE_ENTRIES);
-        set_lifetimes_for_tests(Some((ms(600), ms(1_000))));
-        store.insert("paged", cached_entry(1));
-        std::thread::sleep(ms(400));
-        let first = matches!(read_in(&mut store, "paged", None), Read::Found);
-        std::thread::sleep(ms(400));
+        let secs = Duration::from_secs;
+        let mut store = SessionStore::new(secs(60), MAX_CACHE_ENTRIES);
+        set_lifetimes_for_tests(Some((secs(60), secs(100))));
+        // The clock is passed in: each read happens at an exact time after storing,
+        // so no read depends on how fast the test runs.
+        let item = cached_entry(1);
+        let stored = item.first_stored;
+        store.insert("paged", item);
+        let read = |store: &mut SessionStore<Cached>, at| read_in_at(store, "paged", None, at);
+        let first = matches!(read(&mut store, stored + secs(40)), Read::Found);
         // Past the TTL from storing, inside it from the read.
-        let second = matches!(read_in(&mut store, "paged", None), Read::Found);
-        std::thread::sleep(ms(300));
+        let second = matches!(read(&mut store, stored + secs(80)), Read::Found);
         // Inside the TTL from the last read, past the lifetime cap.
-        let third = matches!(read_in(&mut store, "paged", None), Read::Refused);
+        let third = matches!(read(&mut store, stored + secs(110)), Read::Refused);
         // Memory only: the shortened clocks must not reach the shared spill store.
-        sweep_memory(&mut store);
+        sweep_memory_at(&mut store, stored + secs(110));
         set_lifetimes_for_tests(None);
         assert!(first);
         assert!(second, "a read did not extend it");
