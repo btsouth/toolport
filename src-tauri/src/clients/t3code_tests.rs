@@ -1548,3 +1548,67 @@ fn a_saved_t3_home_is_decided_by_the_walk_first() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// OpenCode reads `opencode.jsonc` when only that exists, and its row shows that file.
+/// The T3 Code instance's folder names `opencode.json`, so the same choice is made for it
+/// (once the walk has passed) and the row is labelled. A `.jsonc` that is a link is
+/// never followed: that row stays unlabelled.
+#[test]
+fn an_opencode_home_with_only_jsonc_labels_its_row() {
+    let _lock = crate::registry::data_dir_test_lock();
+    let root = std::env::temp_dir().join(format!(
+        "toolport-t3-jsonc-{}-{}",
+        std::process::id(),
+        epoch_millis()
+    ));
+    let home = root.join("home");
+    std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+    std::fs::create_dir_all(home.join(".oc-xdg/opencode")).unwrap();
+    std::fs::write(home.join(".oc-xdg/opencode/opencode.jsonc"), "{}").unwrap();
+    std::fs::write(
+        home.join(".t3/userdata/settings.json"),
+        r#"{"providerInstances": {"oc": {"driver": "opencode", "displayName": "OC", "enabled": true,
+            "environment": [{"name": "XDG_CONFIG_HOME", "value": "~/.oc-xdg"}]}}}"#,
+    )
+    .unwrap();
+    let _data = crate::registry::DataDirOverride::set(root.join("data"));
+    let _home = TestHome::set(&home);
+    let _xdg = EnvRestore::set("XDG_CONFIG_HOME", &home.join(".oc-xdg"));
+    let main = resolve_opencode_config_path(opencode_path().unwrap()).unwrap();
+    assert!(
+        main.ends_with("opencode/opencode.jsonc"),
+        "{}",
+        main.display()
+    );
+    let row = || {
+        let mut row = config_error_row(
+            "opencode",
+            "OpenCode",
+            main.display().to_string(),
+            String::new(),
+        );
+        row.error = None;
+        row
+    };
+    let mut clients = vec![row()];
+    annotate(&mut clients);
+    assert_eq!(
+        clients[0]
+            .t3_code
+            .iter()
+            .map(|use_| use_.display_name.as_str())
+            .collect::<Vec<_>>(),
+        ["OC"]
+    );
+    #[cfg(unix)]
+    {
+        let elsewhere = root.join("elsewhere.jsonc");
+        std::fs::write(&elsewhere, "{}").unwrap();
+        std::fs::remove_file(&main).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &main).unwrap();
+        let mut clients = vec![row()];
+        annotate(&mut clients);
+        assert!(clients[0].t3_code.is_empty(), "{:?}", clients[0].t3_code);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
