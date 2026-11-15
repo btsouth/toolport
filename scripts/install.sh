@@ -392,19 +392,30 @@ install_linux() {
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
 
+  local portable_reason=""
   if command -v zypper >/dev/null 2>&1 &&
     grep -qE '^(ID|ID_LIKE)=.*\b(opensuse|suse)\b' "${TOOLPORT_OS_RELEASE:-/etc/os-release}" 2>/dev/null; then
     sudo=""
     if [ "$(id -u)" -ne 0 ]; then
-      command -v sudo >/dev/null 2>&1 && sudo=sudo || err "Refreshing openSUSE package metadata needs root: re-run as root or install sudo."
+      if command -v sudo >/dev/null 2>&1; then
+        sudo=sudo
+      else
+        portable_reason="Native openSUSE package metadata needs root or sudo; using the verified AppImage instead."
+      fi
     fi
-    $sudo zypper --non-interactive refresh
-    if ! command -v awk >/dev/null 2>&1; then
+    if [ -z "$portable_reason" ] && ! $sudo zypper --non-interactive refresh; then
+      portable_reason="openSUSE package metadata could not be refreshed; using the verified AppImage instead."
+    fi
+    if [ -z "$portable_reason" ] && ! command -v awk >/dev/null 2>&1; then
       $sudo zypper --non-interactive install --no-recommends gawk
     fi
   fi
   need awk
   linux_plan
+  if [ -n "$portable_reason" ]; then
+    linux_package=appimage
+    linux_reason="$portable_reason"
+  fi
   [ -z "$linux_reason" ] || say "$linux_reason"
   if [ "$linux_package" = deb ]; then
     url="$(asset_url '_amd64[.]deb')"

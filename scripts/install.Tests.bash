@@ -16,6 +16,10 @@
 
 set -euo pipefail
 
+# Each mutation case supplies a temporary HOME or explicit XDG paths. Inherited
+# desktop overrides must not redirect a fixture into the caller's real files.
+unset XDG_BIN_HOME XDG_DATA_HOME XDG_CONFIG_HOME
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_SH="$SCRIPT_DIR/install.sh"
 
@@ -509,7 +513,8 @@ case "$*" in
   *info*libadwaita-1-0) echo 'Version : 1.4.3-1.1' ;;
   *info*libglib-2_0-0) echo 'Version : 2.78.6-1.1' ;;
   *info*glibc) echo 'Version : 2.38-1.1' ;;
-  '--non-interactive refresh'|*'install --allow-unsigned-rpm '*) exit 0 ;;
+  '--non-interactive refresh') exit "${TOOLPORT_TEST_ZYPPER_REFRESH_FAIL:-0}" ;;
+  *'install --allow-unsigned-rpm '*) exit 0 ;;
   *) exit 99 ;;
 esac
 ZYPPER
@@ -532,6 +537,19 @@ sed -i 's/4.12.5/4.18.6/g; s/1.4.3/1.7.5/g; s/2.78.6/2.84.4/g; s/2.38/2.40/g' "$
 printf 'ID=opensuse-leap\nID_LIKE="suse opensuse"\nVERSION_ID=16.0\n' > "$rpm_dir/os-release"
 result="$(PATH="$rpm_dir/shim:$PATH" TOOLPORT_OS_RELEASE="$rpm_dir/os-release" bash "$INSTALL_SH" --print-plan)"
 check "Leap 16 cached provider floors select RPM" "package=rpm" "$result"
+# A repository outage must not prevent the portable route or bypass checksums.
+make_shim "$rpm_dir/shim" "$(fake_release "sha256:$fake_sha256" 64)
+$(fake_release "sha256:$fake_sha256" 64 | sed 's/amd64[.]AppImage/x86_64.rpm/g')"
+result="$(PATH="$rpm_dir/shim:$PATH" HOME="$rpm_dir/home" TOOLPORT_OS_RELEASE="$rpm_dir/os-release" TOOLPORT_TEST_ZYPPER_REFRESH_FAIL=106 bash "$INSTALL_SH" 2>&1)"
+check "failed zypper refresh keeps portable installation" "could not be refreshed; using the verified AppImage" "$result"
+check "portable fallback still verifies checksum" "sha256 verified: $fake_sha256" "$result"
+# A user denied privileged metadata access can still install in their own HOME.
+printf '#!/bin/sh\necho 1001\n' > "$rpm_dir/shim/id"
+printf '#!/bin/sh\nexit 1\n' > "$rpm_dir/shim/sudo"
+chmod +x "$rpm_dir/shim/id" "$rpm_dir/shim/sudo"
+result="$(PATH="$rpm_dir/shim:$PATH" HOME="$rpm_dir/home" TOOLPORT_OS_RELEASE="$rpm_dir/os-release" bash "$INSTALL_SH" 2>&1)"
+check "denied sudo keeps portable installation" "could not be refreshed; using the verified AppImage" "$result"
+check "unprivileged fallback verifies checksum" "sha256 verified: $fake_sha256" "$result"
 unset TOOLPORT_TEST_ZYPPER_LOG
 
 # Cleanup is offline and honors the same XDG paths as installation.
