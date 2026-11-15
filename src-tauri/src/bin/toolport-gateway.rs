@@ -17411,10 +17411,9 @@ fn process_request_wire(
                 });
             }
             _ => {
-                conduit_lib::secret_redact::redact_outgoing(
-                    &mut response.envelope,
-                    req.get("params"),
-                );
+                // Its result or error only: the id is the client's own, and
+                // it matches the reply by it.
+                conduit_lib::secret_redact::redact_reply(&mut response.envelope, req.get("params"));
             }
         }
         response.observation = Some(observed.clone());

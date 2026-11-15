@@ -3661,6 +3661,27 @@ pub fn redact_outgoing(value: &mut Value, request: Option<&Value>) -> bool {
     m.value_with(value, false, request)
 }
 
+/// [`redact_outgoing`] for a reply to a client's `request`: only its `result`
+/// and `error` are redacted. Its `id` and `jsonrpc` are the client's protocol
+/// fields, which it matches the reply by, and are never changed. Without a
+/// working matcher the reply is withheld as [`redact_outgoing`] withholds it.
+pub fn redact_reply(envelope: &mut Value, request: Option<&Value>) -> bool {
+    let Some(m) = current() else {
+        return false;
+    };
+    if m.main().is_broken() && envelope.get("jsonrpc").is_some() {
+        *envelope = withheld_message(envelope);
+        return true;
+    }
+    let mut changed = false;
+    for key in ["result", "error"] {
+        if let Some(part) = envelope.get_mut(key) {
+            changed |= m.value_with(part, false, request);
+        }
+    }
+    changed
+}
+
 /// [`redact_outgoing`] with the exemption already computed
 /// ([`exempt_values`]), for messages that answer a request seen earlier (its
 /// progress notifications).
@@ -6437,6 +6458,38 @@ mod tests {
         );
         // Inside a word it is still not one.
         assert_eq!(m.redact_text("xab12y"), "xab12y");
+    }
+
+    #[test]
+    fn a_reply_is_redacted_in_its_result_and_error_never_its_id() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-reply-id-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        register("reply-srv", "PIN", "482193");
+        register("reply-srv", "KEY", "sk-ReplyBodySecret88");
+        for id in [
+            serde_json::json!(482193),
+            serde_json::json!("sk-ReplyBodySecret88"),
+        ] {
+            let mut ok = serde_json::json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": {"content": [{"type": "text", "text": "pin 482193 key sk-ReplyBodySecret88"}]}
+            });
+            assert!(redact_reply(&mut ok, None));
+            assert_eq!(ok["id"], id);
+            assert_eq!(
+                ok["result"]["content"][0]["text"],
+                "pin [secret:PIN] key [secret:KEY]"
+            );
+            let mut failed = serde_json::json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": {"code": -32000, "message": "bad key sk-ReplyBodySecret88"}
+            });
+            assert!(redact_reply(&mut failed, None));
+            assert_eq!(failed["id"], id);
+            assert_eq!(failed["error"]["message"], "bad key [secret:KEY]");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
