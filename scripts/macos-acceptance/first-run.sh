@@ -13,7 +13,7 @@ source "$(dirname "$0")/common.sh"
 
 EXE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Contents/Info.plist")"
 EXE_PATH="$APP_PATH/Contents/MacOS/$EXE"
-app_pid() { pgrep -f "^$EXE_PATH" | head -n 1; }
+app_pid() { pids_of "$EXE_PATH" | head -n 1; }
 crash_list() { ls -1 "$HOME/Library/Logs/DiagnosticReports" 2>/dev/null | grep -iE 'toolport|conduit' || true; }
 windows_json() { TPUI_TIMEOUT=15 tpui windows; }
 
@@ -23,7 +23,9 @@ info "automation grants for the job's processes" "$(tr -d ' \n' <"$EVIDENCE/logs
 
 quarantine="$(xattr -p com.apple.quarantine "$APP_PATH" 2>/dev/null || true)"
 log "Opening $APP_PATH (quarantine: ${quarantine:-none})"
-tmo 30 open "$APP_PATH" || fail "open returns" "open did not return within 30s"
+# open waits while Gatekeeper's confirmation is on screen, so run it in the
+# background and handle the prompt below, as a user would.
+tmo 120 open "$APP_PATH" >"$EVIDENCE/logs/open-$LABEL.log" 2>&1 &
 
 # A quarantined, notarized download gets Gatekeeper's "downloaded from the
 # Internet" confirmation before the app's own process starts.
@@ -107,8 +109,9 @@ else
 fi
 tpui menubar "$PID" >"$EVIDENCE/logs/ax-menubar-$LABEL.txt" 2>&1 || true
 
-if wait_for 30 pgrep -f 'toolport-gateway'; then
-  pass "gateway process starts" "$(pgrep -fl toolport-gateway | head -3 | tr '\n' ';')"
+gateway_running() { [[ -n "$(pids_of toolport-gateway)" ]]; }
+if wait_for 30 gateway_running; then
+  pass "gateway process starts" "$(ps -axo pid=,command= | grep toolport-gateway | grep -v grep | head -3 | cut -c1-160 | tr '\n' ';')"
 else
   fail "gateway process starts" "no toolport-gateway process 30s after launch"
 fi

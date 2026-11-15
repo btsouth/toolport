@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared helpers for the macOS acceptance job. Source this file; do not run it.
 #
 # Every check records one row in "$EVIDENCE/results.tsv":
@@ -99,6 +100,10 @@ wait_for() {
   done
   return 1
 }
+
+# pids_of <fixed-string>: pids whose command line contains the string. ps is
+# used instead of pgrep -f, which missed the app on the runner.
+pids_of() { ps -axo pid=,command= | grep -F -- "$1" | grep -v -e 'grep -F' | awk '{print $1}'; }
 
 # The tool the UI and window probes use. Built by the workflow from tpui.swift.
 TPUI_BIN="${TPUI:-$EVIDENCE/bin/tpui}"

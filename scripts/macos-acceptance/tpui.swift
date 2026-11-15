@@ -84,15 +84,20 @@ func appElement(_ pidArg: String) -> AXUIElement {
     return app
 }
 
+// Elements whose title, description, value, placeholder or help equals <text>
+// (case-insensitive); when none does, those that contain it.
 func matches(_ pidArg: String, _ text: String, roles: Set<String>? = nil) -> [AXUIElement] {
     let needle = text.lowercased()
-    var out: [AXUIElement] = []
+    var exact: [AXUIElement] = []
+    var partial: [AXUIElement] = []
     walk(appElement(pidArg), 0, 60) { el, _ in
         let role = str(el, kAXRoleAttribute)
         if let roles = roles, !roles.contains(role) { return }
-        if label(el).lowercased().contains(needle) { out.append(el) }
+        let parts = [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute, kAXPlaceholderValueAttribute, kAXHelpAttribute]
+            .map { str(el, $0).lowercased().trimmingCharacters(in: .whitespacesAndNewlines) }
+        if parts.contains(needle) { exact.append(el) } else if label(el).lowercased().contains(needle) { partial.append(el) }
     }
-    return out
+    return exact.isEmpty ? partial : exact
 }
 
 func postKey(_ code: CGKeyCode, cmd: Bool = false) {
@@ -162,7 +167,9 @@ case "find":
 
 case "press", "focus":
     guard args.count >= 4 else { die("usage: tpui \(args[1]) <pid> <text> [n]") }
-    let n = args.count >= 5 ? max(1, Int(args[4]) ?? 1) : 1
+    // n counts from 1; a negative n counts from the end (-1 is the last match,
+    // which is the topmost dialog's control when a modal repeats a label).
+    let n = args.count >= 5 ? (Int(args[4]) ?? 1) : 1
     let roles: Set<String> = args[1] == "press"
         ? ["AXButton", "AXLink", "AXMenuItem", "AXRadioButton", "AXCheckBox", "AXTab", "AXPopUpButton", "AXMenuButton", "AXCell", "AXRow", "AXStaticText", "AXGroup"]
         : ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
@@ -172,8 +179,12 @@ case "press", "focus":
         let order = ["AXButton", "AXLink", "AXRadioButton", "AXTab", "AXCheckBox", "AXMenuItem", "AXPopUpButton", "AXMenuButton", "AXTextField", "AXTextArea", "AXComboBox", "AXSearchField", "AXCell", "AXRow", "AXStaticText", "AXGroup"]
         return (order.firstIndex(of: str(a, kAXRoleAttribute)) ?? 99) < (order.firstIndex(of: str(b, kAXRoleAttribute)) ?? 99)
     }
-    guard ranked.count >= n else { die("no element matching \"\(args[3])\" (\(found.count) found)", 2) }
-    let el = ranked[n - 1]
+    let index = n < 0 ? found.count + n : n - 1
+    guard index >= 0, index < found.count else { die("no element matching \"\(args[3])\" (\(found.count) found)", 2) }
+    // A negative index keeps document order (last = topmost); a positive one
+    // prefers the most specific role.
+    let el = n < 0 ? found[index] : ranked[index]
+    let shown = "\(str(el, kAXRoleAttribute)) \"\(label(el).prefix(80))\""
     if args[1] == "press" {
         let err = AXUIElementPerformAction(el, kAXPressAction as CFString)
         if err != .success {
@@ -183,9 +194,9 @@ case "press", "focus":
             for t in [CGEventType.leftMouseDown, .leftMouseUp] {
                 CGEvent(mouseEventSource: nil, mouseType: t, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
             }
-            print("clicked \(str(el, kAXRoleAttribute)) at \(Int(p.x)),\(Int(p.y)) after AXPress error \(err.rawValue)")
+            print("clicked \(shown) at \(Int(p.x)),\(Int(p.y)) after AXPress error \(err.rawValue)")
         } else {
-            print("pressed \(str(el, kAXRoleAttribute)) \"\(label(el).prefix(80))\"")
+            print("pressed \(shown)")
         }
     } else {
         let err = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
@@ -195,7 +206,7 @@ case "press", "focus":
                 CGEvent(mouseEventSource: nil, mouseType: t, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
             }
         }
-        print("focused \(str(el, kAXRoleAttribute)) \"\(label(el).prefix(80))\"")
+        print("focused \(shown)")
     }
 
 case "keys":

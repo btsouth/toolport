@@ -1,10 +1,11 @@
 name: macOS acceptance
 
-# On-demand check of a published release on a clean Apple Silicon runner, done
+# On-demand check of a published release on clean Apple Silicon runners, done
 # the way a new Mac user would: download, Gatekeeper, first launch, keychain,
-# client setup, upgrade and uninstall. Evidence (screenshots, logs, leftover
-# files, crash reports) is uploaded as artifacts; the job summary lists every
-# check and everything the runner could not test.
+# client setup, upgrade, Homebrew and uninstall. The window is driven through
+# macOS accessibility. Evidence (screenshots, logs, leftover files, crash
+# reports) is uploaded as artifacts; each job summary lists every check and
+# everything the runner could not test.
 on:
   workflow_dispatch:
     inputs:
@@ -26,71 +27,143 @@ concurrency:
   group: macos-acceptance-${{ github.ref }}-${{ inputs.tag }}
   cancel-in-progress: true
 
+env:
+  GH_TOKEN: ${{ github.token }}
+  TAG_INPUT: ${{ inputs.tag }}
+
 jobs:
-  dmg:
-    name: dmg install and first run
+  new-user:
+    name: New user (dmg)
     runs-on: macos-latest
     timeout-minutes: 45
-    env:
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-
       - name: Resolve the release under test
-        id: release
-        env:
-          TAG_INPUT: ${{ inputs.tag }}
-        run: |
-          bash scripts/macos-acceptance/resolve-release.sh "$TAG_INPUT" | tee -a "$GITHUB_OUTPUT"
-          sed -n 's/^tag=/TAG=/p; s/^previous=/PREVIOUS_TAG=/p' "$GITHUB_OUTPUT" >>"$GITHUB_ENV"
-
-      - name: Record the runner
-        run: |
-          echo "EVIDENCE=$RUNNER_TEMP/macos-acceptance" >>"$GITHUB_ENV"
-          echo "TPUI=$RUNNER_TEMP/macos-acceptance/bin/tpui" >>"$GITHUB_ENV"
-          EVIDENCE="$RUNNER_TEMP/macos-acceptance"
-          mkdir -p "$EVIDENCE/logs" "$EVIDENCE/bin"
-          { sw_vers; uname -a; id; echo "console user: $(stat -f %Su /dev/console)"; launchctl managername; } \
-            | tee "$EVIDENCE/logs/runner.txt"
-          printf 'runner\tINFO\tmacOS\t%s\n' "$(sw_vers -productVersion) $(uname -m)" >>"$EVIDENCE/results.tsv"
-
-      - name: Build the window and accessibility probe
-        run: swiftc -O scripts/macos-acceptance/tpui.swift -o "$TPUI"
-
+        run: bash scripts/macos-acceptance/resolve-release.sh "$TAG_INPUT" | sed 's/^tag=/TAG=/; s/^previous=/PREVIOUS_TAG=/' >>"$GITHUB_ENV"
+      - name: Prepare the runner and seed client configs
+        run: bash scripts/macos-acceptance/prepare.sh
       - name: Install the Apple Silicon dmg
         run: bash scripts/macos-acceptance/install-dmg.sh "$TAG" Toolport_aarch64-apple-darwin.dmg
-
       - name: Check the installed bundle
-        if: ${{ !cancelled() }}
         run: bash scripts/macos-acceptance/bundle-checks.sh /Applications/Toolport.app arm64 "Apple Silicon"
-
       - name: Check the Intel dmg
         if: ${{ !cancelled() }}
         run: |
           bash scripts/macos-acceptance/install-dmg.sh "$TAG" Toolport_x86_64-apple-darwin.dmg --no-install
           bash scripts/macos-acceptance/bundle-checks.sh "$RUNNER_TEMP/inspect/Toolport_x86_64-apple-darwin.dmg/Toolport.app" x86_64 Intel
-
       - name: First launch
-        if: ${{ !cancelled() }}
         timeout-minutes: 8
-        run: bash scripts/macos-acceptance/first-run.sh
-
+        run: bash scripts/macos-acceptance/first-run.sh new
+      - name: Set up through the window (servers, keychain, clients, tool calls)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: bash scripts/macos-acceptance/ui-setup.sh new "$CLIENT_MANIFEST"
+      - name: Second launch
+        if: ${{ !cancelled() }}
+        timeout-minutes: 6
+        run: bash scripts/macos-acceptance/relaunch.sh new
+      - name: Uninstall (Settings, then Trash)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 6
+        run: bash scripts/macos-acceptance/uninstall.sh new "$CLIENT_MANIFEST" ui
+      - name: List leftovers
+        if: ${{ !cancelled() }}
+        run: bash scripts/macos-acceptance/leftovers.sh "uninstall, data kept"
       - name: Write the job summary
         if: always()
-        run: |
-          ls -1 "$HOME/Library/Logs/DiagnosticReports" 2>/dev/null | grep -iE 'toolport|conduit' | while read -r f; do
-            mkdir -p "$EVIDENCE/crash-reports"; cp "$HOME/Library/Logs/DiagnosticReports/$f" "$EVIDENCE/crash-reports/"
-          done || true
-          python3 scripts/macos-acceptance/render_summary.py "$EVIDENCE/results.tsv" \
-            "macOS acceptance: $TAG dmg" >>"$GITHUB_STEP_SUMMARY"
-
+        run: bash scripts/macos-acceptance/finish.sh "New user (dmg) ${TAG:-}"
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: macos-acceptance-dmg
+          name: macos-acceptance-new-user
+          path: ${{ runner.temp }}/macos-acceptance
+          if-no-files-found: error
+          retention-days: 14
+
+  upgrade:
+    name: Upgrade from the previous release (dmg)
+    runs-on: macos-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Resolve the release under test
+        run: bash scripts/macos-acceptance/resolve-release.sh "$TAG_INPUT" | sed 's/^tag=/TAG=/; s/^previous=/PREVIOUS_TAG=/' >>"$GITHUB_ENV"
+      - name: Prepare the runner and seed client configs
+        run: bash scripts/macos-acceptance/prepare.sh
+      - name: Install the previous release
+        run: |
+          test -n "$PREVIOUS_TAG" || { echo "::error::no published release before $TAG"; exit 1; }
+          bash scripts/macos-acceptance/install-dmg.sh "$PREVIOUS_TAG" Toolport_aarch64-apple-darwin.dmg
+      - name: First launch of the previous release
+        timeout-minutes: 8
+        run: bash scripts/macos-acceptance/first-run.sh previous
+      - name: Set up the previous release through the window
+        timeout-minutes: 20
+        run: bash scripts/macos-acceptance/ui-setup.sh previous "$CLIENT_MANIFEST"
+      - name: Upgrade to the release under test
+        if: ${{ !cancelled() }}
+        timeout-minutes: 12
+        run: bash scripts/macos-acceptance/upgrade.sh "$TAG" "$CLIENT_MANIFEST"
+      - name: Uninstall with the CLI and remove data
+        if: ${{ !cancelled() }}
+        timeout-minutes: 8
+        run: bash scripts/macos-acceptance/uninstall.sh upgraded "$CLIENT_MANIFEST" cli --remove-data
+      - name: List leftovers
+        if: ${{ !cancelled() }}
+        run: bash scripts/macos-acceptance/leftovers.sh "uninstall, data removed" --expect-clean
+      - name: Write the job summary
+        if: always()
+        run: bash scripts/macos-acceptance/finish.sh "Upgrade ${PREVIOUS_TAG:-} to ${TAG:-}"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-acceptance-upgrade
+          path: ${{ runner.temp }}/macos-acceptance
+          if-no-files-found: error
+          retention-days: 14
+
+  homebrew:
+    name: Homebrew cask
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Resolve the release under test
+        run: bash scripts/macos-acceptance/resolve-release.sh "$TAG_INPUT" | sed 's/^tag=/TAG=/; s/^previous=/PREVIOUS_TAG=/' >>"$GITHUB_ENV"
+      - name: Prepare the runner
+        run: bash scripts/macos-acceptance/prepare.sh
+      - name: Install with Homebrew
+        run: bash scripts/macos-acceptance/homebrew.sh install "$TAG"
+      - name: Check the installed bundle
+        if: ${{ !cancelled() }}
+        run: bash scripts/macos-acceptance/bundle-checks.sh /Applications/Toolport.app arm64 Homebrew
+      - name: First launch
+        if: ${{ !cancelled() }}
+        timeout-minutes: 8
+        run: bash scripts/macos-acceptance/first-run.sh brew
+      - name: Uninstall with Homebrew (zap)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 8
+        run: bash scripts/macos-acceptance/homebrew.sh uninstall
+      - name: List leftovers
+        if: ${{ !cancelled() }}
+        run: bash scripts/macos-acceptance/leftovers.sh "brew uninstall --zap"
+      - name: Write the job summary
+        if: always()
+        run: bash scripts/macos-acceptance/finish.sh "Homebrew ${TAG:-}"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-acceptance-homebrew
           path: ${{ runner.temp }}/macos-acceptance
           if-no-files-found: error
           retention-days: 14
