@@ -1242,7 +1242,9 @@ mod tests {
         crate::secret_redact::register("relay-server", "RELAY_TOKEN", &secret);
         // SAFETY: F_GETFD probes descriptors; the limit is restored below.
         let (lowest, old) = unsafe {
-            let lowest = (0..).find(|fd| libc::fcntl(*fd, libc::F_GETFD) < 0).unwrap();
+            let lowest = (0..)
+                .find(|fd| libc::fcntl(*fd, libc::F_GETFD) < 0)
+                .unwrap();
             let mut old: libc::rlimit = std::mem::zeroed();
             assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut old), 0);
             (lowest, old)
@@ -1293,7 +1295,8 @@ mod tests {
             "stderr points at the null device: {text}"
         );
         assert!(
-            stdout.contains("state=Silenced { reason: \"the stderr redaction relay could not start"),
+            stdout
+                .contains("state=Silenced { reason: \"the stderr redaction relay could not start"),
             "{stdout}"
         );
         assert!(stdout.contains("recorded=Silenced"), "{stdout}");

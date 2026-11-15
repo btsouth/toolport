@@ -12755,6 +12755,27 @@ bad = "not-a-table"
         assert!(err.contains("line"), "got: {err}");
     }
 
+    /// The parser's own message quotes the broken line; a Codex config keeps
+    /// API keys inline, and the error reaches `--disconnect-all` output and the
+    /// removal report.
+    #[test]
+    fn toml_syntax_errors_never_quote_the_source_line() {
+        let key = "sk-live-canary-8Jx3QwPz";
+        let content = format!(
+            "[mcp_servers.a]\ncommand = \"npx\"\n[mcp_servers.a.env]\nAPI_KEY = \"{key}\" oops\n"
+        );
+        let err = parse_toml(&content).unwrap_err();
+        assert!(!err.contains(key), "{err}");
+        assert!(err.contains("at line 4"), "{err}");
+        let err = read_existing_toml(&content).unwrap_err();
+        assert!(!err.contains(key), "{err}");
+        let err = parse_toml_snippet(&content).unwrap_err();
+        assert!(!err.contains(key), "{err}");
+        let err = content.parse::<toml_edit::DocumentMut>().unwrap_err();
+        let err = diagnostics::offset("TOML", &content, err.span());
+        assert!(!err.contains(key) && err.contains("at line 4"), "{err}");
+    }
+
     #[test]
     fn yaml_extensions_syntax_error_includes_location() {
         let content = "extensions:\n  fetch:\n    cmd: uvx\n bad-indent: true\n";
