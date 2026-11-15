@@ -322,6 +322,8 @@ it("shows a failed Discard once on its own banner and focuses the refreshed Fini
   expect(screen.getAllByText(error)).toHaveLength(1);
   const finish = await screen.findByRole("button", { name: "Finish discarding" });
   await waitFor(() => expect(finish).toHaveFocus());
+  // Same emphasis as GTK's destructive-action Finish button.
+  expect(finish).toHaveAttribute("data-variant", "destructive");
   // A started Discard refuses restoration and cannot be merely dismissed.
   expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Dismiss" })).not.toBeInTheDocument();

@@ -24,8 +24,9 @@ pub struct DiscardConfirmation {
 
 // Receipt status writes that must not revoke consent. Everything else, including
 // the immutable vaultRecovery payload, source binding and published revision, counts.
-const MUTABLE_STATUS: [&str; 5] = [
+const MUTABLE_STATUS: [&str; 6] = [
     "recoveryIssues",
+    "recoveryResolved",
     "recoveryAvailable",
     "recoveryCleanupState",
     "recoveryDismissed",

@@ -701,6 +701,7 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
                 current.as_deref(),
                 after.as_deref(),
                 &values,
+                &backup_storage::resolved_markers(&raw),
             )?;
             return Ok(true);
         }
@@ -1102,6 +1103,7 @@ fn finish_batched(client_id: &str, path: &Path, expected: Option<&str>) -> Resul
             }
             let values = backup_storage::recovery_values(&receipt)?;
             let mut pending = Vec::new();
+            let mut resolved = Vec::new();
             for value in values {
                 if current
                     .as_deref()
@@ -1114,10 +1116,12 @@ fn finish_batched(client_id: &str, path: &Path, expected: Option<&str>) -> Resul
                         marker: value.marker,
                         state: value.state,
                     });
+                } else if !resolved.contains(&value.marker) {
+                    resolved.push(value.marker);
                 }
             }
             if !pending.is_empty() {
-                backup_storage::set_issues(&receipt, &pending)?;
+                backup_storage::set_issues(&receipt, &pending, &resolved)?;
                 return Ok(());
             }
         }
@@ -1878,10 +1882,14 @@ mod tests {
                     .is_some());
                     crate::secrets::set_secret("native", "API_10", env["API_10"].as_str().unwrap())
                         .unwrap();
-                    assert!(recovery::retry_with_report(&row.id)
-                        .unwrap()
-                        .pending
-                        .is_none());
+                    let second = recovery::retry_with_report(&row.id).unwrap();
+                    assert!(second.pending.is_none());
+                    assert_eq!(
+                        (second.restored, second.accounted, second.remaining),
+                        (1, 0, 0),
+                        "{}",
+                        second.message
+                    );
                     let final_config: Value =
                         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
                     assert_eq!(
@@ -1894,6 +1902,86 @@ mod tests {
                 }
                 assert!(!Path::new(&row.backup_path).exists());
             }
+        });
+    }
+    /// D2: a credential pasted into a config with a syntax error never reaches
+    /// a Retry error, the UI-safe error, the listed rows or the receipt.
+    #[test]
+    fn retry_on_broken_config_never_echoes_a_pasted_credential() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let registry=serde_json::from_value(serde_json::json!({"version":3,"profiles":[],"servers":[{"id":"native","name":"Native","transport":"stdio","env":[{"key":"API_ONE","secret":true}]}]})).unwrap();
+            crate::registry::save(&registry).unwrap();
+            let one = "sk-d2-saved-original-value";
+            let pasted = "sk-d2-pasted-credential-text";
+            let formats = [
+                (Format::JsonMcpServers, "json", "cursor", format!("{{\n  \"mcpServers\":{{\"native\":{{\"command\":\"echo\",\"env\":{{\"API_ONE\":\"{one}\"}}}}}}\n}}\n")),
+                (Format::JsonServers, "jsonc", "vscode", format!("// keep\n{{\n  \"servers\":{{\"native\":{{\"command\":\"echo\",\"env\":{{\"API_ONE\":\"{one}\"}}}}}},\n}}\n")),
+                (Format::TomlMcpServers, "toml", "cursor", format!("[mcp_servers.native]\ncommand = 'echo'\n[mcp_servers.native.env]\nAPI_ONE = '{one}'\n")),
+                (Format::YamlMcpServers, "yaml", "cursor", format!("mcp_servers:\n  native:\n    command: echo\n    env:\n      API_ONE: '{one}'\n")),
+            ];
+            for (format, extension, client, original) in formats {
+                backup_storage::reset_missing();
+                let path = data.join(format!("d2-broken.{extension}"));
+                std::fs::write(&path, &original).unwrap();
+                crate::secrets::set_secret("native", "API_ONE", one).unwrap();
+                backup_storage::register("native", "API_ONE", one);
+                mutation::run(client, &path, format, || {
+                    backup_file(client, &path)?;
+                    write_format(format, &path, &[entry()], true)
+                })
+                .unwrap();
+                backup_storage::clear();
+                std::env::set_var("TOOLPORT_SECRET_KEY", "d2-locked");
+                disconnect(client, &path, format).unwrap();
+                let row = recovery::list()
+                    .unwrap()
+                    .into_iter()
+                    .find(|r| r.path == path.to_string_lossy())
+                    .unwrap();
+                // The user pastes a key over the placeholder and breaks the syntax.
+                let broken = std::fs::read_to_string(&path).unwrap().replacen(
+                    "TOOLPORT_MISSING_CREDENTIAL_0",
+                    pasted,
+                    1,
+                ) + &format!("{{{{{{ {pasted}\n");
+                std::fs::write(&path, &broken).unwrap();
+                std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+                let error = match recovery::retry_with_report(&row.id) {
+                    Err(error) => error,
+                    Ok(attempt) => {
+                        panic!("{extension}: broken config retried: {}", attempt.message)
+                    }
+                };
+                assert!(!error.contains(pasted), "{extension}: {error}");
+                assert!(error.contains("line"), "{extension}: {error}");
+                let shown = recovery::safe_action_error(&row.id, &error);
+                assert!(!shown.contains(pasted), "{extension}: {shown}");
+                assert!(
+                    shown.contains("line") && shown.contains("Retry"),
+                    "{extension}: {shown}"
+                );
+                let rows = serde_json::to_string(&recovery::list().unwrap()).unwrap();
+                assert!(!rows.contains(pasted), "{extension}: {rows}");
+                assert!(
+                    rows.contains(&row.id),
+                    "the receipt stays listed: {extension}"
+                );
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+                for file in std::fs::read_dir(backup_dir(client).unwrap()).unwrap() {
+                    let text = std::fs::read_to_string(file.unwrap().path()).unwrap_or_default();
+                    assert!(
+                        !text.contains(pasted),
+                        "{extension}: backup holds the pasted key"
+                    );
+                }
+                std::fs::remove_file(&path).unwrap();
+            }
+            // Anything the allow-list does not recognize becomes generic text.
+            let unknown = format!("unexpected error near `API_ONE = \"{pasted}\"`");
+            let shown = recovery::safe_action_error("no-such-recovery", &unknown);
+            assert!(!shown.contains(pasted), "{shown}");
+            assert!(shown.contains("Retry"), "{shown}");
         });
     }
     #[test]
@@ -1973,6 +2061,13 @@ mod tests {
                         );
                     } else {
                         assert!(locked_retry.unwrap().is_some());
+                        // The locked attempt already counts the user's own replacement.
+                        let accounted = usize::from(variant == "replaced");
+                        assert_eq!(
+                            recovery_values::progress(),
+                            (0, accounted),
+                            "{extension}/{variant}"
+                        );
                     }
                     assert!(Path::new(&row.backup_path).exists());
                     for file in std::fs::read_dir(backup_dir(client).unwrap())
@@ -2001,7 +2096,21 @@ mod tests {
                         crate::secrets::delete_secret("native", "API_TWO").unwrap();
                         lost = Some((account, key));
                     }
-                    let pending = recovery::retry(&row.id).unwrap();
+                    let attempt = recovery::retry_with_report(&row.id).unwrap();
+                    let pending = attempt.pending.clone();
+                    let counts = (attempt.restored, attempt.accounted, attempt.remaining);
+                    let expected = match variant {
+                        "partial" => (1, 0, 1),
+                        // Counted once, by the earlier locked attempt.
+                        "replaced" => (1, 0, 0),
+                        "deleted" => (0, 2, 0),
+                        _ => (2, 0, 0),
+                    };
+                    assert_eq!(
+                        counts, expected,
+                        "{extension}/{variant}: {}",
+                        attempt.message
+                    );
                     let output = std::fs::read_to_string(&path).unwrap();
                     assert!(output.contains("42"));
                     if variant == "partial" {
@@ -2016,7 +2125,15 @@ mod tests {
                         let (account, key) = lost.unwrap();
                         crate::secrets::set_secret(&account, &format!("{key}-credential-1"), two)
                             .unwrap();
-                        assert!(recovery::retry(&row.id).unwrap().is_none());
+                        let second = recovery::retry_with_report(&row.id).unwrap();
+                        assert!(second.pending.is_none());
+                        // The value put back by the first Retry is not recounted.
+                        assert_eq!(
+                            (second.restored, second.accounted, second.remaining),
+                            (1, 0, 0),
+                            "{extension}: {}",
+                            second.message
+                        );
                     } else {
                         assert!(
                             pending.is_none(),

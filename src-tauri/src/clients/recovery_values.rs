@@ -378,6 +378,7 @@ pub(super) fn remember_progress(
     before: Option<&str>,
     after: Option<&str>,
     values: &[backup_storage::RecoveryValue],
+    resolved: &[String],
 ) -> Result<(), String> {
     let mut refs = std::collections::BTreeMap::<(String, String), (bool, bool)>::new();
     for v in values {
@@ -389,6 +390,10 @@ pub(super) fn remember_progress(
             .map(|t| present(format, t, &v.marker))
             .transpose()?
             .unwrap_or(false);
+        // Resolved by an earlier attempt and still gone: not this attempt's work.
+        if !b && !a && resolved.contains(&v.marker) {
+            continue;
+        }
         let pair = refs
             .entry((v.reference.server.clone(), v.reference.key.clone()))
             .or_default();

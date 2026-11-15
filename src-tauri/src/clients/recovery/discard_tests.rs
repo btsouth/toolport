@@ -556,7 +556,7 @@ fn only_the_canonical_receipt_ignores_status_named_fields() {
         assert_eq!(phase(&row), None);
         // Toolport's own status writes to the receipt still keep consent.
         let current = prepare_discard(&row.id).unwrap();
-        backup_storage::set_issues(Path::new(&row.backup_path), &[]).unwrap();
+        backup_storage::set_issues(Path::new(&row.backup_path), &[], &[]).unwrap();
         backup_storage::set_dismissed(Path::new(&row.backup_path), true).unwrap();
         assert_eq!(prepare_discard(&row.id).unwrap().manifest, current.manifest);
         discard_confirmed(&row.id, &current.manifest).unwrap();

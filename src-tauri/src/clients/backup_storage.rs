@@ -424,12 +424,14 @@ pub(super) fn raw_metadata(text: &str) -> Result<(serde_json::Value, Vec<Referen
     let mut refs = Vec::new();
     let mut dismissed = None;
     let mut issues = None;
+    let mut resolved = None;
     let mut cleanup_state = None;
     let mut available = None;
     let mut phase = None;
     for _ in 0..8 {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
             issues = issues.or_else(|| value.get("recoveryIssues").cloned());
+            resolved = resolved.or_else(|| value.get("recoveryResolved").cloned());
             cleanup_state = cleanup_state.or_else(|| value.get("recoveryCleanupState").cloned());
             available = available.or_else(|| value.get("recoveryAvailable").cloned());
             phase = phase.or_else(|| value.get("discardPhase").cloned());
@@ -451,6 +453,9 @@ pub(super) fn raw_metadata(text: &str) -> Result<(serde_json::Value, Vec<Referen
         value["recoveryDismissed"] = dismissed.unwrap_or(false).into();
         if let Some(issues) = issues {
             value["recoveryIssues"] = issues;
+        }
+        if let Some(resolved) = resolved {
+            value["recoveryResolved"] = resolved;
         }
         if let Some(state) = cleanup_state {
             value["recoveryCleanupState"] = state;
@@ -1786,10 +1791,31 @@ pub(super) fn recovery_values(path: &Path) -> Result<Vec<RecoveryValue>, String>
     }
     Ok(values)
 }
-pub(super) fn set_issues(path: &Path, issues: &[RecoveryIssue]) -> Result<(), String> {
+pub(super) fn set_issues(
+    path: &Path,
+    issues: &[RecoveryIssue],
+    resolved: &[String],
+) -> Result<(), String> {
     // A restore attempt checked every remaining value, so an older Scan's
     // "ready" result no longer describes them.
-    set_status(path, issues, &[])
+    set_status(path, issues, &[])?;
+    let text = std::fs::read_to_string(path).map_err(|_| "Could not update recovery status")?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| diagnostics::json(&e))?;
+    value["recoveryResolved"] =
+        serde_json::to_value(resolved).map_err(|e| diagnostics::json(&e))?;
+    crate::registry::atomic_write(
+        path,
+        &serde_json::to_string(&value).map_err(|e| diagnostics::json(&e))?,
+    )
+}
+/// Markers an earlier attempt already resolved (restored, or edited by the
+/// user). A later attempt does not count them again.
+pub(super) fn resolved_markers(raw: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| serde_json::from_value(value["recoveryResolved"].clone()).ok())
+        .unwrap_or_default()
 }
 /// A value a noninteractive Scan authenticated. Never contains value text.
 #[derive(Clone, Serialize, Deserialize)]

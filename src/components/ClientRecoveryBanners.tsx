@@ -396,7 +396,7 @@ export function ClientRecoveryBanners({
                     )}
                     <Button
                       data-recovery-focus={`discard-${row.id}`}
-                      variant={row.discardStarted ? "default" : "outline"}
+                      variant={row.discardStarted ? "destructive" : "outline"}
                       disabled={!!busy}
                       onClick={() => void prepareDiscard(row)}
                     >

@@ -703,6 +703,33 @@ mod tests {
             .find(|r| r.path == path.to_string_lossy())
             .unwrap()
     }
+    /// L2: every credential-store state has its own label and next step, and a
+    /// shown step maps back to exactly its state.
+    #[test]
+    fn every_recovery_state_has_distinct_wording_and_next_steps() {
+        let labels: std::collections::BTreeSet<_> = STATES.iter().map(|&s| reason(s).0).collect();
+        let steps: std::collections::BTreeSet<_> =
+            STATES.iter().map(|&s| next_step(s, false)).collect();
+        let discard_steps: std::collections::BTreeSet<_> =
+            STATES.iter().map(|&s| next_step(s, true)).collect();
+        assert_eq!(labels.len(), STATES.len());
+        assert_eq!(steps.len(), STATES.len());
+        assert_eq!(discard_steps.len(), STATES.len());
+        for state in STATES {
+            assert_eq!(
+                state_for_instructions(&next_step(state, false)),
+                Some(state)
+            );
+            assert_eq!(state_for_instructions(&next_step(state, true)), Some(state));
+        }
+        use crate::secrets::BackupSecretError::*;
+        assert_eq!(reason(Locked).0, "keyring locked");
+        assert!(next_step(Locked, false).contains("unlock it"));
+        assert!(next_step(Ambiguous, false).contains("Resolve the duplicates"));
+        assert!(next_step(Missing, false).contains("Re-enter"));
+        assert!(next_step(Corrupt, false).contains("integrity"));
+        assert!(next_step(Unavailable, false).contains("Start or reconnect"));
+    }
     #[test]
     fn shared_values_in_two_clients_keep_independent_recovery_payloads() {
         crate::secrets::tests::with_isolated_vault(|| {
