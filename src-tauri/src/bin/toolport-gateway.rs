@@ -6028,11 +6028,16 @@ fn execute_call(
             // hostile server can't bypass the injection scanner by answering with an
             // error instead of a result (issue #421). A server's own result, failed or
             // not, gets no Toolport text appended: clients parse these blocks.
+            let request = json!({ "arguments": client_arguments });
             let Defended {
                 result: mut out,
                 pii,
-            } = defend_and_shape(reg, srv, tool, client, result, "", shape);
-            let secrets = secrets_replaced_in(&mut out, &client_arguments, opts.direct);
+                secrets: shaped,
+            } = defend_and_shape_for(reg, srv, tool, client, result, "", shape, Some(&request));
+            let secrets = with_shaped(
+                shaped,
+                secrets_replaced_in(&mut out, &client_arguments, opts.direct),
+            );
             if let Some(profiler) = &mut call_profiler {
                 profiler.mark_postprocess();
             }
@@ -6085,11 +6090,25 @@ fn execute_call(
             // Defend first, then audit: the error text runs through the same PII pass as
             // a successful result, and the audit row has to carry that pass's count like
             // the success path does (SBS-607).
+            let request = json!({ "arguments": client_arguments });
             let Defended {
                 result: mut out,
                 pii,
-            } = defend_and_shape(reg, srv, tool, client, result, &trailer, shape);
-            let secrets = secrets_replaced_in(&mut out, &client_arguments, opts.direct);
+                secrets: shaped,
+            } = defend_and_shape_for(
+                reg,
+                srv,
+                tool,
+                client,
+                result,
+                &trailer,
+                shape,
+                Some(&request),
+            );
+            let secrets = with_shaped(
+                shaped,
+                secrets_replaced_in(&mut out, &client_arguments, opts.direct),
+            );
             let defended_err = audited_error_text(&e, &out);
             audit::record_routed_call(
                 reg,
@@ -6126,6 +6145,18 @@ fn secrets_replaced_in(
         let mut copy = out.clone();
         conduit_lib::secret_redact::redact_outgoing_counted(&mut copy, Some(&request))
     }
+}
+
+/// The audit counts of a call: those replaced before shaping plus any the
+/// final pass found after it (a trailer, say).
+fn with_shaped(
+    shaped: Option<std::collections::BTreeMap<String, usize>>,
+    mut after: std::collections::BTreeMap<String, usize>,
+) -> std::collections::BTreeMap<String, usize> {
+    for (name, count) in shaped.into_iter().flatten() {
+        *after.entry(name).or_default() += count;
+    }
+    after
 }
 
 /// Flags for [`execute_call`] that would otherwise be adjacent bools (easy to swap).
@@ -6745,9 +6776,25 @@ fn defend_and_shape(
     srv: &str,
     tool: &str,
     client: Option<&str>,
+    result: Value,
+    trailer: &str,
+    shape: bool,
+) -> Defended {
+    defend_and_shape_for(reg, srv, tool, client, result, trailer, shape, None)
+}
+
+/// [`defend_and_shape`] for a call whose `request` exempts the client's own
+/// values from the redaction that runs before shaping.
+#[allow(clippy::too_many_arguments)]
+fn defend_and_shape_for(
+    reg: &Registry,
+    srv: &str,
+    tool: &str,
+    client: Option<&str>,
     mut result: Value,
     trailer: &str,
     shape: bool,
+    request: Option<&Value>,
 ) -> Defended {
     // Scan untrusted output for injection; record findings, optionally fail closed.
     // Block mode alone must still run the scanner: an org forceBlockOnInjection (or a
@@ -6776,6 +6823,7 @@ fn defend_and_shape(
     if !blocked {
         integrity::label_untrusted_result(srv, &mut result);
     }
+    let mut secrets = None;
     // Cap an oversized result, cache the full body, hand back a head + fetch cursor.
     // A per-server resultBudget overrides the global default (Some(0) = never shape).
     // Code-mode intermediate calls pass `shape = false`: full bodies stay in the
@@ -6794,6 +6842,13 @@ fn defend_and_shape(
 
                 budget
             });
+        // Before the cut: the head and the cached body are both redacted, so
+        // neither a head that ends inside a secret nor a fetch page that
+        // starts inside one returns part of it.
+        secrets = Some(conduit_lib::secret_redact::redact_outgoing_counted(
+            &mut result,
+            request,
+        ));
         shaping::shape_result(&mut result, budget, client);
     }
     if !blocked && shape {
@@ -6806,7 +6861,11 @@ fn defend_and_shape(
             arr.push(json!({ "type": "text", "text": trailer }));
         }
     }
-    Defended { result, pii }
+    Defended {
+        result,
+        pii,
+        secrets,
+    }
 }
 
 /// [`defend_and_shape`]'s output: the agent-facing result, plus what the PII pass did on
@@ -6819,6 +6878,8 @@ struct Defended {
     result: Value,
     /// `None` when PII redaction was off for this call -- see [`pseudonymize_if_enabled`].
     pii: Option<audit::PiiPass>,
+    /// Secrets replaced before shaping, by name; `None` when not shaped.
+    secrets: Option<std::collections::BTreeMap<String, usize>>,
 }
 
 /// Exposed tool names for code-mode `servers.*` stubs: full catalog minus gateway
