@@ -30,6 +30,9 @@ fn selectable(value: &str) -> gtk::Label {
 fn prose(value: &str) -> gtk::Label {
     let label = selectable(value);
     label.set_focusable(false);
+    // A selectable label's focus handler reports Tab as handled even when it
+    // cannot take focus, which stopped Tab at every card. Skip it entirely.
+    label.set_can_focus(false);
     label
 }
 
@@ -1462,5 +1465,119 @@ mod tests {
             gtk::glib::MainContext::default().iteration(false);
         }
         assert!(!page.recovery_busy.get());
+    }
+}
+
+#[cfg(test)]
+mod tab_order_tests {
+    use super::*;
+
+    fn record(
+        id: &str,
+        name: &str,
+        dismissed: bool,
+        error: bool,
+    ) -> crate::clients::recovery::ClientRecovery {
+        crate::clients::recovery::ClientRecovery {
+            id: id.into(),
+            client_id: id.into(),
+            client_name: name.into(),
+            path: format!("/fixture/{id}.json"),
+            backup_path: format!("/fixture/{id}-original.json"),
+            missing: Vec::new(),
+            dismissed,
+            message: format!("{name} is disconnected.\n\nIts original config is back."),
+            description: "Its original config is back.".into(),
+            value_lines: if error {
+                Vec::new()
+            } else {
+                vec!["API_KEY for server: keyring locked".into()]
+            },
+            discard_values: Vec::new(),
+            error: error.then(|| "This recovery file uses an unsupported version.".into()),
+            can_discard: !error,
+            can_retry: true,
+            discard_started: false,
+            discard_action: "Discard these saved values".into(),
+            cleanup: false,
+            instructions: "Unlock your keyring, then choose Retry.".into(),
+            retention: "The recovery backup does not expire automatically.".into(),
+            details: "TOOLPORT_MISSING_CREDENTIAL_0".into(),
+        }
+    }
+
+    fn identity(widget: &gtk::Widget) -> String {
+        let name = widget.widget_name();
+        if name.starts_with("client") {
+            name.to_string()
+        } else {
+            widget.type_().name().to_string()
+        }
+    }
+
+    /// Tab from "Scan clients again" reaches every card's controls in order,
+    /// including a dismissed card, and Shift+Tab walks back out to the scan button.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop"]
+    fn tab_reaches_every_recovery_control_and_shift_tab_returns() {
+        let _data = crate::registry::DataDirTestEnv::new("gtk-recovery-tab-order");
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.RecoveryTabTest")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gtk::gio::Cancellable::NONE).unwrap();
+        let (_, servers, _) = build_content(&app, crate::approval_broker::start_native());
+        let page = ClientPage::new(&app, servers);
+        page.recoveries.borrow_mut().extend([
+            record("codex", "Codex", false, false),
+            record("windsurf", "Windsurf", false, true),
+            record("claude-code", "Claude Code", true, false),
+        ]);
+        page.rebuild_recoveries();
+        let window = gtk::Window::builder()
+            .application(&app)
+            .default_width(1200)
+            .default_height(900)
+            .child(&page.root)
+            .build();
+        window.present();
+        while gtk::glib::MainContext::default().iteration(false) {}
+        let focused = || {
+            gtk::prelude::GtkWindowExt::focus(&window)
+                .map(|widget| identity(&widget))
+                .unwrap_or_default()
+        };
+        let expected = [
+            "ToolportRecoveryValuesView",
+            "client-recovery-retry:codex",
+            "client-recovery-dismiss:codex",
+            "client-recovery-discard:codex",
+            "client-recovery-details:codex",
+            "client-recovery-retry:windsurf",
+            "client-recovery-details:windsurf",
+            "client-recovery-show:claude-code",
+        ];
+        assert!(page.refresh_button.grab_focus());
+        assert_eq!(focused(), "clients-refresh");
+        let mut forward = Vec::new();
+        for _ in expected {
+            assert!(window.child_focus(gtk::DirectionType::TabForward));
+            forward.push(focused());
+        }
+        assert_eq!(forward, expected);
+        let mut backward = Vec::new();
+        for _ in expected {
+            assert!(window.child_focus(gtk::DirectionType::TabBackward));
+            backward.push(focused());
+        }
+        let mut back_expected: Vec<_> = expected[..expected.len() - 1]
+            .iter()
+            .rev()
+            .map(|id| id.to_string())
+            .collect();
+        back_expected.push("clients-refresh".into());
+        assert_eq!(backward, back_expected);
+        window.destroy();
     }
 }
