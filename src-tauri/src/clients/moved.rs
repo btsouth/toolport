@@ -200,14 +200,14 @@ fn load(client_id: &str) -> Result<Option<Record>, String> {
     let path = record_path(client_id)?;
     let text = match mutation::read(&path) {
         Some(value) => value,
-        None => match std::fs::read_to_string(&path) {
+        None => match backup_storage::read(&path) {
             Ok(text) => Some(text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(format!("could not read {}: {e}", path.display())),
         },
     };
     match text {
-        Some(text) => serde_json::from_str(&text)
+        Some(text) => serde_json::from_str(&backup_storage::decode(&text)?)
             .map(Some)
             .map_err(|e| format!("could not read {}: {e}", path.display())),
         None => Ok(None),
@@ -525,7 +525,7 @@ pub(super) fn record_selected(
     // including its live witnesses, rather than the older copy still on disk.
     let previous = match mutation::read(&record_file) {
         Some(value) => value,
-        None => match std::fs::read_to_string(&record_file) {
+        None => match backup_storage::read(&record_file) {
             Ok(bytes) => Some(bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(format!("could not read {}: {e}", record_file.display())),
@@ -974,6 +974,10 @@ pub(super) fn restore(
 /// Drop the client's record once Disconnect has finished with it.
 pub(super) fn forget(client_id: &str) -> Result<(), String> {
     let path = record_path(client_id)?;
+    if backup_storage::missing() {
+        return Ok(());
+    }
+    backup_storage::release(&path)?;
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

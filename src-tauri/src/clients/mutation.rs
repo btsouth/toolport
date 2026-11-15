@@ -352,7 +352,10 @@ fn run_inner<T>(
         let commit = (|| {
             for (auxiliary, text) in pending.auxiliary {
                 auxiliary_recovery.push(super::restore::checkpoint(&auxiliary)?);
-                crate::registry::atomic_write(&auxiliary, &text)?;
+                crate::registry::atomic_write(
+                    &auxiliary,
+                    &backup_storage::encode(&auxiliary, &text)?,
+                )?;
             }
             let recovery = super::restore::remember(
                 client_id,

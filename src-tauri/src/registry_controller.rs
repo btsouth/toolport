@@ -2333,6 +2333,7 @@ fn migrate_client_reviewed_inputs_with(
             // Only staged registry writes run under the client mutation lock. Vault and
             // transport work can prompt or block and must run without either lock.
             let staged = clients::stage_reviewed(client_id, revision, || {
+                crate::clients::backup_storage::protect_existing()?;
                 commit_imports(&current, prepared)
             })?;
             let attempt = (|| {

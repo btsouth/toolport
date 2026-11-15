@@ -17,6 +17,7 @@ use crate::registry::{ManagedEntry, ServerEntry};
 
 #[cfg(windows)]
 pub(crate) mod backup_permissions;
+pub(crate) mod backup_storage;
 mod claude_profiles;
 pub use claude_profiles::ClaudeProfile;
 mod disconnect;
@@ -5686,7 +5687,17 @@ fn read_config_file_disk(path: &Path) -> Result<String, String> {
             MAX_CONFIG_BYTES
         ));
     }
-    std::fs::read_to_string(path).map_err(|e| e.to_string())
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    if path
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "backups")
+    {
+        backup_storage::decode(&text)
+    } else {
+        Ok(text)
+    }
 }
 
 /// Copy a client's config to a timestamped backup. No-op (Ok(None)) if it doesn't
@@ -5760,7 +5771,10 @@ fn backup_file_named(
         }
         stamp += 1;
     };
-    crate::registry::atomic_write(&dest, &read_config_file(path)?)?;
+    crate::registry::atomic_write(
+        &dest,
+        &backup_storage::encode(&dest, &read_config_file(path)?)?,
+    )?;
     prune_backups(&dir, backup_name);
     Ok(Some(dest))
 }
@@ -6092,7 +6106,17 @@ fn entry_to_toml(entry: &ServerEntry) -> toml::Value {
 /// [`registry::atomic_write`], which uses a unique temp name so two writers to
 /// the same config can't clobber each other.
 fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
-    mutation::write(path, contents)
+    let protected = if path
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "backups")
+    {
+        backup_storage::encode(path, contents)?
+    } else {
+        contents.to_string()
+    };
+    mutation::write(path, &protected)
 }
 
 /// Convert a `serde_json::Value` into a `jsonc-parser` CST input so we can splice
@@ -9266,6 +9290,7 @@ fn keep_only_missing_codex_settings(
 /// any servers "Move into gateway" took out of it (UX-03). Restoring first means
 /// a failure in between leaves the client with both, never with neither.
 pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
+    backup_storage::reset_missing();
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
     if let Some(location) = &def.location {
@@ -9273,6 +9298,7 @@ pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
     }
     let mut outcome = mutation::run(client_id, &path, def.format, || {
         let mut outcome = revision_outcome(client_id, uninstall_gateway_inner(client_id))?;
+        outcome.warnings.extend(backup_storage::warnings());
         outcome
             .warnings
             .extend(disconnect_warnings(def.format, &path)?);

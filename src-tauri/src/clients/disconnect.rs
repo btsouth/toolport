@@ -145,6 +145,7 @@ pub(super) fn restore_path(
     format: Format,
     managed: Option<&ManagedEntry>,
 ) -> Result<Vec<String>, String> {
+    backup_storage::reset_missing();
     let (revision, used_move_record) = restore::run(id, path, format, || {
         mutation::disconnecting();
         backup_file(id, path)?;
@@ -167,7 +168,7 @@ pub(super) fn restore_path(
             hook(path);
         }
     });
-    let warnings = disconnect_warnings(format, path)
+    let mut warnings = disconnect_warnings(format, path)
         .map_err(|error| {
             eprintln!(
                 "toolport: could not inspect disconnect warnings at {}: {error}",
@@ -188,6 +189,7 @@ pub(super) fn restore_path(
             recovery_path: None,
         },
     )?;
+    warnings.extend(backup_storage::warnings());
     Ok(warnings)
 }
 

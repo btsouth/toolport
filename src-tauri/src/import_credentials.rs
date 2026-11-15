@@ -108,7 +108,9 @@ impl VaultWrites {
         let previous = secrets::get_vault_secret_result(id, key).map_err(|_| VAULT_FAILURE)?;
         self.receipts
             .push((id.into(), key.into(), previous, value.into()));
-        secrets::set_secret(id, key, value).map_err(|_| VAULT_FAILURE.into())
+        secrets::set_secret(id, key, value).map_err(|_| VAULT_FAILURE.to_string())?;
+        crate::clients::backup_storage::register(id, key, value);
+        Ok(())
     }
     pub(crate) fn keep(&mut self) {
         self.receipts.clear();
@@ -141,6 +143,13 @@ impl VaultWrites {
 pub(crate) fn transaction<T>(
     action: impl FnOnce(&mut VaultWrites) -> Result<T, String>,
 ) -> Result<T, String> {
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            crate::clients::backup_storage::clear();
+        }
+    }
+    let _clear = Clear;
     let mut writes = VaultWrites::default();
     match action(&mut writes) {
         Ok(result) => Ok(result),

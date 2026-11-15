@@ -67,6 +67,13 @@ exit 1''',
         self.assertIn("cleanup failed for bob", result.stderr)
         self.assertIn("Removal will continue", result.stderr)
 
+    def test_removal_uses_each_users_keyring_bus(self):
+        self.accounts(["alice"])
+        (self.root / "alice/.config/Toolport").mkdir(parents=True)
+        self.gateway.write_text('#!/bin/sh\nprintf "%s|%s\\n" "$XDG_RUNTIME_DIR" "$DBUS_SESSION_BUS_ADDRESS" > "' + str(self.calls) + '"\n')
+        self.run_script(self.helper)
+        self.assertEqual(self.calls.read_text().strip(), "/run/user/1000|unix:path=/run/user/1000/bus")
+
     def test_su_fallback_has_no_login_shell_and_handles_spaces(self):
         self.accounts(["alice"])
         spaced = self.root / "alice home"

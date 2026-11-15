@@ -22453,26 +22453,39 @@ fn main() {
                 }
                 conduit_lib::purge::exit_after_removal(if dry_run { 0 } else { 2 });
             }
-            match conduit_lib::purge::run_with_scope(all_installs) {
-                Ok(report) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&report).expect("serializable removal report")
-                    );
-                    conduit_lib::purge::exit_after_removal(if report.leftovers.is_empty() {
-                        0
-                    } else {
-                        1
-                    });
-                }
+            let report_path = match conduit_lib::purge::plan_with_scope(all_installs) {
+                Ok(plan) => std::path::PathBuf::from(plan.report_path),
                 Err(error) => {
-                    println!(
-                        "{}",
-                        json!({"removed":[], "leftovers":[{"path":conduit_lib::registry::conduit_dir().map(|path| path.display().to_string()), "error":error}]})
+                    eprintln!("{error}");
+                    conduit_lib::purge::exit_after_removal(1);
+                }
+            };
+            let report = conduit_lib::purge::run_with_scope(all_installs).unwrap_or_else(|error| {
+                conduit_lib::purge::Report {
+                    leftovers: vec![conduit_lib::purge::Leftover {
+                        path: conduit_lib::registry::conduit_dir()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default(),
+                        error,
+                    }],
+                    ..Default::default()
+                }
+            });
+            if !after_exit {
+                if let Err(error) = conduit_lib::purge::write_report(&report_path, &report) {
+                    eprintln!(
+                        "Could not write removal report {}: {error}",
+                        report_path.display()
                     );
                     conduit_lib::purge::exit_after_removal(1);
                 }
+                eprintln!("Removal report: {}", report_path.display());
             }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).expect("serializable removal report")
+            );
+            conduit_lib::purge::exit_after_removal(if report.leftovers.is_empty() { 0 } else { 1 });
         }
         ArgAction::DisconnectAll { dry_run, uninstall } => {
             if conduit_lib::registry::conduit_dir().is_none_or(|dir| !dir.exists()) {

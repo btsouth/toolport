@@ -25,6 +25,10 @@ struct Snapshot {
     jsonc_settings: bool,
     #[serde(default)]
     disconnect_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vault_recovery: Option<String>,
+    #[serde(skip)]
+    recovered_vault: bool,
 }
 
 /// Read only valid writer provenance when a forgotten location has no store row.
@@ -36,7 +40,10 @@ pub(super) fn purge_backup_config_paths(dir: &Path) -> Vec<String> {
         .filter_map(|entry| {
             let path = entry.path();
             let name = path.file_name()?.to_str()?;
-            let hash = name.strip_prefix("original-")?.strip_suffix(".json")?;
+            let hash = name
+                .strip_prefix("original-")
+                .or_else(|| name.strip_prefix("released-"))?
+                .strip_suffix(".json")?;
             if hash.len() != 64
                 || !hash
                     .bytes()
@@ -48,7 +55,7 @@ pub(super) fn purge_backup_config_paths(dir: &Path) -> Vec<String> {
             if !metadata.is_file() || crate::purge::is_link(&metadata) {
                 return None;
             }
-            let record: Snapshot = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+            let record: Snapshot = serde_json::from_str(&backup_storage::read(&path).ok()?).ok()?;
             if record.version != 1
                 || !matches!(record.format, Format::JsonMcpServers)
                 || crate::registry::sha256_hex(&record.config_path) != hash
@@ -74,15 +81,43 @@ pub(super) fn record_path(client_id: &str, path: &Path) -> Result<PathBuf, Strin
         .join(format!("original-{hash}.json")))
 }
 
+fn released_path(client_id: &str, path: &Path) -> Result<PathBuf, String> {
+    let original = record_path(client_id, path)?;
+    Ok(
+        original.with_file_name(original.file_name().unwrap().to_string_lossy().replacen(
+            "original-",
+            "released-",
+            1,
+        )),
+    )
+}
+
 fn load(client_id: &str, path: &Path) -> Result<Option<Snapshot>, String> {
     let file = record_path(client_id, path)?;
-    let text = match std::fs::read_to_string(&file) {
+    let text = match backup_storage::read(&file) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match backup_storage::read(&released_path(client_id, path)?) {
+                Ok(text) => text,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
         Err(e) => return Err(format!("could not read {}: {e}", file.display())),
     };
-    let record: Snapshot = serde_json::from_str(&text)
+    let mut record: Snapshot = serde_json::from_str(&text)
         .map_err(|e| format!("could not read {}: {e}", file.display()))?;
+    if let Some(recovery) = record.vault_recovery.as_deref() {
+        let recovered: Snapshot =
+            serde_json::from_str(&backup_storage::decode(recovery)?).map_err(|e| e.to_string())?;
+        if recovered.vault_recovery.is_none() {
+            record.original = recovered.original;
+            record.original_hash = recovered.original_hash;
+            record.baseline = recovered.baseline;
+            record.vault_recovery = None;
+            record.recovered_vault = true;
+        }
+    }
     if record.version != 1
         || record.config_path != path.to_string_lossy()
         || record.original.as_deref().map(crate::registry::sha256_hex) != record.original_hash
@@ -210,6 +245,8 @@ pub(super) fn remember(
                 disconnected: false,
                 jsonc_settings,
                 disconnect_before: None,
+                vault_recovery: None,
+                recovered_vault: false,
             }
         }
     };
@@ -247,7 +284,10 @@ pub(super) fn remember(
     secure_backup_dir(file.parent().ok_or("Could not resolve snapshot parent")?)?;
     crate::registry::atomic_write(
         &file,
-        &serde_json::to_string(&record).map_err(|e| e.to_string())?,
+        &backup_storage::encode(
+            &file,
+            &serde_json::to_string(&record).map_err(|e| e.to_string())?,
+        )?,
     )?;
     Ok(Receipt {
         path: file,
@@ -559,6 +599,7 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
         None
     };
     if record.disconnected
+        && !record.recovered_vault
         && current.as_deref().map(crate::registry::sha256_hex) == record.last_written_hash
     {
         return Ok(true);
@@ -905,14 +946,52 @@ pub(super) fn finish(client_id: &str, path: &Path, expected: Option<&str>) -> Re
                 }
             }
         }
-        // Keep immutable original provenance and a completed-removal marker.
-        // A later uninstaller/retry must not claim the restored native entries.
+        if backup_storage::missing() {
+            // The timestamped vault-backed original remains recoverable after
+            // unlocking. Never delete it after a partial credential recovery.
+            return Ok(());
+        }
+        // Keep only an ownership tombstone; release original config payloads
+        // after the committed revision was checked against the actual file.
+        record.original = None;
+        record.vault_recovery = None;
+        record.original_hash = None;
+        record.baseline = Value::Null;
+        record.last_written = None;
+        record.last_written_hash = None;
         record.disconnected = true;
         record.disconnect_before = None;
+        backup_storage::release(&record_path(client_id, path)?)?;
         crate::registry::atomic_write(
-            &record_path(client_id, path)?,
+            &released_path(client_id, path)?,
             &serde_json::to_string(&record).map_err(|e| e.to_string())?,
         )?;
+        match std::fs::remove_file(record_path(client_id, path)?) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        let name = path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("config");
+        let names = [
+            name.to_string(),
+            claude_settings_backup_name(path),
+            secondary_claude_backup_name(path),
+        ];
+        if let Some(dir) = backup_dir(client_id) {
+            for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let file = entry.file_name().to_string_lossy().into_owned();
+                if file.split_once('-').is_some_and(|(stamp, suffix)| {
+                    stamp.parse::<u128>().is_ok() && names.iter().any(|name| name == suffix)
+                }) {
+                    backup_storage::release(&entry.path())?;
+                    std::fs::remove_file(entry.path()).map_err(|e| e.to_string())?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -925,7 +1004,7 @@ pub(crate) fn after_capture_conflict(
     let dir = crate::registry::conduit_dir().ok_or("Could not resolve mutation lock dir")?;
     let _lock = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
     let mut record: Snapshot =
-        serde_json::from_str(&std::fs::read_to_string(file).map_err(|e| e.to_string())?)
+        serde_json::from_str(&backup_storage::read(file).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
     if record.config_path != target.to_string_lossy() {
         return Err("Client receipt recovery path mismatch".into());
@@ -935,7 +1014,10 @@ pub(crate) fn after_capture_conflict(
         record.exact_eligible = false;
         crate::registry::atomic_write(
             file,
-            &serde_json::to_string(&record).map_err(|e| e.to_string())?,
+            &backup_storage::encode(
+                file,
+                &serde_json::to_string(&record).map_err(|e| e.to_string())?,
+            )?,
         )?;
     }
     Ok(())
@@ -947,7 +1029,7 @@ pub(crate) fn after_rollback(
     written: Option<&str>,
 ) -> Result<(), String> {
     let mut record: Snapshot =
-        serde_json::from_str(&std::fs::read_to_string(file).map_err(|e| e.to_string())?)
+        serde_json::from_str(&backup_storage::read(file).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
     if record.config_path != target.to_string_lossy() {
         return Err("Client rollback recovery path mismatch".into());
@@ -960,7 +1042,10 @@ pub(crate) fn after_rollback(
     record.last_written_hash = written.map(crate::registry::sha256_hex);
     crate::registry::atomic_write(
         file,
-        &serde_json::to_string(&record).map_err(|e| e.to_string())?,
+        &backup_storage::encode(
+            file,
+            &serde_json::to_string(&record).map_err(|e| e.to_string())?,
+        )?,
     )
 }
 
@@ -993,7 +1078,7 @@ pub(super) fn recorded_paths() -> Vec<(String, PathBuf, Result<Format, String>)>
             {
                 continue;
             }
-            let parsed = std::fs::read_to_string(&file)
+            let parsed = backup_storage::read(&file)
                 .map_err(|e| e.to_string())
                 .and_then(|text| {
                     serde_json::from_str::<Snapshot>(&text)
@@ -1061,6 +1146,75 @@ mod tests {
             None
         };
         finish(id, path, revision.as_deref())
+    }
+    #[test]
+    fn vaulted_backup_restores_exact_bytes_and_recovers_without_vault() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            for available in [true, false] {
+                backup_storage::reset_missing();
+                let id = if available {
+                    "vault-present"
+                } else {
+                    "vault-missing"
+                };
+                let path = data.join(format!("{id}-config.json"));
+                let original = "{\r\n  \"mcpServers\" : {\"native\":{\"command\":\"echo\",\"env\":{\"API_KEY\":\"sk-fake-hc-install-secret\"}}}, \"theme\": \"dark\"\r\n}\r\n";
+                std::fs::write(&path, original).unwrap();
+                crate::secrets::set_secret(id, "API_KEY", "sk-fake-hc-install-secret").unwrap();
+                backup_storage::register(id, "API_KEY", "sk-fake-hc-install-secret");
+                mutation::run(id, &path, Format::JsonMcpServers, || {
+                    backup_file(id, &path)?;
+                    moved::record(id, Format::JsonMcpServers, &path)?;
+                    write_format(Format::JsonMcpServers, &path, &[entry()], true)
+                })
+                .unwrap();
+                backup_storage::clear();
+                let dir = backup_dir(id).unwrap();
+                for file in std::fs::read_dir(&dir).unwrap().flatten() {
+                    assert!(
+                        !std::fs::read_to_string(file.path())
+                            .unwrap()
+                            .contains("sk-fake-hc-install-secret"),
+                        "{}",
+                        file.path().display()
+                    );
+                }
+                if !available {
+                    // A different key simulates a locked/lost original vault.
+                    std::env::set_var("TOOLPORT_SECRET_KEY", "unavailable-original-vault");
+                }
+                disconnect(id, &path, Format::JsonMcpServers).unwrap();
+                let restored = std::fs::read_to_string(&path).unwrap();
+                if available {
+                    assert_eq!(restored.as_bytes(), original.as_bytes());
+                    for file in std::fs::read_dir(&dir).unwrap().flatten() {
+                        assert!(!std::fs::read_to_string(file.path())
+                            .unwrap()
+                            .contains("sk-fake-hc-install-secret"));
+                    }
+                } else {
+                    assert_eq!(
+                        restored,
+                        original
+                            .replace("sk-fake-hc-install-secret", "TOOLPORT_MISSING_CREDENTIAL_0")
+                    );
+                    assert!(backup_storage::missing());
+                    assert!(
+                        std::fs::read_dir(&dir).unwrap().count() >= 2,
+                        "recovery retained"
+                    );
+                    std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+                    backup_storage::reset_missing();
+                    disconnect(id, &path, Format::JsonMcpServers).unwrap();
+                    assert_eq!(
+                        std::fs::read(&path).unwrap(),
+                        original.as_bytes(),
+                        "unlock and retry restores every original byte"
+                    );
+                }
+            }
+        });
     }
     #[test]
     fn every_writer_import_connect_move_disconnect_restores_exact_bytes() {
@@ -1453,7 +1607,7 @@ mod tests {
             assert_eq!(read_config_file(&path).unwrap(), restored);
             assert_eq!(
                 load("fixture", &path).unwrap().unwrap().original.as_deref(),
-                Some(original)
+                None, // Successful disconnect must release the original payload.
             );
             if edited {
                 let root = parse_json_value(&restored).unwrap();
@@ -1678,7 +1832,7 @@ mod tests {
             0o644
         );
         assert_eq!(
-            std::fs::metadata(record_path("fixture", &path).unwrap())
+            std::fs::metadata(released_path("fixture", &path).unwrap())
                 .unwrap()
                 .permissions()
                 .mode()

@@ -372,6 +372,27 @@ fn credential_scope(
             ids.remove(&id);
         }
     }
+    // Backup accounts are scoped by the full local path, so another install's
+    // client recovery payloads cannot be swept by this registry's cleanup.
+    if let Ok(clients) = std::fs::read_dir(dir.join("backups")) {
+        for client in clients.flatten() {
+            if client
+                .file_type()
+                .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink())
+            {
+                if let Ok(files) = std::fs::read_dir(client.path()) {
+                    for file in files.flatten() {
+                        if file
+                            .file_type()
+                            .is_ok_and(|kind| kind.is_file() && !kind.is_symlink())
+                        {
+                            ids.insert(crate::clients::backup_storage::account(&file.path()));
+                        }
+                    }
+                }
+            }
+        }
+    }
     Ok(crate::secrets::purge::Scope {
         all_installs,
         server_ids: ids,
@@ -489,7 +510,6 @@ pub fn plan_with_scope(all_installs: bool) -> Result<Plan, String> {
     })
 }
 
-#[cfg(any(feature = "desktop", feature = "gtk-desktop", test))]
 fn open_removal_report(report_path: &Path) -> Result<std::fs::File, String> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -567,6 +587,18 @@ pub fn launch_after_exit(report_path: &Path) -> Result<(), String> {
         std::mem::forget(pipe);
     }
     Ok(())
+}
+
+pub fn write_report(path: &Path, report: &Report) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = open_removal_report(path)?;
+    file.write_all(
+        serde_json::to_string_pretty(report)
+            .map_err(|e| e.to_string())?
+            .as_bytes(),
+    )
+    .map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())
 }
 
 pub fn run() -> Result<Report, String> {
@@ -842,6 +874,8 @@ fn remove_path(path: &Path, report: &mut Report) {
 // Names come from registry/profile stores, clients, telemetry, daemon/broker,
 // secrets, Teams, native-shell state and the gateway's persisted caches.
 const DATA_FILES: &[&str] = &[
+    "ui-settings.json",
+    "ui-settings.lock",
     "client-locations.json",
     "registry.json",
     "registry-recovery.json",
@@ -938,6 +972,21 @@ fn owned_data_name(name: &str, legacy: &std::collections::HashSet<String>) -> bo
 }
 
 fn owned_data_file(name: &str) -> bool {
+    if name.strip_suffix(".bak").is_some_and(|base| {
+        base == "tool-pins.json"
+            || base
+                .strip_prefix("tool-pins-v2-")
+                .and_then(|s| s.strip_suffix(".json"))
+                .is_some_and(|s| hex_name(s, 64))
+    }) || name
+        .strip_prefix("ui-settings.json.corrupt-")
+        .is_some_and(|suffix| {
+            let parts: Vec<_> = suffix.split('-').collect();
+            parts.len() == 3 && parts.iter().all(|part| decimal(part))
+        })
+    {
+        return true;
+    }
     if DATA_FILES.contains(&name)
         || matches!(
             name,
@@ -1052,6 +1101,7 @@ fn backup_file(client: &crate::clients::PurgeBackupClient, name: &str) -> bool {
     name == "moved-servers.json"
         || name
             .strip_prefix("original-")
+            .or_else(|| name.strip_prefix("released-"))
             .and_then(|s| s.strip_suffix(".json"))
             .is_some_and(|s| hex_name(s, 64))
         || name.split_once('-').is_some_and(|(stamp, basename)| {
@@ -1579,6 +1629,27 @@ fn startup_files(files: Vec<PathBuf>, remove: bool, report: &mut Report) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn recognizes_ui_settings_and_pin_recovery_files() {
+        let legacy = Default::default();
+        for name in [
+            "ui-settings.json",
+            "ui-settings.lock",
+            "ui-settings.json.123.1.conduit-tmp",
+            "ui-settings.json.corrupt-123-12-0",
+            "tool-pins.json.bak",
+            &format!("tool-pins-v2-{}.json.bak", "a".repeat(64)),
+        ] {
+            assert!(owned_data_name(name, &legacy), "{name}");
+        }
+        for name in [
+            "ui-settings-notes.json",
+            "tool-pins-custom.json.bak",
+            "ui-settings.json.corrupt-notes",
+        ] {
+            assert!(!owned_data_name(name, &legacy), "{name}");
+        }
+    }
     #[test]
     fn review_r4_purge_removes_only_exact_unreadable_pin_copies() {
         let env = crate::registry::DataDirTestEnv::new("purge-unreadable-pins");
