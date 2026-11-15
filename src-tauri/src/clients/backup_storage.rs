@@ -73,14 +73,19 @@ struct PlainBackup {
     text: String,
 }
 /// One spelling per backup file for provenance hashes, however the data folder
-/// was reached: the parent folder is resolved (symlinks, Windows 8.3 short
-/// names), and on Windows the verbatim prefix, separators and case are folded.
+/// was reached: the nearest existing folder above the file is resolved
+/// (symlinks, Windows 8.3 short names) and the missing rest appended, so a
+/// hash taken before the client's backup folder exists matches one taken
+/// after. On Windows the verbatim prefix, separators and case are folded.
 fn path_identity(path: &Path) -> String {
     let resolved = path
         .parent()
-        .and_then(|parent| std::fs::canonicalize(parent).ok())
-        .zip(path.file_name())
-        .map(|(parent, name)| parent.join(name))
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .find_map(|ancestor| {
+            let base = std::fs::canonicalize(ancestor).ok()?;
+            Some(base.join(path.strip_prefix(ancestor).ok()?))
+        })
         .unwrap_or_else(|| path.to_path_buf());
     fold_spelling(&resolved.to_string_lossy(), cfg!(windows))
 }
@@ -529,10 +534,30 @@ pub(super) fn set_dismissed(path: &Path, dismissed: bool) -> Result<(), String> 
     let mut value: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| diagnostics::json(&e))?;
     value["recoveryDismissed"] = dismissed.into();
-    crate::registry::atomic_write(
-        path,
-        &serde_json::to_string(&value).map_err(|e| e.to_string())?,
-    )
+    crate::registry::atomic_write(path, &wrapper_json(&value)?)
+}
+
+const WRAPPER_KEYS: [&str; 2] = ["toolportBackupVersion", "toolportPlainBackupVersion"];
+/// Serializes a wrapper rewritten as a JSON value with its version key first.
+/// serde_json sorts object keys, which would bury the marker `wrapper_marked`
+/// relies on after an alphabetically earlier field.
+fn wrapper_json(value: &serde_json::Value) -> Result<String, String> {
+    let json = |v: &serde_json::Value| serde_json::to_string(v).map_err(|e| diagnostics::json(&e));
+    let Some(map) = value.as_object() else {
+        return json(value);
+    };
+    let Some(key) = WRAPPER_KEYS.into_iter().find(|key| map.contains_key(*key)) else {
+        return json(value);
+    };
+    let mut rest = map.clone();
+    let version = rest.remove(key).unwrap_or_default();
+    let rest = json(&serde_json::Value::Object(rest))?;
+    let rest = &rest[1..rest.len() - 1];
+    Ok(format!(
+        "{{\"{key}\":{}{}{rest}}}",
+        json(&version)?,
+        if rest.is_empty() { "" } else { "," }
+    ))
 }
 
 /// Toolport's wrappers are serialized with their version key first. A file
@@ -541,12 +566,9 @@ pub(super) fn set_dismissed(path: &Path, dismissed: bool) -> Result<(), String> 
 /// only mentions the key inside a value does not start this way.
 fn wrapper_marked(text: &str) -> bool {
     let text = text.trim_start();
-    [
-        "{\"toolportBackupVersion\":",
-        "{\"toolportPlainBackupVersion\":",
-    ]
-    .iter()
-    .any(|marker| text.starts_with(marker))
+    WRAPPER_KEYS
+        .iter()
+        .any(|key| text.starts_with(&format!("{{\"{key}\":")))
 }
 
 pub(super) fn decode(text: &str) -> Result<String, String> {
@@ -1159,6 +1181,136 @@ mod tests {
             let read = super::super::read_client_backup(&through_alias, &source);
             std::fs::remove_file(&alias).unwrap();
             assert_eq!(read.unwrap(), bytes);
+        });
+    }
+
+    /// `wrapper_marked` needs the version key first in every file Toolport
+    /// writes, including status rewrites that go through a JSON value (which
+    /// serde_json would otherwise sort alphabetically), so a truncated copy of
+    /// any of them is refused instead of being taken for config bytes.
+    #[test]
+    fn every_wrapper_writer_keeps_the_version_key_first() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            clear();
+            reset_missing();
+            let dir = crate::registry::conduit_dir()
+                .unwrap()
+                .join("backups/cursor");
+            std::fs::create_dir_all(&dir).unwrap();
+            let source = dir.join("../../native/mcp.json");
+            register("a", "API_KEY", "sk-wrapper-order-fixture");
+            let vaulted = dir.join("1-mcp.json");
+            let plain = dir.join("2-mcp.json");
+            std::fs::write(
+                &vaulted,
+                encode(
+                    &vaulted,
+                    "{\"mcpServers\":{\"a\":{\"env\":{\"API_KEY\":\"sk-wrapper-order-fixture\"}}}}",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            std::fs::write(&plain, encode_backup(&plain, "{}", false, &source).unwrap()).unwrap();
+            let issue = RecoveryIssue {
+                reference: Reference {
+                    server: "a".into(),
+                    key: "API_KEY".into(),
+                },
+                marker: "TOOLPORT_MISSING_CREDENTIAL_0".into(),
+                state: crate::secrets::BackupSecretError::Locked,
+            };
+            let check = |path: &Path, step: &str| {
+                let text = std::fs::read_to_string(path).unwrap();
+                assert!(
+                    wrapper_marked(&text),
+                    "{step} moved the version key: {}",
+                    &text[..40]
+                );
+                assert!(
+                    decode(&text[..text.len() / 2]).is_err(),
+                    "{step}: truncated copy accepted"
+                );
+            };
+            for (path, key) in [(&vaulted, WRAPPER_KEYS[0]), (&plain, WRAPPER_KEYS[1])] {
+                let text = std::fs::read_to_string(path).unwrap();
+                assert!(text.starts_with(&format!("{{\"{key}\":1,")), "{key}");
+                check(path, key);
+                set_dismissed(path, true).unwrap();
+                check(path, "set_dismissed");
+                set_issues(path, std::slice::from_ref(&issue), &["m".into()]).unwrap();
+                check(path, "set_issues");
+                set_status(path, &[], &[]).unwrap();
+                check(path, "set_status");
+                set_discard_phase(path, DiscardPhase::Started).unwrap();
+                check(path, "set_discard_phase");
+                set_cleanup_state(path, crate::secrets::BackupSecretError::Locked).unwrap();
+                check(path, "set_cleanup_state");
+                let raw = std::fs::read_to_string(path).unwrap();
+                remember_pending_revision(path, &raw, Some("h"), true).unwrap();
+                check(path, "remember_pending_revision");
+            }
+            clear();
+            reset_missing();
+        });
+    }
+
+    /// The first backup for a client is encoded before its folder exists. With
+    /// the data folder behind a symlink, the hash taken then must match the
+    /// one taken once the folder exists, for reading, Retry and cleanup.
+    #[cfg(unix)]
+    #[test]
+    fn first_backup_behind_a_symlinked_data_folder_keeps_its_identity() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            clear();
+            reset_missing();
+            let real = crate::registry::conduit_dir().unwrap();
+            let alias = real.with_file_name(format!(
+                "{}-link",
+                real.file_name().unwrap().to_string_lossy()
+            ));
+            std::os::unix::fs::symlink(&real, &alias).unwrap();
+            let dir = alias.join("backups/new-client");
+            assert!(!dir.exists());
+            let source = alias.join("native/mcp.json");
+            let secret = "sk-first-backup-fixture";
+            let bytes =
+                format!("{{\"mcpServers\":{{\"a\":{{\"env\":{{\"API_KEY\":\"{secret}\"}}}}}}}}");
+            register("a", "API_KEY", secret);
+            let backup = dir.join("1-mcp.json");
+            let encoded = encode_backup(&backup, &bytes, false, &source).unwrap();
+            let plain = dir.join("2-hooks.json");
+            let plain_encoded = encode_backup(&plain, "{}", false, &source).unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&backup, &encoded).unwrap();
+            std::fs::write(&plain, &plain_encoded).unwrap();
+            clear();
+            let outcome = (|| -> Result<(), String> {
+                assert_eq!(
+                    source_path(&backup)?.as_deref(),
+                    Some(&*source.to_string_lossy())
+                );
+                assert_eq!(
+                    source_path(&plain)?.as_deref(),
+                    Some(&*source.to_string_lossy())
+                );
+                assert_eq!(super::super::read_client_backup(&backup, &source)?, bytes);
+                assert_eq!(read(&backup).map_err(|e| e.to_string())?, bytes);
+                let (account, key, count) = test_recovery_key(&backup);
+                assert_eq!(count, 1);
+                release(&backup)?;
+                for name in [key.clone(), format!("{key}-credential-0")] {
+                    assert_eq!(
+                        crate::secrets::get_backup_secret_result(&account, &name)?,
+                        None,
+                        "cleanup by prefix must reach {name}"
+                    );
+                }
+                Ok(())
+            })();
+            std::fs::remove_file(&alias).unwrap();
+            clear();
+            reset_missing();
+            outcome.unwrap();
         });
     }
 
@@ -1906,10 +2058,7 @@ pub(super) fn set_issues(
         serde_json::from_str(&text).map_err(|e| diagnostics::json(&e))?;
     value["recoveryResolved"] =
         serde_json::to_value(resolved).map_err(|e| diagnostics::json(&e))?;
-    crate::registry::atomic_write(
-        path,
-        &serde_json::to_string(&value).map_err(|e| diagnostics::json(&e))?,
-    )
+    crate::registry::atomic_write(path, &wrapper_json(&value)?)
 }
 /// Markers an earlier attempt already resolved (restored, or edited by the
 /// user). A later attempt does not count them again.
@@ -1944,10 +2093,7 @@ pub(super) fn set_status(
         value["recoveryAvailable"] =
             serde_json::to_value(ready).map_err(|e| diagnostics::json(&e))?;
     }
-    crate::registry::atomic_write(
-        path,
-        &serde_json::to_string(&value).map_err(|e| diagnostics::json(&e))?,
-    )
+    crate::registry::atomic_write(path, &wrapper_json(&value)?)
 }
 
 /// Explicit Discard progress. It only restricts restoration and display; it
@@ -1981,10 +2127,7 @@ pub(super) fn set_discard_phase(path: &Path, phase: DiscardPhase) -> Result<(), 
     let mut value: serde_json::Value =
         serde_json::from_str(&text).map_err(|_| "Could not update recovery status")?;
     value["discardPhase"] = serde_json::to_value(phase).map_err(|e| diagnostics::json(&e))?;
-    crate::registry::atomic_write(
-        path,
-        &serde_json::to_string(&value).map_err(|e| diagnostics::json(&e))?,
-    )
+    crate::registry::atomic_write(path, &wrapper_json(&value)?)
 }
 
 #[cfg(test)]
@@ -2040,10 +2183,7 @@ pub(super) fn set_cleanup_state(
         serde_json::from_str(&text).map_err(|e| diagnostics::json(&e))?;
     value["recoveryCleanupState"] =
         serde_json::to_value(state).map_err(|e| diagnostics::json(&e))?;
-    crate::registry::atomic_write(
-        path,
-        &serde_json::to_string(&value).map_err(|e| diagnostics::json(&e))?,
-    )
+    crate::registry::atomic_write(path, &wrapper_json(&value)?)
 }
 
 pub(super) fn remember_pending_revision(
@@ -2058,8 +2198,5 @@ pub(super) fn remember_pending_revision(
         .map(serde_json::Value::from)
         .unwrap_or(serde_json::Value::Null);
     value["exactEligible"] = eligible.into();
-    crate::registry::atomic_write(
-        path,
-        &serde_json::to_string(&value).map_err(|e| diagnostics::json(&e))?,
-    )
+    crate::registry::atomic_write(path, &wrapper_json(&value)?)
 }
