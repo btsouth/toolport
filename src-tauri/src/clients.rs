@@ -5675,6 +5675,22 @@ fn read_config_file(path: &Path) -> Result<String, String> {
     read_config_file_disk(path)
 }
 
+/// A copy in `<data dir>/backups/<client>/`, never a user config that merely
+/// sits under some other folder named `backups`.
+fn is_toolport_backup(path: &Path) -> bool {
+    let Some(parent) = path.parent().and_then(Path::parent) else {
+        return false;
+    };
+    if parent.file_name().is_none_or(|name| name != "backups") {
+        return false;
+    }
+    let Some(root) = crate::registry::conduit_dir().map(|dir| dir.join("backups")) else {
+        return false;
+    };
+    let canonical = |dir: &Path| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.into());
+    canonical(parent) == canonical(&root)
+}
+
 fn read_config_file_disk(path: &Path) -> Result<String, String> {
     // `metadata` follows symlinks, so this reflects the real target's type/size.
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
@@ -5693,12 +5709,7 @@ fn read_config_file_disk(path: &Path) -> Result<String, String> {
         ));
     }
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    if path
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::file_name)
-        .is_some_and(|name| name == "backups")
-    {
+    if is_toolport_backup(path) {
         backup_storage::decode(&text)
     } else {
         Ok(text)
@@ -6118,12 +6129,7 @@ fn entry_to_toml(entry: &ServerEntry) -> toml::Value {
 /// [`registry::atomic_write`], which uses a unique temp name so two writers to
 /// the same config can't clobber each other.
 fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
-    let protected = if path
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::file_name)
-        .is_some_and(|name| name == "backups")
-    {
+    let protected = if is_toolport_backup(path) {
         backup_storage::encode(path, contents)?
     } else {
         contents.to_string()
@@ -10639,6 +10645,30 @@ mod tests {
     }
 
     use super::*;
+
+    /// Only Toolport's own backups folder holds wrapped copies. A user config
+    /// that happens to live under some other folder named `backups` is native.
+    #[test]
+    fn configs_under_a_foreign_backups_folder_stay_native() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let root = std::env::temp_dir().join(format!(
+                "toolport-foreign-backups-{}-{}",
+                std::process::id(),
+                epoch_millis()
+            ));
+            let path = root.join("backups/.codex/config.toml");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let secret = "sk-foreign-backups-folder-fixture";
+            let text = format!("[mcp_servers.native.env]\nAPI_KEY = \"{secret}\"\n");
+            backup_storage::register("native", "API_KEY", secret);
+            let written = atomic_write(&path, &text);
+            backup_storage::clear();
+            written.unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+            assert_eq!(read_config_file_disk(&path).unwrap(), text);
+            std::fs::remove_dir_all(root).unwrap();
+        });
+    }
 
     #[test]
     fn client_parse_diagnostics_never_expose_credential_source() {
