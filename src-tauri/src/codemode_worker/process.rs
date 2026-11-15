@@ -9,7 +9,8 @@ use serde_json::{json, Value};
 
 use super::{memory, FetchFrameArgs, Frame};
 use crate::codemode::{
-    self, CallBinding, CallRecord, FetchBinding, Limits, ScriptInput, ScriptOutcome,
+    self, CallBinding, CallRecord, DescribeBinding, FetchBinding, Limits, ScriptInput,
+    ScriptOutcome,
 };
 use crate::downstream::CancelContext;
 
@@ -131,6 +132,7 @@ pub fn run_script(
     input: ScriptInput,
     call: CallBinding,
     fetch: Option<FetchBinding>,
+    describe: Option<DescribeBinding>,
     limits: Limits,
     catalog: &[String],
     cancel: Option<CancelContext>,
@@ -295,12 +297,19 @@ pub fn run_script(
                 }
                 checkpoint = Some(value);
             }
-            Event::Frame(frame @ (Frame::Call { .. } | Frame::Fetch { .. })) => {
+            Event::Frame(
+                frame @ (Frame::Call { .. } | Frame::Fetch { .. } | Frame::Describe { .. }),
+            ) => {
                 let id = match &frame {
-                    Frame::Call { id, .. } | Frame::Fetch { id, .. } => *id,
+                    Frame::Call { id, .. }
+                    | Frame::Fetch { id, .. }
+                    | Frame::Describe { id, .. } => *id,
                     _ => unreachable!(),
                 };
-                if calls >= limits.max_calls || !seen_ids.insert(id) {
+                // describe is a catalog lookup: it spends no call budget, matching
+                // the in-worker accounting.
+                let budgeted = !matches!(frame, Frame::Describe { .. });
+                if (budgeted && calls >= limits.max_calls) || !seen_ids.insert(id) {
                     break Err(
                         "code mode worker exceeded its call budget or reused a request id"
                             .to_string(),
@@ -314,7 +323,9 @@ pub fn run_script(
                 if super::json_size(&frame, super::MAX_VALUE_BYTES).is_none() {
                     break Err("code mode host arguments exceed the value limit".to_string());
                 }
-                calls += 1;
+                if budgeted {
+                    calls += 1;
+                }
                 inflight += 1;
                 if let Frame::Call { index, .. } = &frame {
                     if *index >= limits.max_calls || !seen_indices.insert(*index) {
@@ -323,6 +334,7 @@ pub fn run_script(
                 }
                 let call = Arc::clone(&call);
                 let fetch = fetch.clone();
+                let describe = describe.clone();
                 let progress = Arc::clone(&progress);
                 let events = events.clone();
                 let permit = Arc::clone(&permit);
@@ -332,6 +344,7 @@ pub fn run_script(
                         // A timed-out binding retains its permit until it drains, so
                         // repeated failures cannot accumulate unlimited host threads.
                         let _permit = permit;
+                        let mut describing = false;
                         let (name, result) = match frame {
                             Frame::Call {
                                 index, name, args, ..
@@ -364,6 +377,17 @@ pub fn run_script(
                                         });
                                 (None, result)
                             }
+                            Frame::Describe { name, .. } => {
+                                let run = || match describe {
+                                    Some(describe) => describe(&name),
+                                    None => Value::Null,
+                                };
+                                let result =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+                                        .unwrap_or(Value::Null);
+                                describing = true;
+                                (None, result)
+                            }
                             _ => unreachable!(),
                         };
                         let result_bytes = super::json_size(&result, super::MAX_FRAME_BYTES);
@@ -385,6 +409,8 @@ pub fn run_script(
                         }
                         let reply = if is_call {
                             Frame::CallResult { id, result }
+                        } else if describing {
+                            Frame::DescribeResult { id, result }
                         } else {
                             Frame::FetchResult { id, result }
                         };
@@ -464,7 +490,9 @@ impl WorkerClient {
             let error = loop {
                 match super::read_frame(&mut reader) {
                     Ok(Some(
-                        Frame::CallResult { id, result } | Frame::FetchResult { id, result },
+                        Frame::CallResult { id, result }
+                        | Frame::FetchResult { id, result }
+                        | Frame::DescribeResult { id, result },
                     )) => {
                         let sender = replies
                             .lock()
@@ -603,6 +631,17 @@ fn worker_run() {
             id,
         )
     });
+    let describe_client = client.clone();
+    let describe: DescribeBinding = Arc::new(move |name| {
+        let id = describe_client.next_id.fetch_add(1, Ordering::Relaxed);
+        describe_client.request(
+            Frame::Describe {
+                id,
+                name: name.into(),
+            },
+            id,
+        )
+    });
     let input = if immutable {
         ScriptInput::ImmutableInput(input)
     } else {
@@ -626,6 +665,7 @@ fn worker_run() {
         input,
         call,
         Some(fetch),
+        Some(describe),
         limits,
         &catalog,
         Some(checkpoint),

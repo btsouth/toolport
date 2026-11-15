@@ -581,6 +581,34 @@ fn host_calls_remain_ordered_and_completed_work_survives_worker_failure() {
     gateway.assert_alive();
 }
 
+/// `toolport.describe` crosses the worker boundary as its own frame, costs no call
+/// budget and leaves the progress ledger empty, in execution and in a dry run.
+#[test]
+fn isolated_describe_returns_signature_and_schema() {
+    let mut gateway = Gateway::configured(mock_registry, None);
+    gateway.wait_for_tool(None, "s__echo");
+    let script = "const d = toolport.describe(servers.s.echo); \
+        const missing = toolport.describe('s__nope'); \
+        toolport.checkpoint({ sig: d.signature, props: Object.keys(d.inputSchema.properties), missing }); \
+        throw new Error('sig=' + d.signature);";
+    for validate in [false, true] {
+        let result = gateway.run(json!({ "script": script, "validate": validate }));
+        let text = result.to_string();
+        assert!(
+            text.contains("servers.s.echo(args?: {text?: string}): ToolResult"),
+            "validate={validate}: {text}"
+        );
+        if !validate {
+            let metadata = &result["structuredContent"]["toolportScript"];
+            assert_eq!(metadata["checkpoint"]["props"], json!(["text"]), "{result}");
+            assert_eq!(metadata["checkpoint"]["missing"], Value::Null, "{result}");
+            assert_eq!(metadata["calls"], 0, "{result}");
+            assert_eq!(metadata["progress"], json!([]), "{result}");
+        }
+    }
+    gateway.assert_alive();
+}
+
 #[test]
 fn isolated_host_calls_preserve_confirmation_pii_and_rate_limits() {
     let mut gateway = Gateway::configured(

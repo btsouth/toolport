@@ -61,6 +61,7 @@ use conduit_lib::session_observability as observation;
 use conduit_lib::session_store::SessionStore;
 use conduit_lib::shaping;
 use conduit_lib::tool_definitions::{CatalogRef, SerializedTools, SharedTools, ToolCatalog};
+use conduit_lib::tool_signature;
 use conduit_lib::topology::LaunchKey;
 
 #[cfg(any(unix, windows))]
@@ -1547,7 +1548,9 @@ fn run_script_tool_def() -> Value {
             structuredContent.toolportScript.progress lists the calls that already ran in order; \
             resume by index, and use toolport.checkpoint(value) to record your own resume state. For \
             a reusable orchestration, pass immutable `input` plus `inputSchema`. Gates match \
-            toolport_call_tool.",
+            toolport_call_tool. A search hit ends with the tool's script signature, shortened when \
+            long; toolport.describe(name) returns the full {name, signature, inputSchema}. \
+            A call returns the MCP result {content, structuredContent, isError}.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3588,6 +3591,38 @@ fn project_search_results(tools: &[&Value], include_top_schema: bool) -> Vec<Val
         } else { entry["schemaOmitted"] = json!(true); }
         entry
     }).collect()
+}
+
+/// Code Mode only: give each search hit the signature of its script call. A menu row
+/// gains a trailing string; a full definition gains a `signature` field. A long
+/// signature is shortened, never dropped. The output schema only types the return:
+/// it stays out of the listed definition (see [`neutralize_listed_tool`]).
+fn add_search_signatures(entries: &mut [Value], source: &[&Value]) {
+    for entry in entries {
+        let name = match &*entry {
+            Value::Array(row) => row.first(),
+            Value::Object(map) => map.get("name"),
+            _ => None,
+        }
+        .and_then(Value::as_str);
+        let Some(tool) = name.and_then(|name| {
+            source
+                .iter()
+                .find(|tool| tool["name"].as_str() == Some(name))
+        }) else {
+            continue;
+        };
+        let Some(signature) = tool_signature::signature(tool) else {
+            continue;
+        };
+        match entry {
+            Value::Array(row) => row.push(Value::String(signature)),
+            Value::Object(map) => {
+                map.insert("signature".into(), Value::String(signature));
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Append this process's health notes, such as a client moved to a private
@@ -6399,7 +6434,7 @@ fn script_catalog_tools(
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
         .filter(|n| !codemode::is_code_mode_meta_tool(n))
         .filter(|n| {
-            let Some((server, tool)) = codemode::split_exposed_name(n) else {
+            let Some((server, tool)) = codemode::split_script_name(n) else {
                 return false;
             };
             if server.is_empty() || tool.is_empty() {
@@ -6415,6 +6450,35 @@ fn script_catalog_tools(
     names.sort();
     names.dedup();
     names
+}
+
+/// `toolport.describe` over the same scoped names the `servers.*` stubs come from.
+/// The schema gets the neutralisation every listed `inputSchema` gets.
+fn script_describe_binding(tools: SharedTools, catalog: &[String]) -> codemode::DescribeBinding {
+    let in_scope: HashSet<String> = catalog.iter().cloned().collect();
+    Arc::new(move |name: &str| {
+        let Some(tool) = in_scope
+            .contains(name)
+            .then(|| {
+                tools
+                    .iter()
+                    .find(|tool| tool["name"].as_str() == Some(name))
+            })
+            .flatten()
+        else {
+            return Value::Null;
+        };
+        let mut schema = tool
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        integrity::neutralize_value_strings(&mut schema);
+        json!({
+            "name": name,
+            "signature": tool_signature::full_signature(tool),
+            "inputSchema": schema,
+        })
+    })
 }
 
 /// Dry-run a code-mode script: compile it, bind the same client-scoped `servers.*`
@@ -6492,11 +6556,13 @@ fn validate_script(
     let fetch: codemode::FetchBinding =
         Arc::new(|_args: codemode::FetchArgs| json!({ "content": [], "isError": false }));
 
+    let describe = script_describe_binding(cached.shared(), &catalog);
     let outcome = run_code_mode_isolated(
         script,
         input,
         call,
         Some(fetch),
+        Some(describe),
         limits,
         &catalog,
         None,
@@ -6830,11 +6896,13 @@ fn execute_script_dispatch(
         owner_of_exposed_tool(Some(router_arc.as_ref()), &owners, name)
     });
 
+    let describe = script_describe_binding(cached.shared(), &catalog);
     let outcome = run_code_mode_isolated(
         script,
         input,
         call,
         Some(fetch),
+        Some(describe),
         limits,
         &catalog,
         cancel.clone(),
@@ -8198,6 +8266,9 @@ fn handle_request_with_cancel(
                 } else {
                     format!("{lead} {} pinned prerequisite tool(s) included with full schema; unranked prerequisites listed first.", pinned.len())
                 };
+                if host.code_mode_enabled() {
+                    add_search_signatures(&mut entries, &source);
+                }
                 // Count the exact serialized payload sent to the client.
                 let payload = serde_json::to_string(&entries).unwrap_or_default();
                 let matched_schema_bytes = payload.len() as u64;
@@ -21655,6 +21726,7 @@ fn run_code_mode_isolated(
     input: codemode::ScriptInput,
     call: codemode::CallBinding,
     fetch: Option<codemode::FetchBinding>,
+    describe: Option<codemode::DescribeBinding>,
     limits: codemode::Limits,
     catalog: &[String],
     cancel: Option<downstream::CancelContext>,
@@ -21668,11 +21740,11 @@ fn run_code_mode_isolated(
         // Cargo's unit-test harness cannot re-enter the gateway's worker mode.
         // Integration tests exercise the real executable and process boundary.
         let _ = (cancel, host_calls);
-        codemode::run_script_with_input(script, input, call, fetch, limits, catalog)
+        codemode::run_script_with_describe(script, input, call, fetch, describe, limits, catalog)
     }
     #[cfg(not(test))]
     worker::run_script(
-        script, input, call, fetch, limits, catalog, cancel, host_calls,
+        script, input, call, fetch, describe, limits, catalog, cancel, host_calls,
     )
 }
 
@@ -47476,6 +47548,7 @@ mod tests {
     }
 
     include!("../gateway/token_budget_tests.rs");
+    include!("../gateway/code_mode_signature_tests.rs");
 
     #[test]
     fn discovery_surface_token_measurement() {
