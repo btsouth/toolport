@@ -14,6 +14,8 @@ fn isolated_command(root: &std::path::Path, data: &std::path::Path) -> Command {
         }
     }
     let home = root.join("home");
+    // A real account has a home directory in which removal writes its report.
+    std::fs::create_dir_all(&home).expect("create isolated account home");
     command
         .env("TOOLPORT_TEST_ROOT", &home)
         .env("TOOLPORT_DATA_DIR", data)
@@ -784,4 +786,54 @@ fn in_process_client_discovery_requires_test_root() {
     let _restore = RestoreRoot(std::env::var_os("TOOLPORT_TEST_ROOT"));
     std::env::remove_var("TOOLPORT_TEST_ROOT");
     conduit_lib::clients::detect_clients();
+}
+
+#[test]
+fn confirmed_removal_persists_the_console_report_in_the_users_home() {
+    let env = conduit_lib::registry::DataDirTestEnv::new("purge_cli_report");
+    let data = env.dir.join("Toolport");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(
+        data.join("registry.json"),
+        serde_json::to_vec(&conduit_lib::registry::Registry::default()).unwrap(),
+    )
+    .unwrap();
+    let output = isolated_command(&env.dir, &data)
+        .args(["--remove-data", "--confirm"])
+        .env("TOOLPORT_SECRET_KEY", "purge-fixture-key")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let console: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let reports: Vec<_> = std::fs::read_dir(env.dir.join("home"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("Toolport-removal-report-")
+        })
+        .collect();
+    assert_eq!(reports.len(), 1);
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(reports[0].path()).unwrap()).unwrap();
+    assert_eq!(saved, console);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(reports[0].path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    assert!(!data.join("registry.json").exists());
 }
