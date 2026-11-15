@@ -245,11 +245,17 @@ fn debug_log_to(path: &std::path::Path, msg: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    // The secret scrub rewrites this file under the same lock. Redact inside
+    // it, so a secret learned while a scrub runs is still caught, and drop the
+    // line rather than write it unlocked.
+    let Ok(_lock) = crate::registry::lock_at(path) else {
+        return;
+    };
     // Owner-only from creation (SBS-868). URLs here come from the user's
     // config and upstream metadata, so they get the gateway.log treatment.
     let msg = crate::secret_redact::redact_log_text(msg);
     if let Ok(mut f) = crate::registry::open_append_private(path) {
-        let _ = writeln!(f, "{msg}");
+        let _ = f.write_all(format!("{msg}\n").as_bytes());
     }
 }
 
@@ -1932,6 +1938,27 @@ mod tests {
         assert!(!text.contains("oauth-query-key-77Zq"), "{text}");
         assert!(!text.contains("typed-pass-9x"), "{text}");
         assert!(text.starts_with("discovering "), "{text}");
+    }
+
+    /// Failure mode: the debug log appends without the scrub's lock, so a line
+    /// written while a scrub runs keeps a secret learned during it.
+    #[test]
+    fn debug_log_waits_for_the_scrub_lock_and_redacts_inside_it() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-oauth-debug-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        let path = dir.join("oauth-debug.log");
+        let target = path.clone();
+        let text = crate::secret_redact::append_during_scrub_for_test(
+            &path,
+            ("oauth-lock", "API_KEY", "oauth-late-key-Q8rT2wXz"),
+            move || debug_log_to(&target, "token request with oauth-late-key-Q8rT2wXz"),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(text.starts_with("token request with "), "{text}");
+        assert!(!text.contains("oauth-late-key-Q8rT2wXz"), "{text}");
     }
 
     /// The vectors are lifted from `src/lib/openUrl.test.ts`. Keeping them
