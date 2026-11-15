@@ -1130,9 +1130,23 @@ pub fn preload_configured_secrets() {
 pub fn register_inline_secrets(server: &ServerEntry) {
     for e in &server.env {
         let Some(value) = &e.value else { continue };
-        // An unflagged inline value that is credential-shaped (by its name or its
-        // value) is protected too: a hand-edited registry need not set the flag.
-        if e.secret || crate::import_credentials::secret_env(&e.key, Some(value)) {
+        // An unflagged inline value is protected too when its name says it is a
+        // credential or it has a known token prefix: a hand-edited registry need
+        // not set the flag. The value-shape guesses used at import (a long
+        // random-looking string) are not used here: a path or id they flag would
+        // then be redacted from every log line and every result that carries it.
+        let token_prefix = [
+            "sk-",
+            "ghp_",
+            "gho_",
+            "github_pat_",
+            "xox",
+            "AKIA",
+            "-----BEGIN",
+        ]
+        .iter()
+        .any(|prefix| value.trim_start().starts_with(prefix));
+        if e.secret || crate::import_credentials::secret_env(&e.key, None) || token_prefix {
             crate::secret_redact::register(&server.id, &e.key, value);
         }
     }
