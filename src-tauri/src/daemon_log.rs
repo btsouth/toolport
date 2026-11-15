@@ -239,7 +239,17 @@ fn relay_writer(
     done: std::sync::mpsc::Sender<()>,
 ) {
     let mut out = RelayOut::new(out);
+    let mut first = true;
     for msg in from_reader {
+        // The relay writes through a duplicate of the original stderr, so the
+        // two share one file offset. A Rust write begun on the original before
+        // the swap may still be running; where the system does not serialize
+        // writes that share an offset (macOS), the relay's first write could
+        // land at the same offset and one would overwrite the other. Such a
+        // write holds Rust's stderr lock until it returns: wait for it once.
+        if std::mem::take(&mut first) {
+            drop(std::io::stderr().lock());
+        }
         match msg {
             RelayMsg::Data(bytes) => {
                 out.data(&bytes);
