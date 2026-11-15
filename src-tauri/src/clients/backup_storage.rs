@@ -35,6 +35,9 @@ struct Envelope {
     toolport_backup_version: u32,
     account: String,
     hash: String,
+    key: String,
+    #[serde(default)]
+    generations: Vec<(String, usize)>,
     fallback: String,
     references: Vec<Reference>,
 }
@@ -144,6 +147,7 @@ fn redact(text: &str, secret: &str, marker: &str, depth: usize) -> String {
 
 pub(super) fn encode(path: &Path, text: &str) -> Result<String, String> {
     let mut values = IMPORTS.with(|v| v.borrow().clone());
+    let mut generations = Vec::new();
     // Rewrites of an existing snapshot must retain its protection even outside
     // the original import transaction.
     if let Ok(previous) = std::fs::read_to_string(path) {
@@ -153,10 +157,14 @@ pub(super) fn encode(path: &Path, text: &str) -> Result<String, String> {
                 .and_then(|record| record["vaultRecovery"].as_str().and_then(envelope))
         });
         if let Some(previous) = prior {
+            generations = previous.generations;
+            if !generations.iter().any(|(key, _)| key == &previous.key) {
+                generations.push((previous.key.clone(), previous.references.len()));
+            }
             for (index, reference) in previous.references.into_iter().enumerate() {
                 if let Some(value) = crate::secrets::get_vault_secret_result(
                     &previous.account,
-                    &format!("{}-credential-{index}", previous.hash),
+                    &format!("{}-credential-{index}", previous.key),
                 )
                 .ok()
                 .flatten()
@@ -185,23 +193,31 @@ pub(super) fn encode(path: &Path, text: &str) -> Result<String, String> {
         return Ok(text.into());
     }
     let hash = crate::registry::sha256_hex(text);
-    let account = format!(
-        "client-backup-{}",
+    let account = install_account(
+        path.parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .ok_or("Invalid backup path")?,
+    );
+    let key = format!(
+        "{}-{hash}",
         crate::registry::sha256_hex(&path.to_string_lossy())
     );
     // The complete byte spelling lives only in the vault. Publish the fallback
     // only after a verified vault write, before modifying the client's file.
     for (index, value) in retained_values.iter().enumerate() {
-        crate::secrets::set_secret(&account, &format!("{hash}-credential-{index}"), value)?;
+        crate::secrets::set_secret(&account, &format!("{key}-credential-{index}"), value)?;
     }
-    crate::secrets::set_secret(&account, &hash, text)?;
-    if crate::secrets::get_vault_secret_result(&account, &hash)?.as_deref() != Some(text) {
+    crate::secrets::set_secret(&account, &key, text)?;
+    if crate::secrets::get_vault_secret_result(&account, &key)?.as_deref() != Some(text) {
         return Err("Could not verify vaulted client backup. Client config unchanged.".into());
     }
     serde_json::to_string(&Envelope {
         toolport_backup_version: 1,
         account,
         hash,
+        key,
+        generations,
         fallback,
         references,
     })
@@ -212,7 +228,7 @@ pub(super) fn decode(text: &str) -> Result<String, String> {
     let Some(saved) = envelope(text) else {
         return Ok(text.into());
     };
-    match crate::secrets::get_vault_secret_result(&saved.account, &saved.hash) {
+    match crate::secrets::get_vault_secret_result(&saved.account, &saved.key) {
         Ok(Some(payload)) if crate::registry::sha256_hex(&payload) == saved.hash => Ok(payload),
         _ => {
             MISSING.with(|v| *v.borrow_mut() = true);
@@ -264,21 +280,32 @@ pub(super) fn warnings() -> Vec<String> {
     WARNINGS.with(|v| v.borrow().clone())
 }
 
-pub(crate) fn account(path: &Path) -> String {
+pub(crate) fn install_account(dir: &Path) -> String {
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.into());
     format!(
         "client-backup-{}",
-        crate::registry::sha256_hex(&path.to_string_lossy())
+        crate::registry::sha256_hex(&dir.to_string_lossy())
     )
 }
 pub(super) fn release(path: &Path) -> Result<(), String> {
     if let Ok(text) = std::fs::read_to_string(path) {
-        if let Some(saved) = envelope(&text) {
-            crate::secrets::delete_secret(&saved.account, &saved.hash)?;
-            for index in 0..saved.references.len() {
-                crate::secrets::delete_secret(
-                    &saved.account,
-                    &format!("{}-credential-{index}", saved.hash),
-                )?;
+        if let Some(mut saved) = envelope(&text) {
+            saved.generations.push((saved.key, saved.references.len()));
+            let mut generations = std::collections::BTreeMap::<String, usize>::new();
+            for (key, count) in saved.generations {
+                generations
+                    .entry(key)
+                    .and_modify(|old| *old = (*old).max(count))
+                    .or_insert(count);
+            }
+            for (key, count) in generations {
+                crate::secrets::delete_secret(&saved.account, &key)?;
+                for index in 0..count {
+                    crate::secrets::delete_secret(
+                        &saved.account,
+                        &format!("{key}-credential-{index}"),
+                    )?;
+                }
             }
         }
     }
@@ -307,7 +334,7 @@ pub(crate) fn protect_existing() -> Result<(), String> {
             let path = file.path();
             let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
             let payload = match envelope(&raw) {
-                Some(saved) => crate::secrets::get_vault_secret_result(&saved.account, &saved.hash)?
+                Some(saved) => crate::secrets::get_vault_secret_result(&saved.account, &saved.key)?
                     .filter(|payload| crate::registry::sha256_hex(payload) == saved.hash)
                     .ok_or("Unlock the original backup vault before importing more credentials. Client config unchanged.")?,
                 None => raw.clone(),
@@ -350,6 +377,22 @@ mod tests {
                 .unwrap()
                 .contains("sk-original-fake-value"));
             assert_eq!(read(&path).unwrap(), original);
+            let first = envelope(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let rewritten = format!("{original}\n");
+            std::fs::write(&path, encode(&path, &rewritten).unwrap()).unwrap();
+            let last = envelope(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            release(&path).unwrap();
+            for key in [first.key, last.key] {
+                assert!(crate::secrets::get_vault_secret_result(&last.account, &key)
+                    .unwrap()
+                    .is_none());
+                assert!(crate::secrets::get_vault_secret_result(
+                    &last.account,
+                    &format!("{key}-credential-0")
+                )
+                .unwrap()
+                .is_none());
+            }
         });
     }
     #[test]

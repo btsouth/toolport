@@ -372,27 +372,9 @@ fn credential_scope(
             ids.remove(&id);
         }
     }
-    // Backup accounts are scoped by the full local path, so another install's
-    // client recovery payloads cannot be swept by this registry's cleanup.
-    if let Ok(clients) = std::fs::read_dir(dir.join("backups")) {
-        for client in clients.flatten() {
-            if client
-                .file_type()
-                .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink())
-            {
-                if let Ok(files) = std::fs::read_dir(client.path()) {
-                    for file in files.flatten() {
-                        if file
-                            .file_type()
-                            .is_ok_and(|kind| kind.is_file() && !kind.is_symlink())
-                        {
-                            ids.insert(crate::clients::backup_storage::account(&file.path()));
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Every backup generation uses one namespace bound to this data directory.
+    // Inventory it even after backup files were removed or a write was interrupted.
+    ids.insert(crate::clients::backup_storage::install_account(dir));
     Ok(crate::secrets::purge::Scope {
         all_installs,
         server_ids: ids,
@@ -2473,14 +2455,21 @@ mod tests {
         let scope = credential_scope(&dev, &others, false).unwrap();
         assert_eq!(
             scope.server_ids,
-            std::collections::HashSet::from(["dev-only".into()])
+            std::collections::HashSet::from([
+                "dev-only".into(),
+                crate::clients::backup_storage::install_account(&dev)
+            ])
         );
         assert!(!scope.all_installs);
         let scope = credential_scope(&dev, &[], false).unwrap();
         assert!(!scope.all_installs);
         assert_eq!(
             scope.server_ids,
-            std::collections::HashSet::from(["shared".into(), "dev-only".into()])
+            std::collections::HashSet::from([
+                "shared".into(),
+                "dev-only".into(),
+                crate::clients::backup_storage::install_account(&dev)
+            ])
         );
         assert!(credential_scope(&dev, &others, true).unwrap().all_installs);
         std::fs::remove_file(main.join("registry.json")).unwrap();
@@ -2664,7 +2653,10 @@ mod tests {
         assert!(!scope.all_installs, "discovery cannot prove sole ownership");
         assert_eq!(
             scope.server_ids,
-            std::collections::HashSet::from(["mine".into()])
+            std::collections::HashSet::from([
+                "mine".into(),
+                crate::clients::backup_storage::install_account(&selected)
+            ])
         );
     }
 
