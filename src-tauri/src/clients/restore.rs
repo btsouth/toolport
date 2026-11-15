@@ -1404,6 +1404,69 @@ mod tests {
     }
 
     #[test]
+    fn pending_locations_cannot_be_forgotten_and_stale_retry_cannot_disconnect() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let folder = crate::registry::conduit_dir()
+                .unwrap()
+                .join("manual-cursor");
+            std::fs::create_dir_all(&folder).unwrap();
+            let path = folder.join("mcp.json");
+            let original = r#"{"mcpServers":{"native":{"command":"echo","env":{"API_KEY":"sk-pending-location-fixture"}}}}"#;
+            std::fs::write(&path, original).unwrap();
+            let id = locations::add_client_location("cursor", folder.to_str().unwrap()).unwrap();
+            backup_storage::register("native", "API_KEY", "sk-pending-location-fixture");
+            mutation::run(&id, &path, Format::JsonMcpServers, || {
+                backup_file(&id, &path)?;
+                write_format(Format::JsonMcpServers, &path, &[entry()], true)
+            })
+            .unwrap();
+            backup_storage::clear();
+            std::env::set_var("TOOLPORT_SECRET_KEY", "locked-pending-location");
+            disconnect::restore_path(&id, &path, Format::JsonMcpServers, None).unwrap();
+            let notice = recovery::list()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.client_id == id)
+                .unwrap();
+            assert!(locations::remove_client_location(&id)
+                .unwrap_err()
+                .contains("Choose Retry"));
+            recovery::dismiss(&notice.id, true).unwrap();
+            assert!(
+                locations::remove_client_location(&id).is_err(),
+                "dismissal never forgets recovery"
+            );
+            assert!(recovery::list().unwrap().iter().any(|r| r.id == notice.id));
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            let reconnect_id = id.clone();
+            let reconnect_path = path.clone();
+            recovery::BEFORE_RETRY_LOCK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    mutation::run(
+                        &reconnect_id,
+                        &reconnect_path,
+                        Format::JsonMcpServers,
+                        || write_format(Format::JsonMcpServers, &reconnect_path, &[entry()], true),
+                    )
+                    .unwrap();
+                }))
+            });
+            assert!(recovery::retry(&notice.id)
+                .unwrap_err()
+                .contains("no longer pending"));
+            let connected = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                connected.contains("toolport-gateway"),
+                "stale Retry must preserve the new connection"
+            );
+            assert!(locations::lookup(&id).is_some());
+            disconnect::restore_path(&id, &path, Format::JsonMcpServers, None).unwrap();
+            locations::remove_client_location(&id).unwrap();
+            assert!(locations::lookup(&id).is_none());
+        });
+    }
+
+    #[test]
     fn every_writer_import_connect_move_disconnect_restores_exact_bytes() {
         let _lock = crate::registry::data_dir_test_lock();
         let dir = std::env::temp_dir().join(format!(

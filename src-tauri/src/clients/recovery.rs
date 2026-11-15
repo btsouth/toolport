@@ -142,12 +142,25 @@ pub fn dismiss(id: &str, dismissed: bool) -> Result<(), String> {
     let receipt = find(id)?;
     backup_storage::set_dismissed(&receipt.file, dismissed)
 }
+#[cfg(test)]
+thread_local! {
+    pub(super) static BEFORE_RETRY_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
 pub fn retry(id: &str) -> Result<Option<ClientRecovery>, String> {
     let receipt = find(id)?;
+    #[cfg(test)]
+    BEFORE_RETRY_LOCK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
     let _lock = crate::registry_controller::acquire_auth_lock(&format!(
         "client-config:{}",
         receipt.notice.client_id
     ))?;
+    // Connect can replace the receipt while Retry waits for this client lock.
+    // Never restore the stale revision against a newly connected config.
+    let receipt = find(id)?;
     let registry = crate::registry_controller::registry_for_disconnect()?;
     disconnect::restore_path(
         &receipt.notice.client_id,

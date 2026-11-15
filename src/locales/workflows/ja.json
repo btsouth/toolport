@@ -419,5 +419,6 @@
   "{key} for {server}": "{server} の {key}",
   "{client} is disconnected and its original config is back, except values Toolport could not read because your keyring is locked or unavailable: {values}. The config has placeholders for those values for now.": "{client} は切断され、元の設定が復元されました。ただし、キーリングがロックされているか利用できないため、Toolport が読み取れなかった値があります: {values}。設定内の該当箇所には現在、仮の値が入っています。",
   "Unlock your keyring, then choose Retry to put the values back. From a terminal, run toolport-gateway --disconnect-all again.": "キーリングのロックを解除してから「再試行」を選ぶと、値を元に戻せます。ターミナルでは toolport-gateway --disconnect-all をもう一度実行してください。",
-  "{client} recovery backup is kept at {path} until recovery succeeds or you remove Toolport data. It does not expire automatically.": "{client} の復元用バックアップは、復元が成功するか Toolport のデータを削除するまで {path} に保存されます。自動的に期限切れになることはありません。"
+  "{client} recovery backup is kept at {path} until recovery succeeds or you remove Toolport data. It does not expire automatically.": "{client} の復元用バックアップは、復元が成功するか Toolport のデータを削除するまで {path} に保存されます。自動的に期限切れになることはありません。",
+  "{client} still has values waiting for recovery. Choose Retry on the Clients page before removing this location.": "{client} にはまだ復元待ちの値があります。この場所を削除する前に、クライアントページで「再試行」を選んでください。"
 }

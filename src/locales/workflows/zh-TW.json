@@ -419,5 +419,6 @@
   "{key} for {server}": "{server} 的 {key}",
   "{client} is disconnected and its original config is back, except values Toolport could not read because your keyring is locked or unavailable: {values}. The config has placeholders for those values for now.": "{client} 已中斷連線，原始設定已復原，但因為金鑰圈已鎖定或無法使用，Toolport 無法讀取下列值：{values}。設定中的這些位置暫時填入了預留值。",
   "Unlock your keyring, then choose Retry to put the values back. From a terminal, run toolport-gateway --disconnect-all again.": "請解鎖金鑰圈，然後選擇「重試」以還原這些值。在終端機中，請再次執行 toolport-gateway --disconnect-all。",
-  "{client} recovery backup is kept at {path} until recovery succeeds or you remove Toolport data. It does not expire automatically.": "{client} 的復原備份會保留在 {path}，直到復原成功或你移除 Toolport 資料。它不會自動到期。"
+  "{client} recovery backup is kept at {path} until recovery succeeds or you remove Toolport data. It does not expire automatically.": "{client} 的復原備份會保留在 {path}，直到復原成功或你移除 Toolport 資料。它不會自動到期。",
+  "{client} still has values waiting for recovery. Choose Retry on the Clients page before removing this location.": "{client} 仍有等待復原的值。請先在用戶端頁面選擇「重試」，再移除此位置。"
 }

@@ -419,5 +419,6 @@
   "{key} for {server}": "{key} for {server}",
   "{client} is disconnected and its original config is back, except values Toolport could not read because your keyring is locked or unavailable: {values}. The config has placeholders for those values for now.": "{client} is disconnected and its original config is back, except values Toolport could not read because your keyring is locked or unavailable: {values}. The config has placeholders for those values for now.",
   "Unlock your keyring, then choose Retry to put the values back. From a terminal, run toolport-gateway --disconnect-all again.": "Unlock your keyring, then choose Retry to put the values back. From a terminal, run toolport-gateway --disconnect-all again.",
-  "{client} recovery backup is kept at {path} until recovery succeeds or you remove Toolport data. It does not expire automatically.": "{client} recovery backup is kept at {path} until recovery succeeds or you remove Toolport data. It does not expire automatically."
+  "{client} recovery backup is kept at {path} until recovery succeeds or you remove Toolport data. It does not expire automatically.": "{client} recovery backup is kept at {path} until recovery succeeds or you remove Toolport data. It does not expire automatically.",
+  "{client} still has values waiting for recovery. Choose Retry on the Clients page before removing this location.": "{client} still has values waiting for recovery. Choose Retry on the Clients page before removing this location."
 }
