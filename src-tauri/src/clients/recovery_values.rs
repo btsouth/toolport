@@ -187,6 +187,7 @@ fn comments(text: &str, out: &mut Vec<Span>) {
 }
 fn yaml_spans(text: &str) -> Result<Vec<Span>, String> {
     use std::mem::MaybeUninit;
+    #[allow(clippy::unsafe_removed_from_name)]
     use unsafe_libyaml as y;
     struct Parser(Box<MaybeUninit<y::yaml_parser_t>>);
     impl Drop for Parser {

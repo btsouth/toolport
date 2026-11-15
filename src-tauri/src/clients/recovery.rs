@@ -677,6 +677,58 @@ pub fn discard(id: &str) -> Result<(), String> {
     discard_confirmed(id, &confirmation.manifest).map(|_| ())
 }
 
+/// Shared busy prose for the active recovery row in every shell.
+pub fn working_message() -> String {
+    crate::i18n::tr("Working on this recovery…")
+}
+pub fn worker_error() -> String {
+    crate::i18n::tr(
+        "Recovery did not finish reporting its result. Choose Retry to check the current status.",
+    )
+}
+pub fn safe_action_error(id: &str, error: &str) -> String {
+    let row = find(id).ok();
+    let path = row
+        .as_ref()
+        .map(|r| r.notice.path.as_str())
+        .unwrap_or("client config");
+    for format in ["JSON", "TOML", "YAML"] {
+        if error.contains(&format!("{format} syntax error in ")) {
+            if let Some((_, position)) = error.rsplit_once(" at line ") {
+                if let Some((line, column)) = position.split_once(" column ") {
+                    if let (Ok(line), Ok(column)) = (
+                        line.parse::<usize>(),
+                        column.split(';').next().unwrap_or("").parse::<usize>(),
+                    ) {
+                        return crate::i18n::trf("{format} syntax error in {path}, line {line}, column {column}. Fix the syntax, then choose Retry. The saved values are kept.",&[("format",format),("path",path),("line",&line.to_string()),("column",&column.to_string())]);
+                    }
+                }
+            }
+        }
+    }
+    for state in [
+        crate::secrets::BackupSecretError::Locked,
+        crate::secrets::BackupSecretError::Unavailable,
+        crate::secrets::BackupSecretError::Ambiguous,
+        crate::secrets::BackupSecretError::AccessDenied,
+        crate::secrets::BackupSecretError::AuthenticationFailed,
+        crate::secrets::BackupSecretError::Cancelled,
+    ] {
+        if error == next_step(state, true) || error == next_step(state, false) {
+            return error.to_string();
+        }
+    }
+    if error == discard_started_refusal() {
+        return error.to_string();
+    }
+    if let Some(row) = row {
+        if !row.notice.can_discard {
+            return row.notice.error.unwrap_or_else(worker_error);
+        }
+    }
+    crate::i18n::tr("Recovery could not finish. Check the client config and credential-store access, then choose Retry. The recovery record is kept.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -907,56 +959,4 @@ mod tests {
             assert!(done.pending.is_none());
         });
     }
-}
-
-/// Shared busy prose for the active recovery row in every shell.
-pub fn working_message() -> String {
-    crate::i18n::tr("Working on this recovery…")
-}
-pub fn worker_error() -> String {
-    crate::i18n::tr(
-        "Recovery did not finish reporting its result. Choose Retry to check the current status.",
-    )
-}
-pub fn safe_action_error(id: &str, error: &str) -> String {
-    let row = find(id).ok();
-    let path = row
-        .as_ref()
-        .map(|r| r.notice.path.as_str())
-        .unwrap_or("client config");
-    for format in ["JSON", "TOML", "YAML"] {
-        if error.contains(&format!("{format} syntax error in ")) {
-            if let Some((_, position)) = error.rsplit_once(" at line ") {
-                if let Some((line, column)) = position.split_once(" column ") {
-                    if let (Ok(line), Ok(column)) = (
-                        line.parse::<usize>(),
-                        column.split(';').next().unwrap_or("").parse::<usize>(),
-                    ) {
-                        return crate::i18n::trf("{format} syntax error in {path}, line {line}, column {column}. Fix the syntax, then choose Retry. The saved values are kept.",&[("format",format),("path",path),("line",&line.to_string()),("column",&column.to_string())]);
-                    }
-                }
-            }
-        }
-    }
-    for state in [
-        crate::secrets::BackupSecretError::Locked,
-        crate::secrets::BackupSecretError::Unavailable,
-        crate::secrets::BackupSecretError::Ambiguous,
-        crate::secrets::BackupSecretError::AccessDenied,
-        crate::secrets::BackupSecretError::AuthenticationFailed,
-        crate::secrets::BackupSecretError::Cancelled,
-    ] {
-        if error == next_step(state, true) || error == next_step(state, false) {
-            return error.to_string();
-        }
-    }
-    if error == discard_started_refusal() {
-        return error.to_string();
-    }
-    if let Some(row) = row {
-        if !row.notice.can_discard {
-            return row.notice.error.unwrap_or_else(worker_error);
-        }
-    }
-    crate::i18n::tr("Recovery could not finish. Check the client config and credential-store access, then choose Retry. The recovery record is kept.")
 }
