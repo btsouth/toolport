@@ -718,6 +718,10 @@ mockIPC(
             "tool_timeout_sec = 600",
           ],
         };
+      case "preview_gateway_settings":
+        return String(args.clientId ?? "").startsWith("codex")
+          ? ["startup_timeout_sec = 75", "tool_timeout_sec = 600"]
+          : [];
       case "migrate_client":
         if (setupVerifying) return new Promise(() => {});
         if (setupFailure && setupFailure !== "optional")

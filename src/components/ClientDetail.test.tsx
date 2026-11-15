@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ClientDetail } from "./ClientDetail";
 import { importServers, previewImportServers } from "@/lib/api";
@@ -9,6 +9,7 @@ const installGateway = vi.fn();
 const uninstallGateway = vi.fn();
 const migrateClient = vi.fn();
 const removeClientLocation = vi.fn();
+const previewGatewaySettings = vi.fn();
 const toastSuccess = vi.fn();
 const toastError = vi.fn();
 
@@ -32,6 +33,7 @@ vi.mock("@/lib/api", () => ({
       },
     ],
   }),
+  previewGatewaySettings: (...a: unknown[]) => previewGatewaySettings(...a),
   setClientDiscovery: vi.fn(),
   removeClientLocation: (...a: unknown[]) => removeClientLocation(...a),
   importServers: vi.fn(),
@@ -83,6 +85,7 @@ beforeEach(() => {
   installGateway.mockReset();
   uninstallGateway.mockReset();
   migrateClient.mockReset();
+  previewGatewaySettings.mockReset().mockResolvedValue([]);
   toastSuccess.mockReset();
   toastError.mockReset();
 });
@@ -259,6 +262,55 @@ describe("ClientDetail customized entry (SOU-406)", () => {
     await waitFor(() =>
       expect(installGateway).toHaveBeenCalledWith("claude-desktop", undefined, true),
     );
+  });
+
+  it("lists the Codex settings a reset adds before it is confirmed", async () => {
+    installGateway.mockResolvedValue({ backup: false });
+    previewGatewaySettings.mockResolvedValue(["tool_timeout_sec = 600"]);
+    render(
+      <ClientDetail
+        client={{ ...customizedClient(), id: "codex", name: "Codex" }}
+        registry={emptyRegistry()}
+        onChanged={() => {}}
+        onRegistryChange={() => {}}
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: /reset to default/i }));
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      await within(dialog).findByText(/its Codex entry, each only if it is not set/),
+    ).toBeVisible();
+    expect(within(dialog).getByText("tool_timeout_sec = 600")).toBeVisible();
+    expect(previewGatewaySettings).toHaveBeenCalledWith("codex");
+    const confirms = within(dialog).getAllByRole("button", { name: /reset to default/i });
+    await userEvent.click(confirms[confirms.length - 1]!);
+    await waitFor(() =>
+      expect(installGateway).toHaveBeenCalledWith("codex", undefined, true),
+    );
+  });
+
+  it("lists no settings in the reset confirmation for a client that gets none", async () => {
+    previewGatewaySettings.mockResolvedValue([]);
+    render(
+      <ClientDetail
+        client={customizedClient()}
+        registry={emptyRegistry()}
+        onChanged={() => {}}
+        onRegistryChange={() => {}}
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: /reset to default/i }));
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() =>
+      expect(
+        within(dialog)
+          .getAllByRole("button", { name: /reset to default/i })
+          .at(-1),
+      ).toBeEnabled(),
+    );
+    expect(
+      within(dialog).queryByText(/each only if it is not set/),
+    ).not.toBeInTheDocument();
   });
 
   it("keeps sharedHttp untouched on mount and uses stdio on explicit reconnect", async () => {

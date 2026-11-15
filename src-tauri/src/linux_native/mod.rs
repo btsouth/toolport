@@ -3782,6 +3782,12 @@ fn client_reset_label(client: &state::ClientView) -> &'static str {
     }
 }
 
+/// The settings notice a reset confirmation shows, or `None` when a reset adds none.
+fn client_reset_settings_card(client_name: &str, settings: &[String]) -> Option<gtk::Box> {
+    setup::gateway_settings_notice(client_name, settings)
+        .map(|(sentence, lines)| setup::gateway_settings_card(&sentence, &lines))
+}
+
 fn confirm_client_reset(client: &state::ClientView, button: gtk::Button, page: ClientPage) {
     let Some(parent) = page.app.active_window() else {
         return;
@@ -3798,6 +3804,14 @@ fn confirm_client_reset(client: &state::ClientView, button: gtk::Button, page: C
         &[("value1", &client.name.to_string())],
     );
     l10n::bind_dialog_body(&dialog, "Toolport backs up the config before replacing its gateway entry with the standard stdio command. Customized commands, arguments and headers will be replaced; review those changes before confirming. Other client settings and MCP servers are preserved. Restart the client afterward.");
+    // A reset writes the same missing client settings a connect does, so the
+    // confirmation lists them the way the connect review does.
+    if let Some(card) = client_reset_settings_card(
+        &client.name,
+        &crate::clients::codex_gateway_settings_for_connect(&client.id),
+    ) {
+        dialog.set_extra_child(Some(&card));
+    }
     dialog.add_response("cancel", &crate::i18n::tr("Cancel"));
     l10n::bind_dialog_response(&dialog, "cancel", "Cancel");
     dialog.add_response("reset", &crate::i18n::lookup(client_reset_label(client)));
@@ -17096,4 +17110,44 @@ fn secret_reference_fields(
         });
     });
     (choice, container, reference)
+}
+
+#[cfg(test)]
+mod client_hints_ui_tests {
+    use super::*;
+
+    fn labels(widget: &gtk::Widget) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+            out.push(label.text().to_string());
+        }
+        let mut child = widget.first_child();
+        while let Some(next) = child {
+            out.extend(labels(&next));
+            child = next.next_sibling();
+        }
+        out
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn reset_confirmation_lists_the_settings_it_adds() {
+        adw::init().unwrap();
+        let card = client_reset_settings_card(
+            "Codex",
+            &[
+                "startup_timeout_sec = 75".into(),
+                "tool_timeout_sec = 600".into(),
+            ],
+        )
+        .expect("a reset that adds settings lists them");
+        let text = labels(card.upcast_ref());
+        assert!(text
+            .iter()
+            .any(|t| t.contains("its Codex entry, each only if it is not set")));
+        assert!(text
+            .iter()
+            .any(|t| t == "startup_timeout_sec = 75\ntool_timeout_sec = 600"));
+        assert!(client_reset_settings_card("Cursor", &[]).is_none());
+    }
 }
