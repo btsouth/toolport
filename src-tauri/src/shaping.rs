@@ -360,13 +360,40 @@ pub fn shape_discovery_result(
 /// Drop the discovery results of host `realm` that describe a tool `stale` names,
 /// so a definition the caller can no longer see does not stay in memory until the
 /// TTL. Search makes a fresh one on demand. Returns how many were dropped.
+///
+/// `stale` runs with the cache unlocked: callers may hold other locks (a registry
+/// publish holds the registry), and a predicate taking a lock under this one could
+/// invert the order with [`fetch_result_visible`].
 pub fn forget_discovery(realm: usize, stale: impl Fn(&str) -> bool) -> usize {
+    let mut candidates: Vec<(String, Vec<String>)> = Vec::new();
+    // A read-only pass: the closure records each candidate and removes nothing.
+    cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove_where(|cursor, cached| {
+            if cached.realm == realm && !cached.describes.is_empty() {
+                candidates.push((cursor.to_string(), cached.describes.clone()));
+            }
+            false
+        });
+    let stale: Vec<(String, Vec<String>)> = candidates
+        .into_iter()
+        .filter(|(_, describes)| describes.iter().any(|tool| stale(tool)))
+        .collect();
+    if stale.is_empty() {
+        return 0;
+    }
     let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
-    store.remove_where(|_, cached| {
-        cached.realm == realm
-            && !cached.describes.is_empty()
-            && cached.describes.iter().any(|tool| stale(tool))
-    })
+    stale
+        .into_iter()
+        .filter(|(cursor, describes)| {
+            // Only the entry that was judged: cursors are never reused, but check.
+            store
+                .peek(cursor, |cached| &cached.describes == describes)
+                .unwrap_or(false)
+                && store.remove(cursor).is_some()
+        })
+        .count()
 }
 
 fn shape_inner(
@@ -585,7 +612,14 @@ pub fn fetch_result(
 /// [`fetch_result`], refusing a discovery result whose tool `visible` no longer
 /// admits (quarantined, disabled, or outside the caller's scope since it was
 /// stashed). The refused entry is dropped. Results of tool calls carry no tool
-/// list and page as before: the caller already received that output.
+/// list and page as before: `visible` is never asked about them, and they stay
+/// readable to their caller after a policy change, because the caller already
+/// received that output.
+///
+/// `visible` runs with the cache unlocked, so it may take other locks (a script's
+/// live check reads the registry, which a registry publish holds while it calls
+/// [`forget_discovery`]). The entry is read again afterwards; one that went away
+/// or changed in between gets the "unknown or expired" answer.
 pub fn fetch_result_visible(
     cursor: &str,
     offset: usize,
@@ -594,28 +628,39 @@ pub fn fetch_result_visible(
     projection: Option<&str>,
     visible: &dyn Fn(&str) -> bool,
 ) -> Value {
-    let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
-    sweep(&mut store);
+    let unknown = || {
+        text_result(
+            format!(
+                "[Toolport: cursor \"{cursor}\" is unknown or expired. Re-run the original \
+                 tool call to get a fresh result.]"
+            ),
+            true,
+        )
+    };
     // Scope: a cached result is readable only by the client that stashed it. Owner
     // must be a stable principal (e.g. client:{id}), never a shared display label
     // (SOU-324). A mismatch returns the SAME "unknown or expired" answer as a
     // missing cursor, so a scoped client can't probe which cursors exist. The
     // stash is process-global; without this check one HTTP client could read
     // another's result by guessing the sequential `r{n}` cursor.
-    let c = match store.get(cursor) {
-        Some(c) if c.owner.as_deref() == requester => c,
-        _ => {
-            return text_result(
-                format!(
-                    "[Toolport: cursor \"{cursor}\" is unknown or expired. Re-run the original \
-                     tool call to get a fresh result.]"
-                ),
-                true,
-            );
+    let owned = |c: &Cached| c.owner.as_deref() == requester;
+    let describes = {
+        let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
+        sweep(&mut store);
+        match store.get(cursor) {
+            Some(c) if owned(c) => c.describes.clone(),
+            _ => return unknown(),
         }
     };
-    if !c.describes.iter().all(|tool| visible(tool)) {
-        store.remove(cursor);
+    // The visibility check runs unlocked (see above).
+    if !describes.iter().all(|tool| visible(tool)) {
+        let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
+        if store
+            .peek(cursor, |c| owned(c) && c.describes == describes)
+            .unwrap_or(false)
+        {
+            store.remove(cursor);
+        }
         return text_result(
             format!(
                 "[Toolport: cursor \"{cursor}\" describes a tool that is no longer available \
@@ -624,6 +669,11 @@ pub fn fetch_result_visible(
             true,
         );
     }
+    let store = cache().lock().unwrap_or_else(|e| e.into_inner());
+    let c = match store.get(cursor) {
+        Some(c) if owned(c) && c.describes == describes => c,
+        _ => return unknown(),
+    };
     if let Some(path) = projection {
         let structured = match &c.structured {
             Some(value) => value,
@@ -1527,5 +1577,82 @@ mod tests {
 
         let text = projected["content"][0]["text"].as_str().unwrap();
         assert_eq!(text, "40");
+    }
+
+    /// R5-1: a discovery page fetch whose visibility check takes another lock (a
+    /// script's live check reads the registry) must not hold the cache meanwhile,
+    /// or it deadlocks against a registry publish, which holds the registry and
+    /// calls [`forget_discovery`]. Barriers force the interleaving; a timeout
+    /// reports the deadlock instead of hanging the run.
+    #[test]
+    fn page_fetch_visibility_check_runs_without_the_cache_lock() {
+        use std::sync::{mpsc, Arc, Barrier, Mutex};
+        let realm = 0x5e_f0_0d;
+        let mut result = big_text_result(20_000);
+        assert!(shape_discovery_result(
+            &mut result,
+            2048,
+            Some("r5-owner"),
+            vec!["t__x".to_string()],
+            realm,
+        ));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let cursor = text
+            .split("\"cursor\":\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_string();
+        // Stands in for `host.registry`.
+        let registry = Arc::new(Mutex::new(()));
+        let in_check = Arc::new(Barrier::new(2));
+        let publishing = Arc::new(Barrier::new(2));
+        let (done, finished) = mpsc::channel();
+        let fetcher = {
+            let (registry, in_check, publishing, done) = (
+                Arc::clone(&registry),
+                Arc::clone(&in_check),
+                Arc::clone(&publishing),
+                done.clone(),
+            );
+            std::thread::spawn(move || {
+                let page = fetch_result_visible(&cursor, 0, 100, Some("r5-owner"), None, &|_| {
+                    in_check.wait();
+                    // The publisher holds the registry now.
+                    publishing.wait();
+                    let _registry = registry.lock().unwrap();
+                    true
+                });
+                done.send(("fetch", page)).unwrap();
+            })
+        };
+        let publisher = std::thread::spawn(move || {
+            in_check.wait();
+            let _registry = registry.lock().unwrap();
+            publishing.wait();
+            let dropped = forget_discovery(realm, |_| true);
+            done.send(("publish", json!(dropped))).unwrap();
+        });
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let (who, value) = finished
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap_or_else(|_| {
+                    panic!("deadlock: page fetch and registry publish, seen {seen:?}")
+                });
+            seen.push((who, value));
+        }
+        fetcher.join().unwrap();
+        publisher.join().unwrap();
+        let publish = seen.iter().find(|(who, _)| *who == "publish").unwrap();
+        assert_eq!(publish.1, json!(1), "{seen:?}");
+        // The publish dropped the entry while the check ran: the fetch reads it
+        // again afterwards and answers as for any expired cursor.
+        let fetch = seen.iter().find(|(who, _)| *who == "fetch").unwrap();
+        let fetched = fetch.1["content"][0]["text"].as_str().unwrap();
+        assert!(fetched.contains("unknown or expired"), "{fetched}");
+        assert_eq!(fetch.1["isError"], true);
     }
 }

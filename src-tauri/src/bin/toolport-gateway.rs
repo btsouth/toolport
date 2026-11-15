@@ -7028,9 +7028,11 @@ fn execute_script_dispatch(
         owner_of_exposed_tool(Some(router_arc.as_ref()), &owners, name)
     });
 
-    // A script can wait on calls, and policy can change meanwhile. Its fetch and
-    // describe callbacks keep the catalog and scope captured here and also ask the
-    // live router, as each `toolport.call` does.
+    // A script can wait on calls, and policy can change meanwhile. Its describe
+    // callback and its fetches of paged tool definitions keep the catalog and scope
+    // captured here and also ask the live router, as each `toolport.call` does.
+    // Fetching an ordinary tool-call result is not rechecked: that output stays
+    // readable to its caller after a policy change.
     let live_check: ScriptLiveCheck = {
         let source = source.clone();
         let reg = reg.clone();
@@ -7054,6 +7056,7 @@ fn execute_script_dispatch(
     // Cursor handoff for any already-shaped result (prior turn, or external cursor in
     // data). A paged tool definition is served only while the script could still
     // see that tool: `catalog` is search's own visibility rule over this catalog.
+    // The check runs only for discovery pages, and with the shaping cache unlocked.
     let client_for_fetch = client.map(str::to_string);
     let fetch_visible: HashSet<String> = catalog.iter().cloned().collect();
     let fetch_live = Arc::clone(&live_check);
