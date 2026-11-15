@@ -541,6 +541,8 @@ def main(argv):
         rows = compare(home, manifest, "config restored byte-exact")
     elif cmd == "unchanged":
         rows = compare(home, manifest, "config untouched by the upgrade")
+    elif cmd == "updated":
+        rows = compare(home, manifest, "config untouched by the in-app update")
     elif cmd == "snapshot":
         rows = snapshot(manifest, argv[4] if len(argv) > 4 else manifest)
     else:

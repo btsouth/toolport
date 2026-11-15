@@ -160,10 +160,10 @@ for p in "$HOME/Library" "$HOME/.claude.json" "$HOME/.claude" "$HOME/.cursor" "$
   "$HOME/.gemini" "$HOME/.copilot" "$HOME/.codeium" "$HOME/.kiro" "$HOME/Library/Application Support/Toolport"; do
   [[ -e "$p" ]] && search+=("$p")
 done
-grep -rIl --exclude-dir=Keychains -F -- "$SECRET" "${search[@]}" >"$EVIDENCE/logs/plain-text-hits-$LABEL.txt" 2>"$EVIDENCE/logs/plain-text-errors-$LABEL.txt"
+grep -rIl -D skip --exclude-dir=Keychains -F -- "$SECRET" "${search[@]}" >"$EVIDENCE/logs/plain-text-hits-$LABEL.txt" 2>"$EVIDENCE/logs/plain-text-errors-$LABEL.txt"
 rc=$?
 unreadable="$(grep -c . "$EVIDENCE/logs/plain-text-errors-$LABEL.txt")"
-others="$(grep -vcE 'Operation not permitted|Permission denied|No such file' "$EVIDENCE/logs/plain-text-errors-$LABEL.txt")"
+others="$(grep -vcE 'Operation not permitted|Permission denied|No such file|Operation not supported on socket' "$EVIDENCE/logs/plain-text-errors-$LABEL.txt")"
 if [[ $rc -eq 0 ]]; then
   fail "token is not on disk in plain text" "found in: $(head -5 "$EVIDENCE/logs/plain-text-hits-$LABEL.txt" | tr '\n' ' ')"
 elif [[ $rc -eq 1 || ( $rc -eq 2 && $others -eq 0 ) ]]; then

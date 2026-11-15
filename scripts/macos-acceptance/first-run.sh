@@ -58,8 +58,17 @@ if [[ -n "$quarantine" ]]; then
   if [[ -n "$gk_pid" ]]; then
     shot "$LABEL-gatekeeper-prompt" >/dev/null || true
     pass "Gatekeeper shows its first-open prompt for the quarantined app" "screenshots/$LABEL-gatekeeper-prompt.png"
+    # The same agent first shows a "Verifying" progress window, then the
+    # prompt; keep trying Open while that agent has a window (up to 120s).
+    pressed=1
+    for _ in $(seq 1 120); do
+      if TPUI_TIMEOUT=20 tpui press "$gk_pid" "Open" >"$EVIDENCE/logs/gatekeeper-press-$LABEL.log" 2>&1; then pressed=0; break; fi
+      winq gatekeeper >/dev/null || break
+      sleep 1
+    done
     tpui dump "$gk_pid" 12 >"$EVIDENCE/logs/ax-gatekeeper-$LABEL.txt" 2>&1
-    if tpui press "$gk_pid" "Open" >"$EVIDENCE/logs/gatekeeper-press-$LABEL.log" 2>&1; then
+    shot "$LABEL-gatekeeper-after-press" >/dev/null
+    if [[ $pressed -eq 0 ]]; then
       pass "Gatekeeper prompt accepted through accessibility" "$(cat "$EVIDENCE/logs/gatekeeper-press-$LABEL.log")"
     else
       fail "Gatekeeper prompt accepted through accessibility" "$(tail -n 2 "$EVIDENCE/logs/gatekeeper-press-$LABEL.log" | tr '\n' ' ')"

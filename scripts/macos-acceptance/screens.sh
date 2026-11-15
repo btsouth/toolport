@@ -74,7 +74,8 @@ resize_to() {
 }
 
 # ── Narrow window ─────────────────────────────────────────────────────────
-# tauri.conf.json sets a 480x360 minimum. Below 900 px the sidebar becomes an
+# tauri.conf.json sets a 480x360 minimum. 480x640 is the tallest narrow
+# window that fits the runner's 1024x768 screen with the menu bar and Dock. Below 900 px the sidebar becomes an
 # icon rail that keeps its accessible labels.
 log "Minimum window size"
 if TPUI_TIMEOUT=20 tpui resize "$(app_pid)" 300 200 >"$EVIDENCE/logs/resize-below-min-$LABEL.txt" 2>&1; then
@@ -87,7 +88,7 @@ if TPUI_TIMEOUT=20 tpui resize "$(app_pid)" 300 200 >"$EVIDENCE/logs/resize-belo
 else
   fail "window can be resized" "$(cat "$EVIDENCE/logs/resize-below-min-$LABEL.txt")"
 fi
-for size in 480x360 480x700; do
+for size in 480x360 480x640; do
   log "Window at $size"
   if resize_to "${size%x*}" "${size#*x}"; then
     pass "window resizes to $size" "$RESIZE_GOT"

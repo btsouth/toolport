@@ -102,7 +102,7 @@ bash "$HERE/bundle-checks.sh" "$APP_PATH" arm64 "after in-app update" || STEP_FA
 q="$(xattr -p com.apple.quarantine "$APP_PATH" 2>/dev/null)"
 info "note: updated app quarantine" "${q:-none}"
 
-record_rows "$AREA" "client configs compared after the update" python3 "$HERE/clients.py" unchanged "$HOME" "$SNAP"
+record_rows "$AREA" "client configs compared after the update" python3 "$HERE/clients.py" updated "$HOME" "$SNAP"
 if [[ -n "$SERVER_ID" ]]; then
   selftest_check "keychain token readable after the update without a prompt" "$EVIDENCE/logs/selftest-secrets-updated.log"
 else
