@@ -6499,6 +6499,42 @@ mod tests {
     }
 
     #[test]
+    fn many_leaves_holding_a_secret_cost_linear_work() {
+        let m = m(&[("TOKEN", "sk-SECRETVALUE1234")]);
+        let doc = |n: usize| {
+            let items: Vec<Value> = (0..n)
+                .map(|_| Value::from("x sk-SECRETVALUE1234 y"))
+                .collect();
+            serde_json::json!({ "content": items })
+        };
+        let (small, large) = (doc(4_000), doc(40_000));
+        let (small_line, large_line) = (small.to_string(), large.to_string());
+        let parsed = |v: &Value| {
+            best_of_three(|| {
+                let mut v = v.clone();
+                assert!(m.redact_value(&mut v));
+            })
+        };
+        let line = |text: &str| {
+            best_of_three(|| {
+                assert!(!m.redact_line(text).contains("SECRETVALUE"));
+            })
+        };
+        // Linear work is ten times as much; a scan of every span per leaf
+        // (or every leaf per span) is a hundred.
+        let (a, b) = (parsed(&small), parsed(&large));
+        assert!(
+            b < a * 40,
+            "parsed: 4,000 leaves {a:?}, 40,000 leaves {b:?}"
+        );
+        let (a, b) = (line(&small_line), line(&large_line));
+        assert!(
+            b < a * 40,
+            "JSON line: 4,000 leaves {a:?}, 40,000 leaves {b:?}"
+        );
+    }
+
+    #[test]
     fn blank_lines_after_a_live_prefix_cost_linear_work_and_are_capped() {
         let m = m(&[("KEY", "sk-AbC123xyZ")]);
         // Pushes of sixteen blank lines: 32 KiB, then 320 KiB, past the cap.
