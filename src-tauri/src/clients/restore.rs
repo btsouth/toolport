@@ -346,6 +346,18 @@ fn nested(format: Format) -> Option<&'static str> {
     }
 }
 
+/// [`nested`] for one file: an OpenCode config already on the 2.x `mcp.servers` map
+/// keeps its servers one level down.
+fn nested_in(format: Format, root: &Value) -> Option<&'static str> {
+    nested(format).or_else(|| {
+        (matches!(format, Format::JsonOpenCodeMcp)
+            && root["mcp"]
+                .as_object()
+                .is_some_and(opencode_uses_server_map))
+        .then_some("servers")
+    })
+}
+
 fn key(format: Format) -> &'static str {
     match format {
         Format::JsonServers => "servers",
@@ -421,7 +433,7 @@ fn original_gateways(
 fn gateway_names(format: Format, root: &Value) -> Vec<String> {
     let key = key(format);
     let mut servers = root.get(key);
-    if let Some(inner) = nested(format) {
+    if let Some(inner) = nested_in(format, root) {
         servers = servers.and_then(|value| value.get(inner));
     }
     let owned = |entry: &Value| {
@@ -575,6 +587,17 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
         return Ok(true);
     }
     let mut before = record.baseline.clone();
+    // The layout Toolport last wrote decides where the server map sits.
+    let shape = mutation::value(
+        format,
+        if record.disconnected {
+            record.disconnect_before.as_deref()
+        } else {
+            record.last_written.as_deref()
+        }
+        .or(current.as_deref()),
+    )?;
+    let inner_key = nested_in(format, &shape);
     // A preview/1.x install can already have our gateway at first capture.
     // Its real pre-install bytes are unknown, so remove that owned entry and
     // restore the legacy moved record rather than resurrecting a dead gateway.
@@ -584,7 +607,7 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
         let key = key(format);
         let entry = |root: &Value| {
             let mut servers = root.get(key)?;
-            if let Some(inner) = nested(format) {
+            if let Some(inner) = inner_key {
                 servers = servers.get(inner)?;
             }
             servers.get(name).cloned()
@@ -605,7 +628,7 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
         }
     } else {
         let mut map = before.get_mut(key);
-        if let Some(inner) = nested(format) {
+        if let Some(inner) = inner_key {
             map = map.and_then(|value| value.get_mut(inner));
         }
         if let Some(map) = map.and_then(Value::as_object_mut) {
@@ -637,7 +660,7 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
         written.get(key),
         latest.get(key),
         1,
-        if nested(format).is_some() { 3 } else { 2 },
+        if inner_key.is_some() { 3 } else { 2 },
     );
     let object = latest
         .as_object_mut()

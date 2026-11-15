@@ -54,6 +54,19 @@ pub(super) fn is_client_path_key(key: &str) -> bool {
             | "GROK_HOME"
             | "QWEN_HOME"
             | "KIMI_CODE_HOME"
+            | "HERMES_HOME"
+            | "HERMES_DATA_DIR_SUFFIX"
+            | "CLINE_MCP_SETTINGS_PATH"
+            | "CLINE_DATA_DIR"
+            | "CLINE_DIR"
+            | "OPENCODE_CONFIG"
+            | "OPENCODE_CONFIG_DIR"
+            | "KILO_CONFIG"
+            | "KILO_CONFIG_DIR"
+            | "PI_CODING_AGENT_DIR"
+            | "PI_CONFIG_DIR"
+            | "OMP_PROFILE"
+            | "PI_PROFILE"
     )
 }
 

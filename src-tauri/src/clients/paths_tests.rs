@@ -1,0 +1,969 @@
+//! Where every client reads its MCP config, on every OS, and how Toolport moves a
+//! connection out of a file a client stopped reading.
+use super::*;
+use serde_json::json;
+
+fn mock_home(platform: Platform) -> PathBuf {
+    match platform {
+        Platform::Windows => PathBuf::from(r"C:\Users\alice"),
+        Platform::MacOs => PathBuf::from("/Users/alice"),
+        Platform::Linux => PathBuf::from("/home/alice"),
+    }
+}
+
+fn no_env(_: &str) -> Option<std::ffi::OsString> {
+    None
+}
+
+/// The OS's roaming config dir for `home` (`%APPDATA%`, Application Support, ~/.config).
+fn roaming(home: &Path, platform: Platform) -> PathBuf {
+    match platform {
+        Platform::Windows => home.join("AppData").join("Roaming"),
+        Platform::MacOs => home.join("Library").join("Application Support"),
+        Platform::Linux => home.join(".config"),
+    }
+}
+
+type Expect = fn(&Path, Platform) -> PathBuf;
+
+/// Every client: its documented default config file on each OS (no env overrides,
+/// nothing on disk) and the format Toolport writes into it.
+const CLIENT_PATHS: &[(&str, &str, Expect)] = &[
+    ("claude-desktop", "JsonMcpServers", |h, p| {
+        roaming(h, p)
+            .join("Claude")
+            .join("claude_desktop_config.json")
+    }),
+    ("cursor", "JsonCursorMcpServers", |h, _| {
+        h.join(".cursor/mcp.json")
+    }),
+    ("droid", "JsonDroidMcpServers", |h, _| {
+        h.join(".factory/mcp.json")
+    }),
+    ("crush", "JsonMcp", |h, _| {
+        h.join(".config/crush/crush.json")
+    }),
+    ("anythingllm", "JsonMcpServers", |h, p| {
+        roaming(h, p).join("anythingllm-desktop/storage/plugins/anythingllm_mcp_servers.json")
+    }),
+    ("vscode", "JsonServers", |h, p| {
+        roaming(h, p).join("Code").join("User").join("mcp.json")
+    }),
+    ("amp", "JsonAmpMcpServers", |h, _| {
+        h.join(".config/amp/settings.json")
+    }),
+    ("windsurf", "JsonMcpServers", |h, p| match p {
+        Platform::Windows => roaming(h, p).join("devin").join("mcp_config.json"),
+        _ => h.join(".config/devin/mcp_config.json"),
+    }),
+    ("devin-cli", "JsonMcpServers", |h, p| match p {
+        Platform::Windows => roaming(h, p).join("devin").join("mcp_config.json"),
+        _ => h.join(".config/devin/mcp_config.json"),
+    }),
+    ("opencode", "JsonOpenCodeMcp", |h, _| {
+        h.join(".config/opencode/opencode.json")
+    }),
+    ("kilo-code", "JsonOpenCodeMcp", |h, _| {
+        h.join(".config/kilo/kilo.jsonc")
+    }),
+    ("grok", "TomlMcpServers", |h, _| h.join(".grok/config.toml")),
+    ("codex", "TomlMcpServers", |h, _| {
+        h.join(".codex/config.toml")
+    }),
+    ("github-copilot-cli", "JsonCopilotMcpServers", |h, _| {
+        h.join(".copilot/mcp-config.json")
+    }),
+    ("antigravity", "JsonMcpServers", |h, _| {
+        h.join(".gemini/config/mcp_config.json")
+    }),
+    ("claude-code", "JsonMcpServers", |h, _| {
+        h.join(".claude.json")
+    }),
+    ("gemini-cli", "JsonMcpServers", |h, _| {
+        h.join(".gemini/settings.json")
+    }),
+    ("qwen-code", "JsonQwenMcpServers", |h, _| {
+        h.join(".qwen/settings.json")
+    }),
+    ("junie", "JsonMcpServers", |h, _| {
+        h.join(".junie/mcp/mcp.json")
+    }),
+    ("cline", "JsonMcpServers", |h, _| {
+        h.join(".cline/data/settings/cline_mcp_settings.json")
+    }),
+    ("roo-code", "JsonMcpServers", |h, p| {
+        roaming(h, p)
+            .join("Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/mcp_settings.json")
+    }),
+    ("warp", "JsonMcpServers", |h, _| h.join(".warp/.mcp.json")),
+    ("amazon-q", "JsonMcpServers", |h, _| {
+        h.join(".aws/amazonq/mcp.json")
+    }),
+    ("kiro", "JsonMcpServers", |h, _| {
+        h.join(".kiro/settings/mcp.json")
+    }),
+    ("auggie", "JsonAuggieMcpServers", |h, _| {
+        h.join(".augment/settings.json")
+    }),
+    ("kimi-code", "JsonKimiMcpServers", |h, _| {
+        h.join(".kimi-code/mcp.json")
+    }),
+    ("deepseek-harness", "YamlDshPatch", |h, _| {
+        h.join(".dsh/cordis.patch.yml")
+    }),
+    ("reasonix", "TomlReasonixPlugins", |h, p| match p {
+        Platform::Windows => roaming(h, p).join("reasonix").join("config.toml"),
+        _ => h.join(".reasonix/config.toml"),
+    }),
+    ("codewhale", "JsonCodewhaleServers", |h, _| {
+        h.join(".codewhale/mcp.json")
+    }),
+    ("openclaw", "JsonOpenClawMcp", |h, _| {
+        h.join(".openclaw/openclaw.json")
+    }),
+    ("openhands", "JsonOpenHandsMcpServers", |h, _| {
+        h.join(".openhands/mcp.json")
+    }),
+    ("nanobot", "JsonNanobotMcp", |h, _| {
+        h.join(".nanobot/config.json")
+    }),
+    ("zcode", "JsonZCodeMcp", |h, _| {
+        h.join(".zcode/cli/config.json")
+    }),
+    ("command-code", "JsonMcpServers", |h, _| {
+        h.join(".commandcode/mcp.json")
+    }),
+    ("tabnine", "JsonMcpServers", |h, _| {
+        h.join(".tabnine/mcp_servers.json")
+    }),
+    ("tabnine-cli", "JsonMcpServers", |h, _| {
+        h.join(".tabnine/agent/settings.json")
+    }),
+    ("zed", "JsonContextServers", |h, p| match p {
+        Platform::Windows => roaming(h, p).join("Zed").join("settings.json"),
+        _ => h.join(".config/zed/settings.json"),
+    }),
+    ("lm-studio", "JsonMcpServers", |h, _| {
+        h.join(".lmstudio/mcp.json")
+    }),
+    ("jan", "JsonMcpServers", |h, p| match p {
+        Platform::Linux => h.join(".local/share/Jan/data/mcp_config.json"),
+        _ => roaming(h, p)
+            .join("Jan")
+            .join("data")
+            .join("mcp_config.json"),
+    }),
+    ("boltai", "JsonMcpServers", |h, _| {
+        h.join(".boltai/mcp.json")
+    }),
+    ("pi", "JsonMcpServers", |h, _| h.join(".pi/agent/mcp.json")),
+    ("omp", "JsonMcpServers", |h, _| {
+        h.join(".omp/agent/mcp.json")
+    }),
+    ("goose", "YamlExtensions", |h, p| match p {
+        Platform::Windows => roaming(h, p).join("Block/goose/config/config.yaml"),
+        _ => h.join(".config/goose/config.yaml"),
+    }),
+    ("hermes", "YamlMcpServers", |h, p| match p {
+        Platform::Windows => h
+            .join("AppData")
+            .join("Local")
+            .join("hermes")
+            .join("config.yaml"),
+        _ => h.join(".hermes/config.yaml"),
+    }),
+    ("continue", "YamlMcpServersList", |h, _| {
+        h.join(".continue/config.yaml")
+    }),
+    ("witsy", "JsonMcpServers", |h, p| {
+        roaming(h, p).join("Witsy").join("settings.json")
+    }),
+];
+
+/// Compare paths by components, so `a/b` and `a\b` spellings of one mock path agree.
+fn same(a: &Path, b: &Path) -> bool {
+    let parts = |p: &Path| {
+        p.to_string_lossy()
+            .replace('\\', "/")
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    parts(a) == parts(b)
+}
+
+#[test]
+fn every_client_has_a_documented_path_and_format_on_every_os() {
+    let ids: Vec<_> = defs().iter().map(|def| def.id).collect();
+    let listed: Vec<_> = CLIENT_PATHS.iter().map(|(id, _, _)| *id).collect();
+    assert_eq!(
+        ids, listed,
+        "CLIENT_PATHS must list every client in defs() order"
+    );
+    for (id, format, expect) in CLIENT_PATHS {
+        let def = find_def(id).unwrap();
+        assert_eq!(
+            serde_json::to_value(def.format).unwrap(),
+            json!(format),
+            "{id} format"
+        );
+        for platform in Platform::ALL {
+            let home = mock_home(platform);
+            let table = resolve_client_config_path(id, &home, platform)
+                .unwrap_or_else(|| panic!("{id} has no {platform:?} path"));
+            let with_env = resolve_client_config_path_env(id, &home, platform, &no_env).unwrap();
+            let expected = expect(&home, platform);
+            assert!(
+                same(&with_env, &expected),
+                "{id} on {platform:?}: {with_env:?}"
+            );
+            // The env-free table agrees, except where Linux reads XDG through `dirs`.
+            if platform != Platform::Linux {
+                assert!(
+                    same(&table, &expected),
+                    "{id} table on {platform:?}: {table:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn goose_and_devin_follow_xdg_config_home_on_macos_and_linux() {
+    let xdg = std::env::temp_dir().join("toolport-xdg-paths");
+    let env = |key: &str| (key == "XDG_CONFIG_HOME").then(|| xdg.clone().into_os_string());
+    let relative = |key: &str| (key == "XDG_CONFIG_HOME").then(|| "relative/config".into());
+    for platform in [Platform::MacOs, Platform::Linux] {
+        let home = mock_home(platform);
+        for (id, file) in [
+            ("goose", "goose/config.yaml"),
+            ("windsurf", "devin/mcp_config.json"),
+            ("devin-cli", "devin/mcp_config.json"),
+        ] {
+            let path = resolve_client_config_path_env(id, &home, platform, &env).unwrap();
+            assert!(same(&path, &xdg.join(file)), "{id} on {platform:?}");
+            // etcetera and `dirs` ignore a relative XDG_CONFIG_HOME.
+            let path = resolve_client_config_path_env(id, &home, platform, &relative).unwrap();
+            assert!(
+                same(&path, &home.join(".config").join(file)),
+                "{id} {platform:?}"
+            );
+        }
+    }
+    // Windows keeps Goose and Devin under %APPDATA%.
+    let home = mock_home(Platform::Windows);
+    let goose = resolve_client_config_path_env("goose", &home, Platform::Windows, &env).unwrap();
+    assert!(same(
+        &goose,
+        &roaming(&home, Platform::Windows).join("Block/goose/config/config.yaml")
+    ));
+}
+
+#[test]
+fn every_moved_location_is_listed_as_legacy_on_the_right_os() {
+    for platform in Platform::ALL {
+        let home = mock_home(platform);
+        let legacy = |id| relocate::resolve_legacy_config_paths(id, &home, platform, &no_env);
+        let goose = legacy("goose");
+        if platform == Platform::MacOs {
+            assert_eq!(
+                goose,
+                vec![home.join("Library/Application Support/Block/goose/config.yaml")]
+            );
+        } else {
+            assert!(goose.is_empty(), "{platform:?}");
+        }
+        assert_eq!(
+            legacy("windsurf"),
+            vec![home
+                .join(".codeium")
+                .join("windsurf")
+                .join("mcp_config.json")]
+        );
+        let cline_config = match platform {
+            Platform::Linux => home.join(".config"),
+            _ => roaming(&home, platform),
+        };
+        assert_eq!(
+            legacy("cline"),
+            vec![cline_config
+                .join("Code")
+                .join("User")
+                .join("globalStorage")
+                .join("saoudrizwan.claude-dev")
+                .join("settings")
+                .join("cline_mcp_settings.json")]
+        );
+        let crush = legacy("crush");
+        let hermes = legacy("hermes");
+        if platform == Platform::Windows {
+            assert_eq!(
+                crush,
+                vec![home
+                    .join("AppData")
+                    .join("Local")
+                    .join("crush")
+                    .join("crush.json")]
+            );
+            assert_eq!(hermes, vec![home.join(".hermes").join("config.yaml")]);
+            assert_eq!(
+                legacy("claude-desktop")[0],
+                roaming(&home, platform)
+                    .join("Claude")
+                    .join("claude_desktop_config.json")
+            );
+        } else {
+            assert!(crush.is_empty() && hermes.is_empty(), "{platform:?}");
+            assert!(legacy("claude-desktop").is_empty(), "{platform:?}");
+        }
+        assert_eq!(
+            legacy("antigravity"),
+            vec![
+                home.join(".gemini/antigravity-ide/mcp_config.json"),
+                home.join(".gemini/antigravity/mcp_config.json"),
+            ]
+        );
+        assert_eq!(legacy("amazon-q"), vec![home.join(".aws/amazonq/mcp.json")]);
+        assert_eq!(
+            legacy("lm-studio"),
+            vec![
+                home.join(".lmstudio/mcp.json"),
+                home.join(".cache/lm-studio/mcp.json")
+            ]
+        );
+        // Env-chosen locations are per shell, so their defaults are never legacy.
+        for id in [
+            "devin-cli",
+            "opencode",
+            "kilo-code",
+            "pi",
+            "omp",
+            "openclaw",
+            "vscode",
+        ] {
+            assert!(legacy(id).is_empty(), "{id} on {platform:?}");
+        }
+    }
+    let reasonix = |platform| {
+        relocate::resolve_legacy_config_paths("reasonix", &mock_home(platform), platform, &no_env)
+    };
+    let home = mock_home(Platform::MacOs);
+    assert_eq!(
+        reasonix(Platform::MacOs),
+        vec![
+            home.join("Library/Application Support/reasonix/config.toml"),
+            home.join(".config/reasonix/config.toml"),
+        ]
+    );
+    let home = mock_home(Platform::Linux);
+    assert_eq!(
+        reasonix(Platform::Linux),
+        vec![home.join(".config/reasonix/config.toml")]
+    );
+    // On Windows the OS config dir IS Reasonix's home, so nothing is legacy there.
+    assert!(reasonix(Platform::Windows).is_empty());
+    let set = |key: &str| (key == "REASONIX_HOME").then(|| "/elsewhere".into());
+    assert!(relocate::resolve_legacy_config_paths(
+        "reasonix",
+        &mock_home(Platform::Linux),
+        Platform::Linux,
+        &set
+    )
+    .is_empty());
+}
+
+#[test]
+fn cline_reads_its_overrides_and_the_old_file_only_before_cline_4_1() {
+    let root = std::env::temp_dir().join(format!("toolport-cline-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let current = home.join(".cline/data/settings/cline_mcp_settings.json");
+    let platform = Platform::Linux;
+    assert_eq!(resolve_cline_path(&home, platform, &no_env), current);
+    // Only the old extension storage exists: an older Cline reads that file, and
+    // 4.1 merges it on first start.
+    let legacy = cline_legacy_settings_path(&home, platform, &no_env);
+    std::fs::create_dir_all(legacy.parent().unwrap().parent().unwrap()).unwrap();
+    assert_eq!(resolve_cline_path(&home, platform, &no_env), legacy);
+    // Once Cline 4.1 created ~/.cline, the new file is the only one read.
+    std::fs::create_dir_all(home.join(".cline")).unwrap();
+    assert_eq!(resolve_cline_path(&home, platform, &no_env), current);
+    let file = root.join("custom.json");
+    let data = root.join("data");
+    let dir = root.join("cline-dir");
+    let padded = format!(" {} ", file.display());
+    let env = |key: &str| match key {
+        "CLINE_MCP_SETTINGS_PATH" => Some(padded.clone().into()),
+        "CLINE_DATA_DIR" => Some(data.clone().into_os_string()),
+        _ => None,
+    };
+    assert_eq!(resolve_cline_path(&home, platform, &env), file);
+    let env = |key: &str| match key {
+        "CLINE_DATA_DIR" => Some(data.clone().into_os_string()),
+        "CLINE_DIR" => Some(dir.clone().into_os_string()),
+        _ => None,
+    };
+    assert_eq!(
+        resolve_cline_path(&home, platform, &env),
+        data.join("settings/cline_mcp_settings.json")
+    );
+    let env = |key: &str| (key == "CLINE_DIR").then(|| dir.clone().into_os_string());
+    assert_eq!(
+        resolve_cline_path(&home, platform, &env),
+        dir.join("data/settings/cline_mcp_settings.json")
+    );
+    // A relative override is Cline's cwd; the default stays.
+    let env = |key: &str| (key == "CLINE_MCP_SETTINGS_PATH").then(|| "rel.json".into());
+    assert_eq!(resolve_cline_path(&home, platform, &env), current);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn pi_and_oh_my_pi_follow_their_agent_dir_and_profile_vars() {
+    let home = std::env::temp_dir().join("toolport-pi-home");
+    let dir = std::env::temp_dir().join("toolport-pi-agent");
+    assert_eq!(pi_agent_dir(&home, &no_env), home.join(".pi/agent"));
+    let env = |key: &str| (key == "PI_CODING_AGENT_DIR").then(|| dir.clone().into_os_string());
+    assert_eq!(pi_agent_dir(&home, &env), dir);
+    let tilde = |key: &str| (key == "PI_CODING_AGENT_DIR").then(|| "~/agents/pi".into());
+    assert_eq!(pi_agent_dir(&home, &tilde), home.join("agents/pi"));
+    let relative = |key: &str| (key == "PI_CODING_AGENT_DIR").then(|| "agents".into());
+    assert_eq!(pi_agent_dir(&home, &relative), home.join(".pi/agent"));
+
+    assert_eq!(omp_agent_dir(&home, &no_env), home.join(".omp/agent"));
+    assert_eq!(omp_agent_dir(&home, &env), dir);
+    let profile = |key: &str| match key {
+        "OMP_PROFILE" => Some(" work ".into()),
+        "PI_CODING_AGENT_DIR" => Some(dir.clone().into_os_string()),
+        _ => None,
+    };
+    assert_eq!(
+        omp_agent_dir(&home, &profile),
+        home.join(".omp/profiles/work/agent")
+    );
+    // OMP_PROFILE, even empty, wins over PI_PROFILE; `default` means none.
+    let shadowed = |key: &str| match key {
+        "OMP_PROFILE" => Some("".into()),
+        "PI_PROFILE" => Some("other".into()),
+        _ => None,
+    };
+    assert_eq!(omp_agent_dir(&home, &shadowed), home.join(".omp/agent"));
+    let pi_profile = |key: &str| (key == "PI_PROFILE").then(|| "other".into());
+    assert_eq!(
+        omp_agent_dir(&home, &pi_profile),
+        home.join(".omp/profiles/other/agent")
+    );
+    let default = |key: &str| (key == "OMP_PROFILE").then(|| "default".into());
+    assert_eq!(omp_agent_dir(&home, &default), home.join(".omp/agent"));
+    let named = |key: &str| (key == "PI_CONFIG_DIR").then(|| ".omp-alt".into());
+    assert_eq!(omp_agent_dir(&home, &named), home.join(".omp-alt/agent"));
+}
+
+#[test]
+fn opencode_and_kilo_follow_xdg_and_their_config_vars() {
+    let root = std::env::temp_dir().join(format!("toolport-oc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let home = root.join("home");
+    let xdg = root.join("xdg");
+    assert_eq!(
+        resolve_opencode_path(&home, &no_env),
+        home.join(".config/opencode/opencode.json")
+    );
+    let env = |key: &str| (key == "XDG_CONFIG_HOME").then(|| xdg.clone().into_os_string());
+    assert_eq!(
+        resolve_opencode_path(&home, &env),
+        xdg.join("opencode/opencode.json")
+    );
+    let dir = root.join("oc-dir");
+    let file = root.join("explicit.json");
+    let env = |key: &str| match key {
+        "XDG_CONFIG_HOME" => Some(xdg.clone().into_os_string()),
+        "OPENCODE_CONFIG_DIR" => Some(dir.clone().into_os_string()),
+        _ => None,
+    };
+    assert_eq!(
+        resolve_opencode_path(&home, &env),
+        dir.join("opencode.json")
+    );
+    let explicit = |key: &str| (key == "OPENCODE_CONFIG").then(|| file.clone().into_os_string());
+    assert_eq!(resolve_opencode_path(&home, &explicit), file);
+
+    let kilo = home.join(".config/kilo");
+    assert_eq!(resolve_kilo_path(&home, &no_env), kilo.join("kilo.jsonc"));
+    std::fs::create_dir_all(&kilo).unwrap();
+    std::fs::write(kilo.join("opencode.json"), "{}").unwrap();
+    assert_eq!(
+        resolve_kilo_path(&home, &no_env),
+        kilo.join("opencode.json")
+    );
+    std::fs::write(kilo.join("kilo.json"), "{}").unwrap();
+    assert_eq!(resolve_kilo_path(&home, &no_env), kilo.join("kilo.json"));
+    let env = |key: &str| (key == "XDG_CONFIG_HOME").then(|| xdg.clone().into_os_string());
+    assert_eq!(resolve_kilo_path(&home, &env), xdg.join("kilo/kilo.jsonc"));
+    let env = |key: &str| (key == "KILO_CONFIG_DIR").then(|| dir.clone().into_os_string());
+    assert_eq!(resolve_kilo_path(&home, &env), dir.join("kilo.jsonc"));
+    let env = |key: &str| (key == "KILO_CONFIG").then(|| file.clone().into_os_string());
+    assert_eq!(resolve_kilo_path(&home, &env), file);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn lm_studio_amazon_q_amp_and_claude_desktop_pick_the_file_their_client_reads() {
+    let root = std::env::temp_dir().join(format!("toolport-alt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    assert_eq!(resolve_lm_studio_home(&home), home.join(".lmstudio"));
+    std::fs::create_dir_all(home.join(".cache/lm-studio")).unwrap();
+    assert_eq!(resolve_lm_studio_home(&home), home.join(".cache/lm-studio"));
+    let moved = root.join("models-disk");
+    std::fs::write(
+        home.join(".lmstudio-home-pointer"),
+        format!("{}\n", moved.display()),
+    )
+    .unwrap();
+    assert_eq!(resolve_lm_studio_home(&home), moved);
+
+    let q = home.join(".aws/amazonq");
+    assert_eq!(resolve_amazon_q_path(&home), q.join("mcp.json"));
+    std::fs::create_dir_all(&q).unwrap();
+    std::fs::write(q.join("default.json"), r#"{"name":"default"}"#).unwrap();
+    assert_eq!(resolve_amazon_q_path(&home), q.join("mcp.json"));
+    std::fs::write(q.join("default.json"), r#"{"useLegacyMcpJson": false}"#).unwrap();
+    assert_eq!(resolve_amazon_q_path(&home), q.join("default.json"));
+
+    let amp = home.join(".config/amp/settings.json");
+    assert_eq!(prefer_existing_jsonc(amp.clone()), amp);
+    std::fs::create_dir_all(amp.parent().unwrap()).unwrap();
+    std::fs::write(amp.with_extension("jsonc"), "{}").unwrap();
+    assert_eq!(
+        prefer_existing_jsonc(amp.clone()),
+        amp.with_extension("jsonc")
+    );
+    std::fs::write(&amp, "{}").unwrap();
+    assert_eq!(prefer_existing_jsonc(amp.clone()), amp);
+
+    let local = home.join("AppData/Local");
+    let real = home.join("AppData/Roaming/Claude/claude_desktop_config.json");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(&real, "{}").unwrap();
+    assert_eq!(resolve_claude_desktop_path(real.clone(), &local), real);
+    let msix = local.join("Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude");
+    std::fs::create_dir_all(&msix).unwrap();
+    // An installed package without its own copy still reads the real file.
+    assert_eq!(resolve_claude_desktop_path(real.clone(), &local), real);
+    std::fs::write(msix.join("claude_desktop_config.json"), "{}").unwrap();
+    assert_eq!(
+        resolve_claude_desktop_path(real.clone(), &local),
+        msix.join("claude_desktop_config.json")
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// Isolated home, data dir and client env for one end-to-end test.
+pub(super) struct Fixture {
+    pub(super) home: PathBuf,
+    gateway: PathBuf,
+    _home: TestHome,
+    _env: Vec<EnvRestore>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+    pub(super) data: crate::registry::DataDirTestEnv,
+}
+
+impl Fixture {
+    pub(super) fn new(label: &str) -> Self {
+        let data = crate::registry::DataDirTestEnv::new(label);
+        let lock = env_test_lock();
+        let env = isolated_client_env(&data.dir);
+        let home = data.dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let test_home = TestHome::set(&home);
+        crate::registry::save(&crate::registry::Registry::default()).unwrap();
+        let gateway = data.dir.join("bin").join("toolport-gateway-9.9.9");
+        std::fs::create_dir_all(gateway.parent().unwrap()).unwrap();
+        std::fs::write(&gateway, "fixture").unwrap();
+        Self {
+            home,
+            gateway,
+            _home: test_home,
+            _env: env,
+            _lock: lock,
+            data,
+        }
+    }
+
+    pub(super) fn gateway(&self) -> &str {
+        self.gateway.to_str().unwrap()
+    }
+}
+
+pub(super) fn write(path: &Path, value: &serde_json::Value) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
+}
+
+pub(super) fn read(path: &Path) -> serde_json::Value {
+    parse_json_value(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+fn old_entry(client: &str) -> serde_json::Value {
+    json!({
+        "command": "/Applications/Toolport.app/Contents/MacOS/toolport-gateway",
+        "args": [],
+        "env": {"TOOLPORT_CLIENT_ID": client, "TOOLPORT_PROFILE": "work"}
+    })
+}
+
+/// A JSON client's connection moves from each legacy file to the current one with
+/// its scope kept, and only Toolport's entry leaves the old file.
+#[test]
+fn json_connections_move_from_every_legacy_file_into_the_current_one() {
+    type Case = (&'static str, fn(&Path) -> PathBuf, fn(&Path));
+    let cases: &[Case] = &[
+        (
+            "windsurf",
+            |h| h.join(".codeium/windsurf/mcp_config.json"),
+            |_| {},
+        ),
+        (
+            "antigravity",
+            |h| h.join(".gemini/antigravity-ide/mcp_config.json"),
+            |_| {},
+        ),
+        (
+            "antigravity",
+            |h| h.join(".gemini/antigravity/mcp_config.json"),
+            |_| {},
+        ),
+        (
+            "cline",
+            |h| cline_legacy_settings_path(h, Platform::current(), &client_path_env),
+            |h| std::fs::create_dir_all(h.join(".cline")).unwrap(),
+        ),
+        (
+            "amazon-q",
+            |h| h.join(".aws/amazonq/mcp.json"),
+            |h| {
+                write(
+                    &h.join(".aws/amazonq/default.json"),
+                    &json!({"useLegacyMcpJson": false}),
+                )
+            },
+        ),
+        (
+            "lm-studio",
+            |h| h.join(".lmstudio/mcp.json"),
+            |h| std::fs::create_dir_all(h.join(".cache/lm-studio")).unwrap(),
+        ),
+    ];
+    for (client, legacy_of, prepare) in cases {
+        let fixture = Fixture::new("relocate-json");
+        prepare(&fixture.home);
+        let legacy = legacy_of(&fixture.home);
+        write(
+            &legacy,
+            &json!({"mcpServers": {"toolport": old_entry(client), "native": {"command": "native"}}}),
+        );
+        let target = resolved_definition_path(&find_def(client).unwrap()).unwrap();
+        assert_ne!(target, legacy, "{client}");
+
+        let moved = relocate::relocate(client, fixture.gateway(), None).unwrap();
+        assert_eq!(moved.cleaned, vec![legacy.clone()], "{client}");
+        let managed = moved.managed.expect("ownership of the moved entry");
+        assert_eq!(managed.command, fixture.gateway());
+
+        let now = read(&target);
+        let entry = &now["mcpServers"]["toolport"];
+        assert_eq!(entry["command"], fixture.gateway(), "{client}");
+        assert_eq!(entry["env"]["TOOLPORT_CLIENT_ID"], *client, "{client}");
+        assert_eq!(entry["env"]["TOOLPORT_PROFILE"], "work", "{client}");
+        let old = read(&legacy);
+        assert!(
+            old["mcpServers"].get("toolport").is_none(),
+            "{client}: {old}"
+        );
+        assert_eq!(old["mcpServers"]["native"], json!({"command": "native"}));
+
+        // The pass is idempotent, and the client now shows as connected.
+        let again = relocate::relocate(client, fixture.gateway(), None).unwrap();
+        assert!(
+            again.cleaned.is_empty() && again.managed.is_none(),
+            "{client}"
+        );
+        let row = read_client(&find_def(client).unwrap());
+        assert!(row.gateway_installed, "{client}");
+        drop(fixture);
+    }
+}
+
+#[test]
+fn a_connection_already_in_the_current_file_is_kept_and_the_old_copy_removed() {
+    let fixture = Fixture::new("relocate-existing");
+    let legacy = fixture.home.join(".codeium/windsurf/mcp_config.json");
+    write(
+        &legacy,
+        &json!({"mcpServers": {"toolport": old_entry("windsurf")}}),
+    );
+    let target = client_config_path("devin-cli").unwrap();
+    let current = json!({"mcpServers": {"toolport": {
+        "command": fixture.gateway(), "args": [],
+        "env": {"TOOLPORT_CLIENT_ID": "devin-cli", "TOOLPORT_ATTRIBUTION_ID": "devin-cli"}}}});
+    write(&target, &current);
+    let moved = relocate::relocate("windsurf", fixture.gateway(), None).unwrap();
+    assert!(moved.managed.is_none());
+    assert_eq!(moved.cleaned, vec![legacy.clone()]);
+    // Devin CLI's connection in the shared file is not rewritten by Devin Desktop.
+    assert_eq!(read(&target), current);
+    assert!(read(&legacy)["mcpServers"].get("toolport").is_none());
+}
+
+#[test]
+fn a_hand_edited_or_shared_http_legacy_entry_and_an_unreadable_target_block_the_move() {
+    let fixture = Fixture::new("relocate-guards");
+    let legacy = fixture.home.join(".codeium/windsurf/mcp_config.json");
+    let custom = json!({"mcpServers": {"toolport": {"command": "npx", "args": ["my-bridge"]}}});
+    write(&legacy, &custom);
+    let moved = relocate::relocate("windsurf", fixture.gateway(), None).unwrap();
+    assert!(moved.cleaned.is_empty() && moved.managed.is_none());
+    assert_eq!(read(&legacy), custom, "a customized entry stays the user's");
+
+    write(
+        &legacy,
+        &json!({"mcpServers": {"toolport": old_entry("windsurf")}}),
+    );
+    let target = client_config_path("devin-cli").unwrap();
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, "{ not json").unwrap();
+    assert!(relocate::relocate("windsurf", fixture.gateway(), None).is_err());
+    assert!(
+        read(&legacy)["mcpServers"].get("toolport").is_some(),
+        "the old entry is never removed without a replacement"
+    );
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "{ not json");
+
+    std::fs::remove_file(&target).unwrap();
+    let shared = json!({"mcpServers": {"toolport": {"command": "npx",
+        "args": ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]}}});
+    write(&legacy, &shared);
+    let managed = ManagedEntry::from_gateway_entry(
+        &serde_json::from_value(json!({"id": "toolport", "name": "toolport",
+            "transport": "stdio", "command": "npx",
+            "args": ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]}))
+        .unwrap(),
+    );
+    assert!(relocate::relocate("windsurf", fixture.gateway(), Some(&managed)).is_err());
+    assert_eq!(read(&legacy), shared);
+}
+
+#[test]
+fn moving_a_connection_restores_the_old_file_from_its_snapshot_and_releases_it() {
+    let fixture = Fixture::new("relocate-snapshot");
+    let legacy = fixture.home.join(".codeium/windsurf/mcp_config.json");
+    let original = json!({"mcpServers": {"native": {"command": "native"}}, "theme": "dark"});
+    write(&legacy, &original);
+    let before = std::fs::read_to_string(&legacy).unwrap();
+    // An older build connected Windsurf at the old location, recording a snapshot.
+    let entry: ServerEntry = serde_json::from_value(json!({"id": "toolport", "name": "toolport",
+        "transport": "stdio", "command": fixture.gateway(),
+        "env": [{"key": "TOOLPORT_CLIENT_ID", "value": "windsurf"}]}))
+    .unwrap();
+    mutation::run("windsurf", &legacy, Format::JsonMcpServers, || {
+        edit_format(Format::JsonMcpServers, &legacy, Some(&entry), false)
+    })
+    .unwrap();
+    assert!(read(&legacy)["mcpServers"].get("toolport").is_some());
+    assert!(restore::recorded_paths()
+        .iter()
+        .any(|(_, path, _)| path == &legacy));
+
+    relocate::relocate("windsurf", fixture.gateway(), None).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&legacy).unwrap(),
+        before,
+        "exact original bytes"
+    );
+    assert!(restore::released("windsurf", &legacy).unwrap());
+    assert!(!restore::recorded_paths()
+        .iter()
+        .any(|(_, path, _)| path == &legacy));
+    let target = client_config_path("devin-cli").unwrap();
+    assert!(read(&target)["mcpServers"].get("toolport").is_some());
+}
+
+#[test]
+fn connect_and_disconnect_leave_no_toolport_entry_in_an_old_file() {
+    let fixture = Fixture::new("relocate-connect");
+    let legacy = fixture.home.join(".gemini/antigravity/mcp_config.json");
+    write(
+        &legacy,
+        &json!({"mcpServers": {"toolport": old_entry("antigravity"),
+        "native": {"command": "native"}}}),
+    );
+    let outcome = install_gateway("antigravity", None).unwrap();
+    assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+    assert!(read(&legacy)["mcpServers"].get("toolport").is_none());
+    let target = client_config_path("antigravity").unwrap();
+    assert!(read(&target)["mcpServers"].get("toolport").is_some());
+
+    write(
+        &legacy,
+        &json!({"mcpServers": {"toolport": old_entry("antigravity")}}),
+    );
+    uninstall_gateway("antigravity").unwrap();
+    assert!(read(&legacy)["mcpServers"].get("toolport").is_none());
+    assert!(!read_client(&find_def("antigravity").unwrap()).gateway_installed);
+}
+
+#[test]
+fn the_launch_pass_moves_legacy_connections_and_reports_their_ownership() {
+    let fixture = Fixture::new("relocate-launch");
+    let legacy = fixture.home.join(".codeium/windsurf/mcp_config.json");
+    write(
+        &legacy,
+        &json!({"mcpServers": {"toolport": old_entry("windsurf")}}),
+    );
+    let outcome = relocate::relocate_all(fixture.gateway(), &HashMap::new());
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    assert!(outcome
+        .repointed
+        .iter()
+        .any(|(id, entry)| id == "windsurf" && entry.command == fixture.gateway()));
+    assert!(read(&legacy)["mcpServers"].get("toolport").is_none());
+}
+
+#[test]
+fn opencode_2_server_maps_are_read_and_written_in_their_own_shape() {
+    let v2 = r#"{
+  "mcp": {
+    "timeout": {"startup": 30},
+    "servers": {
+      "native": {"type": "local", "command": ["native", "--flag"], "environment": {"K": "v"}}
+    },
+    "legacy": {"type": "local", "command": ["old"], "enabled": true}
+  }
+}"#;
+    let servers = parse_opencode_json(v2).unwrap();
+    let names: Vec<_> = servers.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["legacy", "native"], "never `servers` or `timeout`");
+
+    let path = tests::temp_path("opencode-v2.json");
+    std::fs::write(&path, v2).unwrap();
+    let mut entry = tests::sample_gateway(None, "opencode");
+    entry.command = Some("/opt/toolport-gateway".into());
+    edit_opencode_gateway(&path, Some(&entry)).unwrap();
+    let root = read(&path);
+    let ours = &root["mcp"]["servers"]["toolport"];
+    assert_eq!(ours["type"], "local");
+    assert_eq!(ours["command"], json!(["/opt/toolport-gateway"]));
+    assert!(
+        ours.get("enabled").is_none(),
+        "2.x uses `disabled`, absent = on"
+    );
+    assert!(root["mcp"].get("toolport").is_none());
+    assert_eq!(root["mcp"]["timeout"], json!({"startup": 30}));
+    assert_eq!(root["mcp"]["legacy"]["command"], json!(["old"]));
+    assert!(
+        parse_opencode_json(&std::fs::read_to_string(&path).unwrap())
+            .unwrap()
+            .iter()
+            .any(|s| s.name == "toolport")
+    );
+    // Repairs find the entry under the 2.x map.
+    let value = mutation::value(
+        Format::JsonOpenCodeMcp,
+        Some(&std::fs::read_to_string(&path).unwrap()),
+    )
+    .unwrap();
+    assert!(moved::server_container(Format::JsonOpenCodeMcp, &value)
+        .get("toolport")
+        .is_some());
+    edit_opencode_gateway(&path, None).unwrap();
+    let root = read(&path);
+    assert!(root["mcp"]["servers"].get("toolport").is_none());
+    assert!(root["mcp"]["servers"].get("native").is_some());
+
+    // A 1.x file keeps the 1.x shape (2.x still converts it at load).
+    std::fs::write(
+        &path,
+        r#"{"mcp": {"native": {"type": "local", "command": ["n"]}}}"#,
+    )
+    .unwrap();
+    edit_opencode_gateway(&path, Some(&entry)).unwrap();
+    let root = read(&path);
+    assert_eq!(root["mcp"]["toolport"]["enabled"], true);
+    assert!(root["mcp"].get("servers").is_none());
+    // A 1.x server that is literally named `servers` is still a server.
+    let named = r#"{"mcp": {"servers": {"type": "local", "command": ["s"]}}}"#;
+    assert_eq!(parse_opencode_json(named).unwrap()[0].name, "servers");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn continue_files_toolport_creates_carry_the_required_header() {
+    let path = tests::temp_path("continue-new.yaml");
+    std::fs::remove_file(&path).ok();
+    edit_continue_yaml_gateway(&path, Some(&tests::sample_gateway(None, "continue"))).unwrap();
+    let root: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(root["name"], "Local Config");
+    assert_eq!(root["version"], "1.0.0");
+    assert_eq!(root["schema"], "v1");
+    assert_eq!(root["mcpServers"][0]["name"], "toolport");
+    // An existing file is the user's and gets no header.
+    std::fs::write(&path, "models: []\n").unwrap();
+    edit_continue_yaml_gateway(&path, Some(&tests::sample_gateway(None, "continue"))).unwrap();
+    let root: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(root.get("name").is_none());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn openclaw_profiles_select_their_own_state_dir() {
+    let home = std::env::temp_dir().join(format!("toolport-oc-profile-{}", std::process::id()));
+    let env = |key: &str| (key == "OPENCLAW_PROFILE").then(|| "work".to_string());
+    let dirs = openclaw::dirs(&home, &env);
+    assert_eq!(dirs.state, home.join(".openclaw-work"));
+    assert_eq!(
+        dirs.config,
+        home.join(".openclaw-work").join("openclaw.json")
+    );
+    assert!(!dirs.default_state);
+    for ignored in ["default", "-bad", "has space"] {
+        let env = |key: &str| (key == "OPENCLAW_PROFILE").then(|| ignored.to_string());
+        assert_eq!(
+            openclaw::dirs(&home, &env).state,
+            home.join(".openclaw"),
+            "{ignored}"
+        );
+    }
+    let state = home.join("state");
+    let env = |key: &str| match key {
+        "OPENCLAW_PROFILE" => Some("work".to_string()),
+        "OPENCLAW_STATE_DIR" => Some(state.display().to_string()),
+        _ => None,
+    };
+    assert_eq!(openclaw::dirs(&home, &env).state, state);
+}
+
+#[test]
+fn crush_and_antigravity_ignore_their_old_locations() {
+    let fixture = Fixture::new("old-locations");
+    let local = fixture.data.dir.join("local");
+    write(&local.join("crush/crush.json"), &json!({"mcp": {}}));
+    assert_eq!(
+        crush_path().unwrap(),
+        resolve_crush_path(&fixture.home, None, client_path_env("XDG_CONFIG_HOME"))
+    );
+    write(
+        &fixture.home.join(".gemini/antigravity-ide/mcp_config.json"),
+        &json!({"mcpServers": {"x": {"command": "x"}}}),
+    );
+    assert_eq!(
+        antigravity_path().unwrap(),
+        fixture.home.join(".gemini/config/mcp_config.json")
+    );
+}
