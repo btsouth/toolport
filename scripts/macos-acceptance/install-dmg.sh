@@ -65,24 +65,9 @@ finder_drag_install() {
   } >"$dlog" 2>&1
   shot "finder-drag-before-$ASSET" >/dev/null || true
   # Drag the app's icon onto the Applications folder icon in the root window.
-  read -r src dst < <(python3 - "$EVIDENCE/logs/finder-items-$ASSET.txt" <<'PY'
-import re, sys
-icon = target = None
-for line in open(sys.argv[1]):
-    m = re.match(r'(\S+) "(.*)" @(-?\d+),(-?\d+) (\d+)x(\d+)', line.strip())
-    if not m:
-        continue
-    role, label, x, y, w, h = m.group(1), m.group(2), *map(int, m.groups()[2:])
-    cx, cy = x + w // 2, y + h // 2
-    # The dmg window is on the left, the disk's root window on the right.
-    if role == "AXImage" and label.lower().startswith("toolport") and 40 <= x < 480 and icon is None:
-        icon = (cx, cy)
-    if role == "AXImage" and label.split(" | ")[0] == "Applications" and x >= 520 and target is None:
-        target = (cx, cy)
-if icon and target:
-    print("%d,%d %d,%d" % (icon + target))
-PY
-)
+  pair="$(python3 "$(dirname "$0")/finder_targets.py" "$EVIDENCE/logs/finder-items-$ASSET.txt")"
+  src="${pair% *}"
+  dst="${pair#* }"
   if [[ -z "${src:-}" || -z "${dst:-}" ]]; then
     echo "could not locate the icon or the Applications sidebar row" >>"$dlog"
     return 1

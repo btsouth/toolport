@@ -84,7 +84,11 @@ ui_fill() {
   local field="$1" text="$2" secure="${3:-}" pid method got
   pid="$(app_pid)"
   [[ -n "$pid" ]] || { ui_evidence "fill $field"; return 1; }
-  for method in cgevent systemevents axvalue; do
+  local methods="cgevent systemevents axvalue"
+  # A secure field reads back as one bullet per character, so only the length
+  # can be checked; skip methods that have shown they drop text.
+  [[ -n "$secure" ]] && methods="systemevents cgevent axvalue"
+  for method in $methods; do
     TPUI_TIMEOUT=30 tpui focus "$pid" "$field" >/dev/null 2>&1 || break
     sleep 0.3
     tpui key 0 cmd >/dev/null 2>&1 # select all
@@ -98,7 +102,7 @@ ui_fill() {
     esac
     sleep 0.5
     got="$(TPUI_TIMEOUT=20 tpui value "$pid" "$field" 2>/dev/null)"
-    if [[ "$got" == "$text" ]] || [[ -n "$secure" && -n "$got" ]]; then
+    if [[ "$got" == "$text" ]] || [[ -n "$secure" && ${#got} -eq ${#text} ]]; then
       printf '%s\t%s\n' "$field" "$method" >>"$UI_INPUT_METHODS"
       printf '[ui] filled "%s" with %s\n' "$field" "$method" >&2
       return 0

@@ -204,7 +204,7 @@ python3 -c 'import json,sys,shutil,os
 for k, v in json.load(open(sys.argv[1])).items():
     if os.path.exists(v["path"]):
         shutil.copyfile(v["path"], os.path.join(sys.argv[2], k + os.path.splitext(v["path"])[1]))' "$MANIFEST" "$EVIDENCE/client-configs-$LABEL"
-python3 "$HERE/clients.py" check "$HOME" "$MANIFEST" "$ENTRIES" | sed "s/^clients\t/clients ($LABEL)\t/" >>"$RESULTS"
+python3 "$HERE/clients.py" check "$HOME" "$MANIFEST" "$ENTRIES" "--registry=$REGISTRY" | sed "s/^clients\t/clients ($LABEL)\t/" >>"$RESULTS"
 grep -q $'\tFAIL\t' <(grep "^clients ($LABEL)" "$RESULTS") && STEP_FAILED=1
 
 # ── A real stdio tool call through each entry Toolport wrote ──────────────

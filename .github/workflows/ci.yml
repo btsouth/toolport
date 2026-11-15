@@ -193,6 +193,7 @@ jobs:
         run: |
           python3 -B scripts/macos-acceptance/test_render_summary.py
           python3 -B scripts/macos-acceptance/test_clients.py
+          python3 -B scripts/macos-acceptance/test_finder_targets.py
           node --test scripts/macos-acceptance/mcp-call.test.mjs
       - name: Select changed native checks
         id: select

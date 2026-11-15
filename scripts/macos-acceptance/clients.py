@@ -3,7 +3,7 @@
 
 usage:
   clients.py seed <home> <manifest.json>
-  clients.py check <home> <manifest.json> <entries-dir> [--expect-connected]
+  clients.py check <home> <manifest.json> <entries-dir> [--not-connected] [--registry=<registry.json>]
   clients.py restored <home> <manifest.json>
   clients.py unchanged <home> <before-manifest.json>
 
@@ -371,7 +371,16 @@ def user_server_kept(client, data):
     return "filesystem" in (data.get(table) or {})
 
 
-def check(home, manifest_path, entries_dir, expect_connected=True):
+def imported_into(registry):
+    """True when Toolport's registry holds the seeded filesystem server."""
+    if not registry or not os.path.exists(registry):
+        return False
+    with open(registry, encoding="utf-8") as f:
+        reg = json.load(f)
+    return any("server-filesystem" in " ".join(s.get("args", [])) for s in reg.get("servers", []))
+
+
+def check(home, manifest_path, entries_dir, expect_connected=True, registry=None):
     with open(manifest_path, encoding="utf-8") as f:
         manifest = json.load(f)
     os.makedirs(entries_dir, exist_ok=True)
@@ -401,6 +410,8 @@ def check(home, manifest_path, entries_dir, expect_connected=True):
             rows.append(row(area, "PASS", f"{client['name']} entry matches the client's documented format", f"{entry['command']} at {path}"))
         if user_server_kept(client, data):
             rows.append(row(area, "PASS", f"{client['name']} keeps the user's existing server"))
+        elif imported_into(registry):
+            rows.append(row(area, "INFO", f"{client['name']} existing server moved into Toolport", "the connect review imported it; Toolport now serves it through its entry"))
         else:
             rows.append(row(area, "FAIL", f"{client['name']} keeps the user's existing server", f"the seeded server is gone from {path}"))
     return rows
@@ -459,7 +470,8 @@ def main(argv):
         if len(argv) < 5:
             print(__doc__, file=sys.stderr)
             return 2
-        rows = check(home, manifest, argv[4], "--not-connected" not in argv)
+        reg = next((a.split("=", 1)[1] for a in argv if a.startswith("--registry=")), None)
+        rows = check(home, manifest, argv[4], "--not-connected" not in argv, reg)
     elif cmd == "restored":
         rows = compare(home, manifest, "config restored byte-exact")
     elif cmd == "unchanged":
