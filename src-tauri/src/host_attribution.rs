@@ -8,7 +8,8 @@
 //! Signals, strongest first, and never a guess:
 //!
 //! * Claude Code started by T3 Code sets `CLAUDE_CODE_ENTRYPOINT=t3-code` and passes
-//!   `T3CODE_THREAD_ID` down to its MCP servers. Both reach this process's environment.
+//!   `T3CODE_THREAD_ID` down to its MCP servers. Both reach this process's environment,
+//!   and count only with T3 Code installed and among the gateway's ancestors.
 //! * Pi and the ACP providers (Kiro, Grok, fx, ACP Registry agents) get `T3CODE_THREAD_ID`
 //!   in their process environment from T3 Code (its Pi adapter and `acpMcpContext`), so a
 //!   gateway they start inherits it. With T3 Code's own process among the gateway's
@@ -44,7 +45,7 @@ pub struct Host {
 }
 
 /// Detect this process's host. Cheap when T3 Code is not installed: one environment read
-/// and one `stat` of its data folder before any process is inspected.
+/// and one `stat` of its data folder, and no process is inspected.
 pub fn detect() -> Option<Host> {
     detect_with(
         |key| std::env::var(key).ok(),
@@ -107,25 +108,24 @@ pub fn detect_with(
     installed: impl FnOnce() -> bool,
     ancestors: impl FnOnce() -> Vec<String>,
 ) -> Option<Host> {
-    if env("CLAUDE_CODE_ENTRYPOINT").as_deref().map(str::trim) == Some(T3_CODE) {
-        return Some(Host {
-            host: T3_CODE.into(),
-            thread: env("T3CODE_THREAD_ID").and_then(|id| valid_thread(&id)),
-        });
-    }
+    // Every signal needs T3 Code installed and among the ancestors: the environment alone
+    // is something any process can set.
     if !installed() {
         return None;
     }
     let names = ancestors();
     let os = this_os();
-    // Inside a T3 Code thread's process tree, with the thread T3 Code set.
-    if let Some(thread) = env("T3CODE_THREAD_ID").and_then(|id| valid_thread(&id)) {
-        if names.iter().any(|name| is_t3_code_process_on(name, os)) {
-            return Some(Host {
-                host: T3_CODE.into(),
-                thread: Some(thread),
-            });
-        }
+    let thread = env("T3CODE_THREAD_ID").and_then(|id| valid_thread(&id));
+    let claude_from_t3 = env("CLAUDE_CODE_ENTRYPOINT").as_deref().map(str::trim) == Some(T3_CODE);
+    // Claude Code started by T3 Code, or anything in a T3 Code thread's process tree with
+    // the thread T3 Code set.
+    if (claude_from_t3 || thread.is_some())
+        && names.iter().any(|name| is_t3_code_process_on(name, os))
+    {
+        return Some(Host {
+            host: T3_CODE.into(),
+            thread,
+        });
     }
     // T3 Code starts Codex directly, or through npm's Node launcher, which starts the
     // native binary.
@@ -145,8 +145,8 @@ pub fn detect_with(
     })
 }
 
-/// Whether T3 Code has a data folder on this machine: `T3CODE_HOME` is set, or
-/// `<home>/.t3/userdata` exists.
+/// Whether T3 Code has a data folder on this machine: `T3CODE_HOME/userdata`, or
+/// `<home>/.t3/userdata` without `T3CODE_HOME`, exists.
 fn t3_installed() -> bool {
     // Tests never look at the machine's real T3 Code folder.
     #[cfg(any(test, feature = "test-support"))]
@@ -161,10 +161,24 @@ fn t3_installed() -> bool {
 
 #[cfg(not(any(test, feature = "test-support")))]
 fn t3_folder_exists() -> bool {
-    if std::env::var_os("T3CODE_HOME").is_some_and(|value| !value.is_empty()) {
-        return true;
-    }
-    dirs::home_dir().is_some_and(|home| home.join(".t3").join("userdata").is_dir())
+    t3_folder_exists_in(std::env::var_os("T3CODE_HOME"), dirs::home_dir())
+}
+
+/// T3 Code's data folder (`T3CODE_HOME`, else `<home>/.t3`) exists with its `userdata`.
+/// Only the folder counts, not the variable naming it.
+#[cfg_attr(any(test, feature = "test-support"), allow(dead_code))]
+fn t3_folder_exists_in(
+    t3_home: Option<std::ffi::OsString>,
+    home: Option<std::path::PathBuf>,
+) -> bool {
+    let folder = match t3_home.filter(|value| !value.is_empty()) {
+        Some(t3_home) => std::path::PathBuf::from(t3_home),
+        None => match home {
+            Some(home) => home.join(".t3"),
+            None => return false,
+        },
+    };
+    folder.join("userdata").is_dir()
 }
 
 /// A T3 Code thread id as T3 Code makes them (a UUID), or any similar short opaque token.
@@ -225,8 +239,8 @@ mod tests {
                 ("CLAUDE_CODE_ENTRYPOINT", "t3-code"),
                 ("T3CODE_THREAD_ID", "465774fd-c52e-4b7e-9d5c-3f0f3a6f0a11"),
             ]),
-            || panic!("the environment is enough"),
-            || panic!("no process walk for Claude Code"),
+            || true,
+            || vec!["claude".into(), "t3code".into()],
         )
         .unwrap();
         assert_eq!(host.host, "t3-code");
@@ -235,6 +249,58 @@ mod tests {
             Some("465774fd-c52e-4b7e-9d5c-3f0f3a6f0a11")
         );
         assert_eq!(short_thread(host.thread.as_deref().unwrap()), "465774fd");
+        // Started by T3 Code without a thread id: still via T3 Code.
+        let host = detect_with(
+            env(&[("CLAUDE_CODE_ENTRYPOINT", "t3-code")]),
+            || true,
+            || vec!["claude".into(), "t3code".into()],
+        )
+        .unwrap();
+        assert_eq!(host.thread, None);
+    }
+
+    #[test]
+    fn t3_code_home_counts_only_when_its_folder_exists() {
+        let root = std::env::temp_dir().join(format!("toolport-t3-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let missing = root.join("missing");
+        assert!(!t3_folder_exists_in(
+            Some(missing.clone().into_os_string()),
+            Some(home.clone())
+        ));
+        assert!(!t3_folder_exists_in(None, Some(home.clone())));
+        std::fs::create_dir_all(missing.join("userdata")).unwrap();
+        assert!(t3_folder_exists_in(
+            Some(missing.into_os_string()),
+            Some(home.clone())
+        ));
+        std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+        assert!(t3_folder_exists_in(None, Some(home)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_code_environment_alone_is_not_t3_code() {
+        // Anyone can set these variables: T3 Code must be installed and an ancestor.
+        let claimed = env(&[
+            ("CLAUDE_CODE_ENTRYPOINT", "t3-code"),
+            ("T3CODE_THREAD_ID", "chosen-thread"),
+        ]);
+        assert_eq!(
+            detect_with(&claimed, || false, || vec!["bash".into()]),
+            None
+        );
+        assert_eq!(detect_with(&claimed, || true, || vec!["bash".into()]), None);
+        assert_eq!(
+            detect_with(
+                &claimed,
+                || false,
+                || panic!("no process walk without T3 Code installed")
+            ),
+            None
+        );
     }
 
     #[test]

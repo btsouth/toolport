@@ -28,9 +28,11 @@ The approval notification names T3 Code and the start of the thread id, and the
 Clients page's recent client activity says how many of a client's sessions came
 through T3 Code.
 
-To tell, Toolport reads its own environment and, only when T3 Code is installed,
-the names of up to eight parent processes when it starts. It writes nothing for
-this and starts no extra threads.
+To tell, Toolport checks when it starts that T3 Code's data folder exists, then
+reads its own environment and the names of up to eight parent processes. It writes
+nothing for this and starts no extra threads. "via T3 Code" is for information
+only: it comes from the process tree and environment at start, and Toolport never
+uses it for access or approval decisions.
 
 ## T3 Code's own tools
 
