@@ -260,6 +260,19 @@ pub(super) fn remember(
         Err(e) => return Err(e.to_string()),
     };
     let loaded = load(client_id, path)?;
+    // A new snapshot would take the placeholders as the original and drop
+    // the owed values. Only Retry, Discard or another disconnect may proceed.
+    if !disconnecting
+        && loaded.as_ref().is_some_and(|record| record.disconnected)
+        && previous
+            .as_deref()
+            .is_some_and(|raw| backup_storage::raw_markers(raw).is_ok_and(|refs| !refs.is_empty()))
+    {
+        let name = find_def(client_id)
+            .map(|def| def.name.to_string())
+            .unwrap_or_else(|| client_id.into());
+        return Err(crate::i18n::trf("{client} still has saved recovery values. Choose Retry to restore them, or Discard these saved values to remove their copies, before connecting it again.", &[("client", &name)]));
+    }
     let fresh = loaded.as_ref().is_none_or(|record| {
         record.disconnected && record.disconnect_before.is_none() && !disconnecting
     });
@@ -1984,6 +1997,47 @@ mod tests {
             assert!(shown.contains("Retry"), "{shown}");
         });
     }
+    /// Connecting again while values are still owed would snapshot the
+    /// placeholders as the new original and drop the saved values.
+    #[test]
+    fn connect_during_pending_recovery_is_refused_and_keeps_owed_values() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let path = data.join("reconnect-pending.json");
+            let secret = "sk-reconnect-pending-fixture";
+            let original = format!(
+                r#"{{"mcpServers":{{"native":{{"command":"echo","env":{{"API_KEY":"{secret}"}}}}}}}}"#
+            );
+            std::fs::write(&path, &original).unwrap();
+            crate::secrets::set_secret("native", "API_KEY", secret).unwrap();
+            backup_storage::register("native", "API_KEY", secret);
+            mutation::run("cursor", &path, Format::JsonMcpServers, || {
+                backup_file("cursor", &path)?;
+                write_format(Format::JsonMcpServers, &path, &[entry()], true)
+            })
+            .unwrap();
+            backup_storage::clear();
+            std::env::set_var("TOOLPORT_SECRET_KEY", "locked-reconnect-pending");
+            disconnect("cursor", &path, Format::JsonMcpServers).unwrap();
+            let pending = std::fs::read_to_string(&path).unwrap();
+            assert!(pending.contains("TOOLPORT_MISSING_CREDENTIAL_0"));
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            let error = mutation::run("cursor", &path, Format::JsonMcpServers, || {
+                backup_file("cursor", &path)?;
+                write_format(Format::JsonMcpServers, &path, &[entry()], true)
+            })
+            .unwrap_err();
+            assert!(error.contains("Choose Retry"), "{error}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), pending);
+            let row = recovery::list()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.path == path.to_string_lossy())
+                .expect("the owed value stays listed");
+            assert!(recovery::retry(&row.id).unwrap().is_none());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        });
+    }
     #[test]
     fn edited_recovery_accounts_for_each_leaf_without_losing_user_edits() {
         crate::secrets::tests::with_isolated_vault(|| {
@@ -2206,25 +2260,20 @@ mod tests {
             let reconnect_path = path.clone();
             recovery::BEFORE_RETRY_LOCK.with(|slot| {
                 *slot.borrow_mut() = Some(Box::new(move || {
-                    mutation::run(
+                    // A reconnect racing Retry is refused while values are owed.
+                    assert!(mutation::run(
                         &reconnect_id,
                         &reconnect_path,
                         Format::JsonMcpServers,
                         || write_format(Format::JsonMcpServers, &reconnect_path, &[entry()], true),
                     )
-                    .unwrap();
+                    .unwrap_err()
+                    .contains("Choose Retry"));
                 }))
             });
-            assert!(recovery::retry(&notice.id)
-                .unwrap_err()
-                .contains("no longer pending"));
-            let connected = std::fs::read_to_string(&path).unwrap();
-            assert!(
-                connected.contains("toolport-gateway"),
-                "stale Retry must preserve the new connection"
-            );
+            assert!(recovery::retry(&notice.id).unwrap().is_none());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
             assert!(locations::lookup(&id).is_some());
-            disconnect::restore_path(&id, &path, Format::JsonMcpServers, None).unwrap();
             locations::remove_client_location(&id).unwrap();
             assert!(locations::lookup(&id).is_none());
         });

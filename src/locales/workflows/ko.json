@@ -480,6 +480,7 @@
   "{format} syntax error in {path}, line {line}, column {column}. Fix the syntax, then choose Retry. The saved values are kept.": "{path}의 {line}행, {column}열에 {format} 구문 오류가 있습니다. 구문을 수정한 후 다시 시도를 선택하세요. 저장된 값은 유지됩니다.",
   "{key} for {server}: {reason}": "{server}의 {key}: {reason}",
   "{client} still has saved recovery values. Choose Retry to restore them, or Discard these saved values to remove their copies, before removing this location.": "{client}에 아직 저장된 복구 값이 있습니다. 이 위치를 제거하기 전에 다시 시도를 선택하여 값을 복원하거나 저장된 값 버리기를 선택하여 사본을 제거하세요.",
+  "{client} still has saved recovery values. Choose Retry to restore them, or Discard these saved values to remove their copies, before connecting it again.": "{client}에 아직 저장된 복구 값이 있습니다. 다시 연결하기 전에 다시 시도를 선택하여 값을 복원하거나 저장된 값 버리기를 선택하여 사본을 제거하세요.",
   "Unlock your keyring, then choose {action}.": "키링의 잠금을 해제한 후 {action}를 선택하세요.",
   "The saved value is gone. Re-enter it in the client, or enter it in Toolport and choose {action}.": "저장된 값이 사라졌습니다. 클라이언트에 다시 입력하거나 Toolport에 입력한 후 {action}를 선택하세요.",
   "A saved copy failed its integrity check. Re-enter the value in the client, or enter it in Toolport and choose {action}.": "저장된 사본의 무결성 검사에 실패했습니다. 클라이언트에 값을 다시 입력하거나 Toolport에 입력한 후 {action}를 선택하세요.",

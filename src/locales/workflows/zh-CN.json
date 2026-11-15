@@ -480,6 +480,7 @@
   "{format} syntax error in {path}, line {line}, column {column}. Fix the syntax, then choose Retry. The saved values are kept.": "{path} 中的 {format} 语法错误，第 {line} 行，第 {column} 列。请修正语法，然后选择“重试”。已保存的值会保留。",
   "{key} for {server}: {reason}": "{server} 的 {key}：{reason}",
   "{client} still has saved recovery values. Choose Retry to restore them, or Discard these saved values to remove their copies, before removing this location.": "{client} 仍有已保存的恢复值。移除此位置前，请选择“重试”以恢复这些值，或选择“丢弃这些已保存的值”以删除其副本。",
+  "{client} still has saved recovery values. Choose Retry to restore them, or Discard these saved values to remove their copies, before connecting it again.": "{client} 仍有已保存的恢复值。再次连接前，请选择“重试”以恢复这些值，或选择“丢弃这些已保存的值”以删除其副本。",
   "Unlock your keyring, then choose {action}.": "请解锁密钥环，然后选择“{action}”。",
   "The saved value is gone. Re-enter it in the client, or enter it in Toolport and choose {action}.": "已保存的值已不存在。请在客户端中重新输入，或在 Toolport 中输入后选择“{action}”。",
   "A saved copy failed its integrity check. Re-enter the value in the client, or enter it in Toolport and choose {action}.": "保存的副本未通过完整性检查。请在客户端中重新输入该值，或在 Toolport 中输入后选择“{action}”。",

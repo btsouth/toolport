@@ -480,6 +480,7 @@
   "{format} syntax error in {path}, line {line}, column {column}. Fix the syntax, then choose Retry. The saved values are kept.": "{path}の{line}行{column}列に{format}の構文エラーがあります。構文を修正してから「再試行」を選択してください。保存済みの値は保持されます。",
   "{key} for {server}: {reason}": "{server}の{key}：{reason}",
   "{client} still has saved recovery values. Choose Retry to restore them, or Discard these saved values to remove their copies, before removing this location.": "{client}にはまだ復元用の値が保存されています。この場所を削除する前に、「再試行」を選択して値を復元するか、「これらの保存済みの値を破棄」を選択してコピーを削除してください。",
+  "{client} still has saved recovery values. Choose Retry to restore them, or Discard these saved values to remove their copies, before connecting it again.": "{client}にはまだ復元用の値が保存されています。もう一度接続する前に、「再試行」を選択して値を復元するか、「これらの保存済みの値を破棄」を選択してコピーを削除してください。",
   "Unlock your keyring, then choose {action}.": "キーリングのロックを解除してから「{action}」を選択してください。",
   "The saved value is gone. Re-enter it in the client, or enter it in Toolport and choose {action}.": "保存済みの値は失われています。クライアントで再入力するか、Toolportで入力して「{action}」を選択してください。",
   "A saved copy failed its integrity check. Re-enter the value in the client, or enter it in Toolport and choose {action}.": "保存済みコピーの整合性チェックに失敗しました。クライアントで値を再入力するか、Toolportで入力して「{action}」を選択してください。",
