@@ -6574,6 +6574,56 @@ mod tests {
     }
 
     #[test]
+    fn line_endings_after_a_held_start_keep_their_place_when_it_is_no_secret() {
+        let m = m(&[("TOKEN", "sk-SECRETVALUE1234")]);
+        let run = |pieces: &[&str]| {
+            let mut s = Stream::lines();
+            let mut out = String::new();
+            for p in pieces {
+                out.push_str(&s.push_with(&m, p));
+            }
+            out + &s.finish_with(&m)
+        };
+        // "s" is held until "!" shows it is not the secret: nothing after it
+        // goes out first.
+        let blank = "\n".repeat(65_536);
+        assert!(
+            run(&["s", &blank, "!"]) == format!("s{blank}!"),
+            "reordered"
+        );
+        let one_by_one: Vec<&str> = std::iter::once("s")
+            .chain(std::iter::repeat_n("\n", 65_536))
+            .chain(std::iter::once("!"))
+            .collect();
+        assert!(run(&one_by_one) == format!("s{blank}!"), "reordered");
+        // Mixed endings keep their exact bytes.
+        let mixed = format!(
+            "{}{}{}\r\r",
+            "\r\n".repeat(1_000),
+            "\n".repeat(1_000),
+            "\r\n".repeat(1_000)
+        );
+        assert!(
+            run(&["x s", &mixed, "!"]) == format!("x s{mixed}!"),
+            "bytes changed"
+        );
+        // Endings that alternate kind make a run each time: bounded, and every
+        // byte of them is still written.
+        let mut s = Stream::lines();
+        let mut out = s.push_with(&m, "x sk-SECRE");
+        let mut most = 0;
+        for _ in 0..10_000 {
+            out.push_str(&s.push_with(&m, "\n\r\r"));
+            most = most.max(s.held_bytes());
+        }
+        out.push_str(&s.finish_with(&m));
+        assert!(most <= 4 * MAX_HELD_RUNS, "held {most} bytes");
+        assert_eq!(out.matches('\n').count(), 10_000);
+        assert_eq!(out.matches('\r').count(), 20_000);
+        assert!(!out.contains("sk-SECRE"), "{}", &out[..40]);
+    }
+
+    #[test]
     fn blank_lines_after_a_live_prefix_cost_linear_work_and_are_capped() {
         let m = m(&[("KEY", "sk-AbC123xyZ")]);
         // Pushes of sixteen blank lines: 32 KiB, then 320 KiB, past the cap.
