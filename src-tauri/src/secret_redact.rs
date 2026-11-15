@@ -1639,9 +1639,11 @@ fn cover(scope: &Scope, index: usize) {
             (end, pairs, reg.whole_only.clone(), reg.main.clone())
         };
         #[cfg(test)]
-        let hook = COVER_HOOK.lock().unwrap().clone();
-        if let Some(hook) = hook {
-            hook();
+        {
+            let hook = COVER_HOOK.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
         // Searched together with the main matcher it was read with, which covers
         // everything before the delta's first value.
