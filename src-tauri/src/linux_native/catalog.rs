@@ -993,6 +993,23 @@ mod tests {
         assert!(page.pending_notice.borrow().is_none());
     }
 
+    /// The first row's Add button, not the Try again button above the rows.
+    fn first_add_button(widget: &gtk::Widget) -> Option<gtk::Button> {
+        if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+            if button.has_css_class("toolport-catalog-action") {
+                return Some(button.clone());
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Some(button) = first_add_button(&current) {
+                return Some(button);
+            }
+            child = current.next_sibling();
+        }
+        None
+    }
+
     /// Only the catalog is mounted. No broker, registry load or probes run.
     fn catalog_only(app: &adw::Application) -> CatalogPage {
         CatalogPage::new(super::super::ServerPage {
@@ -1043,46 +1060,61 @@ mod tests {
             wait_until(|| page.suggestion_popover.is_visible());
         };
 
+        // Real Escape key presses through the X server, so the key travels
+        // GTK's whole event path (window, popover capture, focused widget).
+        let press_escape = || {
+            let status = std::process::Command::new("xdotool")
+                .args(["key", "--clearmodifiers", "Escape"])
+                .status()
+                .expect("xdotool runs (install it next to xvfb)");
+            assert!(status.success(), "xdotool key Escape failed");
+        };
+        wait_until(|| window.is_active());
+        // Focus sits on the widget or, for the search field, its inner text.
+        let focus_on = |widget: &gtk::Widget| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let inside = |widget: &gtk::Widget| {
+                gtk::prelude::GtkWindowExt::focus(&window)
+                    .is_some_and(|focus| &focus == widget || focus.is_ancestor(widget))
+            };
+            while !inside(widget) {
+                let focus = gtk::prelude::GtkWindowExt::focus(&window);
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "focus is on {:?} {:?}, not {}",
+                    focus.as_ref().map(|w| w.type_().name()),
+                    focus.as_ref().map(|w| w.css_classes()),
+                    widget.type_().name()
+                );
+                gtk::glib::MainContext::default().iteration(false);
+            }
+        };
+
         // Escape in the search field closes the list and keeps the text.
         open(&page);
-        page.search.emit_by_name::<()>("stop-search", &[]);
+        focus_on(page.search.upcast_ref());
+        press_escape();
         wait_until(|| !page.suggestion_popover.is_visible());
         assert_eq!(page.search.text(), "github");
+        focus_on(page.search.upcast_ref());
 
-        // Escape from inside the list closes it and returns to the field.
+        // Escape with focus on an Add button inside the list closes the list,
+        // puts focus back on the search field and keeps the text.
         open(&page);
-        let escape = page
-            .suggestion_popover
-            .observe_controllers()
-            .into_iter()
-            .filter_map(Result::ok)
-            .find_map(|controller| controller.downcast::<gtk::EventControllerKey>().ok())
-            .expect("the suggestion list handles keys");
-        let handled = escape.emit_by_name::<bool>(
-            "key-pressed",
-            &[
-                &gtk::glib::translate::IntoGlib::into_glib(gtk::gdk::Key::Escape),
-                &0u32,
-                &gtk::gdk::ModifierType::empty(),
-            ],
-        );
-        assert!(handled);
+        let add = first_add_button(page.suggestion_list.upcast_ref())
+            .expect("the suggestion list has an Add button");
+        assert!(add.grab_focus());
+        focus_on(add.upcast_ref());
+        press_escape();
         wait_until(|| !page.suggestion_popover.is_visible());
+        focus_on(page.search.upcast_ref());
         assert_eq!(page.search.text(), "github");
-        let other = escape.emit_by_name::<bool>(
-            "key-pressed",
-            &[
-                &gtk::glib::translate::IntoGlib::into_glib(gtk::gdk::Key::a),
-                &0u32,
-                &gtk::gdk::ModifierType::empty(),
-            ],
-        );
-        assert!(!other, "other keys pass through");
 
-        // With the list closed, Escape clears the search.
-        page.search.emit_by_name::<()>("stop-search", &[]);
-        assert_eq!(page.search.text(), "");
+        // With the list closed, a second Escape clears the search.
+        press_escape();
+        wait_until(|| page.search.text().is_empty());
         assert!(!page.suggestion_popover.is_visible());
+        focus_on(page.search.upcast_ref());
         window.close();
     }
 

@@ -307,7 +307,7 @@ jobs:
       # The native shell deliberately skips WebKit/Tauri. Ubuntu 24.04 provides
       # GTK >= 4.10 and libadwaita >= 1.4, the floor for adaptive navigation.
       - name: Install GTK build dependencies
-        run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev libgtk-4-dev libadwaita-1-dev xvfb xauth dbus-daemon
+        run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev libgtk-4-dev libadwaita-1-dev xvfb xauth dbus-daemon xdotool
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
