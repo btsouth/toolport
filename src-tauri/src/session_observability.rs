@@ -13,6 +13,8 @@ pub struct Context {
     pub run_id: Option<String>,
     pub dispatch_ms: Option<u64>,
     pub cold: Option<bool>,
+    /// The app hosting the client (T3 Code), display only. Never an access principal.
+    pub host: Option<crate::host_attribution::Host>,
 }
 
 thread_local! {
@@ -163,6 +165,9 @@ pub fn enrich(entry: &mut Value) {
             entry["clientLabel"] = json!(label);
         }
     }
+    if let Some(host) = ctx.host {
+        write_host(entry, &host);
+    }
     // Broker decisions are recorded outside the gateway request context too.
     for field in ["clientName", "clientLabel"] {
         if let Some(label) = entry[field].as_str() {
@@ -183,6 +188,21 @@ pub fn enrich(entry: &mut Value) {
         } else {
             &name
         });
+    }
+}
+
+/// `host` and `hostThread` beside the client fields. The stored `client` is unchanged.
+fn write_host(entry: &mut Value, host: &crate::host_attribution::Host) {
+    if !crate::host_attribution::valid_host(&host.host) {
+        return;
+    }
+    entry["host"] = json!(host.host);
+    if let Some(thread) = host
+        .thread
+        .as_deref()
+        .and_then(crate::host_attribution::valid_thread)
+    {
+        entry["hostThread"] = json!(thread);
     }
 }
 
@@ -242,6 +262,7 @@ pub struct Session {
     name: String,
     client_type: String,
     label: Option<String>,
+    host: Option<crate::host_attribution::Host>,
     transport: &'static str,
     started: Instant,
     counts: Mutex<Counts>,
@@ -275,6 +296,18 @@ impl Session {
         transport: &'static str,
         reason: &'static str,
     ) -> Arc<Self> {
+        Self::start_hosted(client, display_client, name, label, None, transport, reason)
+    }
+    /// [`Self::start_attributed`] for a client inside a host app such as T3 Code.
+    pub fn start_hosted(
+        client: Option<&str>,
+        display_client: Option<&str>,
+        name: Option<&str>,
+        label: Option<&str>,
+        host: Option<&crate::host_attribution::Host>,
+        transport: &'static str,
+        reason: &'static str,
+    ) -> Arc<Self> {
         let client_type = display_client
             .and_then(|c| c.strip_prefix("adapter:"))
             .filter(|id| crate::clients::known_adapter_name(id).is_some())
@@ -293,6 +326,7 @@ impl Session {
                 .unwrap_or_else(|| "Unknown client".into()),
             client_type,
             label: label.and_then(display_label),
+            host: host.cloned(),
             transport,
             started: Instant::now(),
             counts: Mutex::new(Counts::default()),
@@ -312,6 +346,7 @@ impl Session {
             run_id: None,
             dispatch_ms: None,
             cold: None,
+            host: self.host.clone(),
         }
     }
     pub fn list_delivered(&self, catalog: CatalogDelivery) {
@@ -375,6 +410,9 @@ impl Session {
         }
         if let Some(label) = &self.label {
             row["clientLabel"] = json!(label);
+        }
+        if let Some(host) = &self.host {
+            write_host(&mut row, host);
         }
         if let Some((count, revision)) = counts.first {
             row["firstCatalogSize"] = json!(count);

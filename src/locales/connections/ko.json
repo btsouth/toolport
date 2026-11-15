@@ -1065,5 +1065,15 @@
   "MCP server": "MCP 서버",
   "Server is no longer available": "서버를 더 이상 사용할 수 없습니다",
   "Hide prompts": "프롬프트 숨기기",
-  "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available.": "이 서버의 프롬프트를 AI 클라이언트에 표시하지 않습니다. 프롬프트는 슬래시 명령으로 표시되는 경우가 많습니다. 도구는 계속 사용할 수 있습니다."
+  "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available.": "이 서버의 프롬프트를 AI 클라이언트에 표시하지 않습니다. 프롬프트는 슬래시 명령으로 표시되는 경우가 많습니다. 도구는 계속 사용할 수 있습니다.",
+  "reports \"{label}\"": "\"{label}\" 보고",
+  "Calls via T3 Code": "T3 Code를 통한 호출",
+  "{count} session via T3 Code": "T3 Code를 통한 세션 {count}개",
+  "{count} sessions via T3 Code": "T3 Code를 통한 세션 {count}개",
+  "{client} via T3 Code": "{client}(T3 Code 경유)",
+  "Thread {id}": "스레드 {id}",
+  "T3 Code thread {id}": "T3 Code 스레드 {id}",
+  "Copy thread id {id}": "스레드 ID {id} 복사",
+  "Copied thread id": "스레드 ID를 복사했습니다",
+  "{client} via T3 Code, thread {thread}": "{client}(T3 Code 경유, 스레드 {thread})"
 }

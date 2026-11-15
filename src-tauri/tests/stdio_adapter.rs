@@ -579,3 +579,83 @@ fn a_stop_request_spares_a_connected_client_and_leaves_with_it() {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+/// What a started adapter leaves behind once it has served `initialize` and `tools/list`:
+/// every path in its data directory (digits and hex folded, so pids and hashes compare)
+/// and the names of its own threads.
+#[cfg(target_os = "linux")]
+fn start_footprint(
+    env: &[(&str, &str)],
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
+    let mut harness = Harness::start_with_env(env);
+    harness.send(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "stdio-adapter-test", "version": "1" }
+        }
+    }));
+    harness.response_to(1);
+    harness.send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    harness.send(serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = harness.response_to(2);
+    assert!(tools["result"]["tools"].is_array(), "{tools}");
+    let fold = |text: &str| -> String {
+        let mut out = String::new();
+        for c in text.chars() {
+            let c = if c.is_ascii_hexdigit() { '0' } else { c };
+            if !(c == '0' && out.ends_with('0')) {
+                out.push(c);
+            }
+        }
+        out
+    };
+    let mut paths = std::collections::BTreeSet::new();
+    let mut pending = vec![harness.dir.clone()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let relative = path.strip_prefix(&harness.dir).unwrap().to_string_lossy();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                pending.push(path.clone());
+            }
+            let tag = if kind.is_dir() {
+                "dir"
+            } else if std::os::unix::fs::FileTypeExt::is_socket(&kind) {
+                "socket"
+            } else {
+                "file"
+            };
+            paths.insert(format!("{tag} {}", fold(&relative)));
+        }
+    }
+    let threads = std::fs::read_dir(format!("/proc/{}/task", harness.child.id()))
+        .expect("read the adapter's threads")
+        .flatten()
+        .filter_map(|task| std::fs::read_to_string(task.path().join("comm")).ok())
+        .map(|name| fold(name.trim()))
+        .collect();
+    (paths, threads)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_client_id_adds_no_files_sockets_or_threads_at_start() {
+    // A session's gateway must start the same way whichever client it serves: no
+    // claim folder, socket or watcher thread of its own.
+    let (plain_paths, plain_threads) = start_footprint(&[]);
+    for client in ["claude-code", "codex", "cursor", "zed", "claude-desktop"] {
+        let (paths, threads) = start_footprint(&[("TOOLPORT_CLIENT_ID", client)]);
+        assert!(
+            !paths.iter().any(|path| path.contains("sessions")),
+            "{client}: {paths:?}"
+        );
+        assert_eq!(paths, plain_paths, "{client}: data dir differs");
+        assert_eq!(threads, plain_threads, "{client}: threads differ");
+    }
+}

@@ -225,6 +225,39 @@ describe("PendingApprovals refresh ordering", () => {
 });
 
 describe("PendingApprovals client identity", () => {
+  it("names a client running under T3 Code and shows its thread", async () => {
+    const thread = "0f8e2c1a-9b7d-4e3f-a1b2-c3d4e5f60718";
+    listPendingApprovals.mockResolvedValue([
+      approval({
+        client: "client:c1",
+        clientName: "Codex",
+        host: "t3-code",
+        hostThread: thread,
+      }),
+    ]);
+    render(<PendingApprovals />);
+    await act(async () => {});
+    expect(
+      screen.getByText(/^Codex via T3 Code wants to run this · destructive tool/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Thread 0f8e2c1a")).toHaveAttribute(
+      "title",
+      `T3 Code thread ${thread}`,
+    );
+  });
+
+  it("adds nothing for an unknown host", async () => {
+    listPendingApprovals.mockResolvedValue([
+      approval({ clientName: "Codex", host: "other-app", hostThread: "abc" }),
+    ]);
+    render(<PendingApprovals />);
+    await act(async () => {});
+    expect(
+      screen.getByText("Codex wants to run this · destructive tool"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/via T3 Code|Thread /)).not.toBeInTheDocument();
+  });
+
   it("shows the authenticated client before an escaped secondary label", async () => {
     listPendingApprovals.mockResolvedValue([
       {

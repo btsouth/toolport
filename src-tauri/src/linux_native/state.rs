@@ -17,6 +17,10 @@ pub(super) struct ActivityView {
     pub(super) client: Option<String>,
     pub(super) client_id: Option<String>,
     pub(super) client_label: Option<String>,
+    /// The app hosting the client (`t3-code`), display only. Unknown hosts are dropped.
+    pub(super) host: Option<String>,
+    /// The host's thread id, kept only alongside a known host.
+    pub(super) host_thread: Option<String>,
     pub(super) approval_decision: Option<String>,
     pub(super) cold: Option<bool>,
     pub(super) dispatch_ms: Option<u64>,
@@ -131,6 +135,10 @@ impl ActivitySnapshot {
                         .get("clientLabel")
                         .and_then(serde_json::Value::as_str)
                         .and_then(crate::approval::sanitize_client_label),
+                    host: activity_host(&entry),
+                    host_thread: activity_host(&entry)
+                        .and(entry["hostThread"].as_str())
+                        .and_then(crate::host_attribution::valid_thread),
                     cold: entry["cold"].as_bool(),
                     dispatch_ms: entry["dispatchMs"].as_u64(),
                     failure_kind: entry["failureKind"].as_str().map(str::to_string),
@@ -196,6 +204,13 @@ impl ActivitySnapshot {
             telemetry_notices: Vec::new(),
         }
     }
+}
+
+fn activity_host(entry: &serde_json::Value) -> Option<String> {
+    entry["host"]
+        .as_str()
+        .filter(|host| crate::host_attribution::valid_host(host))
+        .map(str::to_owned)
 }
 
 fn activity_server(entry: &serde_json::Value) -> String {
@@ -1288,6 +1303,50 @@ mod tests {
         assert!(!rendered.contains("/private"));
         assert!(!rendered.contains("secret-command"));
         assert!(!rendered.contains("SECRET_TOKEN"));
+    }
+
+    #[test]
+    fn activity_view_keeps_a_known_host_and_its_thread() {
+        let snapshot = ActivitySnapshot::from_entries(
+            vec![
+                serde_json::json!({
+                    "ts": 1, "server": "github", "tool": "a", "ok": true,
+                    "clientName": "Claude Code", "host": "t3-code",
+                    "hostThread": "465774fd-c52e-4b7e-9d5c-3f0f3a6f0a11"
+                }),
+                serde_json::json!({
+                    "ts": 2, "server": "github", "tool": "b", "ok": true,
+                    "clientName": "Codex", "host": "t3-code"
+                }),
+                serde_json::json!({
+                    "ts": 3, "server": "github", "tool": "c", "ok": true,
+                    "clientName": "Codex", "host": "elsewhere", "hostThread": "abc"
+                }),
+                serde_json::json!({
+                    "ts": 4, "server": "github", "tool": "d", "ok": true,
+                    "clientName": "Codex", "host": "t3-code", "hostThread": "bad id"
+                }),
+            ],
+            100,
+        );
+        let hosts = snapshot
+            .recent
+            .iter()
+            .map(|row| (row.host.as_deref(), row.host_thread.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hosts,
+            [
+                (
+                    Some("t3-code"),
+                    Some("465774fd-c52e-4b7e-9d5c-3f0f3a6f0a11")
+                ),
+                (Some("t3-code"), None),
+                (None, None),
+                (Some("t3-code"), None),
+            ]
+        );
+        assert_eq!(snapshot.recent[0].client.as_deref(), Some("Claude Code"));
     }
 
     #[test]

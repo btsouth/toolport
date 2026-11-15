@@ -20,6 +20,7 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { SectionHeader } from "@/components/ui/section-header";
 import { SkeletonRows } from "@/components/ui/skeleton";
 import { clientDiscovery } from "@/lib/clientDiscovery";
+import { t3CodeActivitySegment } from "@/lib/hostAttribution";
 import {
   importableServers,
   isGatewayDetected,
@@ -682,6 +683,8 @@ export function ClientsView({
                       translate(" · Last saw {value0} tools", {
                         value0: client.firstCatalogSize.toLocaleString(locale),
                       })}
+                    {t3CodeActivitySegment(client) &&
+                      ` · ${t3CodeActivitySegment(client)}`}
                   </p>
                 </div>
               ))}

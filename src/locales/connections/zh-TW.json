@@ -1065,5 +1065,15 @@
   "MCP server": "MCP 伺服器",
   "Server is no longer available": "伺服器已無法使用",
   "Hide prompts": "隱藏提示詞",
-  "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available.": "不在 AI 用戶端中顯示此伺服器的提示詞（它們常以斜線命令的形式出現）。其工具仍可使用。"
+  "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available.": "不在 AI 用戶端中顯示此伺服器的提示詞（它們常以斜線命令的形式出現）。其工具仍可使用。",
+  "reports \"{label}\"": "報告「{label}」",
+  "Calls via T3 Code": "經由 T3 Code 的呼叫",
+  "{count} session via T3 Code": "經由 T3 Code 的 {count} 個工作階段",
+  "{count} sessions via T3 Code": "經由 T3 Code 的 {count} 個工作階段",
+  "{client} via T3 Code": "{client}（透過 T3 Code）",
+  "Thread {id}": "對話 {id}",
+  "T3 Code thread {id}": "T3 Code 對話 {id}",
+  "Copy thread id {id}": "複製執行緒 ID {id}",
+  "Copied thread id": "已複製執行緒 ID",
+  "{client} via T3 Code, thread {thread}": "{client}（透過 T3 Code，執行緒 {thread}）"
 }

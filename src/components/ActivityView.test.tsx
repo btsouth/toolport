@@ -1468,3 +1468,81 @@ it("reconciles hide/show with a delayed first revision and no overlapping checks
   await act(() => vi.advanceTimersByTimeAsync(60_000));
   expect(getAuditLog).toHaveBeenCalledTimes(calls);
 });
+
+it("names calls made through T3 Code and shows their thread", async () => {
+  const ts = Date.now() - 120000;
+  const thread = "0f8e2c1a-9b7d-4e3f-a1b2-c3d4e5f60718";
+  getAuditLog.mockResolvedValue([
+    entry({
+      ts,
+      tool: "hosted",
+      clientName: "Codex",
+      host: "t3-code",
+      hostThread: thread,
+    }),
+    entry({ ts, tool: "hosted_no_thread", clientName: "Cursor", host: "t3-code" }),
+    entry({
+      ts,
+      tool: "hosted_reports",
+      clientName: "Claude Code (claude_personal)",
+      clientLabel: "claude-code-cli",
+      host: "t3-code",
+    }),
+    entry({ ts, tool: "plain_reports", clientName: "Gemini", clientLabel: "my-agent" }),
+    entry({ ts, tool: "other_host", clientName: "Zed", host: "other", hostThread: "x1" }),
+    entry({ ts, tool: "plain", clientName: "Claude Code" }),
+  ]);
+  render(<ActivityView refreshKey={0} registry={null} />);
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+  expect(screen.getByText("Codex via T3 Code · 2m ago · 120 ms")).toBeVisible();
+  const chip = screen.getByText("Thread 0f8e2c1a");
+  expect(chip).toHaveAttribute("title", `T3 Code thread ${thread}`);
+  // A control that copies the full id.
+  expect(screen.getByRole("button", { name: `Copy thread id ${thread}` })).toBe(chip);
+  expect(screen.getByText("Cursor via T3 Code · 2m ago · 120 ms")).toBeVisible();
+  // The host stays beside the client it describes; what it reported comes next.
+  expect(
+    screen.getByText(
+      'Claude Code (claude_personal) via T3 Code · reports "claude-code-cli" · 2m ago · 120 ms',
+    ),
+  ).toBeVisible();
+  expect(screen.getByText('Gemini · reports "my-agent" · 2m ago · 120 ms')).toBeVisible();
+  expect(screen.getAllByText(/^Thread /)).toHaveLength(1);
+  expect(screen.getByText("Zed · 2m ago · 120 ms")).toBeVisible();
+  expect(screen.getByText("Claude Code · 2m ago · 120 ms")).toBeVisible();
+  expect(screen.queryByText(/Zed via/)).not.toBeInTheDocument();
+});
+
+it("names live-inspected calls made through T3 Code", async () => {
+  getInspectLog.mockResolvedValue([
+    {
+      ts: 1700000000000,
+      clientName: "Codex",
+      server: "github",
+      tool: "create_issue",
+      request: {},
+      response: {},
+      ok: true,
+      host: "t3-code",
+      hostThread: "thread:abcdef0123456789",
+    },
+    {
+      ts: 1700000000000,
+      clientName: "Zed",
+      server: "github",
+      tool: "list_issues",
+      request: {},
+      response: {},
+      ok: true,
+    },
+  ]);
+  render(<ActivityView refreshKey={0} registry={{ liveInspect: true } as never} />);
+  expect(await screen.findByText("Codex via T3 Code")).toBeVisible();
+  expect(screen.getByText("Thread abcdef01")).toHaveAttribute(
+    "title",
+    "T3 Code thread thread:abcdef0123456789",
+  );
+  expect(screen.getByText("Zed")).toBeVisible();
+  expect(screen.getAllByText(/^Thread /)).toHaveLength(1);
+});

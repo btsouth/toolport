@@ -96,8 +96,15 @@ export interface MigrateResult {
   outcome: WriteOutcome;
 }
 
+/** The app hosting a client, such as `t3-code`, and its thread id. Display only; the
+ * stored `client` id is unchanged. */
+export interface HostAttribution {
+  host?: string | null;
+  hostThread?: string | null;
+}
+
 /** Retained transport observations. Reported labels are never app identity. */
-export interface ClientSession {
+export interface ClientSession extends HostAttribution {
   sessionId: string;
   client?: string;
   clientName: string;
@@ -119,9 +126,13 @@ export interface ClientActivity extends Partial<ClientSession> {
   lastActiveMs?: number;
   callsToday?: number | null;
   sessionCount?: number;
+  /** Some of this client's retained activity came through T3 Code. */
+  viaT3Code?: boolean;
+  /** How many of its sessions T3 Code hosted, when `viaT3Code`. */
+  t3CodeSessions?: number;
 }
 
-export interface AuditEntry {
+export interface AuditEntry extends HostAttribution {
   /** Approval outcomes are Activity events, never dispatched calls. */
   kind?: string;
   decision?: string;
@@ -166,7 +177,7 @@ export interface AuditEntry {
 /** One live-inspection capture: a tool call's request args and response, plus timing.
  * Only present while live inspection is on. `request`/`response` are the raw captured
  * bodies (or a "<truncated N bytes>" marker string when the body exceeded the size cap). */
-export interface InspectEntry {
+export interface InspectEntry extends HostAttribution {
   ts: number;
   client?: string;
   clientName?: string;
@@ -581,7 +592,7 @@ export interface FolderProfile {
 }
 
 /** A tool call held awaiting a human decision (the HITL approval queue). */
-export interface PendingApproval {
+export interface PendingApproval extends HostAttribution {
   id: string;
   clientName?: string;
   client: string | null;

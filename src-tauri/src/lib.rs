@@ -26,6 +26,7 @@ pub mod gateway_publish;
 pub mod gatewaylog;
 pub mod guard_cleanup;
 pub mod hooks;
+pub mod host_attribution;
 pub mod hostenv;
 pub mod http_bridge;
 pub mod http_client;
