@@ -230,9 +230,7 @@ fn read_contained(path: &Path, userdata: &Path) -> Option<Vec<u8>> {
     // without being zeroed. A file that grew past its size since is cut at the limit.
     let size = file.metadata().ok()?.len().min(SETTINGS_READ_LIMIT) as usize;
     let mut bytes = Vec::with_capacity(size + 1);
-    let read = file
-        .take(size as u64 + 1)
-        .read_to_end(&mut bytes);
+    let read = file.take(size as u64 + 1).read_to_end(&mut bytes);
     if read.is_err() || bytes.len() > size || bytes.len() as u64 > SETTINGS_READ_LIMIT {
         bytes.fill(0);
         return None;
