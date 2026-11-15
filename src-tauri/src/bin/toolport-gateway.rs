@@ -4363,6 +4363,24 @@ fn mcp_app_tool_for_view(tool: &Value, router: &Router, relays: bool, servers: &
 /// Whether a client scoped to `allowed` may see the exposed tool `name`. See
 /// [`scope_tools`] for how `route_of` is resolved and why the `server__` prefix is only a
 /// fallback.
+/// The model-facing visibility rule `toolport_search_tools` applies to every
+/// candidate: MCP Apps visibility (an app-only tool is never shown to the model) and
+/// the caller's server scope. `toolport.describe` and the `servers.*` stubs use the
+/// same function, so a script sees exactly the tools search can return.
+fn tool_visible_to_model(
+    tool: &Value,
+    allowed: Option<&std::collections::HashSet<String>>,
+    route_of: &impl Fn(&str) -> Option<String>,
+) -> bool {
+    mcp_app_tool_is_model_visible(tool)
+        && tool
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| {
+                allowed.is_none_or(|allowed| tool_in_scope(name, allowed, route_of))
+            })
+}
+
 fn tool_in_scope(
     name: &str,
     allowed: &std::collections::HashSet<String>,
@@ -6429,22 +6447,14 @@ fn script_catalog_tools(
     allowed: Option<&std::collections::HashSet<String>>,
     route_of: impl Fn(&str) -> Option<String>,
 ) -> Vec<String> {
+    // Search's own visibility rule. Names with no server part (an override rename)
+    // stay in: they get no `servers.*` stub, but `toolport.call` and `describe` reach
+    // them, exactly as their search signature says.
     let mut names: Vec<String> = cached
         .iter()
+        .filter(|tool| tool_visible_to_model(tool, allowed, &route_of))
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
         .filter(|n| !codemode::is_code_mode_meta_tool(n))
-        .filter(|n| {
-            let Some((server, tool)) = codemode::split_script_name(n) else {
-                return false;
-            };
-            if server.is_empty() || tool.is_empty() {
-                return false;
-            }
-            match allowed {
-                Some(set) => route_of(n).is_some_and(|sid| server_in_allowed_scope(&sid, set)),
-                None => true,
-            }
-        })
         .map(str::to_string)
         .collect();
     names.sort();
@@ -6452,8 +6462,23 @@ fn script_catalog_tools(
     names
 }
 
+/// What a script may see: the catalog search would search (the cached one, or the
+/// live router's on a cold cache) without tools the router refuses, dropped the way
+/// tools/list drops them. A stale cache can still hold a tool that was disabled,
+/// quarantined or put outside this client's tool scope since; no stub or describe
+/// should offer it.
+fn script_source(cached: &dyn ToolCatalog, router: &Router, reg: &Registry) -> SharedTools {
+    let base = if cached.is_empty() {
+        router.shared_tools()
+    } else {
+        cached.shared()
+    };
+    drop_blocked_from_cache(base, router, reg)
+}
+
 /// `toolport.describe` over the same scoped names the `servers.*` stubs come from.
-/// The schema gets the neutralisation every listed `inputSchema` gets.
+/// The schema gets the neutralisation every listed `inputSchema` gets. The signature
+/// is complete; `truncated` is true only when a guard was reached, with the reason.
 fn script_describe_binding(tools: SharedTools, catalog: &[String]) -> codemode::DescribeBinding {
     let in_scope: HashSet<String> = catalog.iter().cloned().collect();
     Arc::new(move |name: &str| {
@@ -6787,7 +6812,8 @@ fn run_script_dispatch(
         .unwrap_or(false)
     {
         let owners = unique_prefix_owners(reg);
-        return validate_script_dispatch(&script, input, cached, allowed, client, |name| {
+        let source = script_source(cached, router_arc, reg);
+        return validate_script_dispatch(&script, input, &source, allowed, client, |name| {
             owner_of_exposed_tool(Some(router_arc.as_ref()), &owners, name)
         });
     }
@@ -6892,11 +6918,12 @@ fn execute_script_dispatch(
 
     // Typed `servers.*` stubs from the client-scoped catalog (meta-tools excluded).
     let owners = unique_prefix_owners(reg);
-    let catalog = script_catalog_tools(cached, allowed, |name| {
+    let source = script_source(cached, router_arc, reg);
+    let catalog = script_catalog_tools(&source, allowed, |name| {
         owner_of_exposed_tool(Some(router_arc.as_ref()), &owners, name)
     });
 
-    let describe = script_describe_binding(cached.shared(), &catalog);
+    let describe = script_describe_binding(source, &catalog);
     let outcome = run_code_mode_isolated(
         script,
         input,
@@ -8083,20 +8110,15 @@ fn handle_request_with_cancel(
                         .map(|entry| entry.id.as_str())
                         .or_else(|| owners.get(&selector.to_lowercase()).map(String::as_str))
                 });
+                let route_of = |name: &str| owner_of_exposed_tool(Some(router), &owners, name);
                 let visible = |tool: &Value| {
-                    mcp_app_tool_is_model_visible(tool)
+                    tool_visible_to_model(tool, allowed, &route_of)
                         && tool
                             .get("name")
                             .and_then(Value::as_str)
                             .is_some_and(|name| {
-                                server_owner.is_none_or(|owner| {
-                                    owner_of_exposed_tool(Some(router), &owners, name).as_deref()
-                                        == Some(owner)
-                                }) && allowed.is_none_or(|allowed| {
-                                    tool_in_scope(name, allowed, &|name| {
-                                        owner_of_exposed_tool(Some(router), &owners, name)
-                                    })
-                                })
+                                server_owner
+                                    .is_none_or(|owner| route_of(name).as_deref() == Some(owner))
                             })
                 };
                 let source: Vec<&Value> = base.iter().filter(|tool| visible(tool)).collect();
@@ -28594,11 +28616,25 @@ mod tests {
         };
         let names = script_catalog_tools(&cached, Some(&allowed), route);
         assert_eq!(names, vec!["file_system__read".to_string()]);
-        // Unscoped sees every namespaced non-meta tool, still drops bare + meta.
+        // Unscoped sees every non-meta tool. A bare (override-renamed) name stays
+        // describable and callable; it just gets no `servers.*` stub.
         let all = script_catalog_tools(&cached, None, |_| None);
         assert_eq!(
             all,
-            vec!["file_system__read".to_string(), "other__tool".to_string(),]
+            vec![
+                "file_system__read".to_string(),
+                "no_separator".to_string(),
+                "other__tool".to_string(),
+            ]
+        );
+        // Scoped, a bare name needs an owner in scope, as search requires.
+        let routed = |name: &str| match name {
+            "no_separator" => Some("file-system".to_string()),
+            other => route(other),
+        };
+        assert_eq!(
+            script_catalog_tools(&cached, Some(&allowed), routed),
+            vec!["file_system__read".to_string(), "no_separator".to_string()]
         );
     }
 

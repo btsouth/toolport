@@ -337,3 +337,163 @@ fn measure_call_tool_arguments_on_code_mode_off_menus() {
     );
     assert!(menus > 0 && with_arguments > today);
 }
+
+/// Run a script that describes `names` and reports the stubs it can see, executed
+/// and as a dry run. Returns the two reports.
+fn describe_report(
+    reg: &Registry,
+    router: &Arc<Router>,
+    cached: &[Value],
+    allowed: Option<&std::collections::HashSet<String>>,
+    names: &[&str],
+) -> [Value; 2] {
+    let script = r#"
+        const seen = { described: {}, stubs: {} };
+        for (const name of data.names) {
+            const d = toolport.describe(name);
+            seen.described[name] = d === null ? null : d.signature;
+        }
+        for (const server of Object.keys(servers)) {
+            seen.stubs[server] = Object.keys(servers[server]).sort();
+        }
+        seen.listed = toolport.listTools();
+        if (data.validate) toolport.call("s__keep", seen);
+        return seen;
+    "#;
+    [false, true].map(|validate| {
+        let args = json!({"script": script, "validate": validate, "data": {"names": names, "validate": validate}});
+        let result = run_script_dispatch(reg, Some(router), &cached.to_vec(), None, None, allowed, None, &args, None);
+        if validate {
+            // Out of scope, the probe call itself is unresolved; the plan still has it.
+            result["structuredContent"]["toolportValidate"]["plan"][0]["args"].clone()
+        } else {
+            assert_eq!(result["isError"], false, "{result}");
+            result["structuredContent"]["result"].clone()
+        }
+    })
+}
+
+/// S5 and L11: describe and the `servers.*` stubs see what search can return. An
+/// app-only tool and an out-of-scope server are hidden by the same predicate search
+/// uses. A stale cache entry the router now refuses (quarantined, disabled, outside
+/// this client's tool allow-list, or destructive under the gate) is dropped the way
+/// tools/list drops it. A bare override name is describable, as its signature says.
+#[test]
+fn describe_and_stubs_follow_search_visibility() {
+    let _data = DataDirTestEnv::new("describe-search-visibility");
+    let tool = |name: &str| json!({"name": name, "description": format!("{name} tool"), "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}}});
+    let mut app = tool("app");
+    app["_meta"] = json!({"ui": {"resourceUri": "ui://s/app", "visibility": ["app"]}});
+    let mut drop_tool = tool("drop");
+    drop_tool["annotations"] = json!({"destructiveHint": true});
+    let upstream = vec![
+        tool("keep"),
+        tool("wipe"),
+        tool("off"),
+        tool("hidden"),
+        drop_tool.clone(),
+        app.clone(),
+    ];
+    let policy = ToolPolicy {
+        quarantined: ["s__wipe".to_string()].into_iter().collect(),
+        disabled: [("s".to_string(), ["off".to_string()].into_iter().collect())]
+            .into_iter()
+            .collect(),
+        allow: [(
+            "s".to_string(),
+            ["keep", "wipe", "off", "drop", "app"]
+                .map(String::from)
+                .into_iter()
+                .collect(),
+        )]
+        .into_iter()
+        .collect(),
+        deny_destructive: true,
+        ..Default::default()
+    };
+    let mut router = Router::with_policy(policy);
+    router.add(
+        DownstreamServer::connect("s".into(), Box::new(MockRoute { tools: upstream })).unwrap(),
+    );
+    let router = Arc::new(router);
+    // The stale cache still lists every tool under its exposed name.
+    let mut cached: Vec<Value> = ["keep", "wipe", "off", "hidden"]
+        .iter()
+        .map(|name| tool(&format!("s__{name}")))
+        .collect();
+    let mut stale_drop = drop_tool;
+    stale_drop["name"] = json!("s__drop");
+    let mut stale_app = app;
+    stale_app["name"] = json!("s__app");
+    cached.extend([stale_drop, stale_app, tool("lonely")]);
+    let reg = Registry {
+        code_mode: true,
+        deny_destructive: true,
+        ..Default::default()
+    };
+    let names = [
+        "s__keep",
+        "s__wipe",
+        "s__off",
+        "s__hidden",
+        "s__drop",
+        "s__app",
+        "lonely",
+    ];
+    for report in describe_report(&reg, &router, &cached, None, &names) {
+        let described = &report["described"];
+        assert_eq!(
+            described["s__keep"], "servers.s.keep(args?: {q?: string}): ToolResult",
+            "{report}"
+        );
+        assert_eq!(
+            described["lonely"], "toolport.call(\"lonely\", args?: {q?: string}): ToolResult",
+            "{report}"
+        );
+        for hidden in ["s__wipe", "s__off", "s__hidden", "s__drop", "s__app"] {
+            assert_eq!(described[hidden], Value::Null, "{hidden}: {report}");
+        }
+        assert_eq!(report["stubs"], json!({"s": ["keep"]}), "{report}");
+        assert_eq!(report["listed"], json!(["s__keep"]), "{report}");
+    }
+    // Search hides the app-only tool through the same predicate.
+    let host = dispatch_host(true);
+    let searched = handle_request(
+        &host,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "toolport_search_tools", "arguments": {"query": "app tool"}}}),
+        &reg,
+        &router,
+        &cached,
+        true,
+        None,
+        &SearchGuard::default(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(!searched.to_string().contains("s__app"), "{searched}");
+    assert!(
+        searched.to_string().contains("servers.s.keep"),
+        "{searched}"
+    );
+    // Server scope: a client allowed only `other` sees nothing from `s`; one allowed
+    // `s` sees the same as unscoped, minus the bare name no server owns.
+    let other: std::collections::HashSet<String> = ["other".to_string()].into_iter().collect();
+    for report in describe_report(&reg, &router, &cached, Some(&other), &names) {
+        assert!(
+            report["described"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(Value::is_null),
+            "{report}"
+        );
+        assert_eq!(report["stubs"], json!({}), "{report}");
+    }
+    let own: std::collections::HashSet<String> = ["s".to_string()].into_iter().collect();
+    for report in describe_report(&reg, &router, &cached, Some(&own), &names) {
+        assert!(report["described"]["s__keep"].is_string(), "{report}");
+        assert_eq!(report["described"]["lonely"], Value::Null, "{report}");
+        assert_eq!(report["described"]["s__app"], Value::Null, "{report}");
+    }
+}
