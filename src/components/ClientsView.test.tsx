@@ -859,6 +859,26 @@ describe("ClientsView", () => {
       expect(screen.queryByText(/T3 Code/)).not.toBeInTheDocument();
     });
 
+    it("says T3 Code's settings can't be read once a revision exists", async () => {
+      vi.useFakeTimers();
+      // A broken settings link still has a revision, so the card reads the instances.
+      vi.mocked(t3CodeRevision).mockResolvedValue("link:broken");
+      vi.mocked(t3CodeOtherInstances).mockResolvedValue([
+        other("", "", "~/.t3/userdata/settings.json", "unreadable"),
+      ]);
+      render(
+        <ClientsView clients={[client()]} registry={null} onSelectClient={vi.fn()} />,
+      );
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(t3CodeOtherInstances).toHaveBeenCalledTimes(1);
+      expect(screen.getByRole("group", { name: "T3 Code" })).toBeVisible();
+      expect(card()).toHaveTextContent(
+        "Toolport can't read T3 Code's settings in ~/.t3/userdata/settings.json, so it can't list T3 Code's instances.",
+      );
+      // Not counted as an unconnected instance, and no status line without rows.
+      expect(card()).not.toHaveTextContent(/not connected|is connected/);
+    });
+
     it("says to add an OpenCode, Grok or Pi home no row covers by hand", async () => {
       vi.useFakeTimers();
       vi.mocked(t3CodeRevision).mockResolvedValue("a");
