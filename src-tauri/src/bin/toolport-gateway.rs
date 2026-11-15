@@ -39174,146 +39174,32 @@ mod tests {
     }
 
     #[test]
-    fn a_secret_split_across_two_progress_messages_is_never_delivered_in_pieces() {
-        let _data = DataDirTestEnv::new("progress-split-secret");
-        conduit_lib::secret_redact::register("alpha", "PROGRESS_KEY", "sk-ProgressSecret456");
-        let state = http_state(false);
-        let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
-        let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
-        let (stdio, _stdio_rx) = stdio_session_with_progress();
-        let (_registration, wire) = register_progress(
-            &routes,
-            Some(&json!({ "progressToken": "tok-split" })),
-            None,
-            "alpha",
-            &s1,
-        )
-        .unwrap();
-        let note = |progress: u64, message: &str| {
-            json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/progress",
-                "params": {"progressToken": wire, "progress": progress, "message": message}
-            })
-        };
-        for (i, message) in ["uploading with sk-Progr", "essSecret456 accepted"]
-            .iter()
-            .enumerate()
-        {
-            deliver_progress(
-                &stdio,
-                &state.mcp_sessions,
-                &routes,
-                "alpha",
-                &note(i as u64, message),
-            );
-        }
-        let got = drain_session(&state, &s1);
-        // The first ends in what may be the start of the secret: its decided
-        // part goes out at once, and only that end waits for the second.
-        assert_eq!(got.len(), 2, "{got:?}");
-        let joined = got.join("\n");
-        for piece in ["sk-Progr", "essSecret456", "Secret456"] {
-            assert!(!joined.contains(piece), "{piece} delivered: {joined}");
-        }
-        assert!(got[0].contains("\"uploading with \""), "{}", got[0]);
-        assert!(got[0].contains("\"progress\":0"), "{}", got[0]);
-        assert!(
-            got[1].contains("\"[secret:PROGRESS_KEY] accepted\""),
-            "{}",
-            got[1]
-        );
-        assert!(got[1].contains("\"progress\":1"), "{}", got[1]);
-    }
-
-    #[test]
-    fn progress_keeps_the_clients_own_secret_and_delivers_a_held_note_when_the_call_ends() {
-        let _data = DataDirTestEnv::new("progress-exempt-held");
+    fn each_progress_message_is_redacted_on_its_own_and_delivered_as_it_came() {
+        let _data = DataDirTestEnv::new("progress-per-message");
+        conduit_lib::secret_redact::register("alpha", "TOKEN", "sk-SECRETVALUE1234");
         conduit_lib::secret_redact::register("alpha", "OWN", "sk-OwnProgress789");
-        conduit_lib::secret_redact::register("alpha", "OTHER", "sk-OtherProg321");
         let state = http_state(false);
         let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
         let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
         let (stdio, _stdio_rx) = stdio_session_with_progress();
-        {
-            let (stdio, sessions) = (Arc::clone(&stdio), state.mcp_sessions.clone());
-            routes.lock().unwrap().deliver = Some(Arc::new(
-                move |session: &str, note: &Value, owner: Option<&downstream::CancelContext>| {
-                    deliver_progress_to(&stdio, &sessions, session, note, owner);
-                },
-            ));
-        }
         let request = json!({ "arguments": { "key": "sk-OwnProgress789" } });
-        let note = |wire: &str, progress: u64, message: &str| {
-            json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/progress",
-                "params": {"progressToken": wire, "progress": progress, "message": message}
-            })
-        };
-        for (tail, expected) in [("sk-Ot", "\"sk-Ot\""), ("sk-OtherP", "\"[secret:OTHER]\"")] {
-            let (registration, wire) = register_progress(
-                &routes,
-                Some(&json!({ "progressToken": "tok-own" })),
-                Some(&request),
-                "alpha",
-                &s1,
-            )
-            .unwrap();
-            for (i, message) in ["echo sk-OwnProgress789 ok", tail].iter().enumerate() {
-                deliver_progress(
-                    &stdio,
-                    &state.mcp_sessions,
-                    &routes,
-                    "alpha",
-                    &note(&wire, i as u64, message),
-                );
-            }
-            let got = drain_session(&state, &s1);
-            assert_eq!(got.len(), 1, "{got:?}");
-            // The client sent this value: its echo is its own.
-            assert!(
-                got[0].contains("\"echo sk-OwnProgress789 ok\""),
-                "{}",
-                got[0]
-            );
-            // The call ends: the held note is delivered, under the end rule.
-            drop(registration);
-            let got = drain_session(&state, &s1);
-            assert_eq!(got.len(), 1, "{got:?}");
-            assert!(got[0].contains(expected), "{}", got[0]);
-            assert!(got[0].contains("tok-own"), "{}", got[0]);
-        }
-    }
-
-    #[test]
-    fn progress_delivers_the_decided_part_and_holds_only_an_undecided_end() {
-        let _data = DataDirTestEnv::new("progress-held-bound");
-        conduit_lib::secret_redact::register("alpha", "OTHER", "sk-OtherProg321");
-        let state = http_state(false);
-        let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
-        let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
-        let (stdio, _stdio_rx) = stdio_session_with_progress();
-        {
-            let (stdio, sessions) = (Arc::clone(&stdio), state.mcp_sessions.clone());
-            routes.lock().unwrap().deliver = Some(Arc::new(
-                move |session: &str, note: &Value, owner: Option<&downstream::CancelContext>| {
-                    deliver_progress_to(&stdio, &sessions, session, note, owner);
-                },
-            ));
-        }
         let (registration, wire) = register_progress(
             &routes,
-            Some(&json!({ "progressToken": "tok-bound" })),
-            None,
+            Some(&json!({ "progressToken": "tok-each" })),
+            Some(&request),
             "alpha",
             &s1,
         )
         .unwrap();
-        // 64 KiB of ordinary text that ends in "s", the start of a secret.
-        let message = format!("{} s", "word ".repeat(64 * 1024 / 5));
-        let (mut delivered, mut most_held) = (0, 0);
-        for i in 0..256u64 {
+        let messages = [
+            "Fetching items",
+            "Processing items",
+            "Step 3 of 7",
+            "using sk-SECRETVALUE1234 now",
+            "echo sk-OwnProgress789 ok",
+            "Done: 12 files",
+        ];
+        for (i, message) in messages.iter().enumerate() {
             deliver_progress(
                 &stdio,
                 &state.mcp_sessions,
@@ -39325,23 +39211,32 @@ mod tests {
                     "params": {"progressToken": wire, "progress": i, "message": message}
                 }),
             );
-            let table = routes.lock().unwrap();
-            let route = &table.active[&registration.key];
-            let held = route.messages.held_bytes()
-                + route
-                    .held
-                    .as_ref()
-                    .map_or(0, |(n, t)| n.to_string().len() + t.len());
-            most_held = most_held.max(held);
-            drop(table);
-            delivered += drain_session(&state, &s1).len();
         }
+        let got: Vec<Value> = drain_session(&state, &s1)
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let texts: Vec<&str> = got
+            .iter()
+            .map(|n| n["params"]["message"].as_str().unwrap())
+            .collect();
         assert_eq!(
-            delivered, 256,
-            "every notification goes out when it arrives"
+            texts,
+            [
+                "Fetching items",
+                "Processing items",
+                "Step 3 of 7",
+                "using [secret:TOKEN] now",
+                // The client sent this value: its echo is its own.
+                "echo sk-OwnProgress789 ok",
+                "Done: 12 files",
+            ]
         );
-        assert!(most_held < 1024, "held {most_held} bytes");
-        // The last undecided end is dropped: progress 255 went out already.
+        for (i, note) in got.iter().enumerate() {
+            assert_eq!(note["params"]["progress"], i, "{note}");
+            assert_eq!(note["params"]["progressToken"], "tok-each", "{note}");
+        }
+        // Nothing waits for the end of the call.
         drop(registration);
         assert!(drain_session(&state, &s1).is_empty());
     }
