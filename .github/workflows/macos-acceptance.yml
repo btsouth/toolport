@@ -7,11 +7,6 @@ name: macOS acceptance
 # reports) is uploaded as artifacts; each job summary lists every check and
 # everything the runner could not test.
 on:
-  # TEMPORARY: runs on the PR while the review fixes are checked; removed before merge.
-  pull_request:
-    paths:
-      - ".github/workflows/macos-acceptance.yml"
-      - "scripts/macos-acceptance/**"
   workflow_dispatch:
     inputs:
       tag:

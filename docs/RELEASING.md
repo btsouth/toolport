@@ -179,11 +179,15 @@ gh workflow run macos-acceptance.yml --repo btsouth/toolport -f tag=v2.3.6
 It installs the dmg the way a user does (browser quarantine, Finder drag,
 Gatekeeper prompt), checks signatures, notarization and every binary's
 architecture, then drives the window through macOS accessibility: onboarding,
-every screen, a server with a keychain secret, and a connection to each seeded
-client, followed by a real tool call through each client entry. It also upgrades
-from the previous release, installs the Homebrew cask, uninstalls per
-[uninstall.md](uninstall.md) and lists every leftover. The three jobs run in
-parallel in about ten minutes. Screenshots, logs and leftover lists are in the
+every screen, a server with a keychain secret, a connection to each seeded
+client with a real tool call through each entry, Launch at login, and every
+screen at the minimum window size, a narrow window and a larger display. It
+also upgrades from the previous release by dmg and through the in-app updater,
+runs the Intel dmg on an Intel runner, installs the Homebrew cask, uninstalls
+per [uninstall.md](uninstall.md) and lists every leftover. Every check is
+pass, fail or untested with a reason. The Homebrew and in-app update legs only
+run for the latest release, since that is all the tap and the updater offer.
+The five jobs run in parallel in about ten minutes. Screenshots, logs and leftover lists are in the
 run's artifacts; the job summary lists every check and what the runner could
 not test. `-f build_ref=true` builds the current ref unsigned instead (about 20
 minutes; keychain checks are skipped because they need the signed entitlements).
