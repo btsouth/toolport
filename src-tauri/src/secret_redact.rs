@@ -35,9 +35,9 @@ use serde_json::Value;
 
 /// Secrets shorter than this (in chars) are redacted only as a whole token.
 pub const SHORT_SECRET_CHARS: usize = 6;
-/// Upper bound on remembered values. OAuth access tokens rotate, so a long-lived
-/// daemon would otherwise grow this forever; the oldest values drop first.
-const MAX_SECRETS: usize = 4096;
+/// How long the background builder waits after a registration for more to
+/// arrive, so a burst (every server's secrets at startup) costs one main build.
+const MAIN_BUILD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(25);
 /// Records which secrets (by `server/key`, never value) the scrub has covered.
 const SCRUB_MARKER: &str = "secret-scrub-v1.json";
 /// How long a scrub waits for another process's scrub of the same directory.
@@ -80,10 +80,12 @@ pub struct Matcher {
 fn edge_index(keys: Vec<(String, usize)>) -> Option<(AhoCorasick, Vec<Vec<usize>>)> {
     let mut distinct: Vec<String> = Vec::new();
     let mut owners: Vec<Vec<usize>> = Vec::new();
+    let mut slot: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (key, pattern) in keys {
-        match distinct.iter().position(|k| *k == key) {
-            Some(i) => owners[i].push(pattern),
+        match slot.get(&key) {
+            Some(&i) => owners[i].push(pattern),
             None => {
+                slot.insert(key.clone(), distinct.len());
                 distinct.push(key);
                 owners.push(vec![pattern]);
             }
@@ -299,9 +301,22 @@ fn is_token_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Largest pattern set (total bytes) compiled to a full DFA. A DFA's memory
+/// grows with its states times the alphabet (about 4.3 GiB for 5,000 secrets),
+/// so past this a contiguous NFA is used: roughly 1.7x the per-line cost, a
+/// fortieth of the memory and a quarter of the build time.
+const DFA_MAX_PATTERN_BYTES: usize = 64 * 1024;
+
 fn build(patterns: &[String]) -> Option<AhoCorasick> {
     if patterns.is_empty() {
         return None;
+    }
+    if patterns.iter().map(String::len).sum::<usize>() > DFA_MAX_PATTERN_BYTES {
+        return AhoCorasickBuilder::new()
+            .match_kind(MatchKind::Standard)
+            .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
+            .build(patterns)
+            .ok();
     }
     // A full DFA: every log line is scanned, and with every form and fragment of
     // every secret the default NFA would be several times slower. Falls back to
@@ -984,16 +999,144 @@ fn merge(mut hits: Vec<(usize, usize, usize, bool)>) -> Vec<(usize, usize, Vec<u
 
 struct Registry {
     /// `(id, marker name, value)`; `id` is `server/key` for the scrub marker.
+    /// Never evicted: a value stays redacted for the life of the process, as
+    /// long as any log could still hold it.
     secrets: Vec<(String, String, String)>,
-    /// Compiled on first use after a change, so a burst of registrations (every
-    /// server's secrets at startup) costs one build, not one per secret.
-    matcher: Option<Arc<Matcher>>,
+    /// The same triples, for constant-time duplicate checks.
+    known: HashSet<(String, String, String)>,
+    /// Matcher over `secrets[..main_len]`, built off the registering thread by
+    /// [`builder`] and swapped in whole; readers never wait for it.
+    main: Option<Arc<Matcher>>,
+    main_len: usize,
+    /// Bumped when `whole_only` changes, so the main matcher is rebuilt.
+    whole_gen: u64,
+    main_whole_gen: u64,
+    /// Matcher over `secrets[delta_start..delta_end]`, the values registered since
+    /// `main` was built. Small, so [`add`] builds it before returning: a value is
+    /// redacted from the moment its registration returns.
+    delta: Option<Arc<Matcher>>,
+    delta_end: usize,
     /// `(id, value)` pairs [`register`] has fully processed, so the repeat reads
     /// (remote servers read their credential from the vault on every call) cost one
     /// read-locked lookup instead of re-deriving forms.
     seen: HashSet<(String, String)>,
     /// Values matched whole but never by fragment (see [`Matcher::new_with`]).
     whole_only: HashSet<String>,
+}
+
+impl Registry {
+    fn new() -> Self {
+        Self {
+            secrets: Vec::new(),
+            known: HashSet::new(),
+            main: None,
+            main_len: 0,
+            whole_gen: 0,
+            main_whole_gen: 0,
+            delta: None,
+            delta_end: 0,
+            seen: HashSet::new(),
+            whole_only: HashSet::new(),
+        }
+    }
+
+    fn layers(&self) -> Option<Layers> {
+        let mut layers = Vec::with_capacity(2);
+        layers.extend(self.main.clone());
+        if self.delta_end > self.main_len {
+            layers.extend(self.delta.clone());
+        }
+        (!layers.is_empty()).then_some(Layers(layers))
+    }
+}
+
+/// The matchers a reader applies in turn: the main one, plus (briefly, after a
+/// registration) one over the values registered since it was built.
+#[derive(Clone)]
+struct Layers(Vec<Arc<Matcher>>);
+
+impl Layers {
+    fn fold<'a>(
+        &self,
+        text: &'a str,
+        f: impl Fn(&Matcher, &str) -> Option<String>,
+    ) -> Cow<'a, str> {
+        let mut out = Cow::Borrowed(text);
+        for m in &self.0 {
+            if let Some(next) = f(m, out.as_ref()) {
+                out = Cow::Owned(next);
+            }
+        }
+        out
+    }
+
+    fn redact_text<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        self.fold(text, |m, t| owned(m.redact_text(t)))
+    }
+
+    fn redact_fragment<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        self.fold(text, |m, t| owned(m.redact_fragment(t)))
+    }
+
+    fn redact_line<'a>(&self, line: &'a str) -> Cow<'a, str> {
+        self.fold(line, |m, t| owned(m.redact_line(t)))
+    }
+
+    fn redact_definition_line<'a>(&self, line: &'a str) -> Cow<'a, str> {
+        self.fold(line, |m, t| owned(m.redact_definition_line(t)))
+    }
+
+    fn truncate_chars(&self, text: &str, max_chars: usize) -> String {
+        let (first, rest) = self.0.split_first().expect("layers are never empty");
+        let mut out = first.truncate_chars(text, max_chars);
+        for m in rest {
+            // The cut was made above; a later layer's secret may end at it.
+            out = m
+                .redact_fragment(&m.truncate_chars(&out, max_chars))
+                .into_owned();
+        }
+        out
+    }
+
+    fn may_contain(&self, text: &str) -> bool {
+        self.0.iter().any(|m| m.may_contain(text))
+    }
+
+    fn value_with(&self, value: &mut Value, fragments: bool, request: Option<&Value>) -> bool {
+        let mut changed = false;
+        for m in &self.0 {
+            let mut exempt = HashSet::new();
+            if let Some(request) = request {
+                m.secrets_in(request, &mut exempt);
+            }
+            changed |= m.value_with(value, fragments, (!exempt.is_empty()).then_some(&exempt));
+        }
+        changed
+    }
+
+    /// Screen one definition; the names of the secrets it held (none: untouched).
+    fn screen(&self, item: &mut Value, record: &mut Vec<(String, String)>) -> Vec<String> {
+        let mut names = Vec::new();
+        for m in &self.0 {
+            let mut found = HashSet::new();
+            m.secrets_in(item, &mut found);
+            if found.is_empty() {
+                continue;
+            }
+            names.extend(found.into_iter().map(|n| m.names[n].clone()));
+            m.screen_definition(item, record);
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+}
+
+fn owned(text: Cow<'_, str>) -> Option<String> {
+    match text {
+        Cow::Owned(s) => Some(s),
+        Cow::Borrowed(_) => None,
+    }
 }
 
 /// Which registry a secret belongs to. A shipped process has one data directory,
@@ -1051,40 +1194,187 @@ fn scope_for_path(path: &Path) -> Scope {
         .flatten()
 }
 
-fn current_in(scope: &Scope) -> Option<Arc<Matcher>> {
+/// The installed matchers for `scope`. Never builds and never waits for a
+/// build: a read lock held for two `Arc` clones.
+fn current_in(scope: &Scope) -> Option<Layers> {
     if !ACTIVE.load(Ordering::Relaxed) {
         return None;
     }
-    if let Some(matcher) = REGISTRY
+    REGISTRY
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()?
         .get(scope)?
-        .matcher
-        .clone()
-    {
-        return Some(matcher);
-    }
-    let mut guard = REGISTRY
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let reg = guard.as_mut()?.get_mut(scope)?;
-    let matcher = reg.matcher.get_or_insert_with(|| {
-        let pairs: Vec<(&str, &str)> = reg
-            .secrets
-            .iter()
-            .map(|(_, n, v)| (n.as_str(), v.as_str()))
-            .collect();
-        Arc::new(Matcher::new_with(&pairs, &reg.whole_only))
-    });
-    Some(Arc::clone(matcher))
+        .layers()
 }
 
-fn current() -> Option<Arc<Matcher>> {
+fn current() -> Option<Layers> {
     if !ACTIVE.load(Ordering::Relaxed) {
         return None;
     }
     current_in(&scope_now())
+}
+
+/// One matcher over every value registered in `scope`, for the scrub (a
+/// background job, which may build one).
+fn complete_in(scope: &Scope) -> Option<Arc<Matcher>> {
+    let layers = current_in(scope)?;
+    if layers.0.len() == 1 {
+        return layers.0.into_iter().next();
+    }
+    let (pairs, whole_only) = {
+        let guard = REGISTRY
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let reg = guard.as_ref()?.get(scope)?;
+        let pairs: Vec<(String, String)> = reg
+            .secrets
+            .iter()
+            .map(|(_, n, v)| (n.clone(), v.clone()))
+            .collect();
+        (pairs, reg.whole_only.clone())
+    };
+    Some(Arc::new(Matcher::new_with(&pairs, &whole_only)))
+}
+
+/// Wakes [`builder`]: some scope has values its main matcher does not cover.
+static BUILD_WANTED: (Mutex<bool>, std::sync::Condvar) =
+    (Mutex::new(false), std::sync::Condvar::new());
+static BUILDER_STARTED: std::sync::Once = std::sync::Once::new();
+
+fn wake_builder() {
+    BUILDER_STARTED.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("toolport-redact-build".into())
+            .spawn(builder);
+    });
+    *BUILD_WANTED
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    BUILD_WANTED.1.notify_one();
+}
+
+/// Rebuilds main matchers off every caller's thread. A build reads a snapshot
+/// under the read lock, compiles with no lock held, and swaps the result in
+/// under a brief write lock only if nothing newer was installed meanwhile.
+fn builder() {
+    loop {
+        {
+            let mut wanted = BUILD_WANTED
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*wanted {
+                wanted = BUILD_WANTED
+                    .1
+                    .wait(wanted)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+        std::thread::sleep(MAIN_BUILD_DEBOUNCE);
+        *BUILD_WANTED
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        rebuild_stale_mains();
+    }
+}
+
+fn rebuild_stale_mains() {
+    let stale: Vec<(Scope, usize, u64, Vec<(String, String)>, HashSet<String>)> = REGISTRY
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(|map| {
+            map.iter()
+                .filter(|(_, reg)| {
+                    reg.secrets.len() > reg.main_len || reg.whole_gen != reg.main_whole_gen
+                })
+                .map(|(scope, reg)| {
+                    let pairs = reg
+                        .secrets
+                        .iter()
+                        .map(|(_, n, v)| (n.clone(), v.clone()))
+                        .collect();
+                    (
+                        scope.clone(),
+                        reg.secrets.len(),
+                        reg.whole_gen,
+                        pairs,
+                        reg.whole_only.clone(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for (scope, len, whole_gen, pairs, whole_only) in stale {
+        let built = Arc::new(Matcher::new_with(&pairs, &whole_only));
+        let mut guard = REGISTRY
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(reg) = guard.as_mut().and_then(|map| map.get_mut(&scope)) else {
+            continue;
+        };
+        // Replaced matchers are freed after the lock is released: a large one
+        // takes a while to free, and readers must not wait for that.
+        let mut retired = Vec::new();
+        if len > reg.main_len || (len == reg.main_len && whole_gen != reg.main_whole_gen) {
+            retired.extend(reg.main.replace(built));
+            reg.main_len = len;
+            reg.main_whole_gen = whole_gen;
+            if reg.delta_end <= reg.main_len {
+                retired.extend(reg.delta.take());
+            }
+        }
+        let more = reg.secrets.len() > reg.main_len;
+        drop(guard);
+        drop(retired);
+        if more {
+            wake_builder();
+        }
+    }
+}
+
+/// Make sure the value at `index` in `scope` is covered before returning: build
+/// a delta matcher over everything the main one lacks (outside the lock) and
+/// install it unless a wider one already was.
+fn cover(scope: &Scope, index: usize) {
+    loop {
+        let (end, pairs, whole_only) = {
+            let guard = REGISTRY
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(reg) = guard.as_ref().and_then(|map| map.get(scope)) else {
+                return;
+            };
+            if reg.main_len > index || (reg.delta_end > index && reg.delta.is_some()) {
+                return;
+            }
+            let start = reg.main_len;
+            let end = reg.secrets.len();
+            let pairs: Vec<(String, String)> = reg.secrets[start..end]
+                .iter()
+                .map(|(_, n, v)| (n.clone(), v.clone()))
+                .collect();
+            (end, pairs, reg.whole_only.clone())
+        };
+        let built = Arc::new(Matcher::new_with(&pairs, &whole_only));
+        let mut guard = REGISTRY
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(reg) = guard.as_mut().and_then(|map| map.get_mut(scope)) else {
+            return;
+        };
+        // The delta started at `main_len` as read, and `main_len` only grows,
+        // so it and the main matcher cover everything below `end`.
+        if end > reg.delta_end {
+            let retired = reg.delta.replace(built);
+            reg.delta_end = end;
+            drop(guard);
+            drop(retired);
+        }
+    }
 }
 
 /// Match `value` whole only (see [`Matcher::new_with`]). Call before [`add`].
@@ -1095,14 +1385,13 @@ fn mark_whole_only(scope: &Scope, value: &str) {
     let reg = guard
         .get_or_insert_with(Default::default)
         .entry(scope.clone())
-        .or_insert_with(|| Registry {
-            secrets: Vec::new(),
-            matcher: None,
-            seen: HashSet::new(),
-            whole_only: HashSet::new(),
-        });
+        .or_insert_with(Registry::new);
     if reg.whole_only.insert(value.to_string()) {
-        reg.matcher = None;
+        // The main matcher is rebuilt to honour it. Until then an older layer may
+        // still match its fragments, which redacts more, never less.
+        reg.whole_gen += 1;
+        drop(guard);
+        wake_builder();
     }
 }
 
@@ -1121,34 +1410,24 @@ fn add(scope: &Scope, id: &str, name: &str, value: &str) -> bool {
     if value.trim().is_empty() {
         return false;
     }
-    let mut guard = REGISTRY
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let reg = guard
-        .get_or_insert_with(Default::default)
-        .entry(scope.clone())
-        .or_insert_with(|| Registry {
-            secrets: Vec::new(),
-            matcher: None,
-            seen: HashSet::new(),
-            whole_only: HashSet::new(),
-        });
-    if reg
-        .secrets
-        .iter()
-        .any(|(i, n, v)| i == id && n == name && v == value)
-    {
-        return false;
-    }
-    reg.secrets
-        .push((id.to_string(), name.to_string(), value.to_string()));
-    if reg.secrets.len() > MAX_SECRETS {
-        let excess = reg.secrets.len() - MAX_SECRETS;
-        reg.secrets.drain(..excess);
-        reg.seen.clear();
-    }
-    reg.matcher = None;
-    ACTIVE.store(true, Ordering::Release);
+    let triple = (id.to_string(), name.to_string(), value.to_string());
+    let index = {
+        let mut guard = REGISTRY
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let reg = guard
+            .get_or_insert_with(Default::default)
+            .entry(scope.clone())
+            .or_insert_with(Registry::new);
+        if !reg.known.insert(triple.clone()) {
+            return false;
+        }
+        reg.secrets.push(triple);
+        ACTIVE.store(true, Ordering::Release);
+        reg.secrets.len() - 1
+    };
+    cover(scope, index);
+    wake_builder();
     true
 }
 
@@ -1270,10 +1549,7 @@ fn secret_fields(value: &Value, key: Option<&str>, out: &mut Vec<(String, String
 /// Redact text bound for a log file. Borrowed and free when nothing matches.
 pub fn redact_text(text: &str) -> Cow<'_, str> {
     match current() {
-        Some(m) => match m.redact_text(text) {
-            Cow::Borrowed(_) => Cow::Borrowed(text),
-            Cow::Owned(s) => Cow::Owned(s),
-        },
+        Some(m) => m.redact_text(text),
         None => Cow::Borrowed(text),
     }
 }
@@ -1281,10 +1557,7 @@ pub fn redact_text(text: &str) -> Cow<'_, str> {
 /// [`Matcher::redact_fragment`] against every registered secret.
 pub fn redact_fragment(text: &str) -> Cow<'_, str> {
     match current() {
-        Some(m) => match m.redact_fragment(text) {
-            Cow::Borrowed(_) => Cow::Borrowed(text),
-            Cow::Owned(s) => Cow::Owned(s),
-        },
+        Some(m) => m.redact_fragment(text),
         None => Cow::Borrowed(text),
     }
 }
@@ -1321,23 +1594,15 @@ pub fn screen_definitions(server_id: &str, items: &mut [Value]) -> Vec<(String, 
     let mut flagged = Vec::new();
     let mut record = Vec::new();
     for item in items.iter_mut() {
-        let mut found = HashSet::new();
-        matcher.secrets_in(item, &mut found);
-        if found.is_empty() {
+        let names = matcher.screen(item, &mut record);
+        if names.is_empty() {
             continue;
         }
-        matcher.screen_definition(item, &mut record);
         let name = ["name", "uri", "uriTemplate"]
             .iter()
             .find_map(|k| item.get(*k).and_then(Value::as_str))
             .unwrap_or("")
             .to_string();
-        let mut names: Vec<String> = found
-            .into_iter()
-            .map(|n| matcher.names[n].clone())
-            .collect();
-        names.sort();
-        names.dedup();
         flagged.push((name, names));
     }
     if !record.is_empty() {
@@ -1436,11 +1701,7 @@ pub fn redact_outgoing(value: &mut Value, request: Option<&Value>) -> bool {
     let Some(m) = current() else {
         return false;
     };
-    let mut exempt = HashSet::new();
-    if let Some(request) = request {
-        m.secrets_in(request, &mut exempt);
-    }
-    m.value_with(value, false, (!exempt.is_empty()).then_some(&exempt))
+    m.value_with(value, false, request)
 }
 
 /// [`redact_outgoing`] for a serialized message with no client request behind
@@ -1467,10 +1728,7 @@ pub fn redact_outgoing_json(json: String) -> String {
 /// [`Matcher::redact_definition_line`] against every registered secret.
 pub fn redact_definition_line(line: &str) -> Cow<'_, str> {
     match current() {
-        Some(m) => match m.redact_definition_line(line) {
-            Cow::Borrowed(_) => Cow::Borrowed(line),
-            Cow::Owned(s) => Cow::Owned(s),
-        },
+        Some(m) => m.redact_definition_line(line),
         None => Cow::Borrowed(line),
     }
 }
@@ -1483,7 +1741,7 @@ pub fn redact_definition(value: &mut Value) -> bool {
 
 /// Redact every string in a JSON value about to be written. True when changed.
 pub fn redact_value(value: &mut Value) -> bool {
-    current().is_some_and(|m| m.redact_value(value))
+    current().is_some_and(|m| m.value_with(value, true, None))
 }
 
 /// Redact one serialized line (JSON or text) about to be appended.
@@ -1500,12 +1758,9 @@ pub fn redact_line_for<'a>(path: &Path, line: &'a str) -> Cow<'a, str> {
     redact_line_with(current_in(&scope_for_path(path)), line)
 }
 
-fn redact_line_with(matcher: Option<Arc<Matcher>>, line: &str) -> Cow<'_, str> {
+fn redact_line_with(matcher: Option<Layers>, line: &str) -> Cow<'_, str> {
     match matcher {
-        Some(m) => match m.redact_line(line) {
-            Cow::Borrowed(_) => Cow::Borrowed(line),
-            Cow::Owned(s) => Cow::Owned(s),
-        },
+        Some(m) => m.redact_line(line),
         None => Cow::Borrowed(line),
     }
 }
@@ -1565,7 +1820,7 @@ pub fn persisted_log_files(dir: &Path) -> Vec<PathBuf> {
 /// Rewrite one file with every registered secret redacted, under the same lock its
 /// writers take. Returns whether anything changed. A missing file is not an error.
 pub fn scrub_file(path: &Path) -> std::io::Result<bool> {
-    let Some(matcher) = current_in(&scope_for_path(path)) else {
+    let Some(matcher) = complete_in(&scope_for_path(path)) else {
         return Ok(false);
     };
     scrub_file_with(&matcher, path)
@@ -1731,7 +1986,7 @@ pub fn scrub_data_dir(dir: &Path) -> std::io::Result<usize> {
     if pending.is_empty() {
         return Ok(0);
     }
-    let Some(matcher) = current_in(&scope_of(dir)) else {
+    let Some(matcher) = complete_in(&scope_of(dir)) else {
         return Ok(0);
     };
     let mut rewritten = 0;

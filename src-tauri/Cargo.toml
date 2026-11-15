@@ -215,6 +215,10 @@ required-features = ["test-support"]
 name = "integrity-report"
 required-features = ["test-support"]
 
+[[example]]
+name = "secret-redact-performance"
+required-features = ["test-support"]
+
 # The search tests hash the 67 MB model file once per process. Unoptimized, that takes
 # over a second, and nextest gives every test its own process.
 [profile.dev.package.sha2]
