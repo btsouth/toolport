@@ -74,6 +74,7 @@ jobs:
 
       - name: First launch
         if: ${{ !cancelled() }}
+        timeout-minutes: 8
         run: bash scripts/macos-acceptance/first-run.sh
 
       - name: Write the job summary

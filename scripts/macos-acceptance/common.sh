@@ -70,10 +70,18 @@ finish_step() {
   fi
 }
 
+# tmo <seconds> <command...>: run with a hard wall-clock limit (macOS has no
+# GNU timeout). Exit 142 means the limit was hit.
+tmo() {
+  local secs="$1"
+  shift
+  perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
+}
+
 # shot <name>: full-screen capture without the shutter sound.
 shot() {
   local file="$EVIDENCE/screenshots/$1.png"
-  if screencapture -x "$file" 2>"$EVIDENCE/logs/screencapture-$1.err"; then
+  if tmo 20 screencapture -x "$file" 2>"$EVIDENCE/logs/screencapture-$1.err"; then
     printf '%s\n' "$file"
   else
     return 1
@@ -93,7 +101,9 @@ wait_for() {
 }
 
 # The tool the UI and window probes use. Built by the workflow from tpui.swift.
-TPUI="${TPUI:-$EVIDENCE/bin/tpui}"
+TPUI_BIN="${TPUI:-$EVIDENCE/bin/tpui}"
+# Every probe call is bounded: an unresponsive app makes each AX call wait.
+tpui() { tmo "${TPUI_TIMEOUT:-60}" "$TPUI_BIN" "$@"; }
 APP_PATH="${APP_PATH:-/Applications/Toolport.app}"
 GATEWAY="$APP_PATH/Contents/MacOS/toolport-gateway"
 DATA_DIR="$HOME/Library/Application Support/Toolport"

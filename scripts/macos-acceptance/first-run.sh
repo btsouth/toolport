@@ -15,20 +15,21 @@ EXE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Content
 EXE_PATH="$APP_PATH/Contents/MacOS/$EXE"
 app_pid() { pgrep -f "^$EXE_PATH" | head -n 1; }
 crash_list() { ls -1 "$HOME/Library/Logs/DiagnosticReports" 2>/dev/null | grep -iE 'toolport|conduit' || true; }
-windows_json() { "$TPUI" windows; }
+windows_json() { TPUI_TIMEOUT=15 tpui windows; }
 
 crashes_before="$(crash_list)"
-"$TPUI" trust >"$EVIDENCE/logs/tcc-$LABEL.json" 2>&1
+tpui trust >"$EVIDENCE/logs/tcc-$LABEL.json" 2>&1
 info "automation grants for the job's processes" "$(tr -d ' \n' <"$EVIDENCE/logs/tcc-$LABEL.json")"
 
 quarantine="$(xattr -p com.apple.quarantine "$APP_PATH" 2>/dev/null || true)"
 log "Opening $APP_PATH (quarantine: ${quarantine:-none})"
-open "$APP_PATH"
+tmo 30 open "$APP_PATH" || fail "open returns" "open did not return within 30s"
 
 # A quarantined, notarized download gets Gatekeeper's "downloaded from the
 # Internet" confirmation before the app's own process starts.
 gk_pid=""
 if [[ -n "$quarantine" ]]; then
+  log "Looking for the Gatekeeper prompt"
   for _ in $(seq 1 20); do
     [[ -n "$(app_pid)" ]] && break
     gk_pid="$(windows_json | python3 -c '
@@ -41,8 +42,8 @@ for w in json.load(sys.stdin):
   done
   if [[ -n "$gk_pid" ]]; then
     shot "$LABEL-gatekeeper-prompt" >/dev/null && info "Gatekeeper first-open prompt" "shown (screenshots/$LABEL-gatekeeper-prompt.png)"
-    "$TPUI" dump "$gk_pid" 12 >"$EVIDENCE/logs/ax-gatekeeper-$LABEL.txt" 2>&1
-    if "$TPUI" press "$gk_pid" "Open" >"$EVIDENCE/logs/gatekeeper-press-$LABEL.log" 2>&1; then
+    tpui dump "$gk_pid" 12 >"$EVIDENCE/logs/ax-gatekeeper-$LABEL.txt" 2>&1
+    if tpui press "$gk_pid" "Open" >"$EVIDENCE/logs/gatekeeper-press-$LABEL.log" 2>&1; then
       pass "Gatekeeper prompt accepted through accessibility" "$(cat "$EVIDENCE/logs/gatekeeper-press-$LABEL.log")"
     else
       fail "Gatekeeper prompt accepted through accessibility" "$(tail -n 2 "$EVIDENCE/logs/gatekeeper-press-$LABEL.log" | tr '\n' ' ')"
@@ -52,6 +53,7 @@ for w in json.load(sys.stdin):
   fi
 fi
 
+log "Waiting for the app process"
 if wait_for 45 app_pid; then
   pass "app process starts" "pid $(app_pid)"
 else
@@ -70,6 +72,7 @@ pid = int(sys.argv[1])
 ok = [w for w in json.load(sys.stdin) if w["pid"] == pid and w["layer"] == 0 and w["onscreen"] and w["w"] >= 400]
 sys.exit(0 if ok else 1)' "$PID"
 }
+log "Waiting for the main window"
 if wait_for 45 has_window; then
   pass "main window appears" "$(windows_json | python3 -c '
 import json, sys
@@ -90,6 +93,7 @@ fi
 
 # Menu bar status item: a layer-25 window owned by the app in CGWindowList, and
 # the AX extras menu bar when accessibility is available.
+log "Looking for the menu bar item"
 tray="$(windows_json | python3 -c '
 import json, sys
 pid = int(sys.argv[1])
@@ -101,7 +105,7 @@ if [[ -n "$tray" ]]; then
 else
   fail "menu bar item exists" "no layer-25 window owned by pid $PID"
 fi
-"$TPUI" menubar "$PID" >"$EVIDENCE/logs/ax-menubar-$LABEL.txt" 2>&1 || true
+tpui menubar "$PID" >"$EVIDENCE/logs/ax-menubar-$LABEL.txt" 2>&1 || true
 
 if wait_for 30 pgrep -f 'toolport-gateway'; then
   pass "gateway process starts" "$(pgrep -fl toolport-gateway | head -3 | tr '\n' ';')"
@@ -110,8 +114,9 @@ else
 fi
 ps -axo pid,ppid,user,command | grep -iE 'toolport|conduit' | grep -v grep >"$EVIDENCE/logs/processes-$LABEL.txt" || true
 
+log "Dumping the accessibility tree"
 # How far accessibility reaches into the window (a WKWebView).
-if "$TPUI" dump "$PID" 40 >"$EVIDENCE/logs/ax-tree-$LABEL.txt" 2>"$EVIDENCE/logs/ax-tree-$LABEL.err"; then
+if tpui dump "$PID" 40 >"$EVIDENCE/logs/ax-tree-$LABEL.txt" 2>"$EVIDENCE/logs/ax-tree-$LABEL.err"; then
   n="$(wc -l <"$EVIDENCE/logs/ax-tree-$LABEL.txt" | tr -d ' ')"
   web="$(grep -c 'AXWebArea' "$EVIDENCE/logs/ax-tree-$LABEL.txt" || true)"
   buttons="$(grep -c 'AXButton' "$EVIDENCE/logs/ax-tree-$LABEL.txt" || true)"
