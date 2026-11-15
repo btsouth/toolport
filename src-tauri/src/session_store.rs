@@ -27,6 +27,15 @@ pub struct SessionStore<V> {
     next_seq: u64,
 }
 
+/// An entry taken out by [`SessionStore::pop_oldest`].
+pub struct Evicted<V> {
+    pub key: String,
+    pub value: V,
+    /// When the entry was last touched; its TTL runs from here.
+    pub last_seen: Instant,
+    seq: u64,
+}
+
 struct Entry<V> {
     value: V,
     last_seen: Instant,
@@ -157,20 +166,39 @@ impl<V> SessionStore<V> {
             .sum()
     }
 
-    /// Drop the oldest entry by insertion order, returning whether one was removed.
-    /// Paired with [`weight`](Self::weight) so a caller can evict to a budget.
     /// Remove the least recently inserted entry and return it with its key and the
-    /// time it was stored, so a caller can keep it elsewhere for its remaining TTL.
-    pub fn pop_oldest(&mut self) -> Option<(String, V, Instant)> {
+    /// time it was last touched, so a caller can keep it elsewhere for its remaining
+    /// TTL, or [`put_back`](Self::put_back) when it cannot.
+    pub fn pop_oldest(&mut self) -> Option<Evicted<V>> {
         let key = self
             .entries
             .iter()
             .min_by_key(|(_, entry)| entry.seq)
             .map(|(key, _)| key.clone())?;
         let entry = self.entries.remove(&key)?;
-        Some((key, entry.value, entry.last_seen))
+        Some(Evicted {
+            key,
+            value: entry.value,
+            last_seen: entry.last_seen,
+            seq: entry.seq,
+        })
     }
 
+    /// Return an entry taken by [`pop_oldest`](Self::pop_oldest) to its old place:
+    /// same insertion order, same TTL clock. The cap is not applied, so a caller that
+    /// could not move an entry elsewhere never loses it here.
+    pub fn put_back(&mut self, evicted: Evicted<V>) {
+        self.entries.insert(
+            evicted.key,
+            Entry {
+                value: evicted.value,
+                last_seen: evicted.last_seen,
+                seq: evicted.seq,
+            },
+        );
+    }
+
+    /// Drop the oldest entry by insertion order, returning whether one was removed.
     pub fn remove_oldest(&mut self) -> bool {
         let oldest = self
             .entries
@@ -240,6 +268,18 @@ mod tests {
         std::thread::sleep(short_ttl() + Duration::from_millis(20));
         assert_eq!(store.reap_expired(), 2);
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn a_popped_entry_put_back_is_still_the_oldest() {
+        let mut store = SessionStore::new(Duration::from_secs(60), 2);
+        store.insert("first", 1);
+        store.insert("second", 2);
+        let popped = store.pop_oldest().unwrap();
+        assert_eq!((popped.key.as_str(), popped.value), ("first", 1));
+        store.put_back(popped);
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.pop_oldest().unwrap().key, "first");
     }
 
     #[test]

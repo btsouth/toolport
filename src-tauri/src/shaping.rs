@@ -35,6 +35,12 @@ const MAX_CACHE_ENTRIES: usize = 64;
 /// that still exceeds the cap, no cursor is offered.
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
+/// How far memory may grow past the caps above when older results cannot move to
+/// disk. They stay in memory rather than lose a cursor already handed out; past these
+/// a new result gets no cursor instead.
+const HARD_MAX_CACHE_ENTRIES: usize = 2 * MAX_CACHE_ENTRIES;
+const HARD_MAX_CACHE_BYTES: usize = 2 * MAX_CACHE_BYTES;
+
 pub fn resolve_budget(value: Option<&str>) -> (usize, Option<String>) {
     match value {
         Some(v) => match v.trim().parse::<usize>() {
@@ -81,7 +87,9 @@ struct Cached {
 /// `MAX_CACHE_BYTES` evicts the oldest.
 fn cache() -> &'static Mutex<SessionStore<Cached>> {
     static C: OnceLock<Mutex<SessionStore<Cached>>> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(SessionStore::new(CACHE_TTL, MAX_CACHE_ENTRIES)))
+    // The store's own cap is the hard one: `evict_to_fit` keeps to the soft caps, and
+    // the store must never drop an entry that could not move to disk.
+    C.get_or_init(|| Mutex::new(SessionStore::new(CACHE_TTL, HARD_MAX_CACHE_ENTRIES)))
 }
 
 fn next_cursor() -> String {
@@ -159,30 +167,54 @@ fn retained_size(body: &String, structured: Option<&Value>) -> usize {
         + structured.map(value_heap_size).unwrap_or(0)
 }
 
-/// Bound memory: evict oldest until the entry count and total bytes leave room for
-/// a `new_entry_size`-byte result. Each entry's `size` is precomputed, so this sum
-/// is O(n) adds, not O(n) JSON re-serializations, on every iteration.
-fn evict_to_fit(store: &mut SessionStore<Cached>, new_entry_size: usize) {
+/// Bound memory: move the oldest results to disk until the entry count and total bytes
+/// leave room for a `new_entry_size`-byte result. Each entry's `size` is precomputed, so
+/// this sum is O(n) adds, not O(n) JSON re-serializations, on every iteration. A result
+/// that cannot be written stays in memory, so a cursor already issued is never lost,
+/// and the caps are then soft up to the hard ones. Returns whether the new result fits
+/// under the hard caps.
+fn evict_to_fit(store: &mut SessionStore<Cached>, new_entry_size: usize) -> bool {
+    let mut unspilled = Vec::new();
+    let mut unspilled_bytes = 0;
     while !store.is_empty()
-        && (store.len() >= MAX_CACHE_ENTRIES
-            || store.weight(|c| c.size) + new_entry_size > MAX_CACHE_BYTES)
+        && (store.len() + unspilled.len() >= MAX_CACHE_ENTRIES
+            || store.weight(|c| c.size) + unspilled_bytes + new_entry_size > MAX_CACHE_BYTES)
     {
         // An entry pushed out of memory moves to disk for the rest of its time.
-        let Some((cursor, entry, stored)) = store.pop_oldest() else {
+        let Some(oldest) = store.pop_oldest() else {
             break;
         };
-        spill::keep(&cursor, entry, stored);
-        TRIM_PENDING.store(true, Ordering::Relaxed);
+        if !oldest.value.describes.is_empty() {
+            // A discovery result is dropped, not kept: search makes a fresh one.
+            TRIM_PENDING.store(true, Ordering::Relaxed);
+        } else if spill::keep(&oldest.key, &oldest.value, oldest.last_seen) {
+            TRIM_PENDING.store(true, Ordering::Relaxed);
+        } else {
+            unspilled_bytes += oldest.value.size;
+            unspilled.push(oldest);
+        }
     }
+    if !unspilled.is_empty() {
+        spill::report_kept_in_memory(unspilled.len());
+        for entry in unspilled {
+            store.put_back(entry);
+        }
+    }
+    store.len() < HARD_MAX_CACHE_ENTRIES
+        && store.weight(|c| c.size) + new_entry_size <= HARD_MAX_CACHE_BYTES
 }
 
 fn retain_in(store: &mut SessionStore<Cached>, cursor: &str, entry: Cached) -> bool {
     if entry.size > MAX_CACHE_BYTES {
         // Too large to hold in memory: keep it, structured part included, on disk.
-        return spill::keep(cursor, entry, Instant::now());
+        return spill::keep(cursor, &entry, Instant::now());
     }
     sweep(store);
-    evict_to_fit(store, entry.size);
+    if !evict_to_fit(store, entry.size) {
+        // Memory is at its hard cap with results that could not move to disk. This
+        // one can still go to disk if the failure has passed.
+        return spill::keep(cursor, &entry, Instant::now());
+    }
     store.insert(cursor, entry);
     true
 }
@@ -1042,6 +1074,17 @@ mod spill {
         CAP_FOR_TESTS.with(|cell| cell.set(cap));
     }
 
+    #[cfg(test)]
+    thread_local! {
+        static FAIL_FOR_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Make every spill on this test thread fail, as a full or broken disk would.
+    #[cfg(test)]
+    pub(super) fn fail_writes_for_tests(fail: bool) {
+        FAIL_FOR_TESTS.with(|cell| cell.set(fail));
+    }
+
     fn max_spill_bytes() -> usize {
         #[cfg(test)]
         if let Some(cap) = CAP_FOR_TESTS.with(std::cell::Cell::get) {
@@ -1080,6 +1123,20 @@ mod spill {
         })
     }
 
+    /// Shown in `toolport_status` and Activity once a result had to stay in memory.
+    pub(super) const KEPT_IN_MEMORY_NOTE: &str = "Some paged results stayed in memory \
+        past the result cache cap because they could not be written to disk.";
+
+    /// Results that could not move to disk stayed in memory. Logged once per run; the
+    /// status note is kept once.
+    pub(super) fn report_kept_in_memory(count: usize) {
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log(&format!("{KEPT_IN_MEMORY_NOTE} ({count} this time)"));
+        }
+        crate::daemon::add_status_note(KEPT_IN_MEMORY_NOTE);
+    }
+
     /// Shown in `toolport_status` and Activity when spilling is off for this run.
     pub(super) const KEY_FAILED_NOTE: &str = "Paged results are kept in memory only: the \
         gateway could not generate a key to seal them on disk.";
@@ -1087,9 +1144,15 @@ mod spill {
     /// Record a spill problem in the gateway log and the status notes. Tests keep it
     /// out of the gateway log, which lives in the real data dir.
     fn report(note: &str) {
-        #[cfg(not(test))]
-        crate::gatewaylog::append(&format!("result spill: {note}"));
+        log(note);
         crate::daemon::add_status_note(note);
+    }
+
+    fn log(message: &str) {
+        #[cfg(not(test))]
+        crate::gatewaylog::append(&format!("result spill: {message}"));
+        #[cfg(test)]
+        let _ = message;
     }
 
     impl State {
@@ -1170,7 +1233,7 @@ mod spill {
 
     /// Keep `entry` on disk under `cursor` until `stored + CACHE_TTL`. Returns false
     /// when it cannot be kept (no data dir, past the disk cap, or a failed write).
-    pub(super) fn keep(cursor: &str, entry: Cached, stored: Instant) -> bool {
+    pub(super) fn keep(cursor: &str, entry: &Cached, stored: Instant) -> bool {
         // A discovery result stays in memory, where its visibility is checked on
         // every fetch and `forget_discovery` drops it; pushed out, it is dropped
         // and search makes a fresh one.
@@ -1182,8 +1245,12 @@ mod spill {
     }
 
     impl State {
-        fn keep(&mut self, cursor: &str, entry: Cached, stored: Instant) -> bool {
+        fn keep(&mut self, cursor: &str, entry: &Cached, stored: Instant) -> bool {
             let state = self;
+            #[cfg(test)]
+            if FAIL_FOR_TESTS.with(std::cell::Cell::get) {
+                return false;
+            }
             if stored.elapsed() >= CACHE_TTL {
                 return false;
             }
@@ -1235,8 +1302,8 @@ mod spill {
                 cursor.to_string(),
                 Spilled {
                     path,
-                    server: entry.server,
-                    owner: entry.owner,
+                    server: entry.server.clone(),
+                    owner: entry.owner.clone(),
                     projections_unavailable: entry.projections_unavailable,
                     bytes: text.len(),
                     stored,
@@ -1351,7 +1418,7 @@ mod spill {
         fn spilling_is_off_when_the_sealing_key_cannot_be_made() {
             let root = case_root("no-key");
             let mut state = State::new(Some(root.clone()), None);
-            assert!(!state.keep("r1", entry("secret body"), Instant::now()));
+            assert!(!state.keep("r1", &entry("secret body"), Instant::now()));
             assert_eq!(
                 files_under(&root),
                 0,
@@ -1359,7 +1426,7 @@ mod spill {
             );
             // The same store with a key does spill, so the test exercises the key.
             let mut keyed = State::new(Some(root.clone()), Some([7; 32]));
-            assert!(keyed.keep("r1", entry("secret body"), Instant::now()));
+            assert!(keyed.keep("r1", &entry("secret body"), Instant::now()));
             assert_eq!(files_under(&root), 1);
             let _ = std::fs::remove_dir_all(&root);
         }
@@ -1975,6 +2042,28 @@ mod tests {
         for cursor in ["oversize", "live"] {
             spill::forget(cursor);
         }
+    }
+
+    #[test]
+    fn an_issued_cursor_stays_in_memory_when_it_cannot_move_to_disk() {
+        let mut store = SessionStore::new(CACHE_TTL, HARD_MAX_CACHE_ENTRIES);
+        store.insert("issued", cached_entry(MAX_CACHE_BYTES));
+        spill::fail_writes_for_tests(true);
+        let next = retain_in(&mut store, "next", cached_entry(MAX_CACHE_BYTES));
+        // Past the hard ceiling the new result is refused, never an issued one.
+        let refused = retain_in(&mut store, "refused", cached_entry(1));
+        spill::fail_writes_for_tests(false);
+        assert!(next);
+        assert!(
+            store.get("issued").is_some(),
+            "an issued cursor was dropped"
+        );
+        assert!(store.get("next").is_some());
+        assert!(!refused);
+        assert!(store.get("refused").is_none());
+        assert!(crate::daemon::status_notes()
+            .iter()
+            .any(|note| note == spill::KEPT_IN_MEMORY_NOTE));
     }
 
     #[test]
