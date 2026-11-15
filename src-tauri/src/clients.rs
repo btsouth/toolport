@@ -9721,6 +9721,11 @@ fn referenced_gateway_paths_in(clients: &[DetectedClient]) -> Option<Vec<PathBuf
 
 pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> RepointOutcome {
     let mut outcome = RepointOutcome::default();
+    if let Err(error) = backup_storage::upgrade_legacy() {
+        outcome
+            .failed
+            .push(("client recovery backups".into(), error));
+    }
     let current = match resolve_gateway_path() {
         Ok(path) => path,
         Err(error) => {
@@ -9746,7 +9751,10 @@ pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> Repoin
     for (id, entry) in &relocated.repointed {
         managed.insert(id.clone(), entry.clone());
     }
-    let mut outcome = repoint_stale_gateways_in(&current, detect_clients(), &managed);
+    let mut repoint = repoint_stale_gateways_in(&current, detect_clients(), &managed);
+    // Keep the earlier legacy-backup upgrade failure in the result.
+    repoint.failed.extend(outcome.failed);
+    let mut outcome = repoint;
     // A client the pass below rewrote again keeps that later ownership snapshot.
     let mut moved = relocated.repointed;
     moved.retain(|(id, _)| !outcome.repointed.iter().any(|(later, _)| later == id));

@@ -21,7 +21,10 @@ the Trash or replaced by a package upgrade notices within a few seconds and exit
 as soon as no client is connected.
 
 Backups of imported credentials are stored in the vault with a recovery copy
-that omits secret values. If the original vault is locked or unavailable,
+that omits secret values. At desktop startup, Toolport also seals older plaintext
+backups before updating client gateway paths. If that migration cannot use the
+vault, it retains the original backup and reports the failure; unlock the vault
+and restart Toolport to retry. If the original vault is locked or unavailable,
 restoration still recovers the config and names each missing credential in the
 result. Missing values are labeled `TOOLPORT_MISSING_CREDENTIAL_<number>`.
 Recovery data is retained; unlock the original vault and repeat disconnect to

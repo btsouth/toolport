@@ -346,6 +346,15 @@ pub(crate) fn install_account(dir: &Path) -> String {
 pub(super) fn release(path: &Path) -> Result<(), String> {
     if let Ok(text) = std::fs::read_to_string(path) {
         if let Some(mut saved) = envelope(&text) {
+            let Some(dir) = path.parent().and_then(Path::parent).and_then(Path::parent) else {
+                return Ok(());
+            };
+            let prefix = format!("{}-", crate::registry::sha256_hex(&path.to_string_lossy()));
+            // A copied backup can refer to another install or config's vault.
+            // Restoring a copy never grants permission to delete its source.
+            if saved.account != install_account(dir) || !saved.key.starts_with(&prefix) {
+                return Ok(());
+            }
             saved.generations.push((saved.key, saved.references.len()));
             let mut generations = std::collections::BTreeMap::<String, usize>::new();
             for (key, count) in saved.generations {
@@ -355,6 +364,9 @@ pub(super) fn release(path: &Path) -> Result<(), String> {
                     .or_insert(count);
             }
             for (key, count) in generations {
+                if !key.starts_with(&prefix) {
+                    continue;
+                }
                 crate::secrets::delete_secret(&saved.account, &key)?;
                 for index in 0..count {
                     crate::secrets::delete_secret(
@@ -368,16 +380,17 @@ pub(super) fn release(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn protect_existing() -> Result<(), String> {
+fn owned_backup_paths() -> Result<Vec<PathBuf>, String> {
     let Some(root) = crate::registry::conduit_dir().map(|dir| dir.join("backups")) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let ownership = super::purge_backup_inventory();
     let clients = match std::fs::read_dir(root) {
         Ok(clients) => clients,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e.to_string()),
     };
+    let mut paths = Vec::new();
     for client in clients {
         let client = client.map_err(|e| e.to_string())?;
         if !client.file_type().map_err(|e| e.to_string())?.is_dir() {
@@ -399,18 +412,202 @@ pub(crate) fn protect_existing() -> Result<(), String> {
             {
                 continue;
             }
-            let path = file.path();
-            let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-            let payload = match envelope(&raw) {
-                Some(saved) => crate::secrets::get_vault_secret_result(&saved.account, &saved.key)?
-                    .filter(|payload| crate::registry::sha256_hex(payload) == saved.hash)
-                    .ok_or("Unlock the original backup vault before importing more credentials. Client config unchanged.")?,
-                None => raw.clone(),
-            };
-            let encoded = encode(&path, &payload)?;
-            if encoded != raw {
-                crate::registry::atomic_write(&path, &encoded)?;
+            paths.push(file.path());
+        }
+    }
+    Ok(paths)
+}
+
+fn native_value(text: &str) -> Option<serde_json::Value> {
+    super::parse_json_value(text)
+        .ok()
+        .or_else(|| {
+            toml::from_str::<toml::Value>(text)
+                .ok()
+                .and_then(|v| serde_json::to_value(v).ok())
+        })
+        .or_else(|| serde_yaml::from_str::<serde_json::Value>(text).ok())
+}
+
+fn legacy_credentials(text: &str, client: &str) -> Vec<(Reference, String)> {
+    use serde_json::Value;
+    fn add(values: &mut Vec<(Reference, String)>, source: &str, key: &str, value: &str) {
+        if crate::import_credentials::provided(value)
+            && !values.iter().any(|(reference, saved)| {
+                reference.server == source && reference.key == key && saved == value
+            })
+        {
+            values.push((
+                Reference {
+                    server: source.into(),
+                    key: key.into(),
+                },
+                value.into(),
+            ));
+        }
+    }
+    fn environment(values: &mut Vec<(Reference, String)>, source: &str, value: &Value) {
+        match value {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    if let Some(value) = value.as_str() {
+                        if crate::import_credentials::secret_env(key, Some(value)) {
+                            add(values, source, key, value);
+                        }
+                    }
+                }
             }
+            Value::Array(entries) => {
+                for entry in entries {
+                    if let (Some(key), Some(value)) = (
+                        entry
+                            .get("key")
+                            .or_else(|| entry.get("name"))
+                            .and_then(Value::as_str),
+                        entry.get("value").and_then(Value::as_str),
+                    ) {
+                        if crate::import_credentials::secret_env(key, Some(value)) {
+                            add(values, source, key, value);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk(value: &Value, source: &str, depth: usize, values: &mut Vec<(Reference, String)>) {
+        if depth > 32 {
+            return;
+        }
+        match value {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    let source = format!("{source}/{key}");
+                    if matches!(
+                        key.as_str(),
+                        "env" | "environment" | "envs" | "headers" | "http_headers"
+                    ) {
+                        environment(values, &source, value);
+                    }
+                    if key == "args" {
+                        if let Some(args) = value.as_array().and_then(|args| {
+                            args.iter()
+                                .map(|v| v.as_str().map(String::from))
+                                .collect::<Option<Vec<_>>>()
+                        }) {
+                            for (index, (arg, secret)) in args
+                                .iter()
+                                .zip(crate::registry::secret_arg_mask(&args))
+                                .enumerate()
+                            {
+                                if secret {
+                                    add(values, &source, &format!("argument-{index}"), arg);
+                                }
+                            }
+                        }
+                    }
+                    if matches!(key.as_str(), "url" | "httpUrl" | "serverUrl") {
+                        if let Some(text) = value.as_str() {
+                            if url::Url::parse(text).is_ok_and(|url| {
+                                !url.username().is_empty()
+                                    || url.password().is_some()
+                                    || url.query().is_some()
+                                    || crate::import_credentials::secret_url_path(&url)
+                            }) {
+                                add(values, &source, "URL", text);
+                            }
+                        }
+                    }
+                    if matches!(
+                        key.as_str(),
+                        "original" | "lastWritten" | "disconnectBefore" | "text"
+                    ) {
+                        if let Some(parsed) = value.as_str().and_then(native_value) {
+                            walk(&parsed, &source, depth + 1, values);
+                        }
+                    }
+                    walk(value, &source, depth + 1, values);
+                }
+            }
+            Value::Array(entries) => {
+                for value in entries {
+                    walk(value, source, depth + 1, values);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut values = Vec::new();
+    if let Some(value) = native_value(text) {
+        walk(&value, client, 0, &mut values);
+    }
+    values
+}
+
+/// Upgrade old plaintext recovery files before either desktop shell repoints
+/// clients. Publish only after verified vault storage; an unavailable vault
+/// leaves the original recovery copy untouched and surfaces a startup failure.
+pub(crate) fn upgrade_legacy() -> Result<usize, String> {
+    let Some(dir) = crate::registry::conduit_dir().filter(|dir| dir.join("backups").exists())
+    else {
+        return Ok(0);
+    };
+    let _lock = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
+    struct RestoreImports(Vec<(Reference, String)>);
+    impl Drop for RestoreImports {
+        fn drop(&mut self) {
+            IMPORTS.with(|slot| *slot.borrow_mut() = std::mem::take(&mut self.0));
+        }
+    }
+    let nonsecret_values: std::collections::HashSet<String> = crate::registry::resolved_path()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|raw| serde_json::from_slice::<crate::registry::Registry>(&raw).ok())
+        .into_iter()
+        .flat_map(|registry| registry.servers)
+        .flat_map(|server| server.env)
+        .filter(|env| !env.secret)
+        .filter_map(|env| env.value)
+        .collect();
+    let mut upgraded = 0;
+    for path in owned_backup_paths()? {
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Could not inspect recovery file {}: {e}", path.display()))?;
+        if envelope(&raw).is_some() {
+            continue;
+        }
+        let client = path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|s| s.to_str())
+            .unwrap_or("client");
+        let mut values = legacy_credentials(&raw, client);
+        values.retain(|(_, value)| !nonsecret_values.contains(value));
+        if values.is_empty() {
+            continue;
+        }
+        let _restore =
+            RestoreImports(IMPORTS.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), values)));
+        let encoded = encode(&path, &raw).map_err(|e| format!("Could not secure legacy recovery file {}: {e}. Original retained; unlock the vault and restart Toolport.", path.display()))?;
+        if encoded != raw {
+            crate::registry::atomic_write(&path, &encoded)?;
+            upgraded += 1;
+        }
+    }
+    Ok(upgraded)
+}
+
+pub(crate) fn protect_existing() -> Result<(), String> {
+    for path in owned_backup_paths()? {
+        let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let payload = match envelope(&raw) {
+            Some(saved) => crate::secrets::get_vault_secret_result(&saved.account, &saved.key)?
+                .filter(|payload| crate::registry::sha256_hex(payload) == saved.hash)
+                .ok_or("Unlock the original backup vault before importing more credentials. Client config unchanged.")?,
+            None => raw.clone(),
+        };
+        let encoded = encode(&path, &payload)?;
+        if encoded != raw {
+            crate::registry::atomic_write(&path, &encoded)?;
         }
     }
     Ok(())
@@ -419,6 +616,76 @@ pub(crate) fn protect_existing() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn copied_backups_do_not_delete_the_source_vault_payload() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let root = crate::registry::conduit_dir().unwrap();
+            let source = root.join("source/backups/cursor/1-mcp.json");
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            register("native", "API_KEY", "sk-copy-fixture-value");
+            let raw = encode(&source, r#"{"env":{"API_KEY":"sk-copy-fixture-value"}}"#).unwrap();
+            clear();
+            std::fs::write(&source, &raw).unwrap();
+            let saved = envelope(&raw).unwrap();
+            for copy in [
+                root.join("copy/backups/cursor/1-mcp.json"),
+                root.join("source/backups/cursor/2-mcp.json"),
+            ] {
+                std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+                std::fs::write(&copy, &raw).unwrap();
+                release(&copy).unwrap();
+                assert!(
+                    crate::secrets::get_vault_secret_result(&saved.account, &saved.key)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            release(&source).unwrap();
+            assert!(
+                crate::secrets::get_vault_secret_result(&saved.account, &saved.key)
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn legacy_upgrade_honors_explicit_nonsecret_settings() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let root = crate::registry::conduit_dir().unwrap();
+            let path = root.join("backups/cursor/1-mcp.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let raw = r#"{"mcpServers":{"native":{"env":{"API_KEY":"public-long-config-value"}}}}"#;
+            std::fs::write(&path, raw).unwrap();
+            let registry: crate::registry::Registry = serde_json::from_value(serde_json::json!({"version":3,"profiles":[],"servers":[{"id":"native","name":"Native","transport":"stdio","command":"echo","env":[{"key":"API_KEY","secret":false,"value":"public-long-config-value"}]}]})).unwrap();
+            crate::registry::save(&registry).unwrap();
+            assert_eq!(upgrade_legacy().unwrap(), 0);
+            assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+        });
+    }
+    #[test]
+    fn legacy_credentials_cover_native_json_toml_yaml_and_provenance_strings() {
+        for text in [
+            r#"{"mcpServers":{"native":{"env":{"API_KEY":"sk-legacy-fixture"}}}}"#,
+            "[mcp_servers.native.env]\nAPI_KEY = 'sk-legacy-fixture'\n",
+            "mcpServers:\n  native:\n    env: { API_KEY: sk-legacy-fixture }\n",
+        ] {
+            for record in [
+                text.to_string(),
+                serde_json::json!({"original":text}).to_string(),
+                serde_json::json!({"entries":[{"format":"toml","text":text}]}).to_string(),
+            ] {
+                let values = legacy_credentials(&record, "fixture");
+                assert!(
+                    values
+                        .iter()
+                        .any(|(reference, value)| reference.key == "API_KEY"
+                            && value == "sk-legacy-fixture"),
+                    "{record}"
+                );
+            }
+        }
+    }
     #[test]
     fn historical_backups_stay_protected_after_rotation_and_another_import() {
         crate::secrets::tests::with_isolated_vault(|| {

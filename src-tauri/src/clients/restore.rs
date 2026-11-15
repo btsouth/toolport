@@ -1148,6 +1148,58 @@ mod tests {
         finish(id, path, revision.as_deref())
     }
     #[test]
+    fn legacy_plaintext_upgrade_seals_backups_without_reimport_and_keeps_locked_recovery() {
+        for available in [true, false] {
+            crate::secrets::tests::with_isolated_vault(|| {
+                backup_storage::reset_missing();
+                let data = crate::registry::conduit_dir().unwrap();
+                let path = data.join("mcp.json");
+                let original = "{\r\n \"mcpServers\":{\"native\":{\"command\":\"echo\",\"env\":{\"API_KEY\":\"sk-fake-legacy-secret\"}}}\r\n}\r\n";
+                std::fs::write(&path, original).unwrap();
+                crate::secrets::set_secret("old-import", "API_KEY", "sk-fake-legacy-secret")
+                    .unwrap();
+                mutation::run("cursor", &path, Format::JsonMcpServers, || {
+                    backup_file("cursor", &path)?;
+                    moved::record("cursor", Format::JsonMcpServers, &path)?;
+                    write_format(Format::JsonMcpServers, &path, &[entry()], true)
+                })
+                .unwrap();
+                let dir = backup_dir("cursor").unwrap();
+                let before: Vec<_> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .flatten()
+                    .map(|file| (file.path(), std::fs::read(file.path()).unwrap()))
+                    .collect();
+                assert!(
+                    before
+                        .iter()
+                        .any(|(_, raw)| String::from_utf8_lossy(raw)
+                            .contains("sk-fake-legacy-secret"))
+                );
+                if !available {
+                    std::env::set_var("TOOLPORT_SECRET_KEY", "wrong-original-vault-key");
+                }
+                let upgraded = backup_storage::upgrade_legacy();
+                if available {
+                    assert!(upgraded.unwrap() >= 3);
+                    assert_eq!(backup_storage::upgrade_legacy().unwrap(), 0);
+                    for file in std::fs::read_dir(&dir).unwrap().flatten() {
+                        assert!(!std::fs::read_to_string(file.path())
+                            .unwrap()
+                            .contains("sk-fake-legacy-secret"));
+                    }
+                } else {
+                    assert!(upgraded.unwrap_err().contains("Original retained"));
+                    for (path, raw) in before {
+                        assert_eq!(std::fs::read(path).unwrap(), raw);
+                    }
+                }
+                disconnect("cursor", &path, Format::JsonMcpServers).unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+            });
+        }
+    }
+    #[test]
     fn vaulted_backup_restores_exact_bytes_and_recovers_without_vault() {
         crate::secrets::tests::with_isolated_vault(|| {
             let data = crate::registry::conduit_dir().unwrap();
