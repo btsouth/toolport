@@ -1182,11 +1182,15 @@ impl Rendezvous {
         known: Option<&DaemonDescriptor>,
     ) -> Result<DaemonDescriptor, String> {
         let deadline = Instant::now() + READY_TIMEOUT;
+        // A new daemon usually answers within a few milliseconds, so start with
+        // short polls instead of making every cold start wait a full READY_POLL.
+        let mut poll = Duration::from_millis(5);
         while Instant::now() < deadline {
             if let Probe::Live(descriptor) = self.probe_with_budget(path, budget, known, false)? {
                 return Ok(descriptor);
             }
-            std::thread::sleep(READY_POLL);
+            std::thread::sleep(poll);
+            poll = (poll * 2).min(READY_POLL);
         }
         Err("the daemon did not become ready before the deadline".to_string())
     }

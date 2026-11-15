@@ -605,6 +605,14 @@ jobs:
         if: matrix.os == 'macos-latest' && matrix.group == 'integration'
         run: node scripts/smoke-headless.mjs
 
+      # Report only: what starting the daemon on demand costs the first call.
+      - name: First tool call with and without a running daemon (macOS, debug build)
+        if: matrix.os == 'macos-latest' && matrix.group == 'integration'
+        continue-on-error: true
+        env:
+          TOOLPORT_BENCH_PROFILE: debug
+        run: node benchmark/cold-start.mjs 20
+
       - name: Headless gateway security smoke (Windows)
         if: matrix.os == 'windows-latest' && matrix.group == 'integration'
         run: powershell -ExecutionPolicy Bypass -File scripts/smoke-headless.ps1
