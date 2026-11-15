@@ -227,7 +227,8 @@ fn read_contained(path: &Path, userdata: &Path) -> Option<Vec<u8>> {
         return None;
     }
     // One allocation, so no grown-out copy of the file (and of any key in it) is freed
-    // without being zeroed. A file that grew past its size since is cut at the limit.
+    // without being zeroed. A file that grew while it was read is skipped this time; its
+    // new size makes the next scan read it again.
     let size = file.metadata().ok()?.len().min(SETTINGS_READ_LIMIT) as usize;
     let mut bytes = Vec::with_capacity(size + 1);
     let read = file.take(size as u64 + 1).read_to_end(&mut bytes);
