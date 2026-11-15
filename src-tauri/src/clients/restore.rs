@@ -2038,6 +2038,91 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         });
     }
+    /// A receipt cut to zero bytes or inside its first key is never read as a
+    /// record: Connect is refused with the config unchanged, the recovery list
+    /// offers Discard recovery file, and Discard deletes only that file.
+    #[test]
+    fn unreadable_receipt_blocks_writes_and_can_be_discarded_alone() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let secret = "sk-unreadable-receipt-fixture";
+            crate::secrets::set_secret("native", "API_KEY", secret).unwrap();
+            let connect = |path: &Path| {
+                mutation::run("cursor", path, Format::JsonMcpServers, || {
+                    backup_file("cursor", path)?;
+                    write_format(Format::JsonMcpServers, path, &[entry()], true)
+                })
+            };
+            let mut pending = Vec::new();
+            for name in ["damaged.json", "kept.json"] {
+                let path = data.join(name);
+                std::fs::write(
+                    &path,
+                    format!(r#"{{"mcpServers":{{"native":{{"command":"echo","env":{{"API_KEY":"{secret}"}}}}}}}}"#),
+                )
+                .unwrap();
+                backup_storage::register("native", "API_KEY", secret);
+                connect(&path).unwrap();
+                backup_storage::clear();
+                pending.push(path);
+            }
+            std::env::set_var("TOOLPORT_SECRET_KEY", "locked-unreadable-receipt");
+            for path in &pending {
+                disconnect("cursor", path, Format::JsonMcpServers).unwrap();
+            }
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            let (path, kept) = (&pending[0], &pending[1]);
+            let file = record_path("cursor", path).unwrap();
+            let kept_file = record_path("cursor", kept).unwrap();
+            let kept_raw = std::fs::read_to_string(&kept_file).unwrap();
+            let (account, key, _) = backup_storage::test_recovery_key(&kept_file);
+            let folder: Vec<_> = std::fs::read_dir(file.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|other| *other != file)
+                .collect();
+            let config = std::fs::read_to_string(path).unwrap();
+            assert!(config.contains("TOOLPORT_MISSING_CREDENTIAL_0"));
+            let mut row = None;
+            for damaged in ["", "{\"toolportBackupVer"] {
+                std::fs::write(&file, damaged).unwrap();
+                assert!(connect(path).is_err(), "{damaged:?}");
+                assert_eq!(std::fs::read_to_string(path).unwrap(), config);
+                let rows = recovery::list().unwrap();
+                let found = rows
+                    .iter()
+                    .find(|r| r.backup_path == file.to_string_lossy())
+                    .expect("the damaged receipt is listed")
+                    .clone();
+                assert!(found.error.is_some(), "{damaged:?}");
+                assert!(found.can_discard_file && !found.can_discard, "{damaged:?}");
+                assert!(rows
+                    .iter()
+                    .any(|r| r.path == kept.to_string_lossy() && r.can_discard));
+                row = Some(found);
+            }
+            let row = row.unwrap();
+            let review = recovery::prepare_discard(&row.id).unwrap();
+            assert_eq!(
+                review.lines,
+                [format!(
+                    "Backup file: {}",
+                    file.file_name().unwrap().to_string_lossy()
+                )]
+            );
+            recovery::discard_confirmed(&row.id, &review.manifest).unwrap();
+            assert!(!file.exists());
+            assert_eq!(std::fs::read_to_string(&kept_file).unwrap(), kept_raw);
+            assert!(crate::secrets::get_backup_secret_result(&account, &key)
+                .unwrap()
+                .is_some());
+            for other in &folder {
+                assert!(other.exists(), "{}", other.display());
+            }
+            assert_eq!(std::fs::read_to_string(path).unwrap(), config);
+            connect(path).unwrap();
+        });
+    }
     #[test]
     fn edited_recovery_accounts_for_each_leaf_without_losing_user_edits() {
         crate::secrets::tests::with_isolated_vault(|| {

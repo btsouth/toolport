@@ -697,6 +697,8 @@ export interface ClientRecovery {
   discardValues: string[];
   error: string | null;
   canDiscard: boolean;
+  /** The recovery file itself cannot be read; Discard deletes only that file. */
+  canDiscardFile?: boolean;
   /** False while a started Discard must be finished; restoration is refused then. */
   canRetry: boolean;
   /** A confirmed Discard already started; only "Finish discarding" is offered. */

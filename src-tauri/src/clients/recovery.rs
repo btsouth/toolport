@@ -30,6 +30,9 @@ pub struct ClientRecovery {
     pub details: String,
     pub error: Option<String>,
     pub can_discard: bool,
+    /// The receipt itself cannot be parsed. Discard deletes only that file; it
+    /// never restores, dismisses or contacts a vault.
+    pub can_discard_file: bool,
     pub cleanup: bool,
     /// False once Discard started: restoring a partially deleted set is refused.
     pub can_retry: bool,
@@ -48,6 +51,33 @@ const READY_REASON: &str = crate::i18n::msg("ready to put back");
 const READY_STEP: &str =
     crate::i18n::msg("Choose Retry to put these values back in the client config.");
 const DISCARD_LOCATION: &str = crate::i18n::msg("Recovery files to delete:\n{path}");
+const MALFORMED_RECEIPT: &str =
+    crate::i18n::msg("This recovery file is malformed. Its saved values have been kept.");
+const NO_CONFIG_PATH: &str = crate::i18n::msg(
+    "This recovery file has no valid config path. Its saved values have been kept.",
+);
+pub(super) const DISCARD_FILE_ACTION: &str = crate::i18n::msg("Discard recovery file");
+/// A receipt whose content cannot be parsed blocks every later write to its
+/// config, so it must stay removable. Links, permission errors, newer formats
+/// and path mismatches are not offered: those files may still be valid.
+fn unreadable_receipt(
+    client_id: &str,
+    name: &str,
+    file: PathBuf,
+    format: Format,
+    reason: &str,
+) -> Receipt {
+    let mut receipt = error_receipt(client_id, name, file, format, reason);
+    if [MALFORMED_RECEIPT, NO_CONFIG_PATH].contains(&reason) {
+        let next = crate::i18n::tr("Toolport cannot read this recovery file, so it cannot put its saved values back. Choose Discard recovery file to delete it; the client config will not change.");
+        let notice = &mut receipt.notice;
+        notice.details = notice.details.replace(&notice.instructions, &next);
+        notice.instructions = next;
+        notice.can_discard_file = true;
+        notice.discard_action = crate::i18n::format_message(DISCARD_FILE_ACTION, &[]);
+    }
+    receipt
+}
 const STARTED_REFUSAL: &str = crate::i18n::msg("Discarding this config's saved recovery copies has started, so Toolport will not put values back. Choose Finish discarding to delete the remaining copies, then re-enter the values in the client if needed.");
 /// Every restore entrypoint shares this refusal (see `restore::load`).
 pub(super) fn discard_started_refusal() -> String {
@@ -198,6 +228,7 @@ fn error_receipt(
             ),
             error: Some(why),
             can_discard: false,
+            can_discard_file: false,
             cleanup: false,
             can_retry: true,
             discard_started: false,
@@ -217,15 +248,16 @@ fn read_receipt(id: &str, name: &str, file: &Path) -> Result<Option<Receipt>, &'
             "This recovery file is a link or is not a regular file. Toolport will not follow it.",
         ));
     }
-    let raw = std::fs::read_to_string(file).map_err(|_| {
-        crate::i18n::msg("Toolport could not read this recovery file. Check its permissions.")
+    let raw = std::fs::read_to_string(file).map_err(|error| {
+        // A copy cut inside a multibyte character is damaged, not unreadable.
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            MALFORMED_RECEIPT
+        } else {
+            crate::i18n::msg("Toolport could not read this recovery file. Check its permissions.")
+        }
     })?;
-    let (record, _) = backup_storage::raw_metadata(&raw).map_err(|_| {
-        crate::i18n::msg("This recovery file is malformed. Its saved values have been kept.")
-    })?;
-    let path = record["configPath"].as_str().ok_or(crate::i18n::msg(
-        "This recovery file has no valid config path. Its saved values have been kept.",
-    ))?;
+    let (record, _) = backup_storage::raw_metadata(&raw).map_err(|_| MALFORMED_RECEIPT)?;
+    let path = record["configPath"].as_str().ok_or(NO_CONFIG_PATH)?;
     if record["version"] != 1 {
         return Err(crate::i18n::msg("This recovery file uses an unsupported version. Open it with a compatible Toolport version."));
     }
@@ -237,9 +269,7 @@ fn read_receipt(id: &str, name: &str, file: &Path) -> Result<Option<Receipt>, &'
         return Err(crate::i18n::msg("This recovery file does not match its original config path. Toolport will not write or discard it."));
     }
     let format:Format=serde_json::from_value(record["format"].clone()).map_err(|_|crate::i18n::msg("This recovery file uses an unsupported config format. Open it with a compatible Toolport version."))?;
-    let markers = backup_storage::raw_markers(&raw).map_err(|_| {
-        crate::i18n::msg("This recovery file is malformed. Its saved values have been kept.")
-    })?;
+    let markers = backup_storage::raw_markers(&raw).map_err(|_| MALFORMED_RECEIPT)?;
     if record["disconnected"] != true || markers.is_empty() {
         return Ok(None);
     }
@@ -387,6 +417,7 @@ fn read_receipt(id: &str, name: &str, file: &Path) -> Result<Option<Receipt>, &'
             details,
             error: config_error,
             can_discard: true,
+            can_discard_file: false,
             cleanup,
             can_retry: !started,
             discard_started: started,
@@ -549,7 +580,7 @@ fn receipts() -> Result<Vec<Receipt>, String> {
             match read_receipt(&id, base.name, &entry.path()) {
                 Ok(Some(record)) => records.push(record),
                 Ok(None) => {}
-                Err(reason) => records.push(error_receipt(
+                Err(reason) => records.push(unreadable_receipt(
                     &id,
                     base.name,
                     entry.path(),

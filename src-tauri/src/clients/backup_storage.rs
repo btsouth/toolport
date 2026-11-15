@@ -539,7 +539,7 @@ pub(super) fn set_dismissed(path: &Path, dismissed: bool) -> Result<(), String> 
 
 const WRAPPER_KEYS: [&str; 2] = ["toolportBackupVersion", "toolportPlainBackupVersion"];
 /// Serializes a wrapper rewritten as a JSON value with its version key first.
-/// serde_json sorts object keys, which would bury the marker `wrapper_marked`
+/// serde_json sorts object keys, which would bury the first key `damaged_wrapper`
 /// relies on after an alphabetically earlier field.
 fn wrapper_json(value: &serde_json::Value) -> Result<String, String> {
     let json = |v: &serde_json::Value| serde_json::to_string(v).map_err(|e| diagnostics::json(&e));
@@ -560,15 +560,52 @@ fn wrapper_json(value: &serde_json::Value) -> Result<String, String> {
     ))
 }
 
-/// Toolport's wrappers are serialized with their version key first. A file
-/// that starts like one but does not parse as a complete, supported wrapper
-/// (for example a truncated copy) is never config bytes. A native config that
-/// only mentions the key inside a value does not start this way.
-fn wrapper_marked(text: &str) -> bool {
-    let text = text.trim_start();
-    WRAPPER_KEYS
-        .iter()
-        .any(|key| text.starts_with(&format!("{{\"{key}\":")))
+/// Text a legacy (raw) reader must refuse, because it is empty or could be a
+/// damaged Toolport wrapper rather than config bytes: after leading whitespace
+/// a `{` whose first key is a wrapper version key, complete or cut off at any
+/// point (so `{`, `{"` and `{"toolportBackupVer` too), or a parsed object with
+/// a wrapper version key anywhere at the top level. No supported client format
+/// can be exactly `{` or `{"`; `{}` and configs that mention the key only
+/// inside a value are still config bytes.
+pub(super) fn damaged_wrapper(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let Some(body) = trimmed.strip_prefix('{').map(str::trim_start) else {
+        return false;
+    };
+    if body.is_empty() {
+        return true;
+    }
+    if let Some(key) = body.strip_prefix('"') {
+        let cut = match key.find('"') {
+            Some(end) => WRAPPER_KEYS.contains(&&key[..end]),
+            None => WRAPPER_KEYS.iter().any(|marker| marker.starts_with(key)),
+        };
+        if cut {
+            return true;
+        }
+    }
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_object()
+                .map(|map| WRAPPER_KEYS.iter().any(|key| map.contains_key(*key)))
+        })
+        .unwrap_or(false)
+}
+
+/// Rollback reads only a backup this process just wrote, and `encode_backup`
+/// always wraps one, so anything but a complete, supported wrapper is an error.
+fn complete_wrapper(raw: &str) -> Result<(), String> {
+    if envelope(raw).is_some() || plain_backup(raw)?.is_some() {
+        return Ok(());
+    }
+    Err(crate::i18n::tr(
+        "This recovery file is malformed. Its saved values have been kept.",
+    ))
 }
 
 pub(super) fn decode(text: &str) -> Result<String, String> {
@@ -582,7 +619,7 @@ pub(super) fn decode(text: &str) -> Result<String, String> {
         return Ok(plain.text);
     }
     let Some(saved) = envelope(text) else {
-        if wrapper_marked(text) {
+        if damaged_wrapper(text) {
             return Err(crate::i18n::tr(
                 "This recovery file is malformed. Its saved values have been kept.",
             ));
@@ -714,6 +751,7 @@ pub(super) fn read_exact(path: &Path, source: &Path) -> Result<String, String> {
         {
             return Err(crate::i18n::tr("This recovery file uses an unsupported version. Open it with a compatible Toolport version."));
         }
+        complete_wrapper(&raw)?;
         return decode(&raw);
     };
     crate::secrets::with_backup_batch(|| {
@@ -1081,6 +1119,8 @@ pub(crate) fn upgrade_legacy() -> Result<usize, String> {
         let source = source_path(&path).ok().flatten();
         let text = match plain {
             Some(_) => decode(&raw)?,
+            // Never seal possibly damaged wrapper bytes into a valid wrapper.
+            None if damaged_wrapper(&raw) => continue,
             None => raw.clone(),
         };
         let client = path
@@ -1113,6 +1153,8 @@ pub(crate) fn protect_existing() -> Result<(), String> {
                 .filter(|payload| crate::registry::sha256_hex(payload) == saved.hash)
                 .ok_or("Unlock the original backup vault before importing more credentials. Client config unchanged.")?,
             None if plain.is_some() => decode(&raw)?,
+            // Left as it is: sealing would turn damaged bytes into a valid wrapper.
+            None if damaged_wrapper(&raw) => continue,
             None => raw.clone(),
         };
         // Re-encoding keeps a backup's validated path provenance, never a
@@ -1184,7 +1226,7 @@ mod tests {
         });
     }
 
-    /// `wrapper_marked` needs the version key first in every file Toolport
+    /// `damaged_wrapper` reads the first key, so it needs the version key first in every file Toolport
     /// writes, including status rewrites that go through a JSON value (which
     /// serde_json would otherwise sort alphabetically), so a truncated copy of
     /// any of them is refused instead of being taken for config bytes.
@@ -1222,14 +1264,18 @@ mod tests {
             let check = |path: &Path, step: &str| {
                 let text = std::fs::read_to_string(path).unwrap();
                 assert!(
-                    wrapper_marked(&text),
+                    WRAPPER_KEYS
+                        .iter()
+                        .any(|key| text.starts_with(&format!("{{\"{key}\":"))),
                     "{step} moved the version key: {}",
                     &text[..40]
                 );
-                assert!(
-                    decode(&text[..text.len() / 2]).is_err(),
-                    "{step}: truncated copy accepted"
-                );
+                for cut in (0..64).chain([text.len() / 2, text.len() - 1]) {
+                    assert!(
+                        decode(&text[..cut]).is_err(),
+                        "{step}: copy truncated to {cut} bytes accepted"
+                    );
+                }
             };
             for (path, key) in [(&vaulted, WRAPPER_KEYS[0]), (&plain, WRAPPER_KEYS[1])] {
                 let text = std::fs::read_to_string(path).unwrap();
@@ -1709,6 +1755,67 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
+        });
+    }
+
+    /// Raw (legacy) reading refuses an empty file and anything that could be a
+    /// damaged wrapper, and the startup upgrade leaves those files untouched
+    /// instead of sealing them; real configs, including `{}` and one that only
+    /// mentions the marker inside a value, still read byte for byte.
+    #[test]
+    fn legacy_readers_refuse_empty_and_cut_wrappers_but_keep_real_configs() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            clear();
+            reset_missing();
+            let dir = crate::registry::conduit_dir()
+                .unwrap()
+                .join("backups/cursor");
+            std::fs::create_dir_all(&dir).unwrap();
+            let damaged = [
+                "",
+                " \n",
+                "{",
+                "{\"",
+                "{\"toolportBackupVer",
+                "{\"toolportPlainBack",
+                "{\n  \"toolportBackupVersion\":1,",
+                "{\"account\":\"x\",\"toolportBackupVersion\":1}",
+                "{\"toolportBackupVersion\":1,\"fallback\":\"{\\\"mcpServers\\\":{\\\"a\\\":{\\\"env\\\":{\\\"API_KEY\\\":\\\"sk-legacy-damaged-value\\\"}}}}\"",
+            ];
+            let mut files = Vec::new();
+            for (index, text) in damaged.iter().enumerate() {
+                assert!(damaged_wrapper(text), "{text:?}");
+                assert!(decode(text).is_err(), "{text:?}");
+                let file = dir.join(format!("{}-mcp.json", 10 + index));
+                std::fs::write(&file, text).unwrap();
+                assert!(read(&file).is_err(), "{text:?}");
+                assert!(read_config_file(&file).is_err(), "{text:?}");
+                files.push((file, *text));
+            }
+            register("a", "API_KEY", "sk-legacy-damaged-value");
+            crate::secrets::set_secret("a", "API_KEY", "sk-legacy-damaged-value").unwrap();
+            protect_existing().unwrap();
+            upgrade_legacy().unwrap();
+            for (file, text) in &files {
+                assert_eq!(&std::fs::read_to_string(file).unwrap(), text);
+            }
+            clear();
+            for text in [
+                "{}",
+                "{ }\n",
+                "{\"note\":\"{\\\"toolportBackupVersion\\\":1,\\\"account\\\":\",\"mcpServers\":{}}",
+                "{\"t\":1}",
+                "{\"toolport\":{}}",
+                "[mcp_servers.native]\ncommand = 'echo'\n",
+                "mcpServers: {}\n",
+            ] {
+                assert!(!damaged_wrapper(text), "{text:?}");
+                assert_eq!(decode(text).unwrap(), text);
+                let file = dir.join("2-legacy.json");
+                std::fs::write(&file, text).unwrap();
+                assert_eq!(read(&file).unwrap(), text);
+            }
+            reset_missing();
         });
     }
 

@@ -446,6 +446,52 @@ it("keeps good recoveries beside a per-record error and refreshes that row throu
   expect(screen.queryByText(/can be read again|refreshed/)).not.toBeInTheDocument();
 });
 
+it("an unreadable recovery file offers only Discard recovery file, never Dismiss", async () => {
+  const unreadable = errorRow({
+    description: "This recovery file is malformed. Its saved values have been kept.",
+    error: "This recovery file is malformed. Its saved values have been kept.",
+    canDiscardFile: true,
+    discardAction: "Discard recovery file",
+  });
+  api.listClientRecoveries.mockResolvedValue([unreadable, recovery()]);
+  api.prepareClientRecoveryDiscard.mockResolvedValue(
+    prepared({
+      manifest: "manifest-file",
+      heading: "Discard the unreadable recovery file for Devin Desktop (Cascade)?",
+      lines: ["Backup file: original-2222.json"],
+      actionLabel: "Discard recovery file",
+    }),
+  );
+  api.discardClientRecovery.mockResolvedValue(
+    "Devin Desktop (Cascade)'s unreadable recovery file was deleted. The client config was not changed.",
+  );
+  render(<ClientRecoveryBanners refreshKey="unreadable" />);
+  const notices = await screen.findAllByRole("region");
+  expect(
+    within(notices[0]).queryByRole("button", { name: "Dismiss" }),
+  ).not.toBeInTheDocument();
+  expect(within(notices[0]).getByRole("button", { name: "Retry" })).toBeInTheDocument();
+  await userEvent.click(
+    within(notices[0]).getByRole("button", { name: "Discard recovery file" }),
+  );
+  expect(api.prepareClientRecoveryDiscard).toHaveBeenCalledWith("bad");
+  const dialog = await screen.findByRole("dialog");
+  expect(
+    within(dialog)
+      .getAllByRole("listitem")
+      .map((item) => item.textContent),
+  ).toEqual(["Backup file: original-2222.json"]);
+  api.listClientRecoveries.mockResolvedValue([recovery()]);
+  await userEvent.click(
+    within(dialog).getByRole("button", { name: "Discard recovery file" }),
+  );
+  expect(api.discardClientRecovery).toHaveBeenCalledWith("bad", "manifest-file");
+  expect(await screen.findByRole("status")).toHaveTextContent(
+    "unreadable recovery file was deleted",
+  );
+  expect(screen.getAllByRole("region")).toHaveLength(1);
+});
+
 it("a file error replaced by a folder error focuses the replacement and reports no success", async () => {
   api.listClientRecoveries.mockResolvedValue([errorRow()]);
   render(<ClientRecoveryBanners refreshKey="replacement" />);

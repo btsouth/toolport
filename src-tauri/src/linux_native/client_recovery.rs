@@ -562,8 +562,8 @@ impl ClientPage {
                 });
                 insert_action(&actions, &retry);
             }
-            if record.can_discard {
-                if !record.discard_started {
+            if record.can_discard || record.can_discard_file {
+                if record.can_discard && !record.discard_started {
                     let dismiss = l10n::button("Dismiss");
                     dismiss.set_sensitive(!busy);
                     dismiss.set_widget_name(&format!("client-recovery-dismiss:{}", record.id));
@@ -946,6 +946,7 @@ mod tests {
             details: String::new(),
             error: None,
             can_discard: true,
+            can_discard_file: false,
             can_retry: true,
             discard_started: false,
             discard_action: "Discard these saved values".into(),
@@ -1109,6 +1110,7 @@ mod tests {
             discard_values: values.lines().map(str::to_string).collect(),
             error: None,
             can_discard: true,
+            can_discard_file: false,
             can_retry: true,
             discard_started: false,
             discard_action: "Discard these saved values".into(),
@@ -1496,6 +1498,7 @@ mod tab_order_tests {
             discard_values: Vec::new(),
             error: error.then(|| "This recovery file uses an unsupported version.".into()),
             can_discard: !error,
+            can_discard_file: false,
             can_retry: true,
             discard_started: false,
             discard_action: "Discard these saved values".into(),
@@ -1516,7 +1519,7 @@ mod tab_order_tests {
     }
 
     /// Tab from "Scan clients again" reaches every card's controls in order,
-    /// including a dismissed card, and Shift+Tab walks back out to the scan button.
+    /// including an unreadable file's Discard and a dismissed card, and Shift+Tab walks back out to the scan button.
     #[test]
     #[ignore = "requires an isolated GTK desktop"]
     fn tab_reaches_every_recovery_control_and_shift_tab_returns() {
@@ -1532,6 +1535,12 @@ mod tab_order_tests {
         page.recoveries.borrow_mut().extend([
             record("codex", "Codex", false, false),
             record("windsurf", "Windsurf", false, true),
+            // An unreadable receipt: Retry and Discard recovery file, no Dismiss.
+            crate::clients::recovery::ClientRecovery {
+                can_discard_file: true,
+                discard_action: "Discard recovery file".into(),
+                ..record("cursor", "Cursor", false, true)
+            },
             record("claude-code", "Claude Code", true, false),
         ]);
         page.rebuild_recoveries();
@@ -1556,6 +1565,9 @@ mod tab_order_tests {
             "client-recovery-details:codex",
             "client-recovery-retry:windsurf",
             "client-recovery-details:windsurf",
+            "client-recovery-retry:cursor",
+            "client-recovery-discard:cursor",
+            "client-recovery-details:cursor",
             "client-recovery-show:claude-code",
         ];
         assert!(page.refresh_button.grab_focus());

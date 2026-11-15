@@ -6223,9 +6223,9 @@ API_KEY = "synthetic-first-origin"
 
     /// Rollback reads the backup through its wrapper. A vaulted backup restores
     /// the exact native bytes, a locked vault refuses without touching the config,
-    /// and a raw backup written by an older version still restores byte for byte.
+    /// and a raw file in the backup slot is refused (rollback has no raw fallback).
     #[test]
-    fn rollback_decodes_vaulted_and_legacy_backups_into_exact_native_bytes() {
+    fn rollback_decodes_vaulted_backups_and_refuses_raw_ones() {
         let fixture = MoveFixture::new(&Registry::default());
         let target = fixture.claude();
         let secret = "sk-rollback-wrapper-fixture";
@@ -6279,18 +6279,19 @@ API_KEY = "synthetic-first-origin"
         assert_eq!(std::fs::read_to_string(&target).unwrap(), connected);
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), stored);
 
-        // A raw backup left by an older Toolport in the same folder.
+        // Rollback only ever names a backup this process just wrapped, so a raw
+        // file there is refused, never written over the config.
         let legacy = backup.with_file_name("1700000000000-.claude.json");
         std::fs::write(&legacy, &original).unwrap();
         std::fs::write(&target, connected).unwrap();
         finish_client_config_mutation(outcome(&legacy), |_| Err("registry full".into()))
             .unwrap_err();
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), connected);
     }
 
-    /// A truncated wrapper is never native config bytes: rollback refuses and
-    /// leaves the client config as it is. A raw backup that only mentions the
-    /// wrapper key inside a value still restores.
+    /// Rollback reads with a wrapper required: a wrapper cut anywhere (Sol's
+    /// three truncations included), an empty file, or raw config bytes in the
+    /// backup slot are refused and the client config is left as it is.
     #[test]
     fn rollback_refuses_truncated_backup_wrappers() {
         let fixture = MoveFixture::new(&Registry::default());
@@ -6323,27 +6324,65 @@ API_KEY = "synthetic-first-origin"
         for backup in [&vaulted, &plain] {
             let full = std::fs::read_to_string(backup).unwrap();
             assert!(full.starts_with("{\"toolport"), "{full}");
+            let key = if backup == &vaulted {
+                "toolportBackupVersion"
+            } else {
+                "toolportPlainBackupVersion"
+            };
             let cut = full
                 .find("\"account\":")
                 .or_else(|| full.find("\"sourceConfigPath\":"))
                 .unwrap();
-            std::fs::write(backup, &full[..cut + 10]).unwrap();
-            std::fs::write(&target, connected).unwrap();
-            let error =
-                finish_client_config_mutation(outcome(backup), |_| Err("registry full".into()))
-                    .unwrap_err();
-            assert!(error.contains("rollback"), "{error}");
-            assert_eq!(std::fs::read_to_string(&target).unwrap(), connected);
+            for damaged in [
+                full[..cut + 10].to_string(),
+                format!("{{\"{}", &key[..key.len() - 4]),
+                format!("{{\n  \"{key}\":1,"),
+                String::new(),
+                "{".into(),
+                "{\"".into(),
+                // A raw config in the backup slot: rollback has no raw fallback.
+                "{\"note\":\"toolportBackupVersion\",\"mcpServers\":{}}".into(),
+                "{}".into(),
+            ] {
+                std::fs::write(backup, &damaged).unwrap();
+                std::fs::write(&target, connected).unwrap();
+                let error =
+                    finish_client_config_mutation(outcome(backup), |_| Err("registry full".into()))
+                        .unwrap_err();
+                assert!(error.contains("rollback"), "{damaged:?}: {error}");
+                assert_eq!(
+                    std::fs::read_to_string(&target).unwrap(),
+                    connected,
+                    "{damaged:?}"
+                );
+            }
         }
+    }
 
-        let legacy = vaulted.with_file_name("1700000000000-.claude.json");
-        let raw =
-            "{\"note\":\"{\\\"toolportBackupVersion\\\":1,\\\"account\\\":\",\"mcpServers\":{}}";
-        std::fs::write(&legacy, raw).unwrap();
-        std::fs::write(&target, connected).unwrap();
-        finish_client_config_mutation(outcome(&legacy), |_| Err("registry full".into()))
-            .unwrap_err();
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), raw);
+    /// A moved-servers record cut to zero bytes or inside its first key is never
+    /// read as a record: Disconnect refuses and leaves the client config as it is.
+    #[test]
+    fn damaged_move_record_refuses_disconnect_without_touching_the_config() {
+        for damaged in ["", "{\"toolportBackupVer"] {
+            let fixture = MoveFixture::new(&Registry::default());
+            std::fs::write(
+                fixture.claude(),
+                r#"{"mcpServers":{"memory":{"command":"npx","args":["-y","server-memory"]}}}"#,
+            )
+            .unwrap();
+            connect_fixture("claude-code", None, false).unwrap();
+            let record = fixture.move_record("claude-code");
+            assert!(record.exists());
+            std::fs::write(&record, damaged).unwrap();
+            let connected = std::fs::read_to_string(fixture.claude()).unwrap();
+            assert!(disconnect_client("claude-code").is_err(), "{damaged:?}");
+            assert_eq!(
+                std::fs::read_to_string(fixture.claude()).unwrap(),
+                connected,
+                "{damaged:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&record).unwrap(), damaged);
+        }
     }
 
     #[test]

@@ -535,5 +535,10 @@
   "Toolport could not check the saved values for {client}. Check the recovery folder and its permissions, then scan again.": "Toolport 無法檢查 {client} 已儲存的值。請檢查復原資料夾及其權限，然後重新掃描。",
   "Toolport will permanently delete recovery copies for {client}. Saved values: {value_count}. Backup files: {file_count}.\n\nThe current client config at {path} will not change. Any temporary text for missing values will stay there; re-enter those values in the client if needed. Toolport's server credentials will not change.": "Toolport 將永久刪除 {client} 的復原副本。已儲存的值：{value_count}。備份檔案：{file_count}。\n\n{path} 中的目前用戶端設定不會變更。缺少值的暫時文字會保留在那裡；請視需要在用戶端中重新輸入這些值。Toolport 的伺服器憑證不會變更。",
   "Toolport already started deleting recovery copies for {client}, so some may already be gone. Saved values to finish discarding: {value_count}. Backup files left to delete: {file_count}.": "Toolport 已開始刪除 {client} 的復原副本，因此部分副本可能已經不在了。待完成捨棄的已儲存值：{value_count}。待刪除的剩餘備份檔案：{file_count}。",
-  "The saved values for {client} were already deleted. Backup files left to delete: {file_count}.": "{client} 已儲存的值已被刪除。待刪除的剩餘備份檔案：{file_count}。"
+  "The saved values for {client} were already deleted. Backup files left to delete: {file_count}.": "{client} 已儲存的值已被刪除。待刪除的剩餘備份檔案：{file_count}。",
+  "Discard recovery file": "捨棄復原檔案",
+  "Toolport cannot read this recovery file, so it cannot put its saved values back. Choose Discard recovery file to delete it; the client config will not change.": "Toolport 無法讀取此復原檔案，因此無法放回其中儲存的值。選擇「捨棄復原檔案」即可刪除；用戶端設定不會改變。",
+  "Discard the unreadable recovery file for {client}?": "要捨棄 {client} 無法讀取的復原檔案嗎？",
+  "Toolport cannot read this recovery file, so it cannot put its saved values back. Discard deletes only this file. Saved values it referred to stay in Toolport's credential store until you remove Toolport's data.\n\nThe client config will not change. Any temporary text for missing values will stay there; re-enter those values in the client if needed.": "Toolport 無法讀取此復原檔案，因此無法放回其中儲存的值。捨棄只會刪除此檔案。它所參照的已儲存值會保留在 Toolport 的憑證存放區，直到你移除 Toolport 的資料。\n\n用戶端設定不會改變。缺少的值的暫時文字會留在那裡；如有需要，請在用戶端重新輸入這些值。",
+  "{client}'s unreadable recovery file was deleted. The client config was not changed.": "{client} 無法讀取的復原檔案已刪除。用戶端設定未變更。"
 }

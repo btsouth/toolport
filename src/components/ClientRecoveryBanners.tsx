@@ -379,9 +379,9 @@ export function ClientRecoveryBanners({
                     {t("Retry")}
                   </Button>
                 )}
-                {row.canDiscard && (
+                {(row.canDiscard || row.canDiscardFile) && (
                   <>
-                    {!row.discardStarted && (
+                    {row.canDiscard && !row.discardStarted && (
                       <Button
                         data-recovery-focus={`dismiss-${row.id}`}
                         variant="outline"

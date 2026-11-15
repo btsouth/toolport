@@ -150,6 +150,9 @@ fn shared_tail(path: &str) -> String {
 /// Reads only recovery metadata and file bytes; never contacts a vault.
 pub fn prepare_discard(id: &str) -> Result<DiscardConfirmation, String> {
     let receipt = find(id)?;
+    if receipt.notice.can_discard_file {
+        return prepare_file_discard(&receipt);
+    }
     if !receipt.notice.can_discard {
         return Err(untrusted());
     }
@@ -232,7 +235,7 @@ fn remove(file: &Path) -> std::io::Result<()> {
 /// Deletes exactly the reviewed inventory. Returns the shared success prose.
 pub fn discard_confirmed(id: &str, manifest: &str) -> Result<String, String> {
     let receipt = find(id)?;
-    if !receipt.notice.can_discard {
+    if !receipt.notice.can_discard && !receipt.notice.can_discard_file {
         return Err(untrusted());
     }
     let _auth = crate::registry_controller::acquire_auth_lock(&format!(
@@ -243,6 +246,9 @@ pub fn discard_confirmed(id: &str, manifest: &str) -> Result<String, String> {
     let _mutation = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
     // Revalidate provenance, path binding and phase under the locks.
     let receipt = find(id)?;
+    if receipt.notice.can_discard_file {
+        return discard_file(&receipt, manifest);
+    }
     if !receipt.notice.can_discard {
         return Err(untrusted());
     }
@@ -291,6 +297,59 @@ pub fn discard_confirmed(id: &str, manifest: &str) -> Result<String, String> {
         }
     }
     Ok(crate::i18n::trf("{client}'s saved recovery copies were deleted. The current config at {path} was not changed. Any temporary text for missing values is still there; re-enter those values in the client if needed.", &[("client", name), ("path", &receipt.notice.path)]))
+}
+
+/// Review for a receipt that cannot be parsed: exactly that one file. Its vault
+/// entries cannot be named from damaged bytes, so they are left for data removal.
+fn prepare_file_discard(receipt: &Receipt) -> Result<DiscardConfirmation, String> {
+    let notice = &receipt.notice;
+    let name = notice.client_name.as_str();
+    let files = [receipt.file.clone()];
+    let manifest = fingerprint(&files, &receipt.file).map_err(|_| {
+        file_failure(name, crate::i18n::trf("Toolport could not list the recovery files. Check the recovery folder and its permissions, then choose {action}:\n{path}", &[("action", &crate::i18n::format_message(DISCARD_FILE_ACTION, &[])), ("path", &folder(receipt).to_string_lossy())]))
+    })?;
+    let file = receipt
+        .file
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Ok(DiscardConfirmation {
+        manifest,
+        heading: crate::i18n::trf("Discard the unreadable recovery file for {client}?", &[("client", name)]),
+        description: crate::i18n::trf("Toolport cannot read this recovery file, so it cannot put its saved values back. Discard deletes only this file. Saved values it referred to stay in Toolport's credential store until you remove Toolport's data.\n\nThe client config will not change. Any temporary text for missing values will stay there; re-enter those values in the client if needed.", &[("client", name)]),
+        lines: vec![crate::i18n::trf("Backup file: {file}", &[("file", &file)])],
+        location: crate::i18n::format_message(
+            DISCARD_LOCATION,
+            &[("path", &folder(receipt).to_string_lossy())],
+        ),
+        action_label: crate::i18n::format_message(DISCARD_FILE_ACTION, &[]),
+    })
+}
+fn file_failure(client: &str, repair: String) -> String {
+    issue(format!(
+        "{}\n\n{repair}",
+        crate::i18n::trf(
+            "Nothing was deleted. The saved values and recovery files for {client} are kept.",
+            &[("client", client)]
+        )
+    ))
+}
+/// Deletes only the reviewed unreadable receipt, under the caller's locks.
+fn discard_file(receipt: &Receipt, manifest: &str) -> Result<String, String> {
+    let name = receipt.notice.client_name.as_str();
+    let files = [receipt.file.clone()];
+    if fingerprint(&files, &receipt.file).ok().as_deref() != Some(manifest) {
+        return Err(failure(name, Done::Nothing, Repair::Changed));
+    }
+    match remove(&receipt.file) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(file_failure(name, crate::i18n::trf("Toolport could not delete a recovery file. Check its permissions and the folder's, then choose {action}:\n{path}", &[("action", &crate::i18n::format_message(DISCARD_FILE_ACTION, &[])), ("path", &receipt.file.to_string_lossy())]))),
+    }
+    Ok(issue(crate::i18n::trf(
+        "{client}'s unreadable recovery file was deleted. The client config was not changed.",
+        &[("client", name)],
+    )))
 }
 
 /// Only typed Discard results pass unchanged. Anything else becomes a
