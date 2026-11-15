@@ -1473,6 +1473,69 @@ mod tests {
         (stdout, text)
     }
 
+    /// Child half of the backpressure test: stderr is a pipe nobody reads,
+    /// and a thread writes far more than any bound into it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stderr_blocked_destination_child() {
+        if std::env::var_os("TOOLPORT_STDERR_BLOCKED_CHILD").is_none() {
+            return;
+        }
+        let rss_kb = || {
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find_map(|l| l.strip_prefix("VmRSS:"))
+                .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+                .unwrap()
+        };
+        let _ = install_stderr_redaction();
+        crate::secret_redact::register("blocked-server", "BLOCKED", "blocked-canary-2Wn8-SECRET");
+        let before = rss_kb();
+        std::thread::spawn(|| {
+            let line = "x".repeat(8191);
+            for _ in 0..8192 {
+                eprintln!("{line}");
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        println!("rss-growth-kb={}", rss_kb().saturating_sub(before));
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        // The writer is blocked on stderr for good: end without draining it.
+        std::process::exit(0);
+    }
+
+    /// Failure mode: when stderr's destination stops reading (an MCP client
+    /// that never drains the pipe), the relay keeps reading into an unbounded
+    /// queue, so a noisy process grows without limit instead of being slowed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_relay_whose_destination_blocks_holds_bounded_memory() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon_log::tests::stderr_blocked_destination_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TOOLPORT_STDERR_BLOCKED_CHILD", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = String::new();
+        std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut stdout).unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success(), "{stdout}");
+        let growth: u64 = stdout
+            .lines()
+            .find_map(|l| l.split_once("rss-growth-kb=").map(|(_, v)| v))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{stdout}"));
+        // 64 MiB was written; the queue holds at most 64 chunks of 8 KiB.
+        assert!(growth < 16 * 1024, "grew {growth} KiB");
+    }
+
     /// Child half of the in-flight-write test: a thread holds Rust's stderr
     /// lock (as a write does while it runs) across the switch.
     #[cfg(unix)]
