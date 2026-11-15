@@ -168,38 +168,50 @@ fn keychain_delete_outcome(
     }
 }
 
-/// A legacy reference failed with a not-found `status`. `fresh` is a new
-/// lookup of the same account in the legacy keychain: nothing there means the
-/// item is already gone; anything there is a real item, deleted through its
-/// fresh reference. Only a fresh reference that refuses deletion is a leftover.
+/// A legacy reference failed with a not-found `status`. `lookup` lists the
+/// same account in the legacy keychain afresh: nothing there means the item is
+/// already gone; anything there is a real item, deleted through its fresh
+/// reference. When a fresh reference also says not found, the account is
+/// listed once more: an item that is still there is a leftover, never absent.
 #[cfg(any(target_os = "macos", test))]
 fn legacy_recheck<R>(
     status: i32,
-    fresh: Result<Vec<(R, String)>, String>,
+    mut lookup: impl FnMut() -> Result<Vec<(R, String)>, String>,
     mut delete: impl FnMut(&R) -> i32,
 ) -> Result<Outcome, String> {
-    let fresh = fresh.map_err(|lookup| {
+    let unconfirmed = |lookup: String| {
         format!("SecKeychainItemDelete: {status}; could not confirm whether it remains: {lookup}")
-    })?;
+    };
+    let fresh = lookup().map_err(unconfirmed)?;
     let mut deleted = false;
+    let mut missing_again = false;
     let mut refused = Vec::new();
     for (reference, _) in &fresh {
         match delete(reference) {
             0 => deleted = true,
-            again if keychain_status_says_missing(again) => {}
+            again if keychain_status_says_missing(again) => missing_again = true,
             again => refused.push(again),
         }
     }
     if !refused.is_empty() {
-        Err(format!(
+        return Err(format!(
             "SecKeychainItemDelete: {status}; the item is still in the keychain and deleting it failed: {}",
             refused.iter().map(i32::to_string).collect::<Vec<_>>().join(", ")
-        ))
-    } else if deleted {
-        Ok(Outcome::Deleted)
-    } else {
-        Ok(Outcome::Absent)
+        ));
     }
+    if missing_again {
+        let remaining = lookup().map_err(unconfirmed)?;
+        if !remaining.is_empty() {
+            return Err(format!(
+                "SecKeychainItemDelete: {status}; the item is still in the keychain although deleting it reported it missing"
+            ));
+        }
+    }
+    Ok(if deleted {
+        Outcome::Deleted
+    } else {
+        Outcome::Absent
+    })
 }
 
 /// `CredDeleteW` fails with ERROR_NOT_FOUND (1168) when no credential has that
@@ -626,7 +638,7 @@ pub(crate) fn remove(scope: &Scope) -> Result<Removal, String> {
         } else if !keychain_status_says_missing(status) {
             Err(format!("SecKeychainItemDelete: {status}"))
         } else {
-            legacy_recheck(status, legacy_refs(Some(&account)), delete_ref)
+            legacy_recheck(status, || legacy_refs(Some(&account)), delete_ref)
         };
         record_outcome(&account, path, outcome, &mut report);
     }
@@ -805,28 +817,86 @@ mod tests {
     }
 
     #[test]
-    fn purge_legacy_view_of_a_deleted_data_protection_item_is_absent() {
-        // v2.3.5: the legacy search returned the data-protection item, which the
-        // first pass deleted; its stale reference then failed with -25304.
-        assert_eq!(
-            legacy_recheck::<()>(-25304, Ok(Vec::new()), |_| panic!("nothing to delete")),
-            Ok(Outcome::Absent)
+    fn purge_legacy_recheck_settles_a_stale_reference_only_on_evidence() {
+        type Listing = Result<Vec<(i32, String)>, String>;
+        let listed = || -> Listing { Ok(vec![(1, "mock::TOKEN".into())]) };
+        let empty = || -> Listing { Ok(Vec::new()) };
+        let locked = || -> Listing { Err("locked".into()) };
+        // (case, successive lookups, status of each fresh delete, expected)
+        type Case = (
+            &'static str,
+            Vec<Listing>,
+            i32,
+            Result<Outcome, &'static str>,
         );
-        // A real legacy item behind the stale view is deleted through a fresh ref.
-        assert_eq!(
-            legacy_recheck(-25304, Ok(vec![(1, "mock::TOKEN".into())]), |_| 0),
-            Ok(Outcome::Deleted)
-        );
-        // One that vanishes during the retry is still absent.
-        assert_eq!(
-            legacy_recheck(-25304, Ok(vec![(1, "mock::TOKEN".into())]), |_| -25300),
-            Ok(Outcome::Absent)
-        );
-        let refused =
-            legacy_recheck(-25304, Ok(vec![(1, "mock::TOKEN".into())]), |_| -25293).unwrap_err();
-        assert!(refused.contains("still in the keychain") && refused.contains("-25293"));
-        let unknown = legacy_recheck::<()>(-25304, Err("locked".into()), |_| 0).unwrap_err();
-        assert!(unknown.contains("could not confirm"), "{unknown}");
+        let cases: Vec<Case> = vec![
+            // v2.3.5: the legacy search returned the data-protection item, which
+            // the first pass deleted; its stale reference then failed with -25304.
+            (
+                "stale view, nothing listed",
+                vec![empty()],
+                0,
+                Ok(Outcome::Absent),
+            ),
+            // A real legacy item behind the stale view is deleted through a fresh ref.
+            (
+                "real item behind the view",
+                vec![listed()],
+                0,
+                Ok(Outcome::Deleted),
+            ),
+            // One that vanishes during the retry, and is no longer listed, is absent.
+            (
+                "vanished during retry",
+                vec![listed(), empty()],
+                -25300,
+                Ok(Outcome::Absent),
+            ),
+            // Listed, the retry says -25304 again, and it is still listed: a leftover.
+            (
+                "still listed after retry",
+                vec![listed(), listed()],
+                -25304,
+                Err("still in the keychain"),
+            ),
+            (
+                "still listed after -25300",
+                vec![listed(), listed()],
+                -25300,
+                Err("still in the keychain"),
+            ),
+            // The second look itself fails: unknown, not absent.
+            (
+                "second look fails",
+                vec![listed(), locked()],
+                -25304,
+                Err("could not confirm"),
+            ),
+            ("refused", vec![listed()], -25293, Err("-25293")),
+            (
+                "first look fails",
+                vec![locked()],
+                0,
+                Err("could not confirm"),
+            ),
+        ];
+        for (case, lookups, retry, expected) in cases {
+            let mut lookups = lookups.into_iter();
+            let outcome = legacy_recheck(
+                -25304,
+                || {
+                    lookups
+                        .next()
+                        .unwrap_or_else(|| panic!("{case}: looked too often"))
+                },
+                |_| retry,
+            );
+            match (outcome, expected) {
+                (Ok(got), Ok(want)) => assert_eq!(got, want, "{case}"),
+                (Err(error), Err(want)) => assert!(error.contains(want), "{case}: {error}"),
+                (got, want) => panic!("{case}: got {got:?}, expected {want:?}"),
+            }
+        }
     }
 
     #[test]
