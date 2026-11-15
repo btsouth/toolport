@@ -8488,7 +8488,9 @@ impl DownstreamServer {
                 .cloned()
                 .unwrap_or_default()
         } else {
-            serde_json::Map::new()
+            // Legacy extension negotiation stays initialize-scoped, except
+            // MCP Skills: its methods are plain requests, so keep only that id.
+            crate::mcp_skills::legacy_declaration(caps)
         };
 
         // Initialize and first-catalog work have separate bounds. Apply one
@@ -9116,6 +9118,18 @@ impl DownstreamServer {
         &self.caps_extensions
     }
 
+    /// Forward an MCP Skills request. See [`ServerDispatch::mcp_skills_request`].
+    pub fn mcp_skills_request(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+        mrtr: Option<&MrtrRequest>,
+    ) -> Result<Value, TransportError> {
+        ServerDispatch::mcp_skills_request(self, method, params, cancel, meta, mrtr)
+    }
+
     /// Forward a Tasks extension request on the same modern hop as the call
     /// that created it. The router has already translated the client-facing
     /// task id back to the server's native id.
@@ -9399,6 +9413,38 @@ pub trait ServerDispatch {
             mrtr,
             &[],
         )
+    }
+
+    /// Forward an MCP Skills request (`skills/list`, `skills/get`,
+    /// `resources/directory/read`, or a skill file `resources/read`) to a
+    /// server that declared the extension. Directory reads also need the
+    /// server's `directoryRead` setting, as the extension requires.
+    fn mcp_skills_request(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+        mrtr: Option<&MrtrRequest>,
+    ) -> Result<Value, TransportError> {
+        let settings = self.extensions().get(crate::mcp_skills::EXTENSION);
+        let allowed = match method {
+            "resources/directory/read" => {
+                settings.is_some_and(crate::mcp_skills::declares_directory_read)
+            }
+            "skills/list" | "skills/get" | "resources/read" => settings.is_some(),
+            _ => false,
+        };
+        if !allowed {
+            return Err(TransportError::Rpc(json!({
+                "code": -32601,
+                "message": format!(
+                    "server '{}' does not serve {method} for MCP Skills",
+                    self.server_id()
+                )
+            })));
+        }
+        self.request_with_mrtr(method, params, cancel, meta, mrtr, &[])
     }
 
     /// Forward a Tasks extension request on the same modern hop as the call

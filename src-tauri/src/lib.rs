@@ -40,6 +40,7 @@ pub mod launcher;
 #[cfg(all(target_os = "linux", feature = "gtk-desktop"))]
 pub mod linux_native;
 pub(crate) mod local_auth;
+pub mod mcp_skills;
 pub mod metrics;
 pub mod oauth;
 mod oauth_controller;

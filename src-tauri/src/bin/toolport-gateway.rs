@@ -70,6 +70,8 @@ static CODE_MODE_ALLOCATOR: worker::WorkerAllocator = worker::WorkerAllocator;
 
 #[path = "../gateway/gateway_memory.rs"]
 mod gateway_memory;
+#[path = "../gateway/mcp_skills_gateway.rs"]
+mod mcp_skills_gateway;
 #[path = "../gateway/search_cache.rs"]
 mod search_cache;
 #[path = "../gateway/search_query.rs"]
@@ -793,6 +795,7 @@ fn gateway_capabilities(
         // on the upstream hop. Remove the whole namespace, not only the one
         // extension known to this build, before adding Toolport's declaration.
         extensions.retain(|identifier, _| !identifier.starts_with("app.toolport/"));
+        mcp_skills_gateway::advertise(router, allowed, &mut extensions);
         // Toolport currently relays only the reserved MCP App HTML payload.
         // Advertise the intersection rather than copying downstream MIME types
         // that this gateway did not negotiate or validate.
@@ -8056,6 +8059,12 @@ fn handle_request_with_cancel(
                 "capabilities": gateway_capabilities(host, router, allowed, reg, mode),
                 "serverInfo": { "name": "toolport-gateway", "version": env!("CARGO_PKG_VERSION") },
             });
+            mcp_skills_gateway::advertise_on_initialize(
+                req,
+                router,
+                allowed,
+                &mut result["capabilities"],
+            );
             if let Some(text) = server_instructions(reg, profile, || {
                 discovery_instructions(
                     listed_discovery_mode(host, reg, router, cached, allowed, client, mode),
@@ -8699,6 +8708,7 @@ fn handle_request_with_cancel(
                         .unwrap_or(false)
                 });
             }
+            resources = mcp_skills_gateway::list_resources(router, allowed, resources);
             gtrace(&format!("resources/list -> {} resources", resources.len()));
             Some(success(
                 id,
@@ -8726,6 +8736,7 @@ fn handle_request_with_cancel(
                         .unwrap_or(false)
                 });
             }
+            templates = mcp_skills_gateway::list_resource_templates(router, allowed, templates);
             gtrace(&format!(
                 "resources/templates/list -> {} templates",
                 templates.len()
@@ -8744,6 +8755,20 @@ fn handle_request_with_cancel(
             ))
         }
         "resources/read" => {
+            if let Some(response) =
+                mcp_skills_gateway::read_skill_file(mcp_skills_gateway::SkillsRequest {
+                    id: id.clone(),
+                    req,
+                    reg,
+                    router,
+                    allowed,
+                    cancel: cancel.clone(),
+                    live_router,
+                    cache_scoped,
+                })
+            {
+                return Some(response);
+            }
             let params = req.get("params");
             let uri = params
                 .and_then(|p| p.get("uri"))
@@ -9100,6 +9125,21 @@ fn handle_request_with_cancel(
             Some(error(id, -32601, "ping is not part of 2026-07-28"))
         }
         "ping" => Some(success(id, json!({}))),
+        method @ ("skills/list" | "skills/get" | "resources/directory/read") => {
+            Some(mcp_skills_gateway::handle(
+                method,
+                mcp_skills_gateway::SkillsRequest {
+                    id,
+                    req,
+                    reg,
+                    router,
+                    allowed,
+                    cancel,
+                    live_router,
+                    cache_scoped,
+                },
+            ))
+        }
         other => Some(error(id, -32601, &format!("Method not found: {other}"))),
     }
 }
@@ -17117,7 +17157,10 @@ fn process_request_wire_inner(
         | "resources/unsubscribe"
         | "prompts/list"
         | "prompts/get"
-        | "completion/complete" => true,
+        | "completion/complete"
+        | "skills/list"
+        | "skills/get"
+        | "resources/directory/read" => true,
         _ => false,
     };
     if wait {
@@ -17133,7 +17176,11 @@ fn process_request_wire_inner(
 
     if matches!(
         method,
-        "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list"
+        "tools/list"
+            | "resources/list"
+            | "resources/templates/list"
+            | "prompts/list"
+            | "skills/list"
     ) {
         let live = state
             .router
@@ -17161,7 +17208,7 @@ fn process_request_wire_inner(
     // wait. Tools wait below, once we have the cache for this client's view.
     let catalog_list = matches!(
         method,
-        "resources/list" | "resources/templates/list" | "prompts/list"
+        "resources/list" | "resources/templates/list" | "prompts/list" | "skills/list"
     );
     let catalog_deadline = Instant::now() + FIRST_CATALOG_WAIT;
     if catalog_list {
@@ -22940,6 +22987,11 @@ mod tests {
 
     mod search_scale {
         include!("../gateway/search_eval_scale.rs");
+    }
+
+    mod mcp_skills_scope {
+        use super::*;
+        include!("../gateway/mcp_skills_tests.rs");
     }
 
     #[test]

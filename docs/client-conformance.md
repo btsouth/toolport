@@ -64,6 +64,44 @@ The fixture replay covers small structured results, oversized structured results
 and cursor retrieval through the real adapter and daemon. It does not claim
 acceptance by an authenticated Claude Code or other client application.
 
+## MCP Skills
+
+Toolport relays the MCP Skills extension (`io.modelcontextprotocol/skills`, beta).
+This is separate from the desktop Skills page, which inventories each client's
+own SKILL.md files.
+
+- Toolport advertises the extension when at least one server the client can see
+  declares it, with `directoryRead: true` when any of them does. Modern clients see
+  it in `server/discover`. Handshake clients (2025-11-25 and earlier) see it in the
+  `initialize` result when they sent `capabilities.extensions` themselves, which is
+  how those versions negotiate extensions. `skills/list`, `skills/get` and
+  `resources/directory/read` are answered on every version. Servers that declare it
+  over a handshake connection are relayed too.
+- Skill identity is the pair of server and URI. Every `skill://` URI from a
+  declaring server is exposed as `skill://<server>/<original authority and path>`
+  in skill entries, `resources/list`, `resources/templates/list`, directory reads and
+  read results. Characters outside `a-z`, `0-9` and `-` in the server id are written
+  as `_` plus two hex digits, so `My_Server` becomes `_4dy_5f_53erver`. The skill name
+  stays the last path segment, and relative links inside a skill resolve as before.
+- The server is decoded from the URI on every request and checked against the
+  client's profile and token scope before anything is sent. A URI naming a server
+  outside the scope is answered as not found.
+- An unprefixed `skill://` URI, such as an absolute link inside a skill file, works
+  when exactly one server in scope serves it. When several do, the error lists the
+  prefixed URIs in `error.data.candidates`. Toolport never picks one.
+- Skill files are delivered byte for byte, so the published `digest` and `size`
+  match. PII masking does not apply to them. A read is refused only when the file
+  forges Toolport's own voice (text like `[Toolport: ...`) or block mode would block
+  it as a high-confidence injection. The error names the server, the file and the
+  reason, and the refusal is recorded in the security log. Frontmatter strings other
+  than `name` are neutralized in listings, and entries carry
+  `_meta["app.toolport/provenance"]`.
+- `skills/list` merges every server into one unpaginated listing. A server that
+  fails is skipped, and a partial listing caps `ttlMs` at 5 seconds.
+- Limits: skill URIs under other schemes are not namespaced, so the same such URI
+  from two servers keeps the first server's entry. Resource subscriptions and
+  completions use the original URIs.
+
 ## Tool name budgets
 
 Client profiles in `clients.rs` declare combined name budgets. Cursor has a

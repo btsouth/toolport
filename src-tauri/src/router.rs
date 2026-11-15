@@ -3463,6 +3463,89 @@ impl Router {
             .cloned()
     }
 
+    /// MCP Skills: the selected servers that declare the extension, with their
+    /// settings, in server add order.
+    pub fn mcp_skills_servers(
+        &self,
+        include_server: impl Fn(&str) -> bool,
+    ) -> Vec<(String, Value)> {
+        self.servers
+            .iter()
+            .filter(|slot| include_server(&slot.id))
+            .filter_map(|slot| {
+                let server = slot
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                server
+                    .extensions()
+                    .get(crate::mcp_skills::EXTENSION)
+                    .map(|settings| (slot.id.clone(), settings.clone()))
+            })
+            .collect()
+    }
+
+    /// Whether `server_id` is one of this router's servers.
+    pub fn has_server(&self, server_id: &str) -> bool {
+        self.by_id.contains_key(server_id)
+    }
+
+    /// Every server id in this router, in server add order.
+    pub fn server_ids(&self) -> Vec<String> {
+        self.servers.iter().map(|slot| slot.id.clone()).collect()
+    }
+
+    /// One server's own `resources/list` rows, before the first-writer
+    /// collision rule merges them with other servers' rows.
+    pub fn server_resources(&self, server_id: &str) -> Vec<Value> {
+        let Some(&index) = self.by_id.get(server_id) else {
+            return Vec::new();
+        };
+        self.servers[index]
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resources
+            .clone()
+    }
+
+    /// One server's own `resources/templates/list` rows, before the
+    /// first-writer collision rule merges them with other servers' rows.
+    pub fn server_resource_templates(&self, server_id: &str) -> Vec<Value> {
+        let Some(&index) = self.by_id.get(server_id) else {
+            return Vec::new();
+        };
+        self.servers[index]
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resource_templates
+            .clone()
+    }
+
+    /// Forward one MCP Skills request to `server_id`, with the original
+    /// (un-namespaced) URI. The caller has already checked the server against
+    /// the request's scope. Read-only, so an ambiguous failure may replay.
+    pub fn mcp_skills_request(
+        &self,
+        server_id: &str,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+        mrtr: Option<&MrtrRequest>,
+    ) -> Result<Value, String> {
+        let slot = self.authorized_slot(server_id)?;
+        self.call_with_retry(
+            &slot,
+            cancel.as_ref(),
+            mrtr.is_some_and(|request| !request.is_empty()),
+            ReplayPolicy::ReadOnly,
+            SlotAccess::Shared,
+            |server| server.mcp_skills_request(method, params.clone(), cancel.clone(), meta, mrtr),
+        )
+    }
+
     /// Positive downstream TTLs schedule a refresh at their expiry. Zero/missing
     /// hints do not create a one-second polling loop; notifications still invalidate
     /// them immediately through the existing dirty-bit path.
