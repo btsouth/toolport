@@ -1062,7 +1062,8 @@ mod spill {
 
     struct State {
         dir: Option<PathBuf>,
-        cipher: XChaCha20Poly1305,
+        /// None when no key could be generated; spilling is then off.
+        cipher: Option<XChaCha20Poly1305>,
         entries: HashMap<String, Spilled>,
     }
 
@@ -1070,17 +1071,42 @@ mod spill {
         static S: OnceLock<Mutex<State>> = OnceLock::new();
         S.get_or_init(|| {
             let mut key = [0u8; 32];
-            let _ = getrandom::getrandom(&mut key);
-            let dir = spill_root().map(|root| {
+            let key = getrandom::getrandom(&mut key).ok().map(|()| key);
+            let state = State::new(spill_root(), key);
+            if state.cipher.is_none() {
+                report(KEY_FAILED_NOTE);
+            }
+            Mutex::new(state)
+        })
+    }
+
+    /// Shown in `toolport_status` and Activity when spilling is off for this run.
+    pub(super) const KEY_FAILED_NOTE: &str = "Paged results are kept in memory only: the \
+        gateway could not generate a key to seal them on disk.";
+
+    /// Record a spill problem in the gateway log and the status notes. Tests keep it
+    /// out of the gateway log, which lives in the real data dir.
+    fn report(note: &str) {
+        #[cfg(not(test))]
+        crate::gatewaylog::append(&format!("result spill: {note}"));
+        crate::daemon::add_status_note(note);
+    }
+
+    impl State {
+        /// The spill store under `root`, sealed with `key`. Stale directories under
+        /// `root` are removed first. Without a key nothing is ever written: a fixed
+        /// key would leave every file readable by anyone who knows it.
+        fn new(root: Option<PathBuf>, key: Option<[u8; 32]>) -> State {
+            let dir = root.map(|root| {
                 remove_stale(&root);
                 root.join(std::process::id().to_string())
             });
-            Mutex::new(State {
+            State {
                 dir,
-                cipher: XChaCha20Poly1305::new((&key).into()),
+                cipher: key.map(|key| XChaCha20Poly1305::new((&key).into())),
                 entries: HashMap::new(),
-            })
-        })
+            }
+        }
     }
 
     fn spill_root() -> Option<PathBuf> {
@@ -1148,69 +1174,76 @@ mod spill {
         // A discovery result stays in memory, where its visibility is checked on
         // every fetch and `forget_discovery` drops it; pushed out, it is dropped
         // and search makes a fresh one.
-        if stored.elapsed() >= CACHE_TTL || !entry.describes.is_empty() {
-            return false;
-        }
-        let plain = json!({ "body": entry.body, "structured": entry.structured }).to_string();
-        // Base64 of the sealed text is a third larger; check before sealing.
-        if plain.len() / 3 * 4 > max_spill_bytes() {
+        if !entry.describes.is_empty() {
             return false;
         }
         let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
-        let Some(dir) = state.dir.clone() else {
-            return false;
-        };
-        let mut nonce = [0u8; NONCE_LEN];
-        if getrandom::getrandom(&mut nonce).is_err() {
-            return false;
-        }
-        let Ok(sealed) = state
-            .cipher
-            .encrypt(XNonce::from_slice(&nonce), plain.as_bytes())
-        else {
-            return false;
-        };
-        let mut bytes = nonce.to_vec();
-        bytes.extend_from_slice(&sealed);
-        let text = base64::engine::general_purpose::STANDARD.encode(bytes);
-        if text.len() > max_spill_bytes() {
-            return false;
-        }
-        reap(&mut state);
-        while state.entries.values().map(|s| s.bytes).sum::<usize>() + text.len()
-            > max_spill_bytes()
-        {
-            let Some(oldest) = state
-                .entries
-                .iter()
-                .min_by_key(|(_, s)| s.stored)
-                .map(|(cursor, _)| cursor.clone())
-            else {
-                break;
-            };
-            if let Some(gone) = state.entries.remove(&oldest) {
-                let _ = std::fs::remove_file(gone.path);
+        state.keep(cursor, entry, stored)
+    }
+
+    impl State {
+        fn keep(&mut self, cursor: &str, entry: Cached, stored: Instant) -> bool {
+            let state = self;
+            if stored.elapsed() >= CACHE_TTL {
+                return false;
             }
+            let plain = json!({ "body": entry.body, "structured": entry.structured }).to_string();
+            // Base64 of the sealed text is a third larger; check before sealing.
+            if plain.len() / 3 * 4 > max_spill_bytes() {
+                return false;
+            }
+            let (Some(dir), Some(cipher)) = (state.dir.clone(), state.cipher.as_ref()) else {
+                return false;
+            };
+            let mut nonce = [0u8; NONCE_LEN];
+            if getrandom::getrandom(&mut nonce).is_err() {
+                return false;
+            }
+            let Ok(sealed) = cipher.encrypt(XNonce::from_slice(&nonce), plain.as_bytes()) else {
+                return false;
+            };
+            let mut bytes = nonce.to_vec();
+            bytes.extend_from_slice(&sealed);
+            let text = base64::engine::general_purpose::STANDARD.encode(bytes);
+            if text.len() > max_spill_bytes() {
+                return false;
+            }
+            reap(state);
+            while state.entries.values().map(|s| s.bytes).sum::<usize>() + text.len()
+                > max_spill_bytes()
+            {
+                let Some(oldest) = state
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, s)| s.stored)
+                    .map(|(cursor, _)| cursor.clone())
+                else {
+                    break;
+                };
+                if let Some(gone) = state.entries.remove(&oldest) {
+                    let _ = std::fs::remove_file(gone.path);
+                }
+            }
+            if create_private_dir(&dir).is_err() {
+                return false;
+            }
+            let path = dir.join(format!("{cursor}.sealed"));
+            if crate::registry::atomic_write(&path, &text).is_err() {
+                return false;
+            }
+            state.entries.insert(
+                cursor.to_string(),
+                Spilled {
+                    path,
+                    server: entry.server,
+                    owner: entry.owner,
+                    projections_unavailable: entry.projections_unavailable,
+                    bytes: text.len(),
+                    stored,
+                },
+            );
+            true
         }
-        if create_private_dir(&dir).is_err() {
-            return false;
-        }
-        let path = dir.join(format!("{cursor}.sealed"));
-        if crate::registry::atomic_write(&path, &text).is_err() {
-            return false;
-        }
-        state.entries.insert(
-            cursor.to_string(),
-            Spilled {
-                path,
-                server: entry.server,
-                owner: entry.owner,
-                projections_unavailable: entry.projections_unavailable,
-                bytes: text.len(),
-                stored,
-            },
-        );
-        true
     }
 
     fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
@@ -1243,6 +1276,7 @@ mod spill {
         let (nonce, sealed) = bytes.split_at(NONCE_LEN);
         let plain = state
             .cipher
+            .as_ref()?
             .decrypt(XNonce::from_slice(nonce), sealed)
             .ok()?;
         let value: Value = serde_json::from_slice(&plain).ok()?;
@@ -1280,6 +1314,55 @@ mod spill {
     pub(super) fn reap_expired() {
         let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
         reap(&mut state);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn entry(body: &str) -> Cached {
+            Cached {
+                server: None,
+                body: body.to_string(),
+                structured: None,
+                projections_unavailable: false,
+                size: 0,
+                owner: None,
+            }
+        }
+
+        /// A fresh spill root of this test's own, under the test spill root.
+        fn case_root(name: &str) -> PathBuf {
+            let root = spill_root().unwrap().join(name);
+            let _ = std::fs::remove_dir_all(&root);
+            root
+        }
+
+        fn files_under(root: &std::path::Path) -> usize {
+            std::fs::read_dir(root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|dir| std::fs::read_dir(dir.path()).map_or(0, |files| files.count()))
+                .sum()
+        }
+
+        #[test]
+        fn spilling_is_off_when_the_sealing_key_cannot_be_made() {
+            let root = case_root("no-key");
+            let mut state = State::new(Some(root.clone()), None);
+            assert!(!state.keep("r1", entry("secret body"), Instant::now()));
+            assert_eq!(
+                files_under(&root),
+                0,
+                "a spill was written under a zero key"
+            );
+            // The same store with a key does spill, so the test exercises the key.
+            let mut keyed = State::new(Some(root.clone()), Some([7; 32]));
+            assert!(keyed.keep("r1", entry("secret body"), Instant::now()));
+            assert_eq!(files_under(&root), 1);
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[cfg(test)]
