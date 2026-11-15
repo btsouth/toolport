@@ -1,5 +1,5 @@
 import { msg, Trans, translate, useI18n, type SourceMessage } from "@/lib/i18n";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import {
   ArrowRight,
   Check,
@@ -34,6 +34,7 @@ import {
   type Registry,
 } from "@/lib/types";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { ErrorCallout } from "@/components/ui/status-card";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
@@ -71,6 +72,10 @@ const DISCOVERY_HINT: Record<string, SourceMessage> = {
 
 export function ClientDetail({ client, registry, onChanged, onRegistryChange }: Props) {
   const { t } = useI18n();
+  const keptReasonId = useId();
+  const keptReason = t(
+    "T3 Code still uses this folder. Remove it from T3 Code's provider settings first.",
+  );
   const [busy, setBusy] = useState(false);
   // Snapshotted at dialog-open time so a registry-changed event mid-review can't
   // reshuffle `toImport` out from under the indices the user already confirmed.
@@ -496,6 +501,34 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           )}
         </div>
         <div className="flex max-w-full flex-wrap items-center gap-2">
+          {client.locationKeptByT3Code && !client.locationRemovable && (
+            <>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span
+                    // A disabled button gets no pointer or focus events, so the wrapper
+                    // shows why, to keyboard users too.
+                    // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
+                    tabIndex={0}
+                    className="inline-flex rounded-md focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+                  >
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled
+                      aria-describedby={keptReasonId}
+                    >
+                      {translate("Remove location")}
+                    </Button>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent className="max-w-64">{keptReason}</TooltipContent>
+              </Tooltip>
+              <span id={keptReasonId} className="sr-only">
+                {keptReason}
+              </span>
+            </>
+          )}
           {client.locationRemovable && (
             <ConfirmDialog
               trigger={

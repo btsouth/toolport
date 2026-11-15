@@ -492,6 +492,7 @@ mod tests {
             name: id.into(),
             uses_connectors: false,
             location_removable: false,
+            location_kept_by_t3_code: false,
             discovery: discovery::capabilities("claude-code"),
             config_path: config.to_string_lossy().into_owned(),
             config_exists: config.exists(),

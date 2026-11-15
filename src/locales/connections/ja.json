@@ -916,6 +916,7 @@
   "This client's rules file is up to date.": "このクライアントのルール ファイルは最新です。",
   "This deletes the server from Toolport on this machine. Any saved secrets stay in your keychain.": "これにより、このマシン上の Toolport からサーバーが削除されます。保存されたシークレットはすべて キーチェーン に残ります。",
   "This forgets the added location. Your client config and backups are kept. Auto-detected Claude folders still appear in Clients.": "これにより、追加された場所は忘れられます。クライアントの構成とバックアップは保持されます。自動検出された Claude フォルダーは引き続きクライアントに表示されます。",
+  "T3 Code still uses this folder. Remove it from T3 Code's provider settings first.": "T3 Code はまだこのフォルダーを使用しています。先に T3 Code のプロバイダー設定から削除してください。",
   "This isn't necessarily empty — Toolport couldn't check.": "これは必ずしも空であるとは限りません。Toolport はチェックできませんでした。",
   "This machine only": "このマシンのみ",
   "This older HTTP connection exposes its bearer credential in process arguments. Review migration to stdio below. Your existing connection is preserved until you confirm.": "この古い HTTP 接続は、プロセス引数でそのベアラー資格情報を公開します。以下の stdio への移行を確認してください。既存の接続は、確認するまで保持されます。",

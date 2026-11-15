@@ -251,6 +251,7 @@ fn a_key_in_the_settings_never_reaches_any_output() {
             name: row.name.clone(),
             uses_connectors: false,
             location_removable: false,
+            location_kept_by_t3_code: false,
             discovery: discovery::capabilities(&row.client_type),
             config_path: row.config_path.display().to_string(),
             config_exists: true,
@@ -1482,4 +1483,68 @@ fn a_t3_codex_home_gets_the_codex_settings_when_connected() {
     assert_eq!(entry["startup_timeout_sec"].as_integer(), Some(75));
     assert_eq!(entry["tool_timeout_sec"].as_integer(), Some(600));
     assert!(!home.join(".codex/config.toml").exists());
+}
+
+/// A saved T3 Code home is judged by the walk alone, before the older Codex checks
+/// (which follow a link higher up the path). A home whose folder exists but has no
+/// config yet is still T3 Code's and is kept; once its folder is gone, writes refuse
+/// it (nothing recreates the folder) and it can be forgotten. A home whose middle
+/// folder became a link is refused and kept, as T3 Code still lists it by its text.
+#[test]
+fn a_saved_t3_home_is_decided_by_the_walk_first() {
+    let _lock = crate::registry::data_dir_test_lock();
+    let root = std::env::temp_dir().join(format!(
+        "toolport-t3-walk-first-{}-{}",
+        std::process::id(),
+        epoch_millis()
+    ));
+    let home = root.join("home");
+    std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+    std::fs::create_dir_all(home.join(".codex2")).unwrap();
+    std::fs::create_dir_all(home.join("Work/.codex")).unwrap();
+    std::fs::write(home.join("Work/.codex/config.toml"), "").unwrap();
+    std::fs::write(
+        home.join(".t3/userdata/settings.json"),
+        r#"{"providerInstances": {
+            "two": {"driver": "codex", "displayName": "Two", "config": {"homePath": "~/.codex2"}},
+            "work": {"driver": "codex", "displayName": "Work", "config": {"homePath": "~/Work/.codex"}}
+        }}"#,
+    )
+    .unwrap();
+    let _data = crate::registry::DataDirOverride::set(root.join("data"));
+    let _home = TestHome::set(&home);
+    let rows = automatic(&[]);
+    let row = |folder: &str| {
+        rows.iter()
+            .find(|row| row.config_path.parent().unwrap().ends_with(folder))
+            .unwrap_or_else(|| panic!("{folder} is listed: {rows:?}"))
+            .clone()
+    };
+    let (two, work) = (row(".codex2"), row("Work/.codex"));
+    for row in [&two, &work] {
+        assert!(is_location_id(&row.id), "{}", row.id);
+        locations::remember(row).unwrap();
+    }
+    // No config yet, but the folder is plain and T3 Code lists it: usable and kept.
+    assert_eq!(locations::validate(&two), Ok(()));
+    assert!(!locations::forgettable(&two), "T3 Code still uses it");
+    assert!(locations::kept_by_t3_code(&two), "Remove location says why");
+    // Its folder removed: refused, so no write recreates it, and it can be forgotten.
+    std::fs::remove_dir_all(home.join(".codex2")).unwrap();
+    assert!(locations::validate(&two).is_err());
+    assert!(locations::forgettable(&two));
+    assert!(!locations::kept_by_t3_code(&two));
+    #[cfg(unix)]
+    {
+        // The middle folder becomes a link to a folder with a Codex home of its own.
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join(".codex")).unwrap();
+        std::fs::remove_dir_all(home.join("Work")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.join("Work")).unwrap();
+        let real = std::fs::canonicalize(&home).unwrap();
+        assert_eq!(walk_below_home(&work.config_path, &real), HomeWalk::Link);
+        assert!(locations::validate(&work).is_err());
+        assert!(!locations::forgettable(&work), "T3 Code still lists it");
+    }
+    let _ = std::fs::remove_dir_all(&root);
 }

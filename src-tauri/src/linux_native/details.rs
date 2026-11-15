@@ -476,9 +476,11 @@ pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
         });
         actions.append(&disconnect);
     }
-    if client.location_removable {
+    if client_rows::shows_remove_location(client) {
         let remove = client_rows::remove_location_button(client, page.clone());
-        remove.set_sensitive(!client.config_error && !connected && !customized);
+        remove.set_sensitive(
+            !client.config_error && !connected && !customized && !client.location_kept_by_t3_code,
+        );
         actions.append(&remove);
     }
     body.append(&page_header::HeaderWrap::new(&info, &actions));
@@ -1123,6 +1125,7 @@ mod tests {
             inherited_discovery: None,
             config_error: false,
             location_removable: true,
+            location_kept_by_t3_code: false,
             claude_profile: None,
             t3_code: Vec::new(),
         }
@@ -1153,6 +1156,56 @@ mod tests {
         app.register(gtk::gio::Cancellable::NONE).unwrap();
         app
     }
+    /// A T3 Code home T3 Code still lists shows Remove location disabled with why, in its
+    /// row and in its details, instead of hiding it or failing after a click.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn a_t3_home_t3_code_still_lists_shows_remove_location_disabled_with_why() {
+        let _data = crate::registry::DataDirTestEnv::new("t3-kept-remove");
+        let app = app();
+        let (_, servers, _) = build_content(&app, crate::approval_broker::start_native());
+        let page = ClientPage::new(&app, servers);
+        let window = adw::ApplicationWindow::builder()
+            .application(&app)
+            .content(&page.root)
+            .default_width(1024)
+            .default_height(700)
+            .build();
+        let mut kept = fixture_client("codex@t3-0123456789abcdef");
+        kept.location_removable = false;
+        kept.location_kept_by_t3_code = true;
+        page.render(snapshot(vec![kept]));
+        window.present();
+        let reason = crate::i18n::tr(
+            "T3 Code still uses this folder. Remove it from T3 Code's provider settings first.",
+        );
+        let removes = |root: &gtk::Widget| -> Vec<gtk::Button> {
+            widgets(root)
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Button>().ok())
+                .filter(|b| b.icon_name().as_deref() == Some("user-trash-symbolic"))
+                .collect()
+        };
+        let row = removes(page.root.upcast_ref());
+        assert_eq!(row.len(), 1, "the row shows Remove location");
+        assert!(!row[0].is_sensitive());
+        assert_eq!(row[0].tooltip_text().as_deref(), Some(reason.as_str()));
+        let open = find_named(
+            page.root.upcast_ref(),
+            "detail-open:codex@t3-0123456789abcdef",
+        )
+        .unwrap()
+        .downcast::<gtk::Button>()
+        .unwrap();
+        open.emit_clicked();
+        let active = page.details.stack.child_by_name("detail").unwrap();
+        let detail = removes(&active);
+        assert_eq!(detail.len(), 1, "the details show Remove location");
+        assert!(!detail[0].is_sensitive());
+        assert_eq!(detail[0].tooltip_text().as_deref(), Some(reason.as_str()));
+        window.close();
+    }
+
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn b5_clients_keep_exact_instance_refresh_and_safe_error_states() {
@@ -2084,6 +2137,7 @@ mod tests {
                 config_exists: selected.config_exists,
                 uses_connectors: false,
                 location_removable: false,
+                location_kept_by_t3_code: false,
                 discovery: crate::clients::discovery_capabilities(id),
                 servers: vec![crate::clients::McpServer {
                     name: "Local notes".into(),

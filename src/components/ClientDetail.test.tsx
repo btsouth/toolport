@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import userEvent from "@testing-library/user-event";
 import { ClientDetail } from "./ClientDetail";
 import {
@@ -752,6 +753,32 @@ it("requires disconnect before forgetting a connected location", () => {
     />,
   );
   expect(screen.getByRole("button", { name: "Remove location" })).toBeDisabled();
+});
+
+it("shows Remove location disabled with why while T3 Code still uses the folder", async () => {
+  const user = userEvent.setup();
+  const reason =
+    "T3 Code still uses this folder. Remove it from T3 Code's provider settings first.";
+  render(
+    <TooltipProvider>
+      <ClientDetail
+        client={client({ id: "codex@t3-0123456789abcdef", locationKeptByT3Code: true })}
+        registry={emptyRegistry()}
+        onChanged={vi.fn()}
+        onRegistryChange={vi.fn()}
+      />
+    </TooltipProvider>,
+  );
+  const remove = screen.getByRole("button", { name: "Remove location" });
+  expect(remove).toBeDisabled();
+  expect(remove).toHaveAccessibleDescription(reason);
+  // Keyboard focus on the wrapper shows why.
+  act(() => remove.parentElement!.focus());
+  expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
+  // Clicking does nothing: no confirmation, no error.
+  await user.click(remove);
+  expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
 
 it("shows disconnect and restart feedback once inline without a duplicate toast", async () => {

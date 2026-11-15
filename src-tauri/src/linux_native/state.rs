@@ -449,6 +449,8 @@ pub(super) struct ClientView {
     pub(super) inherited_discovery: Option<String>,
     pub(super) config_error: bool,
     pub(super) location_removable: bool,
+    /// See [`crate::clients::DetectedClient::location_kept_by_t3_code`].
+    pub(super) location_kept_by_t3_code: bool,
     /// Set when several Claude Code profiles are listed, to tell them apart.
     pub(super) claude_profile: Option<crate::clients::ClaudeProfile>,
     /// The T3 Code provider instances that use this config. Empty without T3 Code.
@@ -493,6 +495,7 @@ impl ClientView {
             inherited_discovery: None,
             config_error: client.error.is_some(),
             location_removable: client.location_removable,
+            location_kept_by_t3_code: client.location_kept_by_t3_code,
             claude_profile: client.claude_profile,
             t3_code: client.t3_code,
         }
@@ -1279,6 +1282,7 @@ mod tests {
             name: "Codex".into(),
             uses_connectors: false,
             location_removable: false,
+            location_kept_by_t3_code: false,
             discovery: crate::clients::discovery_capabilities("codex"),
             config_path: "/private/config.toml".into(),
             config_exists: true,
