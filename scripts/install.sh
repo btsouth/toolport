@@ -95,9 +95,23 @@ rpm_supported() {
   local distro version
   distro="$(os_value ID)"; version="$(os_value VERSION_ID)"
   case "$distro" in
-    fedora) version_at_least "$version" 40 ;;
-    *) return 1 ;;
+    fedora) version_at_least "$version" 40; return ;;
   esac
+  # Other dnf distros must expose the Fedora RPM's actual dependency names and
+  # ABI floors. Installed libraries or cached metadata are read-only evidence;
+  # never refresh repositories just to print an installation plan.
+  local package floor candidate
+  for package in gtk4 libadwaita glib2 glibc; do
+    case "$package" in
+      gtk4) floor=4.14 ;; libadwaita) floor=1.5 ;;
+      glib2) floor=2.80 ;; glibc) floor=2.39 ;;
+    esac
+    if command -v rpm >/dev/null 2>&1 && rpm -q --whatprovides "$package >= $floor" >/dev/null 2>&1; then
+      continue
+    fi
+    candidate="$(dnf -q --cacheonly repoquery --latest-limit=1 --qf '%{version}' "$package" 2>/dev/null | sort -V | tail -n1)" || return 1
+    version_at_least "$candidate" "$floor" || return 1
+  done
 }
 
 linux_plan() {

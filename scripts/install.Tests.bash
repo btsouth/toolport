@@ -475,6 +475,23 @@ result="$(PATH="$rpm_dir/shim:$PATH" HOME="$rpm_dir/home" TOOLPORT_OS_RELEASE="$
 check "RPM checksum verified" "sha256 verified: $fake_sha256" "$result"
 if grep -q 'install -y .*toolport.rpm' "$rpm_dir/dnf.log"; then pass=$((pass+1)); else fail=$((fail+1)); fi
 
+# A compatible derivative uses cached metadata without a network refresh.
+printf 'ID=example\nID_LIKE=rhel\nVERSION_ID=10\n' > "$rpm_dir/os-release"
+printf '#!/bin/sh\nexit 1\n' > "$rpm_dir/shim/rpm"
+cat > "$rpm_dir/shim/dnf" <<'RPMQUERY'
+#!/bin/sh
+case "$*" in
+  *--cacheonly*repoquery*gtk4) echo 4.14.5 ;;
+  *--cacheonly*repoquery*libadwaita) echo 1.5.0 ;;
+  *--cacheonly*repoquery*glib2) echo 2.80.0 ;;
+  *--cacheonly*repoquery*glibc) echo 2.39 ;;
+  *) exit 99 ;;
+esac
+RPMQUERY
+chmod +x "$rpm_dir/shim/rpm" "$rpm_dir/shim/dnf"
+result="$(PATH="$rpm_dir/shim:$PATH" TOOLPORT_OS_RELEASE="$rpm_dir/os-release" bash "$INSTALL_SH" --print-plan)"
+check "compatible RPM derivative uses cached ABI evidence" "package=rpm" "$result"
+
 # Cleanup is offline and honors the same XDG paths as installation.
 mkdir -p "$rpm_dir/home/.local/bin" "$rpm_dir/home/.local/share/applications" "$rpm_dir/home/.config/autostart" "$rpm_dir/home/.config/Toolport"
 touch "$rpm_dir/home/.local/bin/toolport" "$rpm_dir/home/.local/share/applications/toolport.desktop" "$rpm_dir/home/.config/autostart/Toolport.desktop" "$rpm_dir/home/.config/Toolport/http-bridge-update-resume.json"

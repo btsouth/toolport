@@ -23,7 +23,9 @@ established, the installer chooses AppImage. Current Arch and its derivatives
 keep the signed pacman repository route.
 
 On Fedora 40+ the installer verifies the release RPM checksum and installs it
-with dnf. Older Fedora and RHEL use AppImage. The RPM requires GTK 4.14+,
+with dnf. Other dnf distributions use RPM when installed libraries or cached
+repository metadata establish all four dependency floors; otherwise they use
+AppImage. Older Fedora and RHEL 9 use AppImage. The RPM requires GTK 4.14+,
 libadwaita 1.5+, GLib 2.80+ and glibc 2.39+. openSUSE uses different dependency
 names (including libadwaita and D-Bus), so the current Fedora RPM is not selected
 there; openSUSE keeps the portable AppImage.
