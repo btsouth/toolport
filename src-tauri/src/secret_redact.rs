@@ -2708,6 +2708,63 @@ pub fn redact_outgoing(value: &mut Value, request: Option<&Value>) -> bool {
     m.value_with(value, false, request)
 }
 
+/// [`redact_outgoing`], returning how many times each secret was replaced
+/// (names only, never values). Markers already in `value` are not counted.
+pub fn redact_outgoing_counted(
+    value: &mut Value,
+    request: Option<&Value>,
+) -> std::collections::BTreeMap<String, usize> {
+    if current().is_none() {
+        return Default::default();
+    }
+    let before = marker_counts(value);
+    if !redact_outgoing(value, request) {
+        return Default::default();
+    }
+    let mut after = marker_counts(value);
+    for (name, n) in before {
+        if let Some(count) = after.get_mut(&name) {
+            *count = count.saturating_sub(n);
+        }
+    }
+    after.retain(|_, n| *n > 0);
+    after
+}
+
+/// Per secret name, the `[secret:...]` markers in the strings and keys of
+/// `value` (a marker naming two secrets counts for each; an alias suffix is
+/// not part of the name).
+fn marker_counts(value: &Value) -> std::collections::BTreeMap<String, usize> {
+    fn text(t: &str, out: &mut std::collections::BTreeMap<String, usize>) {
+        let mut rest = t;
+        while let Some(at) = rest.find("[secret:") {
+            let body = &rest[at + "[secret:".len()..];
+            let Some(end) = body.find(']') else { break };
+            for name in body[..end].split(',') {
+                let name = name.split('~').next().unwrap_or(name);
+                if !name.is_empty() {
+                    *out.entry(name.to_string()).or_default() += 1;
+                }
+            }
+            rest = &body[end + 1..];
+        }
+    }
+    fn walk(v: &Value, out: &mut std::collections::BTreeMap<String, usize>) {
+        match v {
+            Value::String(s) => text(s, out),
+            Value::Array(items) => items.iter().for_each(|i| walk(i, out)),
+            Value::Object(map) => map.iter().for_each(|(k, v)| {
+                text(k, out);
+                walk(v, out);
+            }),
+            _ => {}
+        }
+    }
+    let mut out = Default::default();
+    walk(value, &mut out);
+    out
+}
+
 /// [`redact_outgoing`] for a serialized message with no client request behind
 /// it. Unchanged (and unparsed) unless it may hold a registered form.
 pub fn redact_outgoing_json(json: String) -> String {
@@ -3934,6 +3991,33 @@ mod tests {
             !line.contains("ACCOUNT") && !line.contains("4821"),
             "{line}"
         );
+    }
+
+    #[test]
+    fn outgoing_redaction_counts_each_secret_it_replaced_by_name() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-counted-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        register("count-server", "API_KEY", "sk-CountedSecret321");
+        register("count-server", "DB_PASS", "hunter2-Counted-pass");
+        let mut result = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "key sk-CountedSecret321 and again sk-CountedSecret321"},
+                {"type": "text", "text": "db hunter2-Counted-pass; old [secret:OTHER] stays"}
+            ]
+        });
+        let counts = redact_outgoing_counted(&mut result, None);
+        assert_eq!(
+            counts,
+            [("API_KEY".to_string(), 2), ("DB_PASS".to_string(), 1)]
+                .into_iter()
+                .collect()
+        );
+        assert!(!result.to_string().contains("Counted"));
+        // The client's own value echoed back is neither replaced nor counted.
+        let mut echo = serde_json::json!({"text": "you sent sk-CountedSecret321"});
+        let request = serde_json::json!({"arguments": {"key": "sk-CountedSecret321"}});
+        assert!(redact_outgoing_counted(&mut echo, Some(&request)).is_empty());
     }
 
     #[test]

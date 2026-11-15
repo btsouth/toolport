@@ -5583,6 +5583,7 @@ fn execute_call(
                         active_client_label().as_deref(),
                         None,
                         None,
+                        None,
                     );
                     return json!({
                         "content": [{ "type": "text", "text": msg }],
@@ -5921,6 +5922,9 @@ fn execute_call(
     };
     // Hash args for the audit line (and SOU-171 org export) without storing them.
     let call_args_hash = audit::args_hash(&arguments);
+    // The client's own arguments, for the outgoing redaction's exemption: a
+    // secret the client sent may be echoed back to it.
+    let client_arguments = arguments.clone();
     if let Some(profiler) = &mut call_profiler {
         profiler.mark_preflight();
     }
@@ -6020,8 +6024,11 @@ fn execute_call(
             // hostile server can't bypass the injection scanner by answering with an
             // error instead of a result (issue #421). A server's own result, failed or
             // not, gets no Toolport text appended: clients parse these blocks.
-            let Defended { result: out, pii } =
-                defend_and_shape(reg, srv, tool, client, result, "", shape);
+            let Defended {
+                result: mut out,
+                pii,
+            } = defend_and_shape(reg, srv, tool, client, result, "", shape);
+            let secrets = secrets_replaced_in(&mut out, &client_arguments, opts.direct);
             if let Some(profiler) = &mut call_profiler {
                 profiler.mark_postprocess();
             }
@@ -6044,6 +6051,7 @@ fn execute_call(
                 active_client_label().as_deref(),
                 Some(&call_args_hash),
                 pii,
+                Some(&secrets),
             );
             if let Some(profiler) = call_profiler {
                 profiler.finish();
@@ -6073,8 +6081,11 @@ fn execute_call(
             // Defend first, then audit: the error text runs through the same PII pass as
             // a successful result, and the audit row has to carry that pass's count like
             // the success path does (SBS-607).
-            let Defended { result: out, pii } =
-                defend_and_shape(reg, srv, tool, client, result, &trailer, shape);
+            let Defended {
+                result: mut out,
+                pii,
+            } = defend_and_shape(reg, srv, tool, client, result, &trailer, shape);
+            let secrets = secrets_replaced_in(&mut out, &client_arguments, opts.direct);
             let defended_err = audited_error_text(&e, &out);
             audit::record_routed_call(
                 reg,
@@ -6088,9 +6099,28 @@ fn execute_call(
                 active_client_label().as_deref(),
                 Some(&call_args_hash),
                 pii,
+                Some(&secrets),
             );
             out
         }
+    }
+}
+
+/// The configured secrets a call's result carries, by name and count, for its
+/// audit row. A direct call's result is redacted here, as the final pass to the
+/// client would redact it; a code-mode step's result goes to the script as it
+/// is (the script may pass a value on), so a copy is counted instead.
+fn secrets_replaced_in(
+    out: &mut Value,
+    client_arguments: &Value,
+    direct: bool,
+) -> std::collections::BTreeMap<String, usize> {
+    let request = json!({ "arguments": client_arguments });
+    if direct {
+        conduit_lib::secret_redact::redact_outgoing_counted(out, Some(&request))
+    } else {
+        let mut copy = out.clone();
+        conduit_lib::secret_redact::redact_outgoing_counted(&mut copy, Some(&request))
     }
 }
 
