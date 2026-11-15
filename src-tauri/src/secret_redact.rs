@@ -1920,7 +1920,7 @@ impl Matcher {
                     b != a + 1
                 });
                 if apart {
-                    self.json_stream_edits(body, &ranges, &members, false, true, &mut edits);
+                    self.json_stream_edits(body, ranges, &members, false, true, &mut edits);
                 }
             }
         }
@@ -6192,7 +6192,10 @@ mod tests {
         assert_eq!(v["a"], "code [secret:PIN]");
         assert_eq!(v["b"], "next");
         let line = r#"{"a":"code ab12","b":"next"}"#;
-        assert_eq!(m.redact_line(line), r#"{"a":"code [secret:PIN]","b":"next"}"#);
+        assert_eq!(
+            m.redact_line(line),
+            r#"{"a":"code [secret:PIN]","b":"next"}"#
+        );
         // Inside a word it is still not one.
         assert_eq!(m.redact_text("xab12y"), "xab12y");
     }
