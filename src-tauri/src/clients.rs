@@ -4862,6 +4862,18 @@ fn read_client(def: &ClientDef) -> DetectedClient {
 
     let path = match resolved_definition_path(def) {
         Ok(path) => path,
+        Err(_)
+            if def
+                .location
+                .as_ref()
+                .is_some_and(locations::t3_home_folder_is_gone) =>
+        {
+            let path = def.location.as_ref().map(|row| &row.config_path);
+            let config_path = path
+                .map(|path| locations::display_path(path).display().to_string())
+                .unwrap_or_default();
+            return build(config_path, false, Vec::new(), None);
+        }
         Err(error) => {
             let fallback = def
                 .location
@@ -4955,7 +4967,7 @@ pub fn detect_client(client_id: &str) -> Option<DetectedClient> {
     if let Some(row) = &def.location {
         // The same rules as the page's scan: a valid location, and never a second way
         // to manage a file a main client row already owns.
-        if locations::validate(row).is_err() {
+        if locations::validate(row).is_err() && !locations::t3_home_folder_is_gone(row) {
             return None;
         }
         let id = row.id.clone();

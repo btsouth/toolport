@@ -103,6 +103,17 @@ pub(super) fn is_t3_home(row: &ClientLocation) -> bool {
     !row.manual && super::t3code::is_location_id(&row.id)
 }
 
+/// A saved T3 Code home whose folder no longer exists, after T3 Code or the instance was
+/// removed. It reads as not installed rather than as an error. Writes still fail
+/// [`validate`], so nothing recreates the folder.
+pub(super) fn t3_home_folder_is_gone(row: &ClientLocation) -> bool {
+    is_t3_home(row)
+        && row.config_path.parent().is_some_and(|folder| {
+            std::fs::symlink_metadata(folder)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        })
+}
+
 /// A saved T3 Code home that T3 Code no longer lists. It stays listed so it can be
 /// disconnected, then forgotten.
 fn t3_home_is_gone(row: &ClientLocation) -> bool {

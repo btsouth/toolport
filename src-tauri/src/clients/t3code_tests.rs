@@ -664,6 +664,39 @@ fn an_unsaved_t3_home_can_be_previewed_and_connected() {
 }
 
 #[test]
+fn a_saved_t3_home_whose_folder_is_gone_reads_as_not_installed() {
+    // Removing T3 Code, or one instance's home, must not turn its saved row into a
+    // config error: it reads like a Claude profile folder that was deleted.
+    let _lock = crate::registry::data_dir_test_lock();
+    let root = std::env::temp_dir().join(format!(
+        "toolport-t3-gone-{}-{}",
+        std::process::id(),
+        epoch_millis()
+    ));
+    let home = root.join("home");
+    std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+    std::fs::create_dir_all(home.join(".t3/commandcode/claude")).unwrap();
+    std::fs::write(
+        home.join(".t3/userdata/settings.json"),
+        r#"{"providerInstances": {"cc": {"driver": "claudeAgent", "displayName": "CC",
+            "config": {"homePath": "~/.t3/commandcode/claude"}}}}"#,
+    )
+    .unwrap();
+    let _data = crate::registry::DataDirOverride::set(root.join("data"));
+    let _home = TestHome::set(&home);
+    let row = automatic(&[]).pop().expect("the T3 Code home is listed");
+    locations::remember(&row).unwrap();
+    std::fs::remove_dir_all(home.join(".t3")).unwrap();
+    let client = detect_client(&row.id).expect("a saved home is still listed");
+    assert_eq!(client.error, None);
+    assert!(!client.app_present && !client.config_exists);
+    assert!(client.location_removable, "it can be forgotten");
+    // Nothing recreates the folder: writes still need a safe, existing folder.
+    assert!(locations::validate_mutation(&row.id, &row.config_path).is_err());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn hostile_settings_cannot_reach_outside_home_or_t3_codes_folder() {
     let root = std::env::temp_dir().join(format!(
         "toolport-t3-hostile-{}-{}",
