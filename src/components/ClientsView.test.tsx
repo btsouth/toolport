@@ -1,13 +1,14 @@
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { DetectedClient, McpServer } from "@/lib/types";
+import type { DetectedClient, McpServer, T3CodeOther } from "@/lib/types";
 import { useRef, useState } from "react";
 import { ClientsView, type T3CodeSeen } from "./ClientsView";
 import {
   getClientSessions,
   listClientRecoveries,
   refreshClientRecoveryStatus,
+  t3CodeOtherInstances,
   t3CodeRevision,
 } from "@/lib/api";
 vi.mock("@/lib/api", () => ({
@@ -17,6 +18,7 @@ vi.mock("@/lib/api", () => ({
   dismissClientRecovery: vi.fn(),
   discardClientRecovery: vi.fn(),
   refreshClientRecoveryStatus: vi.fn().mockResolvedValue(undefined),
+  t3CodeOtherInstances: vi.fn(),
   t3CodeRevision: vi.fn(),
 }));
 // Whether the window is on screen and focused, as `useWindowVisible` reports it.
@@ -42,6 +44,7 @@ beforeEach(() => {
   visibility.value = true;
   vi.mocked(getClientSessions).mockResolvedValue([]);
   vi.mocked(t3CodeRevision).mockResolvedValue(null);
+  vi.mocked(t3CodeOtherInstances).mockResolvedValue([]);
 });
 afterEach(() => {
   vi.useRealTimers();
@@ -789,6 +792,202 @@ describe("ClientsView", () => {
       act(() => screen.getByText("toggle").click());
       await act(() => vi.advanceTimersByTimeAsync(0));
       expect(onChanged).toHaveBeenCalledTimes(1);
+    });
+
+    const card = () => screen.getByText("T3 Code").closest("[data-slot=status-card]");
+    const other = (
+      instanceId: string,
+      providerName: string,
+      displayName: string,
+      gap: T3CodeOther["gap"],
+      enabled = true,
+    ): T3CodeOther => ({ instanceId, providerName, displayName, enabled, gap });
+
+    it("lists instances Toolport cannot connect, with why, and reads them again on change", async () => {
+      vi.useFakeTimers();
+      vi.mocked(t3CodeRevision).mockResolvedValueOnce("a").mockResolvedValue("b");
+      vi.mocked(t3CodeOtherInstances)
+        .mockResolvedValueOnce([
+          other("muse", "Muse Code", "Muse Code", "unsupported"),
+          other("fx", "fx", "My fx", "unsupported", false),
+          other("antigravity", "Antigravity", "Antigravity", "privateHome"),
+        ])
+        .mockResolvedValue([]);
+      render(
+        <ClientsView
+          clients={[client()]}
+          registry={null}
+          onSelectClient={vi.fn()}
+          onChanged={vi.fn(async () => {})}
+        />,
+      );
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      // Only instances Toolport cannot connect: the card shows, without a status line.
+      expect(screen.getByRole("group", { name: "T3 Code" })).toBeVisible();
+      expect(card()).toHaveTextContent(
+        "Not supported by Toolport yet: Muse Code, My fx (fx) (off).",
+      );
+      expect(card()).toHaveTextContent(
+        "Toolport can't connect Antigravity yet: T3 Code gives it a private settings folder.",
+      );
+      expect(card()).not.toHaveTextContent(/not connected|is connected/);
+      expect(within(card() as HTMLElement).queryByRole("button")).not.toBeInTheDocument();
+      await act(() => vi.advanceTimersByTimeAsync(5_000));
+      expect(t3CodeOtherInstances).toHaveBeenCalledTimes(2);
+      expect(screen.queryByText(/T3 Code/)).not.toBeInTheDocument();
+    });
+
+    it("reads the instances again after a scan, and not without T3 Code", async () => {
+      vi.useFakeTimers();
+      vi.mocked(t3CodeRevision).mockResolvedValue("a");
+      vi.mocked(t3CodeOtherInstances)
+        .mockResolvedValueOnce([other("w", "Claude", "Work", "missingHome")])
+        .mockResolvedValue([]);
+      const { rerender } = render(
+        <ClientsView clients={[client()]} registry={null} onSelectClient={vi.fn()} />,
+      );
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(card()).toHaveTextContent(
+        "Toolport can't connect Work (Claude) yet: its home folder doesn't exist yet. Start it once in T3 Code, then refresh Clients.",
+      );
+      // A scan (a new client list) reads them again: the folder may exist now.
+      rerender(
+        <ClientsView clients={[client()]} registry={null} onSelectClient={vi.fn()} />,
+      );
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(t3CodeOtherInstances).toHaveBeenCalledTimes(2);
+      expect(screen.queryByText(/T3 Code/)).not.toBeInTheDocument();
+    });
+
+    it("says to add an OpenCode, Grok or Pi home no row covers by hand", async () => {
+      vi.useFakeTimers();
+      vi.mocked(t3CodeRevision).mockResolvedValue("a");
+      vi.mocked(t3CodeOtherInstances).mockResolvedValue([
+        other("notes", "OpenCode", "Notes", "unlistedHome"),
+      ]);
+      render(
+        <ClientsView clients={[client()]} registry={null} onSelectClient={vi.fn()} />,
+      );
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(card()).toHaveTextContent(
+        "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once Notes (OpenCode)'s home folder exists, add it by hand as a client location to connect it.",
+      );
+    });
+
+    it("counts enabled instances on rows that still need connecting", () => {
+      const { rerender } = render(
+        <ClientsView
+          clients={[client({ t3Code: [on("Work")] })]}
+          registry={null}
+          onSelectClient={vi.fn()}
+        />,
+      );
+      expect(card()).toHaveTextContent(
+        "T3 Code runs these clients as providers. Each reads its own MCP config, so Toolport connects to them, not to T3 Code.",
+      );
+      expect(card()).toHaveTextContent("1 enabled T3 Code instance is not connected.");
+
+      rerender(
+        <ClientsView
+          clients={[client({ t3Code: [on("Work"), on("Home"), off("Old")] })]}
+          registry={null}
+          onSelectClient={vi.fn()}
+        />,
+      );
+      expect(card()).toHaveTextContent("2 enabled T3 Code instances are not connected.");
+
+      rerender(
+        <ClientsView
+          clients={[
+            client({
+              gatewayInstalled: true,
+              entryState: "managed",
+              t3Code: [on("Work")],
+            }),
+            client({ id: "codex", name: "Codex", t3Code: [off("Home")] }),
+          ]}
+          registry={null}
+          onSelectClient={vi.fn()}
+        />,
+      );
+      expect(card()).toHaveTextContent("Every enabled T3 Code instance is connected.");
+    });
+
+    it("leaves out connected, customized, unreadable and absent rows", () => {
+      render(
+        <ClientsView
+          clients={[
+            client({
+              id: "a",
+              name: "A",
+              gatewayInstalled: true,
+              entryState: "managed",
+              t3Code: [on("A")],
+            }),
+            client({ id: "b", name: "B", entryState: "customized", t3Code: [on("B")] }),
+            client({ id: "c", name: "C", error: "bad json", t3Code: [on("C")] }),
+            client({ id: "d", name: "D", appPresent: false, t3Code: [on("D")] }),
+            client({ id: "e", name: "E", t3Code: [off("E")] }),
+          ]}
+          registry={null}
+          onSelectClient={vi.fn()}
+        />,
+      );
+      // B, C and D are not connected, so the card does not say everything is; it names
+      // each with why and what to do.
+      expect(card()).not.toHaveTextContent(
+        "Every enabled T3 Code instance is connected.",
+      );
+      expect(card()).toHaveTextContent("3 enabled T3 Code instances are not connected.");
+      const lines = within(card() as HTMLElement)
+        .getAllByText(/^(B|C|D) uses/)
+        .map((line) => line.textContent);
+      expect(lines).toEqual([
+        "B uses B, whose Toolport entry was changed by hand. Open B below and reset its Toolport entry.",
+        "C uses C, but Toolport can't read its config. Open C below to see why, then connect it.",
+        "D uses D, which isn't installed. Install D, then connect it.",
+      ]);
+    });
+
+    it("counts instances Toolport can't use and says why for each", async () => {
+      vi.useFakeTimers();
+      vi.mocked(t3CodeRevision).mockResolvedValue("a");
+      vi.mocked(t3CodeOtherInstances).mockResolvedValue([
+        other("pi_hidden", "Pi", "Pi Hidden", "hiddenHome"),
+        other("text_entry", "", "text_entry", "malformed"),
+        other("away", "Codex", "Away", "outsideHome"),
+        other("linked", "Claude", "Linked", "linkedHome", false),
+      ]);
+      render(
+        <ClientsView
+          clients={[
+            client({
+              id: "a",
+              name: "A",
+              gatewayInstalled: true,
+              entryState: "managed",
+              t3Code: [on("A")],
+            }),
+          ]}
+          registry={null}
+          onSelectClient={vi.fn()}
+        />,
+      );
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      // The off one is listed but not counted.
+      expect(card()).toHaveTextContent("3 enabled T3 Code instances are not connected.");
+      expect(card()).toHaveTextContent(
+        "Toolport can't read text_entry in T3 Code's settings. Fix this instance in T3 Code's settings.",
+      );
+      expect(card()).toHaveTextContent(
+        "Toolport can't see which home folder Pi Hidden (Pi) uses: it is marked sensitive or isn't plain text. Set its home folder as plain text in T3 Code's provider settings.",
+      );
+      expect(card()).toHaveTextContent(
+        "Toolport won't use the home folder Away (Codex) uses: it isn't inside your home folder. Toolport only manages configs inside it; add it by hand as a client location if you trust it.",
+      );
+      expect(card()).toHaveTextContent(
+        "Toolport won't use the home folder Linked (Claude) (off) uses: it, or its config file, is a link or not a plain folder or file.",
+      );
     });
   });
 });

@@ -1206,6 +1206,7 @@ mod tests {
             ],
             sessions: vec![],
             sessions_error: false,
+            t3_others: Vec::new(),
         }
     }
     fn app() -> adw::Application {

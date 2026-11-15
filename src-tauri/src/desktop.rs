@@ -188,6 +188,15 @@ fn t3_code_revision() -> Option<String> {
     clients::t3_code_revision()
 }
 
+/// T3 Code instances Toolport cannot connect, for the T3 Code card. Parsed only when the
+/// settings file changed.
+#[tauri::command]
+async fn t3_code_other_instances() -> Result<Vec<clients::T3CodeOther>, String> {
+    tauri::async_runtime::spawn_blocking(clients::t3_code_other_instances)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn client_location_types() -> Result<Vec<clients::ClientLocationType>, String> {
     tauri::async_runtime::spawn_blocking(clients::client_location_types)
@@ -4713,6 +4722,7 @@ pub fn run() {
             refresh_client_recovery_status,
             dismiss_client_recovery,
             t3_code_revision,
+            t3_code_other_instances,
             client_location_types,
             add_client_location,
             remove_client_location,

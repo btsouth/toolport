@@ -1,15 +1,16 @@
-import { ErrorCallout } from "@/components/ui/status-card";
+import { ErrorCallout, StatusCard } from "@/components/ui/status-card";
 import { msg, Trans, translate, useI18n } from "@/lib/i18n";
 import { Button } from "@/components/ui/button";
 import { trustedClientName, clientIdentityTooltip } from "@/lib/clientIdentity";
-import { getClientSessions, t3CodeRevision } from "@/lib/api";
-import type { ClientActivity } from "@/lib/types";
+import { getClientSessions, t3CodeOtherInstances, t3CodeRevision } from "@/lib/api";
+import type { ClientActivity, T3CodeOther } from "@/lib/types";
 import { fmtAgo } from "@/lib/utils";
 import { type RefObject, useEffect, useId, useRef, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
   Download,
+  Layers,
   MonitorCog,
   Puzzle,
   RefreshCw,
@@ -29,7 +30,17 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { SectionHeader } from "@/components/ui/section-header";
 import { SkeletonRows } from "@/components/ui/skeleton";
 import { clientDiscovery } from "@/lib/clientDiscovery";
-import { t3CodeActivitySegment, t3CodeBadge } from "@/lib/hostAttribution";
+import {
+  T3_CODE_NAME,
+  t3CodeActivitySegment,
+  t3CodeBadge,
+  t3CodeGapLines,
+  t3CodeLeftOut,
+  t3CodeLeftOutLines,
+  t3CodeStatus,
+  t3CodeTargets,
+  t3CodeUnconnectedCount,
+} from "@/lib/hostAttribution";
 import {
   importableServers,
   isGatewayDetected,
@@ -527,6 +538,25 @@ export function ClientsView({
   const windowVisible = useWindowVisible();
   const ownT3Seen = useRef<T3CodeSeen>(null);
   const t3Seen = keptT3Seen ?? ownT3Seen;
+  // Instances Toolport cannot use, for the card: read when the page opens, when T3 Code's
+  // settings change and after each scan (a home folder may have appeared meanwhile).
+  const [t3Others, setT3Others] = useState<T3CodeOther[]>([]);
+  const t3Read = useRef(0);
+  const readT3Others = () => {
+    const read = ++t3Read.current;
+    void t3CodeOtherInstances()
+      .then((others) => {
+        if (read === t3Read.current) setT3Others(others);
+      })
+      .catch(() => {});
+  };
+  const readT3OthersRef = useRef(readT3Others);
+  useEffect(() => {
+    readT3OthersRef.current = readT3Others;
+  });
+  useEffect(() => {
+    if (t3Seen.current?.value != null) readT3OthersRef.current();
+  }, [clients, t3Seen]);
   useEffect(() => {
     if (!windowVisible) return;
     let active = true;
@@ -541,7 +571,12 @@ export function ClientsView({
       if (!active) return;
       const previous = t3Seen.current;
       t3Seen.current = { value: revision };
-      if (!previous || previous.value === revision) return;
+      if (previous && previous.value === revision) return;
+      if (revision === null) {
+        t3Read.current += 1;
+        setT3Others([]);
+      } else readT3OthersRef.current();
+      if (!previous) return;
       try {
         await onChangedRef.current?.();
       } catch {
@@ -561,6 +596,18 @@ export function ClientsView({
     };
   }, [windowVisible, t3Seen]);
   const sorted = sortClients(clients);
+  // The T3 Code card: how many enabled instances are not connected, the rows they use
+  // that need attention first, then the instances Toolport can't use, each with why and
+  // what to do. GTK's `t3_code_card` shows the same.
+  const hasT3Rows = clients.some((client) => (client.t3Code?.length ?? 0) > 0);
+  const t3Gaps = t3CodeGapLines(t3Others);
+  const t3LeftOut = t3CodeLeftOut(clients);
+  const t3Lines = [...t3CodeLeftOutLines(t3LeftOut), ...t3Gaps];
+  const t3Unconnected = t3CodeUnconnectedCount(
+    t3CodeTargets(sorted),
+    t3LeftOut,
+    t3Others,
+  );
   const present = sorted.filter((client) => statusOf(client) !== "missing");
   const missing = sorted.filter((client) => statusOf(client) === "missing");
   const connected = present.filter((client) => statusOf(client) === "connected");
@@ -645,6 +692,29 @@ export function ClientsView({
           )}
           action={refreshAction}
         />
+      )}
+      {(hasT3Rows || t3Gaps.length > 0) && (
+        <div data-t3-code-card="" role="group" aria-label={T3_CODE_NAME}>
+          <StatusCard
+            icon={<Layers />}
+            title={T3_CODE_NAME}
+            detail={
+              <>
+                <p>
+                  {t(
+                    "T3 Code runs these clients as providers. Each reads its own MCP config, so Toolport connects to them, not to T3 Code.",
+                  )}
+                </p>
+                {hasT3Rows && <p className="mt-1">{t3CodeStatus(t3Unconnected)}</p>}
+                {t3Lines.map((line) => (
+                  <p key={line} className="mt-1">
+                    {line}
+                  </p>
+                ))}
+              </>
+            }
+          />
+        </div>
       )}
 
       {connected.length > 0 && (

@@ -997,6 +997,20 @@ button.toolport-activity-filter {{
   box-shadow: 0 0 0 2px alpha(@toolport_accent, 0.10);
 }}
 
+/* React's StatusCard: a 32px muted tile, a 14/600 title. */
+.toolport-status-tile {{
+  min-width: 32px;
+  min-height: 32px;
+  border-radius: 8px;
+  background-color: alpha(@toolport_fg, 0.06);
+  color: @toolport_text_secondary;
+}}
+
+.toolport-status-card-title {{
+  font-size: 14px;
+  font-weight: 600;
+}}
+
 .toolport-card {{
   background-color: transparent;
   border: none;

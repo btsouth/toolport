@@ -1218,6 +1218,11 @@ export function t3CodeRevision(): Promise<string | null> {
   return invoke<string | null>("t3_code_revision");
 }
 
+/** T3 Code instances Toolport cannot connect, with why, for the T3 Code card. */
+export function t3CodeOtherInstances(): Promise<import("@/lib/types").T3CodeOther[]> {
+  return invoke("t3_code_other_instances");
+}
+
 export function getClientSessions(): Promise<ClientActivity[]> {
   const sinceMs = new Date().setHours(0, 0, 0, 0);
   return invoke<ClientActivity[]>("get_client_sessions", { sinceMs });

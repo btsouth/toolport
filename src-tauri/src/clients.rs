@@ -44,7 +44,10 @@ pub use locations::{
 };
 #[cfg(test)]
 mod gateway_path_tests;
-pub use t3code::{revision as t3_code_revision, T3CodeUse};
+pub use t3code::{
+    other_instances as t3_code_other_instances, revision as t3_code_revision, T3CodeGap,
+    T3CodeOther, T3CodeUse,
+};
 #[cfg(test)]
 mod legacy_shared_http_tests;
 mod moved;

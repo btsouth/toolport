@@ -536,6 +536,419 @@ pub(super) fn remove_location_button(client: &state::ClientView, page: ClientPag
     remove
 }
 
+/// Rows an enabled T3 Code instance uses that Toolport can connect now: the app is
+/// present, its config reads, and it has no Toolport entry yet. A customized entry needs
+/// the row's own Reset, so it is left to the user. React's `t3CodeTargets` matches.
+pub(super) fn t3_code_targets(clients: &[state::ClientView]) -> Vec<&state::ClientView> {
+    clients
+        .iter()
+        .filter(|client| {
+            client.t3_code.iter().any(|instance| instance.enabled)
+                && client.app_present
+                && !client.config_error
+                && client.gateway_state == state::ClientGatewayState::Disconnected
+        })
+        .collect()
+}
+
+/// Why a row an enabled T3 Code instance uses is not connected and can't be connected as
+/// it is, in the order the card lists them (the Clients sections' order).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum T3LeftOutReason {
+    Customized,
+    Unreadable,
+    Missing,
+}
+
+/// A row left out that way: its name, why, and the enabled instances that use it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct T3LeftOut {
+    pub(super) client: String,
+    pub(super) reason: T3LeftOutReason,
+    pub(super) names: Vec<String>,
+}
+
+/// Rows used by an enabled instance that are neither connected nor targets,
+/// with why (the row's own status): customized, then unreadable, then not installed, each
+/// in scan order. Rows that are not installed are included even though the page does not
+/// list them. React's `t3CodeLeftOut` finds the same, in the same order.
+pub(super) fn t3_code_left_out(clients: &[state::ClientView]) -> Vec<T3LeftOut> {
+    let mut left = clients
+        .iter()
+        .filter_map(|client| {
+            let names = client
+                .t3_code
+                .iter()
+                .filter(|instance| instance.enabled)
+                .map(|instance| instance.display_name.clone())
+                .collect::<Vec<_>>();
+            if names.is_empty() {
+                return None;
+            }
+            let reason = if client.config_error {
+                T3LeftOutReason::Unreadable
+            } else if client.gateway_state == state::ClientGatewayState::Customized {
+                T3LeftOutReason::Customized
+            } else if client.gateway_state == state::ClientGatewayState::Connected
+                || client.app_present
+            {
+                return None;
+            } else {
+                T3LeftOutReason::Missing
+            };
+            Some(T3LeftOut {
+                client: client.name.clone(),
+                reason,
+                names,
+            })
+        })
+        .collect::<Vec<_>>();
+    left.sort_by_key(|row| row.reason);
+    left
+}
+
+/// One line per left-out row: who uses it, why it isn't connected, what to do. React's
+/// `t3CodeLeftOutLines` words them the same way.
+pub(super) fn t3_code_left_out_lines(left: &[T3LeftOut]) -> Vec<String> {
+    left.iter()
+        .map(|row| {
+            let one = row.names.len() == 1;
+            let names = row.names.join(", ");
+            let values = [("names", names.as_str()), ("client", row.client.as_str())];
+            match row.reason {
+                T3LeftOutReason::Unreadable => crate::i18n::trf(
+                    if one {
+                        "{names} uses {client}, but Toolport can't read its config. Open {client} below to see why, then connect it."
+                    } else {
+                        "{names} use {client}, but Toolport can't read its config. Open {client} below to see why, then connect it."
+                    },
+                    &values,
+                ),
+                T3LeftOutReason::Customized => crate::i18n::trf(
+                    if one {
+                        "{names} uses {client}, whose Toolport entry was changed by hand. Open {client} below and reset its Toolport entry."
+                    } else {
+                        "{names} use {client}, whose Toolport entry was changed by hand. Open {client} below and reset its Toolport entry."
+                    },
+                    &values,
+                ),
+                T3LeftOutReason::Missing => crate::i18n::trf(
+                    if one {
+                        "{names} uses {client}, which isn't installed. Install {client}, then connect it."
+                    } else {
+                        "{names} use {client}, which isn't installed. Install {client}, then connect it."
+                    },
+                    &values,
+                ),
+            }
+        })
+        .collect()
+}
+
+/// Enabled instances that are not connected: the targets', the left-out rows', and the
+/// ones Toolport can't connect at all. Only zero means every enabled one is connected.
+pub(super) fn t3_code_unconnected_count(
+    targets: &[&state::ClientView],
+    left: &[T3LeftOut],
+    others: &[crate::clients::T3CodeOther],
+) -> usize {
+    t3_code_instance_count(targets)
+        + left.iter().map(|row| row.names.len()).sum::<usize>()
+        + others
+            .iter()
+            .filter(|other| other.enabled && other.gap != crate::clients::T3CodeGap::Unreadable)
+            .count()
+}
+
+/// Enabled T3 Code instances on the given rows. Two instances sharing one home are one row
+/// and two instances.
+pub(super) fn t3_code_instance_count(rows: &[&state::ClientView]) -> usize {
+    rows.iter()
+        .map(|client| {
+            client
+                .t3_code
+                .iter()
+                .filter(|instance| instance.enabled)
+                .count()
+        })
+        .sum()
+}
+
+/// The T3 Code card's status line for this many unconnected enabled instances.
+pub(super) fn t3_code_status_text(count: usize) -> String {
+    match count {
+        0 => crate::i18n::tr("Every enabled T3 Code instance is connected."),
+        1 => crate::i18n::trf(
+            "{count} enabled T3 Code instance is not connected.",
+            &[("count", "1")],
+        ),
+        _ => crate::i18n::trf(
+            "{count} enabled T3 Code instances are not connected.",
+            &[("count", &count.to_string())],
+        ),
+    }
+}
+
+/// The 32px tile with React's "layers" glyph (lucide), drawn in the theme's secondary
+/// text color so it follows light and dark themes. No icon theme ships this glyph.
+fn layers_tile() -> gtk::Box {
+    let tile = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    tile.add_css_class("toolport-status-tile");
+    tile.set_valign(gtk::Align::Start);
+    tile.set_halign(gtk::Align::Start);
+    // The glyph expands to center itself; stop that reaching the card, or the tile
+    // takes half the row.
+    tile.set_hexpand(false);
+    tile.set_vexpand(false);
+    let glyph = gtk::DrawingArea::new();
+    glyph.set_content_width(16);
+    glyph.set_content_height(16);
+    glyph.set_halign(gtk::Align::Center);
+    glyph.set_valign(gtk::Align::Center);
+    glyph.set_vexpand(true);
+    glyph.set_hexpand(true);
+    glyph.set_accessible_role(gtk::AccessibleRole::Presentation);
+    glyph.set_draw_func(|area, cr, width, height| {
+        let color = area.color();
+        cr.set_source_rgba(
+            color.red().into(),
+            color.green().into(),
+            color.blue().into(),
+            color.alpha().into(),
+        );
+        // lucide "layers" is drawn on a 24px grid with a 2px stroke.
+        let scale = f64::from(width.min(height)) / 24.0;
+        cr.scale(scale, scale);
+        cr.set_line_width(2.0);
+        cr.set_line_cap(gtk::cairo::LineCap::Round);
+        cr.set_line_join(gtk::cairo::LineJoin::Round);
+        cr.move_to(12.0, 2.5);
+        cr.line_to(21.5, 7.0);
+        cr.line_to(12.0, 11.5);
+        cr.line_to(2.5, 7.0);
+        cr.close_path();
+        for top in [12.0, 17.0] {
+            cr.move_to(2.0, top);
+            cr.line_to(12.0, top + 4.5);
+            cr.line_to(22.0, top);
+        }
+        let _ = cr.stroke();
+    });
+    tile.append(&glyph);
+    tile
+}
+
+/// The card's lines for T3 Code instances Toolport cannot connect, one per reason.
+/// React's `t3CodeGapLines` builds the same lines.
+pub(super) fn t3_code_gap_lines(others: &[crate::clients::T3CodeOther]) -> Vec<String> {
+    let count =
+        |gap: crate::clients::T3CodeGap| others.iter().filter(|other| other.gap == gap).count();
+    let names = |gap: crate::clients::T3CodeGap| {
+        others
+            .iter()
+            .filter(|other| other.gap == gap)
+            .map(|other| {
+                let name = if other.provider_name.is_empty()
+                    || other.display_name == other.provider_name
+                {
+                    other.display_name.clone()
+                } else {
+                    crate::i18n::trf(
+                        "{name} ({provider})",
+                        &[
+                            ("name", &other.display_name),
+                            ("provider", &other.provider_name),
+                        ],
+                    )
+                };
+                if other.enabled {
+                    name
+                } else {
+                    crate::i18n::trf("{name} (off)", &[("name", &name)])
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut lines = Vec::new();
+    let unsupported = names(crate::clients::T3CodeGap::Unsupported);
+    if !unsupported.is_empty() {
+        lines.push(crate::i18n::trf(
+            "Not supported by Toolport yet: {names}.",
+            &[("names", &unsupported)],
+        ));
+    }
+    let private_home = names(crate::clients::T3CodeGap::PrivateHome);
+    if !private_home.is_empty() {
+        lines.push(crate::i18n::trf(
+            "Toolport can't connect {names} yet: T3 Code gives it a private settings folder.",
+            &[("names", &private_home)],
+        ));
+    }
+    let malformed = count(crate::clients::T3CodeGap::Malformed);
+    if malformed > 0 {
+        lines.push(crate::i18n::trf(
+            if malformed == 1 {
+                "Toolport can't read {names} in T3 Code's settings. Fix this instance in T3 Code's settings."
+            } else {
+                "Toolport can't read {names} in T3 Code's settings. Fix these instances in T3 Code's settings."
+            },
+            &[("names", &names(crate::clients::T3CodeGap::Malformed))],
+        ));
+    }
+    let hidden_home = count(crate::clients::T3CodeGap::HiddenHome);
+    if hidden_home > 0 {
+        lines.push(crate::i18n::trf(
+            if hidden_home == 1 {
+                "Toolport can't see which home folder {names} uses: it is marked sensitive or isn't plain text. Set its home folder as plain text in T3 Code's provider settings."
+            } else {
+                "Toolport can't see which home folders {names} use: they are marked sensitive or aren't plain text. Set each home folder as plain text in T3 Code's provider settings."
+            },
+            &[("names", &names(crate::clients::T3CodeGap::HiddenHome))],
+        ));
+    }
+    let relative_home = count(crate::clients::T3CodeGap::RelativeHome);
+    if relative_home > 0 {
+        lines.push(crate::i18n::trf(
+            if relative_home == 1 {
+                "Toolport can't tell which home folder {names} uses: it is a relative path. Set it to a full path in T3 Code's provider settings."
+            } else {
+                "Toolport can't tell which home folders {names} use: they are relative paths. Set each to a full path in T3 Code's provider settings."
+            },
+            &[("names", &names(crate::clients::T3CodeGap::RelativeHome))],
+        ));
+    }
+    let outside_home = count(crate::clients::T3CodeGap::OutsideHome);
+    if outside_home > 0 {
+        lines.push(crate::i18n::trf(
+            if outside_home == 1 {
+                "Toolport won't use the home folder {names} uses: it isn't inside your home folder. Toolport only manages configs inside it; add it by hand as a client location if you trust it."
+            } else {
+                "Toolport won't use the home folders {names} use: they aren't inside your home folder. Toolport only manages configs inside it; add each by hand as a client location if you trust it."
+            },
+            &[("names", &names(crate::clients::T3CodeGap::OutsideHome))],
+        ));
+    }
+    let linked_home = count(crate::clients::T3CodeGap::LinkedHome);
+    if linked_home > 0 {
+        lines.push(crate::i18n::trf(
+            if linked_home == 1 {
+                "Toolport won't use the home folder {names} uses: it, or its config file, is a link or not a plain folder or file. Point it at the real folder in T3 Code's provider settings, or add it by hand as a client location if you trust it."
+            } else {
+                "Toolport won't use the home folders {names} use: they, or their config files, are links or not plain folders or files. Point each at the real folder in T3 Code's provider settings, or add it by hand as a client location if you trust it."
+            },
+            &[("names", &names(crate::clients::T3CodeGap::LinkedHome))],
+        ));
+    }
+    let missing_home = count(crate::clients::T3CodeGap::MissingHome);
+    if missing_home > 0 {
+        lines.push(crate::i18n::trf(
+            if missing_home == 1 {
+                "Toolport can't connect {names} yet: its home folder doesn't exist yet. Start it once in T3 Code, then refresh Clients."
+            } else {
+                "Toolport can't connect {names} yet: their home folders don't exist yet. Start each once in T3 Code, then refresh Clients."
+            },
+            &[("names", &names(crate::clients::T3CodeGap::MissingHome))],
+        ));
+    }
+    let unlisted_home = count(crate::clients::T3CodeGap::UnlistedHome);
+    if unlisted_home > 0 {
+        lines.push(crate::i18n::trf(
+            if unlisted_home == 1 {
+                "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once {names}'s home folder exists, add it by hand as a client location to connect it."
+            } else {
+                "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once the home folders {names} use exist, add each by hand as a client location to connect it."
+            },
+            &[("names", &names(crate::clients::T3CodeGap::UnlistedHome))],
+        ));
+    }
+    if let Some(file) = others
+        .iter()
+        .find(|other| other.gap == crate::clients::T3CodeGap::Unreadable)
+    {
+        lines.push(crate::i18n::trf(
+            "Toolport can't read T3 Code's settings in {path}, so it can't list T3 Code's instances.",
+            &[("path", &file.display_name)],
+        ));
+    }
+    lines
+}
+
+/// The T3 Code card at the top of Clients: what T3 Code's providers are, how many enabled
+/// instances are not connected, and why for each one Toolport can't connect as it is.
+/// React's ClientsView card shows the same lines in the same order.
+pub(super) fn t3_code_card(
+    clients: &[state::ClientView],
+    others: &[crate::clients::T3CodeOther],
+) -> gtk::Box {
+    let has_rows = clients.iter().any(|client| !client.t3_code.is_empty());
+    // Rows an enabled instance uses that can't be connected as they are, each with why and
+    // what to do, so the status never says everything is connected while one is not.
+    let left_out = t3_code_left_out(clients);
+    let unconnected = t3_code_unconnected_count(&t3_code_targets(clients), &left_out, others);
+    // A named group, like `row_group`.
+    let group = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .accessible_role(gtk::AccessibleRole::Group)
+        .overflow(gtk::Overflow::Hidden)
+        .css_classes(["toolport-row-group", "toolport-t3-card-group"])
+        .build();
+    group.update_property(&[gtk::accessible::Property::Label("T3 Code")]);
+    let card = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    card.add_css_class("toolport-card");
+    card.add_css_class("toolport-client-row");
+    card.add_css_class("toolport-t3-card");
+    card.append(&layers_tile());
+    let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    copy.set_hexpand(true);
+    copy.set_valign(gtk::Align::Center);
+    // A product name, not translated.
+    let title = gtk::Label::builder()
+        .label("T3 Code")
+        .xalign(0.0)
+        .css_classes(["toolport-status-card-title"])
+        .build();
+    copy.append(&title);
+    let body = l10n::label("T3 Code runs these clients as providers. Each reads its own MCP config, so Toolport connects to them, not to T3 Code.");
+    body.set_xalign(0.0);
+    body.set_wrap(true);
+    body.add_css_class("toolport-muted");
+    copy.append(&body);
+    let status = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["caption"])
+        .build();
+    l10n::bind_label_with(&status, move || t3_code_status_text(unconnected));
+    // With only instances Toolport cannot connect, there is nothing to count.
+    status.set_visible(has_rows);
+    copy.append(&status);
+    // Left-out rows first, then instances Toolport can't use, as React orders them.
+    let lines = |left: &[T3LeftOut], others: &[crate::clients::T3CodeOther]| {
+        let mut lines = t3_code_left_out_lines(left);
+        lines.extend(t3_code_gap_lines(others));
+        lines
+    };
+    for (index, _) in lines(&left_out, others).iter().enumerate() {
+        let (left, others) = (left_out.clone(), others.to_vec());
+        let gap = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["caption"])
+            .build();
+        l10n::bind_label_with(&gap, move || {
+            lines(&left, &others)
+                .get(index)
+                .cloned()
+                .unwrap_or_default()
+        });
+        copy.append(&gap);
+    }
+    card.append(&copy);
+    group.append(&card);
+    group
+}
+
 /// A client's profiles under one entry: Claude Code profiles or Codex homes. Copies of the
 /// default Claude Code profile (same account in `~/.claude`, read only through
 /// CLAUDE_CONFIG_DIR) sit behind a note instead of a row.
@@ -827,6 +1240,294 @@ mod tests {
             display_name: name.into(),
             enabled,
         }
+    }
+
+    fn client(id: &str, state: state::ClientGatewayState) -> state::ClientView {
+        state::ClientView {
+            detected: None,
+            imported_names: Vec::new(),
+            id: id.into(),
+            name: id.into(),
+            app_present: true,
+            config_exists: true,
+            uses_connectors: false,
+            server_count: 0,
+            movable_server_count: 0,
+            other_server_count: 0,
+            gateway_state: state,
+            shared_http: false,
+            legacy_bearer_argv: false,
+            scope_id: None,
+            scope_name: None,
+            discovery_mode: None,
+            inherited_discovery: None,
+            config_error: false,
+            location_removable: false,
+            claude_profile: None,
+            t3_code: Vec::new(),
+        }
+    }
+
+    fn ids<'a>(rows: &[&'a state::ClientView]) -> Vec<&'a str> {
+        rows.iter().map(|client| client.id.as_str()).collect()
+    }
+
+    #[test]
+    fn t3_code_gap_lines_name_each_instance_and_why() {
+        use crate::clients::{T3CodeGap, T3CodeOther};
+        let other = |id: &str, provider: &str, name: &str, enabled, gap| T3CodeOther {
+            instance_id: id.into(),
+            provider_name: provider.into(),
+            display_name: name.into(),
+            enabled,
+            gap,
+        };
+        assert!(t3_code_gap_lines(&[]).is_empty());
+        assert_eq!(
+            t3_code_gap_lines(&[
+                other("muse", "Muse Code", "Muse Code", true, T3CodeGap::Unsupported),
+                other("fx", "fx", "My fx", false, T3CodeGap::Unsupported),
+                other(
+                    "antigravity",
+                    "Antigravity",
+                    "Antigravity",
+                    true,
+                    T3CodeGap::PrivateHome
+                ),
+            ]),
+            [
+                "Not supported by Toolport yet: Muse Code, My fx (fx) (off).",
+                "Toolport can't connect Antigravity yet: T3 Code gives it a private settings folder.",
+            ]
+        );
+        assert_eq!(
+            t3_code_gap_lines(&[other(
+                "",
+                "",
+                "~/.t3/userdata/settings.json",
+                true,
+                T3CodeGap::Unreadable
+            )]),
+            ["Toolport can't read T3 Code's settings in ~/.t3/userdata/settings.json, so it can't list T3 Code's instances."]
+        );
+    }
+
+    /// React's "names each one with why and what to do" and "words several of a kind in
+    /// the plural" check the same lines.
+    #[test]
+    fn t3_code_gap_lines_say_why_an_instance_cannot_be_used_and_what_to_do() {
+        use crate::clients::{T3CodeGap, T3CodeOther};
+        let other = |id: &str, provider: &str, name: &str, enabled, gap| T3CodeOther {
+            instance_id: id.into(),
+            provider_name: provider.into(),
+            display_name: name.into(),
+            enabled,
+            gap,
+        };
+        assert_eq!(
+            t3_code_gap_lines(&[
+                other("text_entry", "", "text_entry", true, T3CodeGap::Malformed),
+                other("pi_hidden", "Pi", "Pi Hidden", true, T3CodeGap::HiddenHome),
+                other("rel", "Codex", "Relative", false, T3CodeGap::RelativeHome),
+                other("bad driver", "", "bad driver", false, T3CodeGap::Unsupported),
+            ]),
+            [
+                "Not supported by Toolport yet: bad driver (off).",
+                "Toolport can't read text_entry in T3 Code's settings. Fix this instance in T3 Code's settings.",
+                "Toolport can't see which home folder Pi Hidden (Pi) uses: it is marked sensitive or isn't plain text. Set its home folder as plain text in T3 Code's provider settings.",
+                "Toolport can't tell which home folder Relative (Codex) (off) uses: it is a relative path. Set it to a full path in T3 Code's provider settings.",
+            ]
+        );
+        assert_eq!(
+            t3_code_gap_lines(&[
+                other("a", "Claude", "Claude", true, T3CodeGap::Malformed),
+                other("b", "Grok", "Broken", true, T3CodeGap::Malformed),
+                other("c", "Grok", "Grok", true, T3CodeGap::HiddenHome),
+                other("d", "OpenCode", "Hidden", true, T3CodeGap::HiddenHome),
+                other("e", "Codex", "One", true, T3CodeGap::RelativeHome),
+                other("f", "Claude", "Two", true, T3CodeGap::RelativeHome),
+            ]),
+            [
+                "Toolport can't read Claude, Broken (Grok) in T3 Code's settings. Fix these instances in T3 Code's settings.",
+                "Toolport can't see which home folders Grok, Hidden (OpenCode) use: they are marked sensitive or aren't plain text. Set each home folder as plain text in T3 Code's provider settings.",
+                "Toolport can't tell which home folders One (Codex), Two (Claude) use: they are relative paths. Set each to a full path in T3 Code's provider settings.",
+            ]
+        );
+    }
+
+    #[test]
+    fn t3_code_status_counts_instances() {
+        assert_eq!(
+            t3_code_status_text(0),
+            "Every enabled T3 Code instance is connected."
+        );
+        assert_eq!(
+            t3_code_status_text(1),
+            "1 enabled T3 Code instance is not connected."
+        );
+        assert_eq!(
+            t3_code_status_text(3),
+            "3 enabled T3 Code instances are not connected."
+        );
+    }
+
+    /// React's "counts instances Toolport can't use" and the hostAttribution home tests
+    /// check the same lines: a home outside home, a linked one, a missing one and an
+    /// OpenCode, Grok or Pi one no row covers, each named by its instance only, with a
+    /// next step.
+    #[test]
+    fn t3_code_gap_lines_say_why_a_home_is_not_used_and_what_to_do() {
+        use crate::clients::{T3CodeGap, T3CodeOther};
+        let other = |name: &str, provider: &str, enabled, gap| T3CodeOther {
+            instance_id: name.to_lowercase(),
+            provider_name: provider.into(),
+            display_name: name.into(),
+            enabled,
+            gap,
+        };
+        assert_eq!(
+            t3_code_gap_lines(&[
+                other("Away", "Codex", true, T3CodeGap::OutsideHome),
+                other("Linked", "Claude", false, T3CodeGap::LinkedHome),
+                other("Work", "Claude", true, T3CodeGap::MissingHome),
+                other("Grok", "Grok", true, T3CodeGap::RelativeHome),
+                other("Notes", "OpenCode", true, T3CodeGap::UnlistedHome),
+            ]),
+            [
+                "Toolport can't tell which home folder Grok uses: it is a relative path. Set it to a full path in T3 Code's provider settings.",
+                "Toolport won't use the home folder Away (Codex) uses: it isn't inside your home folder. Toolport only manages configs inside it; add it by hand as a client location if you trust it.",
+                "Toolport won't use the home folder Linked (Claude) (off) uses: it, or its config file, is a link or not a plain folder or file. Point it at the real folder in T3 Code's provider settings, or add it by hand as a client location if you trust it.",
+                "Toolport can't connect Work (Claude) yet: its home folder doesn't exist yet. Start it once in T3 Code, then refresh Clients.",
+                "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once Notes (OpenCode)'s home folder exists, add it by hand as a client location to connect it.",
+            ]
+        );
+        assert_eq!(
+            t3_code_gap_lines(&[
+                other("A", "Codex", true, T3CodeGap::OutsideHome),
+                other("B", "Claude", true, T3CodeGap::OutsideHome),
+                other("C", "Claude", true, T3CodeGap::LinkedHome),
+                other("D", "Pi", true, T3CodeGap::LinkedHome),
+                other("E", "Grok", true, T3CodeGap::MissingHome),
+                other("F", "Codex", false, T3CodeGap::MissingHome),
+                other("G", "OpenCode", true, T3CodeGap::UnlistedHome),
+                other("H", "Pi", false, T3CodeGap::UnlistedHome),
+            ]),
+            [
+                "Toolport won't use the home folders A (Codex), B (Claude) use: they aren't inside your home folder. Toolport only manages configs inside it; add each by hand as a client location if you trust it.",
+                "Toolport won't use the home folders C (Claude), D (Pi) use: they, or their config files, are links or not plain folders or files. Point each at the real folder in T3 Code's provider settings, or add it by hand as a client location if you trust it.",
+                "Toolport can't connect E (Grok), F (Codex) (off) yet: their home folders don't exist yet. Start each once in T3 Code, then refresh Clients.",
+                "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once the home folders G (OpenCode), H (Pi) (off) use exist, add each by hand as a client location to connect it.",
+            ]
+        );
+        // Every enabled one counts as not connected; an off one does not.
+        let others = [
+            other("Away", "Codex", true, T3CodeGap::OutsideHome),
+            other("Linked", "Claude", false, T3CodeGap::LinkedHome),
+            other("Work", "Claude", true, T3CodeGap::MissingHome),
+        ];
+        assert_eq!(t3_code_unconnected_count(&[], &[], &others), 2);
+    }
+
+    #[test]
+    fn t3_code_left_out_names_each_unconnected_row_with_why_and_what_to_do() {
+        use state::ClientGatewayState::*;
+        let mut rows = vec![
+            client("A", Disconnected),
+            client("C", Connected),
+            client("Cursor", Customized),
+            client("Codex", Disconnected),
+            client("Kiro", Disconnected),
+            client("Pi", Disconnected),
+        ];
+        rows[0].t3_code = vec![instance("A", true)];
+        rows[1].t3_code = vec![instance("C", true)];
+        rows[2].t3_code = vec![
+            instance("Work", true),
+            instance("Home", true),
+            instance("Old", false),
+        ];
+        rows[3].t3_code = vec![instance("E", true)];
+        rows[3].config_error = true;
+        rows[4].t3_code = vec![instance("F", true)];
+        rows[4].app_present = false;
+        rows[4].config_exists = false;
+        rows[5].t3_code = vec![instance("G", false)];
+        rows[5].app_present = false;
+        let left = t3_code_left_out(&rows);
+        assert_eq!(
+            left.iter()
+                .map(|row| (row.client.as_str(), row.reason, row.names.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "Cursor",
+                    T3LeftOutReason::Customized,
+                    vec!["Work".to_string(), "Home".to_string()]
+                ),
+                ("Codex", T3LeftOutReason::Unreadable, vec!["E".to_string()]),
+                ("Kiro", T3LeftOutReason::Missing, vec!["F".to_string()]),
+            ]
+        );
+        assert_eq!(
+            t3_code_left_out_lines(&left),
+            [
+                "Work, Home use Cursor, whose Toolport entry was changed by hand. Open Cursor below and reset its Toolport entry.",
+                "E uses Codex, but Toolport can't read its config. Open Codex below to see why, then connect it.",
+                "F uses Kiro, which isn't installed. Install Kiro, then connect it.",
+            ]
+        );
+        use crate::clients::{T3CodeGap, T3CodeOther};
+        let other = |name: &str, enabled, gap| T3CodeOther {
+            instance_id: name.into(),
+            provider_name: name.into(),
+            display_name: name.into(),
+            enabled,
+            gap,
+        };
+        let others = [
+            other("Muse Code", true, T3CodeGap::Unsupported),
+            other("fx", false, T3CodeGap::Unsupported),
+            other("~/f", true, T3CodeGap::Unreadable),
+        ];
+        // A, the left-out rows' four, and the enabled instance Toolport can't connect.
+        assert_eq!(
+            t3_code_unconnected_count(&t3_code_targets(&rows), &left, &others),
+            6
+        );
+        assert_eq!(t3_code_unconnected_count(&[], &[], &[]), 0);
+    }
+
+    #[test]
+    fn t3_code_targets_skip_connected_customized_broken_absent_and_off_rows() {
+        use state::ClientGatewayState::*;
+        let mut rows = vec![
+            client("connected", Connected),
+            client("customized", Customized),
+            client("broken", Disconnected),
+            client("absent", Disconnected),
+            client("off", Disconnected),
+            client("plain", Disconnected),
+            client("shared", Disconnected),
+            client("target", Disconnected),
+        ];
+        for row in &mut rows {
+            row.t3_code = vec![instance(&row.id, true)];
+        }
+        rows[2].config_error = true;
+        rows[3].app_present = false;
+        rows[4].t3_code = vec![instance("Off", false)];
+        rows[5].t3_code.clear();
+        // Two enabled instances sharing one home, and an off one beside them.
+        rows[6].t3_code = vec![
+            instance("A", true),
+            instance("B", true),
+            instance("C", false),
+        ];
+        let targets = t3_code_targets(&rows);
+        assert_eq!(ids(&targets), ["shared", "target"]);
+        // One row per home; the status line counts enabled instances.
+        assert_eq!(t3_code_instance_count(&targets), 3);
+        assert!(t3_code_targets(&rows[..2]).is_empty());
     }
 
     #[test]

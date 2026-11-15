@@ -34,6 +34,7 @@ elsewhere is never read.
 - A folder you added by hand and the same folder named in T3 Code are one row.
 - An instance whose home folder is marked sensitive, isn't plain text or is a
   relative path labels no row: Toolport can't tell which config it reads.
+- Instances Toolport leaves out are listed on the T3 Code card, below.
 - When you add, remove or switch on an instance in T3 Code, the open Clients page
   updates within a few seconds while Toolport's window is in front, or as soon as
   you switch back to it or return from a client's details. Without T3 Code, Toolport checks for it only when the page
@@ -44,6 +45,38 @@ elsewhere is never read.
 - While T3 Code still lists a home whose folder exists, even one with no config yet,
   **Remove location** is shown disabled with the reason: remove the instance from T3
   Code's provider settings first.
+
+## The T3 Code card
+
+With T3 Code installed, the Clients page shows a T3 Code card. It counts the
+instances that are on and not connected, and names each one Toolport can't connect
+as it is, with why and what to do:
+
+- A row it uses that isn't installed, has a config Toolport can't read, or has a
+  Toolport entry changed by hand. Open that client below to fix it.
+- **Antigravity**: T3 Code gives it a private settings folder, which Toolport doesn't
+  manage yet. **fx**, **Muse Code**, **ACP Registry** agents and any provider T3 Code
+  adds later: Toolport has no client for them yet.
+- A home folder that is marked sensitive, isn't plain text, or is a relative path
+  (T3 Code passes `CLAUDE_CONFIG_DIR` and `CODEX_HOME` as they are, so `~` there is
+  relative too). Set a full, plain path in T3 Code's provider settings.
+- A home folder outside your home folder, written with `.`, `..` or `//`, or on a
+  network or device path.
+  Toolport judges it by its text alone and never opens it. Add it by hand as a client
+  location if you trust it.
+- A home folder with a link anywhere below your home folder
+  (the home itself, a folder above it, or its config file), or something that isn't a
+  plain folder or file. Point the instance at the real folder, or add it by hand.
+- A Claude Code or Codex home folder that doesn't exist yet. Start the instance once in T3 Code, then
+  refresh Clients.
+- An OpenCode, Grok or Pi home folder that no row on the page covers. Toolport makes
+  rows only for Claude Code and Codex homes, so once the folder exists, add it by hand
+  as a client location to connect it.
+- An entry in `settings.json` Toolport can't read, or a settings file it can't read
+  at all, named by its path with `~` for your home folder.
+
+The card names instances by their name and provider only, never by the paths in the
+settings file.
 
 ## What Activity shows
 

@@ -8,11 +8,12 @@
 //! T3 Code keeps its data in `T3CODE_HOME`, or `<home>/.t3` (Node's `os.homedir()`), on
 //! every platform, with settings in `userdata/settings.json`. The file is internal and has
 //! no schema version, and some instances hold API keys inline in `environment`. Only an
-//! instance's driver, display name, enabled flags, `homePath`, and the values of
-//! non-sensitive `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_CONFIG_HOME`, `GROK_HOME` and
-//! `PI_CODING_AGENT_DIR` entries are ever decoded. Every other value, secrets included,
-//! is skipped by the parser without being copied, and the file buffer is zeroed once
-//! parsing ends. Nothing here is logged except a fixed one-line notice.
+//! instance's driver, display name, enabled flags, `homePath`, an ACP Registry `agentId`,
+//! and the values of non-sensitive `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_CONFIG_HOME`,
+//! `GROK_HOME` and `PI_CODING_AGENT_DIR` entries are ever decoded; of an entry with another
+//! shape, only a plain-text driver, display name and enabled flag. Every other value,
+//! secrets included, is skipped by the parser without being copied, and the file buffer is
+//! zeroed once parsing ends. Nothing here is logged except a fixed one-line notice.
 use super::*;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -99,13 +100,73 @@ pub struct T3CodeUse {
     pub enabled: bool,
 }
 
+/// Why Toolport cannot connect a T3 Code instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum T3CodeGap {
+    /// Toolport has no client for this provider yet.
+    Unsupported,
+    /// T3 Code runs this provider with a private settings folder of its own (Antigravity's
+    /// `GEMINI_HOME` under T3 Code's data folder), which Toolport does not manage.
+    PrivateHome,
+    /// T3 Code's settings file could not be read, so no instance is known. The entry's
+    /// display name is the file, with `~` for home.
+    Unreadable,
+    /// This instance's entry, or its `config`, is not in a shape Toolport can read. Only
+    /// its id, and its display name and driver when they are plain text, are shown.
+    Malformed,
+    /// The variable that names this instance's home folder is marked sensitive or is not
+    /// plain text, so Toolport cannot tell which config it reads. Its value is never read.
+    HiddenHome,
+    /// This instance's home folder is a relative path, which T3 Code resolves against a
+    /// working directory Toolport cannot know.
+    RelativeHome,
+    /// This instance's home folder is not plainly inside the user's home: outside it, another
+    /// user's, a network or device path, or with `..`. Judged by its text alone; the path
+    /// is never opened and never shown.
+    OutsideHome,
+    /// This instance's home folder, or the config file in it, is a link or not a plain
+    /// folder or file, so Toolport does not make it a row it could write to.
+    LinkedHome,
+    /// This instance's home folder does not exist yet.
+    MissingHome,
+    /// An OpenCode, Grok or Pi instance's home folder, existing or not yet, that no Clients
+    /// row covers. Toolport makes rows only for Claude Code and Codex homes, so this one
+    /// has to be added by hand as a client location.
+    UnlistedHome,
+}
+
+/// A T3 Code instance Toolport cannot connect, shown on the T3 Code card.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct T3CodeOther {
+    pub instance_id: String,
+    /// The provider as T3 Code names it, such as "Muse Code".
+    pub provider_name: String,
+    pub display_name: String,
+    pub enabled: bool,
+    pub gap: T3CodeGap,
+}
+
+/// T3 Code's drivers that Toolport cannot connect, with T3 Code's own provider names
+/// (`PROVIDER_DISPLAY_NAMES`) and whether the driver is on before it is configured.
+fn other_driver(driver: &str) -> Option<(&'static str, T3CodeGap, bool)> {
+    Some(match driver {
+        "antigravity" => ("Antigravity", T3CodeGap::PrivateHome, false),
+        "fx" => ("fx", T3CodeGap::Unsupported, false),
+        "muse" => ("Muse Code", T3CodeGap::Unsupported, false),
+        "acpRegistry" => ("ACP Registry", T3CodeGap::Unsupported, true),
+        _ => return None,
+    })
+}
+
 /// What `settings.json` says, or why it could not be used.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Reading {
     /// T3 Code is not installed here: no data folder.
     Absent,
-    /// The instances Toolport can match, in instance id order.
-    Instances(Vec<Instance>),
+    /// The instances Toolport can match, in instance id order, and the ones it cannot.
+    Instances(Vec<Instance>, Vec<T3CodeOther>),
     /// The file exists but could not be read as T3 Code settings.
     Unreadable,
 }
@@ -386,7 +447,7 @@ pub(super) fn current() -> Arc<Reading> {
         // T3 Code writes settings.json only after a setting changes. Until then its two
         // default instances are on, with their default homes.
         None if std::fs::symlink_metadata(&path).is_err() => {
-            Reading::Instances(with_defaults(BTreeMap::new()))
+            Reading::Instances(with_defaults(BTreeMap::new()), Vec::new())
         }
         // A link to nothing.
         None => Reading::Unreadable,
@@ -602,6 +663,9 @@ struct RawConfig {
     home_path: Option<String>,
     #[serde(default)]
     enabled: Option<bool>,
+    /// The ACP Registry agent an `acpRegistry` instance runs.
+    #[serde(rename = "agentId", default)]
+    agent_id: Option<String>,
 }
 
 impl<'a> RawInstance<'a> {
@@ -612,6 +676,18 @@ impl<'a> RawInstance<'a> {
         }
         serde_json::from_str(raw.get()).ok()
     }
+}
+
+/// What can still be shown of an instance that does not read as [`RawInstance`]: each
+/// field is kept undecoded and read only when it is plain text (or a flag).
+#[derive(Deserialize, Default)]
+struct LooseInstance<'a> {
+    #[serde(borrow, default)]
+    driver: Option<&'a RawValue>,
+    #[serde(rename = "displayName", borrow, default)]
+    display_name: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    enabled: Option<&'a RawValue>,
 }
 
 #[derive(Deserialize)]
@@ -633,18 +709,34 @@ fn parse_text(text: &str, home: &Path) -> Reading {
         return Reading::Unreadable;
     };
     let mut found = BTreeMap::new();
+    let mut others = Vec::new();
     for (id, raw) in settings.provider_instances.unwrap_or_default() {
         // One odd instance must not hide the rest. T3 Code keeps unknown-driver configs
-        // verbatim, so shapes Toolport does not know are expected. An instance Toolport
-        // cannot use labels no row, and still stops T3 Code's default for that id from
-        // standing in for it.
-        let instance = RawInstance::of(raw).and_then(|raw| {
-            let provider = Provider::of(raw.driver.trim())?;
-            instance_of(&id, provider, raw, home)
-        });
+        // verbatim, so shapes Toolport does not know are expected.
+        // An instance Toolport cannot use is listed on the card with why, and still stops
+        // T3 Code's default for that id from standing in for it.
+        let instance = match RawInstance::of(raw) {
+            Some(raw) => match Provider::of(raw.driver.trim()) {
+                Some(provider) => match instance_of(&id, provider, raw, home) {
+                    Ok(instance) => Some(instance),
+                    Err(other) => {
+                        others.push(other);
+                        None
+                    }
+                },
+                None => {
+                    others.push(other_of(&id, raw));
+                    None
+                }
+            },
+            None => {
+                others.push(malformed(&id, raw));
+                None
+            }
+        };
         found.insert(id.clone(), instance);
     }
-    Reading::Instances(with_defaults(found))
+    Reading::Instances(with_defaults(found), others)
 }
 
 /// The enabled rule T3 Code's `resolveProviderInstanceEnabled` applies: either flag off
@@ -676,6 +768,105 @@ fn with_defaults(mut found: BTreeMap<String, Option<Instance>>) -> Vec<Instance>
     found.into_values().flatten().collect()
 }
 
+/// An instance entry Toolport cannot read, for the card: its id, and its display name,
+/// driver and flag only when each is plain text. Nothing else of it is decoded.
+fn malformed(id: &str, raw: &RawValue) -> T3CodeOther {
+    let loose = if raw.get().trim_start().starts_with('{') {
+        serde_json::from_str::<LooseInstance>(raw.get()).unwrap_or_default()
+    } else {
+        LooseInstance::default()
+    };
+    let text = |value: Option<&RawValue>| {
+        value.and_then(|value| serde_json::from_str::<String>(value.get()).ok())
+    };
+    let driver = text(loose.driver);
+    let driver = driver.as_deref().map(str::trim);
+    let (provider_name, default_on) = match driver {
+        Some(driver) => match (Provider::of(driver), other_driver(driver)) {
+            (Some(provider), _) => (
+                provider.default_name().to_string(),
+                matches!(provider, Provider::ClaudeCode | Provider::Codex),
+            ),
+            (None, Some(known)) => (known.0.to_string(), known.2),
+            (None, None) if plain_identifier(driver) => (driver.to_string(), false),
+            // Unknown drivers are off unless the file says otherwise, as in `other_of`.
+            (None, None) => (String::new(), false),
+        },
+        // Nothing says what it is: shown as it is, not marked off.
+        None => (String::new(), true),
+    };
+    let enabled = loose
+        .enabled
+        .and_then(|value| serde_json::from_str::<bool>(value.get()).ok());
+    let instance_id = display_name_id(id);
+    let display_name = text(loose.display_name)
+        .as_deref()
+        .map(display_name)
+        .filter(|name| !name.is_empty())
+        .or_else(|| (!provider_name.is_empty()).then(|| provider_name.clone()))
+        .unwrap_or_else(|| instance_id.clone());
+    T3CodeOther {
+        instance_id,
+        provider_name,
+        display_name,
+        enabled: enabled.unwrap_or(default_on),
+        gap: T3CodeGap::Malformed,
+    }
+}
+
+/// An instance of a T3 Code driver Toolport cannot connect. A driver T3 Code adds later
+/// shows under its own id until Toolport learns its name; one whose id is not a plain
+/// identifier shows by its display name or instance id alone.
+fn other_of(id: &str, raw: RawInstance) -> T3CodeOther {
+    let driver = raw.driver.trim();
+    let config = match raw.config {
+        Some(config) => serde_json::from_str::<RawConfig>(config.get()).unwrap_or_default(),
+        None => RawConfig::default(),
+    };
+    let (provider_name, gap, default_on) = match other_driver(driver) {
+        Some(known) => (known.0.to_string(), known.1, known.2),
+        // A driver id is code, not prose: only a plain identifier is shown. Unknown
+        // drivers are off unless the file says otherwise.
+        None if plain_identifier(driver) => (driver.to_string(), T3CodeGap::Unsupported, false),
+        // Still listed, by its display name or id, without the driver.
+        None => (String::new(), T3CodeGap::Unsupported, false),
+    };
+    let provider_name = match config.agent_id.as_deref().map(str::trim) {
+        Some(agent) if driver == "acpRegistry" && plain_identifier(agent) => {
+            format!("{provider_name}: {agent}")
+        }
+        _ => provider_name,
+    };
+    let instance_id = display_name_id(id);
+    let display_name = raw
+        .display_name
+        .as_deref()
+        .map(display_name)
+        .filter(|name| !name.is_empty())
+        .or_else(|| (!provider_name.is_empty()).then(|| provider_name.clone()))
+        .unwrap_or_else(|| instance_id.clone());
+    T3CodeOther {
+        instance_id,
+        provider_name,
+        display_name,
+        enabled: resolve_enabled(raw.enabled, config.enabled, default_on),
+        gap,
+    }
+}
+
+/// A short ASCII identifier such as a driver or ACP agent id.
+fn plain_identifier(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// An instance id made safe to show and to key UI rows by.
+fn display_name_id(id: &str) -> String {
+    display_name(id)
+}
+
 /// An instance's `config`, when it is an object of the expected shape.
 fn config_of(config: &RawValue) -> Option<RawConfig> {
     if !config.get().trim_start().starts_with('{') {
@@ -684,10 +875,13 @@ fn config_of(config: &RawValue) -> Option<RawConfig> {
     serde_json::from_str(config.get()).ok()
 }
 
-/// The instance, or `None` when Toolport cannot tell which config it reads or must not
-/// look at it: its config is not an object of the expected shape, or its home folder is
-/// hidden, relative or not plainly inside the user's home.
-fn instance_of(id: &str, provider: Provider, raw: RawInstance, home: &Path) -> Option<Instance> {
+/// The instance, or why Toolport cannot tell which config it reads.
+fn instance_of(
+    id: &str,
+    provider: Provider,
+    raw: RawInstance,
+    home: &Path,
+) -> Result<Instance, T3CodeOther> {
     let display_name = raw
         .display_name
         .as_deref()
@@ -695,84 +889,93 @@ fn instance_of(id: &str, provider: Provider, raw: RawInstance, home: &Path) -> O
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| provider.default_name().into());
     let default_on = matches!(provider, Provider::ClaudeCode | Provider::Codex);
+    let gap = |gap, enabled| T3CodeOther {
+        instance_id: display_name_id(id),
+        provider_name: provider.default_name().into(),
+        display_name: display_name.clone(),
+        enabled,
+        gap,
+    };
     // A config Toolport cannot read says nothing reliable about the home: no guess.
     let config = match raw.config {
-        Some(config) => config_of(config)?,
+        Some(config) => match config_of(config) {
+            Some(config) => config,
+            None => {
+                return Err(gap(
+                    T3CodeGap::Malformed,
+                    resolve_enabled(raw.enabled, None, default_on),
+                ))
+            }
+        },
         None => RawConfig::default(),
     };
     let enabled = resolve_enabled(raw.enabled, config.enabled, default_on);
-    // `Err` when the folder is hidden (sensitive or not text) or relative to T3 Code's
-    // working directory, which Toolport cannot know.
-    let folder = |value: Result<Option<String>, ()>| -> Result<Option<PathBuf>, ()> {
-        match value?
+    let folder = |value: Result<Option<String>, ()>| -> Result<Option<PathBuf>, T3CodeOther> {
+        let value = value.map_err(|()| gap(T3CodeGap::HiddenHome, enabled))?;
+        match value
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
             None => Ok(None),
-            Some(value) if !plain_path_text(value, cfg!(windows)) => Err(()),
+            Some(value) if !plain_path_text(value, cfg!(windows)) => {
+                Err(gap(T3CodeGap::OutsideHome, enabled))
+            }
             Some(value) => match expand(value, home) {
                 Some(path) if path.is_absolute() => Ok(Some(path)),
-                _ => Err(()),
+                // Relative to T3 Code's working directory, which Toolport cannot know.
+                _ => Err(gap(T3CodeGap::RelativeHome, enabled)),
             },
         }
     };
     // Claude's and Codex's home: `homePath`, else the instance environment's variable,
     // which T3 Code passes to the provider as it is, so a `~` there is not expanded
     // (ClaudeHome.ts `resolveClaudeHomePath`, CodexAdapterV2's `CODEX_HOME`).
-    let home_or = |variable: &str| -> Result<Option<PathBuf>, ()> {
+    let home_or = |variable: &str| -> Result<Option<PathBuf>, T3CodeOther> {
         if let Some(path) = folder(Ok(config.home_path.clone()))? {
             return Ok(Some(path));
         }
-        match environment_value(&raw.environment, variable)?
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        {
+        let value = environment_value(&raw.environment, variable)
+            .map_err(|()| gap(T3CodeGap::HiddenHome, enabled))?;
+        match value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
             None => Ok(None),
-            Some(value)
-                if plain_path_text(value, cfg!(windows)) && Path::new(value).is_absolute() =>
-            {
-                Ok(Some(PathBuf::from(value)))
+            Some(value) if !plain_path_text(value, cfg!(windows)) => {
+                Err(gap(T3CodeGap::OutsideHome, enabled))
             }
-            Some(_) => Err(()),
+            Some(value) if Path::new(value).is_absolute() => Ok(Some(PathBuf::from(value))),
+            Some(_) => Err(gap(T3CodeGap::RelativeHome, enabled)),
         }
     };
     let config_path = match provider {
-        Provider::ClaudeCode => home_or("CLAUDE_CONFIG_DIR")
-            .ok()?
-            .map(|dir| claude_code_config_path(&dir)),
+        Provider::ClaudeCode => {
+            home_or("CLAUDE_CONFIG_DIR")?.map(|dir| claude_code_config_path(&dir))
+        }
         // A shadow home links the shared home's config.toml (T3 Code's
         // CodexHomeLayout), so the instance reads the shared home's MCP servers.
-        Provider::Codex => home_or("CODEX_HOME")
-            .ok()?
-            .map(|dir| codex_config_path(&dir)),
-        Provider::OpenCode => folder(environment_value(&raw.environment, "XDG_CONFIG_HOME"))
-            .ok()?
+        Provider::Codex => home_or("CODEX_HOME")?.map(|dir| codex_config_path(&dir)),
+        Provider::OpenCode => folder(environment_value(&raw.environment, "XDG_CONFIG_HOME"))?
             .map(|dir| dir.join("opencode").join("opencode.json")),
         // T3 Code's Grok driver merges the instance environment over its own, and Grok
         // reads `GROK_HOME/config.toml`, `~/.grok` by default.
-        Provider::Grok => folder(environment_value(&raw.environment, "GROK_HOME"))
-            .ok()?
+        Provider::Grok => folder(environment_value(&raw.environment, "GROK_HOME"))?
             .map(|dir| dir.join("config.toml")),
         // Pi reads its MCP servers from `PI_CODING_AGENT_DIR/mcp.json`, `~/.pi/agent` by
         // default.
-        Provider::Pi => folder(environment_value(&raw.environment, "PI_CODING_AGENT_DIR"))
-            .ok()?
+        Provider::Pi => folder(environment_value(&raw.environment, "PI_CODING_AGENT_DIR"))?
             .map(|dir| dir.join("mcp.json")),
         // T3 Code's Cursor and Kiro use the user's own default MCP config.
         Provider::Cursor | Provider::Kiro => None,
     };
     // Checked by its text alone, before anything touches the file system: a network or
     // device path, `..`, or a folder outside the user's home is never opened, resolved or
-    // listed.
+    // listed. The card still lists the instance, by its name only.
     if config_path
         .as_deref()
         .is_some_and(|path| !lexically_inside(path, home))
     {
-        return None;
+        return Err(gap(T3CodeGap::OutsideHome, enabled));
     }
-    Some(Instance {
+    Ok(Instance {
         id: id.into(),
         provider,
         display_name,
@@ -821,9 +1024,105 @@ fn display_name(raw: &str) -> String {
 /// The instances, or nothing when T3 Code is absent or its settings are unreadable.
 pub(super) fn instances() -> Vec<Instance> {
     match &*current() {
-        Reading::Instances(instances) => instances.clone(),
+        Reading::Instances(instances, _) => instances.clone(),
         _ => Vec::new(),
     }
+}
+
+/// T3 Code instances Toolport cannot connect, for the T3 Code card. Empty when T3 Code is
+/// absent or its settings are unreadable.
+pub fn other_instances() -> Vec<T3CodeOther> {
+    match &*current() {
+        Reading::Instances(instances, others) => {
+            let mut others = others.clone();
+            others.extend(home_gaps(instances));
+            others.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
+            others
+        }
+        Reading::Unreadable => {
+            let path = settings_path().unwrap_or_default();
+            let shown = home()
+                .and_then(|home| {
+                    path.strip_prefix(&home)
+                        .ok()
+                        .map(|rest| format!("~/{}", rest.display()))
+                })
+                .unwrap_or_else(|| path.display().to_string());
+            vec![T3CodeOther {
+                instance_id: String::new(),
+                provider_name: String::new(),
+                display_name: shown,
+                enabled: true,
+                gap: T3CodeGap::Unreadable,
+            }]
+        }
+        Reading::Absent => Vec::new(),
+    }
+}
+
+/// Instances with a home of their own that no Clients row covers, with why. For Claude
+/// Code and Codex: the folder does not exist yet, or it or its config file is a link or
+/// not a plain folder or file ([`walk_below_home`]). For the other providers (OpenCode,
+/// Grok, Pi), whose homes never become rows by themselves: a link or not plain as for
+/// Claude Code and Codex, and otherwise, existing or not, a home to add by hand. A home
+/// the page lists anyway (a client's main config, a profile, a launcher or a saved
+/// location) is not one. Only homes that passed [`lexically_inside`] get here. A home that
+/// passed the walk is compared with the listed rows by where it resolves to; one that did
+/// not is compared by its text only, so nothing it names is followed.
+fn home_gaps(instances: &[Instance]) -> Vec<T3CodeOther> {
+    let Some(home) = home() else {
+        return Vec::new();
+    };
+    let real_home = std::fs::canonicalize(&home).ok();
+    // Listing the locations scans launchers; only done when a home needs it.
+    let mut listed: Option<Vec<locations::ClientLocation>> = None;
+    instances
+        .iter()
+        .filter_map(|instance| {
+            let path = instance.config_path.as_deref()?;
+            let walk = walk_below_home(path, &home);
+            let gap = if matches!(instance.provider, Provider::ClaudeCode | Provider::Codex) {
+                match walk {
+                    HomeWalk::Plain => return None,
+                    HomeWalk::Missing => T3CodeGap::MissingHome,
+                    HomeWalk::Link | HomeWalk::NotPlain => T3CodeGap::LinkedHome,
+                }
+            } else {
+                // These homes only label rows that already exist, so one with no row is
+                // listed whether its folder exists or not.
+                match walk {
+                    HomeWalk::Plain | HomeWalk::Missing => T3CodeGap::UnlistedHome,
+                    HomeWalk::Link | HomeWalk::NotPlain => T3CodeGap::LinkedHome,
+                }
+            };
+            // The same text below the resolved home, for rows listed by resolved path.
+            let below: PathBuf = path.components().skip(home.components().count()).collect();
+            let resolved = real_home.as_ref().map(|root| root.join(&below));
+            // Only a home that passed the walk may be resolved to compare it.
+            let plain = walk == HomeWalk::Plain;
+            let names = |other: &Path| {
+                same_text(other, path)
+                    || resolved.as_deref().is_some_and(|r| same_text(other, r))
+                    || (plain && locations::same_path(other, path))
+            };
+            let client_type = instance.provider.client_type();
+            if client_config_path_for_type(client_type).is_some_and(|main| names(&main))
+                || listed
+                    .get_or_insert_with(locations::all)
+                    .iter()
+                    .any(|row| row.client_type == client_type && names(&row.config_path))
+            {
+                return None;
+            }
+            Some(T3CodeOther {
+                instance_id: display_name_id(&instance.id),
+                provider_name: instance.provider.default_name().into(),
+                display_name: instance.display_name.clone(),
+                enabled: instance.enabled,
+                gap,
+            })
+        })
+        .collect()
 }
 
 fn default_config_path(provider: Provider) -> Option<PathBuf> {
@@ -872,7 +1171,9 @@ pub(super) fn path_is_safe(config: &Path) -> bool {
 }
 
 /// Locations for T3 Code's Claude Code and Codex homes that are not a client's main
-/// config and that `known` does not already list. Homes whose folder does not exist yet are left out until it does.
+/// config and that `known` does not already list. Homes whose folder does not exist yet
+/// are left out until it does; [`other_instances`] lists them, and the other homes left
+/// out, on the card.
 pub(super) fn automatic(known: &[locations::ClientLocation]) -> Vec<locations::ClientLocation> {
     let mut rows: Vec<locations::ClientLocation> = Vec::new();
     // Only Claude Code and Codex homes become rows; other providers' homes only label

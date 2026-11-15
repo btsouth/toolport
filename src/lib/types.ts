@@ -69,6 +69,36 @@ export interface T3CodeUse {
   enabled: boolean;
 }
 
+/** A T3 Code instance Toolport cannot connect (src-tauri/src/clients/t3code.rs). */
+export interface T3CodeOther {
+  instanceId: string;
+  /** The provider as T3 Code names it, such as "Muse Code". */
+  providerName: string;
+  displayName: string;
+  enabled: boolean;
+  /** `unsupported`: no Toolport client yet. `privateHome`: T3 Code gives it a private
+   * settings folder (Antigravity). `unreadable`: T3 Code's settings file can't be read.
+   * `malformed`: this instance's entry or config can't be read. `hiddenHome`: its home
+   * folder variable is sensitive or not plain text. `relativeHome`: its home folder is a
+   * relative path. `outsideHome`: its home folder isn't inside the user's home (judged by
+   * its text alone). `linkedHome`: its home folder or config file is a link or not a plain
+   * folder or file. `missingHome`: its home folder doesn't exist yet. `unlistedHome`: an
+   * OpenCode, Grok or Pi home, existing or not, that no Clients row covers; Toolport makes
+   * rows only for Claude Code and Codex homes. `providerName` is empty when the driver
+   * can't be shown. */
+  gap:
+    | "unsupported"
+    | "privateHome"
+    | "unreadable"
+    | "malformed"
+    | "hiddenHome"
+    | "relativeHome"
+    | "outsideHome"
+    | "linkedHome"
+    | "missingHome"
+    | "unlistedHome";
+}
+
 /** What tells one Claude Code profile apart (src-tauri/src/clients/claude_profiles.rs). */
 export interface ClaudeProfile {
   /** `claude`, or the launcher script or alias that sets CLAUDE_CONFIG_DIR to it. */
