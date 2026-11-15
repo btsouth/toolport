@@ -2542,7 +2542,7 @@ pub fn connect_client_stdio(
     })
 }
 
-const CLIENT_HTTP_VAULT_SERVER: &str = "__toolport_http_clients__";
+pub(crate) const CLIENT_HTTP_VAULT_SERVER: &str = "__toolport_http_clients__";
 
 fn random_token() -> Result<String, String> {
     let mut bytes = [0u8; 24];
@@ -2580,6 +2580,28 @@ fn disconnect_client_with_revocation(
     client_id: &str,
     revoke: impl FnOnce() -> Result<(), String>,
 ) -> Result<ClientMutationResult, String> {
+    disconnect_client_with(client_id, update_registry_on_disk, revoke)
+}
+
+fn update_registry_on_disk(apply: &dyn Fn(&mut Registry)) -> Result<Registry, String> {
+    let (registry, ()) = registry::update(|registry| {
+        apply(registry);
+        Ok(())
+    })?;
+    Ok(registry)
+}
+
+/// The one Disconnect path for both shells. `update_registry` persists the
+/// registry change it is handed (GTK writes the file; the Tauri shell also
+/// refreshes its in-memory registry), and a failure there rolls the client
+/// config back. `revoke` deletes the vaulted Shared HTTP bearer after its
+/// registry row is gone; a failure there is reported as a warning because the
+/// bearer no longer authenticates.
+pub(crate) fn disconnect_client_with(
+    client_id: &str,
+    update_registry: impl FnOnce(&dyn Fn(&mut Registry)) -> Result<Registry, String>,
+    revoke: impl FnOnce() -> Result<(), String>,
+) -> Result<ClientMutationResult, String> {
     let current = read_registry_exact_or_default()?;
     let http_id = format!("client:{client_id}");
     let has_shared_http_token = current
@@ -2588,25 +2610,23 @@ fn disconnect_client_with_revocation(
         .any(|client| client.id == http_id);
     if !has_shared_http_token {
         return disconnect_client_stdio_with(client_id, false, |_| {
-            let (registry, ()) = registry::update(|registry| {
+            update_registry(&|registry| {
                 registry.set_client_scope(client_id, None);
                 registry.clear_client_managed_entry(client_id);
-                Ok(())
-            })?;
-            Ok(registry)
+            })
         });
     }
 
     let _lock = acquire_auth_lock(&format!("client-config:{client_id}"))?;
     let outcome = clients::uninstall_gateway(client_id)?;
     let mut result = finish_client_config_mutation(outcome, |_| {
-        let (registry, ()) = registry::update(|registry| {
+        update_registry(&|registry| {
             registry.set_client_scope(client_id, None);
             registry.clear_client_managed_entry(client_id);
+            // The row is what authenticates the bearer, so dropping it in the
+            // same write as the scope revokes the token atomically.
             registry.http_clients.retain(|row| row.id != http_id);
-            Ok(())
-        })?;
-        Ok(registry)
+        })
     })?;
     finish_http_disconnect(client_id, &mut result, revoke)?;
     Ok(result)

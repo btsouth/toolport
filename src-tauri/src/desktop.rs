@@ -574,52 +574,6 @@ async fn install_gateway(
     .map_err(|e| format!("install task join failed: {e}"))?
 }
 
-/// Drop the managed shared-HTTP bearer for this client (registry row, then vault).
-///
-/// `delete_secret` already treats a missing vault entry as success (WS3-4), so
-/// Disconnect is not blocked when the bearer was never stored. A real vault or
-/// `http_clients` persist failure is returned so uninstall cannot report Ok
-/// while the token is still live (SBS-845).
-fn revoke_client_http_token(state: &RegistryState, client_id: &str) -> Result<(), String> {
-    revoke_client_http_token_with(state, client_id, crate::secrets::delete_secret)
-}
-
-/// [`revoke_client_http_token`] with the vault delete injected.
-///
-/// Split out because the real vault is not reachable on every platform the
-/// tests run on: headless Linux CI has no Secret Service, and the macOS
-/// data-protection keychain needs a signed build (the same reason
-/// `secrets::tests::set_get_delete_round_trip` is `ignore`d there). A test that
-/// called it would assert on the machine rather than on this function, so tests
-/// pass a stub while production passes [`crate::secrets::delete_secret`].
-fn revoke_client_http_token_with(
-    state: &RegistryState,
-    client_id: &str,
-    delete_vaulted_token: impl FnOnce(&str, &str) -> Result<(), String>,
-) -> Result<(), String> {
-    const VAULT_SERVER: &str = "__toolport_http_clients__";
-    let http_id = format!("client:{client_id}");
-    // Drop the registry row FIRST. `resolve_http_caller` authenticates a bearer
-    // through `http_client_for_token`, which matches the row's `token_sha256`;
-    // the vault copy is never consulted on the auth path. So the row is the
-    // thing that grants access, and removing it revokes the bearer even if the
-    // vault step below then fails. The reverse order fails open: a vault error
-    // would return early with the row still registered and the bearer still
-    // authenticating. An orphaned vault entry is a hygiene problem; a live
-    // bearer after a failed revoke is a security one.
-    write_registry(state, |reg| {
-        reg.http_clients.retain(|c| c.id != http_id);
-        Ok(())
-    })?;
-    // A failed persist above means nothing was revoked, so the vault copy is
-    // deliberately left alone: the bearer it belongs to is still registered.
-    // Past this point the bearer is already dead, but a vault failure is still
-    // returned, because uninstall must not report a clean Disconnect while a
-    // copy of the token is left on the machine.
-    delete_vaulted_token(VAULT_SERVER, client_id)?;
-    Ok(())
-}
-
 #[tauri::command]
 async fn list_client_recoveries() -> Result<Vec<clients::recovery::ClientRecovery>, String> {
     tauri::async_runtime::spawn_blocking(clients::recovery::list)
@@ -688,8 +642,8 @@ async fn dismiss_client_recovery(id: String, dismissed: bool) -> Result<(), Stri
 /// Remove the Toolport gateway from a client.
 ///
 /// Runs on the blocking pool for the same reason as [`install_gateway`]
-/// (SBS-818): `revoke_client_http_token` deletes the vaulted bearer, which is a
-/// synchronous Secret Service round trip on Linux.
+/// (SBS-818): revoking a Shared HTTP bearer deletes it from the vault, which is
+/// a synchronous Secret Service round trip on Linux.
 #[tauri::command]
 async fn uninstall_gateway(
     app: AppHandle,
@@ -697,22 +651,38 @@ async fn uninstall_gateway(
 ) -> Result<clients::WriteOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<RegistryState>();
-        let mut outcome = clients::uninstall_gateway(&client_id)?;
-        // Config entry is gone; also revoke the bridge bearer so a leftover backup or
-        // stale token cannot keep authenticating (WS3-4). A vault or registry
-        // failure must fail Disconnect — the bearer is still live (SBS-845).
-        revoke_client_http_token(state.inner(), &client_id)?;
-        write_registry(state.inner(), |reg| {
-            reg.set_client_scope(&client_id, None);
-            reg.clear_client_managed_entry(&client_id);
-            Ok(())
-        })?;
-        let warnings = clients::finish_uninstall_with_warnings(&client_id, &outcome)?;
-        outcome.warnings.extend(warnings);
-        Ok(outcome)
+        disconnect_client_in_app(state.inner(), &client_id, crate::secrets::delete_secret)
     })
     .await
     .map_err(|e| format!("uninstall task join failed: {e}"))?
+}
+
+/// The body of [`uninstall_gateway`]: the GTK shell's Disconnect
+/// ([`crate::registry_controller::disconnect_client`]) with this app's registry
+/// writer, so the in-memory registry follows the write and a failed write rolls
+/// the client config back. The vault delete is injected for tests.
+fn disconnect_client_in_app(
+    state: &RegistryState,
+    client_id: &str,
+    delete_vaulted_token: impl FnOnce(&str, &str) -> Result<(), String>,
+) -> Result<clients::WriteOutcome, String> {
+    crate::registry_controller::disconnect_client_with(
+        client_id,
+        |apply| {
+            let (registry, ()) = write_registry(state, |registry| {
+                apply(registry);
+                Ok(())
+            })?;
+            Ok(registry)
+        },
+        || {
+            delete_vaulted_token(
+                crate::registry_controller::CLIENT_HTTP_VAULT_SERVER,
+                client_id,
+            )
+        },
+    )
+    .map(|result| result.outcome)
 }
 
 #[tauri::command]
@@ -1936,10 +1906,10 @@ fn write_registry<T>(
     Ok((reg, out))
 }
 
-/// Process-global test hook for SBS-845. Tests that set it must hold
-/// [`REVOKE_HOOK_LOCK`] so a leftover flag cannot leak into another case.
-/// The vault half of the revoke needs no hook: it is injected instead, via
-/// [`revoke_client_http_token_with`].
+/// Process-global test hook that fails the next [`write_registry`]. Tests that
+/// set it must hold [`REVOKE_HOOK_LOCK`] so a leftover flag cannot leak into
+/// another case. The vault delete needs no hook: it is injected instead, via
+/// [`disconnect_client_in_app`].
 #[cfg(test)]
 static FAIL_NEXT_REGISTRY_WRITE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -7186,14 +7156,6 @@ mod tests {
         assert_eq!(supplied_secret(None), None);
     }
 
-    // ----- SBS-845: Disconnect must not succeed while the bearer is still live --
-    //
-    // These drive `revoke_client_http_token_with` rather than the real vault:
-    // headless Linux CI has no Secret Service, so a real `delete_secret` fails
-    // there and every case would assert on the runner instead of on the revoke
-    // logic. What is under test is which failures propagate and what each one
-    // leaves behind, so the vault result is injected.
-
     fn fail_next_registry_write() {
         FAIL_NEXT_REGISTRY_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -7202,42 +7164,43 @@ mod tests {
         FAIL_NEXT_REGISTRY_WRITE.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Scratch data dir + seeded `http_clients` row. Holds the process-global
-    /// hook lock and `data_dir_test_lock` so persist and injected failures cannot
-    /// interleave with another test.
-    ///
-    /// Field order IS drop order (unlike locals, struct fields drop in declaration
-    /// order), so the override is declared before the guards that protect it. The
-    /// other way round, teardown released `data_dir_test_lock` while this fixture's
-    /// `DataDirOverride` was still installed; the next test could take the lock and
-    /// install its own override, only for this drop to land and clear it. That
-    /// test's `registry::load()` then read the REAL data dir, where its seeded
-    /// `http_clients` row does not exist.
-    ///
-    /// `_generation` is held for the same reason, but against a different race:
-    /// this fixture's revoke path calls `write_registry`, which bumps the global
-    /// `REGISTRY_GENERATION`. The watcher tests sample that counter before their
-    /// load and refuse to publish if it moved, so a revoke landing in that window
-    /// turned their `Applied` into `LostRace`. Acquired first and declared last,
-    /// so it is taken before and released after the other two.
-    struct RevokeFixture {
+    // ----- React Disconnect goes through the registry controller -------------
+    //
+    // `disconnect_client_in_app` is the body of the `uninstall_gateway` command.
+    // These drive it against a scratch Claude Code config and data dir. The
+    // vault delete is injected: headless Linux CI has no Secret Service, so a
+    // real `delete_secret` would assert on the runner instead of on Disconnect.
+
+    /// Scratch Claude Code home and data dir with Toolport connected through the
+    /// stdio adapter. `GEN_TEST_LOCK` is held because `write_registry` bumps the
+    /// registry generation the watcher tests sample; the rest follow the
+    /// controller's `MoveFixture` order. Fields drop in declaration order, so the
+    /// env vars and data dir are put back before the locks are released.
+    struct DisconnectFixture {
+        root: std::path::PathBuf,
+        _vars: Vec<clients::EnvRestore>,
         _override: crate::registry::DataDirOverride,
+        _env: std::sync::MutexGuard<'static, ()>,
+        _registry_env: std::sync::MutexGuard<'static, ()>,
         _data_dir: std::sync::MutexGuard<'static, ()>,
         _hooks: std::sync::MutexGuard<'static, ()>,
         _generation: std::sync::MutexGuard<'static, ()>,
         state: RegistryState,
-        client_id: String,
-        http_id: String,
+        connected: String,
     }
 
-    impl Drop for RevokeFixture {
+    impl Drop for DisconnectFixture {
         fn drop(&mut self) {
             clear_revoke_hooks();
+            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 
-    impl RevokeFixture {
-        fn new(label: &str) -> Self {
+    impl DisconnectFixture {
+        const CLIENT: &'static str = "claude-code";
+        const ORIGINAL: &'static str = "{\"mcpServers\":{}}";
+
+        fn new(label: &str, shared_http: bool) -> Self {
             let generation = GEN_TEST_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -7246,113 +7209,195 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             clear_revoke_hooks();
             let data_dir = crate::registry::data_dir_test_lock();
-            let dir = unique_update_test_dir(label);
-            std::fs::create_dir_all(&dir).unwrap();
-            let over = crate::registry::DataDirOverride::set(&dir);
-            let client_id = "cursor".to_string();
-            let http_id = format!("client:{client_id}");
+            let registry_env = crate::registry::REGISTRY_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let env = clients::env_test_lock();
+            let root = unique_update_test_dir(label);
+            for dir in ["data", "claude"] {
+                std::fs::create_dir_all(root.join(dir)).unwrap();
+            }
+            let over = crate::registry::DataDirOverride::set(root.join("data"));
+            let vars = vec![
+                clients::EnvRestore::set("CLAUDE_CONFIG_DIR", &root.join("claude")),
+                clients::EnvRestore::set(
+                    "TOOLPORT_SECRET_KEY",
+                    std::path::Path::new("synthetic-disconnect-fixture"),
+                ),
+            ];
             let mut reg = Registry::default();
-            reg.http_clients.push(registry::HttpClient {
-                id: http_id.clone(),
-                label: format!("Client: {client_id}"),
-                token_sha256: registry::sha256_hex("leftover-bearer"),
-                profile: String::new(),
-                unknown_fields: Default::default(),
-            });
+            if shared_http {
+                reg.http_clients.push(registry::HttpClient {
+                    id: format!("client:{}", Self::CLIENT),
+                    label: "Claude Code".into(),
+                    token_sha256: registry::sha256_hex("synthetic-bearer"),
+                    profile: String::new(),
+                    unknown_fields: Default::default(),
+                });
+            }
             registry::save(&reg).unwrap();
+            let config = root.join("claude").join(".claude.json");
+            std::fs::write(&config, Self::ORIGINAL).unwrap();
+            let outcome = clients::install_gateway(Self::CLIENT, None).unwrap();
+            registry::update(|reg| {
+                reg.set_client_unscoped(Self::CLIENT);
+                reg.set_client_managed_entry(Self::CLIENT, outcome.managed.clone().unwrap());
+                Ok(())
+            })
+            .unwrap();
+            let connected = std::fs::read_to_string(&config).unwrap();
+            assert_ne!(connected, Self::ORIGINAL);
             Self {
+                root,
+                _vars: vars,
                 _override: over,
+                _env: env,
+                _registry_env: registry_env,
                 _data_dir: data_dir,
                 _hooks: hooks,
                 _generation: generation,
-                state: Mutex::new(reg),
-                client_id,
-                http_id,
+                state: Mutex::new(registry::load().unwrap()),
+                connected,
             }
         }
 
-        fn http_row_present(&self) -> bool {
-            let on_disk = registry::load().expect("scratch registry loads");
-            on_disk.http_clients.iter().any(|c| c.id == self.http_id)
+        fn config(&self) -> String {
+            std::fs::read_to_string(self.root.join("claude").join(".claude.json")).unwrap()
+        }
+
+        fn client_registered(reg: &Registry) -> bool {
+            reg.client_scopes.contains_key(Self::CLIENT)
+                || reg.client_managed_entries.contains_key(Self::CLIENT)
+        }
+
+        fn http_row_present(reg: &Registry) -> bool {
+            let http_id = format!("client:{}", Self::CLIENT);
+            reg.http_clients.iter().any(|c| c.id == http_id)
+        }
+
+        fn cached(&self) -> Registry {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
     }
 
+    /// F1 for the React shell: a registry write that fails after Disconnect
+    /// changed the client config puts the config back from the backup this
+    /// Disconnect took, instead of leaving the client half disconnected.
     #[test]
-    fn revoke_client_http_token_fails_when_vault_delete_fails() {
-        let fixture = RevokeFixture::new("sbs-845-vault-delete");
-        let err = revoke_client_http_token_with(
-            &fixture.state,
-            &fixture.client_id,
-            |_server, _client| Err("the keychain is locked".into()),
-        )
-        .expect_err("a failed vault delete must not look like a successful disconnect");
-        assert!(
-            err.contains("the keychain is locked"),
-            "the vault failure must reach the caller verbatim, got: {err}"
-        );
-        // The point of the ordering: the row is dropped before the vault is
-        // touched, so a keychain failure still revokes the bearer. The caller
-        // is told the disconnect was not clean (an orphaned vault entry is
-        // left), but the token can no longer authenticate.
-        assert!(
-            !fixture.http_row_present(),
-            "the bearer must be revoked even when the vault delete fails"
-        );
+    fn react_disconnect_rolls_the_client_config_back_when_the_registry_write_fails() {
+        let fixture = DisconnectFixture::new("react-disconnect-rollback", false);
+        fail_next_registry_write();
+        let err =
+            disconnect_client_in_app(&fixture.state, DisconnectFixture::CLIENT, |_, _| Ok(()))
+                .expect_err("a failed registry write must fail Disconnect");
+        assert!(err.contains("injected registry write"), "{err}");
+        assert!(err.contains("rolled back"), "{err}");
+        assert_eq!(fixture.config(), fixture.connected);
+        let on_disk = registry::load().unwrap();
+        assert!(DisconnectFixture::client_registered(&on_disk));
+        assert!(DisconnectFixture::client_registered(&fixture.cached()));
     }
 
     #[test]
-    fn revoke_client_http_token_fails_when_registry_write_fails() {
-        let fixture = RevokeFixture::new("sbs-845-registry-write");
+    fn react_disconnect_returns_the_outcome_and_clears_the_client() {
+        let fixture = DisconnectFixture::new("react-disconnect-success", false);
         let vault_called = std::cell::Cell::new(false);
-        fail_next_registry_write();
-        let err = revoke_client_http_token_with(
-            &fixture.state,
-            &fixture.client_id,
-            |_server, _client| {
+        let outcome =
+            disconnect_client_in_app(&fixture.state, DisconnectFixture::CLIENT, |_, _| {
                 vault_called.set(true);
+                Ok(())
+            })
+            .expect("Disconnect succeeds");
+        let config = fixture.root.join("claude").join(".claude.json");
+        assert_eq!(outcome.path, config.display().to_string());
+        assert!(outcome.restored.is_empty(), "{:?}", outcome.restored);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let after: serde_json::Value = serde_json::from_str(&fixture.config()).unwrap();
+        assert!(after["mcpServers"]
+            .get(clients::GATEWAY_ENTRY_NAME)
+            .is_none());
+        let on_disk = registry::load().unwrap();
+        assert!(!DisconnectFixture::client_registered(&on_disk));
+        // The app's cached registry follows the write.
+        assert!(!DisconnectFixture::client_registered(&fixture.cached()));
+        // A stdio client has no Shared HTTP bearer to revoke.
+        assert!(!vault_called.get());
+    }
+
+    /// React can still disconnect a Shared HTTP client: the bearer row goes in
+    /// the same registry write as the scope, then the vault copy is deleted.
+    #[test]
+    fn react_disconnect_of_a_shared_http_client_revokes_the_bearer() {
+        let fixture = DisconnectFixture::new("react-disconnect-http", true);
+        let deleted = std::cell::RefCell::new(Vec::new());
+        let outcome = disconnect_client_in_app(
+            &fixture.state,
+            DisconnectFixture::CLIENT,
+            |server, client| {
+                deleted
+                    .borrow_mut()
+                    .push((server.to_string(), client.to_string()));
                 Ok(())
             },
         )
-        .expect_err("a failed http_clients persist must not look like a successful disconnect");
-        assert!(
-            err.contains("injected registry write"),
-            "expected the injected registry failure, got: {err}"
-        );
-        assert!(
-            fixture.http_row_present(),
-            "a failed persist must leave the http_clients row registered"
-        );
-        // Nothing was revoked, so the vault copy must survive: it still belongs
-        // to a bearer that is registered and can authenticate. Deleting it here
-        // would strip Toolport's own record of a token that still works.
-        assert!(
-            !vault_called.get(),
-            "a failed persist must not delete the vaulted bearer"
-        );
-    }
-
-    #[test]
-    fn revoke_client_http_token_drops_the_http_clients_row() {
-        let fixture = RevokeFixture::new("sbs-845-success");
-        let deleted = std::cell::RefCell::new(Vec::new());
-        revoke_client_http_token_with(&fixture.state, &fixture.client_id, |server, client| {
-            deleted
-                .borrow_mut()
-                .push((server.to_string(), client.to_string()));
-            Ok(())
-        })
-        .expect("a successful vault delete must not block Disconnect");
+        .expect("a Shared HTTP client can be disconnected");
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
         assert_eq!(
             deleted.into_inner(),
             vec![(
                 "__toolport_http_clients__".to_string(),
-                fixture.client_id.clone()
-            )],
-            "the vaulted bearer must be deleted under the shared-HTTP namespace"
+                DisconnectFixture::CLIENT.to_string()
+            )]
         );
+        let on_disk = registry::load().unwrap();
+        assert!(!DisconnectFixture::http_row_present(&on_disk));
+        assert!(!DisconnectFixture::client_registered(&on_disk));
+        assert!(!DisconnectFixture::http_row_present(&fixture.cached()));
+    }
+
+    /// A failed vault delete after the row is gone no longer fails Disconnect:
+    /// the bearer cannot authenticate, the config and registry already changed,
+    /// so the leftover keychain copy is reported as a warning (same as GTK).
+    #[test]
+    fn react_disconnect_reports_a_failed_vault_delete_as_a_warning() {
+        let fixture = DisconnectFixture::new("react-disconnect-vault", true);
+        let outcome =
+            disconnect_client_in_app(&fixture.state, DisconnectFixture::CLIENT, |_, _| {
+                Err("the keychain is locked".into())
+            })
+            .expect("the bearer is revoked even when the vault delete fails");
         assert!(
-            !fixture.http_row_present(),
-            "success means the bearer is gone from the registry"
+            outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("the keychain is locked")),
+            "{:?}",
+            outcome.warnings
         );
+        let on_disk = registry::load().unwrap();
+        assert!(!DisconnectFixture::http_row_present(&on_disk));
+    }
+
+    /// A failed registry write on a Shared HTTP client keeps the bearer row and
+    /// its vault copy, and rolls the config back.
+    #[test]
+    fn react_disconnect_of_a_shared_http_client_keeps_the_bearer_when_the_write_fails() {
+        let fixture = DisconnectFixture::new("react-disconnect-http-rollback", true);
+        let vault_called = std::cell::Cell::new(false);
+        fail_next_registry_write();
+        let err = disconnect_client_in_app(&fixture.state, DisconnectFixture::CLIENT, |_, _| {
+            vault_called.set(true);
+            Ok(())
+        })
+        .expect_err("a failed registry write must fail Disconnect");
+        assert!(err.contains("rolled back"), "{err}");
+        assert_eq!(fixture.config(), fixture.connected);
+        let on_disk = registry::load().unwrap();
+        assert!(DisconnectFixture::http_row_present(&on_disk));
+        assert!(DisconnectFixture::client_registered(&on_disk));
+        assert!(!vault_called.get());
     }
 }
