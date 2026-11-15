@@ -47028,7 +47028,7 @@ mod tests {
                 .as_u64()
                 .unwrap_or(CLAUDE_RESULT_CHARS_DEFAULT as u64) as usize
         };
-        let call = |name: &str, arguments: Value| {
+        let call_on = |router: &Router, name: &str, arguments: Value| {
             let req = json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": { "name": name, "arguments": arguments }
@@ -47037,7 +47037,7 @@ mod tests {
                 &host,
                 &req,
                 &reg,
-                &router,
+                router,
                 &[],
                 true,
                 None,
@@ -47048,11 +47048,20 @@ mod tests {
             .unwrap()["result"]
                 .clone()
         };
+        let call = |name: &str, arguments: Value| call_on(&router, name, arguments);
         let mut outputs = Vec::new();
 
         // toolport_call_tool: the largest per-server budget in scope.
         let called = call("toolport_call_tool", json!({ "name": "s__big" }));
         outputs.push(("toolport_call_tool", "call", called));
+        // Text whose JSON encoding is much longer than the text itself (escaped
+        // backslashes, quotes and control characters) is still the body, not an
+        // oversized envelope, so it is shaped too.
+        for escaped in ["\\".repeat(300_000), "\\\"\u{1}é".repeat(60_000)] {
+            let router = paging_router(escaped);
+            let called = call_on(&router, "toolport_call_tool", json!({ "name": "s__big" }));
+            outputs.push(("toolport_call_tool", "escaped", called));
+        }
 
         // toolport_fetch_result: a default page and a structured projection.
         let structured = json!({ "rows": vec!["r😀".repeat(50); 6_000] });
@@ -47074,6 +47083,24 @@ mod tests {
             json!({ "cursor": cursor, "projection": "rows" }),
         );
         outputs.push(("toolport_fetch_result", "projection", projection));
+        let escaped = json!({ "s": "\\".repeat(60_000), "q": "\"\u{1}".repeat(30_000) });
+        let escaped_cursor = shaping::stash_payload(body.clone(), Some(escaped), None).unwrap();
+        for path in ["s", "q"] {
+            let projection = call(
+                "toolport_fetch_result",
+                json!({ "cursor": escaped_cursor, "projection": path }),
+            );
+            outputs.push(("toolport_fetch_result", "escaped projection", projection));
+        }
+        // Error replies echo a short preview of what they were given, never all of it.
+        let huge = "x".repeat(100_001);
+        let echoes = [
+            call("toolport_fetch_result", json!({ "cursor": huge })),
+            call(
+                "toolport_fetch_result",
+                json!({ "cursor": cursor, "projection": huge }),
+            ),
+        ];
 
         // toolport_run_script: a large aggregate and a large failure.
         for script in [
@@ -47101,6 +47128,13 @@ mod tests {
         assert_eq!(hint("toolport_call_tool"), 150_000);
         assert_eq!(hint("toolport_fetch_result"), 100_000);
         assert_eq!(hint("toolport_run_script"), 100_000);
+        for echo in echoes {
+            assert!(
+                claude_text_chars(&echo) < 400,
+                "{}",
+                &echo.to_string()[..400]
+            );
+        }
         for (tool, case, output) in outputs {
             let chars = claude_text_chars(&output);
             assert!(

@@ -93,7 +93,12 @@ are sent to every client.
   back shaped like any other large result, with a cursor to page the projected JSON
   (projections exist to cut a result down, so they follow the same budget). Script
   results and failures are shaped with the global budget, and a successful
-  `toolport_call_tool` result gets no Toolport text after shaping. Two kinds of
+  `toolport_call_tool` result gets no Toolport text after shaping. The budget counts
+  text as the result encodes it, so heavily escaped text (backslashes, quotes,
+  control characters) is shaped like any other text. A page cut by the budget says
+  so in its footer, and a shaped projection says its text is a fragment, not
+  complete JSON. Error replies quote at most a short preview of the cursor or
+  projection they were given. Two kinds of
   result are passed through whole because shaping would drop data: results with
   non-text blocks (images, audio, resource links) and results whose envelope outweighs
   their text. Those are not budget-bound, and Claude's own file fallback applies to

@@ -239,7 +239,19 @@ fn extract_body(result: &Value) -> (String, usize) {
             }
         }
     }
-    let mut source_bytes = out.len();
+    // The body's share of the serialized result is its JSON-encoded size, not its raw
+    // size: escaping (backslashes, quotes, control characters) belongs to the body.
+    let mut source_bytes = result
+        .get("content")
+        .and_then(|c| c.as_array())
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .map(json_string_len)
+                .sum()
+        })
+        .unwrap_or(0);
     if let Some(sc) = result.get("structuredContent") {
         let structured_text = serde_json::to_string(sc).unwrap_or_default();
         source_bytes += structured_text.len() + usize::from(!out.is_empty());
@@ -266,6 +278,46 @@ fn extract_body(result: &Value) -> (String, usize) {
     (out, source_bytes)
 }
 
+/// Bytes `s` takes as a JSON string, quotes included, as serde_json writes it.
+fn json_string_len(s: &str) -> usize {
+    2 + s.chars().map(json_char_len).sum::<usize>()
+}
+
+fn json_char_len(ch: char) -> usize {
+    match ch {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        ch if (ch as u32) < 0x20 => 6,
+        ch => ch.len_utf8(),
+    }
+}
+
+/// The longest char-boundary prefix of `s` whose JSON-encoded length (without
+/// quotes) is at most `max_bytes`. Heavily escaped text takes more room in the result
+/// than its raw bytes, so the head is measured the way the result is.
+fn head_within_encoded_bytes(s: &str, max_bytes: usize) -> &str {
+    let mut used = 0;
+    for (i, ch) in s.char_indices() {
+        used += json_char_len(ch);
+        if used > max_bytes {
+            return &s[..i];
+        }
+    }
+    s
+}
+
+/// A short preview of a caller-supplied value for an error message, so an error never
+/// echoes an argument of any size back into the model's context.
+fn preview(value: &str) -> String {
+    const LIMIT: usize = 48;
+    let mut chars = value.chars();
+    let head: String = chars.by_ref().take(LIMIT).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 fn value_size(value: &Value) -> usize {
     serde_json::to_string(value).map(|s| s.len()).unwrap_or(0)
 }
@@ -288,25 +340,6 @@ fn project<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
     }
 
     Some(current)
-}
-
-/// The longest char-boundary prefix of `s` whose UTF-8 length is at most
-/// `max_bytes`. Truncating by char COUNT alone would let a multi-byte body (CJK,
-/// emoji) emit several times the byte budget; this honors the byte budget exactly
-/// while never splitting a code point.
-fn head_within_bytes(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let mut end = 0;
-    for (i, ch) in s.char_indices() {
-        let next = i + ch.len_utf8();
-        if next > max_bytes {
-            break;
-        }
-        end = next;
-    }
-    &s[..end]
 }
 
 /// True if every content block is text, so the text projection in [`extract_body`]
@@ -454,11 +487,16 @@ fn shape_inner(
     // floor won whenever `budget - reserve - preserved` fell below it. The final
     // fit-check below is what actually enforces the contract; this is only the
     // starting estimate.
-    let min_head_bytes = min_head_bytes.min(body.len());
+    // The protected prefix is given in raw bytes; measure it the way the head is.
+    let mut prefix_end = min_head_bytes.min(body.len());
+    while !body.is_char_boundary(prefix_end) {
+        prefix_end -= 1;
+    }
+    let min_head_bytes = json_string_len(&body[..prefix_end]) - 2;
     let mut head_byte_limit = budget
         .saturating_sub(512 + preserved_bytes)
         .max(min_head_bytes);
-    let head = head_within_bytes(&body, head_byte_limit).to_string();
+    let head = head_within_encoded_bytes(&body, head_byte_limit).to_string();
     let is_error = result
         .get("isError")
         .and_then(|v| v.as_bool())
@@ -530,7 +568,7 @@ fn shape_inner(
     let mut shaped = build(&head);
     // Shrink until it fits. Each pass subtracts the exact overage, so this
     // converges immediately in practice; the bound is a guard, not a search.
-    for _ in 0..4 {
+    for _ in 0..8 {
         let shaped_size = serde_json::to_string(&shaped).map(|s| s.len()).unwrap_or(0);
         if shaped_size <= budget || head.is_empty() {
             break;
@@ -539,7 +577,7 @@ fn shape_inner(
         head_byte_limit = head_byte_limit
             .saturating_sub(overage.max(1))
             .max(min_head_bytes);
-        head = head_within_bytes(&head, head_byte_limit).to_string();
+        head = head_within_encoded_bytes(&head, head_byte_limit).to_string();
         shaped = build(&head);
     }
 
@@ -598,8 +636,8 @@ pub fn stash_payload(
 }
 
 /// Room a model-facing page keeps under the budget for its footer, which is at most
-/// about 210 bytes with five 20-digit numbers.
-const PAGE_FOOTER_RESERVE_BYTES: usize = 256;
+/// about 250 bytes with five 20-digit numbers.
+const PAGE_FOOTER_RESERVE_BYTES: usize = 320;
 
 /// Return the next slice of a cached shaped result, by cursor + character offset.
 /// `len` of 0 means "use the current budget" (the whole rest when it is 0). This is
@@ -676,8 +714,25 @@ pub fn fetch_result_for_model_visible(
         Some(budget),
         visible,
     );
-    if projection.is_some() && result["isError"] != true {
-        shape_result(&mut result, budget, requester);
+    if let Some(path) = projection.filter(|_| result["isError"] != true) {
+        // A projection cut to the budget is a fragment of its JSON. Say so, inside the
+        // budget, so a model never parses the head as the whole value.
+        let notice = format!(
+            "\n[Toolport: the text above is the start of projection \"{}\", not complete \
+             JSON. Page the rest with the cursor above.]",
+            preview(path)
+        );
+        let reserve = json_string_len(&notice);
+        if budget > reserve
+            && shape_result(&mut result, budget - reserve, requester)
+            && result["content"][0]["text"].is_string()
+        {
+            let text = result["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            result["content"][0]["text"] = Value::String(text + &notice);
+        }
     }
     result
 }
@@ -694,8 +749,9 @@ fn fetch_result_bounded(
     let unknown = || {
         text_result(
             format!(
-                "[Toolport: cursor \"{cursor}\" is unknown or expired. Re-run the original \
-                 tool call to get a fresh result.]"
+                "[Toolport: cursor \"{}\" is unknown or expired. Re-run the original \
+                 tool call to get a fresh result.]",
+                preview(cursor)
             ),
             true,
         )
@@ -726,8 +782,9 @@ fn fetch_result_bounded(
         }
         return text_result(
             format!(
-                "[Toolport: cursor \"{cursor}\" describes a tool that is no longer available \
-                 to this client. Search again for the current tools.]"
+                "[Toolport: cursor \"{}\" describes a tool that is no longer available \
+                 to this client. Search again for the current tools.]",
+                preview(cursor)
             ),
             true,
         );
@@ -756,7 +813,7 @@ fn fetch_result_bounded(
             Some(value) => value,
             None => {
                 return text_result(
-                    format!("[Toolport: projection \"{path}\" not found.]"),
+                    format!("[Toolport: projection \"{}\" not found.]", preview(path)),
                     true,
                 );
             }
@@ -811,6 +868,7 @@ fn fetch_result_bounded(
     // the page early, but never before its first character, so paging always advances.
     let mut start_byte = c.body.len();
     let mut end_byte = c.body.len();
+    let mut cut_by_budget = false;
     for (char_idx, (byte_idx, ch)) in c.body.char_indices().enumerate() {
         if char_idx == offset {
             start_byte = byte_idx;
@@ -818,6 +876,7 @@ fn fetch_result_bounded(
         let over_bytes = char_idx > offset
             && max_page_bytes.is_some_and(|max| byte_idx + ch.len_utf8() - start_byte > max);
         if char_idx == end || over_bytes {
+            cut_by_budget = over_bytes && char_idx < end;
             end = char_idx;
             end_byte = byte_idx;
             break;
@@ -825,7 +884,13 @@ fn fetch_result_bounded(
     }
     let slice = c.body[start_byte..end_byte].to_string();
     let remaining = total - end;
-    let footer = if remaining > 0 {
+    let footer = if remaining > 0 && cut_by_budget {
+        format!(
+            "\n\n[Toolport: characters {offset}..{end} of {total}. This page stopped at the \
+             result budget. {remaining} remain, call toolport_fetch_result with offset={end} \
+             for the next slice.]"
+        )
+    } else if remaining > 0 {
         format!(
             "\n\n[Toolport: characters {offset}..{end} of {total}. {remaining} remain, call \
              toolport_fetch_result with offset={end} for the next slice.]"
@@ -1610,6 +1675,95 @@ mod tests {
         );
     }
 
+    /// Text as Claude Code counts it: UTF-16 units across the text blocks.
+    fn utf16_units(result: &Value) -> usize {
+        result["content"]
+            .as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter_map(|block| block["text"].as_str())
+                    .map(|text| text.encode_utf16().count())
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn text_of_any_escape_density_is_shaped_to_the_budget() {
+        // Characters with every JSON encoding cost: plain, escaped as two bytes,
+        // escaped as \uXXXX, multi-byte and astral.
+        const PALETTE: [char; 8] = ['a', ' ', '\\', '"', '\n', '\u{1}', 'é', '😀'];
+        let mut seed: u64 = 0x5eed_1234_abcd_0001;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize
+        };
+        for case in 0..60 {
+            let budget = [2_000, 9_000, 30_000][case % 3];
+            // Escape density from none to every character.
+            let escaped_share = case % 11;
+            let len = budget / 2 + next() % (budget * 3);
+            let text: String = (0..len)
+                .map(|_| {
+                    if next() % 10 < escaped_share {
+                        PALETTE[2 + next() % 4]
+                    } else {
+                        [PALETTE[0], PALETTE[1], PALETTE[6], PALETTE[7]][next() % 4]
+                    }
+                })
+                .collect();
+            let mut result = text_result(text.clone(), false);
+            shape_result(&mut result, budget, None);
+            assert!(
+                utf16_units(&result) <= budget,
+                "case {case}: {} units over {budget} (density {escaped_share})",
+                utf16_units(&result)
+            );
+            assert!(serde_json::to_string(&result).unwrap().len() <= budget || text.is_empty());
+            // The same text as a projection and as pages.
+            let cursor = stash_payload(text.clone(), Some(json!({ "v": text })), None).unwrap();
+            let projected = fetch_result_for_model(&cursor, 0, 0, None, Some("v"), budget);
+            assert!(utf16_units(&projected) <= budget, "case {case} projection");
+            let page = fetch_result_for_model(&cursor, 0, 0, None, None, budget);
+            assert!(utf16_units(&page) <= budget, "case {case} page");
+        }
+    }
+
+    #[test]
+    fn a_result_dominated_by_its_envelope_is_still_left_whole() {
+        // A small body under a large _meta: shaping cannot help, so it declines.
+        let mut result = text_result("short".into(), false);
+        result["_meta"] = json!({ "blob": "m".repeat(5_000) });
+        let before = result.clone();
+        assert!(!shape_result(&mut result, 2_000, None));
+        assert_eq!(result, before);
+        // A non-text block is never dropped by shaping.
+        let mut image = json!({ "content": [
+            { "type": "image", "data": "i".repeat(5_000), "mimeType": "image/png" },
+            { "type": "text", "text": "t".repeat(5_000) }
+        ] });
+        let before = image.clone();
+        assert!(!shape_result(&mut image, 2_000, None));
+        assert_eq!(image, before);
+    }
+
+    #[test]
+    fn error_replies_echo_only_a_preview_of_their_arguments() {
+        let huge = "x".repeat(100_001);
+        let unknown = fetch_result_for_model(&huge, 0, 0, None, None, 100_000);
+        assert!(utf16_units(&unknown) < 400, "{}", utf16_units(&unknown));
+        let cursor = stash_payload("body".into(), Some(json!({ "a": 1 })), None).unwrap();
+        let missing = fetch_result_for_model(&cursor, 0, 0, None, Some(&huge), 100_000);
+        assert!(utf16_units(&missing) < 400, "{}", utf16_units(&missing));
+        assert!(missing["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not found"));
+    }
+
     #[test]
     fn model_pages_and_projections_fit_the_budget() {
         let body = "a😀".repeat(1_000);
@@ -1642,6 +1796,15 @@ mod tests {
             budget,
         ));
         assert!(long.len() <= budget);
+        // The footer says the budget cut the page, and how to continue.
+        assert!(long.contains("stopped at the result budget"), "{long}");
+        assert!(
+            long.contains("toolport_fetch_result with offset="),
+            "{long}"
+        );
+        // A page cut by its own len says nothing about the budget.
+        let short = text(&fetch_result_for_model(&cursor, 0, 10, None, None, budget));
+        assert!(!short.contains("result budget"), "{short}");
         // Budget 0 never shapes: the page is the rest of the body, never empty.
         let whole = text(&fetch_result_for_model(&cursor, 0, 0, None, None, 0));
         assert!(whole.starts_with(&body), "{}", &whole[..40]);
@@ -1649,6 +1812,12 @@ mod tests {
         let projected = fetch_result_for_model(&cursor, 0, 0, None, Some("rows"), budget);
         assert!(serde_json::to_string(&projected).unwrap().len() <= budget);
         assert!(text(&projected).contains("Toolport shaped this result"));
+        // A model must not take the fragment for complete JSON.
+        assert!(
+            text(&projected).contains("not complete JSON"),
+            "{}",
+            text(&projected)
+        );
         // A small projection is unchanged.
         let small = fetch_result_for_model(&cursor, 0, 0, None, Some("rows.0"), budget);
         assert_eq!(text(&small), format!("\"{}\"", "r".repeat(100)));
