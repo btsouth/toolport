@@ -55,7 +55,40 @@ grep "^uninstall ($LABEL)" "$RESULTS" | grep -q $'\tFAIL\t' && STEP_FAILED=1
 
 if quit_app; then pass "app quits"; else fail "app quits" "had to be killed"; fi
 
-if [[ $REMOVE_DATA -eq 1 ]]; then
+if [[ $REMOVE_DATA -eq 1 && "$MODE" == "ui" ]]; then
+  # Settings > Help and data > Remove Toolport data closes the app and removes
+  # data, then writes a report in the home folder.
+  tmo 60 open "$APP_PATH" >/dev/null 2>&1 &
+  wait_for 45 app_pid && sleep 6
+  ui_activate
+  if ui_press "Settings" && ui_press "Help and data" && ui_press "Remove Toolport data" &&
+    ui_wait "Remove Toolport data?" 15; then
+    shot "$LABEL-remove-data-confirm" >/dev/null
+    ui_press "Close and remove data" || true
+    if wait_for 120 bash -c "! ps -axo command= | grep -F '/Contents/MacOS/$EXE' | grep -vq grep"; then
+      pass "Remove Toolport data closes the app"
+    else
+      fail "Remove Toolport data closes the app" "still running after 120s"
+      shot "$LABEL-remove-data-stuck" >/dev/null
+    fi
+    sleep 5
+    report="$(ls -t "$HOME"/Toolport-removal-report*.json 2>/dev/null | head -1)"
+    if [[ -n "$report" ]]; then
+      cp "$report" "$EVIDENCE/logs/remove-data-report-$LABEL.json"
+      left="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get("leftovers") or []), json.dumps(d.get("leftovers"))[:300])' "$report" 2>&1)"
+      if [[ "${left%% *}" == "0" ]]; then
+        pass "Remove Toolport data completes" "report: $(basename "$report")"
+      else
+        fail "Remove Toolport data completes" "report lists leftovers: $left (logs/remove-data-report-$LABEL.json)"
+      fi
+    else
+      fail "Remove Toolport data completes" "no removal report in the home folder"
+    fi
+  else
+    fail "Remove Toolport data (Settings)" "button or dialog not found"
+  fi
+  no_prompt_check "remove data"
+elif [[ $REMOVE_DATA -eq 1 ]]; then
   tmo 120 "$GATEWAY" --remove-data --dry-run >"$EVIDENCE/logs/remove-data-dry-run-$LABEL.json" 2>&1
   info "--remove-data --dry-run" "exit $? (logs/remove-data-dry-run-$LABEL.json)"
   tmo 300 "$GATEWAY" --remove-data --confirm >"$EVIDENCE/logs/remove-data-$LABEL.json" 2>&1

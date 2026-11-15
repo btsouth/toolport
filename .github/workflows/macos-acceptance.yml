@@ -66,13 +66,13 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 6
         run: bash scripts/macos-acceptance/relaunch.sh new
-      - name: Uninstall (Settings, then Trash)
+      - name: Uninstall (Settings, remove data, Trash)
         if: ${{ !cancelled() }}
-        timeout-minutes: 6
-        run: bash scripts/macos-acceptance/uninstall.sh new "$CLIENT_MANIFEST" ui
+        timeout-minutes: 8
+        run: bash scripts/macos-acceptance/uninstall.sh new "$CLIENT_MANIFEST" ui --remove-data
       - name: List leftovers
         if: ${{ !cancelled() }}
-        run: bash scripts/macos-acceptance/leftovers.sh "uninstall, data kept"
+        run: bash scripts/macos-acceptance/leftovers.sh "uninstall, data removed" --expect-clean
       - name: Write the job summary
         if: always()
         run: bash scripts/macos-acceptance/finish.sh "New user (dmg) ${TAG:-}"
@@ -113,13 +113,13 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 12
         run: bash scripts/macos-acceptance/upgrade.sh "$TAG" "$CLIENT_MANIFEST"
-      - name: Uninstall with the CLI and remove data
+      - name: Uninstall with the CLI (data kept)
         if: ${{ !cancelled() }}
         timeout-minutes: 8
-        run: bash scripts/macos-acceptance/uninstall.sh upgraded "$CLIENT_MANIFEST" cli --remove-data
+        run: bash scripts/macos-acceptance/uninstall.sh upgraded "$CLIENT_MANIFEST" cli
       - name: List leftovers
         if: ${{ !cancelled() }}
-        run: bash scripts/macos-acceptance/leftovers.sh "uninstall, data removed" --expect-clean
+        run: bash scripts/macos-acceptance/leftovers.sh "uninstall, data kept"
       - name: Write the job summary
         if: always()
         run: bash scripts/macos-acceptance/finish.sh "Upgrade ${PREVIOUS_TAG:-} to ${TAG:-}"

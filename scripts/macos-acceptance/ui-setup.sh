@@ -155,7 +155,7 @@ else
   pass "token is not in the legacy login keychain" "expected: it lives in the data-protection keychain"
 fi
 security dump-keychain "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null |
-  awk '/^keychain:/{blk=$0; next} {blk=blk "\n" $0} /^    "svce"/ && /conduit|toolport/i {print blk}' \
+  awk '/^keychain:/{blk=$0; next} {blk=blk "\n" $0} /^    "svce"/ && tolower($0) ~ /conduit|toolport/ {print blk}' \
   >"$EVIDENCE/logs/login-keychain-toolport-items-$LABEL.txt" || true
 info "Toolport items in the login keychain" "$(grep -c '"svce"' "$EVIDENCE/logs/login-keychain-toolport-items-$LABEL.txt" 2>/dev/null || echo 0) (logs/login-keychain-toolport-items-$LABEL.txt)"
 

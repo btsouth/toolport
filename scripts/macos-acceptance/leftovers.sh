@@ -74,7 +74,7 @@ if [[ $CLEAN -eq 1 ]]; then
   # After Remove Toolport data the docs promise only the report file and
   # folders that held unrelated files remain.
   extra="$(sed -n '/^## Files and folders/,/^## Toolport data folder/p' "$OUT" | grep '^/' |
-    grep -v -e 'toolport-removal-report' -e '/Toolport$' -e '/Conduit$' | head -20)"
+    grep -vi -e 'toolport-removal-report' -e '/Toolport$' -e '/Conduit$' | head -20)"
   if [[ -z "$extra" ]]; then
     pass "only the removal report and empty folders remain"
   else
