@@ -87,6 +87,12 @@ pub struct Matcher {
     /// Every registered value as written (and trimmed), for whole-value checks of
     /// JSON numbers and identifiers.
     exact: HashMap<String, usize>,
+    /// Every whole form, sorted (raw), and every case-free form lowercased and
+    /// sorted: what [`Matcher::hold_from`] checks a stream's tail against.
+    prefixes: Vec<String>,
+    ci_prefixes: Vec<String>,
+    /// Longest entry of either list, in bytes.
+    prefix_reach: usize,
     /// A larger matcher searched together with this one, its names numbered
     /// after this one's: the process registry's main matcher, while this one
     /// holds only the values registered since it was built. Hits from both are
@@ -485,6 +491,23 @@ impl Matcher {
                     .ok()
             })
             .flatten();
+        let mut prefixes: Vec<String> = raw_patterns
+            .iter()
+            .filter(|(_, meta)| !meta.fragment)
+            .map(|(text, _)| text.clone())
+            .collect();
+        prefixes.sort_unstable();
+        prefixes.dedup();
+        let mut ci_prefixes: Vec<String> =
+            ci_texts.iter().map(|t| t.to_ascii_lowercase()).collect();
+        ci_prefixes.sort_unstable();
+        ci_prefixes.dedup();
+        let prefix_reach = prefixes
+            .iter()
+            .chain(&ci_prefixes)
+            .map(String::len)
+            .max()
+            .unwrap_or(0);
         Self {
             names,
             raw: build(&raw_texts),
@@ -496,6 +519,9 @@ impl Matcher {
             heads,
             tails,
             exact,
+            prefixes,
+            ci_prefixes,
+            prefix_reach,
             extra: None,
         }
     }
@@ -558,6 +584,12 @@ impl Matcher {
             + self.ci.as_ref().map_or(0, AhoCorasick::memory_usage)
             + edge(&self.heads)
             + edge(&self.tails)
+            + self
+                .prefixes
+                .iter()
+                .chain(&self.ci_prefixes)
+                .map(|p| p.capacity() + std::mem::size_of::<String>())
+                .sum::<usize>()
             + self.extra.as_ref().map_or(0, |m| m.memory_usage())
     }
 
@@ -675,6 +707,63 @@ impl Matcher {
             }
         }
         hits
+    }
+
+    /// Where a stream may be cut: the start of the earliest tail of `text` that is
+    /// a proper prefix of a whole form (raw, or case-free in any case), moved back
+    /// before any complete form that would straddle the cut. Text before it can
+    /// be redacted and written now; the rest is held until the stream continues,
+    /// so no piece of a secret is written before the stream shows whether the
+    /// rest follows. `text.len()` when nothing needs holding.
+    pub fn hold_from(&self, text: &str) -> usize {
+        let mut cut = self.own_hold(text);
+        if let Some(extra) = &self.extra {
+            cut = cut.min(extra.own_hold(text));
+        }
+        if cut == text.len() {
+            return cut;
+        }
+        // A complete form crossing the cut would be written in part.
+        let spans = self.spans_with(text, false);
+        loop {
+            match spans.iter().find(|(s, e, _)| *s < cut && cut < *e) {
+                Some((s, _, _)) => cut = *s,
+                None => return cut,
+            }
+        }
+    }
+
+    fn own_hold(&self, text: &str) -> usize {
+        if self.prefix_reach == 0 {
+            return text.len();
+        }
+        let mut from = text.len().saturating_sub(self.prefix_reach);
+        while !text.is_char_boundary(from) {
+            from += 1;
+        }
+        let live = |list: &[String], tail: &str| {
+            let k = list.partition_point(|p| p.as_str() < tail);
+            list[k..]
+                .iter()
+                .take_while(|p| p.starts_with(tail))
+                .any(|p| p.len() > tail.len())
+        };
+        let mut lowered = String::new();
+        for (i, _) in text[from..].char_indices() {
+            let tail = &text[from + i..];
+            if live(&self.prefixes, tail) {
+                return from + i;
+            }
+            if !self.ci_prefixes.is_empty() {
+                lowered.clear();
+                lowered.push_str(tail);
+                lowered.make_ascii_lowercase();
+                if live(&self.ci_prefixes, &lowered) {
+                    return from + i;
+                }
+            }
+        }
+        text.len()
     }
 
     /// Replace every whole occurrence of a secret or one of its encodings.
@@ -1526,6 +1615,14 @@ impl Layers {
         self.0.iter().any(|m| m.may_contain(text))
     }
 
+    fn hold_from(&self, text: &str) -> usize {
+        self.0
+            .iter()
+            .map(|m| m.hold_from(text))
+            .min()
+            .unwrap_or(text.len())
+    }
+
     fn redact_pair(&self, a: &str, b: &str) -> Option<(String, String)> {
         let (mut a, mut b) = (a.to_string(), b.to_string());
         let mut changed = false;
@@ -2343,6 +2440,47 @@ fn recorded_originals(server_id: &str) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// [`Matcher::hold_from`] with the current secrets.
+pub fn hold_from(text: &str) -> usize {
+    match current() {
+        Some(m) => m.hold_from(text),
+        None => text.len(),
+    }
+}
+
+/// Redaction for text written in chunks (a relayed stream, a child's stderr,
+/// a sequence of messages): [`Self::push`] returns the part that is safe to
+/// write now and holds the tail that may be the start of a secret, until the
+/// next chunk shows whether the rest follows (the held text is then matched
+/// together with it) or [`Self::finish`] ends the stream.
+#[derive(Debug, Default)]
+pub struct Stream {
+    held: String,
+}
+
+impl Stream {
+    /// `chunk` appended to the held tail; the redacted part to write now.
+    pub fn push(&mut self, chunk: &str) -> String {
+        self.held.push_str(chunk);
+        let cut = hold_from(&self.held);
+        let rest = self.held.split_off(cut);
+        let ready = std::mem::replace(&mut self.held, rest);
+        redact_text(&ready).into_owned()
+    }
+
+    /// Whether a tail is being held.
+    pub fn is_holding(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    /// The end of the stream: the held tail, redacted, including a piece of a
+    /// secret left dangling at its end.
+    pub fn finish(&mut self) -> String {
+        let held = std::mem::take(&mut self.held);
+        redact_fragment(&held).into_owned()
+    }
 }
 
 /// Text for a diagnostic log: registered secrets, URL userinfo and

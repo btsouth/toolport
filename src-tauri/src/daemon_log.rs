@@ -220,6 +220,44 @@ impl RelayOut {
         }
         let _ = self.out.flush();
     }
+
+    /// [`Self::drain`] on a timer: a held line whose end may be the start of a
+    /// secret broken across the line break stays held until the next line.
+    fn drain_settled(&mut self) {
+        let open = self.held.as_deref().is_some_and(|held| {
+            let body = held.trim_end_matches(['\n', '\r']);
+            crate::secret_redact::hold_from(body) < body.len()
+        });
+        if !open {
+            self.drain();
+        } else {
+            let _ = self.out.flush();
+        }
+    }
+
+    /// Write the part of an unterminated line that cannot be the start of a
+    /// secret, and keep the rest in `pending` for the next chunk.
+    fn partial_settled(&mut self, pending: &mut Vec<u8>) {
+        let valid = match std::str::from_utf8(pending) {
+            Ok(text) => text.len(),
+            // An unfinished character at the end waits for its last bytes.
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            Err(_) => {
+                // Not text: no secret can be matched across it, write it all.
+                self.partial(pending, true);
+                pending.clear();
+                return;
+            }
+        };
+        let text = std::str::from_utf8(&pending[..valid]).expect("checked above");
+        let cut = crate::secret_redact::hold_from(text);
+        if cut == 0 {
+            return;
+        }
+        let rest = pending.split_off(cut);
+        let ready = std::mem::replace(pending, rest);
+        self.partial(&ready, false);
+    }
 }
 
 fn relay_writer(
@@ -242,8 +280,7 @@ fn relay_writer(
                     pending = rest;
                 }
                 if pending.len() > MAX_PENDING_BYTES {
-                    out.partial(&pending, true);
-                    pending.clear();
+                    out.partial_settled(&mut pending);
                 }
             }
             Ok(RelayMsg::Sync(ack)) => {
@@ -254,12 +291,17 @@ fn relay_writer(
                 out.drain();
                 let _ = ack.send(());
             }
+            // A pause: write what cannot be the start of a secret, hold the rest
+            // until the stream continues or the process ends (a sync).
             Err(RecvTimeoutError::Timeout) => {
                 if !pending.is_empty() {
-                    out.partial(&pending, true);
-                    pending.clear();
+                    out.partial_settled(&mut pending);
                 }
-                out.drain();
+                if pending.is_empty() {
+                    out.drain_settled();
+                } else {
+                    let _ = out.out.flush();
+                }
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -871,6 +913,65 @@ mod tests {
         let _ = std::thread::spawn(move || panic!("worker failed holding {secret}")).join();
         let _ = std::fs::remove_dir_all(&dir);
         std::process::abort();
+    }
+
+    /// Child half of `a_secret_split_across_a_pause_is_never_written_in_part`.
+    #[test]
+    fn stderr_relay_pause_child() {
+        if std::env::var_os("TOOLPORT_STDERR_PAUSE_CHILD").is_none() {
+            return;
+        }
+        crate::secret_redact::register("relay-server", "PAUSE_TOKEN", "sk-PauseSecret123");
+        install_stderr_redactor();
+        let pause = || std::thread::sleep(PARTIAL_FLUSH_AFTER * 3);
+        // Split inside a line, across a pause longer than the timed flush.
+        eprint!("token=sk-Pa");
+        pause();
+        eprintln!("useSecret123 end");
+        // Split at a line break, across a pause.
+        eprint!("wrapped sk-Pause\n");
+        pause();
+        eprintln!("Secret123 tail");
+        // A tail that only looked like a start is written once the stream shows
+        // it is not one.
+        eprint!("ordinary sk-P");
+        pause();
+        eprintln!("lain words");
+        flush_stderr_relay(std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_secret_split_across_a_pause_is_never_written_in_part() {
+        let dir = scratch("stderr-pause");
+        let log = dir.join("daemon.log");
+        let file = std::fs::File::create(&log).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon_log::tests::stderr_relay_pause_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TOOLPORT_STDERR_PAUSE_CHILD", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(file)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(text.contains("token=[secret:PAUSE_TOKEN] end\n"), "{text}");
+        assert!(
+            text.contains("wrapped [secret:PAUSE_TOKEN]\n tail\n"),
+            "{text}"
+        );
+        assert!(text.contains("ordinary sk-Plain words\n"), "{text}");
+        for piece in ["sk-Pa", "Secret123", "useSecret"] {
+            assert!(
+                !text.replace("sk-Plain", "").contains(piece),
+                "{piece} written: {text}"
+            );
+        }
     }
 
     #[test]
