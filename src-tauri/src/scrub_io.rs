@@ -1063,6 +1063,28 @@ mod tests {
     }
 
     #[test]
+    fn journal_over_16_mib_is_recovered() {
+        let dir = TempDir::new("recover-large");
+        let path = dir.0.join("daemon.log");
+        let size = 4 * 1024 * 1024u64;
+        std::fs::write(&path, vec![b'a'; size as usize]).unwrap();
+        let loc = locate(&dir.0, &path).unwrap().unwrap();
+        let ident = sys::ident(&File::open(&path).unwrap()).unwrap();
+        let journal = loc.dir.join(journal_name(&loc.name));
+        let ranges: Vec<(u64, u64)> = (0..size / 2).map(|i| (i * 2, 1)).collect();
+        write_journal(&loc, &journal, ident.id, &ranges).unwrap();
+        assert!(std::fs::metadata(&journal).unwrap().len() > 16 * 1024 * 1024);
+        assert_eq!(recover_masks(&dir.0).unwrap(), 1);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len() as u64, size);
+        assert!(bytes
+            .iter()
+            .enumerate()
+            .all(|(i, &b)| b == if i % 2 == 0 { b'*' } else { b'a' }));
+        assert!(leftovers(&dir.0).is_empty());
+    }
+
+    #[test]
     fn large_file_streams_correctly() {
         let dir = TempDir::new("large");
         let path = dir.0.join("big.log");
