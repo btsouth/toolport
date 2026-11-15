@@ -225,16 +225,27 @@ pub(crate) fn header_param_specs(tool: &Value) -> Result<Vec<HeaderParamSpec>, S
 /// (clients, search, the tool cache, integrity pins) sees it, and the server and
 /// item are reported as a security event. Calls still reach the item by the
 /// name the server advertised ([`crate::secret_redact::upstream_identifier`]).
-fn screen_definitions_for_secrets(server_id: &str, kind: &str, items: &mut [Value]) {
-    for (tool, secrets) in crate::secret_redact::screen_definitions(server_id, items) {
+///
+/// The identifier mapping is returned uncommitted: the caller commits it when
+/// the screened catalog replaces the advertised one, so a refresh that keeps the
+/// previous catalog keeps the mapping that goes with it.
+fn screen_definitions_for_secrets(
+    server_id: &str,
+    catalog: crate::secret_redact::Catalog,
+    items: &mut [Value],
+) -> crate::secret_redact::Screened {
+    let screened = crate::secret_redact::screen_definitions(server_id, catalog, items);
+    for (tool, secrets) in &screened.flagged {
         let message = format!(
-            "toolport: server '{server_id}' put a configured secret ({}) in the definition of {kind} '{tool}'; it is advertised with the value replaced",
-            secrets.join(", ")
+            "toolport: server '{server_id}' put a configured secret ({}) in the definition of {} '{tool}'; it is advertised with the value replaced",
+            secrets.join(", "),
+            catalog.as_str()
         );
         eprintln!("{message}");
         crate::gatewaylog::append(&message);
-        crate::integrity::record_secret_in_definition(server_id, &tool, &secrets);
+        crate::integrity::record_secret_in_definition(server_id, tool, secrets);
     }
+    screened
 }
 
 fn filter_modern_http_tools(server_id: &str, tools: Vec<Value>) -> Vec<Value> {
@@ -8889,7 +8900,8 @@ impl DownstreamServer {
         } else {
             listed.items
         };
-        screen_definitions_for_secrets(&id, "tool", &mut tools);
+        screen_definitions_for_secrets(&id, crate::secret_redact::Catalog::Tool, &mut tools)
+            .commit();
 
         // MCP Apps is advertised only for capability-aware catalog fetches.
         // Restore Toolport's ordinary per-request metadata before any live call
@@ -9088,8 +9100,12 @@ impl DownstreamServer {
                 } else {
                     listed.items
                 };
-                screen_definitions_for_secrets(&self.id, "tool", &mut new_tools);
-                apply_catalog_refresh(
+                let screened = screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Tool,
+                    &mut new_tools,
+                );
+                let applied = apply_catalog_refresh(
                     &mut self.tools,
                     new_tools,
                     &mut self.shrink_tools_streak,
@@ -9097,7 +9113,11 @@ impl DownstreamServer {
                     listed.cache_hint,
                     &self.id,
                     "tool",
-                )
+                );
+                if applied {
+                    screened.commit();
+                }
+                applied
             }
             Ok(listed) => {
                 self.tool_cache_hint.mark_stale_and_defer();
@@ -9152,8 +9172,12 @@ impl DownstreamServer {
         match fetch_paginated_list(&mut *self.transport, "resources/list", "resources") {
             Ok(listed) if listed.warning.is_none() => {
                 let mut items = listed.items;
-                screen_definitions_for_secrets(&self.id, "resource", &mut items);
-                apply_catalog_refresh(
+                let screened = screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Resource,
+                    &mut items,
+                );
+                let applied = apply_catalog_refresh(
                     &mut self.resources,
                     items,
                     &mut self.shrink_resources_streak,
@@ -9162,6 +9186,9 @@ impl DownstreamServer {
                     &self.id,
                     "resource",
                 );
+                if applied {
+                    screened.commit();
+                }
             }
             Ok(listed) => {
                 self.resource_cache_hint.mark_stale_and_defer();
@@ -9188,8 +9215,12 @@ impl DownstreamServer {
         ) {
             Ok(listed) if listed.warning.is_none() => {
                 let mut items = listed.items;
-                screen_definitions_for_secrets(&self.id, "resource-template", &mut items);
-                apply_catalog_refresh(
+                let screened = screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Template,
+                    &mut items,
+                );
+                let applied = apply_catalog_refresh(
                     &mut self.resource_templates,
                     items,
                     &mut self.shrink_templates_streak,
@@ -9198,6 +9229,9 @@ impl DownstreamServer {
                     &self.id,
                     "resource-template",
                 );
+                if applied {
+                    screened.commit();
+                }
             }
             Ok(listed) => {
                 self.resource_template_cache_hint.mark_stale_and_defer();
@@ -9239,8 +9273,12 @@ impl DownstreamServer {
         match fetch_paginated_list(&mut *self.transport, "prompts/list", "prompts") {
             Ok(listed) if listed.warning.is_none() => {
                 let mut items = listed.items;
-                screen_definitions_for_secrets(&self.id, "prompt", &mut items);
-                apply_catalog_refresh(
+                let screened = screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Prompt,
+                    &mut items,
+                );
+                let applied = apply_catalog_refresh(
                     &mut self.prompts,
                     items,
                     &mut self.shrink_prompts_streak,
@@ -9249,6 +9287,9 @@ impl DownstreamServer {
                     &self.id,
                     "prompt",
                 );
+                if applied {
+                    screened.commit();
+                }
             }
             Ok(listed) => {
                 self.prompt_cache_hint.mark_stale_and_defer();
@@ -9288,7 +9329,12 @@ impl DownstreamServer {
                 }
                 self.resource_cache_hint = listed.cache_hint;
                 let mut items = listed.items;
-                screen_definitions_for_secrets(&self.id, "resource", &mut items);
+                screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Resource,
+                    &mut items,
+                )
+                .commit();
                 self.resources = items;
             }
             if let Ok(listed) = fetch_paginated_list(
@@ -9304,7 +9350,12 @@ impl DownstreamServer {
                 }
                 self.resource_template_cache_hint = listed.cache_hint;
                 let mut items = listed.items;
-                screen_definitions_for_secrets(&self.id, "resource template", &mut items);
+                screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Template,
+                    &mut items,
+                )
+                .commit();
                 self.resource_templates = items;
             }
         }
@@ -9320,7 +9371,12 @@ impl DownstreamServer {
                 }
                 self.prompt_cache_hint = listed.cache_hint;
                 let mut items = listed.items;
-                screen_definitions_for_secrets(&self.id, "prompt", &mut items);
+                screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Prompt,
+                    &mut items,
+                )
+                .commit();
                 self.prompts = items;
             }
         }
@@ -9402,7 +9458,11 @@ impl DownstreamServer {
             }
             return Ok(json!({}));
         }
-        let uri = crate::secret_redact::upstream_identifier(self.server_id(), uri);
+        let uri = crate::secret_redact::upstream_identifier(
+            self.server_id(),
+            crate::secret_redact::Catalog::Resource,
+            uri,
+        );
         self.transport
             .request("resources/subscribe", json!({ "uri": uri }))
     }
@@ -9429,7 +9489,11 @@ impl DownstreamServer {
             }
             return Ok(json!({}));
         }
-        let uri = crate::secret_redact::upstream_identifier(self.server_id(), uri);
+        let uri = crate::secret_redact::upstream_identifier(
+            self.server_id(),
+            crate::secret_redact::Catalog::Resource,
+            uri,
+        );
         self.transport
             .request("resources/unsubscribe", json!({ "uri": uri }))
     }
@@ -9729,8 +9793,16 @@ pub trait ServerDispatch {
         };
         // A name or argument key the server advertised with a secret in it was
         // shown to clients with the marker; send the server its own text.
-        let tool = crate::secret_redact::upstream_identifier(self.server_id(), tool);
-        let arguments = crate::secret_redact::upstream_arguments(self.server_id(), arguments);
+        let tool = crate::secret_redact::upstream_identifier(
+            self.server_id(),
+            crate::secret_redact::Catalog::Tool,
+            tool,
+        );
+        let arguments = crate::secret_redact::upstream_arguments(
+            self.server_id(),
+            crate::secret_redact::Catalog::Tool,
+            arguments,
+        );
         self.request_with_mrtr(
             "tools/call",
             json!({ "name": tool, "arguments": arguments }),
@@ -9748,7 +9820,11 @@ pub trait ServerDispatch {
         meta: Option<&Value>,
         mrtr: Option<&MrtrRequest>,
     ) -> Result<Value, TransportError> {
-        let uri = crate::secret_redact::upstream_identifier(self.server_id(), uri);
+        let uri = crate::secret_redact::upstream_identifier(
+            self.server_id(),
+            crate::secret_redact::Catalog::Resource,
+            uri,
+        );
         self.request_with_mrtr(
             "resources/read",
             json!({ "uri": uri }),
@@ -9767,8 +9843,16 @@ pub trait ServerDispatch {
         meta: Option<&Value>,
         mrtr: Option<&MrtrRequest>,
     ) -> Result<Value, TransportError> {
-        let name = crate::secret_redact::upstream_identifier(self.server_id(), name);
-        let arguments = crate::secret_redact::upstream_arguments(self.server_id(), arguments);
+        let name = crate::secret_redact::upstream_identifier(
+            self.server_id(),
+            crate::secret_redact::Catalog::Prompt,
+            name,
+        );
+        let arguments = crate::secret_redact::upstream_arguments(
+            self.server_id(),
+            crate::secret_redact::Catalog::Prompt,
+            arguments,
+        );
         self.request_with_mrtr(
             "prompts/get",
             json!({ "name": name, "arguments": arguments }),

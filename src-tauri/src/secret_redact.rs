@@ -24,7 +24,7 @@
 //! borrowed when nothing matches; only a hit allocates.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -86,7 +86,7 @@ pub struct Matcher {
     tails: Option<(AhoCorasick, Vec<Vec<usize>>)>,
     /// Every registered value as written (and trimmed), for whole-value checks of
     /// JSON numbers and identifiers.
-    exact: std::collections::HashMap<String, usize>,
+    exact: HashMap<String, usize>,
     /// A larger matcher searched together with this one, its names numbered
     /// after this one's: the process registry's main matcher, while this one
     /// holds only the values registered since it was built. Hits from both are
@@ -102,7 +102,7 @@ type Hit = (usize, usize, usize, bool);
 fn edge_index(keys: Vec<(String, usize)>) -> Option<(AhoCorasick, Vec<Vec<usize>>)> {
     let mut distinct: Vec<String> = Vec::new();
     let mut owners: Vec<Vec<usize>> = Vec::new();
-    let mut slot: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut slot: HashMap<String, usize> = HashMap::new();
     for (key, pattern) in keys {
         match slot.get(&key) {
             Some(&i) => owners[i].push(pattern),
@@ -1045,37 +1045,80 @@ impl Matcher {
         }
     }
 
-    /// `text` with whole secret forms replaced (never fragments), recording each
-    /// replaced span as `(marker, original text)` and the whole string as
-    /// `(new, old)`.
-    fn screen_text(&self, text: &str, record: &mut Vec<(String, String)>) -> Option<String> {
+    /// An identifier (a tool or prompt name, a resource URI or template, an
+    /// argument name) with whole secret forms replaced by aliased markers
+    /// (`[secret:NAME~3f9a0c12]`), recorded in `ids` so a call can name the
+    /// original. `None` when it holds no secret.
+    fn screen_identifier(&self, text: &str, part: Part, ids: &mut IdBuilder) -> Option<String> {
         let spans = self.spans_with(text, false);
         if spans.is_empty() {
             return None;
         }
-        for (start, end, names) in &spans {
-            record.push((self.marker(names), text[*start..*end].to_string()));
+        let mut out = String::with_capacity(text.len());
+        let mut at = 0;
+        let mut pieces = Vec::new();
+        for (i, (start, end, names)) in spans.iter().enumerate() {
+            out.push_str(&text[at..*start]);
+            let listed = self.marker(names);
+            let base = &listed[..listed.len() - 1];
+            let marker = ids.alias(part, text, i, base);
+            pieces.push((marker.clone(), text[*start..*end].to_string()));
+            out.push_str(&marker);
+            at = *end;
         }
-        let new = self.apply(text, &spans);
-        if text.len() <= MAX_RECORDED_IDENTIFIER {
-            record.push((new.clone(), text.to_string()));
-        }
-        Some(new)
+        out.push_str(&text[at..]);
+        ids.record(part, &out, text, pieces);
+        Some(out)
+    }
+
+    /// Text that is not an identifier (a description, a title, a default value):
+    /// whole forms become plain markers and nothing is recorded.
+    fn screen_plain(&self, text: &str) -> Option<String> {
+        let spans = self.spans_with(text, false);
+        (!spans.is_empty()).then(|| self.apply(text, &spans))
     }
 
     /// Screen one advertised definition (tool, prompt, resource or template) by
     /// whole forms only. Fragment windows are for error text; in a definition they
     /// would rename ordinary identifiers (`Tools-Read` is a piece of
-    /// `sk-Tools-ReadSecret123`), change pins and break calls.
-    fn screen_definition(&self, value: &mut Value, record: &mut Vec<(String, String)>) -> bool {
+    /// `sk-Tools-ReadSecret123`), change pins and break calls. Identifier fields
+    /// get stable aliases ([`Self::screen_identifier`]); every other string gets
+    /// plain markers.
+    fn screen_definition(&self, item: &mut Value, ids: &mut IdBuilder) -> bool {
+        let Value::Object(map) = item else {
+            return self.screen_in(item, Role::Text, ids);
+        };
+        let catalog = ids.catalog;
+        let mut changed = false;
+        for (key, v) in map.iter_mut() {
+            let role = match (catalog, key.as_str()) {
+                (Catalog::Tool | Catalog::Prompt, "name") => Role::Name,
+                (Catalog::Resource, "uri") | (Catalog::Template, "uriTemplate") => Role::Name,
+                (Catalog::Tool, "inputSchema") => Role::Schema,
+                (Catalog::Prompt, "arguments") => Role::PromptArguments,
+                _ => Role::Text,
+            };
+            changed |= self.screen_in(v, role, ids);
+        }
+        changed | self.screen_keys(map, Role::Text, ids)
+    }
+
+    fn screen_in(&self, value: &mut Value, role: Role, ids: &mut IdBuilder) -> bool {
         match value {
-            Value::String(s) => match self.screen_text(s, record) {
-                Some(new) => {
-                    *s = new;
-                    true
+            Value::String(s) => {
+                let new = match role {
+                    Role::Name => self.screen_identifier(s, Part::Name, ids),
+                    Role::Argument => self.screen_identifier(s, Part::Argument, ids),
+                    _ => self.screen_plain(s),
+                };
+                match new {
+                    Some(new) => {
+                        *s = new;
+                        true
+                    }
+                    None => false,
                 }
-                None => false,
-            },
+            }
             Value::Number(n) => match self.number_secret(n) {
                 Some(name) => {
                     *value = Value::String(self.marker(&[name]));
@@ -1083,36 +1126,65 @@ impl Matcher {
                 }
                 None => false,
             },
-            Value::Array(items) => items.iter_mut().fold(false, |changed, item| {
-                self.screen_definition(item, record) | changed
-            }),
+            Value::Array(items) => {
+                let inner = match role {
+                    // `required: ["arg", ...]` names arguments.
+                    Role::Required => Role::Argument,
+                    Role::PromptArguments => Role::PromptArgument,
+                    other => other,
+                };
+                items.iter_mut().fold(false, |changed, item| {
+                    self.screen_in(item, inner, ids) | changed
+                })
+            }
             Value::Object(map) => {
                 let mut changed = false;
-                for v in map.values_mut() {
-                    changed |= self.screen_definition(v, record);
+                for (key, v) in map.iter_mut() {
+                    let inner = match role {
+                        Role::Schema if key == "required" => Role::Required,
+                        Role::Schema => Role::Schema,
+                        Role::PromptArgument if key == "name" => Role::Argument,
+                        _ => Role::Text,
+                    };
+                    changed |= self.screen_in(v, inner, ids);
                 }
-                let renamed: Vec<(String, String)> = map
-                    .keys()
-                    .filter_map(|key| self.screen_text(key, record).map(|new| (key.clone(), new)))
-                    .collect();
-                for (old, new) in renamed {
-                    let Some(v) = map.remove(&old) else { continue };
-                    let mut key = new.clone();
-                    let mut n = 2;
-                    while map.contains_key(&key) {
-                        key = format!("{new}#{n}");
-                        n += 1;
-                    }
-                    if key != new {
-                        record.push((key.clone(), old));
-                    }
-                    map.insert(key, v);
-                    changed = true;
-                }
-                changed
+                changed | self.screen_keys(map, role, ids)
             }
             _ => false,
         }
+    }
+
+    /// Object keys of a definition: in an input schema they are argument names
+    /// (aliased); anywhere else plain markers, made unique with `#2`, `#3`.
+    fn screen_keys(
+        &self,
+        map: &mut serde_json::Map<String, Value>,
+        role: Role,
+        ids: &mut IdBuilder,
+    ) -> bool {
+        let renamed: Vec<(String, String)> = map
+            .keys()
+            .filter_map(|key| {
+                let new = if role == Role::Schema {
+                    self.screen_identifier(key, Part::Argument, ids)
+                } else {
+                    self.screen_plain(key)
+                };
+                new.map(|new| (key.clone(), new))
+            })
+            .collect();
+        let changed = !renamed.is_empty();
+        for (old, new) in renamed {
+            let Some(v) = map.remove(&old) else { continue };
+            let mut key = new.clone();
+            let mut n = 2;
+            while map.contains_key(&key) {
+                key = format!("{new}#{n}");
+                n += 1;
+            }
+            map.insert(key, v);
+        }
+        changed
     }
 
     /// The secret a JSON number spells, by its text or, for an integral value
@@ -1479,7 +1551,7 @@ impl Layers {
     }
 
     /// Screen one definition; the names of the secrets it held (none: untouched).
-    fn screen(&self, item: &mut Value, record: &mut Vec<(String, String)>) -> Vec<String> {
+    fn screen(&self, item: &mut Value, ids: &mut IdBuilder) -> Vec<String> {
         let mut names = Vec::new();
         for m in &self.0 {
             let mut found = HashSet::new();
@@ -1488,7 +1560,7 @@ impl Layers {
                 continue;
             }
             names.extend(found.into_iter().map(|n| m.name(n).to_string()));
-            m.screen_definition(item, record);
+            m.screen_definition(item, ids);
         }
         names.sort();
         names.dedup();
@@ -1960,111 +2032,317 @@ pub fn truncate_chars(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// Longest whole string kept for restoring an identifier exactly; longer text
-/// (a description) is never an identifier a client sends back.
-const MAX_RECORDED_IDENTIFIER: usize = 1024;
+/// The catalog a definition belongs to. Identifier mappings are kept per server
+/// and catalog, so a tool name never resolves a prompt or a resource.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Catalog {
+    Tool,
+    Resource,
+    Template,
+    Prompt,
+}
 
-/// Per server, advertised text to the text the server actually advertised, for
-/// identifiers [`screen_definitions`] replaced. Memory only: it holds values the
-/// registry holds anyway, and lets a call name the upstream tool, prompt,
-/// resource or argument even though clients only ever saw the marker.
-type Identities = std::collections::HashMap<String, std::collections::HashMap<String, String>>;
-static IDENTITIES: Mutex<Option<Identities>> = Mutex::new(None);
-
-/// Screen definitions a server advertised (tools, prompts, resources or
-/// templates): any configured secret value in them is replaced (so neither
-/// clients, the search index, pins nor the tool cache see it) and each affected
-/// item is reported as `(advertised name, secret names)`. Identifiers that were
-/// replaced stay callable through [`upstream_identifier`] and
-/// [`upstream_arguments`]. Definitions with no secret are left byte for byte.
-pub fn screen_definitions(server_id: &str, items: &mut [Value]) -> Vec<(String, Vec<String>)> {
-    let Some(matcher) = current() else {
-        return Vec::new();
-    };
-    let mut flagged = Vec::new();
-    let mut record = Vec::new();
-    for item in items.iter_mut() {
-        let names = matcher.screen(item, &mut record);
-        if names.is_empty() {
-            continue;
+impl Catalog {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Catalog::Tool => "tool",
+            Catalog::Resource => "resource",
+            Catalog::Template => "resource template",
+            Catalog::Prompt => "prompt",
         }
-        let name = ["name", "uri", "uriTemplate"]
-            .iter()
-            .find_map(|k| item.get(*k).and_then(Value::as_str))
-            .unwrap_or("")
-            .to_string();
-        flagged.push((name, names));
     }
-    if !record.is_empty() {
+}
+
+/// Which identifier of a definition: its own name (or URI, or URI template) or
+/// one of its argument names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Part {
+    Name,
+    Argument,
+}
+
+/// Where a string sits in a definition, for [`Matcher::screen_in`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    Text,
+    Name,
+    Argument,
+    Schema,
+    Required,
+    PromptArguments,
+    PromptArgument,
+}
+
+/// The identifiers of one screened catalog: advertised text to the text the
+/// server advertised, for names and for argument names, plus each aliased
+/// marker to the span it replaced (a URI expanded from a template carries the
+/// marker inside it). Only identifiers are kept; descriptions never are.
+#[derive(Clone, Debug, Default)]
+struct CatalogIds {
+    names: HashMap<String, String>,
+    arguments: HashMap<String, String>,
+    pieces: HashMap<String, String>,
+}
+
+impl CatalogIds {
+    fn is_empty(&self) -> bool {
+        self.names.is_empty() && self.arguments.is_empty()
+    }
+}
+
+/// Builds the [`CatalogIds`] for one screening of a catalog, choosing aliases.
+struct IdBuilder {
+    server: String,
+    catalog: Catalog,
+    key: [u8; 32],
+    ids: CatalogIds,
+    /// Each alias marker handed out, with the identifier and span it stands for.
+    owners: HashMap<String, (Part, String, usize)>,
+}
+
+impl IdBuilder {
+    fn new(server: &str, catalog: Catalog) -> Self {
+        Self {
+            server: server.to_string(),
+            catalog,
+            key: alias_key(),
+            ids: CatalogIds::default(),
+            owners: HashMap::new(),
+        }
+    }
+
+    /// `base` (`[secret:NAME`) closed with an alias suffix: a keyed hash of the
+    /// server, catalog, part, whole original identifier and span position, so the
+    /// same original gets the same alias on every run, different originals never
+    /// share one, and the suffix says nothing about the secret. Lengthened on
+    /// the rare clash within this catalog.
+    fn alias(&mut self, part: Part, original: &str, index: usize, base: &str) -> String {
+        use hmac::{Hmac, Mac};
+        let mut mac =
+            Hmac::<sha2::Sha256>::new_from_slice(&self.key).expect("HMAC takes any key length");
+        for field in [
+            self.server.as_bytes(),
+            self.catalog.as_str().as_bytes(),
+            if part == Part::Name {
+                b"name"
+            } else {
+                b"argument"
+            },
+            original.as_bytes(),
+            index.to_string().as_bytes(),
+        ] {
+            mac.update(&(field.len() as u64).to_le_bytes());
+            mac.update(field);
+        }
+        let digest = mac.finalize().into_bytes();
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        let mut digits = 8;
+        loop {
+            let marker = format!("{base}~{}]", &hex[..digits]);
+            let owner = (part, original.to_string(), index);
+            // One identifier listed twice (a key and in `required`) is the same
+            // owner and gets the same alias.
+            let clash = self.owners.get(&marker).is_some_and(|o| *o != owner);
+            if !clash || digits == hex.len() {
+                self.owners.insert(marker.clone(), owner);
+                return marker;
+            }
+            digits += 8;
+        }
+    }
+
+    fn record(
+        &mut self,
+        part: Part,
+        advertised: &str,
+        original: &str,
+        pieces: Vec<(String, String)>,
+    ) {
+        let table = match part {
+            Part::Name => &mut self.ids.names,
+            Part::Argument => &mut self.ids.arguments,
+        };
+        table.insert(advertised.to_string(), original.to_string());
+        self.ids.pieces.extend(pieces);
+    }
+}
+
+/// The key for [`IdBuilder::alias`]: the installation's persisted task handle
+/// key, so aliases survive restarts. If it cannot be read, a random key for this
+/// process (aliases then change on restart, which re-pins the affected items,
+/// but never expose the secret through an unkeyed hash).
+fn alias_key() -> [u8; 32] {
+    static FALLBACK: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    crate::secrets::task_handle_key().unwrap_or_else(|_| {
+        *FALLBACK.get_or_init(|| {
+            let mut key = [0u8; 32];
+            if getrandom::getrandom(&mut key).is_err() {
+                use sha2::Digest as _;
+                key = sha2::Sha256::digest(format!(
+                    "{:?}{}",
+                    std::time::SystemTime::now(),
+                    std::process::id()
+                ))
+                .into();
+            }
+            key
+        })
+    })
+}
+
+/// Per server and catalog, the identifiers [`screen_definitions`] replaced.
+/// Memory only: it holds values the registry holds anyway, and lets a call name
+/// the upstream tool, prompt, resource or argument even though clients only
+/// ever saw the alias.
+static IDENTITIES: Mutex<Option<HashMap<(String, Catalog), CatalogIds>>> = Mutex::new(None);
+
+/// The result of [`screen_definitions`]: the affected items, and the identifier
+/// mapping to install with [`Screened::commit`] once the screened catalog is the
+/// one being advertised.
+#[must_use = "commit the identifiers when the screened catalog is stored"]
+pub struct Screened {
+    pub flagged: Vec<(String, Vec<String>)>,
+    server: String,
+    catalog: Catalog,
+    ids: CatalogIds,
+}
+
+impl Screened {
+    /// Replace this server's mapping for this catalog with the one built from the
+    /// catalog just screened. Call it when that catalog replaces the advertised
+    /// one; a refresh that keeps the previous catalog keeps its mapping too.
+    pub fn commit(self) {
         let mut guard = IDENTITIES
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let map = guard
-            .get_or_insert_with(Default::default)
-            .entry(server_id.to_string())
-            .or_default();
-        for (advertised, upstream) in record {
-            map.entry(advertised).or_insert(upstream);
+        let all = guard.get_or_insert_with(Default::default);
+        let key = (self.server, self.catalog);
+        if self.ids.is_empty() {
+            all.remove(&key);
+        } else {
+            all.insert(key, self.ids);
         }
     }
-    flagged
 }
 
-/// The identifier `server_id` advertised for `advertised` (a tool or prompt
-/// name, a resource URI or an argument name a client sends back). Unchanged
-/// unless [`screen_definitions`] replaced a secret in it. A URI expanded from a
-/// screened template gets each marker put back.
-pub fn upstream_identifier<'a>(server_id: &str, advertised: &'a str) -> Cow<'a, str> {
-    if !advertised.contains("[secret:") {
-        return Cow::Borrowed(advertised);
+/// Screen definitions a server advertised for one catalog: any configured
+/// secret value in them is replaced (so neither clients, the search index, pins
+/// nor the tool cache see it) and each affected item is reported as
+/// `(advertised name, secret names)`. Identifiers get stable aliases and stay
+/// callable through [`upstream_identifier`] and [`upstream_arguments`] once the
+/// result is committed. Definitions with no secret are left byte for byte.
+pub fn screen_definitions(server_id: &str, catalog: Catalog, items: &mut [Value]) -> Screened {
+    let mut ids = IdBuilder::new(server_id, catalog);
+    let mut flagged = Vec::new();
+    if let Some(matcher) = current() {
+        for item in items.iter_mut() {
+            let names = matcher.screen(item, &mut ids);
+            if names.is_empty() {
+                continue;
+            }
+            let name = ["name", "uri", "uriTemplate"]
+                .iter()
+                .find_map(|k| item.get(*k).and_then(Value::as_str))
+                .unwrap_or("")
+                .to_string();
+            flagged.push((name, names));
+        }
     }
+    Screened {
+        flagged,
+        server: server_id.to_string(),
+        catalog,
+        ids: ids.ids,
+    }
+}
+
+fn with_ids<T>(server_id: &str, catalog: Catalog, f: impl FnOnce(&CatalogIds) -> T) -> Option<T> {
     let guard = IDENTITIES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(map) = guard.as_ref().and_then(|m| m.get(server_id)) else {
+    guard
+        .as_ref()
+        .and_then(|all| all.get(&(server_id.to_string(), catalog)))
+        .map(f)
+}
+
+/// The identifier `server_id` advertised in `catalog` for `advertised` (a tool
+/// or prompt name, or a resource URI a client sends back). Unchanged unless
+/// [`screen_definitions`] replaced a secret in it. A resource URI is also
+/// looked up among expanded templates: each aliased marker in it is put back.
+pub fn upstream_identifier<'a>(
+    server_id: &str,
+    catalog: Catalog,
+    advertised: &'a str,
+) -> Cow<'a, str> {
+    if !advertised.contains("[secret:") {
         return Cow::Borrowed(advertised);
-    };
-    if let Some(upstream) = map.get(advertised) {
-        return Cow::Owned(upstream.clone());
     }
-    let mut out = advertised.to_string();
-    for (marker, upstream) in map {
-        if marker.starts_with("[secret:") && marker.ends_with(']') && out.contains(marker.as_str())
-        {
-            out = out.replace(marker.as_str(), upstream);
+    if let Some(Some(upstream)) =
+        with_ids(server_id, catalog, |ids| ids.names.get(advertised).cloned())
+    {
+        return Cow::Owned(upstream);
+    }
+    if catalog == Catalog::Resource {
+        let expanded = with_ids(server_id, Catalog::Template, |ids| {
+            let mut out = advertised.to_string();
+            for (marker, piece) in &ids.pieces {
+                if out.contains(marker.as_str()) {
+                    out = out.replace(marker.as_str(), piece);
+                }
+            }
+            out
+        });
+        if let Some(out) = expanded.filter(|out| out != advertised) {
+            return Cow::Owned(out);
         }
     }
-    Cow::Owned(out)
+    Cow::Borrowed(advertised)
 }
 
 /// `arguments` with object keys a client copied from a screened schema renamed
-/// back to the keys `server_id` advertised.
-pub fn upstream_arguments(server_id: &str, arguments: Value) -> Value {
-    fn walk(server_id: &str, value: Value) -> Value {
+/// back to the keys `server_id` advertised for that catalog.
+pub fn upstream_arguments(server_id: &str, catalog: Catalog, arguments: Value) -> Value {
+    fn walk(table: &HashMap<String, String>, value: Value) -> Value {
         match value {
             Value::Object(map) => Value::Object(
                 map.into_iter()
                     .map(|(k, v)| {
-                        let key = upstream_identifier(server_id, &k).into_owned();
-                        (key, walk(server_id, v))
+                        let key = table.get(&k).cloned().unwrap_or(k);
+                        (key, walk(table, v))
                     })
                     .collect(),
             ),
             Value::Array(items) => {
-                Value::Array(items.into_iter().map(|v| walk(server_id, v)).collect())
+                Value::Array(items.into_iter().map(|v| walk(table, v)).collect())
             }
             other => other,
         }
     }
-    let screened = IDENTITIES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .is_some_and(|m| m.contains_key(server_id));
-    if !screened {
+    let table = with_ids(server_id, catalog, |ids| ids.arguments.clone()).unwrap_or_default();
+    if table.is_empty() {
         return arguments;
     }
-    walk(server_id, arguments)
+    walk(&table, arguments)
+}
+
+/// Every original text held for `server_id`, for tests.
+#[cfg(test)]
+fn recorded_originals(server_id: &str) -> Vec<String> {
+    let guard = IDENTITIES.lock().unwrap();
+    guard
+        .iter()
+        .flat_map(|all| all.iter())
+        .filter(|((s, _), _)| s == server_id)
+        .flat_map(|(_, ids)| {
+            ids.names
+                .values()
+                .chain(ids.arguments.values())
+                .chain(ids.pieces.values())
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Text for a diagnostic log: registered secrets, URL userinfo and
@@ -2870,49 +3148,152 @@ mod tests {
         });
         let prompt = json!({"name": "p", "arguments": [{"name": "named-tool-secret-9Q"}]});
         let template = json!({"uriTemplate": "mem://named-tool-secret-9Q/{id}", "name": "t"});
-        let mut items = vec![plain.clone(), leaky, prompt, template];
-        let flagged = screen_definitions("defs-server", &mut items);
-        assert_eq!(items[0], plain, "a definition with no secret is untouched");
-        assert_eq!(flagged.len(), 3, "{flagged:?}");
+        let mut tools = vec![plain.clone(), leaky];
+        let mut prompts = vec![prompt];
+        let mut templates = vec![template];
+        let screened = screen_definitions("defs-server", Catalog::Tool, &mut tools);
+        let flagged = screened.flagged.clone();
+        screened.commit();
+        let p = screen_definitions("defs-server", Catalog::Prompt, &mut prompts);
+        assert_eq!(p.flagged.len(), 1);
+        p.commit();
+        let t = screen_definitions("defs-server", Catalog::Template, &mut templates);
+        assert_eq!(t.flagged.len(), 1);
+        t.commit();
+        assert_eq!(tools[0], plain, "a definition with no secret is untouched");
+        assert_eq!(flagged.len(), 1, "{flagged:?}");
+        let name = tools[1]["name"].as_str().unwrap().to_string();
+        assert!(
+            name.starts_with("[secret:NAMED~") && name.len() == "[secret:NAMED~12345678]".len(),
+            "{name}"
+        );
         assert_eq!(
             flagged[0],
             (
-                "[secret:NAMED]".to_string(),
+                name.clone(),
                 vec!["API_KEY".to_string(), "NAMED".to_string()]
             )
         );
-        let advertised = items[1].to_string() + &items[2].to_string() + &items[3].to_string();
+        let advertised = tools[1].to_string() + &prompts[0].to_string() + &templates[0].to_string();
         assert!(
             !advertised.contains("named-tool-secret") && !advertised.contains(secret),
             "{advertised}"
         );
-        assert_eq!(items[1]["description"], "Send [secret:API_KEY] as the key.");
+        // A description gets the plain marker; only identifiers are aliased.
+        assert_eq!(tools[1]["description"], "Send [secret:API_KEY] as the key.");
+        let properties = tools[1]["inputSchema"]["properties"].as_object().unwrap();
+        let arg = properties
+            .keys()
+            .find(|k| k.starts_with("[secret:NAMED~"))
+            .unwrap()
+            .clone();
         assert_eq!(
-            items[1]["inputSchema"]["required"],
-            json!(["[secret:NAMED]", "path"])
+            tools[1]["inputSchema"]["required"],
+            json!([arg.clone(), "path"])
         );
         // Routing: the client calls the advertised name with advertised keys; the
         // server gets its own text back.
         assert_eq!(
-            upstream_identifier("defs-server", "[secret:NAMED]"),
+            upstream_identifier("defs-server", Catalog::Tool, &name),
             "named-tool-secret-9Q"
         );
         assert_eq!(
-            upstream_arguments("defs-server", json!({"[secret:NAMED]": "x", "path": "/a"})),
+            upstream_arguments(
+                "defs-server",
+                Catalog::Tool,
+                json!({arg.clone(): "x", "path": "/a"})
+            ),
             json!({"named-tool-secret-9Q": "x", "path": "/a"})
         );
+        let prompt_arg = prompts[0]["arguments"][0]["name"].as_str().unwrap();
         assert_eq!(
-            upstream_identifier("defs-server", "mem://[secret:NAMED]/42"),
+            upstream_arguments("defs-server", Catalog::Prompt, json!({prompt_arg: "v"})),
+            json!({"named-tool-secret-9Q": "v"})
+        );
+        let template_uri = templates[0]["uriTemplate"]
+            .as_str()
+            .unwrap()
+            .replace("{id}", "42");
+        assert_eq!(
+            upstream_identifier("defs-server", Catalog::Resource, &template_uri),
             "mem://named-tool-secret-9Q/42"
         );
-        // Another server never gets this server's text.
+        // Another server, or another catalog of this one, never resolves it.
         assert_eq!(
-            upstream_identifier("other-server", "[secret:NAMED]"),
-            "[secret:NAMED]"
+            upstream_identifier("other-server", Catalog::Tool, &name),
+            name
         );
         assert_eq!(
-            upstream_identifier("defs-server", "Tools-Read"),
+            upstream_identifier("defs-server", Catalog::Prompt, &name),
+            name
+        );
+        assert_eq!(
+            upstream_identifier("defs-server", Catalog::Tool, "Tools-Read"),
             "Tools-Read"
+        );
+    }
+
+    #[test]
+    fn identifier_aliases_are_unique_stable_scoped_and_replaced_with_their_catalog() {
+        use serde_json::json;
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-alias-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        // Two values under one key name (two servers' TOKEN).
+        register("alias-a", "TOKEN", "alpha-secret-111A");
+        register("alias-b", "TOKEN", "beta-secret-222B");
+        let catalog = || {
+            vec![
+                json!({"name": "use-alpha-secret-111A", "description": "first alpha-secret-111A"}),
+                json!({"name": "use-beta-secret-222B"}),
+            ]
+        };
+        let mut items = catalog();
+        screen_definitions("alias-srv", Catalog::Tool, &mut items).commit();
+        let (one, two) = (
+            items[0]["name"].as_str().unwrap().to_string(),
+            items[1]["name"].as_str().unwrap().to_string(),
+        );
+        assert_ne!(one, two, "two originals never share an advertised name");
+        assert_eq!(
+            upstream_identifier("alias-srv", Catalog::Tool, &one),
+            "use-alpha-secret-111A"
+        );
+        assert_eq!(
+            upstream_identifier("alias-srv", Catalog::Tool, &two),
+            "use-beta-secret-222B"
+        );
+        // Descriptions are never kept in the mapping.
+        assert!(
+            !recorded_originals("alias-srv")
+                .iter()
+                .any(|o| o.contains("first")),
+            "{:?}",
+            recorded_originals("alias-srv")
+        );
+        // Stable across a restart: a fresh mapping gives the same aliases.
+        *IDENTITIES.lock().unwrap() = None;
+        let mut again = catalog();
+        screen_definitions("alias-srv", Catalog::Tool, &mut again).commit();
+        assert_eq!(again[0]["name"], one.as_str());
+        assert_eq!(again[1]["name"], two.as_str());
+        // Scoped by server: the same original elsewhere gets its own alias.
+        let mut elsewhere = catalog();
+        screen_definitions("alias-other", Catalog::Tool, &mut elsewhere).commit();
+        assert_ne!(elsewhere[0]["name"], one.as_str());
+        // Replaced with its catalog: once the tool is gone, its alias no longer
+        // resolves; a screening that is not committed changes nothing.
+        let mut smaller = vec![catalog().remove(1)];
+        let pending = screen_definitions("alias-srv", Catalog::Tool, &mut smaller);
+        assert_eq!(
+            upstream_identifier("alias-srv", Catalog::Tool, &one),
+            "use-alpha-secret-111A"
+        );
+        pending.commit();
+        assert_eq!(upstream_identifier("alias-srv", Catalog::Tool, &one), one);
+        assert_eq!(
+            upstream_identifier("alias-srv", Catalog::Tool, &two),
+            "use-beta-secret-222B"
         );
     }
 
