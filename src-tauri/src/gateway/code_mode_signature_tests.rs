@@ -644,3 +644,109 @@ fn search_hides_stale_refused_tools_in_both_code_mode_states() {
         );
     }
 }
+
+/// Search results trimmed to the describe budget hand out fetch cursors. Every cursor
+/// a response names is distinct, and paging each one to the end through
+/// `toolport_fetch_result` returns every hit exactly once, in both Code Mode states.
+#[test]
+fn search_cursors_are_distinct_and_page_every_hit_once() {
+    let _data = DataDirTestEnv::new("search-cursor-paging");
+    let mut tools = off_identity_fixture();
+    let wide: serde_json::Map<String, Value> = (0..300)
+        .map(|i| {
+            (
+                format!("reset_{i:03}"),
+                json!({"type": "boolean", "description": format!("Reset option {i}.")}),
+            )
+        })
+        .collect();
+    tools.push(json!({
+        "name": "wide__reset",
+        "description": "Reset every option of the wide tool at once.",
+        "inputSchema": {"type": "object", "properties": wide}
+    }));
+    let cursor_re = regex::Regex::new(r#""cursor":"(r[0-9]+)","offset":([0-9]+)"#).unwrap();
+    let next_re =
+        regex::Regex::new(r"call toolport_fetch_result with offset=([0-9]+) for").unwrap();
+    let text_of = |resp: &Value| -> String {
+        resp["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    for code_mode in [false, true] {
+        let reg = Registry {
+            code_mode,
+            ..Default::default()
+        };
+        let host = dispatch_host(true);
+        let router = Router::new();
+        let call = |name: &str, arguments: Value| {
+            handle_request(
+                &host,
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": arguments}}),
+                &reg,
+                &router,
+                &tools,
+                true,
+                None,
+                &SearchGuard::default(),
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let mut every_cursor = std::collections::HashSet::new();
+        for (query, prefix, count) in [
+            ("wide__configure", "option_", 300),
+            ("wide__reset", "reset_", 300),
+        ] {
+            let first = text_of(&call("toolport_search_tools", json!({"query": query})));
+            let cursors: Vec<(String, usize)> = cursor_re
+                .captures_iter(&first)
+                .map(|c| (c[1].to_string(), c[2].parse().unwrap()))
+                .collect();
+            assert_eq!(cursors.len(), 1, "code_mode={code_mode} {query}: {first}");
+            let distinct: std::collections::HashSet<_> = cursors.iter().map(|c| &c.0).collect();
+            assert_eq!(distinct.len(), cursors.len(), "{first}");
+            let (cursor, mut offset) = cursors[0].clone();
+            assert!(
+                every_cursor.insert(cursor.clone()),
+                "cursor {cursor} reused"
+            );
+            // Reassemble the stashed body: the head shown, then each page in order.
+            let marker = first.rfind("\n\n[Toolport shaped this result").unwrap();
+            let mut body = first[..marker].to_string();
+            let mut pages = 0;
+            loop {
+                let page = text_of(&call(
+                    "toolport_fetch_result",
+                    json!({"cursor": cursor, "offset": offset, "len": 6000}),
+                ));
+                pages += 1;
+                assert!(pages < 100, "paging never ended: {page}");
+                let at = page.rfind("\n\n[Toolport: ").expect("page footer");
+                body.push_str(&page[..at]);
+                match next_re.captures(&page[at..]) {
+                    Some(next) => offset = next[1].parse().unwrap(),
+                    None => {
+                        assert!(page[at..].contains("end of result"), "{page}");
+                        break;
+                    }
+                }
+            }
+            assert!(pages > 1, "code_mode={code_mode} {query}: one page only");
+            for i in 0..count {
+                let key = format!("\"{prefix}{i:03}\":");
+                assert_eq!(
+                    body.matches(&key).count(),
+                    1,
+                    "code_mode={code_mode} {query}: {key} after {pages} page(s)"
+                );
+            }
+        }
+    }
+}
