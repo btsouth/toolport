@@ -10829,7 +10829,9 @@ struct ProgressRoute {
     /// The registered values the client sent in the request (any spelling):
     /// echoed in its progress, they are its own and are left as they are.
     exempt: Option<Arc<std::collections::HashSet<String>>>,
-    /// A notification held as above, with the message text written so far.
+    /// The fields of the last notification while its stream holds an
+    /// undecided end (delivered with that end when the call ends), with any
+    /// message text written so far that is not yet delivered.
     held: Option<(Value, String)>,
     /// The request instance that asked for it. Its progress is delivered only while
     /// that instance is live, so a cancelled call's late progress never reaches the
@@ -11034,12 +11036,24 @@ fn deliver_progress(
                     let mut text = route.held.take().map(|(_, t)| t).unwrap_or_default();
                     text.push_str(&ready);
                     if route.messages.is_holding() {
-                        // Its end may be the start of a secret: held whole,
-                        // merged into the next notification or delivered when
-                        // the call ends.
-                        route.held = Some((note, text));
-                        return;
+                        // Its end may be the start of a secret. Only that end
+                        // is held (by the stream, within its cap), with this
+                        // notification's fields to deliver it with when the
+                        // call ends; it goes out with the next one otherwise.
+                        // A message that is all undecided is held whole.
+                        if text.is_empty() {
+                            route.held = Some((note, text));
+                            return;
+                        }
+                        let mut fields = note.clone();
+                        if let Some(m) = fields.pointer_mut("/params/message") {
+                            *m = Value::String(String::new());
+                        }
+                        route.held = Some((fields, String::new()));
                     }
+                    let Some(Value::String(message)) = note.pointer_mut("/params/message") else {
+                        unreachable!("matched above");
+                    };
                     *message = text;
                 }
                 finish_progress_note(&mut note, route);
@@ -39205,19 +39219,21 @@ mod tests {
             );
         }
         let got = drain_session(&state, &s1);
-        // The first ends in what may be the start of the secret: it is held
-        // whole and merged into the second, so progress stays increasing.
-        assert_eq!(got.len(), 1, "{got:?}");
+        // The first ends in what may be the start of the secret: its decided
+        // part goes out at once, and only that end waits for the second.
+        assert_eq!(got.len(), 2, "{got:?}");
         let joined = got.join("\n");
         for piece in ["sk-Progr", "essSecret456", "Secret456"] {
             assert!(!joined.contains(piece), "{piece} delivered: {joined}");
         }
+        assert!(got[0].contains("\"uploading with \""), "{}", got[0]);
+        assert!(got[0].contains("\"progress\":0"), "{}", got[0]);
         assert!(
-            got[0].contains("\"uploading with [secret:PROGRESS_KEY] accepted\""),
+            got[1].contains("\"[secret:PROGRESS_KEY] accepted\""),
             "{}",
-            got[0]
+            got[1]
         );
-        assert!(got[0].contains("\"progress\":1"), "{}", got[0]);
+        assert!(got[1].contains("\"progress\":1"), "{}", got[1]);
     }
 
     #[test]
@@ -39244,8 +39260,8 @@ mod tests {
             })
         };
         for (tail, expected) in [
-            ("almost sk-Ot", "\"almost sk-Ot\""),
-            ("almost sk-OtherP", "\"almost [secret:OTHER]\""),
+            ("almost sk-Ot", "\"sk-Ot\""),
+            ("almost sk-OtherP", "\"[secret:OTHER]\""),
         ] {
             let (registration, wire) = register_progress(
                 &routes,
@@ -39265,20 +39281,81 @@ mod tests {
                 );
             }
             let got = drain_session(&state, &s1);
-            assert_eq!(got.len(), 1, "{got:?}");
+            assert_eq!(got.len(), 2, "{got:?}");
             // The client sent this value: its echo is its own.
             assert!(
                 got[0].contains("\"echo sk-OwnProgress789 ok\""),
                 "{}",
                 got[0]
             );
-            // The call ends: the held note is delivered, under the end rule.
+            // The decided part goes out now; only the undecided end waits.
+            assert!(got[1].contains("\"almost \""), "{}", got[1]);
+            // The call ends: the held end is delivered, under the end rule.
             drop(registration);
             let got = drain_session(&state, &s1);
             assert_eq!(got.len(), 1, "{got:?}");
             assert!(got[0].contains(expected), "{}", got[0]);
             assert!(got[0].contains("tok-own"), "{}", got[0]);
         }
+    }
+
+    #[test]
+    fn progress_delivers_the_decided_part_and_holds_only_an_undecided_end() {
+        let _data = DataDirTestEnv::new("progress-held-bound");
+        conduit_lib::secret_redact::register("alpha", "OTHER", "sk-OtherProg321");
+        let state = http_state(false);
+        let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
+        let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+        let (stdio, _stdio_rx) = stdio_session_with_progress();
+        {
+            let (stdio, sessions) = (Arc::clone(&stdio), state.mcp_sessions.clone());
+            routes.lock().unwrap().deliver = Some(Arc::new(move |session: &str, note: &Value| {
+                deliver_progress_to(&stdio, &sessions, session, note);
+            }));
+        }
+        let (registration, wire) = register_progress(
+            &routes,
+            Some(&json!({ "progressToken": "tok-bound" })),
+            None,
+            "alpha",
+            &s1,
+        )
+        .unwrap();
+        // 64 KiB of ordinary text that ends in "s", the start of a secret.
+        let message = format!("{} s", "word ".repeat(64 * 1024 / 5));
+        let (mut delivered, mut most_held) = (0, 0);
+        for i in 0..256u64 {
+            deliver_progress(
+                &stdio,
+                &state.mcp_sessions,
+                &routes,
+                "alpha",
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": {"progressToken": wire, "progress": i, "message": message}
+                }),
+            );
+            let table = routes.lock().unwrap();
+            let route = &table.active[&registration.key];
+            let held = route.messages.held_bytes()
+                + route
+                    .held
+                    .as_ref()
+                    .map_or(0, |(n, t)| n.to_string().len() + t.len());
+            most_held = most_held.max(held);
+            drop(table);
+            delivered += drain_session(&state, &s1).len();
+        }
+        assert_eq!(
+            delivered, 256,
+            "every notification goes out when it arrives"
+        );
+        assert!(most_held < 1024, "held {most_held} bytes");
+        drop(registration);
+        let got = drain_session(&state, &s1);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].contains("\"s\""), "{}", got[0]);
     }
 
     #[test]
