@@ -108,7 +108,8 @@ class ClientsTest(unittest.TestCase):
         with open(self.path("zed"), "w") as f:
             f.write(text)
         rows = clients.check(self.home, self.manifest, self.entries)
-        for name in ("OpenCode", "Codex", "Zed"):
+        names = ["OpenCode", "Zed"] + (["Codex"] if clients.tomllib else [])
+        for name in names:
             self.assertEqual(statuses(rows, f"{name} entry matches"), ["PASS"], name)
             self.assertEqual(statuses(rows, f"{name} keeps the user's existing server"), ["PASS"], name)
 
