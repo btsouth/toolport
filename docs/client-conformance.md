@@ -103,9 +103,12 @@ Drift fingerprints and the listed-catalog digest do not cover `_meta`, so these 
 never cause drift warnings or extra list notifications.
 
 Modern (`2026-07-28`) clients send no `initialize`, so Toolport reads the client's name
-and version from `params._meta["io.modelcontextprotocol/clientInfo"]`: from the first
-request on stdio, and from each request on sessionless HTTP. Approvals and Activity
-show it the same way as a legacy client's `clientInfo`.
+and version from `params._meta["io.modelcontextprotocol/clientInfo"]` on each request,
+on stdio, through the stdio adapter and daemon, and on HTTP. A caller that sends
+several identities over one connection gets each request labelled as itself. A request
+without the key uses the connection's label: the legacy `initialize` `clientInfo`, or
+on stdio the first modern name seen. Approvals and Activity show it the same way as a
+legacy client's `clientInfo`.
 
 Codex config keys Toolport writes for its own entry are listed in
 [docs/clients.md](clients.md#codex-setup-walkthrough). Every Toolport meta-tool input

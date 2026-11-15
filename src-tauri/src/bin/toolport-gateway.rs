@@ -17046,7 +17046,13 @@ fn process_request_wire(
             "sessionless_request",
         )
     };
-    let _context = observation::ContextGuard::enter(observed.context());
+    // The session keeps the label it started with; a request that names its own
+    // client (a multiplexing caller's later identity) is attributed to that name.
+    let mut context = observed.context();
+    if label.is_some() {
+        context.client_label = label.clone();
+    }
+    let _context = observation::ContextGuard::enter(context);
     let internal = match (method, req["params"]["name"].as_str()) {
         ("server/discover", _) => Some("describe"),
         ("tools/call", Some("toolport_search_tools")) => Some("search"),
@@ -17184,7 +17190,7 @@ fn process_request_wire_inner(
         std::thread::spawn(move || refresh_client_root(&st));
     } else if !state.http && !method.is_empty() {
         // A modern client never sends initialize; it names itself in every
-        // request's _meta. Keep the first name seen for the session's label.
+        // request's _meta. Keep the first name seen as the session's fallback label.
         if let Some(label) = approval::client_info_label(req.get("params")) {
             state
                 .stdio_upstream
@@ -17195,30 +17201,38 @@ fn process_request_wire_inner(
         }
     }
 
-    let session_label = if state.http {
-        active_mcp_session()
-            .and_then(|sid| {
-                state
-                    .mcp_sessions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(&sid)
-                    .cloned()
-            })
-            .and_then(|session| {
-                session
-                    .client_label
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone()
-            })
-    } else {
-        state
-            .stdio_upstream
-            .client_label
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+    // The request's own `_meta` clientInfo names its client, so a caller that
+    // multiplexes several identities over one connection gets each labelled as itself.
+    // The stored label is the fallback for requests that carry none.
+    let request_label = (!method.is_empty())
+        .then(|| approval::client_info_label(req.get("params")))
+        .flatten();
+    let session_label = request_label.or_else(|| {
+        if state.http {
+            active_mcp_session()
+                .and_then(|sid| {
+                    state
+                        .mcp_sessions
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&sid)
+                        .cloned()
+                })
+                .and_then(|session| {
+                    session
+                        .client_label
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone()
+                })
+        } else {
+            state
+                .stdio_upstream
+                .client_label
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
     });
     let _label = ClientLabelGuard::enter(session_label);
 
@@ -47153,28 +47167,52 @@ mod tests {
         };
         let reply = call(&request(1, "Claude Code"));
         assert_eq!(reply["result"]["resultType"], "input_required", "{reply}");
-        // The first modern request names the session; a later one does not rename it.
-        let _ = call(&request(2, "Someone Else"));
+        // A multiplexing caller names a different client on a later request. That
+        // request is labelled with its own name; the first name stays the session's
+        // fallback for requests that carry none.
+        let second = call(&request(2, "Someone Else"));
         assert_eq!(
             state.stdio_upstream.client_label.lock().unwrap().as_deref(),
             Some("Claude Code 2.1.290")
         );
-        let token = reply["result"]["requestState"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let pending = session_tables()
-            .hitl()
-            .with(&token, |approval| approval.abandoned_audit.take())
-            .flatten()
-            .expect("the approval keeps its audit record");
-        pending.finish("withdrawn", 0);
+        for reply in [&reply, &second] {
+            let token = reply["result"]["requestState"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let pending = session_tables()
+                .hitl()
+                .with(&token, |approval| approval.abandoned_audit.take())
+                .flatten()
+                .expect("the approval keeps its audit record");
+            pending.finish("withdrawn", 0);
+        }
         let rows = audit::read_all().unwrap();
-        let approval = rows
+        // Each approval writes more than one row; every row of one call carries the
+        // label of the request that made it.
+        let labels: HashMap<String, HashSet<String>> = rows
             .iter()
-            .find(|row| row["kind"] == "approval")
-            .expect("approval audit row");
-        assert_eq!(approval["clientLabel"], "Claude Code 2.1.290", "{approval}");
+            .filter(|row| row["kind"] == "approval")
+            .fold(HashMap::new(), |mut labels, row| {
+                labels
+                    .entry(row["argsHash"].as_str().unwrap().to_string())
+                    .or_default()
+                    .insert(row["clientLabel"].as_str().unwrap_or("").to_string());
+                labels
+            });
+        let mut per_call: Vec<Vec<String>> = labels
+            .into_values()
+            .map(|set| set.into_iter().collect())
+            .collect();
+        per_call.sort();
+        assert_eq!(
+            per_call,
+            [
+                vec!["Claude Code 2.1.290".to_string()],
+                vec!["Someone Else 2.1.290".to_string()]
+            ],
+            "{rows:?}"
+        );
         session_tables().hitl().clear();
     }
 
