@@ -2121,6 +2121,27 @@ pub fn redact_fragment(text: &str) -> Cow<'_, str> {
     }
 }
 
+/// Text that is an excerpt of a longer stream (the kept tail of a child's
+/// stderr): a secret a tool wrapped across a line break is matched across it,
+/// and a piece of one cut off at either end of the excerpt is removed.
+pub fn redact_excerpt(text: &str) -> String {
+    let Some(m) = current() else {
+        return text.to_string();
+    };
+    let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_string).collect();
+    for i in 1..lines.len() {
+        let (before, after) = lines.split_at_mut(i);
+        let (prev, next) = (&mut before[i - 1], &mut after[0]);
+        let body = prev.trim_end_matches(['\n', '\r']);
+        let ending = prev[body.len()..].to_string();
+        if let Some((a, b)) = m.redact_pair(body, next) {
+            *prev = format!("{a}{ending}");
+            *next = b;
+        }
+    }
+    m.redact_fragment(&lines.concat()).into_owned()
+}
+
 /// Redact, then keep at most `max_chars`. See [`Matcher::truncate_chars`].
 pub fn truncate_chars(text: &str, max_chars: usize) -> String {
     match current() {

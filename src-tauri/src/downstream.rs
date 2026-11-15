@@ -4126,10 +4126,13 @@ impl StdioCore {
             .try_wait()
             .ok()
             .flatten();
+        // Redacted here, where it is still the whole kept tail: its first line
+        // may begin inside a secret the ring cut, and a secret may be wrapped
+        // across lines; every sink after this sees only one message.
         let tail = self
             .stderr
             .lock()
-            .map(|b| b.trim().to_string())
+            .map(|b| crate::secret_redact::redact_excerpt(&b).trim().to_string())
             .unwrap_or_default();
         let mut msg = String::from("downstream server exited");
         if let Some(code) = status.and_then(|s| s.code()) {
@@ -14251,6 +14254,34 @@ for line in sys.stdin:
             other => panic!("a request after the exit must fail at once, got {other:?}"),
         }
         fixture.finish();
+    }
+
+    #[test]
+    fn a_stderr_tail_never_reports_a_piece_of_a_secret() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-tail-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        crate::secret_redact::register("tail-server", "TAIL_KEY", "sk-TailSecret789xyz");
+        // The kept tail starts inside one secret (the ring trimmed the rest) and
+        // a tool wrapped another across a line break.
+        let mut fixture = CoreFixture::new(
+            "tail",
+            "Secret789xyz was rejected\nretrying with sk-Tail\nSecret789xyz\n",
+        );
+        let waiter = fixture.request("a", json!({ "name": "one" }), None);
+        fixture.wait_for_pending(1);
+        fixture.close_stdout();
+        match waiter.join().unwrap() {
+            Err(TransportError::Unavailable(message)) => {
+                assert!(message.contains("was rejected"), "{message}");
+                for piece in ["Secret789", "sk-Tail", "789xyz"] {
+                    assert!(!message.contains(piece), "{piece} in {message}");
+                }
+            }
+            other => panic!("expected the exit to fail the call, got {other:?}"),
+        }
+        fixture.finish();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn server_request(id: &str, method: &str) -> Value {
