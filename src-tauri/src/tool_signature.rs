@@ -47,7 +47,7 @@ pub const MAX_DESCRIBE_SIGNATURE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Schema nodes one search-hit signature may visit. Past it, deeper types read
 /// `unknown` (wider, so still true); keys and `required` already read stay exact.
-const SEARCH_WORK: usize = 20_000;
+const SEARCH_WORK: usize = 10_000;
 /// Schema nodes [`full_signature`] may visit before it reports `truncated`.
 const DESCRIBE_WORK: usize = 4_000_000;
 /// Nesting rendered inline before a subschema becomes a named declaration. Keeps
@@ -178,6 +178,9 @@ enum Ty<'a> {
         index: Index<'a>,
     },
     Union(Vec<Ty<'a>>),
+    /// A union admitting every kind (an untyped nested schema). Printed in full,
+    /// or as `unknown` once shortening collapses nested types.
+    Wide(Vec<Ty<'a>>),
     /// A memoised definition, inlined or printed by name.
     Ref(usize),
 }
@@ -207,17 +210,23 @@ impl Ty<'_> {
 
 fn union<'a>(members: Vec<Ty<'a>>) -> Ty<'a> {
     let mut flat: Vec<Ty<'a>> = Vec::with_capacity(members.len());
+    let mut wide = false;
     for member in members {
         match member {
             Ty::Unknown => return Ty::Unknown,
             Ty::Never => {}
             Ty::Union(inner) => flat.extend(inner),
+            Ty::Wide(inner) => {
+                wide = true;
+                flat.extend(inner);
+            }
             other => flat.push(other),
         }
     }
     match flat.len() {
         0 => Ty::Never,
         1 => flat.pop().unwrap(),
+        _ if wide => Ty::Wide(flat),
         _ => Ty::Union(flat),
     }
 }
@@ -237,17 +246,76 @@ struct Entry<'a> {
     uses: usize,
 }
 
+/// A choice a merged shape still has to make. Each becomes a union of shapes.
+#[derive(Clone, Copy)]
+enum Group<'a> {
+    /// `anyOf` or `oneOf` (true): one member holds.
+    Any(&'a [Value], bool),
+    /// `if`/`then`/`else`. TypeScript cannot test the condition, so this renders
+    /// as the union of the then-shape (with the condition merged in) and the
+    /// else-shape, unless the condition is settled for the shape at hand.
+    Cond {
+        cond: &'a Value,
+        then: Option<&'a Value>,
+        otherwise: Option<&'a Value>,
+    },
+}
+
 /// The merged view of a list of schemas that must all hold (`allOf` semantics).
 #[derive(Clone, Default)]
 struct Shape<'a> {
     parts: Vec<&'a Map<String, Value>>,
-    /// `anyOf` / `oneOf` groups not yet distributed: (members, is oneOf).
-    groups: Vec<(&'a [Value], bool)>,
+    /// Choices not yet distributed.
+    groups: Vec<Group<'a>>,
     never: bool,
-    /// Holds a constraint the renderer cannot see (an external `$ref`, `not`, `if`).
+    /// Holds a constraint the renderer cannot see (an external or dynamic `$ref`).
     /// Only [`Ctx::accepts_empty`] cares: the rendered type is still a true widening.
     opaque: bool,
     seen: HashSet<usize>,
+    /// Keys required by an applied `dependentRequired` or a trigger taken as present.
+    extra_required: Vec<&'a str>,
+    /// Trigger keys taken as absent in this branch of a dependency.
+    absent: Vec<&'a str>,
+    /// Dependencies already applied, by address.
+    applied: HashSet<usize>,
+}
+
+/// What failing a simple `if` implies about one key.
+#[derive(Clone, Copy)]
+enum Refinement<'a> {
+    /// `if: {properties: {k: ...}}` fails only when `k` is present (and fails).
+    Present(&'a str),
+    /// `if: {required: [k]}` fails only when `k` is absent.
+    Absent(&'a str),
+}
+
+/// For a condition about exactly one key, what an instance failing it must do.
+fn failing(cond: &Value) -> Option<Refinement<'_>> {
+    let object = cond.as_object()?;
+    let mut assertions = object
+        .iter()
+        .filter(|(key, _)| !is_annotation(key) || *key == "$ref");
+    let (keyword, value) = assertions.next()?;
+    if assertions.next().is_some() {
+        return None;
+    }
+    match (keyword.as_str(), value) {
+        ("properties", Value::Object(properties)) if properties.len() == 1 => properties
+            .keys()
+            .next()
+            .map(|key| Refinement::Present(key.as_str())),
+        ("required", Value::Array(keys)) if keys.len() == 1 => {
+            keys[0].as_str().map(Refinement::Absent)
+        }
+        _ => None,
+    }
+}
+
+/// A dependency keyword entry: its trigger key and what it adds.
+#[derive(Clone, Copy)]
+enum Dependency<'a> {
+    Required(&'a [Value]),
+    Schema(&'a Value),
 }
 
 /// Three-valued answer for "does the schema accept `{}`".
@@ -356,10 +424,7 @@ impl<'a> Ctx<'a> {
                     None => shape.opaque = true,
                 }
             }
-            if object.contains_key("$dynamicRef")
-                || object.contains_key("not")
-                || object.contains_key("if")
-            {
+            if object.contains_key("$dynamicRef") || object.contains_key("$recursiveRef") {
                 shape.opaque = true;
             }
             if let Some(Value::Array(members)) = object.get("allOf") {
@@ -368,8 +433,18 @@ impl<'a> Ctx<'a> {
             for (key, one_of) in [("anyOf", false), ("oneOf", true)] {
                 match object.get(key) {
                     Some(Value::Array(members)) if members.is_empty() => shape.never = true,
-                    Some(Value::Array(members)) => shape.groups.push((members, one_of)),
+                    Some(Value::Array(members)) => shape.groups.push(Group::Any(members, one_of)),
                     _ => {}
+                }
+            }
+            if let Some(cond) = object.get("if") {
+                let (then, otherwise) = (object.get("then"), object.get("else"));
+                if then.is_some() || otherwise.is_some() {
+                    shape.groups.push(Group::Cond {
+                        cond,
+                        then,
+                        otherwise,
+                    });
                 }
             }
         }
@@ -383,50 +458,127 @@ impl<'a> Ctx<'a> {
         shape
     }
 
-    /// Required keys of a merged shape, closed over `dependentRequired` and
-    /// `dependentSchemas` (merged in), plus keys a `then`/`else` may require.
-    fn required_keys(&mut self, shape: &mut Shape<'a>) -> BTreeSet<&'a str> {
-        let mut required: BTreeSet<&'a str> = BTreeSet::new();
-        let mut scanned = 0;
-        loop {
-            let before = (required.len(), shape.parts.len());
-            while scanned < shape.parts.len() {
-                let part = shape.parts[scanned];
-                scanned += 1;
-                let mut lists = vec![part.get("required")];
-                // A branch of `if` may apply; requiring its keys is the safe side.
-                for branch in ["then", "else"] {
-                    lists.push(part.get(branch).and_then(|branch| branch.get("required")));
-                }
-                for list in lists.into_iter().flatten() {
-                    if let Value::Array(keys) = list {
-                        required.extend(keys.iter().filter_map(Value::as_str));
-                    }
-                }
-            }
-            let parts = shape.parts.clone();
-            for part in parts {
-                if let Some(Value::Object(dependent)) = part.get("dependentRequired") {
-                    for (key, keys) in dependent {
-                        if required.contains(key.as_str()) {
-                            if let Value::Array(keys) = keys {
-                                required.extend(keys.iter().filter_map(Value::as_str));
-                            }
-                        }
-                    }
-                }
-                if let Some(Value::Object(dependent)) = part.get("dependentSchemas") {
-                    for (key, schema) in dependent {
-                        if required.contains(key.as_str()) {
-                            self.flatten(shape, schema);
-                        }
-                    }
-                }
-            }
-            if (required.len(), shape.parts.len()) == before && scanned == shape.parts.len() {
-                return required;
+    /// Required keys of a merged shape: every part's `required` plus keys an
+    /// applied dependency added. Dependencies were expanded before this.
+    fn required_keys(&mut self, shape: &Shape<'a>) -> BTreeSet<&'a str> {
+        let mut required: BTreeSet<&'a str> = shape.extra_required.iter().copied().collect();
+        let mut scanned = shape.parts.len();
+        for part in &shape.parts {
+            if let Some(Value::Array(keys)) = part.get("required") {
+                scanned += keys.len();
+                required.extend(keys.iter().filter_map(Value::as_str));
             }
         }
+        self.charge(scanned);
+        required
+    }
+
+    /// Whether `key` is certainly present in a shape: required by a part or by an
+    /// applied dependency.
+    fn certainly_present(&mut self, shape: &Shape<'a>, key: &str) -> bool {
+        if shape.extra_required.contains(&key) {
+            return true;
+        }
+        self.charge(shape.parts.len());
+        shape.parts.iter().any(|part| {
+            part.get("required")
+                .and_then(Value::as_array)
+                .is_some_and(|keys| keys.iter().any(|k| k.as_str() == Some(key)))
+        })
+    }
+
+    /// The first dependency (`dependentRequired`, `dependentSchemas`, or draft-7
+    /// `dependencies`) not yet decided for this shape.
+    fn next_dependency(&mut self, shape: &Shape<'a>) -> Option<(usize, &'a str, Dependency<'a>)> {
+        self.charge(shape.parts.len());
+        for part in &shape.parts {
+            for keyword in ["dependentRequired", "dependentSchemas", "dependencies"] {
+                let Some(Value::Object(entries)) = part.get(keyword) else {
+                    continue;
+                };
+                for (key, value) in entries {
+                    let id = address(value);
+                    if shape.applied.contains(&id) || shape.absent.contains(&key.as_str()) {
+                        continue;
+                    }
+                    let dependency = match (keyword, value) {
+                        ("dependentRequired" | "dependencies", Value::Array(keys)) => {
+                            Dependency::Required(keys)
+                        }
+                        (
+                            "dependentSchemas" | "dependencies",
+                            schema @ (Value::Object(_) | Value::Bool(_)),
+                        ) => Dependency::Schema(schema),
+                        _ => continue,
+                    };
+                    return Some((id, key, dependency));
+                }
+            }
+        }
+        None
+    }
+
+    fn apply_dependency(&mut self, shape: &mut Shape<'a>, id: usize, dependency: Dependency<'a>) {
+        shape.applied.insert(id);
+        match dependency {
+            Dependency::Required(keys) => {
+                shape
+                    .extra_required
+                    .extend(keys.iter().filter_map(Value::as_str));
+            }
+            Dependency::Schema(schema) => self.flatten(shape, schema),
+        }
+    }
+
+    /// Spend work proportional to `units` (at least one unit).
+    fn charge(&mut self, units: usize) {
+        let cost = units / 32 + 1;
+        if self.work.saturating_add(cost) > self.max_work {
+            self.work = self.max_work;
+            self.exhausted = true;
+        } else {
+            self.work += cost;
+        }
+    }
+
+    /// Whether `cond` holds for every value of `shape`, for none, or neither is known.
+    fn settled(&mut self, cond: &'a Value, shape: &Shape<'a>, depth: usize) -> Option<bool> {
+        let object = match cond {
+            Value::Bool(value) => return Some(*value),
+            Value::Object(object) => object,
+            _ => return None,
+        };
+        let mut holds = true;
+        for (key, value) in object {
+            match key.as_str() {
+                key if is_annotation(key) && key != "$ref" => {}
+                "type" => {
+                    let mut kinds = shape
+                        .parts
+                        .iter()
+                        .fold(K_ALL, |kinds, part| kinds & part_kinds(part));
+                    if kinds == K_ALL && depth == 0 {
+                        kinds = K_OBJ;
+                    }
+                    let allowed = part_kinds(object);
+                    if kinds & allowed == 0 {
+                        return Some(false);
+                    }
+                    holds &= kinds & !allowed == 0;
+                }
+                "required" => {
+                    let keys = value.as_array()?;
+                    for key in keys.iter().filter_map(Value::as_str) {
+                        if shape.absent.contains(&key) {
+                            return Some(false);
+                        }
+                        holds &= self.certainly_present(shape, key);
+                    }
+                }
+                _ => return None,
+            }
+        }
+        holds.then_some(true)
     }
 
     fn pattern(&mut self, pattern: &'a str) -> Option<&regex::Regex> {
@@ -513,40 +665,19 @@ impl<'a> Ctx<'a> {
         self.render_shape(shape, depth)
     }
 
+    /// A declaration name: `$` plus the definition's own name made an identifier.
+    /// The prefix keeps every generated name clear of reserved and contextual words
+    /// (`class`, `type`, `string`) and of built-in names such as `Record`.
     fn entry_name(&mut self, hint: &str) -> String {
-        let mut base: String = hint
-            .chars()
-            .map(|c| {
+        let base: String = std::iter::once('$')
+            .chain(hint.chars().map(|c| {
                 if c.is_ascii_alphanumeric() || c == '_' || c == '$' {
                     c
                 } else {
                     '_'
                 }
-            })
+            }))
             .collect();
-        if base.is_empty() || base.starts_with(|c: char| c.is_ascii_digit()) {
-            base.insert(0, 'T');
-        }
-        if matches!(
-            base.as_str(),
-            "string"
-                | "number"
-                | "boolean"
-                | "null"
-                | "object"
-                | "unknown"
-                | "never"
-                | "any"
-                | "undefined"
-                | "void"
-                | "type"
-                | "Record"
-                | "ToolResult"
-                | "Array"
-                | "Promise"
-        ) {
-            base.push('_');
-        }
         let mut name = base.clone();
         let mut n = 2;
         while self.names.contains(&name) {
@@ -558,7 +689,11 @@ impl<'a> Ctx<'a> {
     }
 
     fn reference(&mut self, target: &'a Value, reference: &str, depth: usize) -> Ty<'a> {
-        let key = vec![address(target)];
+        // At the top a definition is read as tool arguments (always an object);
+        // below it an untyped definition admits other kinds too. Keep those apart.
+        let top = depth == 0;
+        let split = top && target.get("type").is_none();
+        let key = vec![address(target), usize::from(split)];
         if let Some(&id) = self.by_key.get(&key) {
             let entry = &mut self.entries[id];
             entry.uses += 1;
@@ -591,7 +726,7 @@ impl<'a> Ctx<'a> {
             self.entries[id].named = true;
             self.pending.push(id);
         } else {
-            let ty = self.build(&[target], depth + 1);
+            let ty = self.build(&[target], if top { 0 } else { depth + 1 });
             let entry = &mut self.entries[id];
             entry.ty = Some(ty);
             entry.building = false;
@@ -601,7 +736,8 @@ impl<'a> Ctx<'a> {
 
     /// A subschema past [`INLINE_DEPTH`]: render it later as a named declaration.
     fn defer(&mut self, subs: &[&'a Value]) -> Ty<'a> {
-        let key: Vec<usize> = subs.iter().map(|sub| address(sub)).collect();
+        let mut key: Vec<usize> = subs.iter().map(|sub| address(sub)).collect();
+        key.push(2);
         if let Some(&id) = self.by_key.get(&key) {
             self.entries[id].uses += 1;
             return Ty::Ref(id);
@@ -621,6 +757,43 @@ impl<'a> Ctx<'a> {
         self.by_key.insert(key, id);
         self.pending.push(id);
         Ty::Ref(id)
+    }
+
+    /// A definition that reaches itself through unions and references alone (no
+    /// object, array or tuple in between) has no finite meaning TypeScript can
+    /// declare. It becomes `unknown`, which is wider.
+    fn settle_cycles(&mut self) {
+        let mut cyclic = Vec::new();
+        for id in 0..self.entries.len() {
+            let mut stack: Vec<&Ty<'a>> = self.entries[id].ty.iter().collect();
+            let mut seen = HashSet::new();
+            let mut steps = 0usize;
+            while let Some(ty) = stack.pop() {
+                steps += 1;
+                if steps > 100_000 {
+                    cyclic.push(id);
+                    break;
+                }
+                match ty {
+                    Ty::Ref(next) if *next == id => {
+                        cyclic.push(id);
+                        break;
+                    }
+                    Ty::Ref(next) => {
+                        if seen.insert(*next) {
+                            stack.extend(self.entries[*next].ty.iter());
+                        }
+                    }
+                    Ty::Union(members) | Ty::Wide(members) => stack.extend(members.iter()),
+                    _ => {}
+                }
+            }
+        }
+        for id in cyclic {
+            let entry = &mut self.entries[id];
+            entry.ty = Some(Ty::Unknown);
+            entry.recursive = false;
+        }
     }
 
     /// Build every deferred declaration, iteratively.
@@ -656,8 +829,11 @@ impl<'a> Ctx<'a> {
         self.render_shape(shape, 0)
     }
 
-    /// Distribute `anyOf`/`oneOf` groups over the merged parts, then render each
-    /// resulting shape. Iterative: a work list of shapes, not recursion.
+    /// Distribute the choices (`anyOf`/`oneOf`, `if`/`then`/`else`, and
+    /// dependencies whose trigger may be absent) over the merged parts, then render
+    /// each resulting shape. Iterative: a work list of shapes, not recursion.
+    /// Dependencies are expanded here, before rendering, because a dependency can
+    /// itself bring in new choices.
     fn render_shape(&mut self, shape: Shape<'a>, depth: usize) -> Ty<'a> {
         let mut open = std::collections::VecDeque::from([shape]);
         let mut done: Vec<Shape<'a>> = Vec::new();
@@ -665,18 +841,74 @@ impl<'a> Ctx<'a> {
             if shape.never {
                 continue;
             }
-            if shape.groups.is_empty() {
-                done.push(shape);
-                continue;
-            }
-            let (members, _) = shape.groups.remove(0);
-            for member in members {
-                if !self.tick() {
+            if !shape.groups.is_empty() {
+                if self.exhausted {
                     return Ty::Unknown;
                 }
-                let mut next = shape.clone();
-                self.flatten(&mut next, member);
-                open.push_back(next);
+                let group = shape.groups.remove(0);
+                let mut refine_else: Option<Refinement<'a>> = None;
+                let branches: Vec<Vec<&'a Value>> = match group {
+                    Group::Any(members, _) => members.iter().map(|member| vec![member]).collect(),
+                    Group::Cond {
+                        cond,
+                        then,
+                        otherwise,
+                    } => {
+                        // The then-branch also satisfies the condition, so merge it in;
+                        // the else-branch cannot say "not the condition" (wider).
+                        let then_branch: Vec<&'a Value> =
+                            std::iter::once(cond).chain(then).collect();
+                        let else_branch: Vec<&'a Value> = otherwise.into_iter().collect();
+                        refine_else = failing(cond);
+                        match self.settled(cond, &shape, depth) {
+                            Some(true) => vec![then_branch],
+                            Some(false) => vec![else_branch],
+                            None => vec![then_branch, else_branch],
+                        }
+                    }
+                };
+                let last = branches.len().saturating_sub(1);
+                let two = branches.len() == 2;
+                for (index, branch) in branches.into_iter().enumerate() {
+                    self.charge(shape.parts.len());
+                    if !self.tick() {
+                        return Ty::Unknown;
+                    }
+                    let mut next = shape.clone();
+                    for sub in branch {
+                        self.flatten(&mut next, sub);
+                    }
+                    // The else-branch fails the condition; say what that implies.
+                    if two && index == last {
+                        match refine_else {
+                            Some(Refinement::Present(key)) => next.extra_required.push(key),
+                            Some(Refinement::Absent(key)) => next.absent.push(key),
+                            None => {}
+                        }
+                    }
+                    open.push_back(next);
+                }
+                continue;
+            }
+            match self.next_dependency(&shape) {
+                None => done.push(shape),
+                // Out of budget with a dependency undecided: claim nothing.
+                Some(_) if self.exhausted => return Ty::Unknown,
+                Some((id, key, dependency)) => {
+                    if self.certainly_present(&shape, key) {
+                        self.apply_dependency(&mut shape, id, dependency);
+                        open.push_front(shape);
+                    } else {
+                        // Optional trigger: either absent, or present with its dependency.
+                        self.charge(shape.parts.len());
+                        let mut present = shape.clone();
+                        present.extra_required.push(key);
+                        self.apply_dependency(&mut present, id, dependency);
+                        shape.absent.push(key);
+                        open.push_back(shape);
+                        open.push_back(present);
+                    }
+                }
             }
         }
         let mut members = Vec::with_capacity(done.len());
@@ -687,9 +919,9 @@ impl<'a> Ctx<'a> {
     }
 
     /// Render one merged shape with no groups left.
-    fn render_merged(&mut self, mut shape: Shape<'a>, depth: usize) -> Ty<'a> {
-        let required = self.required_keys(&mut shape);
-        if shape.never {
+    fn render_merged(&mut self, shape: Shape<'a>, depth: usize) -> Ty<'a> {
+        let required = self.required_keys(&shape);
+        if shape.never || shape.absent.iter().any(|key| required.contains(key)) {
             return Ty::Never;
         }
         let mut kinds = shape
@@ -709,6 +941,7 @@ impl<'a> Ctx<'a> {
                 }
                 _ => continue,
             };
+            self.charge(values.len());
             literals = Some(match literals {
                 None => values,
                 Some(previous) => {
@@ -730,14 +963,34 @@ impl<'a> Ctx<'a> {
             return union(members);
         }
         if kinds == K_ALL {
-            // No `type`: infer the author's intent from the keywords used.
             let object = shape.parts.iter().any(|part| has_object_keywords(part));
             let array = shape.parts.iter().any(|part| has_array_keywords(part));
-            kinds = match (object, array) {
-                (true, false) => K_OBJ,
-                (false, true) => K_ARR,
-                _ => return Ty::Unknown,
-            };
+            if !object && !array {
+                return Ty::Unknown;
+            }
+            if depth > 0 {
+                // No `type` below the top: object or array keywords constrain only
+                // values of that kind, and every other kind is admitted. Keep the
+                // shape visible; shortening may still say `unknown`.
+                let mut members = Vec::new();
+                if object {
+                    members.push(self.render_object(&shape, &required, depth));
+                }
+                members.push(self.render_array(&shape, depth));
+                members.extend(["string", "number", "boolean", "null"].map(Ty::Prim));
+                if !object {
+                    members.push(Ty::Object {
+                        props: Vec::new(),
+                        index: Index::Free,
+                    });
+                }
+                return match union(members) {
+                    Ty::Union(members) => Ty::Wide(members),
+                    other => other,
+                };
+            }
+            // The top level: MCP tool arguments are always an object.
+            kinds = if object { K_OBJ } else { K_ARR };
         }
         let mut members = Vec::new();
         for (bit, prim) in [(K_STR, "string"), (K_NUM, "number"), (K_BOOL, "boolean")] {
@@ -763,21 +1016,83 @@ impl<'a> Ctx<'a> {
         required: &BTreeSet<&'a str>,
         depth: usize,
     ) -> Ty<'a> {
-        let mut keys: BTreeSet<&'a str> = required.clone();
+        // Too many declared keys for the work left: keep every required key (its
+        // type `unknown`) and admit any other key. Wider, and never hides a
+        // requirement; `describe` has the budget for the whole object.
+        let declared_total: usize = shape
+            .parts
+            .iter()
+            .filter_map(|part| part.get("properties").and_then(Value::as_object))
+            .map(Map::len)
+            .sum();
+        self.charge(shape.parts.len());
+        if declared_total.saturating_mul(3) > self.max_work.saturating_sub(self.work) {
+            self.exhausted = true;
+            let props = required
+                .iter()
+                .map(|key| Prop {
+                    key,
+                    required: true,
+                    ty: Ty::Unknown,
+                })
+                .chain(shape.absent.iter().map(|key| Prop {
+                    key,
+                    required: false,
+                    ty: Ty::Never,
+                }))
+                .collect();
+            return Ty::Object {
+                props,
+                index: Index::Free,
+            };
+        }
+        // Index declared properties once, so each key costs its own constraints,
+        // not a scan of every part. Only parts that type undeclared keys
+        // (patterns, `additionalProperties`) are consulted per key.
+        let mut declared: HashMap<&'a str, Vec<&'a Value>> = HashMap::new();
+        let mut generic: Vec<&'a Map<String, Value>> = Vec::new();
+        let mut scanned = shape.parts.len();
         for part in &shape.parts {
             if let Some(Value::Object(properties)) = part.get("properties") {
-                keys.extend(properties.keys().map(String::as_str));
-            }
-        }
-        let mut props = Vec::with_capacity(keys.len());
-        for key in keys {
-            let mut subs = Vec::new();
-            for part in &shape.parts {
-                if let Some(applies) = self.key_constraint(part, key) {
-                    subs.extend(applies);
+                scanned += properties.len();
+                for (key, schema) in properties {
+                    declared.entry(key.as_str()).or_default().push(schema);
                 }
             }
-            let ty = if subs.is_empty() {
+            if part.contains_key("patternProperties") || part.contains_key("additionalProperties") {
+                generic.push(part);
+            }
+        }
+        self.charge(scanned);
+        let mut keys: BTreeSet<&'a str> = required.clone();
+        keys.extend(declared.keys().copied());
+        keys.extend(shape.absent.iter().copied());
+        let mut props = Vec::with_capacity(keys.len());
+        for key in keys {
+            if shape.absent.contains(&key) {
+                props.push(Prop {
+                    key,
+                    required: false,
+                    ty: Ty::Never,
+                });
+                continue;
+            }
+            let mut subs = declared.get(key).cloned().unwrap_or_default();
+            if !generic.is_empty() {
+                self.charge(generic.len());
+                for part in &generic {
+                    let declares = part
+                        .get("properties")
+                        .and_then(Value::as_object)
+                        .is_some_and(|properties| properties.contains_key(key));
+                    if !declares {
+                        if let Some(applies) = self.key_constraint(part, key) {
+                            subs.extend(applies);
+                        }
+                    }
+                }
+            }
+            let ty = if subs.is_empty() || self.exhausted {
                 Ty::Unknown
             } else {
                 self.build(&subs, depth + 1)
@@ -921,6 +1236,9 @@ impl<'a> Ctx<'a> {
         answer
     }
 
+    /// Evaluates `{}` against the schema: every keyword that can reject an empty
+    /// object is checked, `not` and `if`/`then`/`else` by evaluating their
+    /// subschemas, and only what cannot be seen (an external `$ref`) is `Maybe`.
     fn accepts_empty_uncached(&mut self, sub: &'a Value) -> Tri {
         let shape = self.shape_of(&[sub]);
         if shape.never {
@@ -932,6 +1250,14 @@ impl<'a> Ctx<'a> {
             Tri::Yes
         };
         let empty = Value::Object(Map::new());
+        let and = |answer: &mut Tri, part: Tri| match part {
+            Tri::No => false,
+            Tri::Maybe => {
+                *answer = Tri::Maybe;
+                true
+            }
+            Tri::Yes => true,
+        };
         for part in &shape.parts {
             if part_kinds(part) & K_OBJ == 0 {
                 return Tri::No;
@@ -960,32 +1286,60 @@ impl<'a> Ctx<'a> {
             {
                 return Tri::No;
             }
-        }
-        for (members, one_of) in shape.groups.clone() {
-            let results: Vec<Tri> = members
-                .iter()
-                .map(|member| self.accepts_empty(member))
-                .collect();
-            let yes = results.iter().filter(|r| **r == Tri::Yes).count();
-            let maybe = results.iter().filter(|r| **r == Tri::Maybe).count();
-            let group = if one_of {
-                match (yes, maybe) {
-                    (1, 0) => Tri::Yes,
-                    (0, 0) => Tri::No,
-                    (yes, _) if yes >= 2 => Tri::No,
-                    _ => Tri::Maybe,
+            if let Some(not) = part.get("not") {
+                let negated = match self.accepts_empty(not) {
+                    Tri::Yes => Tri::No,
+                    Tri::No => Tri::Yes,
+                    Tri::Maybe => Tri::Maybe,
+                };
+                if !and(&mut answer, negated) {
+                    return Tri::No;
                 }
-            } else if yes > 0 {
-                Tri::Yes
-            } else if maybe > 0 {
-                Tri::Maybe
-            } else {
-                Tri::No
+            }
+        }
+        // `properties`, patterns, extra keys, dependencies and property names are
+        // vacuous for an object with no keys.
+        for group in shape.groups.clone() {
+            let result = match group {
+                Group::Any(members, one_of) => {
+                    let results: Vec<Tri> = members
+                        .iter()
+                        .map(|member| self.accepts_empty(member))
+                        .collect();
+                    let yes = results.iter().filter(|r| **r == Tri::Yes).count();
+                    let maybe = results.iter().filter(|r| **r == Tri::Maybe).count();
+                    if one_of {
+                        match (yes, maybe) {
+                            (1, 0) => Tri::Yes,
+                            (0, 0) => Tri::No,
+                            (yes, _) if yes >= 2 => Tri::No,
+                            _ => Tri::Maybe,
+                        }
+                    } else if yes > 0 {
+                        Tri::Yes
+                    } else if maybe > 0 {
+                        Tri::Maybe
+                    } else {
+                        Tri::No
+                    }
+                }
+                Group::Cond {
+                    cond,
+                    then,
+                    otherwise,
+                } => {
+                    let then = then.map_or(Tri::Yes, |then| self.accepts_empty(then));
+                    let otherwise = otherwise.map_or(Tri::Yes, |other| self.accepts_empty(other));
+                    match self.accepts_empty(cond) {
+                        Tri::Yes => then,
+                        Tri::No => otherwise,
+                        Tri::Maybe if then == otherwise => then,
+                        Tri::Maybe => Tri::Maybe,
+                    }
+                }
             };
-            match group {
-                Tri::No => return Tri::No,
-                Tri::Maybe => answer = Tri::Maybe,
-                Tri::Yes => {}
+            if !and(&mut answer, result) {
+                return Tri::No;
             }
         }
         answer
@@ -1104,7 +1458,21 @@ impl<'c, 'a> Printer<'c, 'a> {
     }
 
     fn compound(&self, ty: &Ty<'a>) -> bool {
+        let mut ty = ty;
+        let mut seen: Vec<usize> = Vec::new();
+        // Follow inlined references to what they print as, without looping.
+        while let Ty::Ref(id) = ty {
+            if self.by_name(*id, 1) || seen.contains(id) {
+                return false;
+            }
+            seen.push(*id);
+            match self.ctx.entries[*id].ty.as_ref() {
+                Some(next) => ty = next,
+                None => return false,
+            }
+        }
         match ty {
+            Ty::Wide(_) => !self.step.collapse,
             Ty::Union(members) => {
                 if self.step.enum_base && members.iter().all(|m| matches!(m, Ty::Lit(_))) {
                     let kinds: HashSet<Kinds> = members
@@ -1118,13 +1486,6 @@ impl<'c, 'a> Printer<'c, 'a> {
                 } else {
                     true
                 }
-            }
-            Ty::Ref(id) => {
-                !self.by_name(*id, 1)
-                    && self.ctx.entries[*id]
-                        .ty
-                        .as_ref()
-                        .is_some_and(|ty| self.compound(ty))
             }
             _ => false,
         }
@@ -1191,6 +1552,8 @@ impl<'c, 'a> Printer<'c, 'a> {
             }
             Ty::Object { props, index } => self.object(props, index, depth),
             Ty::Union(members) => self.union(members, depth),
+            Ty::Wide(_) if self.step.collapse => self.push("unknown"),
+            Ty::Wide(members) => self.union(members, depth),
             Ty::Ref(id) => {
                 let id = *id;
                 if self.by_name(id, depth) {
@@ -1303,6 +1666,7 @@ impl<'c, 'a> Printer<'c, 'a> {
         let mut first = true;
         let (mut folded_required, mut folded_optional) = (0usize, 0usize);
         let mut prop_types: Vec<String> = Vec::new();
+        let mut any_optional = false;
         for prop in props {
             if !prop.required && fold_optional {
                 folded_optional += 1;
@@ -1319,7 +1683,10 @@ impl<'c, 'a> Printer<'c, 'a> {
             let mark = self.mark();
             let attempt = self.prop(prop, first, depth, reserve, &mut prop_types);
             match attempt {
-                Ok(()) => first = false,
+                Ok(()) => {
+                    first = false;
+                    any_optional |= !prop.required;
+                }
                 Err(TooLong) if trim => {
                     self.reset(mark);
                     // Keep the name; `unknown` is wider than any type.
@@ -1330,7 +1697,10 @@ impl<'c, 'a> Printer<'c, 'a> {
                     };
                     let mark = self.mark();
                     match self.prop(&wide, first, depth, reserve, &mut prop_types) {
-                        Ok(()) => first = false,
+                        Ok(()) => {
+                            first = false;
+                            any_optional |= !prop.required;
+                        }
                         Err(TooLong) => {
                             self.reset(mark);
                             if prop.required {
@@ -1361,6 +1731,10 @@ impl<'c, 'a> Printer<'c, 'a> {
                     self.push(&text)?;
                     seen.push(text);
                 }
+            }
+            // Under `strict`, an optional property reads as `T | undefined`.
+            if any_optional && !seen.iter().any(|text| text == "unknown") {
+                self.push(" | undefined")?;
             }
         }
         for (count, label) in [(folded_required, "required"), (folded_optional, "optional")] {
@@ -1451,6 +1825,7 @@ pub fn render_type(schema: &Value, max_chars: usize) -> Option<String> {
     let mut ctx = Ctx::new(schema, DESCRIBE_WORK);
     let ty = ctx.build(&[schema], 0);
     ctx.drain();
+    ctx.settle_cycles();
     let mut printer = Printer::new(&ctx, Step::FULL, Mode::Search, max_chars);
     printer.print(&ty, 0).ok()?;
     Some(printer.out)
@@ -1483,6 +1858,7 @@ fn build_tool<'a>(input: &'a Value, output: Option<&'a Value>, max_work: usize) 
         ty
     });
     ctx.drain();
+    ctx.settle_cycles();
     Built {
         ctx,
         args,
@@ -1545,18 +1921,13 @@ fn call_callee(name: &str) -> String {
 /// The callee used when the name itself does not fit: `name` is the hit's own name.
 const NAMELESS_CALLEE: &str = "toolport.call(name, ";
 
-fn tool_parts(tool: &Value) -> Option<(&str, Value, Option<Value>)> {
+/// The name and schemas, borrowed. Nothing is copied: every string the schema
+/// contributes reaches the text through the printer, and the finished text passes
+/// the same gateway-voice neutralisation a listed `inputSchema` gets.
+fn tool_parts(tool: &Value) -> Option<(&str, &Value, Option<&Value>)> {
     let name = tool.get("name").and_then(Value::as_str)?;
-    let mut input = tool.get("inputSchema").cloned().unwrap_or(Value::Null);
-    integrity::neutralize_value_strings(&mut input);
-    let output = tool
-        .get("outputSchema")
-        .filter(|schema| schema.is_object())
-        .cloned()
-        .map(|mut output| {
-            integrity::neutralize_value_strings(&mut output);
-            output
-        });
+    let input = tool.get("inputSchema").unwrap_or(&NULL);
+    let output = tool.get("outputSchema").filter(|schema| schema.is_object());
     Some((name, input, output))
 }
 
@@ -1605,7 +1976,7 @@ fn search_signature_of(built: &Built<'_>, name: &str, cap: usize) -> String {
 /// shaped. A recursive type is named, with a note that `toolport.describe` has it.
 pub fn signature(tool: &Value) -> Option<String> {
     let (name, input, output) = tool_parts(tool)?;
-    let built = build_tool(&input, output.as_ref(), SEARCH_WORK);
+    let built = build_tool(input, output, SEARCH_WORK);
     Some(search_signature_of(&built, name, MAX_SIGNATURE_CHARS))
 }
 
@@ -1627,7 +1998,7 @@ pub fn full_signature(tool: &Value) -> Option<FullSignature> {
 
 fn full_signature_with(tool: &Value, max_work: usize, max_bytes: usize) -> Option<FullSignature> {
     let (name, input, output) = tool_parts(tool)?;
-    let built = build_tool(&input, output.as_ref(), max_work);
+    let built = build_tool(input, output, max_work);
     let callee = callee(name);
     let full = |hoist_shared: bool, cap: usize| {
         let mode = Mode::Describe { hoist_shared };

@@ -152,7 +152,9 @@ fn s2_args_optional_only_when_empty_object_validates() {
             json!({"type": "object", "oneOf": [{"properties": {"a": {}}}, {"properties": {"b": {}}}]}),
             false,
         ),
-        (json!({"type": "object", "not": {"required": ["a"]}}), false),
+        // `not` is evaluated: `{}` lacks `a`, so it passes.
+        (json!({"type": "object", "not": {"required": ["a"]}}), true),
+        (json!({"type": "object", "not": {"properties": {}}}), false),
         (json!({"type": "string"}), false),
         (json!({}), true),
     ] {
@@ -175,7 +177,7 @@ fn s3_undeclared_required_keys_and_index_signatures() {
     });
     assert_eq!(
         sig(schema),
-        "servers.t.x(args: {extra: number; fixed?: string; [key: string]: number | string}): ToolResult"
+        "servers.t.x(args: {extra: number; fixed?: string; [key: string]: number | string | undefined}): ToolResult"
     );
     let patterned = json!({
         "type": "object",
@@ -269,7 +271,7 @@ fn l3_deep_nesting_renders_completely() {
         "{}",
         described.signature
     );
-    assert!(described.signature.contains("type T"));
+    assert!(described.signature.contains("type $T"));
     let mut ordinary = json!({"type": "string"});
     for key in ["g", "f", "e", "d", "c", "b", "a"] {
         ordinary = json!({"type": "object", "properties": {key: ordinary}});
@@ -360,8 +362,8 @@ fn l5_repeated_refs_are_memoised() {
     );
     assert!(described
         .signature
-        .contains("type d39 = {l?: d40; r?: d40};"));
-    assert!(described.signature.contains("type d40 = string;"));
+        .contains("type $d39 = {l?: $d40; r?: $d40};"));
+    assert!(described.signature.contains("type $d40 = string;"));
     assert!(sig(bomb).chars().count() <= MAX_SIGNATURE_CHARS);
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
 }
@@ -378,17 +380,17 @@ fn l6_recursive_refs_become_named_types() {
     });
     assert_eq!(
         full(input.clone()).signature,
-        "type Node = {children?: Node[]; value: string};\nservers.t.x(args: Node): ToolResult"
+        "type $Node = {children?: $Node[]; value: string};\nservers.t.x(args: $Node): ToolResult"
     );
     assert_eq!(
         sig(input),
-        "servers.t.x(args: {children?: Node[]; value: string}): ToolResult /* Node: see toolport.describe */"
+        "servers.t.x(args: {children?: $Node[]; value: string}): ToolResult /* $Node: see toolport.describe */"
     );
     // Self-reference through the root, and mutual recursion.
     let root = json!({"type": "object", "properties": {"next": {"$ref": "#"}}});
     assert_eq!(
         full(root).signature,
-        "type Root = {next?: Root};\nservers.t.x(args?: {next?: Root}): ToolResult"
+        "type $Root = {next?: $Root};\nservers.t.x(args?: {next?: $Root}): ToolResult"
     );
     let mutual = json!({
         "$defs": {"a": {"type": "array", "items": {"$ref": "#/$defs/b"}}, "b": {"type": "array", "items": {"$ref": "#/$defs/a"}}},
@@ -396,7 +398,7 @@ fn l6_recursive_refs_become_named_types() {
     });
     assert_eq!(
         full(mutual).signature,
-        "type a = a[][];\nservers.t.x(args?: {x?: a}): ToolResult"
+        "type $a = $a[][];\nservers.t.x(args?: {x?: $a}): ToolResult"
     );
     // External and missing references stay unknown.
     assert_eq!(
@@ -437,7 +439,7 @@ fn l2_describe_is_complete_or_says_it_is_truncated() {
     let reason = worked.truncated.expect("work guard reported");
     assert!(reason.contains("100-node work guard"), "{reason}");
     assert!(
-        worked.signature.contains("parameter_04999?: unknown"),
+        worked.signature.contains("args?: Record<string, unknown>"),
         "{}",
         worked.signature.len()
     );
@@ -638,7 +640,7 @@ fn output_schema_types_structured_content() {
     });
     assert_eq!(
         full_signature(&both).unwrap().signature,
-        "type Node = {next?: Node};\ntype Node2 = {up?: Node2};\nservers.a.b(args?: Node): ToolResult<Node2>"
+        "type $Node = {next?: $Node};\ntype $Node2 = {up?: $Node2};\nservers.a.b(args?: $Node): ToolResult<$Node2>"
     );
 }
 
@@ -732,6 +734,337 @@ fn forged_gateway_voice_is_neutralised() {
     }
 }
 
+/// R2-1: `if`/`then`/`else` requirements are alternatives, found through `allOf`,
+/// refs and nesting, and `{}` is decided by evaluating the condition.
+#[test]
+fn r2_1_conditionals_render_as_alternatives() {
+    let always = json!({"type": "object", "properties": {"a": {"type": "string"}},
+        "if": true, "then": {"allOf": [{"required": ["a"]}]}});
+    assert!(!validates(&always, &json!({})));
+    assert_eq!(sig(always), "servers.t.x(args: {a: string}): ToolResult");
+    let choose = json!({"type": "object",
+        "properties": {"mode": {"type": "string"}, "a": {"type": "string"}, "b": {"type": "string"}},
+        "if": {"properties": {"mode": {"const": "a"}}, "required": ["mode"]},
+        "then": {"required": ["a"]}, "else": {"required": ["b"]}});
+    assert_eq!(
+        sig(choose.clone()),
+        "servers.t.x(args: {a: string; b?: string; mode: \"a\"} | {a?: string; b: string; mode?: string}): ToolResult"
+    );
+    let built = build_tool(&choose, None, SEARCH_WORK);
+    for value in [
+        json!({"mode": "a", "a": "ok"}),
+        json!({"mode": "b", "b": "ok"}),
+    ] {
+        assert!(validates(&choose, &value));
+        assert!(admits(&built.args, &value, &built.ctx, 0), "{value}");
+    }
+    // Through a ref and allOf; `{}` fails the condition, so no requirement applies.
+    let nested = json!({"type": "object", "$defs": {"c": {"if": {"required": ["x"]}, "then": {"required": ["y"]}}},
+        "allOf": [{"$ref": "#/$defs/c"}], "properties": {"x": {"type": "string"}, "y": {"type": "string"}}});
+    assert!(validates(&nested, &json!({})));
+    assert_eq!(
+        sig(nested),
+        "servers.t.x(args?: {x: string; y: string} | {x?: never; y?: string}): ToolResult"
+    );
+    // `{}` passes a condition with no requirement, so `then` applies to it.
+    let applies = json!({"type": "object", "if": {"properties": {}}, "then": {"required": ["a"]}});
+    assert!(!validates(&applies, &json!({})));
+    assert!(sig(applies).contains("(args: "));
+    // Nested conditionals in a branch distribute too.
+    let deeper = json!({"type": "object", "properties": {"k": {"type": "string"}, "p": {"type": "string"}, "q": {"type": "string"}},
+        "if": {"required": ["k"]}, "then": {"if": {"required": ["p"]}, "then": {"required": ["q"]}}});
+    assert!(full(deeper)
+        .signature
+        .contains("{k: string; p: string; q: string}"));
+}
+
+/// R2-2: dependencies are expanded before unions are distributed, and an optional
+/// trigger splits into "absent" and "present with its dependency".
+#[test]
+fn r2_2_dependencies_expand_before_unions() {
+    let dep = json!({"type": "object",
+        "properties": {"a": {"type": "string"}, "b": {"type": "string"}, "c": {"type": "string"}},
+        "required": ["a"],
+        "dependentSchemas": {"a": {"anyOf": [{"required": ["b"]}, {"required": ["c"]}]}}});
+    assert!(!validates(&dep, &json!({"a": "ok"})));
+    assert_eq!(
+        sig(dep),
+        "servers.t.x(args: {a: string; b: string; c?: string} | {a: string; b?: string; c: string}): ToolResult"
+    );
+    let optional = json!({"type": "object",
+        "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+        "dependentRequired": {"a": ["b"]}});
+    assert!(validates(&optional, &json!({})));
+    assert!(!validates(&optional, &json!({"a": "x"})));
+    assert_eq!(
+        sig(optional),
+        "servers.t.x(args?: {a?: never; b?: string} | {a: string; b: string}): ToolResult"
+    );
+    // A dependency found inside a branch is expanded in that branch.
+    let in_branch = json!({"type": "object", "properties": {"m": {"type": "string"}, "n": {"type": "string"}},
+        "anyOf": [{"required": ["m"], "dependentRequired": {"m": ["n"]}}, {"required": ["n"]}]});
+    assert_eq!(
+        sig(in_branch),
+        "servers.t.x(args: {m: string; n: string} | {m?: string; n: string}): ToolResult"
+    );
+    // Draft 7 `dependencies` too.
+    let draft7 = json!({"type": "object", "properties": {"a": {}, "b": {}}, "required": ["a"], "dependencies": {"a": ["b"]}});
+    assert!(sig(draft7).contains("{a: unknown; b: unknown}"));
+}
+
+/// R2-3: optional properties next to an index signature compile under `strict`.
+#[test]
+fn r2_3_index_signature_admits_undefined() {
+    let schema = json!({"type": "object", "properties": {"a": {"type": "string"}}, "additionalProperties": {"type": "number"}});
+    assert_eq!(
+        sig(schema.clone()),
+        "servers.t.x(args?: {a?: string; [key: string]: number | string | undefined}): ToolResult"
+    );
+    tsc_strict(&[full(schema).signature], &["servers.t.x("]);
+}
+
+/// R2-4: constraints are indexed by property; a schema with thousands of branches
+/// renders in linear time and stops at the work budget with a wider type.
+#[test]
+fn r2_4_many_branches_render_in_linear_time() {
+    let branches: Vec<Value> = (0..5_000)
+        .map(|i| json!({"properties": {format!("p{i:04}"): {"type": "string"}}, "required": [format!("p{i:04}")]}))
+        .collect();
+    let schema = json!({"type": "object", "allOf": branches});
+    let started = std::time::Instant::now();
+    let text = sig(schema.clone());
+    let elapsed = started.elapsed();
+    // Past the search budget the required names stay, typed `unknown`.
+    assert!(
+        text.starts_with("servers.t.x(args: {p0000: unknown;"),
+        "{text}"
+    );
+    assert!(text.ends_with(" required}): ToolResult"), "{text}");
+    assert!(text.chars().count() <= MAX_SIGNATURE_CHARS);
+    // Debug build; the release figure is in `bench_signature_timings`.
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "{elapsed:?}"
+    );
+    let described = full(schema);
+    assert_eq!(described.signature.matches(": string").count(), 5_000);
+}
+
+/// R2-5: generated names cannot collide with reserved words or built-in types.
+#[test]
+fn r2_5_declaration_names_are_always_safe() {
+    let mut defs = Map::new();
+    for name in ["class", "type", "Record", "string", "enum", "await", "1st"] {
+        defs.insert(
+            name.to_string(),
+            json!({"type": "object", "properties": {"next": {"$ref": format!("#/$defs/{name}")}}}),
+        );
+    }
+    let props: Map<String, Value> = defs
+        .keys()
+        .map(|name| {
+            (
+                format!("p_{name}"),
+                json!({"$ref": format!("#/$defs/{name}")}),
+            )
+        })
+        .collect();
+    let described = full(json!({"type": "object", "$defs": defs, "properties": props}));
+    assert!(
+        described
+            .signature
+            .contains("type $class = {next?: $class};"),
+        "{}",
+        described.signature
+    );
+    assert!(described.signature.contains("type $1st = {next?: $1st};"));
+    tsc_strict(&[described.signature], &["servers.t.x("]);
+}
+
+/// R2-6: a pure reference cycle renders `unknown` and never hangs.
+#[test]
+fn r2_6_pure_reference_cycles_are_unknown() {
+    let schema = json!({"type": "object", "$defs": {"A": {"$ref": "#/$defs/A"}, "B": {"anyOf": [{"$ref": "#/$defs/B"}, {"type": "string"}]}},
+        "properties": {"x": {"type": "array", "items": {"$ref": "#/$defs/A"}}, "y": {"type": "array", "items": {"$ref": "#/$defs/B"}}}});
+    let started = std::time::Instant::now();
+    assert_eq!(
+        sig(schema.clone()),
+        "servers.t.x(args?: {x?: unknown[]; y?: unknown[]}): ToolResult"
+    );
+    assert_eq!(
+        full(schema).signature,
+        "servers.t.x(args?: {x?: unknown[]; y?: unknown[]}): ToolResult"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
+/// R2-7: a nested schema with `properties` but no `type` admits every kind.
+#[test]
+fn r2_7_untyped_nested_schemas_admit_every_kind() {
+    let schema =
+        json!({"type": "object", "properties": {"x": {"properties": {"a": {"type": "string"}}}}});
+    assert!(validates(&schema, &json!({"x": false})));
+    assert_eq!(
+        sig(schema.clone()),
+        "servers.t.x(args?: {x?: {a?: string} | unknown[] | string | number | boolean | null}): ToolResult"
+    );
+    let built = build_tool(&schema, None, SEARCH_WORK);
+    assert!(admits(&built.args, &json!({"x": false}), &built.ctx, 0));
+    // The top level stays an object (MCP arguments always are).
+    assert_eq!(
+        sig(json!({"properties": {"a": {"type": "string"}}})),
+        "servers.t.x(args?: {a?: string}): ToolResult"
+    );
+    // Shortening may collapse the wide union to `unknown`.
+    let mut props: Map<String, Value> = (0..30)
+        .map(|i| {
+            (
+                format!("req_{i:02}"),
+                json!({"properties": {"a": {"type": "string"}}}),
+            )
+        })
+        .collect();
+    props.insert("only".into(), json!({"type": "string"}));
+    let keys: Vec<String> = props.keys().cloned().collect();
+    let text = sig(json!({"type": "object", "properties": props, "required": keys}));
+    assert!(text.contains("req_00: unknown"), "{text}");
+}
+
+/// Compile `signatures` with `tsc --strict --noEmit` when the repository's
+/// TypeScript is installed. Each signature's last line starts with its callee.
+fn tsc_strict(signatures: &[String], callees: &[&str]) {
+    let tsc = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../node_modules/.bin/tsc");
+    if !tsc.exists() {
+        eprintln!(
+            "tsc not installed; skipping the strict compile of {} signatures",
+            signatures.len()
+        );
+        return;
+    }
+    let mut source = String::from(
+        "type ToolResult<T = unknown> = { content: unknown[]; structuredContent?: T; isError?: boolean };\n",
+    );
+    for (index, signature) in signatures.iter().enumerate() {
+        let (declarations, call) = signature.rsplit_once('\n').unwrap_or(("", signature));
+        let callee = callees[index.min(callees.len() - 1)];
+        let rest = call
+            .strip_prefix(callee)
+            .unwrap_or_else(|| panic!("{call} lacks {callee}"));
+        source.push_str(&format!(
+            "namespace N{index} {{\n{declarations}\ndeclare function f({rest};\n}}\n"
+        ));
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "toolport-tsc-{}-{}",
+        std::process::id(),
+        signatures.len()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("signatures.ts");
+    std::fs::write(&file, &source).unwrap();
+    // Its own project, so no @types from the surrounding tree are loaded.
+    std::fs::write(
+        dir.join("tsconfig.json"),
+        r#"{"compilerOptions": {"strict": true, "noEmit": true, "target": "es2020", "lib": ["es2020"], "types": [], "typeRoots": []}, "files": ["signatures.ts"]}"#,
+    )
+    .unwrap();
+    let output = std::process::Command::new(&tsc)
+        .arg("-p")
+        .arg(&dir)
+        .output()
+        .expect("tsc runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "tsc --strict rejected signatures:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Release timings for the review: `cargo test --release --lib -- --ignored bench_signature`.
+#[test]
+#[ignore]
+fn bench_signature_timings() {
+    let time = |label: &str, runs: usize, f: &dyn Fn()| {
+        let started = std::time::Instant::now();
+        for _ in 0..runs {
+            f();
+        }
+        eprintln!(
+            "bench {label}: {:?} total over {runs} run(s), {:?} each",
+            started.elapsed(),
+            started.elapsed() / runs as u32
+        );
+    };
+    let branches: Vec<Value> = (0..5_000)
+        .map(|i| json!({"properties": {format!("p{i:04}"): {"type": "string"}}, "required": [format!("p{i:04}")]}))
+        .collect();
+    let small = tool("t__x", json!({"type": "object", "allOf": branches}));
+    eprintln!(
+        "bench 5000-branch schema: {} bytes",
+        small.to_string().len()
+    );
+    time("5000 branches, one search signature", 20, &|| {
+        signature(&small).unwrap();
+    });
+    let big_branches: Vec<Value> = (0..9_000)
+        .map(|i| {
+            let props: Map<String, Value> = (0..20)
+                .map(|j| {
+                    (
+                        format!("k{i:04}_{j:02}"),
+                        json!({"type": "string", "description": "x".repeat(60)}),
+                    )
+                })
+                .collect();
+            json!({"properties": props, "required": [format!("k{i:04}_00")]})
+        })
+        .collect();
+    let big = tool("t__x", json!({"type": "object", "allOf": big_branches}));
+    eprintln!("bench 9000-branch schema: {} bytes", big.to_string().len());
+    time("9000 branches, 20 search signatures", 1, &|| {
+        for _ in 0..20 {
+            signature(&big).unwrap();
+        }
+    });
+    let values: Vec<String> = (0..100_000).map(|i| format!("value_{i}")).collect();
+    let enum_tool = tool(
+        "t__x",
+        json!({"type": "object", "properties": {"mode": {"enum": values}}, "required": ["mode"]}),
+    );
+    time("100k-value enum, one search signature", 5, &|| {
+        signature(&enum_tool).unwrap();
+    });
+    let flat: Map<String, Value> = (0..100_000)
+        .map(|i| (format!("p{i}"), json!({"type": "string"})))
+        .collect();
+    let flat_tool = tool("t__x", json!({"type": "object", "properties": flat}));
+    time("100k flat properties, one search signature", 5, &|| {
+        signature(&flat_tool).unwrap();
+    });
+    let doc: Value =
+        serde_json::from_str(include_str!("../tests/fixtures/search-eval/catalog.json")).unwrap();
+    let catalog: Vec<Value> = doc["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| {
+            let mut tool = tool.clone();
+            if tool.get("inputSchema").is_none() {
+                tool["inputSchema"] = doc["sharedInputSchema"].clone();
+            }
+            tool
+        })
+        .collect();
+    let hits: Vec<&Value> = catalog.iter().take(20).collect();
+    time("ordinary 20-hit search", 100, &|| {
+        for hit in &hits {
+            signature(hit).unwrap();
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Property test: the minimal value a signature allows validates.
 
@@ -813,6 +1146,41 @@ fn gen_object(rng: &mut Rng, depth: usize, defs: usize) -> Value {
         .map(|key| json!(key))
         .collect();
     let mut object = json!({"type": "object", "properties": properties});
+    let keys: Vec<String> = object["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    // Conditionals and dependencies over the declared keys.
+    if !keys.is_empty() && rng.chance(25) {
+        let k = rng.pick(&keys).clone();
+        let other = rng.pick(&keys).clone();
+        object["if"] = match rng.below(3) {
+            0 => json!({"required": [k]}),
+            1 => json!({"properties": {k: {"type": "string"}}}),
+            _ => json!(true),
+        };
+        object["then"] = json!({"required": [other]});
+        if rng.chance(50) {
+            object["else"] = json!({"allOf": [{"required": [rng.pick(&keys)]}]});
+        }
+    }
+    if !keys.is_empty() && rng.chance(25) {
+        let k = rng.pick(&keys).clone();
+        let other = rng.pick(&keys).clone();
+        if rng.chance(50) {
+            object["dependentRequired"] = json!({ k: [other] });
+        } else {
+            let third = rng.pick(&keys).clone();
+            object["dependentSchemas"] =
+                json!({ k: {"anyOf": [{"required": [other]}, {"required": [third]}]} });
+        }
+    }
+    // Below the top, sometimes leave the type out.
+    if depth > 0 && rng.chance(15) {
+        object.as_object_mut().unwrap().remove("type");
+    }
     match rng.below(5) {
         0 => {
             object["additionalProperties"] = gen(rng, depth + 1, defs);
@@ -856,7 +1224,7 @@ fn gen(rng: &mut Rng, depth: usize, defs: usize) -> Value {
     if depth > 3 {
         return gen_leaf(rng);
     }
-    match rng.below(9) {
+    match rng.below(11) {
         0 | 1 => gen_leaf(rng),
         2 | 3 => gen_object(rng, depth, defs),
         4 => gen_array(rng, depth, defs),
@@ -899,8 +1267,204 @@ fn gen(rng: &mut Rng, depth: usize, defs: usize) -> Value {
                 .collect();
             json!({"type": "object", "oneOf": branches})
         }
-        _ if defs > 0 => json!({"$ref": format!("#/$defs/d{}", rng.below(defs))}),
-        _ => json!({"$ref": "#/$defs/node"}),
+        8 => {
+            // A oneOf with nothing to tell its branches apart.
+            let members: Vec<Value> = (0..2).map(|_| gen(rng, depth + 1, defs)).collect();
+            json!({ "oneOf": members })
+        }
+        9 if defs > 0 => json!({"$ref": format!("#/$defs/{}", DEF_NAMES[rng.below(defs)])}),
+        _ => json!({"$ref": "#/$defs/class"}),
+    }
+}
+
+fn one_of_as_any_of(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, v)| {
+                    let key = if key == "oneOf" {
+                        "anyOf".to_string()
+                    } else {
+                        key.clone()
+                    };
+                    (key, one_of_as_any_of(v))
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(one_of_as_any_of).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Definition names, reserved and built-in words first.
+const DEF_NAMES: [&str; 4] = ["type", "Record", "string", "d3"];
+
+/// Whether `value` is admitted by the rendered type: the other direction of the
+/// property, a schema-valid value must type-check against the signature.
+fn admits(ty: &Ty<'_>, value: &Value, ctx: &Ctx<'_>, depth: usize) -> bool {
+    if depth > 64 {
+        return true;
+    }
+    match ty {
+        Ty::Unknown => true,
+        Ty::Never => false,
+        Ty::Prim("string") => value.is_string(),
+        Ty::Prim("number") => value.is_number(),
+        Ty::Prim("boolean") => value.is_boolean(),
+        Ty::Prim(_) => value.is_null(),
+        Ty::Lit(literal) => *literal == value,
+        Ty::Array(item) => value
+            .as_array()
+            .is_some_and(|items| items.iter().all(|v| admits(item, v, ctx, depth + 1))),
+        Ty::Tuple {
+            items,
+            required,
+            rest,
+        } => value.as_array().is_some_and(|values| {
+            values.len() >= *required
+                && (rest.is_some() || values.len() <= items.len())
+                && values.iter().enumerate().all(|(i, v)| match items.get(i) {
+                    Some(item) => admits(item, v, ctx, depth + 1),
+                    None => admits(rest.as_deref().unwrap_or(&Ty::Never), v, ctx, depth + 1),
+                })
+        }),
+        Ty::Object { props, index } => value.as_object().is_some_and(|map| {
+            props.iter().all(|prop| match map.get(prop.key) {
+                Some(v) => admits(&prop.ty, v, ctx, depth + 1),
+                None => !prop.required,
+            }) && map.iter().all(|(key, v)| {
+                props.iter().any(|prop| prop.key == key)
+                    || match index {
+                        Index::Free => true,
+                        Index::Closed => false,
+                        Index::Typed(ty) => admits(ty, v, ctx, depth + 1),
+                    }
+            })
+        }),
+        Ty::Union(members) | Ty::Wide(members) => {
+            members.iter().any(|m| admits(m, value, ctx, depth + 1))
+        }
+        Ty::Ref(id) => ctx.entries[*id]
+            .ty
+            .as_ref()
+            .is_none_or(|ty| admits(ty, value, ctx, depth + 1)),
+    }
+}
+
+/// A random value shaped by `schema`, usually but not always valid. The test keeps
+/// the ones the validator accepts.
+fn sample(schema: &Value, root: &Value, rng: &mut Rng, depth: usize) -> Value {
+    let scalar = |rng: &mut Rng| match rng.below(4) {
+        0 => json!(rng.pick(&NASTY)),
+        1 => json!(rng.below(5)),
+        2 => json!(rng.chance(50)),
+        _ => Value::Null,
+    };
+    let Some(object) = schema.as_object() else {
+        return scalar(rng);
+    };
+    if depth > 6 {
+        return scalar(rng);
+    }
+    if let Some(target) = object.get("$ref").and_then(Value::as_str).and_then(|r| {
+        r.strip_prefix('#').and_then(|p| {
+            if p.is_empty() {
+                Some(root)
+            } else {
+                root.pointer(p)
+            }
+        })
+    }) {
+        return sample(target, root, rng, depth + 1);
+    }
+    if let Some(value) = object.get("const") {
+        return value.clone();
+    }
+    if let Some(Value::Array(values)) = object.get("enum") {
+        return rng.pick(values).clone();
+    }
+    let mut merged: Vec<&Value> = vec![schema];
+    for key in ["anyOf", "oneOf"] {
+        if let Some(Value::Array(members)) = object.get(key) {
+            merged.push(rng.pick(members));
+        }
+    }
+    if let Some(Value::Array(members)) = object.get("allOf") {
+        merged.extend(members.iter());
+    }
+    if object.contains_key("if") {
+        if let Some(branch) = object.get(if rng.chance(50) { "then" } else { "else" }) {
+            merged.push(branch);
+        }
+    }
+    let types: Vec<&str> = match object.get("type") {
+        Some(Value::String(t)) => vec![t.as_str()],
+        Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect(),
+        _ if merged.len() > 1 && rng.chance(70) => {
+            // Untyped composition: sample a member and use its value.
+            return sample(
+                merged[1 + rng.below(merged.len() - 1)],
+                root,
+                rng,
+                depth + 1,
+            );
+        }
+        _ if object.contains_key("properties") && rng.chance(60) => vec!["object"],
+        _ if object.contains_key("items") || object.contains_key("prefixItems") => vec!["array"],
+        _ => return scalar(rng),
+    };
+    match *rng.pick(&types) {
+        "string" => json!(rng.pick(&NASTY)),
+        "integer" | "number" => json!(rng.below(5)),
+        "boolean" => json!(rng.chance(50)),
+        "null" => Value::Null,
+        "array" => {
+            let prefix = object.get("prefixItems").and_then(Value::as_array);
+            let min = object.get("minItems").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let len = min + rng.below(3);
+            Value::Array(
+                (0..len)
+                    .map(|i| match prefix.and_then(|p| p.get(i)) {
+                        Some(item) => sample(item, root, rng, depth + 1),
+                        None => match object.get("items") {
+                            Some(items) => sample(items, root, rng, depth + 1),
+                            None => scalar(rng),
+                        },
+                    })
+                    .collect(),
+            )
+        }
+        _ => {
+            let mut map = Map::new();
+            for part in &merged {
+                let Some(part) = part.as_object() else {
+                    continue;
+                };
+                if let Some(Value::Object(properties)) = part.get("properties") {
+                    for (key, sub) in properties {
+                        if rng.chance(60) {
+                            map.insert(key.clone(), sample(sub, root, rng, depth + 1));
+                        }
+                    }
+                }
+                if let Some(Value::Array(required)) = part.get("required") {
+                    for key in required.iter().filter_map(Value::as_str) {
+                        if !map.contains_key(key) {
+                            let sub = part
+                                .get("properties")
+                                .and_then(|p| p.get(key))
+                                .or_else(|| object.get("additionalProperties"));
+                            let value = match sub {
+                                Some(sub) => sample(sub, root, rng, depth + 1),
+                                None => scalar(rng),
+                            };
+                            map.insert(key.to_string(), value);
+                        }
+                    }
+                }
+            }
+            Value::Object(map)
+        }
     }
 }
 
@@ -932,7 +1496,9 @@ fn minimal(ty: &Ty<'_>, ctx: &Ctx<'_>, depth: usize) -> Option<Value> {
                 .map(|prop| Some((prop.key.to_string(), minimal(&prop.ty, ctx, depth + 1)?)))
                 .collect::<Option<_>>()?,
         ),
-        Ty::Union(members) => return members.iter().find_map(|m| minimal(m, ctx, depth + 1)),
+        Ty::Union(members) | Ty::Wide(members) => {
+            return members.iter().find_map(|m| minimal(m, ctx, depth + 1))
+        }
         Ty::Ref(id) => return minimal(ctx.entries[*id].ty.as_ref()?, ctx, depth + 1),
     })
 }
@@ -1033,19 +1599,23 @@ fn schema_strings(value: &Value, out: &mut HashSet<String>) {
 #[test]
 fn property_minimal_values_validate_and_text_round_trips() {
     let mut rng = Rng(0x5eed_1234_abcd_ef01);
-    let (mut checked, mut optional_checked) = (0usize, 0usize);
+    let (mut checked, mut optional_checked, mut admitted, mut skipped_one_of) =
+        (0usize, 0usize, 0usize, 0usize);
+    let mut compile: Vec<String> = Vec::new();
+    let mut callees: Vec<String> = Vec::new();
     for case in 0..1_500 {
-        let defs_count = rng.below(3);
+        let defs_count = rng.below(DEF_NAMES.len());
         let mut defs = Map::new();
-        for i in 0..defs_count {
-            // Acyclic: a definition only refers to later ones (or the recursive node).
-            defs.insert(format!("d{i}"), gen(&mut rng, 2, 0));
+        for name in DEF_NAMES.iter().take(defs_count) {
+            defs.insert(name.to_string(), gen(&mut rng, 2, 0));
         }
+        // The recursive definition carries a reserved word, so its declaration
+        // name reaches the compiled output.
         defs.insert(
-            "node".into(),
+            "class".into(),
             json!({"type": "object", "properties": {
                 "value": {"type": "string"},
-                "children": {"type": "array", "items": {"$ref": "#/$defs/node"}}
+                "children": {"type": "array", "items": {"$ref": "#/$defs/class"}}
             }, "required": ["value"]}),
         );
         let mut root = match rng.below(4) {
@@ -1066,15 +1636,39 @@ fn property_minimal_values_validate_and_text_round_trips() {
                 "case {case}: args? but {{}} fails: {root}"
             );
         }
+        let rendered = || {
+            full_signature(&tool(&name, root.clone()))
+                .unwrap()
+                .signature
+        };
         if let Some(value) = minimal(&built.args, &built.ctx, 0) {
-            checked += 1;
-            assert!(
-                validator.is_valid(&value),
-                "case {case}: minimal value {value} fails {root}\nrendered: {}",
-                full_signature(&tool(&name, root.clone()))
-                    .unwrap()
-                    .signature
-            );
+            if validator.is_valid(&value) {
+                checked += 1;
+            } else {
+                // A oneOf whose branches overlap renders as a union, which is wider:
+                // the first branch's smallest value may match two branches. Only that
+                // is excused: the value must pass once every oneOf reads as anyOf.
+                assert!(
+                    jsonschema::draft202012::new(&one_of_as_any_of(&root))
+                        .unwrap()
+                        .is_valid(&value),
+                    "case {case}: minimal value {value} fails {root}\nrendered: {}",
+                    rendered()
+                );
+                skipped_one_of += 1;
+            }
+        }
+        for _ in 0..8 {
+            let value = sample(&root, &root, &mut rng, 0);
+            // Tool arguments are always an object; the top level renders as one.
+            if value.is_object() && validator.is_valid(&value) {
+                admitted += 1;
+                assert!(
+                    admits(&built.args, &value, &built.ctx, 0),
+                    "case {case}: valid {value} not admitted by {}\nschema: {root}",
+                    rendered()
+                );
+            }
         }
         let mut known = HashSet::from([name.clone()]);
         let (server, tool_name) = name.split_once("__").unwrap();
@@ -1093,12 +1687,21 @@ fn property_minimal_values_validate_and_text_round_trips() {
                 );
             }
         }
+        if case % 3 == 0 {
+            compile.push(described.signature);
+            callees.push(callee(&name));
+        }
     }
-    eprintln!("property: {checked} minimal values and {optional_checked} optional args validated");
-    assert!(
-        checked > 500 && optional_checked > 50,
-        "{checked} {optional_checked}"
+    eprintln!(
+        "property: {checked} minimal values, {optional_checked} optional args and {admitted} \
+         sampled valid values checked; {skipped_one_of} overlapping-oneOf minimal values skipped"
     );
+    assert!(
+        checked > 500 && optional_checked > 50 && admitted > 1_000,
+        "{checked} {optional_checked} {admitted}"
+    );
+    let callees: Vec<&str> = callees.iter().map(String::as_str).collect();
+    tsc_strict(&compile, &callees);
 }
 
 /// The lexical check rejects what it should, so the property test means something.

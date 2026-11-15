@@ -531,12 +531,12 @@ fn run_script_describe_returns_complete_recursive_signatures() {
     assert_eq!(
         result["structuredContent"]["result"],
         json!({
-            "sig": "type Node = {children?: Node[]; value: string};\nservers.tree.walk(args: Node): ToolResult",
+            "sig": "type $Node = {children?: $Node[]; value: string};\nservers.tree.walk(args: $Node): ToolResult",
             "truncated": false,
             "reason": true
         }),
         "{result}"
     );
     let hit = tool_signature::signature(&tools[0]).unwrap();
-    assert!(hit.ends_with("/* Node: see toolport.describe */"), "{hit}");
+    assert!(hit.ends_with("/* $Node: see toolport.describe */"), "{hit}");
 }
