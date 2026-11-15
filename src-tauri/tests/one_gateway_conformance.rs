@@ -176,6 +176,9 @@ struct AdapterOptions<'a> {
     roots: Vec<PathBuf>,
     /// Whether this client can answer legacy form elicitation requests.
     elicitation: bool,
+    /// The gateway executable the client launches, when not the test build's own
+    /// (an installed copy a test can upgrade or remove).
+    exe: Option<&'a Path>,
 }
 
 fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
@@ -193,7 +196,11 @@ fn spawn_configured_adapter(
     options: &AdapterOptions,
     client_id: &str,
 ) -> AdapterClient {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_toolport-gateway"));
+    let mut command = Command::new(
+        options
+            .exe
+            .unwrap_or(Path::new(env!("CARGO_BIN_EXE_toolport-gateway"))),
+    );
     if !options.default_role {
         command.arg("--stdio-adapter");
     }
@@ -5992,5 +5999,192 @@ fn protocol_lane_long_server_aliases_keep_both_identity_parts_and_cached_routes(
         for (original, alias) in &aliases {
             assert_eq!(text_of(&second.call_tool(alias, json!({}))), *original);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle when Toolport itself goes away or is replaced
+// ---------------------------------------------------------------------------
+
+/// An installed copy of the gateway in `dir/app`, standing in for the binary
+/// inside Toolport.app, a package, or the published copy clients launch.
+fn installed_gateway(dir: &Path) -> PathBuf {
+    let app = dir.join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    let path = app.join(
+        Path::new(env!("CARGO_BIN_EXE_toolport-gateway"))
+            .file_name()
+            .unwrap(),
+    );
+    std::fs::copy(env!("CARGO_BIN_EXE_toolport-gateway"), &path).unwrap();
+    path
+}
+
+fn daemon_pid(dir: &Path) -> Option<u32> {
+    first_descriptor(dir).and_then(|descriptor| descriptor["pid"].as_u64().map(|pid| pid as u32))
+}
+
+fn wait_for_pid_exit(pid: u32, within: Duration, dir: &Path) {
+    let deadline = Instant::now() + within;
+    while pid_alive(u64::from(pid)) {
+        assert!(
+            Instant::now() < deadline,
+            "daemon pid {pid} is still running\n{}",
+            gateway_log_tail(dir)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The lead's lifecycle question 2. Quitting the app asks the daemon to stop.
+/// A terminal client that connects later must still get a working gateway,
+/// started on demand from the same installed binary, with nothing else to do.
+#[test]
+fn after_the_app_quits_a_later_client_starts_a_gateway_on_demand() {
+    let (_fixture, dir) = Fixture::new("quit-later-client");
+    let transcript = dir.join("mock.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("mock", &transcript, None)],
+        vec![],
+    );
+    let exe = installed_gateway(&dir);
+    let options = AdapterOptions {
+        exe: Some(&exe),
+        grace_ms: Some(600_000),
+        ..AdapterOptions::default()
+    };
+
+    let mut first = spawn_adapter(&dir, &options);
+    first.initialize("quit-first");
+    let echo = first.wait_for_tool("__echo", Duration::from_secs(30));
+    assert_eq!(
+        text_of(&first.call_tool(&echo, json!({ "text": "before" }))),
+        "before"
+    );
+    let first_daemon = daemon_pid(&dir).expect("a daemon descriptor");
+    first.close_stdin();
+    first.wait_exit(Duration::from_secs(20));
+
+    // The app quits with no client connected: the daemon stops at once instead
+    // of idling for its grace.
+    let outcomes = conduit_lib::daemon::stop_when_idle(&dir, Duration::from_secs(10));
+    assert!(
+        matches!(
+            outcomes.as_slice(),
+            [conduit_lib::daemon::IdleStop::Stopped(pid)] if *pid == first_daemon
+        ),
+        "{outcomes:?}\n{}",
+        gateway_log_tail(&dir)
+    );
+    wait_for_pid_exit(first_daemon, Duration::from_secs(20), &dir);
+
+    // Later, a terminal client with no app running.
+    let mut later = spawn_adapter(&dir, &options);
+    later.initialize("quit-later");
+    let echo = later.wait_for_tool("__echo", Duration::from_secs(30));
+    assert_eq!(
+        text_of(&later.call_tool(&echo, json!({ "text": "later" }))),
+        "later"
+    );
+    let second_daemon = daemon_pid(&dir).expect("a new daemon descriptor");
+    assert_ne!(second_daemon, first_daemon, "the old daemon was reused");
+}
+
+/// The lead's lifecycle question 1. An in-app update, dmg drag or package
+/// upgrade replaces the gateway file while a client is in the middle of a call.
+/// The call finishes, the connected client keeps its daemon, and once it
+/// disconnects the old daemon exits and the next client runs the new binary.
+/// Unix only: Windows cannot replace a running image, so its installer stops
+/// gateways first (installer_preflight) and clients reconnect to the new one.
+#[cfg(unix)]
+#[test]
+fn an_upgrade_mid_call_finishes_the_call_and_the_next_client_runs_the_new_binary() {
+    let (_fixture, dir) = Fixture::new("upgrade-mid-call");
+    let transcript = dir.join("mock.jsonl");
+    let mut server = mock_server_entry("mock", &transcript, None);
+    server.env.push(EnvVar {
+        key: "MOCK_MCP_CONCURRENT".to_string(),
+        value: Some("1".to_string()),
+        secret: false,
+        unknown_fields: Default::default(),
+    });
+    write_registry(&dir, vec![server], vec![]);
+    let exe = installed_gateway(&dir);
+    let options = AdapterOptions {
+        exe: Some(&exe),
+        grace_ms: Some(600_000),
+        ..AdapterOptions::default()
+    };
+
+    let mut client = spawn_adapter(&dir, &options);
+    client.initialize("upgrade-client");
+    let sleep = client.wait_for_tool("__sleep", Duration::from_secs(30));
+    let old_daemon = daemon_pid(&dir).expect("a daemon descriptor");
+
+    // Start a four-second call, then replace the binary under it the way an
+    // updater does: write the new file beside it and rename it over the old.
+    client.send(json!({
+        "jsonrpc": "2.0", "id": 9001, "method": "tools/call",
+        "params": { "name": sleep, "arguments": { "ms": 4000 } }
+    }));
+    std::thread::sleep(Duration::from_millis(500));
+    let staged = exe.with_extension("new");
+    std::fs::copy(env!("CARGO_BIN_EXE_toolport-gateway"), &staged).unwrap();
+    std::fs::rename(&staged, &exe).unwrap();
+
+    let reply = client.response_to(9001);
+    assert!(
+        reply.get("result").is_some() && reply["result"]["isError"] != true,
+        "the call in flight during the upgrade failed: {reply}\n{}",
+        gateway_log_tail(&dir)
+    );
+    // Well past the daemon's binary checks: the connected client is still
+    // served by the same daemon.
+    std::thread::sleep(Duration::from_secs(3));
+    let echo = client.wait_for_tool("__echo", Duration::from_secs(10));
+    assert_eq!(
+        text_of(&client.call_tool(&echo, json!({ "text": "after" }))),
+        "after"
+    );
+    assert_eq!(
+        daemon_pid(&dir),
+        Some(old_daemon),
+        "the daemon changed under a client"
+    );
+
+    // The client disconnects: the old daemon leaves without the idle grace.
+    client.close_stdin();
+    client.wait_exit(Duration::from_secs(20));
+    wait_for_pid_exit(old_daemon, Duration::from_secs(60), &dir);
+    assert!(
+        gateway_log_tail(&dir).contains("reason=binary_removed")
+            || std::fs::read_to_string(dir.join("gateway.log"))
+                .unwrap_or_default()
+                .contains("reason=binary_removed"),
+        "the old daemon did not exit for the replaced binary\n{}",
+        gateway_log_tail(&dir)
+    );
+
+    // The next client starts a daemon from the new file.
+    let mut next = spawn_adapter(&dir, &options);
+    next.initialize("upgrade-next");
+    let echo = next.wait_for_tool("__echo", Duration::from_secs(30));
+    assert_eq!(
+        text_of(&next.call_tool(&echo, json!({ "text": "new" }))),
+        "new"
+    );
+    let new_daemon = daemon_pid(&dir).expect("a new daemon descriptor");
+    assert_ne!(new_daemon, old_daemon);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let running = std::fs::metadata(format!("/proc/{new_daemon}/exe")).unwrap();
+        let installed = std::fs::metadata(&exe).unwrap();
+        assert_eq!(
+            (running.dev(), running.ino()),
+            (installed.dev(), installed.ino()),
+            "the new daemon is not running the upgraded file"
+        );
     }
 }
