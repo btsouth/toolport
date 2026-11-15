@@ -1164,8 +1164,9 @@ pub fn register_inline_secrets(server: &ServerEntry) {
         ]
         .iter()
         .any(|prefix| value.trim_start().starts_with(prefix));
-        let by_name =
-            crate::import_credentials::secret_env(&e.key, None) && credential_shaped(value);
+        let by_name = crate::import_credentials::secret_env(&e.key, None)
+            && credential_shaped(value)
+            && (crate::import_credentials::secret_word_is_last(&e.key) || looks_random(value));
         if e.secret || token_prefix || by_name {
             crate::secret_redact::register(&server.id, &e.key, value);
         }
@@ -1220,8 +1221,13 @@ pub fn register_inline_secrets(server: &ServerEntry) {
 /// be at least 8 characters and must not be a switch word, a plain number,
 /// duration or size (digits with an optional unit), or a path or URL with no
 /// credentials in it (no password, no query, no path segment of 16 or more
-/// characters). A value flagged `secret`, one with a known token prefix,
-/// and one read from the vault are always registered.
+/// characters). Where the credential word sits matters too: when it ends the
+/// name (`API_KEY`, `GITHUB_TOKEN`, `BASIC_AUTH`) that shape is enough, but when
+/// another word follows it (`AUTH_METHOD`, `TOKEN_TYPE`, `KEY_FILE`) the name
+/// describes a setting, and the value is registered only if it also looks
+/// random: 16 or more characters with both a letter and a digit. A value
+/// flagged `secret`, one with a known token prefix, and one read from the
+/// vault are always registered.
 fn credential_shaped(value: &str) -> bool {
     let value = value.trim();
     if value.chars().count() < 8 {
@@ -1258,6 +1264,15 @@ fn credential_shaped(value: &str) -> bool {
         }
     }
     true
+}
+
+/// At least 16 characters with both a letter and a digit, for a value whose
+/// name only qualifies a credential word ([`credential_shaped`]).
+fn looks_random(value: &str) -> bool {
+    let value = value.trim();
+    value.chars().count() >= 16
+        && value.chars().any(|c| c.is_ascii_alphabetic())
+        && value.chars().any(|c| c.is_ascii_digit())
 }
 
 /// The credential in a masked argument: the value of `--flag=value`, nothing
@@ -1483,7 +1498,7 @@ mod tests {
                 {"key":"TOKEN_TYPE","value":"bearer_token"},
                 {"key":"KEY_FILE","value":"keys.json"},
                 {"key":"GITHUB_TOKEN","value":"correcthorsebatterystaple"},
-                {"key":"API_KEY_OVERRIDE","value":"abcd1234efgh5678ijkl"},
+                {"key":"API_KEY_OVERRIDE","value":"zyxw9876vuts5432rqpo"},
                 {"key":"PIN","value":"4821","secret":true}
             ]}"#,
         )
@@ -1492,7 +1507,7 @@ mod tests {
         let ordinary = r#"{"enabled": true, "ttl": 3600, "min": 8, "use": 1} /var/cache/tokens https://auth.example.invalid/login 1500ms password authorization_code github-oauth bearer_token keys.json"#;
         let kept = crate::secret_redact::redact_text(ordinary).into_owned();
         let secrets = crate::secret_redact::redact_text(
-            "key abcd1234efgh pass postgres://app:pw-Zx81kq@db.example.invalid/app hook https://hooks.example.invalid/services/abcdEFGHijklMNOPqrst pin 4821 gh correcthorsebatterystaple override abcd1234efgh5678ijkl",
+            "key abcd1234efgh pass postgres://app:pw-Zx81kq@db.example.invalid/app hook https://hooks.example.invalid/services/abcdEFGHijklMNOPqrst pin 4821 gh correcthorsebatterystaple override zyxw9876vuts5432rqpo",
         )
         .into_owned();
         let _ = std::fs::remove_dir_all(&dir);

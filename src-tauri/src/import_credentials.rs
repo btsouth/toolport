@@ -45,6 +45,25 @@ pub(crate) fn secret_url_name(value: &str) -> bool {
         .any(|word| SECRET_NAMES.contains(&word))
 }
 
+/// Whether the last word of `key` is the credential word `secret_env` matches
+/// (`API_KEY`, `DB_PASSWORD`, `AUTHORIZATION`), rather than a word that
+/// qualifies one (`TOKEN_TYPE`, `AUTH_METHOD`, `API_KEY_ID`).
+pub(crate) fn secret_word_is_last(key: &str) -> bool {
+    let key = key.to_ascii_uppercase();
+    let Some(last) = key
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .rfind(|word| !word.is_empty())
+    else {
+        return false;
+    };
+    last == "PAT"
+        || (!matches!(last, "KEYBOARD" | "MONKEY" | "COMPASS")
+            && SECRET_NAMES
+                .iter()
+                .filter(|needle| **needle != "PAT")
+                .any(|needle| last.contains(needle)))
+}
+
 pub(crate) fn secret_env(key: &str, value: Option<&str>) -> bool {
     let key = key.to_ascii_uppercase();
     if key == "PATH" {
