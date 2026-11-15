@@ -6079,11 +6079,15 @@ API_KEY = "synthetic-first-origin"
             let snapshot = std::fs::read_dir(record)
                 .unwrap()
                 .filter_map(Result::ok)
-                .find(|entry| entry.file_name().to_string_lossy().starts_with("original-"))
+                .find(|entry| entry.file_name().to_string_lossy().starts_with("released-"))
                 .unwrap();
             let record: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(snapshot.path()).unwrap()).unwrap();
             assert_eq!(record["disconnected"], true);
+            assert!(
+                record["original"].is_null(),
+                "verified recovery payload must be released"
+            );
             assert!(record["disconnectBefore"].is_null());
             assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
             Err("keychain unreachable".into())
