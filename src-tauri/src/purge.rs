@@ -1369,18 +1369,28 @@ fn install_root(exe: &Path) -> &Path {
         .unwrap_or_else(|| exe.parent().unwrap_or(exe))
 }
 
-/// Whether `path` is inside a Trash folder: `~/.Trash`, or a volume's
-/// `.Trashes/<uid>`.
+/// Whether `path` is inside this user's Trash: `~/.Trash` on the startup volume,
+/// or `/Volumes/<volume>/.Trashes/<uid>` on another mounted volume. A `.Trashes`
+/// folder anywhere else (a copied backup) is not a Trash.
 #[cfg(any(target_os = "macos", test))]
 fn in_trash(path: &Path, home: &Path, uid: u32) -> bool {
     if path.starts_with(home.join(".Trash")) {
         return true;
     }
     let uid = uid.to_string();
-    let parts: Vec<_> = path.components().map(|part| part.as_os_str()).collect();
-    parts
-        .windows(2)
-        .any(|pair| pair[0] == ".Trashes" && pair[1] == uid.as_str())
+    let mut parts = path.components();
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()),
+        (
+            Some(std::path::Component::RootDir),
+            Some(volumes),
+            Some(std::path::Component::Normal(_)),
+            Some(trashes),
+            Some(owner),
+        ) if volumes.as_os_str() == "Volumes"
+            && trashes.as_os_str() == ".Trashes"
+            && owner.as_os_str() == uid.as_str()
+    )
 }
 
 /// Whether a daemon whose executable `removed_exe` is gone may remove this
@@ -2165,6 +2175,9 @@ mod tests {
         for (now_at, remove) in [
             (Some("/Volumes/Data/.Trashes/501/Toolport.app/Contents/MacOS/toolport-gateway"), true),
             (Some("/Volumes/Data/.Trashes/502/Toolport.app/Contents/MacOS/toolport-gateway"), false),
+            // R3-4: a `.Trashes` folder outside a mounted volume's root is not a Trash.
+            (Some("/Users/me/backup/.Trashes/501/Toolport.app/Contents/MacOS/toolport-gateway"), false),
+            (Some("/Volumes/Data/backup/.Trashes/501/Toolport.app/Contents/MacOS/toolport-gateway"), false),
             (Some("/Applications/Toolport.app.old/Contents/MacOS/toolport-gateway"), false),
             (Some("/private/var/folders/xy/T/tauri_updated_app/Toolport.app/Contents/MacOS/toolport-gateway"), false),
             (Some("/opt/homebrew/Caskroom/toolport/2.3.5/Toolport.app/Contents/MacOS/toolport-gateway"), false),
