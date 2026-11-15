@@ -27,7 +27,7 @@ below for you, so you never have to edit these by hand.
 | Cline                   | `~/.cline/data/settings/cline_mcp_settings.json` (or `CLINE_MCP_SETTINGS_PATH`, `CLINE_DATA_DIR`, `CLINE_DIR`)                                                               | JSON (`mcpServers`)                |
 | Roo Code                | `<config>/Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/mcp_settings.json`                                                                                     | JSON (`mcpServers`)                |
 | Warp                    | `~/.warp/.mcp.json`                                                                                                                                                          | JSON (`mcpServers`)                |
-| Amazon Q                | `~/.aws/amazonq/mcp.json`, or `default.json` once `useLegacyMcpJson` is off                                                                                                  | JSON (`mcpServers`)                |
+| Amazon Q                | `~/.aws/amazonq/mcp.json`, or `agents/default.json` once `useLegacyMcpJson` is off                                                                                           | JSON (`mcpServers`)                |
 | Kiro                    | `~/.kiro/settings/mcp.json`                                                                                                                                                  | JSON (`mcpServers`)                |
 | Auggie CLI              | `~/.augment/settings.json`                                                                                                                                                   | JSON (`mcpServers`)                |
 | Kimi Code               | `$KIMI_CODE_HOME/mcp.json` (default `~/.kimi-code/mcp.json`)                                                                                                                 | JSON (`mcpServers`)                |
@@ -55,13 +55,29 @@ below for you, so you never have to edit these by hand.
 
 `<config>` is your OS application-config dir (`%APPDATA%` on Windows, `~/Library/Application Support` on macOS, `~/.config` on Linux); `<data>` is the data dir (`~/.local/share` on Linux, the same as `<config>` elsewhere). Zed and Goose paths vary slightly by OS; Toolport resolves the right one automatically.
 
-When a client moves its config (Goose on macOS reads `~/.config/goose`, Cline 4.1
-moved to `~/.cline`, Devin Desktop no longer reads `~/.codeium/windsurf`, Antigravity
-dropped its `antigravity-ide` and `antigravity` folders, Crush on Windows and Hermes
-on Windows changed folders), Toolport moves an existing connection on its next
-launch: it writes the entry where the client reads now, keeping its profile, and
-takes only its own entry out of the old file. A location you chose with an
-environment variable is per shell, so the default file is left alone.
+When a client moves its config, Toolport writes the connection where the client
+reads now, keeping its profile, on its next launch and on Connect. It takes its entry
+out of the old file only when there is evidence this machine's client no longer reads
+it, and never when the new file holds a different connection. Otherwise both files
+keep a working entry (one client row), and Disconnect, uninstall and "Remove from all
+clients" take Toolport out of both and put each file back byte for byte.
+
+| Client                   | Old file                                                                        | Toolport removes its old entry when                                                                 | Evidence                                                                                                                              |
+| ------------------------ | ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Goose (macOS)            | `~/Library/Application Support/Block/goose/config.yaml`                         | always                                                                                              | No release read it: goose `paths.rs` uses etcetera's Xdg strategy on macOS since 54af4c9; only an older Toolport wrote there          |
+| Cline                    | VS Code `globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json` | Cline 4 is installed in VS Code, or `~/.cline/data/globalState.json` records its one-time migration | Cline 4.0.0 migrates the file once (`mcp-settings-legacy-migration.ts`); 3.x reads only it. A `~/.cline` folder alone is not evidence |
+| Hermes (Windows)         | `~\.hermes\config.yaml`                                                         | `HERMES_HOME` is set                                                                                | The installer sets it and Hermes then reads only that folder; pip and git installs before 2026.6 read `~\.hermes`                     |
+| LM Studio                | the other default home's `mcp.json`                                             | `~/.lmstudio-home-pointer` exists                                                                   | LM Studio reads the home the pointer names (`findLMStudioHome.ts`)                                                                    |
+| Reasonix                 | a legacy `config.toml`                                                          | its home `config.toml` exists                                                                       | Reasonix falls back to legacy files only while the home file is missing (`paths.go`)                                                  |
+| Devin Desktop (Windsurf) | `~/.codeium/windsurf/mcp_config.json`                                           | never                                                                                               | Devin still imports it by default (`read_config_from.windsurf`)                                                                       |
+| Antigravity              | `~/.gemini/antigravity-ide/` and `~/.gemini/antigravity/mcp_config.json`        | never                                                                                               | 1.x read them; no vendor statement that current builds ignore them. Links to the new file are left as they are                        |
+| Crush (Windows)          | `%LOCALAPPDATA%\crush\crush.json`                                               | never                                                                                               | Crush still merges it last, so it wins (`load.go`)                                                                                    |
+| Amazon Q                 | `~/.aws/amazonq/mcp.json`                                                       | never                                                                                               | The IDE loads it on top of `agents/default.json` while `useLegacyMcpJson` is on, and Q CLI reads it                                   |
+
+Claude Desktop's MSIX copy is not moved: which file the Store build reads when both
+exist is unverified, so the real `%APPDATA%\Claude` file stays the target when it
+exists. A location you chose with an environment variable is per shell, so the
+default file is left alone.
 
 ### Several Claude Code accounts
 

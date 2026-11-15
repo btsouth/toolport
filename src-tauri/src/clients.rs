@@ -1726,14 +1726,15 @@ fn claude_desktop_path() -> Option<PathBuf> {
     Some(resolve_claude_desktop_path(real, &local))
 }
 
-/// The Windows Store (MSIX) build of Claude Desktop reads its package's virtualized
-/// copy, `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\...`, whenever
-/// that copy exists, even when a real `%APPDATA%\Claude` file is present too: the
-/// package filter serves its private copy first. Preferring the real file whenever it
-/// existed wrote Toolport where the Store build never looks. Without a package copy
-/// the real file is the one read, by both builds, so it stays the default (and the
-/// status reads "not found" rather than erroring when neither exists).
+/// Claude Desktop's Roaming config can live at the real `%APPDATA%\Claude` and/or in
+/// a `Claude*` MSIX package's virtualized `LocalCache`. The real file wins when it
+/// exists; a package copy is used only when it is the only one. Which file the Store
+/// build reads when both exist is unverified, so Toolport never moves an entry
+/// between them.
 fn resolve_claude_desktop_path(real: PathBuf, local_app_data: &Path) -> PathBuf {
+    if real.exists() {
+        return real;
+    }
     claude_desktop_msix_configs(local_app_data)
         .into_iter()
         .find(|path| path.is_file())
@@ -2202,11 +2203,12 @@ fn cline_path() -> Option<PathBuf> {
 /// relocated by `CLINE_MCP_SETTINGS_PATH` (the file), `CLINE_DATA_DIR` or `CLINE_DIR`.
 /// It merges the old VS Code storage file in once and then ignores it.
 ///
-/// Before Cline 4.1 has run there is no `~/.cline`, and the old file is the one the
-/// installed extension reads. Writing it then works for both versions: an older Cline
-/// reads it, and 4.1 carries the entry over on its first start. Once `~/.cline` exists
-/// the new file is the only one read, and an entry left in the old one is cleaned up
-/// (see `relocate`).
+/// Until the new settings file exists, the old file is the one an installed pre-4.1
+/// extension reads, and writing it works for both versions: an older Cline reads it,
+/// and 4.1 carries the entry over on its first start. A `~/.cline` folder alone is not
+/// evidence (the CLI and shared rules create it while an older extension still reads
+/// its storage). Once the new file exists it is the target, and the old entry is kept
+/// and written too unless `relocate` has evidence the extension moved.
 fn resolve_cline_path(
     home: &Path,
     platform: Platform,
@@ -2228,7 +2230,10 @@ fn resolve_cline_path(
     }
     let legacy = cline_legacy_settings_path(home, platform, env);
     let extension_storage = legacy.parent().and_then(Path::parent);
-    if !current.exists() && !cline_dir.exists() && extension_storage.is_some_and(Path::is_dir) {
+    if !current.exists()
+        && !relocate::cline_moved(home)
+        && extension_storage.is_some_and(Path::is_dir)
+    {
         return legacy;
     }
     current
@@ -2386,13 +2391,14 @@ fn amazon_q_path() -> Option<PathBuf> {
     Some(resolve_amazon_q_path(&home()?))
 }
 
-/// The Amazon Q IDE plugins keep servers in the agent file `default.json` and also
-/// read the legacy `mcp.json` while its `useLegacyMcpJson` is true (the default).
-/// Toolport keeps writing `mcp.json` in that case, which every version reads, and
-/// writes `default.json` once the user has turned legacy reading off.
+/// The Amazon Q IDE language server keeps servers in the agent file
+/// `agents/default.json` (it creates it on first run) and also loads the legacy
+/// `mcp.json` on top while that file's `useLegacyMcpJson` is true, the default
+/// (mcpUtils.ts@lsp-codewhisperer/v0.0.134). Toolport keeps writing `mcp.json` then,
+/// which every version reads, and writes the agent file once legacy reading is off.
 fn resolve_amazon_q_path(home: &Path) -> PathBuf {
     let dir = amazon_q_dir(home);
-    let agent = dir.join("default.json");
+    let agent = dir.join("agents").join("default.json");
     let legacy_off = std::fs::read_to_string(&agent)
         .ok()
         .and_then(|text| parse_json_value(&text).ok())
@@ -8873,9 +8879,11 @@ fn backfill_gateway_identity(
 pub fn install_gateway(client_id: &str, profile: Option<&str>) -> Result<WriteOutcome, String> {
     let entry = gateway_entry(profile, client_id)?;
     let mut outcome = install_or_remove(client_id, Some(&entry))?;
-    // The client reads only the file just written; an entry older Toolport left in
-    // a file it no longer reads would be a second, dead connection.
-    outcome.warnings.extend(relocate::clean(client_id, None));
+    // Older files the client may still read get the same entry; ones it no longer
+    // reads lose the entry an older Toolport left there.
+    outcome
+        .warnings
+        .extend(relocate::after_connect(client_id, &entry));
     Ok(outcome)
 }
 

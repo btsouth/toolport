@@ -307,16 +307,11 @@ fn every_moved_location_is_listed_as_legacy_on_the_right_os() {
                     .join("crush.json")]
             );
             assert_eq!(hermes, vec![home.join(".hermes").join("config.yaml")]);
-            assert_eq!(
-                legacy("claude-desktop")[0],
-                roaming(&home, platform)
-                    .join("Claude")
-                    .join("claude_desktop_config.json")
-            );
         } else {
             assert!(crush.is_empty() && hermes.is_empty(), "{platform:?}");
-            assert!(legacy("claude-desktop").is_empty(), "{platform:?}");
         }
+        // Which file the Store build reads when both exist is unverified: no move.
+        assert!(legacy("claude-desktop").is_empty(), "{platform:?}");
         assert_eq!(
             legacy("antigravity"),
             vec![
@@ -374,7 +369,7 @@ fn every_moved_location_is_listed_as_legacy_on_the_right_os() {
 }
 
 #[test]
-fn cline_reads_its_overrides_and_the_old_file_only_before_cline_4_1() {
+fn cline_reads_its_overrides_and_the_old_file_until_the_new_one_exists() {
     let root = std::env::temp_dir().join(format!("toolport-cline-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let home = root.join("home");
@@ -387,8 +382,12 @@ fn cline_reads_its_overrides_and_the_old_file_only_before_cline_4_1() {
     let legacy = cline_legacy_settings_path(&home, platform, &no_env);
     std::fs::create_dir_all(legacy.parent().unwrap().parent().unwrap()).unwrap();
     assert_eq!(resolve_cline_path(&home, platform, &no_env), legacy);
-    // Once Cline 4.1 created ~/.cline, the new file is the only one read.
-    std::fs::create_dir_all(home.join(".cline")).unwrap();
+    // A ~/.cline folder alone (the CLI, shared rules) is not evidence (S1).
+    std::fs::create_dir_all(home.join(".cline").join("rules")).unwrap();
+    assert_eq!(resolve_cline_path(&home, platform, &no_env), legacy);
+    // Once the new settings file exists, it is the target.
+    std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+    std::fs::write(&current, "{}").unwrap();
     assert_eq!(resolve_cline_path(&home, platform, &no_env), current);
     let file = root.join("custom.json");
     let data = root.join("data");
@@ -530,10 +529,22 @@ fn lm_studio_amazon_q_amp_and_claude_desktop_pick_the_file_their_client_reads() 
     let q = home.join(".aws/amazonq");
     assert_eq!(resolve_amazon_q_path(&home), q.join("mcp.json"));
     std::fs::create_dir_all(&q).unwrap();
-    std::fs::write(q.join("default.json"), r#"{"name":"default"}"#).unwrap();
+    // The IDE's agent file is agents/default.json; ~/.aws/amazonq/default.json is
+    // read by nothing.
+    std::fs::create_dir_all(q.join("agents")).unwrap();
+    std::fs::write(q.join("agents/default.json"), r#"{"name":"default"}"#).unwrap();
     assert_eq!(resolve_amazon_q_path(&home), q.join("mcp.json"));
     std::fs::write(q.join("default.json"), r#"{"useLegacyMcpJson": false}"#).unwrap();
-    assert_eq!(resolve_amazon_q_path(&home), q.join("default.json"));
+    assert_eq!(resolve_amazon_q_path(&home), q.join("mcp.json"));
+    std::fs::write(
+        q.join("agents/default.json"),
+        r#"{"useLegacyMcpJson": false}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_amazon_q_path(&home),
+        q.join("agents").join("default.json")
+    );
 
     let amp = home.join(".config/amp/settings.json");
     assert_eq!(prefer_existing_jsonc(amp.clone()), amp);
@@ -556,6 +567,10 @@ fn lm_studio_amazon_q_amp_and_claude_desktop_pick_the_file_their_client_reads() 
     // An installed package without its own copy still reads the real file.
     assert_eq!(resolve_claude_desktop_path(real.clone(), &local), real);
     std::fs::write(msix.join("claude_desktop_config.json"), "{}").unwrap();
+    // With both, the real file stays the target (precedence is unverified).
+    assert_eq!(resolve_claude_desktop_path(real.clone(), &local), real);
+    // A package copy alone is the one read.
+    std::fs::remove_file(&real).unwrap();
     assert_eq!(
         resolve_claude_desktop_path(real.clone(), &local),
         msix.join("claude_desktop_config.json")
@@ -617,49 +632,87 @@ fn old_entry(client: &str) -> serde_json::Value {
     })
 }
 
-/// A JSON client's connection moves from each legacy file to the current one with
-/// its scope kept, and only Toolport's entry leaves the old file.
+/// A JSON client's connection reaches the current file with its scope kept. The old
+/// entry leaves the old file only where there is evidence the client no longer reads
+/// it; otherwise it stays, pointed at the current gateway. Nothing else changes.
 #[test]
-fn json_connections_move_from_every_legacy_file_into_the_current_one() {
-    type Case = (&'static str, fn(&Path) -> PathBuf, fn(&Path));
+fn json_connections_reach_the_current_file_and_leave_old_ones_only_on_evidence() {
+    type Case = (&'static str, fn(&Path) -> PathBuf, fn(&Path), bool);
     let cases: &[Case] = &[
+        // Devin Desktop still imports the Windsurf file by default.
         (
             "windsurf",
             |h| h.join(".codeium/windsurf/mcp_config.json"),
             |_| {},
+            false,
         ),
+        // Antigravity 1.x read these; no vendor statement that it stopped.
         (
             "antigravity",
             |h| h.join(".gemini/antigravity-ide/mcp_config.json"),
             |_| {},
+            false,
         ),
         (
             "antigravity",
             |h| h.join(".gemini/antigravity/mcp_config.json"),
             |_| {},
+            false,
         ),
+        // Cline 4 recorded its one-time migration of the storage file.
         (
             "cline",
             |h| cline_legacy_settings_path(h, Platform::current(), &client_path_env),
-            |h| std::fs::create_dir_all(h.join(".cline")).unwrap(),
+            |h| {
+                write(
+                    &h.join(".cline/data/globalState.json"),
+                    &json!({"__vscodeLegacyMcpSettingsMigration": {"done": true}}),
+                )
+            },
+            true,
         ),
+        // Cline 4 installed in VS Code.
+        (
+            "cline",
+            |h| cline_legacy_settings_path(h, Platform::current(), &client_path_env),
+            |h| {
+                std::fs::create_dir_all(h.join(".vscode/extensions/saoudrizwan.claude-dev-4.1.26"))
+                    .unwrap()
+            },
+            true,
+        ),
+        // Amazon Q CLI and IDEs with legacy reading on still load mcp.json.
         (
             "amazon-q",
             |h| h.join(".aws/amazonq/mcp.json"),
             |h| {
                 write(
-                    &h.join(".aws/amazonq/default.json"),
+                    &h.join(".aws/amazonq/agents/default.json"),
                     &json!({"useLegacyMcpJson": false}),
                 )
             },
+            false,
         ),
+        // Without a home pointer LM Studio may still pick the old home.
         (
             "lm-studio",
             |h| h.join(".lmstudio/mcp.json"),
             |h| std::fs::create_dir_all(h.join(".cache/lm-studio")).unwrap(),
+            false,
+        ),
+        // The pointer names the home LM Studio reads.
+        (
+            "lm-studio",
+            |h| h.join(".lmstudio/mcp.json"),
+            |h| {
+                let cache = h.join(".cache/lm-studio");
+                std::fs::create_dir_all(&cache).unwrap();
+                std::fs::write(h.join(".lmstudio-home-pointer"), cache.to_str().unwrap()).unwrap();
+            },
+            true,
         ),
     ];
-    for (client, legacy_of, prepare) in cases {
+    for (client, legacy_of, prepare, moves) in cases {
         let fixture = Fixture::new("relocate-json");
         prepare(&fixture.home);
         let legacy = legacy_of(&fixture.home);
@@ -671,23 +724,35 @@ fn json_connections_move_from_every_legacy_file_into_the_current_one() {
         assert_ne!(target, legacy, "{client}");
 
         let moved = relocate::relocate(client, fixture.gateway(), None).unwrap();
-        assert_eq!(moved.cleaned, vec![legacy.clone()], "{client}");
         let managed = moved.managed.expect("ownership of the moved entry");
         assert_eq!(managed.command, fixture.gateway());
-
         let now = read(&target);
         let entry = &now["mcpServers"]["toolport"];
         assert_eq!(entry["command"], fixture.gateway(), "{client}");
         assert_eq!(entry["env"]["TOOLPORT_CLIENT_ID"], *client, "{client}");
         assert_eq!(entry["env"]["TOOLPORT_PROFILE"], "work", "{client}");
         let old = read(&legacy);
-        assert!(
-            old["mcpServers"].get("toolport").is_none(),
-            "{client}: {old}"
-        );
+        if *moves {
+            assert_eq!(moved.cleaned, vec![legacy.clone()], "{client}");
+            assert!(
+                old["mcpServers"].get("toolport").is_none(),
+                "{client}: {old}"
+            );
+        } else {
+            assert_eq!(moved.kept, vec![legacy.clone()], "{client}");
+            assert_eq!(
+                old["mcpServers"]["toolport"]["command"],
+                fixture.gateway(),
+                "{client}"
+            );
+            assert_eq!(
+                old["mcpServers"]["toolport"]["env"]["TOOLPORT_PROFILE"],
+                "work"
+            );
+        }
         assert_eq!(old["mcpServers"]["native"], json!({"command": "native"}));
 
-        // The pass is idempotent, and the client now shows as connected.
+        // The pass is idempotent, and the client shows as one connected row.
         let again = relocate::relocate(client, fixture.gateway(), None).unwrap();
         assert!(
             again.cleaned.is_empty() && again.managed.is_none(),
@@ -699,25 +764,137 @@ fn json_connections_move_from_every_legacy_file_into_the_current_one() {
     }
 }
 
+/// The current file already holds a different connection (Devin CLI's, unscoped)
+/// while the old Windsurf file holds a `work`-scoped one: removing the old entry
+/// would change what the client is connected to, so it stays, even when the client
+/// is known not to read the old file.
 #[test]
-fn a_connection_already_in_the_current_file_is_kept_and_the_old_copy_removed() {
-    let fixture = Fixture::new("relocate-existing");
-    let legacy = fixture.home.join(".codeium/windsurf/mcp_config.json");
+fn a_different_connection_in_the_current_file_never_removes_the_old_one() {
+    for verdict in [
+        relocate::OldFile::MaybeRead,
+        relocate::OldFile::Unread("test"),
+    ] {
+        let fixture = Fixture::new("relocate-existing");
+        let legacy = fixture
+            .home
+            .join(".codeium")
+            .join("windsurf")
+            .join("mcp_config.json");
+        write(
+            &legacy,
+            &json!({"mcpServers": {"toolport": old_entry("windsurf")}}),
+        );
+        let target = client_config_path("devin-cli").unwrap();
+        let current = json!({"mcpServers": {"toolport": {
+            "command": fixture.gateway(), "args": [],
+            "env": {"TOOLPORT_CLIENT_ID": "devin-cli", "TOOLPORT_ATTRIBUTION_ID": "devin-cli"}}}});
+        write(&target, &current);
+        relocate::STATUS_OVERRIDE.with(|cell| cell.set(Some(verdict)));
+        let moved = relocate::relocate("windsurf", fixture.gateway(), None);
+        relocate::STATUS_OVERRIDE.with(|cell| cell.set(None));
+        let moved = moved.unwrap();
+        assert!(moved.managed.is_none());
+        assert!(moved.cleaned.is_empty(), "{verdict:?}");
+        assert_eq!(moved.kept, vec![legacy.clone()]);
+        // Devin CLI's connection in the shared file is not rewritten by Devin Desktop.
+        assert_eq!(read(&target), current);
+        let old = &read(&legacy)["mcpServers"]["toolport"];
+        assert_eq!(old["env"]["TOOLPORT_PROFILE"], "work", "{verdict:?}");
+        assert_eq!(
+            old["command"],
+            fixture.gateway(),
+            "kept entries follow the gateway"
+        );
+    }
+}
+
+/// S2: Windsurf still reads `~/.codeium/windsurf/mcp_config.json` through
+/// `chat.mcp.discovery.enabled`, and older builds read only that file. The startup
+/// pass writes the Devin file and keeps the old entry working.
+#[test]
+fn startup_keeps_an_old_entry_the_client_may_still_read() {
+    let fixture = Fixture::new("relocate-keep");
+    let legacy = fixture
+        .home
+        .join(".codeium")
+        .join("windsurf")
+        .join("mcp_config.json");
     write(
         &legacy,
-        &json!({"mcpServers": {"toolport": old_entry("windsurf")}}),
+        &json!({"mcpServers": {"toolport": old_entry("windsurf"), "native": {"command": "native"}}}),
     );
-    let target = client_config_path("devin-cli").unwrap();
-    let current = json!({"mcpServers": {"toolport": {
-        "command": fixture.gateway(), "args": [],
-        "env": {"TOOLPORT_CLIENT_ID": "devin-cli", "TOOLPORT_ATTRIBUTION_ID": "devin-cli"}}}});
-    write(&target, &current);
-    let moved = relocate::relocate("windsurf", fixture.gateway(), None).unwrap();
-    assert!(moved.managed.is_none());
-    assert_eq!(moved.cleaned, vec![legacy.clone()]);
-    // Devin CLI's connection in the shared file is not rewritten by Devin Desktop.
-    assert_eq!(read(&target), current);
-    assert!(read(&legacy)["mcpServers"].get("toolport").is_none());
+    let outcome = relocate::relocate_all(fixture.gateway(), &HashMap::new());
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    let target = client_config_path("windsurf").unwrap();
+    assert_eq!(
+        read(&target)["mcpServers"]["toolport"]["env"]["TOOLPORT_PROFILE"],
+        "work"
+    );
+    let old = read(&legacy);
+    assert_eq!(old["mcpServers"]["toolport"]["command"], fixture.gateway());
+    assert_eq!(
+        old["mcpServers"]["toolport"]["env"]["TOOLPORT_PROFILE"],
+        "work"
+    );
+    assert_eq!(old["mcpServers"]["native"], json!({"command": "native"}));
+    // One client row, connected.
+    let rows: Vec<_> = detect_clients()
+        .into_iter()
+        .filter(|row| row.id == "windsurf")
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].gateway_installed);
+}
+
+/// S1: a `~/.cline` folder (from the CLI or shared rules) is not evidence that the
+/// VS Code extension moved. Until Cline's new settings file exists, the extension's
+/// own storage file stays the one Toolport writes, and its entry is never removed.
+#[test]
+fn a_dot_cline_folder_alone_never_disconnects_the_vscode_extension() {
+    let fixture = Fixture::new("relocate-cline");
+    let legacy = cline_legacy_settings_path(&fixture.home, Platform::current(), &client_path_env);
+    write(
+        &legacy,
+        &json!({"mcpServers": {"toolport": old_entry("cline"), "native": {"command": "native"}}}),
+    );
+    std::fs::create_dir_all(fixture.home.join(".cline").join("rules")).unwrap();
+    assert_eq!(
+        resolved_definition_path(&find_def("cline").unwrap()).unwrap(),
+        legacy
+    );
+    let outcome = relocate::relocate_all(fixture.gateway(), &HashMap::new());
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    let old = read(&legacy);
+    assert!(old["mcpServers"].get("toolport").is_some(), "{old}");
+    assert_eq!(old["mcpServers"]["native"], json!({"command": "native"}));
+}
+
+/// Connect writes every old file the client may still read, and Disconnect puts
+/// both files back byte for byte.
+#[test]
+fn connect_writes_both_files_and_disconnect_restores_both_byte_for_byte() {
+    let fixture = Fixture::new("relocate-both");
+    let legacy = fixture
+        .home
+        .join(".codeium")
+        .join("windsurf")
+        .join("mcp_config.json");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    let legacy_bytes =
+        "{\n  \"mcpServers\": {\"native\": {\"command\": \"native\"}},\n  \"theme\": 1\n}\n";
+    std::fs::write(&legacy, legacy_bytes).unwrap();
+    let target = client_config_path("windsurf").unwrap();
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let target_bytes = "{\"mcpServers\": {\"mine\": {\"command\": \"mine\"}}}\n";
+    std::fs::write(&target, target_bytes).unwrap();
+
+    install_gateway("windsurf", None).unwrap();
+    assert!(read(&target)["mcpServers"].get("toolport").is_some());
+    assert!(read(&legacy)["mcpServers"].get("toolport").is_some());
+
+    uninstall_gateway("windsurf").unwrap();
+    assert_eq!(std::fs::read_to_string(&legacy).unwrap(), legacy_bytes);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), target_bytes);
 }
 
 #[test]
@@ -785,7 +962,11 @@ fn moving_a_connection_restores_the_old_file_from_its_snapshot_and_releases_it()
         .iter()
         .any(|(_, path, _)| path == &legacy));
 
-    relocate::relocate("windsurf", fixture.gateway(), None).unwrap();
+    // Where the client is known not to read the old file, the move restores it.
+    relocate::STATUS_OVERRIDE.with(|cell| cell.set(Some(relocate::OldFile::Unread("test"))));
+    let moved = relocate::relocate("windsurf", fixture.gateway(), None);
+    relocate::STATUS_OVERRIDE.with(|cell| cell.set(None));
+    moved.unwrap();
     assert_eq!(
         std::fs::read_to_string(&legacy).unwrap(),
         before,
@@ -800,7 +981,7 @@ fn moving_a_connection_restores_the_old_file_from_its_snapshot_and_releases_it()
 }
 
 #[test]
-fn connect_and_disconnect_leave_no_toolport_entry_in_an_old_file() {
+fn connect_keeps_an_old_file_working_and_disconnect_leaves_no_toolport_entry_in_it() {
     let fixture = Fixture::new("relocate-connect");
     let legacy = fixture.home.join(".gemini/antigravity/mcp_config.json");
     write(
@@ -810,16 +991,20 @@ fn connect_and_disconnect_leave_no_toolport_entry_in_an_old_file() {
     );
     let outcome = install_gateway("antigravity", None).unwrap();
     assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
-    assert!(read(&legacy)["mcpServers"].get("toolport").is_none());
+    // Antigravity 1.x read this file: it gets the same, current entry.
     let target = client_config_path("antigravity").unwrap();
-    assert!(read(&target)["mcpServers"].get("toolport").is_some());
+    let written = read(&target)["mcpServers"]["toolport"].clone();
+    assert!(written.is_object());
+    let old = read(&legacy);
+    assert_eq!(old["mcpServers"]["toolport"], written);
+    assert_eq!(old["mcpServers"]["native"], json!({"command": "native"}));
 
-    write(
-        &legacy,
-        &json!({"mcpServers": {"toolport": old_entry("antigravity")}}),
-    );
     uninstall_gateway("antigravity").unwrap();
     assert!(read(&legacy)["mcpServers"].get("toolport").is_none());
+    assert_eq!(
+        read(&legacy)["mcpServers"]["native"],
+        json!({"command": "native"})
+    );
     assert!(!read_client(&find_def("antigravity").unwrap()).gateway_installed);
 }
 
@@ -837,7 +1022,11 @@ fn the_launch_pass_moves_legacy_connections_and_reports_their_ownership() {
         .repointed
         .iter()
         .any(|(id, entry)| id == "windsurf" && entry.command == fixture.gateway()));
-    assert!(read(&legacy)["mcpServers"].get("toolport").is_none());
+    // Devin Desktop still imports the old file, so its entry stays, kept current.
+    assert_eq!(
+        read(&legacy)["mcpServers"]["toolport"]["command"],
+        fixture.gateway()
+    );
 }
 
 #[test]

@@ -7,12 +7,17 @@
 //! `~/.codeium/windsurf`. An entry at the old place is invisible to the client, so the
 //! user's connection quietly stops working.
 //!
-//! The repair pass moves that connection. The entry is written to the file the client
-//! reads now, with its scope environment kept, and Toolport's own entry is then taken
-//! out of the old file through the same per-path restore a Disconnect uses
-//! ([`disconnect::restore_path`]). That honours the old file's original snapshot and
-//! any "Move into gateway" record for it, changes nothing else in the file, and marks
-//! the snapshot released so a later Disconnect or uninstall does not revisit it.
+//! A client that moved may still read the old place: an older install that was not
+//! updated, a discovery setting, a second editor. So the old entry is removed only on
+//! positive evidence that this machine's client no longer reads it ([`old_file_status`]:
+//! the client never read that path, or a file or version only the new release writes).
+//! Without that evidence both files keep a working Toolport entry: the repair pass
+//! writes the new file and keeps the old entry current, and Connect writes both.
+//! Disconnect, uninstall and "Remove from all clients" take Toolport out of both
+//! through the same per-path restore ([`disconnect::restore_path`]), which puts each
+//! file back byte for byte from its own snapshot. An old entry is also never removed
+//! when the new file holds a different connection (another scope, a hand edit, a
+//! Shared HTTP entry): removing it would change what the client is connected to.
 //!
 //! Only real location moves are listed. A location chosen by an env var
 //! (`XDG_CONFIG_HOME`, `HERMES_HOME`, `CLINE_DIR`, ...) is per shell: the default file
@@ -52,13 +57,6 @@ pub(super) fn resolve_legacy_config_paths(
             .collect(),
         // The Windows build always reads %LOCALAPPDATA%\hermes.
         ("hermes", Platform::Windows) => vec![home.join(".hermes").join("config.yaml")],
-        ("claude-desktop", Platform::Windows) => {
-            let mut paths = vec![roaming_config_dir(home, platform)
-                .join("Claude")
-                .join("claude_desktop_config.json")];
-            paths.extend(claude_desktop_msix_configs(&local()));
-            paths
-        }
         ("amazon-q", _) => vec![amazon_q_dir(home).join("mcp.json")],
         ("lm-studio", _) => lm_studio_default_homes(home)
             .into_iter()
@@ -105,6 +103,7 @@ fn stale_files(
                 .iter()
                 .any(|row| locations::same_path(&row.config_path, &legacy))
             || !std::fs::metadata(&legacy).is_ok_and(|meta| meta.is_file())
+            || std::fs::symlink_metadata(&legacy).is_ok_and(|meta| meta.file_type().is_symlink())
         {
             continue;
         }
@@ -146,6 +145,17 @@ pub(super) struct Relocated {
     pub managed: Option<ManagedEntry>,
     /// Legacy files Toolport's entry was taken out of.
     pub cleaned: Vec<PathBuf>,
+    /// Legacy files the client may still read, whose Toolport entry was kept.
+    pub kept: Vec<PathBuf>,
+}
+
+/// Whether this machine's client still reads one of its old config files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OldFile {
+    /// Positive evidence it is not read; the text names the evidence.
+    Unread(&'static str),
+    /// No such evidence: the client may still read it.
+    MaybeRead,
 }
 
 /// Move `client_id`'s Toolport connection out of every legacy file into the file the
@@ -176,11 +186,69 @@ pub(super) fn relocate(
             entry.command = Some(gateway.to_string());
             outcome.managed = install_or_remove(client_id, Some(&entry))?.managed;
         }
-        // The record that made this entry ours, not the one just written.
-        remove_from_legacy(&def, &legacy, managed)?;
-        outcome.cleaned.push(legacy);
+        let unread = matches!(old_file_status(def.id, &legacy), OldFile::Unread(_));
+        if unread && same_connection(&def, &target, &legacy, &server.name, client_id)? {
+            // The record that made this entry ours, not the one just written.
+            remove_from_legacy(&def, &legacy, managed)?;
+            outcome.cleaned.push(legacy);
+        } else {
+            // The client may still read it, or the new file holds a different
+            // connection: keep the old entry, pointed at the current gateway.
+            if server.command.as_deref() != Some(gateway) {
+                refresh_legacy(&def, &legacy, &server.name, gateway)?;
+            }
+            outcome.kept.push(legacy);
+        }
     }
     Ok(outcome)
+}
+
+/// The `TOOLPORT_PROFILE` (or legacy `CONDUIT_PROFILE`) scope of an entry.
+fn scope_of(entry: &ServerEntry) -> Option<String> {
+    ["TOOLPORT_PROFILE", "CONDUIT_PROFILE"]
+        .iter()
+        .find_map(|key| {
+            entry
+                .env
+                .iter()
+                .find(|var| var.key == *key)
+                .and_then(|var| var.value.clone())
+        })
+}
+
+/// Whether the current file's Toolport entry is the same connection as the old
+/// file's: a local Toolport gateway with the same scope.
+fn same_connection(
+    def: &ClientDef,
+    target: &Path,
+    legacy: &Path,
+    name: &str,
+    client_id: &str,
+) -> Result<bool, String> {
+    if !target_has_gateway(def, target)? {
+        return Ok(false);
+    }
+    let servers = parse_client_content(def.format, &read_config_file(target)?)?;
+    let Some(current) = gateway_entry_for_client(def.id, &servers) else {
+        return Ok(false);
+    };
+    if current.url.is_some() || !command_is_gateway_binary(current.command.as_deref().unwrap_or(""))
+    {
+        return Ok(false);
+    }
+    let current = repair_gateway_entry(def.format, target, &current.name, client_id)?;
+    let old = repair_gateway_entry(def.format, legacy, name, client_id)?;
+    Ok(scope_of(&current) == scope_of(&old))
+}
+
+/// Point the old file's Toolport entry at `gateway`, keeping its scope.
+fn refresh_legacy(def: &ClientDef, legacy: &Path, name: &str, gateway: &str) -> Result<(), String> {
+    mutation::run(def.id, legacy, def.format, || {
+        backup_file(def.id, legacy)?;
+        let mut entry = repair_gateway_entry(def.format, legacy, name, def.id)?;
+        entry.command = Some(gateway.to_string());
+        edit_format(def.format, legacy, Some(&entry), false)
+    })
 }
 
 /// Take Toolport's entry out of one legacy file. The per-path restore a Disconnect
@@ -247,9 +315,9 @@ pub(super) fn relocate_all(
 }
 
 /// Take Toolport's entry out of every legacy file without writing the current one.
-/// Connect and Disconnect call this after changing the current file, so a client is
-/// never left with a second, dead Toolport entry. Failures become warnings: the
-/// current file, which the client reads, is already right.
+/// Disconnect calls this after changing the current file, so Toolport leaves no entry
+/// behind in any file the client reads or used to read. Failures become warnings:
+/// the current file is already right.
 pub(super) fn clean(client_id: &str, managed: Option<&ManagedEntry>) -> Vec<String> {
     let Some(def) = find_def(client_id).filter(|def| def.location.is_none()) else {
         return Vec::new();
@@ -274,4 +342,161 @@ pub(super) fn clean(client_id: &str, managed: Option<&ManagedEntry>) -> Vec<Stri
                 })
         })
         .collect()
+}
+
+/// After Connect wrote `entry` to the current file: an old file the client no longer
+/// reads loses Toolport's entry, and one it may still read gets the same entry, so
+/// every install of the client is connected. Only existing files are written, a
+/// hand-edited entry under Toolport's name is left alone, and failures are warnings.
+pub(super) fn after_connect(client_id: &str, entry: &ServerEntry) -> Vec<String> {
+    let Some(def) = find_def(client_id).filter(|def| def.location.is_none()) else {
+        return Vec::new();
+    };
+    let Ok(target) = resolved_definition_path(&def) else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+    let saved = locations::saved().unwrap_or_default();
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for legacy in legacy_config_paths(def.id) {
+        if locations::same_path(&legacy, &target)
+            || seen.iter().any(|path| locations::same_path(path, &legacy))
+            || saved
+                .iter()
+                .any(|row| locations::same_path(&row.config_path, &legacy))
+            || !std::fs::metadata(&legacy).is_ok_and(|meta| meta.is_file())
+            // A link (Antigravity links its old files to the new one) is written
+            // through its target, never replaced.
+            || std::fs::symlink_metadata(&legacy).is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            continue;
+        }
+        seen.push(legacy.clone());
+        let Ok(text) = read_config_file(&legacy) else {
+            continue;
+        };
+        let Ok(servers) = parse_client_content(def.format, &text) else {
+            continue;
+        };
+        let existing = gateway_entry_for_client(def.id, &servers);
+        let ours = existing.is_some_and(|server| {
+            entry_state_for(Some(server), None) == GatewayEntryState::Managed
+        });
+        let result = match old_file_status(def.id, &legacy) {
+            OldFile::Unread(_) if ours => remove_from_legacy(&def, &legacy, None),
+            OldFile::Unread(_) => Ok(()),
+            // A hand-edited entry under our name is the user's.
+            OldFile::MaybeRead if existing.is_some() && !ours => Ok(()),
+            OldFile::MaybeRead => mutation::run(def.id, &legacy, def.format, || {
+                backup_file(def.id, &legacy)?;
+                edit_format(def.format, &legacy, Some(entry), false)
+            }),
+        };
+        if let Err(error) = result {
+            warnings.push(format!(
+                "could not update Toolport in the older config {}: {error}",
+                legacy.display()
+            ));
+        }
+    }
+    warnings
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Forces [`old_file_status`] for tests of what a verdict leads to.
+    pub(super) static STATUS_OVERRIDE: std::cell::Cell<Option<OldFile>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`resolve_old_file_status`] for this machine.
+pub(super) fn old_file_status(client_id: &str, legacy: &Path) -> OldFile {
+    #[cfg(test)]
+    if let Some(status) = STATUS_OVERRIDE.with(std::cell::Cell::get) {
+        return status;
+    }
+    let Some(home) = home() else {
+        return OldFile::MaybeRead;
+    };
+    resolve_old_file_status(
+        client_id,
+        legacy,
+        &home,
+        Platform::current(),
+        &client_path_env,
+    )
+}
+
+/// Whether `client_id` on `platform` still reads `legacy`, one of its old files.
+/// `Unread` needs positive evidence, stated in the text; everything else is
+/// `MaybeRead`. Evidence per client is in docs/clients.md.
+pub(super) fn resolve_old_file_status(
+    client_id: &str,
+    legacy: &Path,
+    home: &Path,
+    platform: Platform,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> OldFile {
+    match (client_id, platform) {
+        // goose v1.0.0 read ~/.config/goose; since 54af4c9 it uses etcetera's
+        // choose_app_strategy, which is Xdg on macOS (paths.rs@v1.59.1). No release
+        // read Application Support; only an older Toolport wrote there.
+        ("goose", Platform::MacOs) => {
+            OldFile::Unread("Goose has never read Application Support on macOS")
+        }
+        // Cline 4 migrates the old storage file once and records it in globalState
+        // (mcp-settings-legacy-migration.ts@v4.1.26); 3.x reads only the old file.
+        ("cline", _) if cline_moved(home) => {
+            OldFile::Unread("Cline 4 is installed or recorded its one-time migration")
+        }
+        // The Windows installer sets HERMES_HOME (install.ps1@v2026.5.16), and Hermes
+        // then reads only that folder (hermes_constants.py@v0.23.1).
+        ("hermes", Platform::Windows) if env("HERMES_HOME").is_some_and(|v| !v.is_empty()) => {
+            OldFile::Unread("HERMES_HOME is set, so Hermes reads only that folder")
+        }
+        // LM Studio reads the home named in ~/.lmstudio-home-pointer
+        // (findLMStudioHome.ts@2025945), so other default homes are unused.
+        ("lm-studio", _) if home.join(".lmstudio-home-pointer").is_file() => {
+            OldFile::Unread("~/.lmstudio-home-pointer names the LM Studio home")
+        }
+        // Reasonix falls back to a legacy config.toml only while its home file is
+        // missing (paths.go@cd20bb50be); Toolport writes the legacy file until then.
+        ("reasonix", _)
+            if legacy.parent().is_some_and(|dir| {
+                resolve_client_config_path_env("reasonix", home, platform, env)
+                    .is_some_and(|primary| primary.is_file() && primary.parent() != Some(dir))
+            }) =>
+        {
+            OldFile::Unread("Reasonix reads only its home config.toml once it exists")
+        }
+        // Devin Desktop still imports ~/.codeium/windsurf by default
+        // (read_config_from.windsurf), Crush still merges %LOCALAPPDATA%\crush last,
+        // Amazon Q still loads mcp.json while useLegacyMcpJson is on, and Antigravity
+        // 1.x read its old folders: no evidence any of them stopped.
+        _ => OldFile::MaybeRead,
+    }
+}
+
+/// Cline 4's own record that it migrated the VS Code storage file, or an installed
+/// Cline 4 extension in VS Code (whose storage the old file is).
+pub(super) fn cline_moved(home: &Path) -> bool {
+    let migrated =
+        std::fs::read_to_string(home.join(".cline").join("data").join("globalState.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .is_some_and(|state| state.get("__vscodeLegacyMcpSettingsMigration").is_some());
+    migrated || installed_cline_major(home).is_some_and(|major| major >= 4)
+}
+
+/// The newest `saoudrizwan.claude-dev-<version>` major in VS Code's extensions folder.
+fn installed_cline_major(home: &Path) -> Option<u64> {
+    std::fs::read_dir(home.join(".vscode").join("extensions"))
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let version = name.strip_prefix("saoudrizwan.claude-dev-")?;
+            version.split('.').next()?.parse::<u64>().ok()
+        })
+        .max()
 }
