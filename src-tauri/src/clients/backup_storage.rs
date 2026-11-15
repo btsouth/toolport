@@ -72,10 +72,36 @@ struct PlainBackup {
     binding: String,
     text: String,
 }
+/// One spelling per backup file for provenance hashes, however the data folder
+/// was reached: the parent folder is resolved (symlinks, Windows 8.3 short
+/// names), and on Windows the verbatim prefix, separators and case are folded.
+fn path_identity(path: &Path) -> String {
+    let resolved = path
+        .parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+        .zip(path.file_name())
+        .map(|(parent, name)| parent.join(name))
+        .unwrap_or_else(|| path.to_path_buf());
+    fold_spelling(&resolved.to_string_lossy(), cfg!(windows))
+}
+fn fold_spelling(path: &str, windows: bool) -> String {
+    if !windows {
+        return path.to_string();
+    }
+    let path = path.replace('/', "\\");
+    let path = if let Some(rest) = path.strip_prefix("\\\\?\\UNC\\") {
+        format!("\\\\{rest}")
+    } else {
+        path.strip_prefix("\\\\?\\")
+            .map(str::to_string)
+            .unwrap_or(path)
+    };
+    path.to_lowercase()
+}
 fn plain_binding(path: &Path, source: &str, text: &str) -> String {
     format!(
         "{}-{}-{}",
-        crate::registry::sha256_hex(&path.to_string_lossy()),
+        crate::registry::sha256_hex(&path_identity(path)),
         crate::registry::sha256_hex(source),
         crate::registry::sha256_hex(text)
     )
@@ -382,7 +408,7 @@ fn encode_internal(
     );
     let key = format!(
         "{}-{}{hash}",
-        crate::registry::sha256_hex(&path.to_string_lossy()),
+        crate::registry::sha256_hex(&path_identity(path)),
         source
             .map(|p| format!("{}-", crate::registry::sha256_hex(&p.to_string_lossy())))
             .unwrap_or_default()
@@ -654,7 +680,9 @@ pub(super) fn read_exact(path: &Path, source: &Path) -> Result<String, String> {
         return Err(invalid());
     }
     let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    if source_path_in(path, &raw)?.is_some_and(|saved| Path::new(&saved) != source) {
+    if source_path_in(path, &raw)?
+        .is_some_and(|saved| path_identity(Path::new(&saved)) != path_identity(source))
+    {
         return Err(invalid());
     }
     let Some(saved) = envelope(&raw) else {
@@ -735,7 +763,7 @@ fn release_owned(path: &Path, discard_all: bool) -> Result<(), String> {
             let Some(dir) = path.parent().and_then(Path::parent).and_then(Path::parent) else {
                 return Ok(());
             };
-            let prefix = format!("{}-", crate::registry::sha256_hex(&path.to_string_lossy()));
+            let prefix = format!("{}-", crate::registry::sha256_hex(&path_identity(path)));
             // A copied backup can refer to another install or config's vault.
             // Restoring a copy never grants permission to delete its source.
             if saved.account != install_account(dir) || !saved.key.starts_with(&prefix) {
@@ -1079,6 +1107,61 @@ pub(crate) fn protect_existing() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Windows spellings of one data folder fold to one identity, on every OS.
+    #[test]
+    fn windows_path_spellings_fold_to_one_identity() {
+        let long = r"C:\Users\RunnerAdmin\AppData\Local\Temp\data\backups\cursor\1-hooks.json";
+        for spelling in [
+            r"\\?\C:\Users\runneradmin\AppData\Local\Temp\data\backups\cursor\1-hooks.json",
+            "C:/Users/RUNNERADMIN/AppData/Local/Temp/data/backups/cursor/1-hooks.json",
+            long,
+        ] {
+            assert_eq!(fold_spelling(spelling, true), fold_spelling(long, true));
+        }
+        assert_eq!(
+            fold_spelling(r"\\?\UNC\server\share\Toolport\b.json", true),
+            fold_spelling(r"\\server\share\Toolport\b.json", true)
+        );
+        // Unix paths are case sensitive and kept as they are.
+        assert_ne!(
+            fold_spelling("/tmp/A/b.json", false),
+            fold_spelling("/tmp/a/b.json", false)
+        );
+    }
+
+    /// A backup reached through another spelling of the data folder (a
+    /// symlink here; an 8.3 short name or verbatim prefix on Windows) still
+    /// passes its provenance check.
+    #[cfg(unix)]
+    #[test]
+    fn backups_read_through_another_folder_spelling() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            clear();
+            reset_missing();
+            let data = crate::registry::conduit_dir().unwrap();
+            let dir = data.join("backups/cursor");
+            std::fs::create_dir_all(&dir).unwrap();
+            let source = data.join("native-hooks.json");
+            let bytes = "{\"hooks\":{}}";
+            std::fs::write(&source, bytes).unwrap();
+            let backup = dir.join("1-hooks.json");
+            std::fs::write(
+                &backup,
+                encode_backup(&backup, bytes, false, &source).unwrap(),
+            )
+            .unwrap();
+            let alias = data.with_file_name(format!(
+                "{}-alias",
+                data.file_name().unwrap().to_string_lossy()
+            ));
+            std::os::unix::fs::symlink(&data, &alias).unwrap();
+            let through_alias = alias.join("backups/cursor/1-hooks.json");
+            let read = super::super::read_client_backup(&through_alias, &source);
+            std::fs::remove_file(&alias).unwrap();
+            assert_eq!(read.unwrap(), bytes);
+        });
+    }
+
     #[test]
     fn rollback_reads_exact_plain_and_vaulted_bytes_but_never_missing_templates() {
         crate::secrets::tests::with_isolated_vault(|| {
@@ -1934,7 +2017,7 @@ fn source_path_in(path: &Path, raw: &str) -> Result<Option<String>, String> {
     if let Some(source) = saved.source_config_path {
         let expected = format!(
             "{}-{}-{}",
-            crate::registry::sha256_hex(&path.to_string_lossy()),
+            crate::registry::sha256_hex(&path_identity(path)),
             crate::registry::sha256_hex(&source),
             saved.hash
         );
