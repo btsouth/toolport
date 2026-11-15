@@ -970,10 +970,7 @@ mod tests {
         let mut redact = higher_ranked(|line: &str| {
             if !appended {
                 appended = true;
-                let mut f = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&appender)
-                    .unwrap();
+                let mut f = crate::registry::open_append_private(&appender).unwrap();
                 f.write_all(b"appended\n").unwrap();
             }
             Cow::Owned(line.replace("SECRET", "x"))
