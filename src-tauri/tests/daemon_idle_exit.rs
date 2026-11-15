@@ -447,6 +447,77 @@ fn a_removed_app_keeps_serving_a_live_session_until_it_ends() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Assert the daemon is still running, then remove its app and expect the
+/// usual `binary_removed` exit: the watch stays armed after a false alarm.
+fn still_running_then_exits_on_removal(child: &mut ChildGuard, dir: &Path, binary: &Path) {
+    assert!(
+        child.0.try_wait().expect("daemon status").is_none(),
+        "the daemon exited on a mismatch that recovered\n{}",
+        diagnostics(dir)
+    );
+    assert!(
+        !diagnostics(dir).contains("reason=binary_removed"),
+        "{}",
+        diagnostics(dir)
+    );
+    uninstall_copy(binary);
+    let status = wait_for_exit(child, dir, Duration::from_secs(20));
+    assert!(status.success(), "unexpected daemon exit: {status:?}");
+    assert!(
+        diagnostics(dir).contains("reason=binary_removed"),
+        "{}",
+        diagnostics(dir)
+    );
+}
+
+#[test]
+fn a_binary_that_disappears_briefly_and_comes_back_does_not_end_the_daemon() {
+    // A volume that drops for a moment, or an installer that moves the app
+    // aside and back, is not an uninstall.
+    let dir = scratch_dir();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let binary = installed_copy(&dir);
+    let mut child = spawn_daemon_from(&binary, &dir, 600_000);
+    wait_for_descriptor(&mut child, &dir);
+    std::thread::sleep(Duration::from_millis(500));
+    let aside = binary.with_extension("aside");
+    std::fs::rename(&binary, &aside).expect("move the gateway aside");
+    std::thread::sleep(Duration::from_millis(1500));
+    std::fs::rename(&aside, &binary).expect("put the gateway back");
+    // Well past the confirmation window.
+    std::thread::sleep(Duration::from_secs(8));
+    still_running_then_exits_on_removal(&mut child, &dir, &binary);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_binary_that_becomes_readable_again_does_not_end_the_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch_dir();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let binary = installed_copy(&dir);
+    let app = binary.parent().expect("app folder").to_path_buf();
+    let mut child = spawn_daemon_from(&binary, &dir, 600_000);
+    wait_for_descriptor(&mut child, &dir);
+    std::thread::sleep(Duration::from_millis(500));
+    std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o000)).expect("lock the app");
+    if std::fs::metadata(&binary).is_ok() {
+        // Root can stat through a 000 folder; there is nothing to test.
+        std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipped: this user can stat through an unreadable folder");
+        return;
+    }
+    // Unreadable for longer than the confirmation window: unknown is not gone.
+    std::thread::sleep(Duration::from_secs(8));
+    std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o755)).expect("unlock the app");
+    std::thread::sleep(Duration::from_secs(3));
+    still_running_then_exits_on_removal(&mut child, &dir, &binary);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn stop_when_idle_stops_an_idle_daemon_at_once() {
     let dir = scratch_dir();

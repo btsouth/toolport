@@ -20186,22 +20186,22 @@ fn spawn_daemon_idle_watchdog(
     let poll = Duration::from_millis(200).min(grace);
     // The app was deleted, moved to the Trash, or replaced by a package upgrade.
     // Keep serving any connected client, but exit the moment none is, instead of
-    // lingering for the idle grace on a binary that is no longer installed.
-    let executable = conduit_lib::daemon::ExecutableIdentity::current();
+    // lingering for the idle grace on a binary that is no longer installed. The
+    // watch only decides "gone" after the mismatch has held for several spaced
+    // looks, and never on a path it cannot read.
+    let mut executable = conduit_lib::daemon::BinaryWatch::current();
     let mut binary_gone = false;
-    let mut polls: u32 = 0;
     std::thread::spawn(move || loop {
         std::thread::sleep(poll);
-        polls = polls.wrapping_add(1);
-        if !binary_gone && polls.is_multiple_of(5) {
-            if let Some(executable) = executable.as_ref().filter(|exe| !exe.still_installed()) {
-                binary_gone = true;
-                glog(&format!(
-                    "daemon: executable {} was removed or replaced; exiting once no client is connected",
-                    executable.path().display()
-                ));
-                host.shutdown_if_idle.store(true, Ordering::Release);
-            }
+        if !binary_gone && executable.poll(std::time::Instant::now()) {
+            binary_gone = true;
+            glog(&format!(
+                "daemon: executable {} was removed or replaced; exiting once no client is connected",
+                executable
+                    .path()
+                    .map_or_else(|| "<unknown>".into(), |path| path.display().to_string())
+            ));
+            host.shutdown_if_idle.store(true, Ordering::Release);
         }
         if inflight.load(Ordering::Relaxed) > 0 {
             continue;
