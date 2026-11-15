@@ -140,12 +140,16 @@ fn marker_name(name: &str) -> String {
 }
 
 /// Shortest base64 inner string registered for a secret embedded at an unknown
-/// byte offset inside a longer base64 blob. Sixteen characters carry 96 bits of
-/// the secret, so a coincidental match in unrelated base64 is not a real risk;
-/// shorter inner strings would start matching random blobs. A secret too short
-/// to reach it (under 13 bytes) is still matched in its whole-value encodings,
-/// which is how an upstream that encodes the bare secret writes it.
-pub const MIN_BASE64_INNER_CHARS: usize = 16;
+/// byte offset inside a longer base64 blob (`Basic base64(user:password)`).
+/// Twelve characters carry 72 bits of the secret: on an 89.5 MB corpus of
+/// code, docs and logs (`examples/secret-redact-false-positives.rs`) no value
+/// from 8 to 24 produced a single false positive, and 12 is what finds an
+/// 11-character password behind any username. A secret too short to reach it
+/// is still matched in its whole-value encodings.
+pub const MIN_BASE64_INNER_CHARS: usize = 12;
+
+/// Shortest line of a multi-line secret (a PEM body) registered on its own.
+const MIN_SECRET_LINE_CHARS: usize = 16;
 
 const BASE64_ENGINES: [&base64::engine::GeneralPurpose; 4] = [
     &base64::engine::general_purpose::STANDARD,
@@ -294,7 +298,7 @@ fn text_forms(value: &str) -> Vec<String> {
     }
     if value.contains(['\n', '\r']) {
         for line in value.lines().map(str::trim) {
-            if line.chars().count() >= MIN_BASE64_INNER_CHARS {
+            if line.chars().count() >= MIN_SECRET_LINE_CHARS {
                 push(line.to_string());
             }
         }
@@ -3458,7 +3462,8 @@ mod tests {
         }
         // The floor: a short secret has no inner form, so a blob at an offset is
         // not matched, while its whole-value encoding still is.
-        assert!(base64_inner(b"short-Qm7").is_empty());
+        assert!(base64_inner(b"shrt-Qm7").is_empty());
+        assert!(!base64_inner(b"short-Qm7").is_empty());
         let short = m_short();
         let whole = base64::engine::general_purpose::STANDARD.encode("short-Qm7");
         assert!(short
@@ -4074,6 +4079,19 @@ mod tests {
         let mut echo = serde_json::json!({"text": "you sent sk-CountedSecret321"});
         let request = serde_json::json!({"arguments": {"key": "sk-CountedSecret321"}});
         assert!(redact_outgoing_counted(&mut echo, Some(&request)).is_empty());
+    }
+
+    #[test]
+    fn an_eleven_character_password_inside_basic_auth_base64_is_found() {
+        let password = "Tq8#mZr2!Lp";
+        let m = m(&[("PASS", password)]);
+        for user in ["dave", "x", "service-account"] {
+            let blob =
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+            let line = format!("Authorization: Basic {blob}");
+            let out = m.redact_text(&line);
+            assert!(out.contains("[secret:PASS]"), "{user}: {out}");
+        }
     }
 
     #[test]
