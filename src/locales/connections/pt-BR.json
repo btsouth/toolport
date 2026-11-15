@@ -1077,5 +1077,5 @@
   "Copy thread id {id}": "Copiar o id da conversa {id}",
   "Copied thread id": "Id da conversa copiado",
   "{client} via T3 Code, thread {thread}": "{client} via T3 Code, conversa {thread}",
-  "Toolport also adds these settings to its {client} entry, each only if it is not set. A setting you delete stays deleted until you connect again.": "O Toolport também adiciona estas configurações à sua entrada do {client}, cada uma só se não estiver definida. Uma configuração que você excluir continua excluída até você conectar de novo."
+  "Toolport also adds these settings to its {client} entry, each only if it is not set. A setting you delete stays deleted until you connect again.": "O Toolport também adiciona estas configurações à entrada do Toolport no {client}, cada uma só se não estiver definida. Uma configuração que você excluir continua excluída até você conectar de novo."
 }
