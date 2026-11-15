@@ -800,12 +800,14 @@ impl Matcher {
         if self.is_broken() {
             return withheld_span(text.len());
         }
-        let mut hits = self.plain_hits(text, fragments);
+        // The whole logical text, with nothing to decode, matches nothing:
+        // nothing can be in any piece or across them.
+        if !crate::secret_normalize::has_encoding(text) && !self.may_contain_plain(text) {
+            return Vec::new();
+        }
+        let mut hits = self.plain_hits(text, fragments, starts);
         for level in crate::secret_normalize::levels(text) {
-            for (s, e, name, fragment, value) in self.plain_hits(&level.text, fragments) {
-                let (s, e) = crate::secret_normalize::source_range(&level, s, e);
-                hits.push((s, e, name, fragment, value));
-            }
+            hits.extend(self.level_hits(&level, fragments, starts));
         }
         if starts.len() > 1 {
             hits.retain(|h| !h.3 || !crosses(starts, h.0, h.1));
@@ -851,13 +853,33 @@ impl Matcher {
         merge(out)
     }
 
-    fn plain_hits(&self, text: &str, fragments: bool) -> Vec<Hit> {
-        let mut hits = self.own_hits(text, fragments);
-        hits.extend(self.extra_hits(|m| m.own_hits(text, fragments)));
+    /// Automaton hits in `text`. A piece boundary (one of `starts`) is a word
+    /// boundary for the whole-token rule, as the end of a separate text is.
+    fn plain_hits(&self, text: &str, fragments: bool, starts: &[usize]) -> Vec<Hit> {
+        let mut hits = self.own_hits(text, fragments, starts);
+        hits.extend(self.extra_hits(|m| m.own_hits(text, fragments, starts)));
         hits
     }
 
-    fn own_hits(&self, text: &str, fragments: bool) -> Vec<Hit> {
+    /// [`Self::plain_hits`] at one decoding level, in source offsets.
+    fn level_hits(
+        &self,
+        level: &crate::secret_normalize::Normalized,
+        fragments: bool,
+        starts: &[usize],
+    ) -> Vec<Hit> {
+        let level_starts = level_starts(level, starts);
+        self.plain_hits(&level.text, fragments, &level_starts)
+            .into_iter()
+            .map(|(s, e, name, fragment, value)| {
+                let (s, e) = crate::secret_normalize::source_range(level, s, e);
+                (s, e, name, fragment, value)
+            })
+            .collect()
+    }
+
+    fn own_hits(&self, text: &str, fragments: bool, starts: &[usize]) -> Vec<Hit> {
+        let edge = |i: usize| starts.binary_search(&i).is_ok();
         let Some(ac) = &self.raw else {
             return Vec::new();
         };
@@ -870,7 +892,9 @@ impl Matcher {
             if pattern.whole_token {
                 let before = text[..m.start()].chars().next_back();
                 let after = text[m.end()..].chars().next();
-                if before.is_some_and(is_token_char) || after.is_some_and(is_token_char) {
+                if (before.is_some_and(is_token_char) && !edge(m.start()))
+                    || (after.is_some_and(is_token_char) && !edge(m.end()))
+                {
                     continue;
                 }
             }
@@ -888,7 +912,9 @@ impl Matcher {
                 if pattern.whole_token {
                     let before = text[..m.start()].chars().next_back();
                     let after = text[m.end()..].chars().next();
-                    if before.is_some_and(is_token_char) || after.is_some_and(is_token_char) {
+                    if (before.is_some_and(is_token_char) && !edge(m.start()))
+                        || (after.is_some_and(is_token_char) && !edge(m.end()))
+                    {
                         continue;
                     }
                 }
@@ -917,15 +943,12 @@ impl Matcher {
         if self.is_broken() {
             return withheld_span(bytes.len());
         }
-        let mut hits = self.own_byte_hits(bytes);
-        hits.extend(self.extra_hits(|m| m.own_byte_hits(bytes)));
+        let mut hits = self.own_byte_hits(bytes, starts);
+        hits.extend(self.extra_hits(|m| m.own_byte_hits(bytes, starts)));
         // Encoded spellings, as in `piece_spans`, wherever the bytes are text.
         if let Ok(text) = std::str::from_utf8(bytes) {
             for level in crate::secret_normalize::levels(text) {
-                for (s, e, name, fragment, value) in self.plain_hits(&level.text, true) {
-                    let (s, e) = crate::secret_normalize::source_range(&level, s, e);
-                    hits.push((s, e, name, fragment, value));
-                }
+                hits.extend(self.level_hits(&level, true, starts));
             }
         }
         if starts.len() > 1 {
@@ -934,10 +957,11 @@ impl Matcher {
         merge(hits)
     }
 
-    fn own_byte_hits(&self, bytes: &[u8]) -> Vec<Hit> {
+    fn own_byte_hits(&self, bytes: &[u8], starts: &[usize]) -> Vec<Hit> {
         let Some(ac) = &self.raw else {
             return Vec::new();
         };
+        let edge = |i: usize| starts.binary_search(&i).is_ok();
         let token = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
         let mut hits = Vec::new();
         for m in ac.find_overlapping_iter(bytes) {
@@ -945,7 +969,9 @@ impl Matcher {
             if pattern.whole_token {
                 let before = m.start().checked_sub(1).map(|i| bytes[i]);
                 let after = bytes.get(m.end()).copied();
-                if before.is_some_and(token) || after.is_some_and(token) {
+                if (before.is_some_and(token) && !edge(m.start()))
+                    || (after.is_some_and(token) && !edge(m.end()))
+                {
                     continue;
                 }
             }
@@ -963,7 +989,9 @@ impl Matcher {
                 if pattern.whole_token {
                     let before = m.start().checked_sub(1).map(|i| bytes[i]);
                     let after = bytes.get(m.end()).copied();
-                    if before.is_some_and(token) || after.is_some_and(token) {
+                    if (before.is_some_and(token) && !edge(m.start()))
+                        || (after.is_some_and(token) && !edge(m.end()))
+                    {
                         continue;
                     }
                 }
@@ -1008,7 +1036,7 @@ impl Matcher {
             return (text.len(), withheld_span(text.len()));
         }
         let mut cut = self.plain_hold(text);
-        let mut hits = self.plain_hits(text, fragments);
+        let mut hits = self.plain_hits(text, fragments, starts);
         if crate::secret_normalize::has_encoding(text) {
             for level in crate::secret_normalize::levels(text) {
                 let len = level.text.len();
@@ -1016,10 +1044,7 @@ impl Matcher {
                 if at < len {
                     cut = cut.min(crate::secret_normalize::source_range(&level, at, len).0);
                 }
-                for (s, e, name, fragment, value) in self.plain_hits(&level.text, fragments) {
-                    let (s, e) = crate::secret_normalize::source_range(&level, s, e);
-                    hits.push((s, e, name, fragment, value));
-                }
+                hits.extend(self.level_hits(&level, fragments, starts));
             }
             // An encoded sequence still being written may decode to anything,
             // so it is held, and so is a live prefix that ends just before it
@@ -1441,12 +1466,9 @@ impl Matcher {
                 starts.push(joined.len());
                 joined.push_str(m);
             }
-            let mut hits = self.plain_hits(&joined, false);
+            let mut hits = self.plain_hits(&joined, false, &starts);
             for level in crate::secret_normalize::levels(&joined) {
-                for (s, e, n, f, v) in self.plain_hits(&level.text, false) {
-                    let (s, e) = crate::secret_normalize::source_range(&level, s, e);
-                    hits.push((s, e, n, f, v));
-                }
+                hits.extend(self.level_hits(&level, false, &starts));
             }
             // Only a value that is a whole span: never one inside a longer
             // secret the client sent.
@@ -1854,23 +1876,31 @@ impl Matcher {
                 }
             }
         }
-        if !t.keys.is_empty() {
-            let ranges: Vec<(usize, usize)> = t.keys.clone();
-            let (joined, starts) = join_ranges(body, &ranges);
-            if self
-                .piece_spans(&joined, &starts, false, None)
-                .iter()
-                .any(|(s, e, _)| !crosses(&starts, *s, *e))
-            {
-                return None;
-            }
-        }
-        if t.values.is_empty() {
+        // One search for the whole line: the values as one text, then the
+        // keys after them, each key matched on its own.
+        let mut ranges: Vec<(usize, usize)> = t.values.iter().map(|(s, e, _)| (*s, *e)).collect();
+        let values = ranges.len();
+        ranges.extend(t.keys.iter().copied());
+        if ranges.is_empty() {
             return Some(edits);
         }
-        let ranges: Vec<(usize, usize)> = t.values.iter().map(|(s, e, _)| (*s, *e)).collect();
-        let all: Vec<usize> = (0..ranges.len()).collect();
-        self.json_stream_edits(body, &ranges, &all, fragments, false, &mut edits);
+        let (joined, starts) = join_ranges(body, &ranges);
+        let key_start = starts.get(values).copied().unwrap_or(joined.len());
+        let mut spans = self.piece_spans(&joined, &starts, fragments, None);
+        if spans
+            .iter()
+            .any(|(s, e, _)| *s >= key_start && !crosses(&starts, *s, *e))
+        {
+            return None;
+        }
+        // A span that runs on from the last value into the keys is kept to its
+        // value part (keys are never joined to values).
+        spans.retain(|(s, _, _)| *s < key_start);
+        for span in &mut spans {
+            span.1 = span.1.min(key_start);
+        }
+        let ranges = &ranges[..values];
+        self.spans_to_edits(body, ranges, &starts[..values], spans, &mut edits);
         let mut classes: Vec<&str> = t.values.iter().map(|(_, _, c)| *c).collect();
         classes.sort_unstable();
         classes.dedup();
@@ -1913,6 +1943,20 @@ impl Matcher {
         if crossing {
             spans.retain(|(s, e, _)| crosses(&starts, *s, *e));
         }
+        self.spans_to_edits(body, &picked, &starts, spans, edits);
+    }
+
+    /// Spans of the joined `picked` ranges of `body` (starting at `starts`) as
+    /// edits of `body`: the marker where a span starts, the rest of it removed
+    /// from every later range it reaches, never splitting an escape.
+    fn spans_to_edits(
+        &self,
+        body: &str,
+        picked: &[(usize, usize)],
+        starts: &[usize],
+        spans: Vec<Span>,
+        edits: &mut Vec<(usize, usize, String)>,
+    ) {
         for (s, e, names) in spans {
             let marker = json_escaped(&self.marker(&names));
             for (k, &(ps, pe)) in picked.iter().enumerate() {
@@ -2171,6 +2215,21 @@ fn collect_leaves<'v>(value: &'v mut Value, class: &str, out: &mut Vec<(String, 
         Value::Object(map) => map.iter_mut().for_each(|(k, v)| collect_leaves(v, k, out)),
         _ => {}
     }
+}
+
+/// The byte offsets in `level`'s text whose character was decoded from text
+/// starting at one of the piece `starts`.
+fn level_starts(level: &crate::secret_normalize::Normalized, starts: &[usize]) -> Vec<usize> {
+    if starts.len() < 2 {
+        return Vec::new();
+    }
+    level
+        .text
+        .char_indices()
+        .zip(&level.spans)
+        .filter(|(_, (s, _))| starts.binary_search(s).is_ok())
+        .map(|((b, _), _)| b)
+        .collect()
 }
 
 /// Whether `s..e` crosses one of the piece `starts` (strictly inside it).
@@ -6123,5 +6182,18 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_short_secret_at_the_end_of_one_string_is_a_whole_word() {
+        let m = m(&[("PIN", "ab12")]);
+        let mut v = serde_json::json!({"a": "code ab12", "b": "next"});
+        assert!(m.redact_value(&mut v));
+        assert_eq!(v["a"], "code [secret:PIN]");
+        assert_eq!(v["b"], "next");
+        let line = r#"{"a":"code ab12","b":"next"}"#;
+        assert_eq!(m.redact_line(line), r#"{"a":"code [secret:PIN]","b":"next"}"#);
+        // Inside a word it is still not one.
+        assert_eq!(m.redact_text("xab12y"), "xab12y");
     }
 }
