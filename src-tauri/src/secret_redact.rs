@@ -1424,7 +1424,10 @@ impl Matcher {
             let mut out = String::new();
             let mut at = ls;
             let mut touched = false;
-            for (s, e, names) in spans.iter().filter(|(s, e, _)| *s < le && *e > ls) {
+            // Spans are sorted and disjoint: only those from the first that
+            // ends past this leaf's start, until one starts past its end.
+            let first = spans.partition_point(|(_, e, _)| *e <= ls);
+            for (s, e, names) in spans[first..].iter().take_while(|(s, _, _)| *s < le) {
                 touched = true;
                 if *s >= ls {
                     out.push_str(&joined[at..*s]);
@@ -1923,8 +1926,14 @@ impl Matcher {
     ) {
         for (s, e, names) in spans {
             let marker = json_escaped(&self.marker(&names));
-            for (k, &(ps, pe)) in picked.iter().enumerate() {
+            // Pieces are in order: from the one holding the span's start, until
+            // one starts at or past its end.
+            let first = starts.partition_point(|&st| st <= s).saturating_sub(1);
+            for (k, &(ps, pe)) in picked.iter().enumerate().skip(first) {
                 let (ls, le) = (starts[k], starts[k] + (pe - ps));
+                if ls >= e {
+                    break;
+                }
                 if s >= le || e <= ls || (ls == le) {
                     continue;
                 }
