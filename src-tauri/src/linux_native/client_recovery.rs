@@ -120,6 +120,44 @@ fn values_list(
         .focusable(true)
         .child(&label)
         .build();
+    // An outer page scroller allocates its child's minimum height. Propagating
+    // only the natural height leaves every nested list at the scrollbar minimum.
+    // Reserve the actual wrapped content height, bounded like the React list.
+    fn fit(scroll: &gtk::ScrolledWindow, label: &gtk::Label, width: i32) {
+        let content_height = label.measure(gtk::Orientation::Vertical, width).1;
+        // Automatic scrollbars impose their own minimum even when hidden.
+        // A list that fits needs no vertical scrolling or scrollbar minimum.
+        let policy = if content_height > 240 {
+            gtk::PolicyType::Automatic
+        } else {
+            gtk::PolicyType::Never
+        };
+        if scroll.vscrollbar_policy() != policy {
+            scroll.set_vscrollbar_policy(policy);
+        }
+        let height = content_height.clamp(1, 240);
+        if scroll.min_content_height() != height {
+            scroll.set_min_content_height(height);
+        }
+    }
+    fit(&scroll, &label, -1);
+    let weak_scroll = scroll.downgrade();
+    let weak_label = label.downgrade();
+    scroll.hadjustment().connect_changed(move |adjustment| {
+        if let (Some(scroll), Some(label)) = (weak_scroll.upgrade(), weak_label.upgrade()) {
+            let width = adjustment.page_size() as i32;
+            if width > 0 {
+                fit(&scroll, &label, width);
+            }
+        }
+    });
+    let weak_scroll = scroll.downgrade();
+    label.connect_label_notify(move |label| {
+        if let Some(scroll) = weak_scroll.upgrade() {
+            let width = scroll.hadjustment().page_size() as i32;
+            fit(&scroll, label, if width > 0 { width } else { -1 });
+        }
+    });
     l10n::bind_accessible_label(
         &scroll,
         if discard {
@@ -501,6 +539,118 @@ impl ClientPage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires an isolated GTK desktop"]
+    fn nested_recovery_lists_keep_their_bounded_content_height() {
+        let _data = crate::registry::DataDirTestEnv::new("gtk-recovery-list-allocation");
+        adw::init().unwrap();
+        let mut record = crate::clients::recovery::ClientRecovery {
+            id: "allocation".into(),
+            client_id: "cursor".into(),
+            client_name: "Cursor".into(),
+            path: "/fixture/config.json".into(),
+            backup_path: "/fixture/original.json".into(),
+            missing: Vec::new(),
+            dismissed: false,
+            message: String::new(),
+            description: String::new(),
+            value_lines: vec!["API_KEY for server: keyring locked".into()],
+            discard_values: Vec::new(),
+            instructions: String::new(),
+            retention: String::new(),
+            details: String::new(),
+            error: None,
+            can_discard: true,
+            cleanup: false,
+        };
+        let short = values_list(&record, false);
+        record.value_lines = (0..20)
+            .map(|index| format!("API_KEY_{index:02} for server: keyring locked"))
+            .collect();
+        let long = values_list(&record, false);
+        record.value_lines = vec![format!(
+            "API_KEY for {}: keyring locked",
+            "long-server-name-".repeat(24)
+        )];
+        let wrapped = values_list(&record, false);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        content.append(&short);
+        content.append(&long);
+        content.append(&wrapped);
+        let remaining_clients = gtk::Label::new(Some("Other client rows"));
+        remaining_clients.set_height_request(600);
+        content.append(&remaining_clients);
+        let outer = gtk::ScrolledWindow::builder().child(&content).build();
+        let window = gtk::Window::builder().child(&outer).build();
+        window.present();
+        let context = gtk::glib::MainContext::default();
+        let mut narrow_height = 0;
+        for width in [480, 1200] {
+            for _ in 0..8 {
+                while context.pending() {
+                    context.iteration(false);
+                }
+                outer.allocate(width, 400, -1, None);
+            }
+            assert_eq!(
+                long.height(),
+                240,
+                "long list at {width}px must use the shared 240px cap"
+            );
+            assert!(
+                short.height() < 40,
+                "one value at {width}px must not leave a scrollbar-sized gap: {}",
+                short.height()
+            );
+            if width == 480 {
+                narrow_height = wrapped.height();
+                assert!(
+                    (40..=240).contains(&narrow_height),
+                    "wrapped narrow list must reserve its lines"
+                );
+            } else {
+                assert!(
+                    wrapped.height() < narrow_height,
+                    "widening must remove the space for unneeded wrapped lines"
+                );
+            }
+        }
+        let short_label = short
+            .child()
+            .unwrap()
+            .downcast::<gtk::Viewport>()
+            .unwrap()
+            .child()
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        for (text, expected_height) in [
+            (vec!["Translated value"; 20].join("\n"), 240),
+            ("One value".into(), 15),
+        ] {
+            short_label.set_text(&text);
+            for _ in 0..8 {
+                while context.pending() {
+                    context.iteration(false);
+                }
+                outer.allocate(1200, 400, -1, None);
+            }
+            if expected_height == 240 {
+                assert_eq!(
+                    short.height(),
+                    240,
+                    "changed text must enable bounded scrolling"
+                );
+            } else {
+                assert!(
+                    short.height() < 40,
+                    "changed text must remove the scrollbar gap"
+                );
+            }
+        }
+        window.close();
+    }
+
     use super::*;
 
     #[test]
