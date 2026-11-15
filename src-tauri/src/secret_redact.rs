@@ -3054,9 +3054,10 @@ fn scrub_file_with(matcher: &Matcher, path: &Path) -> std::io::Result<bool> {
     if !changed {
         return Ok(false);
     }
-    // Tool catalogs are replaced whole by their writer without this lock. If one
-    // was rewritten since the read, the newer file came from a build that already
-    // redacts, so keep it rather than put back an older catalog.
+    // Every current writer takes this lock, but an older build may still replace
+    // a tool catalog whole without it. If the file changed since the read, the
+    // newer one came from a build that already redacts, so keep it rather than
+    // put back an older catalog.
     if std::fs::read(path).map(|now| now != bytes).unwrap_or(true) {
         return Ok(false);
     }
@@ -3275,6 +3276,31 @@ pub fn flush_pending_scrub(budget: std::time::Duration) {
         // Past the budget the durable pending marker stays for the next start.
         let _ = rx.recv_timeout(budget);
     }
+}
+
+/// Test support for every writer of a [`persisted_log_files`] file: hold
+/// `path`'s lock the way a scrub does, run `append` on another thread, learn
+/// `secret` (owner, key, value) while still holding it, then release and return
+/// what the file holds once `append` is done. A writer that skips the lock (or
+/// concedes it after a short wait) writes before the secret is known, and one
+/// that redacts before taking the lock redacts with the old matcher; either
+/// leaves the value in the returned text. The caller's data directory override
+/// decides the scope.
+#[cfg(any(test, feature = "test-support"))]
+pub fn append_during_scrub_for_test(
+    path: &Path,
+    secret: (&str, &str, &str),
+    append: impl FnOnce() + Send + 'static,
+) -> String {
+    let held = crate::registry::lock_at(path).expect("hold the log lock like a scrub");
+    let writer = std::thread::spawn(append);
+    // Longer than any short lock wait an appender might concede after.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let (owner, key, value) = secret;
+    register(owner, key, value);
+    drop(held);
+    writer.join().expect("appender thread");
+    std::fs::read_to_string(path).unwrap_or_default()
 }
 
 static SCRUB_PENDING: Mutex<Option<PathBuf>> = Mutex::new(None);
