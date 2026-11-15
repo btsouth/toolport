@@ -1146,7 +1146,9 @@ pub fn register_inline_secrets(server: &ServerEntry) {
         ]
         .iter()
         .any(|prefix| value.trim_start().starts_with(prefix));
-        if e.secret || crate::import_credentials::secret_env(&e.key, None) || token_prefix {
+        let by_name =
+            crate::import_credentials::secret_env(&e.key, None) && credential_shaped(value);
+        if e.secret || token_prefix || by_name {
             crate::secret_redact::register(&server.id, &e.key, value);
         }
     }
@@ -1192,15 +1194,79 @@ pub fn register_inline_secrets(server: &ServerEntry) {
     }
 }
 
-/// The credential in a masked argument: the value of `--flag=value`, nothing
-/// for `--flag=` (its value is the next entry), else the whole entry.
-fn arg_credential(arg: &str) -> Option<&str> {
-    match arg.split_once('=') {
-        Some((name, value)) if name.starts_with('-') && !name.contains(char::is_whitespace) => {
-            (!value.trim().is_empty()).then_some(value)
-        }
-        _ => Some(arg),
+/// Whether a value registered by its name alone looks like a credential.
+///
+/// A name such as `AUTH_ENABLED` or `TOKEN_TTL` matches a credential word but
+/// holds a setting, and a registered `true` or `3600` would be replaced in
+/// every result and log line. So a value registered for its name alone must
+/// be at least 8 characters and must not be a switch word, a plain number,
+/// duration or size (digits with an optional unit), or a path or URL with no
+/// credentials in it (no password, no query, no path segment of 16 or more
+/// characters). A value flagged `secret`, one with a known token prefix,
+/// and one read from the vault are always registered.
+fn credential_shaped(value: &str) -> bool {
+    let value = value.trim();
+    if value.chars().count() < 8 {
+        return false;
     }
+    const SWITCHES: [&str; 10] = [
+        "true", "false", "yes", "no", "on", "off", "null", "none", "enabled", "disabled",
+    ];
+    if SWITCHES.iter().any(|w| value.eq_ignore_ascii_case(w)) {
+        return false;
+    }
+    let digits = value.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let unit = value.len() - digits.len();
+    if unit <= 3
+        && digits.starts_with(|c: char| c.is_ascii_digit())
+        && digits
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == '_')
+    {
+        return false;
+    }
+    if value.starts_with(['/', '~', '.']) || value.get(1..3) == Some(":\\") {
+        return false;
+    }
+    if let Ok(url) = url::Url::parse(value) {
+        // A webhook carries its token in the path: a long segment counts.
+        let plain_path = url
+            .path_segments()
+            .into_iter()
+            .flatten()
+            .all(|segment| segment.len() < 16);
+        if url.has_host() && url.password().is_none() && url.query().is_none() && plain_path {
+            return false;
+        }
+    }
+    true
+}
+
+/// The credential in a masked argument: the value of `--flag=value`, nothing
+/// for `--flag=` (its value is the next entry), else the whole entry. A header
+/// (`Authorization: Bearer tok`) gives its value without its name, so the
+/// bearer form and its bare token are registered and the name is not.
+fn arg_credential(arg: &str) -> Option<&str> {
+    let value = match arg.split_once('=') {
+        Some((name, value)) if name.starts_with('-') && !name.contains(char::is_whitespace) => {
+            value
+        }
+        _ => arg,
+    };
+    let value = match value.split_once(':') {
+        Some((name, rest))
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                && rest.starts_with(' ') =>
+        {
+            rest
+        }
+        _ => value,
+    };
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
 }
 
 pub fn has_references(server: &ServerEntry) -> bool {
@@ -1360,6 +1426,7 @@ mod tests {
                 {"key":"TOKEN_TIMEOUT","value":"1500ms"},
                 {"key":"API_KEY","value":"abcd1234efgh"},
                 {"key":"DB_PASSWORD","value":"postgres://app:pw-Zx81kq@db.example.invalid/app"},
+                {"key":"HOOK_TOKEN","value":"https://hooks.example.invalid/services/abcdEFGHijklMNOPqrst"},
                 {"key":"PIN","value":"4821","secret":true}
             ]}"#,
         )
@@ -1368,14 +1435,14 @@ mod tests {
         let ordinary = r#"{"enabled": true, "ttl": 3600, "min": 8, "use": 1} /var/cache/tokens https://auth.example.invalid/login 1500ms"#;
         let kept = crate::secret_redact::redact_text(ordinary).into_owned();
         let secrets = crate::secret_redact::redact_text(
-            "key abcd1234efgh pass postgres://app:pw-Zx81kq@db.example.invalid/app pin 4821",
+            "key abcd1234efgh pass postgres://app:pw-Zx81kq@db.example.invalid/app hook https://hooks.example.invalid/services/abcdEFGHijklMNOPqrst pin 4821",
         )
         .into_owned();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(kept, ordinary);
         assert_eq!(
             secrets,
-            "key [secret:API_KEY] pass [secret:DB_PASSWORD] pin [secret:PIN]"
+            "key [secret:API_KEY] pass [secret:DB_PASSWORD] hook [secret:HOOK_TOKEN] pin [secret:PIN]"
         );
     }
 
