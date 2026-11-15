@@ -1022,3 +1022,79 @@ fn result_cursors_outlive_later_policy_for_their_caller() {
         "{page}"
     );
 }
+
+/// `toolport_status` counts the tools search would return: a stale cache entry for
+/// a quarantined, disabled, allow-listed-out or destructive-denied tool is not
+/// counted.
+#[test]
+fn status_counts_agree_with_search() {
+    let _data = DataDirTestEnv::new("status-counts-search");
+    let tool = |name: &str| json!({"name": name, "description": format!("{name} tool"), "inputSchema": {"type": "object"}});
+    let mut drop_tool = tool("drop");
+    drop_tool["annotations"] = json!({"destructiveHint": true});
+    let upstream = vec![
+        tool("keep"),
+        tool("wipe"),
+        tool("off"),
+        tool("hidden"),
+        drop_tool.clone(),
+    ];
+    let mut router = Router::with_policy(ToolPolicy {
+        quarantined: ["s__wipe".to_string()].into_iter().collect(),
+        disabled: [("s".to_string(), ["off".to_string()].into_iter().collect())]
+            .into_iter()
+            .collect(),
+        allow: [(
+            "s".to_string(),
+            ["keep", "wipe", "off", "drop"]
+                .map(String::from)
+                .into_iter()
+                .collect(),
+        )]
+        .into_iter()
+        .collect(),
+        deny_destructive: true,
+        ..Default::default()
+    });
+    router.add(
+        DownstreamServer::connect("s".into(), Box::new(MockRoute { tools: upstream })).unwrap(),
+    );
+    let mut cached: Vec<Value> = ["keep", "wipe", "off", "hidden"]
+        .iter()
+        .map(|name| tool(&format!("s__{name}")))
+        .collect();
+    let mut stale_drop = drop_tool;
+    stale_drop["name"] = json!("s__drop");
+    cached.push(stale_drop);
+    let mut reg = Registry {
+        deny_destructive: true,
+        ..Default::default()
+    };
+    reg.servers.push(
+        serde_json::from_str(r#"{"id":"s","name":"S","transport":"stdio","command":"s-cmd"}"#)
+            .unwrap(),
+    );
+    let host = dispatch_host(true);
+    let allowed: std::collections::HashSet<String> = ["s".to_string()].into_iter().collect();
+    let status = enabled_summary_with(&host, &router, &reg, &cached, None, Some(&allowed));
+    assert!(status.contains("- s: 1 tool(s)"), "{status}");
+    // The same catalog through search lists only that one tool.
+    let searched = handle_request(
+        &host,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "toolport_search_tools", "arguments": {"query": "", "server": "s"}}}),
+        &reg,
+        &router,
+        &cached,
+        true,
+        None,
+        &SearchGuard::default(),
+        Some(&allowed),
+        None,
+    )
+    .unwrap()
+    .to_string();
+    for name in ["s__wipe", "s__off", "s__hidden", "s__drop"] {
+        assert!(!searched.contains(name), "{name}: {searched}");
+    }
+    assert!(searched.contains("s__keep"), "{searched}");
+}

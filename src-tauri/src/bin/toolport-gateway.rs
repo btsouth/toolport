@@ -3643,8 +3643,31 @@ fn with_status_notes(summary: String) -> String {
     out
 }
 
+/// [`enabled_summary_with`] against the host's live router (tests only; requests
+/// pass the router they were dispatched with).
+#[cfg(test)]
 fn enabled_summary(
     host: &HostState,
+    reg: &Registry,
+    cached: &dyn ToolCatalog,
+    profile: Option<&str>,
+    allowed: Option<&std::collections::HashSet<String>>,
+) -> String {
+    let router = Arc::clone(
+        &host
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    enabled_summary_with(host, &router, reg, cached, profile, allowed)
+}
+
+/// [`enabled_summary`] judged against `router`: its tool counts are the tools
+/// search would return to this caller ([`tool_visible_to_model`]), so a stale
+/// cache entry for a refused tool is not counted.
+fn enabled_summary_with(
+    host: &HostState,
+    router: &Router,
     reg: &Registry,
     cached: &dyn ToolCatalog,
     profile: Option<&str>,
@@ -3753,9 +3776,12 @@ fn enabled_summary(
         // belong to instead. An ambiguous prefix resolves to nothing and is counted for
         // neither twin, which is the same fail-closed answer scoping gives (SBS-866).
         let owners = unique_prefix_owners(reg);
+        let route_of = |name: &str| owner_of_exposed_tool(Some(router), &owners, name);
+        let deny_destructive = reg.deny_destructive_effective();
+        let refused = |tool: &Value| tool_refused(tool, router, deny_destructive);
         for t in cached.iter() {
             let prefix = tool_prefix(t);
-            if prefix.is_empty() {
+            if prefix.is_empty() || !tool_visible_to_model(t, allowed, &route_of, &refused) {
                 continue;
             }
             // `tool_prefix` already lower-cases, matching how `owners` is keyed.
