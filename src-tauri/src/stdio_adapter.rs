@@ -1558,23 +1558,35 @@ impl Session {
     /// reopened session, and one whose connection never opened is sent once to
     /// the daemon found (or started) again; a second refusal, and every other
     /// failure, goes back to the client unretried.
+    ///
+    /// The second send is the same request: this thread still answers the same
+    /// ticket, so it carries the same adapter request number, and the daemon never
+    /// began the first one.
     fn exchange(&self, body: &str) -> Result<(), String> {
         match self.exchange_once(body) {
-            Err(ExchangeError::SessionRefused(_))
-                if resendable_after_refusal(body) && !self.answering_cancelled() =>
-            {
+            Err(error) if self.may_resend(&error, body) => {
+                let refused = matches!(error, ExchangeError::SessionRefused(_));
                 self.exchange_once(body).map_err(|error| match error {
-                    ExchangeError::SessionRefused(detail) => {
+                    ExchangeError::SessionRefused(detail) if refused => {
                         format!("the host daemon refused the reopened session too: {detail}")
                     }
-                    ExchangeError::NotDelivered(detail) | ExchangeError::Failed(detail) => detail,
+                    error => error.into_message(),
                 })
             }
-            Err(ExchangeError::NotDelivered(_)) => self
-                .exchange_once(body)
-                .map_err(ExchangeError::into_message),
             result => result.map_err(ExchangeError::into_message),
         }
+    }
+
+    /// Whether a first attempt that failed with `error` is sent once more. Never a
+    /// request the client cancelled meanwhile: its cancellation may have been lost
+    /// with the daemon, and the replacement would run it.
+    fn may_resend(&self, error: &ExchangeError, body: &str) -> bool {
+        let resendable = match error {
+            ExchangeError::SessionRefused(_) => resendable_after_refusal(body),
+            ExchangeError::NotDelivered(_) => true,
+            ExchangeError::Failed(_) => false,
+        };
+        resendable && !self.answering_cancelled()
     }
 
     /// One attempt. Healthy calls share the read gate and run concurrently; after a
@@ -3161,6 +3173,7 @@ mod tests {
     struct Posted {
         session: Option<String>,
         connection: Option<String>,
+        adapter_request: Option<String>,
         message: serde_json::Value,
     }
 
@@ -3259,6 +3272,7 @@ mod tests {
                         let mut length = 0;
                         let mut session = None;
                         let mut connection = None;
+                        let mut adapter_request = None;
                         loop {
                             let mut line = String::new();
                             if reader.read_line(&mut line).unwrap_or(0) == 0 {
@@ -3273,6 +3287,9 @@ mod tests {
                                     "content-length" => length = value.trim().parse().unwrap(),
                                     "mcp-session-id" => session = Some(value.trim().to_string()),
                                     "connection" => connection = Some(value.trim().to_string()),
+                                    "toolport-adapter-request" => {
+                                        adapter_request = Some(value.trim().to_string());
+                                    }
                                     _ => {}
                                 }
                             }
@@ -3304,6 +3321,7 @@ mod tests {
                         let posted = Posted {
                             session,
                             connection,
+                            adapter_request,
                             message: serde_json::from_slice(&body).unwrap(),
                         };
                         record.lock().unwrap().push(posted.clone());
@@ -4597,13 +4615,29 @@ mod tests {
         let session = scripted_session(&daemon, &sink, TEST_TIMEOUT);
         open(&session);
 
-        session.exchange(&tool_call(2)).unwrap();
+        let call = tool_call(2);
+        let ticket = session
+            .open_request(&serde_json::from_str(&call).unwrap())
+            .expect("numbered");
+        assert!(session.start_posting(&ticket));
+        let answering = AnsweringScope::enter(Some(ticket.clone()));
+        session.exchange(&call).unwrap();
+        drop(answering);
 
         assert_eq!(
             executed.load(Ordering::SeqCst),
             1,
             "the call ran exactly once"
         );
+        // The resend is the same request instance to the daemon, not a new one.
+        let numbers: Vec<_> = daemon
+            .posted("tools/call")
+            .into_iter()
+            .map(|posted| posted.adapter_request)
+            .collect();
+        let tag = Some(ticket.generation.to_string());
+        assert_eq!(numbers, [tag.clone(), tag]);
+        session.close_request(Some(ticket));
         assert_eq!(minted.load(Ordering::SeqCst), 2, "one replacement session");
         let sessions: Vec<_> = daemon
             .posted("tools/call")
@@ -4621,6 +4655,36 @@ mod tests {
         assert_eq!(replies[1]["id"], 2);
         assert!(replies[1].get("result").is_some());
         assert_eq!(session.stale.load(Ordering::SeqCst), HEALTHY);
+    }
+
+    #[test]
+    fn a_call_cancelled_before_its_resend_is_not_sent_again() {
+        let sink = Sink::default();
+        let session = sink_session(&sink);
+        let call = tool_call(3);
+        let ticket = session
+            .open_request(&serde_json::from_str(&call).unwrap())
+            .expect("numbered");
+        assert!(session.start_posting(&ticket));
+        let _answering = AnsweringScope::enter(Some(ticket.clone()));
+        let lost = || ExchangeError::NotDelivered("connection refused".into());
+        let refused = || ExchangeError::SessionRefused("refused".into());
+        assert!(session.may_resend(&lost(), &call));
+        assert!(session.may_resend(&refused(), &call));
+        assert!(!session.may_resend(&ExchangeError::Failed("cut".into()), &call));
+        // The client cancels after the first attempt failed.
+        assert!(matches!(
+            session.note_cancellation(&client_cancel(serde_json::json!(3))),
+            CancelRoute::Forward(tag) if tag == ticket.generation
+        ));
+        assert!(
+            !session.may_resend(&lost(), &call),
+            "a cancelled call was resent"
+        );
+        assert!(
+            !session.may_resend(&refused(), &call),
+            "a cancelled call was resent"
+        );
     }
 
     #[test]
