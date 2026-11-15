@@ -184,6 +184,125 @@ fn same_name(a: &std::ffi::OsStr, b: &std::ffi::OsStr, ignore_case: bool) -> boo
         || (ignore_case && a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase())
 }
 
+/// Whether a home folder exactly as T3 Code's settings spell it is plain text Toolport
+/// may use, checked before any `Path` parsing (which would drop `.` segments). Rejects
+/// `.` and `..` segments, empty segments in the middle (`//`), `~user`, and on Windows
+/// (`windows`, so both rules run in tests) `\` as a separator too, a segment ending in a
+/// dot or space, and a `:` anywhere but a leading drive (alternate data streams).
+pub(super) fn plain_path_text(raw: &str, windows: bool) -> bool {
+    let separator = |c: char| c == '/' || (windows && c == '\\');
+    let (tilde, body) = match raw.strip_prefix('~') {
+        Some("") => return true,
+        Some(rest) if rest.starts_with(separator) => (true, &rest[1..]),
+        Some(_) => return false,
+        None => (false, raw),
+    };
+    if tilde && body.is_empty() {
+        return true;
+    }
+    let segments: Vec<&str> = body.split(separator).collect();
+    let last = segments.len() - 1;
+    segments.iter().enumerate().all(|(i, segment)| {
+        if segment.is_empty() {
+            // The root of an absolute path, or one trailing separator.
+            return (i == 0 && !tilde) || (i == last && i > 0);
+        }
+        if *segment == "." || *segment == ".." {
+            return false;
+        }
+        if !windows {
+            return true;
+        }
+        let drive = i == 0
+            && !tilde
+            && segment.len() == 2
+            && segment.as_bytes()[0].is_ascii_alphabetic()
+            && segment.as_bytes()[1] == b':';
+        (drive || !segment.contains(':')) && !segment.ends_with(['.', ' '])
+    })
+}
+
+/// What [`walk_below_home`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HomeWalk {
+    /// Every folder below home is a plain folder, and the config is a plain file or is
+    /// not written yet.
+    Plain,
+    /// A folder on the way does not exist.
+    Missing,
+    /// A folder on the way, or the config, is a link (or a Windows reparse point).
+    Link,
+    /// Not below home by its text, something that is not a folder where one should be,
+    /// or a folder Toolport cannot look at.
+    NotPlain,
+}
+
+/// Walk a T3 Code-named config path from `home` down, one name at a time, without
+/// following anything: each name is looked at with `symlink_metadata`, and the walk stops
+/// at the first link. Nothing that follows a link (canonicalize, metadata, exists, read)
+/// may run on such a path until this returns [`HomeWalk::Plain`]. Home itself may be a
+/// link (`/home` to `/var/home`); only names below it are checked.
+pub(super) fn walk_below_home(config: &Path, home: &Path) -> HomeWalk {
+    if !lexically_inside(config, home) {
+        return HomeWalk::NotPlain;
+    }
+    let below: Vec<_> = config
+        .components()
+        .skip(home.components().count())
+        .collect();
+    let mut at = home.to_path_buf();
+    for (i, name) in below.iter().enumerate() {
+        let is_config = i + 1 == below.len();
+        at.push(name);
+        match std::fs::symlink_metadata(&at) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return if is_config {
+                    HomeWalk::Plain
+                } else {
+                    HomeWalk::Missing
+                };
+            }
+            Err(_) => return HomeWalk::NotPlain,
+            Ok(meta) if is_link(&meta) => return HomeWalk::Link,
+            Ok(meta) if is_config && !meta.is_file() => return HomeWalk::NotPlain,
+            Ok(meta) if !is_config && !meta.is_dir() => return HomeWalk::NotPlain,
+            Ok(_) => {}
+        }
+    }
+    HomeWalk::Plain
+}
+
+/// A link, or on Windows any reparse point (a junction or mount point too).
+fn is_link(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    meta.file_type().is_symlink()
+}
+
+/// The config an instance uses, if Toolport may look at it: its own path only once
+/// [`walk_below_home`] has passed, else its client's default (Toolport's own path, not
+/// one T3 Code named). Every use of an instance's path goes through here.
+fn checked_path(instance: &Instance) -> Option<PathBuf> {
+    match &instance.config_path {
+        Some(path) => (walk_below_home(path, &home()?) == HomeWalk::Plain).then(|| path.clone()),
+        None => default_config_path(instance.provider),
+    }
+}
+
+/// An instance's own path with its folder resolved, once the walk has passed.
+fn checked_canonical(instance: &Instance) -> Option<PathBuf> {
+    let path = instance.config_path.as_ref()?;
+    checked_path(instance)?;
+    let folder = std::fs::canonicalize(path.parent()?).ok()?;
+    Some(folder.join(path.file_name()?))
+}
+
 /// A cheap token that changes when T3 Code's settings change, for the Clients page to
 /// notice an edit while it is open. `None` when there is no settings file.
 pub fn revision() -> Option<String> {
@@ -556,6 +675,7 @@ fn instance_of(id: &str, provider: Provider, raw: RawInstance, home: &Path) -> O
             .filter(|value| !value.is_empty())
         {
             None => Ok(None),
+            Some(value) if !plain_path_text(value, cfg!(windows)) => Err(()),
             Some(value) => match expand(value, home) {
                 Some(path) if path.is_absolute() => Ok(Some(path)),
                 _ => Err(()),
@@ -575,7 +695,11 @@ fn instance_of(id: &str, provider: Provider, raw: RawInstance, home: &Path) -> O
             .filter(|v| !v.is_empty())
         {
             None => Ok(None),
-            Some(value) if Path::new(value).is_absolute() => Ok(Some(PathBuf::from(value))),
+            Some(value)
+                if plain_path_text(value, cfg!(windows)) && Path::new(value).is_absolute() =>
+            {
+                Ok(Some(PathBuf::from(value)))
+            }
             Some(_) => Err(()),
         }
     };
@@ -667,14 +791,6 @@ pub(super) fn instances() -> Vec<Instance> {
     }
 }
 
-/// The config path an instance uses: its own, or its client's default.
-fn resolved_path(instance: &Instance) -> Option<PathBuf> {
-    instance
-        .config_path
-        .clone()
-        .or_else(|| default_config_path(instance.provider))
-}
-
 fn default_config_path(provider: Provider) -> Option<PathBuf> {
     match provider {
         // With no homePath and no CLAUDE_CONFIG_DIR or CODEX_HOME in the instance
@@ -709,65 +825,41 @@ pub(super) fn is_location_id(id: &str) -> bool {
         })
 }
 
-/// A T3 Code home's config is an ordinary file in an ordinary folder inside the user's own
-/// home, or not written yet. The folder is already resolved (no links, no `..`); the
-/// config file itself is never a link. A settings file that names `/etc` or another
-/// user's folder therefore never becomes a row Toolport could write to. A folder outside
-/// home can still be added by hand as a manual location.
+/// A saved T3 Code home's config is an ordinary file in an ordinary folder inside the
+/// user's own home, or not written yet, with no link anywhere below home
+/// ([`walk_below_home`]). A settings file that names `/etc` or another user's folder
+/// therefore never becomes a row Toolport could write to. A folder outside home can
+/// still be added by hand as a manual location.
 pub(super) fn path_is_safe(config: &Path) -> bool {
-    let Some(folder) = config.parent() else {
-        return false;
-    };
-    let Some(root) = home().and_then(|home| std::fs::canonicalize(home).ok()) else {
-        return false;
-    };
-    config.is_absolute()
-        && std::fs::canonicalize(folder)
-            .is_ok_and(|real| real == folder && real.is_dir() && real.starts_with(&root))
-        && match std::fs::symlink_metadata(config) {
-            Ok(meta) => meta.is_file(),
-            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
-        }
+    home()
+        .and_then(|home| std::fs::canonicalize(home).ok())
+        .is_some_and(|root| walk_below_home(config, &root) == HomeWalk::Plain)
 }
 
 /// Locations for T3 Code's Claude Code and Codex homes that are not a client's main
 /// config and that `known` does not already list. Homes whose folder does not exist yet are left out until it does.
 pub(super) fn automatic(known: &[locations::ClientLocation]) -> Vec<locations::ClientLocation> {
     let mut rows: Vec<locations::ClientLocation> = Vec::new();
-    let Some(home) = home() else {
+    // Only Claude Code and Codex homes become rows; other providers' homes only label
+    // rows that already exist.
+    let homes: Vec<Instance> = instances()
+        .into_iter()
+        .filter(|instance| {
+            matches!(instance.provider, Provider::ClaudeCode | Provider::Codex)
+                && instance.config_path.is_some()
+        })
+        .collect();
+    if homes.is_empty() {
         return rows;
-    };
-    let Ok(real_home) = std::fs::canonicalize(&home) else {
-        return rows;
-    };
-    for instance in instances() {
-        // Only Claude Code and Codex homes become rows; other providers' homes only
-        // label rows that already exist.
-        if !matches!(instance.provider, Provider::ClaudeCode | Provider::Codex) {
-            continue;
-        }
-        let Some(path) = instance.config_path.as_ref() else {
+    }
+    // Saved locations too, so a folder added by hand and the same folder named by T3
+    // Code are one row however each is spelled.
+    let saved = locations::saved().unwrap_or_default();
+    for instance in homes {
+        // The walk first: nothing below resolves the path until it has passed.
+        let Some(config_path) = checked_canonical(&instance) else {
             continue;
         };
-        // No link below home is followed: the folder must resolve to where its text
-        // says. Home itself may be a link (for example `/home` to `/var/home`).
-        let Some(folder) = path.parent().and_then(|folder| {
-            // `instance_of` checked that the folder is below home by its text.
-            let below: PathBuf = folder
-                .components()
-                .skip(home.components().count())
-                .collect();
-            let expected = real_home.join(below);
-            std::fs::canonicalize(folder)
-                .ok()
-                .filter(|real| same_text(real, &expected))
-        }) else {
-            continue;
-        };
-        let Some(file) = path.file_name() else {
-            continue;
-        };
-        let config_path = folder.join(file);
         let client_type = instance.provider.client_type();
         let main = client_config_path_for_type(client_type);
         if main
@@ -775,8 +867,9 @@ pub(super) fn automatic(known: &[locations::ClientLocation]) -> Vec<locations::C
             .is_some_and(|main| locations::same_path(main, &config_path))
             || known
                 .iter()
+                .chain(&saved)
                 .chain(rows.iter())
-                .any(|row| locations::same_path(&row.config_path, &config_path))
+                .any(|row| row_has_path(row, &config_path))
             || !path_is_safe(&config_path)
         {
             continue;
@@ -792,6 +885,16 @@ pub(super) fn automatic(known: &[locations::ClientLocation]) -> Vec<locations::C
     rows
 }
 
+/// Whether a listed row is for `config` (a checked, resolved path). A T3 Code row that
+/// no longer passes the walk (its folder became a link, or is gone) is compared by its
+/// text only, so nothing it names is followed.
+fn row_has_path(row: &locations::ClientLocation, config: &Path) -> bool {
+    if locations::is_t3_home(row) && !path_is_safe(&row.config_path) {
+        return same_text(&row.config_path, config);
+    }
+    locations::same_path(&row.config_path, config)
+}
+
 /// The config path Toolport's own row for a client type uses.
 fn client_config_path_for_type(client_type: &str) -> Option<PathBuf> {
     match client_type {
@@ -801,13 +904,29 @@ fn client_config_path_for_type(client_type: &str) -> Option<PathBuf> {
     }
 }
 
-/// Whether T3 Code still lists the home behind a saved T3 location.
+/// Whether T3 Code still lists the home behind a saved T3 location. A home whose walk
+/// passes is compared on disk; any other (gone, or now a link) only by its text, so
+/// nothing is followed.
 pub(super) fn lists(config: &Path) -> bool {
+    let Some(home) = home() else {
+        return false;
+    };
+    let real_home = std::fs::canonicalize(&home).ok();
     instances().iter().any(|instance| {
-        instance
-            .config_path
-            .as_ref()
-            .is_some_and(|path| locations::same_path(path, config))
+        let Some(path) = instance.config_path.as_ref() else {
+            return false;
+        };
+        if let Some(checked) = checked_canonical(instance) {
+            if path_is_safe(config) {
+                return locations::same_path(&checked, config);
+            }
+            return same_text(&checked, config);
+        }
+        let below: PathBuf = path.components().skip(home.components().count()).collect();
+        same_text(path, config)
+            || real_home
+                .as_ref()
+                .is_some_and(|root| same_text(&root.join(below), config))
     })
 }
 
@@ -822,14 +941,24 @@ pub(super) fn annotate(clients: &mut [DetectedClient]) {
 
 pub(super) fn annotate_with(clients: &mut [DetectedClient], instances: &[Instance]) {
     for instance in instances {
-        let Some(path) = resolved_path(instance) else {
+        // A home that fails the walk (a link, gone, not plain) labels nothing.
+        let Some(path) = checked_path(instance) else {
             continue;
         };
+        let canonical = checked_canonical(instance);
         let client_type = instance.provider.client_type();
         let Some(client) = clients.iter_mut().find(|client| {
             (client.id == client_type || client.id.starts_with(&format!("{client_type}@")))
                 && !client.config_path.is_empty()
-                && locations::same_path(Path::new(&client.config_path), &path)
+                && if is_location_id(&client.id) {
+                    // A T3 Code row's own path is compared by its text: it may have
+                    // become a link since it was saved.
+                    canonical.as_ref().is_some_and(|canonical| {
+                        same_text(Path::new(&client.config_path), canonical)
+                    })
+                } else {
+                    locations::same_path(Path::new(&client.config_path), &path)
+                }
         }) else {
             continue;
         };

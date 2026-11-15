@@ -428,7 +428,19 @@ fn t3_home_variable_moves_the_data_folder() {
 
 #[test]
 fn annotate_labels_the_matching_rows() {
-    let home = PathBuf::from("/fixture-home");
+    // Labels look at the folders on disk (after the walk), so the homes exist here.
+    let _lock = crate::registry::data_dir_test_lock();
+    let root = std::env::temp_dir().join(format!(
+        "toolport-t3-annotate-{}-{}",
+        std::process::id(),
+        epoch_millis()
+    ));
+    let home = root.join("home");
+    for folder in [".claude_personal", ".codex", ".cursor"] {
+        std::fs::create_dir_all(home.join(folder)).unwrap();
+    }
+    let _data = crate::registry::DataDirOverride::set(root.join("data"));
+    let _home = TestHome::set(&home);
     let row = |id: &str, path: PathBuf| {
         let mut row = config_error_row(id, id, path.display().to_string(), String::new());
         row.error = None;
@@ -492,6 +504,7 @@ fn annotate_labels_the_matching_rows() {
         vec![("WORK".to_string(), true), ("SHADOW".to_string(), false)]
     );
     assert!(names(3).is_empty());
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -847,6 +860,214 @@ fn only_claude_code_and_codex_homes_become_rows() {
         .map(|row| row.client_type)
         .collect();
     assert_eq!(types, vec!["claude-code".to_string()]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The home text is checked as written, before `Path` drops `.` segments (S2).
+#[test]
+fn home_text_is_checked_segment_by_segment() {
+    for (text, unix, windows) in [
+        ("~", true, true),
+        ("~/", true, true),
+        ("~/.codex", true, true),
+        ("~/.codex/", true, true),
+        ("/home/n/work/codex", true, true),
+        ("/home/n/work/./codex", false, false),
+        ("/home/n/work/../codex", false, false),
+        ("/home/n//codex", false, false),
+        ("~/./codex", false, false),
+        ("~user/codex", false, false),
+        ("/home/n/a...", true, false),
+        ("/home/n/codex.", true, false),
+        ("/home/n/codex ", true, false),
+        ("/home/n/codex:stream", true, false),
+        (r"C:\Users\N\.codex", true, true),
+        (r"C:\Users\N\.\codex", true, false),
+        (r"C:\Users\N\\codex", true, false),
+        (r"C:\Users\N\codex:ads", true, false),
+        (r"C:\Users\N\codex.", true, false),
+        (r"\\host\share\x", true, false),
+        (r"~\.codex", false, true),
+    ] {
+        assert_eq!(plain_path_text(text, false), unix, "unix {text}");
+        assert_eq!(plain_path_text(text, true), windows, "windows {text}");
+    }
+}
+
+/// In settings, a home with `.` or empty segments drops the instance (S2).
+#[test]
+fn a_home_with_dot_or_empty_segments_drops_the_instance() {
+    let home = fixture_home();
+    let h = json_path(&home);
+    let text = format!(
+        r#"{{"providerInstances": {{
+            "dot": {{"driver": "codex", "config": {{"homePath": "{h}/work/./codex"}}}},
+            "double": {{"driver": "codex", "config": {{"homePath": "{h}/work//codex"}}}},
+            "env": {{"driver": "claudeAgent", "environment": [{{"name": "CLAUDE_CONFIG_DIR", "value": "{h}/./c"}}]}},
+            "ok": {{"driver": "codex", "config": {{"homePath": "{h}/work/codex"}}}}
+        }}}}"#
+    );
+    let found = instances_of(parse(text.into_bytes(), &home));
+    for id in ["dot", "double", "env"] {
+        assert!(found.iter().all(|i| i.id != id), "{id}");
+    }
+    assert!(by_id(&found, "ok").config_path.is_some());
+}
+
+/// A link anywhere below home stops the walk there: as the home, in a middle folder,
+/// or as the config file. Each target is a path that does not exist, so following the
+/// link would read as missing, not as a link (S1).
+#[cfg(unix)]
+#[test]
+fn the_walk_stops_at_the_first_link_without_following_it() {
+    let _lock = crate::registry::data_dir_test_lock();
+    let root = std::env::temp_dir().join(format!(
+        "toolport-t3-walk-{}-{}",
+        std::process::id(),
+        epoch_millis()
+    ));
+    let home = root.join("home");
+    let nowhere = root.join("nowhere/at/all");
+    std::fs::create_dir_all(home.join("mid/real")).unwrap();
+    std::fs::create_dir_all(home.join("plain")).unwrap();
+    std::os::unix::fs::symlink(&nowhere, home.join("as-home")).unwrap();
+    std::os::unix::fs::symlink(&nowhere, home.join("mid/link")).unwrap();
+    std::os::unix::fs::symlink(&nowhere, home.join("plain/.claude.json")).unwrap();
+    for path in [
+        home.join("as-home/.claude.json"),
+        home.join("mid/link/deeper/.claude.json"),
+        home.join("plain/.claude.json"),
+    ] {
+        assert_eq!(
+            walk_below_home(&path, &home),
+            HomeWalk::Link,
+            "{}",
+            path.display()
+        );
+    }
+    assert_eq!(
+        walk_below_home(&home.join("mid/real/.claude.json"), &home),
+        HomeWalk::Plain
+    );
+    assert_eq!(
+        walk_below_home(&home.join("gone/x/.claude.json"), &home),
+        HomeWalk::Missing
+    );
+    assert_eq!(
+        walk_below_home(&root.join("elsewhere/.claude.json"), &home),
+        HomeWalk::NotPlain
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A linked home labels nothing and makes no row, wherever the link is, even when it
+/// points at a folder that has a row of its own (S1).
+#[cfg(unix)]
+#[test]
+fn a_linked_home_labels_nothing() {
+    let _lock = crate::registry::data_dir_test_lock();
+    let root = std::env::temp_dir().join(format!(
+        "toolport-t3-linklabel-{}-{}",
+        std::process::id(),
+        epoch_millis()
+    ));
+    let home = root.join("home");
+    std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+    std::fs::create_dir_all(home.join(".claude_personal")).unwrap();
+    std::fs::create_dir_all(home.join(".t3/cc/claude")).unwrap();
+    std::fs::write(home.join(".claude_personal/.claude.json"), "{}").unwrap();
+    // As the home, in a middle folder (a link to home itself), and as the config file.
+    std::os::unix::fs::symlink(home.join(".claude_personal"), home.join("linked")).unwrap();
+    std::os::unix::fs::symlink(&home, home.join("mid")).unwrap();
+    std::os::unix::fs::symlink(
+        home.join(".claude_personal/.claude.json"),
+        home.join(".t3/cc/claude/.claude.json"),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".t3/userdata/settings.json"),
+        r#"{"providerInstances": {
+            "a": {"driver": "claudeAgent", "displayName": "Home", "config": {"homePath": "~/linked"}},
+            "b": {"driver": "claudeAgent", "displayName": "Middle", "config": {"homePath": "~/mid/.claude_personal"}},
+            "c": {"driver": "claudeAgent", "displayName": "File", "config": {"homePath": "~/.t3/cc/claude"}}}}"#,
+    )
+    .unwrap();
+    let _data = crate::registry::DataDirOverride::set(root.join("data"));
+    let _home = TestHome::set(&home);
+    assert!(automatic(&[]).is_empty());
+    let mut clients = vec![{
+        let mut row = config_error_row(
+            "claude-code@claude_personal",
+            "p",
+            home.join(".claude_personal/.claude.json")
+                .display()
+                .to_string(),
+            String::new(),
+        );
+        row.error = None;
+        row
+    }];
+    annotate(&mut clients);
+    assert!(clients[0].t3_code.is_empty(), "{:?}", clients[0].t3_code);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A folder added by hand and the same folder named by T3 Code are one row, however each
+/// is spelled, even before the config exists (S3). On Unix the hand-added spelling goes
+/// through another name for home; on Windows it differs in case and has no `\\?\`.
+#[test]
+fn a_hand_added_folder_and_a_t3_home_are_one_row() {
+    let _lock = crate::registry::data_dir_test_lock();
+    let root = std::env::temp_dir().join(format!(
+        "toolport-t3-samefolder-{}-{}",
+        std::process::id(),
+        epoch_millis()
+    ));
+    let home = root.join("home");
+    std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+    std::fs::create_dir_all(home.join(".t3/cx/codex")).unwrap();
+    std::fs::write(
+        home.join(".t3/userdata/settings.json"),
+        r#"{"providerInstances": {"cx": {"driver": "codex", "config": {"homePath": "~/.t3/cx/codex"}}}}"#,
+    )
+    .unwrap();
+    let _data = crate::registry::DataDirOverride::set(root.join("data"));
+    let _home = TestHome::set(&home);
+    #[cfg(unix)]
+    let by_hand = {
+        std::os::unix::fs::symlink(&home, root.join("alias")).unwrap();
+        root.join("alias/.t3/cx/codex")
+    };
+    #[cfg(windows)]
+    let by_hand = PathBuf::from(
+        home.join(".t3/cx/codex")
+            .display()
+            .to_string()
+            .to_uppercase(),
+    );
+    assert!(!home.join(".t3/cx/codex/config.toml").exists());
+    // Saved earlier under its own spelling, as a hand-added folder is kept.
+    locations::remember(&locations::ClientLocation {
+        id: "codex@byhand".into(),
+        manual: true,
+        client_type: "codex".into(),
+        name: "Codex (by hand)".into(),
+        config_path: by_hand.join("config.toml"),
+    })
+    .unwrap();
+    let rows: Vec<_> = locations::all()
+        .into_iter()
+        .filter(|row| {
+            row.config_path.ends_with("config.toml")
+                && row
+                    .config_path
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains("cx")
+        })
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].manual);
     let _ = std::fs::remove_dir_all(&root);
 }
 

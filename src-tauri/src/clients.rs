@@ -4831,8 +4831,11 @@ fn read_client(def: &ClientDef) -> DetectedClient {
         } else {
             None
         };
+        // A T3 Code home whose folder became a link, or is gone, is never looked at.
         let app_present =
-            app_present_with_override(&config_path, config_exists, install_marker.as_deref());
+            !def.location.as_ref().is_some_and(|row| {
+                locations::is_t3_home(row) && !t3code::path_is_safe(&row.config_path)
+            }) && app_present_with_override(&config_path, config_exists, install_marker.as_deref());
         DetectedClient {
             id: def
                 .location

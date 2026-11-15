@@ -25,10 +25,13 @@ elsewhere is never read.
   Homes of other providers, such as OpenCode, Grok or Pi, get no row of their own.
 - Folders named like `~/.claude_personal` and `~/.codex_personal`, which T3 Code's
   guides suggest, are found the same way as `~/.claude2`.
-- Toolport uses only homes inside your home folder. A home outside it, on a network
-  share or device, or given with `..`, is ignored without being opened. A home
-  whose folder is a link gets no row of its own. To use such a folder anyway, add it
-  on the Clients page with **Add client location**.
+- Toolport uses only homes inside your home folder, written plainly. A home outside
+  it, on a network share or device, or written with `.`, `..` or `//` is ignored
+  without being opened. A home with a link anywhere below your home folder (the home
+  itself, a folder above it, or its config file) is not followed: it gets no row and
+  labels nothing. To use such a folder anyway, add it on the Clients page with **Add
+  client location**.
+- A folder you added by hand and the same folder named in T3 Code are one row.
 - An instance whose home folder is marked sensitive, isn't plain text or is a
   relative path labels no row: Toolport can't tell which config it reads.
 - When you add, remove or switch on an instance in T3 Code, the open Clients page

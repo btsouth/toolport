@@ -108,10 +108,12 @@ pub(super) fn is_t3_home(row: &ClientLocation) -> bool {
 /// [`validate`], so nothing recreates the folder.
 pub(super) fn t3_home_folder_is_gone(row: &ClientLocation) -> bool {
     is_t3_home(row)
-        && row.config_path.parent().is_some_and(|folder| {
-            std::fs::symlink_metadata(folder)
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-        })
+        && home()
+            .and_then(|home| std::fs::canonicalize(home).ok())
+            .is_some_and(|root| {
+                super::t3code::walk_below_home(&row.config_path, &root)
+                    == super::t3code::HomeWalk::Missing
+            })
 }
 
 /// A saved T3 Code home that T3 Code no longer lists. It stays listed so it can be
@@ -749,8 +751,18 @@ pub(super) fn same_path(a: &Path, b: &Path) -> bool {
             .is_some_and(|(a, b)| a == b)
         // A config may not exist yet. Its existing canonical parent still
         // identifies the same location, including Windows extended prefixes.
-        || (a.file_name() == b.file_name() && a.parent().zip(b.parent()).is_some_and(|(a, b)|
+        || (same_file_name(a, b) && a.parent().zip(b.parent()).is_some_and(|(a, b)|
             std::fs::canonicalize(a).ok().zip(std::fs::canonicalize(b).ok()).is_some_and(|(a, b)| a == b)))
+}
+
+/// File names compare as the platform does: without regard to case on Windows.
+fn same_file_name(a: &Path, b: &Path) -> bool {
+    match (a.file_name(), b.file_name()) {
+        (Some(a), Some(b)) if cfg!(windows) => {
+            a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+        }
+        (a, b) => a == b,
+    }
 }
 
 /// Prefer ordinary Windows paths only when they resolve to the same directory.
