@@ -11584,6 +11584,13 @@ mod tests {
             "inbox 1 (reported)"
         );
         assert_eq!(display_caller_name(None, None), "Unrecorded client");
+        // An unlabelled modern request reads as its connection's client, or as
+        // "Unknown client" when the connection has no trusted name.
+        assert_eq!(display_caller_name(Some("Codex"), None), "Codex");
+        assert_eq!(
+            display_caller_name(Some("Unknown client"), None),
+            "Unknown client"
+        );
         let reg = crate::registry::Registry::default();
         assert_eq!(
             resolve_launch_profile(&reg, Some("inbox"), &None),

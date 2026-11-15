@@ -17047,9 +17047,10 @@ fn process_request_wire(
         )
     };
     // The session keeps the label it started with; a request that names its own
-    // client (a multiplexing caller's later identity) is attributed to that name.
+    // client (a multiplexing caller's later identity) is attributed to that name, and
+    // a modern request that names none is unlabelled rather than the session's.
     let mut context = observed.context();
-    if label.is_some() {
+    if label.is_some() || upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION) {
         context.client_label = label.clone();
     }
     let _context = observation::ContextGuard::enter(context);
@@ -17123,6 +17124,46 @@ fn process_request_wire(
     response
 }
 
+/// The display label for one request. A request that names its client (a legacy
+/// `initialize`'s `clientInfo`, or a modern request's `_meta` clientInfo) is labelled
+/// as itself, so a caller that multiplexes identities over one connection gets each
+/// request labelled correctly. A modern request without clientInfo is unlabelled: it
+/// never borrows another request's name. Only handshake-era requests fall back to the
+/// label their connection's `initialize` set.
+fn request_client_label(state: &GatewayState, req: &Value) -> Option<String> {
+    if let Some(label) = approval::client_info_label(req.get("params")) {
+        return Some(label);
+    }
+    if upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION) {
+        return None;
+    }
+    if state.http {
+        active_mcp_session()
+            .and_then(|sid| {
+                state
+                    .mcp_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&sid)
+                    .cloned()
+            })
+            .and_then(|session| {
+                session
+                    .client_label
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            })
+    } else {
+        state
+            .stdio_upstream
+            .client_label
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 // Carry transport, profile, cancellation and client identity across dispatch.
 #[allow(clippy::too_many_arguments)]
 fn process_request_wire_inner(
@@ -17188,52 +17229,9 @@ fn process_request_wire_inner(
         // so the initialize response is never blocked on the round-trip (issue #239).
         let st = state.clone();
         std::thread::spawn(move || refresh_client_root(&st));
-    } else if !state.http && !method.is_empty() {
-        // A modern client never sends initialize; it names itself in every
-        // request's _meta. Keep the first name seen as the session's fallback label.
-        if let Some(label) = approval::client_info_label(req.get("params")) {
-            state
-                .stdio_upstream
-                .client_label
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get_or_insert(label);
-        }
     }
 
-    // The request's own `_meta` clientInfo names its client, so a caller that
-    // multiplexes several identities over one connection gets each labelled as itself.
-    // The stored label is the fallback for requests that carry none.
-    let request_label = (!method.is_empty())
-        .then(|| approval::client_info_label(req.get("params")))
-        .flatten();
-    let session_label = request_label.or_else(|| {
-        if state.http {
-            active_mcp_session()
-                .and_then(|sid| {
-                    state
-                        .mcp_sessions
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .get(&sid)
-                        .cloned()
-                })
-                .and_then(|session| {
-                    session
-                        .client_label
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone()
-                })
-        } else {
-            state
-                .stdio_upstream
-                .client_label
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-        }
-    });
+    let session_label = request_client_label(state, req);
     let _label = ClientLabelGuard::enter(session_label);
 
     let wait = match method {
@@ -47171,17 +47169,18 @@ mod tests {
         *state.cached_tools.lock().unwrap() =
             Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
         swap_router(&state, router);
-        let request = |id: i64, name: &str| {
+        let request = |id: i64, name: Option<&str>| {
+            let mut meta = json!({
+                "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
+            });
+            if let Some(name) = name {
+                meta["io.modelcontextprotocol/clientInfo"] =
+                    json!({ "name": name, "version": "2.1.290" });
+            }
             json!({
                 "jsonrpc": "2.0", "id": id, "method": "tools/call",
-                "params": {
-                    "name": "s__delete", "arguments": { "id": id },
-                    "_meta": {
-                        "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
-                        "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} },
-                        "io.modelcontextprotocol/clientInfo": { "name": name, "version": "2.1.290" }
-                    }
-                }
+                "params": { "name": "s__delete", "arguments": { "id": id }, "_meta": meta }
             })
         };
         let call = |req: &Value| {
@@ -47199,17 +47198,19 @@ mod tests {
             )
             .unwrap()
         };
-        let reply = call(&request(1, "Claude Code"));
+        let reply = call(&request(1, Some("Claude Code")));
         assert_eq!(reply["result"]["resultType"], "input_required", "{reply}");
         // A multiplexing caller names a different client on a later request. That
-        // request is labelled with its own name; the first name stays the session's
-        // fallback for requests that carry none.
-        let second = call(&request(2, "Someone Else"));
+        // request is labelled with its own name. The same caller then sends a modern
+        // request with no clientInfo: it is unlabelled, never named after an earlier
+        // request's client. Only an initialize sets a connection's fallback label.
+        let second = call(&request(2, Some("Someone Else")));
+        let third = call(&request(3, None));
         assert_eq!(
             state.stdio_upstream.client_label.lock().unwrap().as_deref(),
-            Some("Claude Code 2.1.290")
+            None
         );
-        for reply in [&reply, &second] {
+        for reply in [&reply, &second, &third] {
             let token = reply["result"]["requestState"]
                 .as_str()
                 .unwrap()
@@ -47242,12 +47243,53 @@ mod tests {
         assert_eq!(
             per_call,
             [
+                vec![String::new()],
                 vec!["Claude Code 2.1.290".to_string()],
                 vec!["Someone Else 2.1.290".to_string()]
             ],
             "{rows:?}"
         );
         session_tables().hitl().clear();
+    }
+
+    #[test]
+    fn only_handshake_era_requests_fall_back_to_the_initialize_label() {
+        let state = stdio_state();
+        let legacy_init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-06-18","capabilities":{},
+            "clientInfo":{"name":"Codex","version":"1"}}});
+        let _ = process_request(
+            &state,
+            &legacy_init,
+            &SearchGuard::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            DiscoveryMode::Full,
+        );
+        let legacy = json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}});
+        assert_eq!(
+            request_client_label(&state, &legacy).as_deref(),
+            Some("Codex 1")
+        );
+        let modern = |info: Value| {
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":{
+                "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientInfo": info}}})
+        };
+        assert_eq!(
+            request_client_label(&state, &modern(json!({"name":"B","version":"2"}))).as_deref(),
+            Some("B 2")
+        );
+        let mut bare = modern(Value::Null);
+        bare["params"]["_meta"]
+            .as_object_mut()
+            .unwrap()
+            .remove("io.modelcontextprotocol/clientInfo");
+        assert_eq!(request_client_label(&state, &bare), None);
     }
 
     #[test]

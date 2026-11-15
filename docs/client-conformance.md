@@ -110,10 +110,12 @@ never cause drift warnings or extra list notifications.
 Modern (`2026-07-28`) clients send no `initialize`, so Toolport reads the client's name
 and version from `params._meta["io.modelcontextprotocol/clientInfo"]` on each request,
 on stdio, through the stdio adapter and daemon, and on HTTP. A caller that sends
-several identities over one connection gets each request labelled as itself. A request
-without the key uses the connection's label: the legacy `initialize` `clientInfo`, or
-on stdio the first modern name seen. Approvals and Activity show it the same way as a
-legacy client's `clientInfo`.
+several identities over one connection gets each request labelled as itself. A modern
+request without the key has no label, never another request's: Approvals and Activity
+name it by its connection, such as "Codex", or "Unknown client" when the connection
+has no trusted name. A handshake-era request without one uses the label its
+connection's `initialize` reported. Approvals and Activity show labels the same way
+as a legacy client's `clientInfo`.
 
 Codex config keys Toolport writes for its own entry are listed in
 [docs/clients.md](clients.md#codex-setup-walkthrough). Every Toolport meta-tool input
