@@ -59,8 +59,12 @@ fn learn_and_wait(dir: &Path) {
     std::env::set_var("TOOLPORT_SECRET_APP_TOKEN", SECRET);
     let value = conduit_lib::secrets::get_secret_result("app-srv", "APP_TOKEN").unwrap();
     assert_eq!(value.as_deref(), Some(SECRET));
+    // The marker is written after the rewrite: a process that exits once the
+    // logs are clean may never write it, and the next one scrubs again.
     wait_for("the background scrub", Duration::from_secs(30), || {
         scrubbed(dir)
+            && std::fs::read_to_string(dir.join("secret-scrub-v1.json"))
+                .is_ok_and(|marker| marker.contains("app-srv/APP_TOKEN"))
     });
 }
 
