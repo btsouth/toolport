@@ -12359,6 +12359,7 @@ fn save_server_catalogs_for_launches(router: &Router, profile: Option<&str>, key
         })
     };
     if let Ok(raw) = raw {
+        let raw = conduit_lib::secret_redact::redact_line(&raw);
         let _ = registry::atomic_write(&path, &raw);
     }
 }
@@ -12377,6 +12378,7 @@ fn save_tool_cache(tools: &dyn ToolCatalog, profile: Option<&str>) {
         if let Ok(s) = serde_json::to_string(&wrapped) {
             // Atomic + unique temp: several gateways share this cache file, so a
             // torn or interleaved write would leave an inconsistent catalog.
+            let s = conduit_lib::secret_redact::redact_line(&s);
             let _ = registry::atomic_write(&path, &s);
         }
     }
@@ -22777,6 +22779,9 @@ fn main() {
         // Record the servers this gateway starts, and stop the ones a killed or
         // crashed gateway left behind.
         conduit_lib::child_ledger::bind_data_dir(&dir);
+        // Once this process resolves a server's secrets, rewrite any copy an older
+        // build left in the logs (once per secret name, off the call path).
+        conduit_lib::secret_redact::enable_background_scrub();
         let reaped = conduit_lib::child_ledger::reap_orphans(&dir);
         if reaped > 0 {
             glog(&format!(
@@ -22785,6 +22790,8 @@ fn main() {
         }
         if daemon_requested(&cli_args) {
             conduit_lib::daemon_log::install_panic_hook(dir.clone());
+            #[cfg(unix)]
+            conduit_lib::daemon_log::install_stderr_redactor();
         }
     }
     // Diagnostic: `toolport-gateway --selftest-secrets` reads every vaulted secret

@@ -587,6 +587,24 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
                     ),
                 ));
             }
+            // `echo` with `echoEnvError` reads the named variable from this
+            // process's environment (where the gateway injected the server's
+            // secrets) and fails with its value in the text: `mode` "result" gives
+            // an `isError` result, "rpc" a JSON-RPC error. Exercises what Toolport
+            // persists when an upstream echoes a credential back.
+            if name == "echo" {
+                if let Some(key) = args.get("echoEnvError").and_then(Value::as_str) {
+                    let value = std::env::var(key).unwrap_or_default();
+                    let text = format!("upstream rejected credential {value} (Bearer {value})");
+                    if args.get("mode").and_then(Value::as_str) == Some("rpc") {
+                        return Some(error(id, -32001, &text, Some(json!({ "echo": value }))));
+                    }
+                    return Some(success(
+                        id,
+                        json!({ "content": [{ "type": "text", "text": text }], "isError": true }),
+                    ));
+                }
+            }
             // `echo_meta` reflects the request's `_meta` back as structured
             // content so a test can assert end-to-end propagation through the
             // gateway without reading the transcript file.

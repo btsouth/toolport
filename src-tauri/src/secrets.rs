@@ -1692,6 +1692,8 @@ mod file {
 }
 
 fn set_secret_raw(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+    // Before the write, so a refreshed OAuth token is covered even if the store fails.
+    crate::secret_redact::register(server_id, key, value);
     if file::active() {
         return file::set_secret(server_id, key, value);
     }
@@ -1776,13 +1778,27 @@ pub(crate) fn task_handle_key() -> Result<[u8; 32], String> {
 ///    `CONDUIT_SECRET_KEY`) is set
 /// 4. OS keychain / platform backend
 fn get_secret_result_raw(server_id: &str, key: &str) -> Result<Option<String>, String> {
-    if let Some(v) = env_secret_override(key) {
-        return Ok(Some(v));
+    let value = if let Some(v) = env_secret_override(key) {
+        Ok(Some(v))
+    } else if file::active() {
+        file::get_secret_result(server_id, key)
+    } else {
+        platform::get_secret_result(server_id, key)
+    };
+    registered(server_id, key, value)
+}
+
+/// Every value this process reads or stores is registered for redaction at the log
+/// writers ([`crate::secret_redact`]), so no echo of it reaches disk.
+fn registered(
+    server_id: &str,
+    key: &str,
+    value: Result<Option<String>, String>,
+) -> Result<Option<String>, String> {
+    if let Ok(Some(v)) = &value {
+        crate::secret_redact::register(server_id, key, v);
     }
-    if file::active() {
-        return file::get_secret_result(server_id, key);
-    }
-    platform::get_secret_result(server_id, key)
+    value
 }
 
 /// Inspect only the managed identity's vault, never environment overrides or aliases.
@@ -1838,10 +1854,12 @@ pub fn get_vault_secret_result(server_id: &str, key: &str) -> Result<Option<Stri
     }
     let owner = crate::local_auth::owner(server_id)?;
     let server_id = owner.as_str();
-    if file::active() {
-        return file::get_secret_result(server_id, key);
-    }
-    platform::get_secret_result(server_id, key)
+    let value = if file::active() {
+        file::get_secret_result(server_id, key)
+    } else {
+        platform::get_secret_result(server_id, key)
+    };
+    registered(server_id, key, value)
 }
 
 /// Stable recovery categories. No backend error text or secret bytes cross this boundary.

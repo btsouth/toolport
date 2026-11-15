@@ -95,6 +95,9 @@ fn environment_for_probe_with(
     let mut env = Vec::new();
     for entry in &server.env {
         if let Some(value) = &entry.value {
+            if entry.secret {
+                crate::secret_redact::register(&server.id, &entry.key, value);
+            }
             env.push((entry.key.clone(), value.clone()));
         } else if entry.secret {
             match vault(&server.id, &entry.key) {

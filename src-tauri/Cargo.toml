@@ -112,6 +112,7 @@ subtle = "2.6"
 # build free of a C toolchain / FFI. `boa_gc` supplies the Trace impls host state needs.
 boa_engine = "0.21"
 boa_gc = "0.21"
+aho-corasick = "1"
 base64 = "0.22"
 regex = "1"
 unicode-normalization = "0.1"

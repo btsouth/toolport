@@ -45,6 +45,9 @@ fn epoch_millis() -> u128 {
 
 /// Truncate `s` to at most `max` chars on a char boundary (never mid-codepoint).
 fn cap_chars(s: &str, max: usize) -> String {
+    // Redact before cutting, so the cut can never keep part of a secret.
+    let s = crate::secret_redact::redact_text(s);
+    let s = s.as_ref();
     if s.chars().count() <= max {
         return s.to_string();
     }

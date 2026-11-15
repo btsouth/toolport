@@ -948,6 +948,7 @@ dependencies = [
 name = "conduit"
 version = "2.3.5"
 dependencies = [
+ "aho-corasick",
  "base64 0.22.1",
  "boa_engine",
  "boa_gc",

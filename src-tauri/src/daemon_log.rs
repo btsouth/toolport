@@ -58,9 +58,111 @@ pub fn stderr_file(dir: &Path) -> Option<std::fs::File> {
 
 /// Append one line stamped with the time and this process id.
 pub fn append(dir: &Path, line: &str) {
+    let line = crate::secret_redact::redact_text(line);
     if let Some(mut file) = open_for_append(dir) {
         let _ = writeln!(file, "{} pid={} {line}", now_ms(), std::process::id());
     }
+}
+
+/// The relay thread that carries this process's stderr into `daemon.log`.
+#[cfg(unix)]
+static STDERR_RELAY: Mutex<Option<std::sync::mpsc::Receiver<()>>> = Mutex::new(None);
+
+/// Route this process's stderr through the secret redactor before it reaches
+/// wherever it pointed (the daemon's `daemon.log`).
+///
+/// The daemon's stderr is a file the OS writes directly, so every `eprintln!`
+/// and panic report, and the stderr of any child that inherits it, would land on
+/// disk unredacted. Fd 2 becomes a pipe; one thread reads it line by line,
+/// replaces resolved secret values and writes to the original destination. A
+/// failed write is dropped, never propagated, so stderr itself can never fail.
+#[cfg(unix)]
+pub fn install_stderr_redactor() {
+    use std::io::{BufRead as _, BufReader};
+    use std::os::fd::FromRawFd as _;
+
+    let mut guard = STDERR_RELAY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.is_some() {
+        return;
+    }
+    // SAFETY: plain fd syscalls; every fd is checked before use and owned by
+    // exactly one `File` afterwards.
+    let (reader, original) = unsafe {
+        let mut fds = [0 as libc::c_int; 2];
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            return;
+        }
+        let original = libc::dup(2);
+        if original < 0 || libc::dup2(fds[1], 2) < 0 {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+            if original >= 0 {
+                libc::close(original);
+            }
+            return;
+        }
+        libc::close(fds[1]);
+        // Children get fd 2 (the pipe), never the relay's private ends.
+        libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(original, libc::F_SETFD, libc::FD_CLOEXEC);
+        (
+            std::fs::File::from_raw_fd(fds[0]),
+            std::fs::File::from_raw_fd(original),
+        )
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("toolport-stderr-redact".into())
+        .spawn(move || {
+            let mut reader = BufReader::new(reader);
+            let mut out = original;
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                match reader.read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let text = String::from_utf8_lossy(&line);
+                        let redacted = crate::secret_redact::redact_text(&text);
+                        let _ = out.write_all(redacted.as_bytes());
+                    }
+                }
+            }
+            let _ = out.flush();
+            let _ = done_tx.send(());
+        });
+    if spawned.is_ok() {
+        *guard = Some(done_rx);
+    }
+}
+
+/// Drain the stderr relay before an explicit exit, so the last lines (a fatal
+/// error, a panic report) are not lost with the process. Bounded: a child still
+/// holding the pipe open cannot delay exit past the budget.
+pub fn flush_stderr_relay(budget: std::time::Duration) {
+    #[cfg(unix)]
+    {
+        let Some(done) = STDERR_RELAY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        else {
+            return;
+        };
+        // SAFETY: swaps fd 2 for /dev/null, closing this process's pipe write end.
+        unsafe {
+            let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            if null >= 0 {
+                libc::dup2(null, 2);
+                libc::close(null);
+            }
+        }
+        let _ = done.recv_timeout(budget);
+    }
+    #[cfg(not(unix))]
+    let _ = budget;
 }
 
 /// Record every panic, on any thread, with its message and location, then run
@@ -233,6 +335,63 @@ mod tests {
     use super::*;
 
     static RUN_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Child half of `daemon_stderr_is_redacted_before_it_reaches_the_log`: runs in
+    /// its own process, because it replaces fd 2.
+    #[cfg(unix)]
+    #[test]
+    fn stderr_redactor_child() {
+        let Some(secret) = std::env::var_os("TOOLPORT_STDERR_REDACT_CHILD") else {
+            return;
+        };
+        let secret = secret.to_string_lossy().to_string();
+        crate::secret_redact::register("relay-server", "RELAY_TOKEN", &secret);
+        install_stderr_redactor();
+        eprintln!("upstream said: invalid token {secret}");
+        // A child that inherits fd 2 goes through the relay too.
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("echo child echoed {secret} >&2"))
+            .status();
+        eprint!("partial line without newline {secret}");
+        flush_stderr_relay(std::time::Duration::from_secs(5));
+    }
+
+    /// The detached daemon's stderr is a file the OS writes directly; without the
+    /// relay an `eprintln!` or an inheriting child would put a secret in daemon.log.
+    #[cfg(unix)]
+    #[test]
+    fn daemon_stderr_is_redacted_before_it_reaches_the_log() {
+        let dir = scratch("stderr-redact");
+        let log = dir.join("daemon.log");
+        let secret = "relay-canary-7Hq2-SECRET";
+        let file = std::fs::File::create(&log).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon_log::tests::stderr_redactor_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TOOLPORT_STDERR_REDACT_CHILD", secret)
+            .stdout(std::process::Stdio::null())
+            .stderr(file)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!text.contains(secret), "{text}");
+        assert!(
+            text.contains("upstream said: invalid token [secret:RELAY_TOKEN]"),
+            "{text}"
+        );
+        assert!(text.contains("child echoed [secret:RELAY_TOKEN]"), "{text}");
+        assert!(
+            text.contains("partial line without newline [secret:RELAY_TOKEN]"),
+            "the last unterminated line is flushed, redacted: {text}"
+        );
+    }
 
     fn scratch(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

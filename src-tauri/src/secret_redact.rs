@@ -1,0 +1,1152 @@
+//! Exact-value redaction of resolved secrets at every persistence boundary.
+//!
+//! Toolport hands a server's secrets to that server, and an upstream is free to echo
+//! them back in an error, a result or its stderr. The caller still gets that text
+//! unchanged; what Toolport itself writes to disk (audit, gateway and daemon logs,
+//! security events, live inspection, search traces) must never carry the value.
+//!
+//! Every secret this process resolves or stores (vault, encrypted file, environment
+//! override, secret reference, OAuth state, HTTP auth headers) is registered here.
+//! The log writers then replace any occurrence of the value, or of the encodings an
+//! upstream is likely to echo (percent-encoded, base64 in its four common forms,
+//! JSON-escaped inside a serialized line), with `[secret:NAME]`. A `Bearer <value>`
+//! header is covered by the raw match, and an auth header saved with its scheme also
+//! registers the bare credential.
+//!
+//! Secrets shorter than [`SHORT_SECRET_CHARS`] are matched only as a whole token
+//! (not touching a letter, digit or underscore on either side), so a four-digit PIN
+//! does not shred every number containing those digits, while `pin=4821` still loses
+//! its value. Overlapping matches of different secrets are merged into one marker so
+//! no tail of either survives.
+//!
+//! Cost: with no secret registered every entry point is one relaxed atomic load.
+//! Otherwise a line is scanned once by an Aho-Corasick automaton and returned
+//! borrowed when nothing matches; only a hit allocates.
+
+use std::borrow::Cow;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use base64::Engine as _;
+use serde_json::Value;
+
+/// Secrets shorter than this (in chars) are redacted only as a whole token.
+pub const SHORT_SECRET_CHARS: usize = 6;
+/// Upper bound on remembered values. OAuth access tokens rotate, so a long-lived
+/// daemon would otherwise grow this forever; the oldest values drop first.
+const MAX_SECRETS: usize = 4096;
+/// Files in the data directory the one-time scrub rewrites.
+const SCRUB_MARKER: &str = "secret-scrub-v1.json";
+
+#[derive(Clone)]
+struct Pattern {
+    name: usize,
+    whole_token: bool,
+}
+
+/// An immutable set of secrets compiled for matching. Pure, so the matching rules
+/// are unit-testable without touching the process-global registry.
+pub struct Matcher {
+    names: Vec<String>,
+    /// Raw-text forms, for log text and JSON string values after parsing.
+    raw: Option<AhoCorasick>,
+    raw_patterns: Vec<(String, Pattern)>,
+    /// The same forms as they appear inside a serialized JSON string, used to decide
+    /// cheaply whether a JSON line needs parsing at all.
+    json: Option<AhoCorasick>,
+    /// Longest raw pattern in chars, used to bound how much text a truncation site
+    /// must scan.
+    longest_chars: usize,
+}
+
+fn marker_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .collect();
+    let cleaned = cleaned.trim_matches('_');
+    if cleaned.is_empty() {
+        "secret".to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+/// The forms an upstream plausibly echoes. Deduplicated; the raw value first.
+fn variants(value: &str) -> Vec<String> {
+    let mut out = vec![value.to_string()];
+    let mut push = |v: String| {
+        if !v.is_empty() && !out.contains(&v) {
+            out.push(v);
+        }
+    };
+    let percent = urlencoding::encode(value).into_owned();
+    push(percent.to_ascii_lowercase_hex());
+    push(percent);
+    push(url::form_urlencoded::byte_serialize(value.as_bytes()).collect());
+    let bytes = value.as_bytes();
+    for engine in [
+        &base64::engine::general_purpose::STANDARD,
+        &base64::engine::general_purpose::STANDARD_NO_PAD,
+        &base64::engine::general_purpose::URL_SAFE,
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+    ] {
+        push(engine.encode(bytes));
+    }
+    out
+}
+
+trait LowerHex {
+    fn to_ascii_lowercase_hex(&self) -> String;
+}
+impl LowerHex for String {
+    /// `%2F` -> `%2f`, leaving every other character alone.
+    fn to_ascii_lowercase_hex(&self) -> String {
+        let mut out = String::with_capacity(self.len());
+        let mut chars = self.chars().peekable();
+        while let Some(c) = chars.next() {
+            out.push(c);
+            if c == '%' {
+                for _ in 0..2 {
+                    if let Some(h) = chars.next() {
+                        out.push(h.to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+fn json_escaped(text: &str) -> String {
+    let quoted = serde_json::to_string(text).unwrap_or_default();
+    quoted[1..quoted.len().saturating_sub(1).max(1)].to_string()
+}
+
+fn is_token_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn build(patterns: &[String]) -> Option<AhoCorasick> {
+    if patterns.is_empty() {
+        return None;
+    }
+    AhoCorasickBuilder::new()
+        .match_kind(MatchKind::Standard)
+        .build(patterns)
+        .ok()
+}
+
+impl Matcher {
+    pub fn new<N: AsRef<str>, V: AsRef<str>>(secrets: &[(N, V)]) -> Self {
+        let mut names: Vec<String> = Vec::new();
+        let mut raw_patterns: Vec<(String, Pattern)> = Vec::new();
+        let mut seen = HashSet::new();
+        for (name, value) in secrets {
+            let value = value.as_ref();
+            if value.trim().is_empty() {
+                continue;
+            }
+            let marker = marker_name(name.as_ref());
+            let name = match names.iter().position(|n| n == &marker) {
+                Some(i) => i,
+                None => {
+                    names.push(marker);
+                    names.len() - 1
+                }
+            };
+            for variant in variants(value) {
+                if seen.insert(variant.clone()) {
+                    let whole_token = variant.chars().count() < SHORT_SECRET_CHARS;
+                    raw_patterns.push((variant, Pattern { name, whole_token }));
+                }
+            }
+        }
+        let raw_texts: Vec<String> = raw_patterns.iter().map(|(p, _)| p.clone()).collect();
+        let json_texts: Vec<String> = raw_texts.iter().map(|p| json_escaped(p)).collect();
+        let longest_chars = raw_texts
+            .iter()
+            .map(|p| p.chars().count())
+            .max()
+            .unwrap_or(0);
+        Self {
+            names,
+            raw: build(&raw_texts),
+            raw_patterns,
+            json: build(&json_texts),
+            longest_chars,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.raw.is_none()
+    }
+
+    fn marker(&self, names: &[usize]) -> String {
+        let mut listed: Vec<&str> = Vec::new();
+        for &n in names {
+            let name = self.names[n].as_str();
+            if !listed.contains(&name) {
+                listed.push(name);
+            }
+        }
+        format!("[secret:{}]", listed.join(","))
+    }
+
+    /// Merged `(start, end, names)` spans of every secret occurrence in `text`.
+    fn spans(&self, text: &str) -> Vec<(usize, usize, Vec<usize>)> {
+        let Some(ac) = &self.raw else {
+            return Vec::new();
+        };
+        let mut hits: Vec<(usize, usize, usize)> = Vec::new();
+        for m in ac.find_overlapping_iter(text) {
+            let pattern = &self.raw_patterns[m.pattern().as_usize()].1;
+            if pattern.whole_token {
+                let before = text[..m.start()].chars().next_back();
+                let after = text[m.end()..].chars().next();
+                if before.is_some_and(is_token_char) || after.is_some_and(is_token_char) {
+                    continue;
+                }
+            }
+            hits.push((m.start(), m.end(), pattern.name));
+        }
+        merge(hits)
+    }
+
+    fn apply(&self, text: &str, spans: &[(usize, usize, Vec<usize>)]) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut at = 0;
+        for (start, end, names) in spans {
+            out.push_str(&text[at..*start]);
+            out.push_str(&self.marker(names));
+            at = *end;
+        }
+        out.push_str(&text[at..]);
+        out
+    }
+
+    /// [`Self::spans`] over raw file bytes, which may not be valid UTF-8. A byte
+    /// outside ASCII counts as a token character for the short-secret rule, the
+    /// conservative choice for a whole-token check.
+    fn byte_spans(&self, bytes: &[u8]) -> Vec<(usize, usize, Vec<usize>)> {
+        let Some(ac) = &self.raw else {
+            return Vec::new();
+        };
+        let token = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
+        let mut hits = Vec::new();
+        for m in ac.find_overlapping_iter(bytes) {
+            let pattern = &self.raw_patterns[m.pattern().as_usize()].1;
+            if pattern.whole_token {
+                let before = m.start().checked_sub(1).map(|i| bytes[i]);
+                let after = bytes.get(m.end()).copied();
+                if before.is_some_and(token) || after.is_some_and(token) {
+                    continue;
+                }
+            }
+            hits.push((m.start(), m.end(), pattern.name));
+        }
+        merge(hits)
+    }
+
+    /// Replace every whole occurrence of a secret or one of its encodings.
+    pub fn redact_text<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        let spans = self.spans(text);
+        if spans.is_empty() {
+            Cow::Borrowed(text)
+        } else {
+            Cow::Owned(self.apply(text, &spans))
+        }
+    }
+
+    /// Like [`Self::redact_text`], for text that may itself be a cut of something
+    /// longer (an excerpt window, an already-truncated message): also removes a
+    /// trailing prefix or a leading suffix of a secret of at least
+    /// [`SHORT_SECRET_CHARS`] chars, the part a reader could otherwise complete.
+    pub fn redact_fragment<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        let mut spans = self.spans(text);
+        let edge = |spans: &mut Vec<(usize, usize, Vec<usize>)>, start: usize, end: usize, n| {
+            if start < end && !spans.iter().any(|(s, e, _)| *s <= start && end <= *e) {
+                spans.push((start, end, vec![n]));
+            }
+        };
+        for (pattern, meta) in &self.raw_patterns {
+            if meta.whole_token {
+                continue;
+            }
+            let len = pattern.len();
+            // Longest proper prefix at the end of `text`.
+            for k in (1..len).rev() {
+                if !pattern.is_char_boundary(k) {
+                    continue;
+                }
+                if pattern[..k].chars().count() < SHORT_SECRET_CHARS {
+                    break;
+                }
+                if text.ends_with(&pattern[..k]) {
+                    edge(&mut spans, text.len() - k, text.len(), meta.name);
+                    break;
+                }
+            }
+            // Longest proper suffix at the start of `text`.
+            for k in 1..len {
+                if !pattern.is_char_boundary(k) {
+                    continue;
+                }
+                if pattern[k..].chars().count() < SHORT_SECRET_CHARS {
+                    break;
+                }
+                if text.starts_with(&pattern[k..]) {
+                    edge(&mut spans, 0, len - k, meta.name);
+                    break;
+                }
+            }
+        }
+        if spans.is_empty() {
+            return Cow::Borrowed(text);
+        }
+        let hits = spans
+            .into_iter()
+            .flat_map(|(s, e, names)| names.into_iter().map(move |n| (s, e, n)))
+            .collect();
+        let spans = merge(hits);
+        Cow::Owned(self.apply(text, &spans))
+    }
+
+    /// Redact then cut to `max_chars`, so a cut can never leave part of a secret.
+    /// Scans only the window that can reach the kept prefix, so a multi-megabyte
+    /// error costs no more than a short one.
+    pub fn truncate_chars(&self, text: &str, max_chars: usize) -> String {
+        let window_chars = max_chars.saturating_add(self.longest_chars);
+        let window = match text.char_indices().nth(window_chars) {
+            Some((byte, _)) => &text[..byte],
+            None => text,
+        };
+        // The window end may split a secret that starts past `max_chars`; that part
+        // is cut away below, and any secret starting earlier ends inside the window.
+        // Fragment rules, because the text may itself be a cut an upstream made: a
+        // leading suffix or trailing prefix of a secret goes too.
+        let redacted = self.redact_fragment(window);
+        redacted.chars().take(max_chars).collect()
+    }
+
+    /// Redact every string (and object key) in a JSON value. True when anything changed.
+    pub fn redact_value(&self, value: &mut Value) -> bool {
+        match value {
+            Value::String(s) => match self.redact_text(s) {
+                Cow::Borrowed(_) => false,
+                Cow::Owned(new) => {
+                    *s = new;
+                    true
+                }
+            },
+            Value::Array(items) => items
+                .iter_mut()
+                .fold(false, |changed, item| self.redact_value(item) | changed),
+            Value::Object(map) => {
+                let mut changed = false;
+                let keys: Vec<String> = map.keys().cloned().collect();
+                for key in keys {
+                    if let Cow::Owned(new_key) = self.redact_text(&key) {
+                        if let Some(v) = map.remove(&key) {
+                            map.insert(new_key, v);
+                        }
+                        changed = true;
+                    }
+                }
+                for v in map.values_mut() {
+                    changed |= self.redact_value(v);
+                }
+                changed
+            }
+            _ => false,
+        }
+    }
+
+    /// Redact one persisted line. A JSON line is parsed and its strings redacted, so
+    /// the result stays valid JSON and numbers are never touched; any other line is
+    /// redacted as text. Unchanged lines come back borrowed.
+    pub fn redact_line<'a>(&self, line: &'a str) -> Cow<'a, str> {
+        let Some(json) = &self.json else {
+            return Cow::Borrowed(line);
+        };
+        let body = line.trim_end_matches(['\n', '\r']);
+        let looks_json = body.trim_start().starts_with(['{', '[']);
+        if looks_json {
+            if !json.is_match(body) {
+                return Cow::Borrowed(line);
+            }
+            if let Ok(mut value) = serde_json::from_str::<Value>(body) {
+                if !self.redact_value(&mut value) {
+                    return Cow::Borrowed(line);
+                }
+                let mut out = value.to_string();
+                out.push_str(&line[body.len()..]);
+                return Cow::Owned(out);
+            }
+        }
+        // Text, or a torn JSON line. JSON escapes can hide a value from the raw
+        // automaton, so try both forms.
+        let raw = self.redact_text(line);
+        let Some(ac) = &self.json else {
+            return raw;
+        };
+        if !ac.is_match(raw.as_ref()) {
+            return raw;
+        }
+        let mut hits = Vec::new();
+        for m in ac.find_overlapping_iter(raw.as_ref()) {
+            let pattern = &self.raw_patterns[m.pattern().as_usize()].1;
+            if pattern.whole_token {
+                let text = raw.as_ref();
+                let before = text[..m.start()].chars().next_back();
+                let after = text[m.end()..].chars().next();
+                if before.is_some_and(is_token_char) || after.is_some_and(is_token_char) {
+                    continue;
+                }
+            }
+            hits.push((m.start(), m.end(), pattern.name));
+        }
+        let spans = merge(hits);
+        if spans.is_empty() {
+            return raw;
+        }
+        Cow::Owned(self.apply(raw.as_ref(), &spans))
+    }
+
+    /// Cheap pre-check: could `text` hold any registered form, raw or JSON-escaped?
+    /// False positives are fine (short secrets ignore token boundaries here).
+    pub fn may_contain(&self, text: &str) -> bool {
+        self.raw.as_ref().is_some_and(|a| a.is_match(text))
+            || self.json.as_ref().is_some_and(|a| a.is_match(text))
+    }
+}
+
+fn merge(mut hits: Vec<(usize, usize, usize)>) -> Vec<(usize, usize, Vec<usize>)> {
+    hits.sort_by_key(|(s, e, _)| (*s, std::cmp::Reverse(*e)));
+    let mut spans: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+    for (s, e, n) in hits {
+        match spans.last_mut() {
+            Some(last) if s < last.1 => {
+                last.1 = last.1.max(e);
+                if !last.2.contains(&n) {
+                    last.2.push(n);
+                }
+            }
+            _ => spans.push((s, e, vec![n])),
+        }
+    }
+    spans
+}
+
+// ---------------------------------------------------------------------------
+// Process-global registry.
+
+struct Registry {
+    /// `(id, marker name, value)`; `id` is `server/key` for the scrub marker.
+    secrets: Vec<(String, String, String)>,
+    matcher: Arc<Matcher>,
+    /// `(id, value)` pairs [`register`] has fully processed, so the repeat reads
+    /// (remote servers read their credential from the vault on every call) cost one
+    /// read-locked lookup instead of re-deriving forms.
+    seen: HashSet<(String, String)>,
+}
+
+/// Which registry a secret belongs to. A shipped process has one data directory,
+/// so one registry (`None`). Test builds run many tests in one process, each with
+/// its own data directory, so there the registry is per directory: a value one
+/// test stores (`new`, `private`) must not redact another test's output.
+type Scope = Option<PathBuf>;
+
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+type Registries = std::collections::HashMap<Scope, Registry>;
+static REGISTRY: RwLock<Option<Registries>> = RwLock::new(None);
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn scope_now() -> Scope {
+    None
+}
+
+/// Never panics and never resolves the developer's real directory: the test
+/// override, else the explicit `TOOLPORT_DATA_DIR` a binary fixture runs with.
+#[cfg(any(test, feature = "test-support"))]
+fn scope_now() -> Scope {
+    crate::registry::data_dir_override().or_else(|| {
+        let explicit =
+            !cfg!(test) && crate::brand::env_var("TOOLPORT_DATA_DIR", "CONDUIT_DATA_DIR").is_some();
+        explicit.then(crate::registry::conduit_dir).flatten()
+    })
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn scope_of(_dir: &Path) -> Scope {
+    None
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn scope_of(dir: &Path) -> Scope {
+    Some(dir.to_path_buf())
+}
+
+/// The scope of a file being written, for writers that run on a background thread
+/// after the data directory may have changed (test builds only; see [`Scope`]).
+#[cfg(not(any(test, feature = "test-support")))]
+fn scope_for_path(_path: &Path) -> Scope {
+    None
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn scope_for_path(path: &Path) -> Scope {
+    let guard = REGISTRY
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let map = guard.as_ref()?;
+    path.ancestors()
+        .map(|dir| Some(dir.to_path_buf()))
+        .find(|scope| map.contains_key(scope))
+        .flatten()
+}
+
+fn current_in(scope: &Scope) -> Option<Arc<Matcher>> {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return None;
+    }
+    REGISTRY
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()?
+        .get(scope)
+        .map(|r| Arc::clone(&r.matcher))
+}
+
+fn current() -> Option<Arc<Matcher>> {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return None;
+    }
+    current_in(&scope_now())
+}
+
+fn add(scope: &Scope, id: &str, name: &str, value: &str) -> bool {
+    if value.trim().is_empty() {
+        return false;
+    }
+    let mut guard = REGISTRY
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let reg = guard
+        .get_or_insert_with(Default::default)
+        .entry(scope.clone())
+        .or_insert_with(|| Registry {
+            secrets: Vec::new(),
+            matcher: Arc::new(Matcher::new::<&str, &str>(&[])),
+            seen: HashSet::new(),
+        });
+    if reg
+        .secrets
+        .iter()
+        .any(|(i, n, v)| i == id && n == name && v == value)
+    {
+        return false;
+    }
+    reg.secrets
+        .push((id.to_string(), name.to_string(), value.to_string()));
+    if reg.secrets.len() > MAX_SECRETS {
+        let excess = reg.secrets.len() - MAX_SECRETS;
+        reg.secrets.drain(..excess);
+        reg.seen.clear();
+    }
+    let pairs: Vec<(&str, &str)> = reg
+        .secrets
+        .iter()
+        .map(|(_, n, v)| (n.as_str(), v.as_str()))
+        .collect();
+    reg.matcher = Arc::new(Matcher::new(&pairs));
+    ACTIVE.store(true, Ordering::Release);
+    true
+}
+
+/// Register a resolved secret value. `owner` is the server id (or another namespace)
+/// and `key` the secret's name, which becomes the marker.
+///
+/// Derived forms are registered too: a stored auth header also registers its bare
+/// credential, a JSON blob (OAuth state) registers its token, secret and password
+/// fields, and a URL registers its password and secret-named query values.
+pub fn register(owner: &str, key: &str, value: &str) {
+    if value.trim().is_empty() {
+        return;
+    }
+    let scope = scope_now();
+    let id = format!("{owner}/{key}");
+    let pair = (id, value.to_string());
+    if REGISTRY
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|map| map.get(&scope))
+        .is_some_and(|reg| reg.seen.contains(&pair))
+    {
+        return;
+    }
+    let (id, _) = &pair;
+    let id = id.as_str();
+    let added = register_forms(&scope, id, key, value);
+    if let Some(reg) = REGISTRY
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+        .and_then(|map| map.get_mut(&scope))
+    {
+        reg.seen.insert(pair.clone());
+    }
+    if added {
+        schedule_scrub(id);
+    }
+}
+
+fn register_forms(scope: &Scope, id: &str, key: &str, value: &str) -> bool {
+    let id = id.to_string();
+    let mut added = add(scope, &id, key, value);
+    let trimmed = value.trim();
+    if trimmed != value {
+        added |= add(scope, &id, key, trimmed);
+    }
+    for scheme in ["bearer ", "basic ", "token ", "bot "] {
+        if trimmed.len() > scheme.len()
+            && trimmed.is_char_boundary(scheme.len())
+            && trimmed[..scheme.len()].eq_ignore_ascii_case(scheme)
+        {
+            added |= add(scope, &id, key, trimmed[scheme.len()..].trim());
+        }
+    }
+    if trimmed.starts_with(['{', '[']) {
+        if let Ok(json) = serde_json::from_str::<Value>(trimmed) {
+            let mut found = Vec::new();
+            secret_fields(&json, None, &mut found);
+            for (field, v) in found {
+                added |= add(scope, &id, &field, &v);
+            }
+        }
+    }
+    if let Ok(url) = url::Url::parse(trimmed) {
+        if url.has_host() {
+            if let Some(password) = url.password() {
+                added |= add(scope, &id, key, password);
+                if let Ok(decoded) = urlencoding::decode(password) {
+                    added |= add(scope, &id, key, &decoded);
+                }
+            }
+            for (name, v) in url.query_pairs() {
+                if crate::import_credentials::secret_url_name(&name) {
+                    added |= add(scope, &id, key, &v);
+                }
+            }
+        }
+    }
+    added
+}
+
+fn secret_fields(value: &Value, key: Option<&str>, out: &mut Vec<(String, String)>) {
+    match value {
+        Value::String(s) => {
+            if let Some(key) = key {
+                let k = key.to_ascii_lowercase();
+                let named =
+                    (k.contains("token") && !k.contains("endpoint") && !k.ends_with("type"))
+                        || k.contains("secret")
+                        || k.contains("password")
+                        || k == "api_key"
+                        || k == "apikey";
+                if named {
+                    out.push((key.to_string(), s.clone()));
+                }
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|v| secret_fields(v, key, out)),
+        Value::Object(map) => map.iter().for_each(|(k, v)| secret_fields(v, Some(k), out)),
+        _ => {}
+    }
+}
+
+/// Redact text bound for a log file. Borrowed and free when nothing matches.
+pub fn redact_text(text: &str) -> Cow<'_, str> {
+    match current() {
+        Some(m) => match m.redact_text(text) {
+            Cow::Borrowed(_) => Cow::Borrowed(text),
+            Cow::Owned(s) => Cow::Owned(s),
+        },
+        None => Cow::Borrowed(text),
+    }
+}
+
+/// [`Matcher::redact_fragment`] against every registered secret.
+pub fn redact_fragment(text: &str) -> Cow<'_, str> {
+    match current() {
+        Some(m) => match m.redact_fragment(text) {
+            Cow::Borrowed(_) => Cow::Borrowed(text),
+            Cow::Owned(s) => Cow::Owned(s),
+        },
+        None => Cow::Borrowed(text),
+    }
+}
+
+/// Redact, then keep at most `max_chars`. See [`Matcher::truncate_chars`].
+pub fn truncate_chars(text: &str, max_chars: usize) -> String {
+    match current() {
+        Some(m) => m.truncate_chars(text, max_chars),
+        None => text.chars().take(max_chars).collect(),
+    }
+}
+
+/// Redact every string in a JSON value about to be written. True when changed.
+pub fn redact_value(value: &mut Value) -> bool {
+    current().is_some_and(|m| m.redact_value(value))
+}
+
+/// Redact one serialized line (JSON or text) about to be appended.
+pub fn redact_line(line: &str) -> Cow<'_, str> {
+    redact_line_with(current(), line)
+}
+
+/// [`redact_line`] for a writer that knows the file it appends to, which may run
+/// on a background thread (the telemetry writer).
+pub fn redact_line_for<'a>(path: &Path, line: &'a str) -> Cow<'a, str> {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return Cow::Borrowed(line);
+    }
+    redact_line_with(current_in(&scope_for_path(path)), line)
+}
+
+fn redact_line_with(matcher: Option<Arc<Matcher>>, line: &str) -> Cow<'_, str> {
+    match matcher {
+        Some(m) => match m.redact_line(line) {
+            Cow::Borrowed(_) => Cow::Borrowed(line),
+            Cow::Owned(s) => Cow::Owned(s),
+        },
+        None => Cow::Borrowed(line),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One-time scrub of files written before this fix.
+
+/// Every file in the data directory that Toolport appends diagnostic text to.
+pub fn persisted_log_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = [
+        "audit.jsonl",
+        "security.jsonl",
+        "inspect.jsonl",
+        "search-trace.jsonl",
+        "search-trace-v2.jsonl",
+        "savings.jsonl",
+        "savings-v2.jsonl",
+        "savings-v3.jsonl",
+        "savings-v4.jsonl",
+        "team-activity.jsonl",
+        "gateway.log",
+        "daemon.log",
+        "daemon.log.1",
+        "last-daemon-exit.json",
+    ]
+    .iter()
+    .map(|name| dir.join(name))
+    .collect();
+    // Rotated siblings (`audit.jsonl.1`, `gateway.log.old`, ...).
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let rotated = [
+                "audit.jsonl.",
+                "security.jsonl.",
+                "gateway.log.",
+                "inspect.jsonl.",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix) && !name.ends_with(".lock"));
+            if rotated && !files.contains(&path) {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+/// Rewrite one file with every registered secret redacted, under the same lock its
+/// writers take. Returns whether anything changed. A missing file is not an error.
+pub fn scrub_file(path: &Path) -> std::io::Result<bool> {
+    let Some(matcher) = current_in(&scope_for_path(path)) else {
+        return Ok(false);
+    };
+    scrub_file_with(&matcher, path)
+}
+
+/// Logs a live process holds open by descriptor (the daemon's stderr is
+/// `daemon.log`, and follows it into `daemon.log.1` on rotation). Replacing those
+/// by rename would leave the daemon writing into an unlinked file, so they are
+/// masked in place instead.
+fn held_open(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("daemon.log"))
+}
+
+/// Overwrite each secret occurrence with a same-length mask (the marker when it
+/// fits, padded with `*`), so concurrent `O_APPEND` writers and open descriptors
+/// are unaffected: nothing moves and the file is never replaced.
+fn mask_in_place(matcher: &Matcher, path: &Path) -> std::io::Result<bool> {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut &file, &mut bytes)?;
+    let spans = matcher.byte_spans(&bytes);
+    for (start, end, names) in &spans {
+        let len = end - start;
+        let marker = matcher.marker(names);
+        let mut mask: Vec<u8> = if marker.len() <= len {
+            marker.into_bytes()
+        } else {
+            Vec::new()
+        };
+        mask.resize(len, b'*');
+        write_at(&file, &mask, *start as u64)?;
+    }
+    if !spans.is_empty() {
+        file.sync_all()?;
+    }
+    Ok(!spans.is_empty())
+}
+
+#[cfg(unix)]
+fn write_at(file: &std::fs::File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, bytes, offset)
+}
+
+#[cfg(windows)]
+fn write_at(file: &std::fs::File, mut bytes: &[u8], mut offset: u64) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let n = std::os::windows::fs::FileExt::seek_write(file, bytes, offset)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        bytes = &bytes[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+fn scrub_file_with(matcher: &Matcher, path: &Path) -> std::io::Result<bool> {
+    if held_open(path) {
+        return mask_in_place(matcher, path);
+    }
+    let _lock = crate::registry::lock_at(path).map_err(std::io::Error::other)?;
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    if !matcher.may_contain(&text) {
+        return Ok(false);
+    }
+    let mut changed = false;
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let redacted = matcher.redact_line(line);
+        changed |= matches!(redacted, Cow::Owned(_));
+        out.push_str(&redacted);
+    }
+    if !changed {
+        return Ok(false);
+    }
+    crate::registry::atomic_write(path, &out).map_err(std::io::Error::other)?;
+    Ok(true)
+}
+
+/// Scrub every log file in `dir` for secrets not yet scrubbed there, then record
+/// their ids (names only, never values) in the marker so later starts skip the work.
+pub fn scrub_data_dir(dir: &Path) -> std::io::Result<usize> {
+    let marker = dir.join(SCRUB_MARKER);
+    let done: HashSet<String> = std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| {
+            v.get("scrubbed").and_then(Value::as_array).map(|ids| {
+                ids.iter()
+                    .filter_map(|id| id.as_str().map(str::to_string))
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    let (pending, matcher) = {
+        let guard = REGISTRY
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(reg) = guard.as_ref().and_then(|map| map.get(&scope_of(dir))) else {
+            return Ok(0);
+        };
+        let pending: Vec<(String, String, String)> = reg
+            .secrets
+            .iter()
+            .filter(|(id, _, _)| !done.contains(id))
+            .cloned()
+            .collect();
+        (pending, Arc::clone(&reg.matcher))
+    };
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let mut rewritten = 0;
+    for path in persisted_log_files(dir) {
+        if scrub_file_with(&matcher, &path)? {
+            rewritten += 1;
+        }
+    }
+    let mut ids: Vec<String> = done.into_iter().collect();
+    ids.extend(pending.into_iter().map(|(id, _, _)| id));
+    ids.sort();
+    ids.dedup();
+    let body = serde_json::json!({ "v": 1, "scrubbed": ids }).to_string();
+    let _lock = crate::registry::lock_at(&marker).map_err(std::io::Error::other)?;
+    crate::registry::atomic_write(&marker, &body).map_err(std::io::Error::other)?;
+    Ok(rewritten)
+}
+
+static SCRUB_PENDING: Mutex<Option<PathBuf>> = Mutex::new(None);
+static SCRUB_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Turn on the background scrub for this process (gateway, daemon and app call it
+/// once their data directory is bound). Off by default so unit tests, which share
+/// one process and swap data directories, never get a stray rewrite.
+pub fn enable_background_scrub() {
+    SCRUB_ENABLED.store(true, Ordering::Release);
+    if ACTIVE.load(Ordering::Acquire) {
+        schedule_scrub("");
+    }
+}
+
+fn schedule_scrub(_id: &str) {
+    if !SCRUB_ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    // Capture the directory now: it is the one the secret was resolved for.
+    let Some(dir) = crate::registry::conduit_dir() else {
+        return;
+    };
+    let mut pending = SCRUB_PENDING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if pending.is_some() {
+        return; // a scrub is already queued and will see this secret too
+    }
+    *pending = Some(dir);
+    drop(pending);
+    let spawned = std::thread::Builder::new()
+        .name("toolport-secret-scrub".into())
+        .spawn(|| {
+            // Let a burst of resolutions (every server's env at start) settle so
+            // one pass covers them all.
+            std::thread::sleep(std::time::Duration::from_millis(750));
+            let dir = SCRUB_PENDING
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(dir) = dir {
+                if let Err(error) = scrub_data_dir(&dir) {
+                    eprintln!("toolport: secret scrub of old logs failed: {error}");
+                }
+            }
+        });
+    if spawned.is_err() {
+        SCRUB_PENDING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn m(pairs: &[(&str, &str)]) -> Matcher {
+        Matcher::new(pairs)
+    }
+
+    #[test]
+    fn exact_value_becomes_named_marker() {
+        let m = m(&[("API_TOKEN", "sk-live-abcdef123456")]);
+        assert_eq!(
+            m.redact_text("denied for sk-live-abcdef123456 today"),
+            "denied for [secret:API_TOKEN] today"
+        );
+        assert!(matches!(m.redact_text("nothing here"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn encodings_an_upstream_echoes_are_redacted() {
+        let secret = "p@ss/w0rd+key=1";
+        let m = m(&[("PW", secret)]);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(secret);
+        let b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
+        let pct = urlencoding::encode(secret).into_owned();
+        let pct_lower = pct.to_ascii_lowercase_hex();
+        let form: String = url::form_urlencoded::byte_serialize(secret.as_bytes()).collect();
+        for text in [
+            format!("Authorization: Bearer {secret}"),
+            format!("basic {b64}"),
+            format!("x={b64url}&"),
+            format!("GET /?k={pct} 401"),
+            format!("GET /?k={pct_lower} 401"),
+            format!("form {form}"),
+        ] {
+            let out = m.redact_text(&text);
+            assert!(out.contains("[secret:PW]"), "{text} -> {out}");
+            for v in [secret, &b64, &b64url, &pct, &pct_lower, &form] {
+                assert!(!out.contains(v), "{text} still has {v}: {out}");
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_secrets_leave_no_tail_of_either() {
+        let m = m(&[("A", "xxxxyyyy1"), ("B", "yyyy1zzzz")]);
+        let out = m.redact_text("<xxxxyyyy1zzzz>");
+        assert_eq!(out, "<[secret:A,B]>");
+        // One secret containing another: the longer wins, nothing leaks.
+        let m2 = Matcher::new(&[("SHORTER", "abcdef12"), ("LONGER", "zzabcdef1234")]);
+        let out = m2.redact_text("v=zzabcdef1234;");
+        assert!(!out.contains("1234") && !out.contains("abcdef"), "{out}");
+    }
+
+    #[test]
+    fn several_secrets_in_one_text() {
+        let m = m(&[("ONE", "first-secret-111"), ("TWO", "second-secret-222")]);
+        assert_eq!(
+            m.redact_text("a first-secret-111 b second-secret-222 c first-secret-111"),
+            "a [secret:ONE] b [secret:TWO] c [secret:ONE]"
+        );
+    }
+
+    #[test]
+    fn short_secret_is_redacted_only_as_a_whole_token() {
+        let m = m(&[("PIN", "4821")]);
+        assert_eq!(m.redact_text("pin=4821."), "pin=[secret:PIN].");
+        assert_eq!(m.redact_text("4821"), "[secret:PIN]");
+        assert_eq!(m.redact_text("Bearer 4821"), "Bearer [secret:PIN]");
+        assert_eq!(m.redact_text("id 948210 and x4821"), "id 948210 and x4821");
+    }
+
+    #[test]
+    fn truncation_never_leaves_a_partial_secret() {
+        let secret = "tok_ABCDEFGHIJKLMNOPQRSTUVWX";
+        let m = m(&[("TOKEN", secret)]);
+        for lead in 570..600 {
+            let text = format!("{}{secret} tail tail", "e".repeat(lead));
+            let out = m.truncate_chars(&text, 600);
+            assert!(out.chars().count() <= 600);
+            assert!(
+                !out.contains("tok_"),
+                "lead {lead}: {}",
+                &out[lead.min(out.len())..]
+            );
+            assert!(!out.contains("ABCDEF"), "lead {lead}");
+        }
+        // Text an upstream already cut: the leftover ends of a secret go too.
+        let out = m.truncate_chars("QRSTUVWX] request failed near tok_ABCDEFGHIJ", 600);
+        assert_eq!(out, "[secret:TOKEN]] request failed near [secret:TOKEN]");
+        // A secret past the cut is cut away; a huge error is bounded.
+        let huge = format!("{}{secret}", "e".repeat(5_000_000));
+        assert_eq!(m.truncate_chars(&huge, 600), "e".repeat(600));
+    }
+
+    #[test]
+    fn fragments_lose_a_dangling_prefix_or_suffix() {
+        let secret = "tok_ABCDEFGHIJKLMNOPQRSTUVWX";
+        let m = m(&[("TOKEN", secret)]);
+        let out = m.redact_fragment("error near tok_ABCDEFGH");
+        assert_eq!(out, "error near [secret:TOKEN]");
+        let out = m.redact_fragment("QRSTUVWX was echoed");
+        assert_eq!(out, "[secret:TOKEN] was echoed");
+        // A short coincidental overlap is not a secret.
+        assert_eq!(m.redact_fragment("x tok_"), "x tok_");
+    }
+
+    #[test]
+    fn json_lines_stay_valid_and_numbers_are_untouched() {
+        let m = m(&[("PIN", "1234"), ("Q", "quote\"and\\slash-secret")]);
+        let line = serde_json::json!({"durationMs":1234,"error":"bad pin 1234 and quote\"and\\slash-secret"}).to_string();
+        let out = m.redact_line(&line);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["durationMs"], 1234);
+        assert_eq!(v["error"], "bad pin [secret:PIN] and [secret:Q]");
+        let clean = serde_json::json!({"durationMs":1234,"ok":true}).to_string() + "\n";
+        assert!(matches!(m.redact_line(&clean), Cow::Borrowed(_)));
+        // Torn JSON is redacted as text, in escaped form too.
+        let torn = r#"{"error":"quote\"and\\slash-secret"#;
+        assert!(!m.redact_line(torn).contains("slash-secret"));
+    }
+
+    #[test]
+    fn oauth_state_and_auth_headers_register_their_credentials() {
+        let mut found = Vec::new();
+        let state = serde_json::json!({"access_token":"at-123456789","refresh_token":"rt-987654321","token_endpoint":"https://idp.example.invalid/token","token_type":"Bearer","client_id":"cid"});
+        secret_fields(&state, None, &mut found);
+        let names: Vec<&str> = found.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(names.contains(&"access_token") && names.contains(&"refresh_token"));
+        assert!(!names.contains(&"token_endpoint") && !names.contains(&"token_type"));
+    }
+
+    #[test]
+    fn scrub_rewrites_existing_files_once() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-scrub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        let secret = "scrub-unit-secret-5f1c9a7e";
+        let audit = dir.join("audit.jsonl");
+        let leaked =
+            serde_json::json!({"ok":false,"error":format!("echo {secret}"),"durationMs":5})
+                .to_string();
+        std::fs::write(&audit, format!("{leaked}\n{{\"ok\":true}}\n")).unwrap();
+        std::fs::write(dir.join("gateway.log"), format!("line with {secret}\n")).unwrap();
+        // The daemon holds daemon.log open as its stderr: it must be masked in place.
+        let daemon_log = dir.join("daemon.log");
+        std::fs::write(&daemon_log, format!("1 pid=9 panic: {secret}\n")).unwrap();
+        let mut held = crate::registry::open_append_private(&daemon_log).unwrap();
+        register("unit-scrub-server", "SCRUB_KEY", secret);
+        assert_eq!(scrub_data_dir(&dir).unwrap(), 3);
+        std::io::Write::write_all(&mut held, b"after scrub\n").unwrap();
+        let daemon_text = std::fs::read_to_string(&daemon_log).unwrap();
+        assert!(!daemon_text.contains(secret), "{daemon_text}");
+        assert!(
+            daemon_text.starts_with("1 pid=9 panic: [secret:SCRUB_KEY]*")
+                && daemon_text.ends_with("\nafter scrub\n"),
+            "same file, same length, writer unaffected: {daemon_text}"
+        );
+        let after = std::fs::read_to_string(&audit).unwrap();
+        assert!(!after.contains(secret));
+        assert!(after.contains("echo [secret:SCRUB_KEY]"));
+        assert!(after.ends_with("{\"ok\":true}\n"));
+        assert!(!std::fs::read_to_string(dir.join("gateway.log"))
+            .unwrap()
+            .contains(secret));
+        // The marker holds names, never the value, and makes the next start a no-op.
+        let marker = std::fs::read_to_string(dir.join(SCRUB_MARKER)).unwrap();
+        assert!(marker.contains("unit-scrub-server/SCRUB_KEY") && !marker.contains(secret));
+        std::fs::write(&audit, format!("{leaked}\n")).unwrap();
+        assert_eq!(scrub_data_dir(&dir).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

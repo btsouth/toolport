@@ -92,9 +92,14 @@ fn write_line(entry: &Value) {
     let Some(path) = inspect_path() else {
         return;
     };
+    let mut entry = entry.clone();
+    crate::secret_redact::redact_value(&mut entry);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    // Shared with the secret scrub's rewrite, so a capture cannot land between its
+    // read and replace and be lost.
+    let _lock = crate::registry::lock_at(&path).ok();
     // Owner-only from creation: these are raw request and response bodies, so
     // arguments that may carry secrets and PII (SBS-868).
     if let Ok(mut file) = crate::registry::open_append_private(&path) {

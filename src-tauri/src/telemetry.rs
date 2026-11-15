@@ -286,6 +286,7 @@ pub fn shutdown() {
 /// Flush diagnostics within the shutdown budget before any explicit process exit.
 pub fn exit_with(code: i32) -> ! {
     shutdown();
+    crate::daemon_log::flush_stderr_relay(Duration::from_millis(500));
     std::process::exit(code)
 }
 

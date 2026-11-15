@@ -832,6 +832,22 @@ fn read_cli(
     Ok(value)
 }
 pub fn resolve(reference: &str) -> Result<String, ResolveError> {
+    let value = resolve_uncached(reference)?;
+    crate::secret_redact::register("reference", reference_name(reference), &value);
+    Ok(value)
+}
+
+/// The last path segment of a reference (`op://vault/item/field` -> `field`), used
+/// only as the redaction marker's name.
+fn reference_name(reference: &str) -> &str {
+    reference
+        .trim_end_matches('/')
+        .rsplit(['/', ':'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or("reference")
+}
+
+fn resolve_uncached(reference: &str) -> Result<String, ResolveError> {
     let p = parse(reference)?;
     if p.scheme == "env:" {
         return std::env::var(&reference[4..])

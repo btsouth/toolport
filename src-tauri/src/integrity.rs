@@ -3430,7 +3430,10 @@ fn rules() -> &'static [Rule] {
 /// Best-effort: returns None for hits with no direct phrase position (e.g. an encoded
 /// payload), where the labels alone remain the evidence.
 fn evidence_snippet(text: &str) -> Option<String> {
-    let text = truncate_on_char_boundary(text, MAX_SCAN_BYTES);
+    // Redact before normalizing (which lowercases) and before cutting the excerpt
+    // window, either of which would hide a secret from the exact match at the log.
+    let redacted = crate::secret_redact::redact_text(text);
+    let text = truncate_on_char_boundary(&redacted, MAX_SCAN_BYTES);
     let hay = normalize(text);
     let mut best: Option<usize> = None;
     let mut consider = |pos: Option<usize>| {
@@ -4688,6 +4691,10 @@ fn record_event(event: &Value) -> bool {
     {
         return false;
     }
+    // The persistence boundary for security.jsonl: no resolved secret is written.
+    let mut redacted = event.clone();
+    crate::secret_redact::redact_value(&mut redacted);
+    let event = &redacted;
     if let Some(path) = security_path() {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);

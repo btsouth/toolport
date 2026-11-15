@@ -253,7 +253,8 @@ fn timed_entry(
     }
     if !ok {
         if let Some(err) = error {
-            let trimmed: String = err.trim().chars().take(MAX_AUDIT_ERR_CHARS).collect();
+            // Redact before cutting: a cut first could keep part of a secret.
+            let trimmed = crate::secret_redact::truncate_chars(err.trim(), MAX_AUDIT_ERR_CHARS);
             if !trimmed.is_empty() {
                 entry["error"] = json!(trimmed);
             }
