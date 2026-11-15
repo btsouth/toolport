@@ -4395,6 +4395,11 @@ pub fn run() {
     // Before anything can resolve a secret: the shell's stderr (a terminal, the
     // journal, or a console) and its children's are redacted from here on.
     crate::daemon_log::install_stderr_redaction();
+    // The relay can only remove values it knows: learn every configured secret
+    // that can be read without a prompt, off the startup path.
+    let _ = std::thread::Builder::new()
+        .name("toolport-secret-preload".into())
+        .spawn(crate::secret_refs::preload_configured_secrets);
     let _ = crate::i18n::initialize();
     // `generate_context!()` must expand exactly once in this crate: on macOS dev
     // builds each expansion embeds a `_EMBED_INFO_PLIST` byte section, and two
