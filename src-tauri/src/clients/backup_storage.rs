@@ -457,9 +457,9 @@ pub(super) fn release(path: &Path) -> Result<(), String> {
                 if !key.starts_with(&prefix) {
                     continue;
                 }
-                crate::secrets::delete_secret(&saved.account, &key)?;
+                crate::secrets::delete_backup_secret(&saved.account, &key)?;
                 for index in 0..count {
-                    crate::secrets::delete_secret(
+                    crate::secrets::delete_backup_secret(
                         &saved.account,
                         &format!("{key}-credential-{index}"),
                     )?;

@@ -921,6 +921,29 @@ mod platform {
         .map_err(|error| error.to_string())
     }
 
+    /// Backup rotation and recovery cleanup must never ask to unlock a vault.
+    /// The zero prompt timeout also prevents Prompt if the item locks after SearchItems.
+    pub fn delete_backup_secret(server_id: &str, key: &str) -> Result<(), String> {
+        use dbus_secret_service::{EncryptionType, SecretService};
+        with_service(|| {
+            let failure = |error| keyring::Error::PlatformFailure(Box::new(error));
+            let service = SecretService::connect_with_max_prompt_timeout(EncryptionType::Dh, 0)
+                .map_err(failure)?;
+            let account = account(server_id, key);
+            let entries = service
+                .search_items(std::collections::HashMap::from([
+                    ("service", SERVICE),
+                    ("username", account.as_str()),
+                ]))
+                .map_err(failure)?;
+            read_backup_item(entries.unlocked.len(), entries.locked.len(), || {
+                entries.unlocked[0].delete().map_err(failure)
+            })
+            .map(|_| ())
+        })
+        .map_err(|error| error.to_string())
+    }
+
     pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
         match with_service(|| Entry::new(SERVICE, &account(server_id, key))?.delete_credential()) {
             Ok(()) => Ok(()),
@@ -948,6 +971,21 @@ mod platform {
                 Some("exact payload")
             );
         }
+        #[test]
+        fn backup_cleanup_never_deletes_locked_or_ambiguous_items() {
+            for (unlocked, locked) in [(0, 1), (1, 1), (2, 0)] {
+                let result =
+                    read_backup_item(unlocked, locked, || -> Result<(), keyring::Error> {
+                        panic!(
+                            "locked cleanup must retain recovery instead of deleting or prompting"
+                        )
+                    });
+                assert!(matches!(result, Err(keyring::Error::NoStorageAccess(_))));
+            }
+            assert_eq!(read_backup_item(0, 0, || Ok(())).unwrap(), None);
+            assert_eq!(read_backup_item(1, 0, || Ok(())).unwrap(), Some(()));
+        }
+
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         fn dead_daemon() -> keyring::Error {
@@ -1442,6 +1480,25 @@ pub(crate) fn get_backup_secret_result(
     #[cfg(not(target_os = "linux"))]
     {
         platform::get_secret_result(owner.as_str(), key)
+    }
+}
+
+/// Backup-only deletion follows the same noninteractive policy as recovery reads.
+pub(crate) fn delete_backup_secret(server_id: &str, key: &str) -> Result<(), String> {
+    if server_id == INTERNAL_SERVER_ID {
+        return Err("reserved Toolport secret namespace".to_string());
+    }
+    let owner = crate::local_auth::owner(server_id)?;
+    if file::active() {
+        return file::delete_secret(owner.as_str(), key);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        platform::delete_backup_secret(owner.as_str(), key)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        platform::delete_secret(owner.as_str(), key)
     }
 }
 
