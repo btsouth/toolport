@@ -1439,8 +1439,7 @@ fn running_image_path() -> Option<PathBuf> {
 /// Toolport's launch-at-login LaunchAgent that would start it, and unload it, so a
 /// drag to the Trash with Launch at login on leaves nothing behind. Only plists
 /// [`stale_launch_agent`] accepts are touched; a bundle moved anywhere else (an
-/// update in progress) keeps its plist, and the app reconciles it on its next
-/// start ([`repoint_launch_agent_if_stale`]).
+/// update in progress) keeps its plist.
 #[cfg(target_os = "macos")]
 pub fn remove_stale_launch_agents(removed_exe: &Path) -> Report {
     let mut report = Report::default();
@@ -1475,40 +1474,6 @@ pub fn remove_stale_launch_agents(removed_exe: &Path) -> Report {
         }
     }
     report
-}
-
-/// Whether Toolport's own LaunchAgent `name` starts a program that no longer
-/// exists while `current_exe` does (the app was updated or moved and a kept plist
-/// still names the old place). The app then registers launch at login again.
-#[cfg(any(target_os = "macos", test))]
-fn launch_agent_needs_repoint(
-    contents: &str,
-    name: &str,
-    current_exe: &Path,
-    exists: impl Fn(&Path) -> bool,
-) -> bool {
-    owned_launch_agent(contents, name)
-        && launch_agent_program(contents)
-            .is_some_and(|program| program != current_exe && !exists(&program))
-}
-
-/// At app start: a kept launch-at-login plist that names a program which is gone
-/// (launchd would fail to start it at the next login) is reported so the app can
-/// register its current executable again.
-#[cfg(target_os = "macos")]
-pub fn repoint_launch_agent_if_stale(name: &str) -> bool {
-    let (Some(home), Ok(current)) = (home_dir(), std::env::current_exe()) else {
-        return false;
-    };
-    let path = home
-        .join("Library")
-        .join("LaunchAgents")
-        .join(format!("{name}.plist"));
-    std::fs::read_to_string(path).is_ok_and(|contents| {
-        launch_agent_needs_repoint(&contents, name, &current, |program| {
-            program.try_exists().unwrap_or(true)
-        })
-    })
 }
 
 /// Best effort `launchctl bootout gui/<uid>/<label>`. A plist that was never
@@ -2231,31 +2196,6 @@ mod tests {
             Some(loose_trash),
             home,
             501,
-            gone
-        ));
-        // A kept plist naming a program that is gone is registered again at start.
-        let current = Path::new("/Applications/Toolport.app/Contents/MacOS/Toolport");
-        assert!(!launch_agent_needs_repoint(
-            &ours, "Toolport", current, present
-        ));
-        assert!(!launch_agent_needs_repoint(
-            &ours, "Toolport", current, gone
-        ));
-        let moved = plist(
-            "Toolport",
-            "/Users/me/Downloads/Toolport.app/Contents/MacOS/Toolport",
-            true,
-        );
-        assert!(launch_agent_needs_repoint(
-            &moved, "Toolport", current, gone
-        ));
-        assert!(!launch_agent_needs_repoint(
-            &moved, "Toolport", current, present
-        ));
-        assert!(!launch_agent_needs_repoint(
-            &plist("Other", other, true),
-            "Toolport",
-            current,
             gone
         ));
         assert_eq!(
