@@ -1520,6 +1520,23 @@ mod tests {
         }
         assert!(!page.recovery_busy.get(), "Cancel releases the row");
         assert!(!dialog.is_visible());
+
+        // A reload that empties the list under an open dialog keeps the dialog,
+        // and closing it still releases the row: nothing stays "Working".
+        let saved = page.recoveries.borrow().clone();
+        page.begin_recovery_action(&record.id);
+        let dialog = page.confirm_discard_recovery(&record, prepared.clone());
+        page.recoveries.borrow_mut().clear();
+        page.rebuild_recoveries();
+        assert!(dialog.is_visible() && page.recovery_busy.get());
+        dialog.close();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while page.recovery_busy.get() && std::time::Instant::now() < deadline {
+            gtk::glib::MainContext::default().iteration(false);
+        }
+        assert!(!page.recovery_busy.get(), "closing releases an emptied row");
+        *page.recoveries.borrow_mut() = saved;
+        page.rebuild_recoveries();
         page.recovery_feedback
             .borrow_mut()
             .push((record.id.clone(), "Previous Retry failure".into()));
@@ -1824,6 +1841,21 @@ mod tab_order_tests {
         );
         page.set_recovery_result("cursor", "Cursor: record deleted.".into(), true);
         assert!(!page.feedback.is_visible());
+
+        // The notice is keyed to the client the action was for, even when the
+        // user opened another client before it failed.
+        *page.details.selected.borrow_mut() = Some("codex".into());
+        page.show_client_error("cursor", "Cursor: could not read its move record");
+        assert_eq!(
+            page.detail_notice
+                .borrow()
+                .as_ref()
+                .map(|(id, _)| id.clone()),
+            Some("cursor".to_string())
+        );
+        page.set_recovery_result("cursor", "Cursor: record deleted.".into(), true);
+        assert!(page.detail_notice.borrow().is_none());
+        page.details.selected.borrow_mut().take();
         window.destroy();
     }
 }

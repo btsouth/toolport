@@ -255,7 +255,9 @@ export function ClientRecoveryBanners({
   const visible = rows.filter((row) => !clientId || row.clientId === clientId);
   const shownResult =
     result && (!clientId || result.clientId === clientId) ? result : null;
-  if (!visible.length && !error && !shownResult) return null;
+  // An open confirmation must render even when a reload emptied the list, or
+  // its row would stay busy with no dialog left to release it.
+  if (!visible.length && !error && !shownResult && !confirmation) return null;
   // Keyboard focus is required to scroll this bounded list without a pointer.
   /* eslint-disable jsx-a11y/no-noninteractive-tabindex */
   const values = (lines: string[], label: string) => (

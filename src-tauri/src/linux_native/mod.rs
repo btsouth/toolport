@@ -3317,8 +3317,14 @@ impl ClientPage {
     /// A refused client action. It stays until that client's recovery state
     /// changes ([`Self::clear_client_error`]) or another message replaces it.
     fn show_client_error(&self, client_id: &str, error: &str) {
-        self.show_error(error);
+        self.show_error_line(error);
+        // Keyed by the client the action was for, not whichever client is
+        // open now: the user may have selected another one meanwhile.
+        *self.detail_notice.borrow_mut() = Some((client_id.to_string(), error.into()));
         *self.error_client.borrow_mut() = Some(client_id.to_string());
+        if self.details.selected.borrow().as_deref() == Some(client_id) {
+            self.refresh_open_detail();
+        }
     }
 
     /// A recovery action for this client succeeded, so its refused-action
@@ -3336,16 +3342,24 @@ impl ClientPage {
             .is_some_and(|(id, _)| id == client_id);
         if stale {
             self.detail_notice.borrow_mut().take();
+            if self.details.selected.borrow().as_deref() == Some(client_id) {
+                self.refresh_open_detail();
+            }
         }
     }
 
     fn show_error(&self, error: &str) {
-        self.error_client.borrow_mut().take();
         let selected = self.details.selected.borrow().clone();
         if let Some(id) = selected {
             *self.detail_notice.borrow_mut() = Some((id, error.into()));
             self.refresh_open_detail();
         }
+        self.show_error_line(error);
+    }
+
+    /// The page's error line only; callers decide which detail it belongs to.
+    fn show_error_line(&self, error: &str) {
+        self.error_client.borrow_mut().take();
         self.pending_confirmation.borrow_mut().take();
         self.cancel_feedback_timer();
         self.feedback.set_label(error);

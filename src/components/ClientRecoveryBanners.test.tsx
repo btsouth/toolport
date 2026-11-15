@@ -698,3 +698,30 @@ it("keeps the row working while its Discard confirmation is open, as GTK does", 
     ).toHaveFocus(),
   );
 });
+
+it("keeps an open Discard confirmation when a reload empties the list", async () => {
+  const unreadable = errorRow({
+    canDiscardFile: true,
+    discardAction: "Discard recovery file",
+  });
+  api.listClientRecoveries.mockResolvedValue([unreadable]);
+  api.prepareClientRecoveryDiscard.mockResolvedValue(
+    prepared({
+      lines: ["Backup file: original-2222.json"],
+      actionLabel: "Discard recovery file",
+    }),
+  );
+  const { rerender } = render(<ClientRecoveryBanners refreshKey="before" />);
+  const notice = await screen.findByRole("region");
+  await userEvent.click(
+    within(notice).getByRole("button", { name: "Discard recovery file" }),
+  );
+  const dialog = await screen.findByRole("dialog");
+  api.listClientRecoveries.mockResolvedValue([]);
+  rerender(<ClientRecoveryBanners refreshKey="after" />);
+  await waitFor(() => expect(api.listClientRecoveries).toHaveBeenCalledTimes(2));
+  expect(screen.getByRole("dialog")).toBe(dialog);
+  await userEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  expect(document.querySelector("[data-recovery-busy]")).toBeNull();
+});
