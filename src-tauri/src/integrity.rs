@@ -4651,8 +4651,18 @@ pub fn record_sync_refusal(server: &str, detail: &str) {
     }));
 }
 
+/// `event` with every secret known now redacted: the persistence boundary for
+/// security.jsonl. Called under the file's lock, which the secret scrub also
+/// rewrites it under, so a secret learned while a scrub runs is still caught.
+fn redacted_event(event: &Value) -> Value {
+    let mut redacted = event.clone();
+    crate::secret_redact::redact_value(&mut redacted);
+    redacted
+}
+
 fn record_definition_change(event: &Value, path: &Path) -> Result<(), String> {
     let _lock = crate::registry::lock_at(path)?;
+    let event = &redacted_event(event);
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -4714,10 +4724,6 @@ fn record_event(event: &Value) -> bool {
     {
         return false;
     }
-    // The persistence boundary for security.jsonl: no resolved secret is written.
-    let mut redacted = event.clone();
-    crate::secret_redact::redact_value(&mut redacted);
-    let event = &redacted;
     if let Some(path) = security_path() {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -4730,6 +4736,7 @@ fn record_event(event: &Value) -> bool {
         let Ok(_lock) = crate::registry::lock_at(&path) else {
             return false;
         };
+        let event = &redacted_event(event);
         // Collapse the concurrent multi-gateway burst before it hits disk (see
         // `recently_recorded`), so the shared log carries one line per real change.
         if recently_recorded(event, &path) {
@@ -5503,6 +5510,29 @@ mod tests {
     impl Drop for TestDataDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Failure mode: a security event is redacted before the log's lock is
+    /// taken, so an event queued behind a scrub keeps a secret the scrub just
+    /// learned. Both the plain append and the drift-merge path are covered.
+    #[test]
+    fn security_events_are_redacted_inside_the_scrub_lock() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let data = TestDataDir::new("security-scrub-lock");
+        let path = data.path.join("security.jsonl");
+        for (kind, secret) in [
+            ("tool_poison_flag", "sec-late-token-F4hZ7cUw"),
+            ("tool_drift", "sec-drift-token-K9mE2rTb"),
+        ] {
+            let event = json!({"type": kind, "server": "srv", "tool": "srv__t", "detail": secret, "ts": 1});
+            let text = crate::secret_redact::append_during_scrub_for_test(
+                &path,
+                ("security-lock", kind, secret),
+                move || assert!(record_event(&event)),
+            );
+            assert!(text.contains(kind), "{text}");
+            assert!(!text.contains(secret), "{kind}: {text}");
         }
     }
 
