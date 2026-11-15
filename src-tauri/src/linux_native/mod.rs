@@ -2647,6 +2647,8 @@ struct ClientPage {
     details: details::DetailHost,
     detail_clients: std::rc::Rc<std::cell::RefCell<Vec<state::ClientView>>>,
     detail_notice: std::rc::Rc<std::cell::RefCell<Option<(String, String)>>>,
+    /// The client whose refused Connect or Disconnect the error line shows.
+    error_client: std::rc::Rc<std::cell::RefCell<Option<String>>>,
     recoveries: std::rc::Rc<std::cell::RefCell<Vec<crate::clients::recovery::ClientRecovery>>>,
     recovery_feedback: std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>,
     recovery_busy: std::rc::Rc<std::cell::Cell<bool>>,
@@ -2737,6 +2739,7 @@ impl ClientPage {
             details,
             detail_clients: Default::default(),
             detail_notice: Default::default(),
+            error_client: Default::default(),
             recoveries: Default::default(),
             recovery_feedback: Default::default(),
             recovery_busy: Default::default(),
@@ -3311,7 +3314,33 @@ impl ClientPage {
         self.feedback.set_visible(false);
     }
 
+    /// A refused client action. It stays until that client's recovery state
+    /// changes ([`Self::clear_client_error`]) or another message replaces it.
+    fn show_client_error(&self, client_id: &str, error: &str) {
+        self.show_error(error);
+        *self.error_client.borrow_mut() = Some(client_id.to_string());
+    }
+
+    /// A recovery action for this client succeeded, so its refused-action
+    /// error no longer describes the current state.
+    pub(super) fn clear_client_error(&self, client_id: &str) {
+        if self.error_client.borrow().as_deref() == Some(client_id) {
+            self.error_client.borrow_mut().take();
+            self.cancel_feedback_timer();
+            self.feedback.set_visible(false);
+        }
+        let stale = self
+            .detail_notice
+            .borrow()
+            .as_ref()
+            .is_some_and(|(id, _)| id == client_id);
+        if stale {
+            self.detail_notice.borrow_mut().take();
+        }
+    }
+
     fn show_error(&self, error: &str) {
+        self.error_client.borrow_mut().take();
         let selected = self.details.selected.borrow().clone();
         if let Some(id) = selected {
             *self.detail_notice.borrow_mut() = Some((id, error.into()));
@@ -4001,6 +4030,7 @@ fn run_client_mutation(
         crate::i18n::msg("Disconnecting client…")
     }));
     let client_id = client.id.clone();
+    let client_id_for_error = client.id.clone();
     let client_name = client.name.clone();
     let button = button.clone();
     gtk::glib::spawn_future_local(async move {
@@ -4072,7 +4102,9 @@ fn run_client_mutation(
                     );
                 }
             }
-            Ok(Err(error)) => page.show_error(&format!("{client_name}: {error}")),
+            Ok(Err(error)) => {
+                page.show_client_error(&client_id_for_error, &format!("{client_name}: {error}"))
+            }
             Err(_) => page.show_error(&crate::i18n::trf(
                 "{value0}: the operation stopped",
                 &[("value0", &client_name.to_string())],

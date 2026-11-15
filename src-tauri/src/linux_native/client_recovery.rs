@@ -145,6 +145,11 @@ pub(super) fn focus_named(root: &impl IsA<gtk::Widget>, name: &str) -> bool {
     if !widget.grab_focus() {
         return false;
     }
+    // Focus alone: a selectable label otherwise selects all of its text,
+    // which reads as a highlight bar (and is hard to read in dark themes).
+    if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+        label.select_region(0, 0);
+    }
     // Programmatic focus after a keyboard action must show its ring.
     if let Some(window) = widget.root().and_downcast::<gtk::Window>() {
         window.set_focus_visible(true);
@@ -580,6 +585,9 @@ impl ClientPage {
     }
 
     fn set_recovery_result(&self, client_id: &str, message: String, success: bool) {
+        if success {
+            self.clear_client_error(client_id);
+        }
         *self.recovery_success.borrow_mut() = Some(RecoveryResult {
             client_id: client_id.into(),
             message,
@@ -1789,6 +1797,33 @@ mod tab_order_tests {
             .collect();
         back_expected.push("clients-refresh".into());
         assert_eq!(backward, back_expected);
+
+        // The result line takes focus without selecting its text.
+        page.set_recovery_result("codex", "Codex: values put back: 1.".into(), true);
+        page.rebuild_recoveries();
+        assert!(focus_named(&page.root, "client-recovery-result"));
+        let result = find_named(page.root.upcast_ref(), "client-recovery-result")
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        assert!(result.has_focus());
+        assert!(
+            result
+                .selection_bounds()
+                .is_none_or(|(start, end)| start == end),
+            "focus must not select the result text"
+        );
+
+        // A refused Disconnect stays until that client's recovery changes.
+        page.show_client_error("cursor", "Cursor: could not read its move record");
+        assert!(page.feedback.is_visible());
+        page.set_recovery_result("codex", "Codex: values put back: 1.".into(), true);
+        assert!(
+            page.feedback.is_visible(),
+            "another client's result keeps it"
+        );
+        page.set_recovery_result("cursor", "Cursor: record deleted.".into(), true);
+        assert!(!page.feedback.is_visible());
         window.destroy();
     }
 }

@@ -411,7 +411,11 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       <ClientRecoveryBanners
         clientId={client.id}
         refreshKey={client}
-        onRecovered={onChanged}
+        onRecovered={() => {
+          // The recovery that blocked Disconnect changed: its error is stale.
+          setActionError(null);
+          onChanged();
+        }}
       />
       {/* Connection: the one thing that actually matters in a client. */}
       {/* The title keeps at least 240px; when the actions don't fit beside it they wrap below. */}

@@ -486,10 +486,12 @@ it("an unreadable recovery file offers only Discard recovery file, never Dismiss
     within(dialog).getByRole("button", { name: "Discard recovery file" }),
   );
   expect(api.discardClientRecovery).toHaveBeenCalledWith("bad", "manifest-file");
-  expect(await screen.findByRole("status")).toHaveTextContent(
-    "unreadable recovery file was deleted",
-  );
+  const status = await screen.findByRole("status");
+  expect(status).toHaveTextContent("unreadable recovery file was deleted");
   expect(screen.getAllByRole("region")).toHaveLength(1);
+  // The result line takes focus without selecting its text, as in GTK.
+  await waitFor(() => expect(status).toHaveFocus());
+  expect(window.getSelection()?.toString() ?? "").toBe("");
 });
 
 it("a file error replaced by a folder error focuses the replacement and reports no success", async () => {
