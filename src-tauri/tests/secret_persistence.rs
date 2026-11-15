@@ -309,12 +309,16 @@ fn echoed_secrets_reach_the_caller_but_no_file_on_disk() {
             "vaulted__echo",
             json!({ "echoEnvError": key, "mode": "rpc" }),
         );
-        // The gateway already masks a JSON-RPC error's credentials for the caller
-        // (`<redacted>`); that reply is unchanged by the persistence redaction.
+        // A JSON-RPC error reaches the caller with the upstream's message and data
+        // intact, only the configured value replaced by the same marker the audit
+        // uses, so the model can still tell what went wrong.
         let text = text_of(&rpc);
         assert!(
-            text.contains("upstream rejected credential") && !text.contains("[secret:"),
-            "caller gets the JSON-RPC error as before: {rpc}"
+            text.contains(&format!(
+                "upstream rejected credential [secret:{key}] (Bearer [secret:{key}])"
+            )) && text.contains(&format!(r#""echo":"[secret:{key}]""#))
+                && !text.contains(secret),
+            "caller gets the real JSON-RPC error minus the secret: {rpc}"
         );
     }
     // A search whose query carries a secret lands in the search trace.

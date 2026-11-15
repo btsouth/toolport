@@ -45,6 +45,8 @@ const SCRUB_MARKER: &str = "secret-scrub-v1.json";
 struct Pattern {
     name: usize,
     whole_token: bool,
+    /// A [`fragment_windows`] window, not a whole value or encoding of one.
+    fragment: bool,
 }
 
 /// An immutable set of secrets compiled for matching. Pure, so the matching rules
@@ -116,6 +118,39 @@ fn base64_inner(value: &[u8]) -> Vec<String> {
     out
 }
 
+/// Length of the windows [`fragment_windows`] takes from a secret.
+pub const FRAGMENT_CHARS: usize = 8;
+/// Secrets at least this long are also matched by fragment.
+pub const FRAGMENT_MIN_SECRET_CHARS: usize = 12;
+
+/// Every [`FRAGMENT_CHARS`]-character window of a secret of at least
+/// [`FRAGMENT_MIN_SECRET_CHARS`], so any piece of it that long is found wherever it
+/// appears (a stderr tail that starts mid-value, a value split across two
+/// messages): adjacent window hits merge into one span covering the whole piece.
+/// Windows of a single character class (`password`, `12345678`) are skipped, since
+/// an ordinary word inside a passphrase must not redact that word everywhere.
+fn fragment_windows(value: &str) -> Vec<String> {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() < FRAGMENT_MIN_SECRET_CHARS {
+        return Vec::new();
+    }
+    chars
+        .windows(FRAGMENT_CHARS)
+        .filter(|window| {
+            let classes = [
+                window.iter().any(|c| c.is_lowercase()),
+                window.iter().any(|c| c.is_uppercase()),
+                window.iter().any(|c| c.is_numeric()),
+                window
+                    .iter()
+                    .any(|c| !c.is_alphanumeric() && !c.is_whitespace()),
+            ];
+            classes.iter().filter(|present| **present).count() >= 2
+        })
+        .map(|window| window.iter().collect())
+        .collect()
+}
+
 /// Text forms an upstream error formatter realistically applies to a value it
 /// quotes: the value itself, trimmed, upper- and lowercased, Unicode NFC/NFKC
 /// (a formatter or terminal that normalizes), and each line of a multi-line value
@@ -157,7 +192,7 @@ fn text_forms(value: &str) -> Vec<String> {
 /// them.
 fn variants(value: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let mut push = |v: String, out: &mut Vec<String>| {
+    let push = |v: String, out: &mut Vec<String>| {
         if !v.is_empty() && !out.contains(&v) {
             out.push(v);
         }
@@ -255,7 +290,26 @@ impl Matcher {
             for variant in variants(value) {
                 if seen.insert(variant.clone()) {
                     let whole_token = short || variant.chars().count() < SHORT_SECRET_CHARS;
-                    raw_patterns.push((variant, Pattern { name, whole_token }));
+                    raw_patterns.push((
+                        variant,
+                        Pattern {
+                            name,
+                            whole_token,
+                            fragment: false,
+                        },
+                    ));
+                }
+            }
+            for window in fragment_windows(value) {
+                if seen.insert(window.clone()) {
+                    raw_patterns.push((
+                        window,
+                        Pattern {
+                            name,
+                            whole_token: false,
+                            fragment: true,
+                        },
+                    ));
                 }
             }
         }
@@ -295,7 +349,7 @@ impl Matcher {
         let Some(ac) = &self.raw else {
             return Vec::new();
         };
-        let mut hits: Vec<(usize, usize, usize)> = Vec::new();
+        let mut hits: Vec<(usize, usize, usize, bool)> = Vec::new();
         for m in ac.find_overlapping_iter(text) {
             let pattern = &self.raw_patterns[m.pattern().as_usize()].1;
             if pattern.whole_token {
@@ -305,7 +359,7 @@ impl Matcher {
                     continue;
                 }
             }
-            hits.push((m.start(), m.end(), pattern.name));
+            hits.push((m.start(), m.end(), pattern.name, pattern.fragment));
         }
         merge(hits)
     }
@@ -340,7 +394,7 @@ impl Matcher {
                     continue;
                 }
             }
-            hits.push((m.start(), m.end(), pattern.name));
+            hits.push((m.start(), m.end(), pattern.name, pattern.fragment));
         }
         merge(hits)
     }
@@ -403,7 +457,7 @@ impl Matcher {
         }
         let hits = spans
             .into_iter()
-            .flat_map(|(s, e, names)| names.into_iter().map(move |n| (s, e, n)))
+            .flat_map(|(s, e, names)| names.into_iter().map(move |n| (s, e, n, false)))
             .collect();
         let spans = merge(hits);
         Cow::Owned(self.apply(text, &spans))
@@ -501,7 +555,7 @@ impl Matcher {
                     continue;
                 }
             }
-            hits.push((m.start(), m.end(), pattern.name));
+            hits.push((m.start(), m.end(), pattern.name, pattern.fragment));
         }
         let spans = merge(hits);
         if spans.is_empty() {
@@ -518,21 +572,35 @@ impl Matcher {
     }
 }
 
-fn merge(mut hits: Vec<(usize, usize, usize)>) -> Vec<(usize, usize, Vec<usize>)> {
-    hits.sort_by_key(|(s, e, _)| (*s, std::cmp::Reverse(*e)));
-    let mut spans: Vec<(usize, usize, Vec<usize>)> = Vec::new();
-    for (s, e, n) in hits {
+/// Merge overlapping hits into spans. A span is named after the whole-value
+/// matches inside it; only a span found purely by fragment windows lists the
+/// secrets those windows came from.
+fn merge(mut hits: Vec<(usize, usize, usize, bool)>) -> Vec<(usize, usize, Vec<usize>)> {
+    hits.sort_by_key(|(s, e, _, _)| (*s, std::cmp::Reverse(*e)));
+    let mut spans: Vec<(usize, usize, Vec<usize>, Vec<usize>)> = Vec::new();
+    for (s, e, n, fragment) in hits {
+        let names = |last: &mut (usize, usize, Vec<usize>, Vec<usize>)| {
+            let list = if fragment { &mut last.3 } else { &mut last.2 };
+            if !list.contains(&n) {
+                list.push(n);
+            }
+        };
         match spans.last_mut() {
             Some(last) if s < last.1 => {
                 last.1 = last.1.max(e);
-                if !last.2.contains(&n) {
-                    last.2.push(n);
-                }
+                names(last);
             }
-            _ => spans.push((s, e, vec![n])),
+            _ => {
+                let mut span = (s, e, Vec::new(), Vec::new());
+                names(&mut span);
+                spans.push(span);
+            }
         }
     }
     spans
+        .into_iter()
+        .map(|(s, e, full, fragments)| (s, e, if full.is_empty() { fragments } else { full }))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1216,6 +1284,9 @@ mod tests {
         }
         // Userinfo the gateway learns from a credential URL registers the exact
         // credential, so the whole Basic value is replaced.
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-basic-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
         register(
             "basic-url-server",
             "URL_KEY",
