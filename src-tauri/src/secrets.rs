@@ -2114,6 +2114,8 @@ pub fn retry_retired_scrubs() -> usize {
             crate::secret_redact::scrub_value_now(server, key, value).is_err()
         })
         .collect();
+    #[cfg(test)]
+    tests::run_retry_hook();
     let left = remaining.len();
     if let Err(error) = retired_save(&remaining) {
         eprintln!("toolport: could not update retired secrets: {error}");
@@ -2382,6 +2384,26 @@ pub(crate) mod tests {
         }
         let _restore = Restore(FAILED_READ.with(|failed| failed.replace(Some(key))));
         test()
+    }
+
+    thread_local! {
+        static RETRY_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Run `hook` inside the next [`super::retry_retired_scrubs`] on this
+    /// thread, after its scrubs and before it updates the retired list.
+    pub(crate) fn with_retry_hook<T>(hook: impl FnOnce() + 'static, test: impl FnOnce() -> T) -> T {
+        RETRY_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        let out = test();
+        RETRY_HOOK.with(|h| h.borrow_mut().take());
+        out
+    }
+
+    pub(crate) fn run_retry_hook() {
+        if let Some(hook) = RETRY_HOOK.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
     }
 
     pub(crate) fn write_is_injected_failure(key: &str) -> bool {

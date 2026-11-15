@@ -5771,6 +5771,37 @@ mod tests {
     }
 
     #[test]
+    fn a_value_retired_while_a_retry_runs_is_kept() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let dir = crate::registry::conduit_dir().unwrap();
+            std::fs::write(dir.join("gateway.log"), "unrelated\n").unwrap();
+            // A value whose cleanup now succeeds, left by an earlier run.
+            crate::secrets::set_secret("first-srv", "FIRST_KEY", "retired-first-9Kw2").unwrap();
+            std::fs::create_dir_all(dir.join("audit.jsonl")).unwrap();
+            crate::secrets::delete_secret("first-srv", "FIRST_KEY").unwrap();
+            std::fs::remove_dir_all(dir.join("audit.jsonl")).unwrap();
+            assert_eq!(crate::secrets::retired_scrubs_pending(), 1);
+            // Another process retires a second value while the retry scrubs.
+            crate::secrets::set_secret("second-srv", "SECOND_KEY", "retired-second-4Mx7").unwrap();
+            let left = crate::secrets::tests::with_retry_hook(
+                || {
+                    let dir = crate::registry::conduit_dir().unwrap();
+                    std::fs::create_dir_all(dir.join("audit.jsonl")).unwrap();
+                    crate::secrets::delete_secret("second-srv", "SECOND_KEY").unwrap();
+                    std::fs::remove_dir_all(dir.join("audit.jsonl")).unwrap();
+                },
+                crate::secrets::retry_retired_scrubs,
+            );
+            assert_eq!(left, 0, "the first value is clean now");
+            assert_eq!(
+                crate::secrets::retired_scrubs_pending(),
+                1,
+                "the value retired meanwhile was lost"
+            );
+        });
+    }
+
+    #[test]
     fn a_value_that_cannot_be_kept_for_cleanup_is_not_replaced_or_deleted() {
         crate::secrets::tests::with_isolated_vault(|| {
             let dir = crate::registry::conduit_dir().unwrap();
