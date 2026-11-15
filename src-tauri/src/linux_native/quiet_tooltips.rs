@@ -524,8 +524,9 @@ mod tests {
                 b'\'' => {
                     if bytes.get(i + 1) == Some(&b'\\') {
                         // Skip the escaped character itself, which may be a quote.
-                        i = source[i + 3..]
-                            .find('\'')
+                        i = source
+                            .get(i + 3..)
+                            .and_then(|rest| rest.find('\''))
                             .map_or(bytes.len(), |at| i + 3 + at);
                     } else if let Some(c) = source[i + 1..].chars().next() {
                         if source[i + 1 + c.len_utf8()..].starts_with('\'') {

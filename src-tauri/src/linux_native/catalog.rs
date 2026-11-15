@@ -187,7 +187,10 @@ impl CatalogPage {
                 entry.set_text("");
             }
         });
+        // Capture runs before GTK's own popover key handling, which would
+        // otherwise pop down without returning focus to the search.
         let escape = gtk::EventControllerKey::new();
+        escape.set_propagation_phase(gtk::PropagationPhase::Capture);
         let page_for_escape = catalog.clone();
         escape.connect_key_pressed(move |_, key, _, _| {
             if key != gtk::gdk::Key::Escape {
