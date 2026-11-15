@@ -70,6 +70,9 @@ pub struct Matcher {
     /// patterns that start (or end) with them.
     heads: Option<(AhoCorasick, Vec<Vec<usize>>)>,
     tails: Option<(AhoCorasick, Vec<Vec<usize>>)>,
+    /// Every registered value as written (and trimmed), for whole-value checks of
+    /// JSON numbers and identifiers.
+    exact: std::collections::HashMap<String, usize>,
 }
 
 /// Index `keys` (one per pattern) into an automaton over the distinct keys and,
@@ -403,6 +406,18 @@ impl Matcher {
                 })
                 .collect(),
         );
+        let mut exact = std::collections::HashMap::new();
+        for (name, value) in secrets {
+            let value = value.as_ref();
+            if value.trim().is_empty() {
+                continue;
+            }
+            let marker = marker_name(name.as_ref());
+            if let Some(n) = names.iter().position(|m| *m == marker) {
+                exact.entry(value.to_string()).or_insert(n);
+                exact.entry(value.trim().to_string()).or_insert(n);
+            }
+        }
         Self {
             names,
             raw: build(&raw_texts),
@@ -411,6 +426,7 @@ impl Matcher {
             longest_chars,
             heads,
             tails,
+            exact,
         }
     }
 
@@ -442,12 +458,20 @@ impl Matcher {
 
     /// Merged `(start, end, names)` spans of every secret occurrence in `text`.
     fn spans(&self, text: &str) -> Vec<(usize, usize, Vec<usize>)> {
+        self.spans_with(text, true)
+    }
+
+    /// [`Self::spans`], optionally without fragment windows (whole forms only).
+    fn spans_with(&self, text: &str, fragments: bool) -> Vec<(usize, usize, Vec<usize>)> {
         let Some(ac) = &self.raw else {
             return Vec::new();
         };
         let mut hits: Vec<(usize, usize, usize, bool)> = Vec::new();
         for m in ac.find_overlapping_iter(text) {
             let pattern = &self.raw_patterns[m.pattern().as_usize()].1;
+            if pattern.fragment && !fragments {
+                continue;
+            }
             if pattern.whole_token {
                 let before = text[..m.start()].chars().next_back();
                 let after = text[m.end()..].chars().next();
@@ -592,30 +616,151 @@ impl Matcher {
 
     /// Redact every string (and object key) in a JSON value. True when anything changed.
     pub fn redact_value(&self, value: &mut Value) -> bool {
+        self.value_with(value, true, None)
+    }
+
+    /// Text with secrets replaced, or `None` when nothing matched. `fragments`
+    /// includes [`fragment_windows`] hits; a span whose secrets are all in
+    /// `exempt` is left as it is.
+    fn text_with(
+        &self,
+        text: &str,
+        fragments: bool,
+        exempt: Option<&HashSet<usize>>,
+    ) -> Option<String> {
+        let mut spans = self.spans_with(text, fragments);
+        if let Some(exempt) = exempt {
+            spans.retain(|(_, _, names)| !names.iter().all(|n| exempt.contains(n)));
+        }
+        (!spans.is_empty()).then(|| self.apply(text, &spans))
+    }
+
+    /// [`Self::redact_value`] with the [`Self::text_with`] options.
+    fn value_with(
+        &self,
+        value: &mut Value,
+        fragments: bool,
+        exempt: Option<&HashSet<usize>>,
+    ) -> bool {
         match value {
-            Value::String(s) => match self.redact_text(s) {
-                Cow::Borrowed(_) => false,
-                Cow::Owned(new) => {
+            Value::String(s) => match self.text_with(s, fragments, exempt) {
+                Some(new) => {
                     *s = new;
                     true
                 }
+                None => false,
             },
-            Value::Array(items) => items
-                .iter_mut()
-                .fold(false, |changed, item| self.redact_value(item) | changed),
+            // A number whose text is a registered value (a numeric PIN or account
+            // number) becomes the marker string. Booleans and null carry no value.
+            Value::Number(n) => match self
+                .number_secret(n)
+                .filter(|name| !exempt.is_some_and(|e| e.contains(name)))
+            {
+                Some(name) => {
+                    *value = Value::String(self.marker(&[name]));
+                    true
+                }
+                None => false,
+            },
+            Value::Array(items) => items.iter_mut().fold(false, |changed, item| {
+                self.value_with(item, fragments, exempt) | changed
+            }),
             Value::Object(map) => {
                 let mut changed = false;
-                let keys: Vec<String> = map.keys().cloned().collect();
-                for key in keys {
-                    if let Cow::Owned(new_key) = self.redact_text(&key) {
-                        if let Some(v) = map.remove(&key) {
-                            map.insert(new_key, v);
-                        }
-                        changed = true;
-                    }
-                }
                 for v in map.values_mut() {
-                    changed |= self.redact_value(v);
+                    changed |= self.value_with(v, fragments, exempt);
+                }
+                changed | self.redact_keys(map, exempt)
+            }
+            _ => false,
+        }
+    }
+
+    /// The secrets whose whole forms occur anywhere in `value` (strings, numbers
+    /// and keys), by index.
+    fn secrets_in(&self, value: &Value, out: &mut HashSet<usize>) {
+        let text = |t: &str, out: &mut HashSet<usize>| {
+            for (_, _, names) in self.spans_with(t, false) {
+                out.extend(names);
+            }
+        };
+        match value {
+            Value::String(s) => text(s, out),
+            Value::Number(n) => out.extend(self.number_secret(n)),
+            Value::Array(items) => items.iter().for_each(|v| self.secrets_in(v, out)),
+            Value::Object(map) => {
+                for (k, v) in map {
+                    text(k, out);
+                    self.secrets_in(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `text` with whole secret forms replaced (never fragments), recording each
+    /// replaced span as `(marker, original text)` and the whole string as
+    /// `(new, old)`.
+    fn screen_text(&self, text: &str, record: &mut Vec<(String, String)>) -> Option<String> {
+        let spans = self.spans_with(text, false);
+        if spans.is_empty() {
+            return None;
+        }
+        for (start, end, names) in &spans {
+            record.push((self.marker(names), text[*start..*end].to_string()));
+        }
+        let new = self.apply(text, &spans);
+        if text.len() <= MAX_RECORDED_IDENTIFIER {
+            record.push((new.clone(), text.to_string()));
+        }
+        Some(new)
+    }
+
+    /// Screen one advertised definition (tool, prompt, resource or template) by
+    /// whole forms only. Fragment windows are for error text; in a definition they
+    /// would rename ordinary identifiers (`Tools-Read` is a piece of
+    /// `sk-Tools-ReadSecret123`), change pins and break calls.
+    fn screen_definition(&self, value: &mut Value, record: &mut Vec<(String, String)>) -> bool {
+        match value {
+            Value::String(s) => match self.screen_text(s, record) {
+                Some(new) => {
+                    *s = new;
+                    true
+                }
+                None => false,
+            },
+            Value::Number(n) => match self.number_secret(n) {
+                Some(name) => {
+                    *value = Value::String(self.marker(&[name]));
+                    true
+                }
+                None => false,
+            },
+            Value::Array(items) => items.iter_mut().fold(false, |changed, item| {
+                self.screen_definition(item, record) | changed
+            }),
+            Value::Object(map) => {
+                let mut changed = false;
+                for v in map.values_mut() {
+                    changed |= self.screen_definition(v, record);
+                }
+                let renamed: Vec<(String, String)> = map
+                    .keys()
+                    .filter_map(|key| self.screen_text(key, record).map(|new| (key.clone(), new)))
+                    .collect();
+                for (old, new) in renamed {
+                    let Some(v) = map.remove(&old) else { continue };
+                    let mut key = new.clone();
+                    let mut n = 2;
+                    while map.contains_key(&key) {
+                        key = format!("{new}#{n}");
+                        n += 1;
+                    }
+                    if key != new {
+                        record.push((key.clone(), old));
+                    }
+                    map.insert(key, v);
+                    changed = true;
                 }
                 changed
             }
@@ -623,10 +768,123 @@ impl Matcher {
         }
     }
 
+    /// The secret a JSON number spells, by its text or, for an integral value
+    /// written another way (`482193.0`, `4.82193e5`), by its integer text.
+    fn number_secret(&self, n: &serde_json::Number) -> Option<usize> {
+        if self.exact.is_empty() {
+            return None;
+        }
+        if let Some(&name) = self.exact.get(&n.to_string()) {
+            return Some(name);
+        }
+        let f = n.as_f64()?;
+        (f.fract() == 0.0 && f.abs() < 9.0e15)
+            .then(|| self.exact.get(&format!("{}", f as i64)).copied())
+            .flatten()
+    }
+
+    /// Replace object keys that contain a whole secret form (never a fragment: a
+    /// key is an identifier). Two keys that become the same text are kept apart
+    /// with `#2`, `#3`, so no value is overwritten and the result stays a valid,
+    /// unambiguous object.
+    fn redact_keys(
+        &self,
+        map: &mut serde_json::Map<String, Value>,
+        exempt: Option<&HashSet<usize>>,
+    ) -> bool {
+        let renamed: Vec<(String, String)> = map
+            .keys()
+            .filter_map(|key| {
+                self.text_with(key, false, exempt)
+                    .map(|new| (key.clone(), new))
+            })
+            .collect();
+        if renamed.is_empty() {
+            return false;
+        }
+        for (old, new) in renamed {
+            let Some(v) = map.remove(&old) else { continue };
+            let mut key = new.clone();
+            let mut n = 2;
+            while map.contains_key(&key) {
+                key = format!("{new}#{n}");
+                n += 1;
+            }
+            map.insert(key, v);
+        }
+        true
+    }
+
+    /// Rewrite number tokens in serialized JSON whose source text is a registered
+    /// value as the quoted marker, before parsing loses that text (`1.50`, `0042`
+    /// as written). Strings are skipped; the result is still valid JSON.
+    fn redact_number_tokens(&self, body: &str) -> Option<String> {
+        if self.exact.is_empty() {
+            return None;
+        }
+        let bytes = body.as_bytes();
+        let mut out = String::new();
+        let mut at = 0;
+        let mut i = 0;
+        let mut in_string = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_string {
+                match b {
+                    b'\\' => i += 1,
+                    b'"' => in_string = false,
+                    _ => {}
+                }
+                i += 1;
+                continue;
+            }
+            if b == b'"' {
+                in_string = true;
+                i += 1;
+                continue;
+            }
+            if b == b'-' || b.is_ascii_digit() {
+                let start = i;
+                while i < bytes.len()
+                    && matches!(bytes[i], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+                {
+                    i += 1;
+                }
+                let token = &body[start..i];
+                let name = self.exact.get(token).copied().or_else(|| {
+                    serde_json::from_str::<serde_json::Number>(token)
+                        .ok()
+                        .and_then(|n| self.number_secret(&n))
+                });
+                if let Some(name) = name {
+                    out.push_str(&body[at..start]);
+                    out.push_str(&serde_json::to_string(&self.marker(&[name])).ok()?);
+                    at = i;
+                }
+                continue;
+            }
+            i += 1;
+        }
+        (at > 0).then(|| {
+            out.push_str(&body[at..]);
+            out
+        })
+    }
+
     /// Redact one persisted line. A JSON line is parsed and its strings redacted, so
     /// the result stays valid JSON and numbers are never touched; any other line is
     /// redacted as text. Unchanged lines come back borrowed.
     pub fn redact_line<'a>(&self, line: &'a str) -> Cow<'a, str> {
+        self.line_with(line, true)
+    }
+
+    /// [`Self::redact_line`] with whole forms only, for serialized definitions
+    /// (the tool cache), which [`screen_definitions`] screened the same way.
+    pub fn redact_definition_line<'a>(&self, line: &'a str) -> Cow<'a, str> {
+        self.line_with(line, false)
+    }
+
+    fn line_with<'a>(&self, line: &'a str, fragments: bool) -> Cow<'a, str> {
         let Some(json) = &self.json else {
             return Cow::Borrowed(line);
         };
@@ -636,8 +894,10 @@ impl Matcher {
             if !json.is_match(body) {
                 return Cow::Borrowed(line);
             }
-            if let Ok(mut value) = serde_json::from_str::<Value>(body) {
-                if !self.redact_value(&mut value) {
+            let numbers = self.redact_number_tokens(body);
+            let source = numbers.as_deref().unwrap_or(body);
+            if let Ok(mut value) = serde_json::from_str::<Value>(source) {
+                if !self.value_with(&mut value, fragments, None) && numbers.is_none() {
                     return Cow::Borrowed(line);
                 }
                 let mut out = value.to_string();
@@ -647,7 +907,10 @@ impl Matcher {
         }
         // Text, or a torn JSON line. JSON escapes can hide a value from the raw
         // automaton, so try both forms.
-        let raw = self.redact_text(line);
+        let raw = match self.text_with(line, fragments, None) {
+            Some(new) => Cow::Owned(new),
+            None => Cow::Borrowed(line),
+        };
         let Some(ac) = &self.json else {
             return raw;
         };
@@ -657,6 +920,9 @@ impl Matcher {
         let mut hits = Vec::new();
         for m in ac.find_overlapping_iter(raw.as_ref()) {
             let pattern = &self.raw_patterns[m.pattern().as_usize()].1;
+            if pattern.fragment && !fragments {
+                continue;
+            }
             if pattern.whole_token {
                 let text = raw.as_ref();
                 let before = text[..m.start()].chars().next_back();
@@ -672,27 +938,6 @@ impl Matcher {
             return raw;
         }
         Cow::Owned(self.apply(raw.as_ref(), &spans))
-    }
-
-    /// The names of every secret found in the strings (and keys) of `value`.
-    fn names_in(&self, value: &Value, out: &mut Vec<String>) {
-        match value {
-            Value::String(s) => self.names_in_text(s, out),
-            Value::Array(items) => items.iter().for_each(|v| self.names_in(v, out)),
-            Value::Object(map) => {
-                for (k, v) in map {
-                    self.names_in_text(k, out);
-                    self.names_in(v, out);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn names_in_text(&self, text: &str, out: &mut Vec<String>) {
-        for (_, _, names) in self.spans(text) {
-            out.extend(names.into_iter().map(|n| self.names[n].clone()));
-        }
     }
 
     /// Cheap pre-check: could `text` hold any registered form, raw or JSON-escaped?
@@ -1052,31 +1297,136 @@ pub fn truncate_chars(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// Screen tool definitions a server advertised: any configured secret value in
-/// them is replaced (so neither clients, the search index nor the tool cache see
-/// it) and each affected tool is reported as `(tool name, secret names)`.
-pub fn screen_definitions(tools: &mut [Value]) -> Vec<(String, Vec<String>)> {
+/// Longest whole string kept for restoring an identifier exactly; longer text
+/// (a description) is never an identifier a client sends back.
+const MAX_RECORDED_IDENTIFIER: usize = 1024;
+
+/// Per server, advertised text to the text the server actually advertised, for
+/// identifiers [`screen_definitions`] replaced. Memory only: it holds values the
+/// registry holds anyway, and lets a call name the upstream tool, prompt,
+/// resource or argument even though clients only ever saw the marker.
+type Identities = std::collections::HashMap<String, std::collections::HashMap<String, String>>;
+static IDENTITIES: Mutex<Option<Identities>> = Mutex::new(None);
+
+/// Screen definitions a server advertised (tools, prompts, resources or
+/// templates): any configured secret value in them is replaced (so neither
+/// clients, the search index, pins nor the tool cache see it) and each affected
+/// item is reported as `(advertised name, secret names)`. Identifiers that were
+/// replaced stay callable through [`upstream_identifier`] and
+/// [`upstream_arguments`]. Definitions with no secret are left byte for byte.
+pub fn screen_definitions(server_id: &str, items: &mut [Value]) -> Vec<(String, Vec<String>)> {
     let Some(matcher) = current() else {
         return Vec::new();
     };
     let mut flagged = Vec::new();
-    for tool in tools.iter_mut() {
-        let mut names = Vec::new();
-        matcher.names_in(tool, &mut names);
-        if names.is_empty() {
+    let mut record = Vec::new();
+    for item in items.iter_mut() {
+        let mut found = HashSet::new();
+        matcher.secrets_in(item, &mut found);
+        if found.is_empty() {
             continue;
         }
-        matcher.redact_value(tool);
-        let name = tool
-            .get("name")
-            .and_then(Value::as_str)
+        matcher.screen_definition(item, &mut record);
+        let name = ["name", "uri", "uriTemplate"]
+            .iter()
+            .find_map(|k| item.get(*k).and_then(Value::as_str))
             .unwrap_or("")
             .to_string();
+        let mut names: Vec<String> = found
+            .into_iter()
+            .map(|n| matcher.names[n].clone())
+            .collect();
         names.sort();
         names.dedup();
         flagged.push((name, names));
     }
+    if !record.is_empty() {
+        let mut guard = IDENTITIES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = guard
+            .get_or_insert_with(Default::default)
+            .entry(server_id.to_string())
+            .or_default();
+        for (advertised, upstream) in record {
+            map.entry(advertised).or_insert(upstream);
+        }
+    }
     flagged
+}
+
+/// The identifier `server_id` advertised for `advertised` (a tool or prompt
+/// name, a resource URI or an argument name a client sends back). Unchanged
+/// unless [`screen_definitions`] replaced a secret in it. A URI expanded from a
+/// screened template gets each marker put back.
+pub fn upstream_identifier<'a>(server_id: &str, advertised: &'a str) -> Cow<'a, str> {
+    if !advertised.contains("[secret:") {
+        return Cow::Borrowed(advertised);
+    }
+    let guard = IDENTITIES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(map) = guard.as_ref().and_then(|m| m.get(server_id)) else {
+        return Cow::Borrowed(advertised);
+    };
+    if let Some(upstream) = map.get(advertised) {
+        return Cow::Owned(upstream.clone());
+    }
+    let mut out = advertised.to_string();
+    for (marker, upstream) in map {
+        if marker.starts_with("[secret:") && marker.ends_with(']') && out.contains(marker.as_str())
+        {
+            out = out.replace(marker.as_str(), upstream);
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// `arguments` with object keys a client copied from a screened schema renamed
+/// back to the keys `server_id` advertised.
+pub fn upstream_arguments(server_id: &str, arguments: Value) -> Value {
+    fn walk(server_id: &str, value: Value) -> Value {
+        match value {
+            Value::Object(map) => Value::Object(
+                map.into_iter()
+                    .map(|(k, v)| {
+                        let key = upstream_identifier(server_id, &k).into_owned();
+                        (key, walk(server_id, v))
+                    })
+                    .collect(),
+            ),
+            Value::Array(items) => {
+                Value::Array(items.into_iter().map(|v| walk(server_id, v)).collect())
+            }
+            other => other,
+        }
+    }
+    let screened = IDENTITIES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|m| m.contains_key(server_id));
+    if !screened {
+        return arguments;
+    }
+    walk(server_id, arguments)
+}
+
+/// [`Matcher::redact_definition_line`] against every registered secret.
+pub fn redact_definition_line(line: &str) -> Cow<'_, str> {
+    match current() {
+        Some(m) => match m.redact_definition_line(line) {
+            Cow::Borrowed(_) => Cow::Borrowed(line),
+            Cow::Owned(s) => Cow::Owned(s),
+        },
+        None => Cow::Borrowed(line),
+    }
+}
+
+/// A definition loaded from an older cache, screened the way the live catalog is
+/// (whole forms only). True when changed.
+pub fn redact_definition(value: &mut Value) -> bool {
+    current().is_some_and(|m| m.value_with(value, false, None))
 }
 
 /// Redact every string in a JSON value about to be written. True when changed.
@@ -1253,10 +1603,20 @@ fn scrub_file_with(matcher: &Matcher, path: &Path) -> std::io::Result<bool> {
     if !matcher.may_contain(&text) {
         return Ok(false);
     }
+    // A tool catalog is screened like a live one (whole forms only) so a cached
+    // identifier never differs from the advertised one.
+    let catalog = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("tool-cache"));
     let mut changed = false;
     let mut out = String::with_capacity(text.len());
     for line in text.split_inclusive('\n') {
-        let redacted = matcher.redact_line(line);
+        let redacted = if catalog {
+            matcher.redact_definition_line(line)
+        } else {
+            matcher.redact_line(line)
+        };
         changed |= matches!(redacted, Cow::Owned(_));
         out.push_str(&redacted);
     }
@@ -1653,6 +2013,114 @@ mod tests {
     }
 
     #[test]
+    fn numeric_values_and_keys_that_spell_a_secret_are_redacted() {
+        let m = m(&[
+            ("PIN", "482193"),
+            ("RATE", "1.50"),
+            ("KEY", "sk-key-abc123456"),
+        ]);
+        let line = r#"{"data":{"pin":482193,"alt":4.82193e5,"f":482193.0,"list":[1,482193],"rate":1.50,"other":4821930,"ok":true,"none":null}}"#;
+        let out = m.redact_line(line);
+        let v: Value = serde_json::from_str(&out).expect("valid JSON");
+        let d = &v["data"];
+        assert_eq!(d["pin"], "[secret:PIN]");
+        assert_eq!(d["alt"], "[secret:PIN]");
+        assert_eq!(d["f"], "[secret:PIN]");
+        assert_eq!(d["list"], serde_json::json!([1, "[secret:PIN]"]));
+        assert_eq!(d["rate"], "[secret:RATE]", "source text of a float");
+        assert_eq!(d["other"], 4821930, "a longer number is not the PIN");
+        assert_eq!(d["ok"], true);
+        assert!(d["none"].is_null());
+        // The parsed-value path (writers that never had source text).
+        let mut value = serde_json::json!({"pin": 482193, "n": [482193]});
+        assert!(m.redact_value(&mut value));
+        assert_eq!(
+            value,
+            serde_json::json!({"pin":"[secret:PIN]","n":["[secret:PIN]"]})
+        );
+        // A key that is a secret: replaced, and kept apart from a key that already
+        // reads the same, so neither value is lost.
+        let mut keyed = serde_json::json!({"sk-key-abc123456": 1, "[secret:KEY]": 2, "plain": 3});
+        assert!(m.redact_value(&mut keyed));
+        let obj = keyed.as_object().unwrap();
+        assert_eq!(obj.len(), 3);
+        assert!(obj.contains_key("[secret:KEY]") && obj.contains_key("[secret:KEY]#2"));
+        assert!(!keyed.to_string().contains("abc123456"));
+    }
+
+    #[test]
+    fn definitions_are_screened_by_whole_value_and_stay_callable() {
+        use serde_json::json;
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-defs-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        let secret = "sk-Tools-ReadSecret123";
+        register("defs-server", "API_KEY", secret);
+        register("defs-server", "NAMED", "named-tool-secret-9Q");
+        // Pieces of a secret in a definition are ordinary words, not the secret.
+        let plain = json!({
+            "name": "Tools-Read",
+            "description": "Reads tools. ReadSecret123 is just a word here.",
+            "inputSchema": {"type": "object", "properties": {"Tools-Read": {"type": "string"}}}
+        });
+        let leaky = json!({
+            "name": "named-tool-secret-9Q",
+            "description": format!("Send {secret} as the key."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"named-tool-secret-9Q": {"type": "string"}, "path": {"type": "string"}},
+                "required": ["named-tool-secret-9Q", "path"]
+            }
+        });
+        let prompt = json!({"name": "p", "arguments": [{"name": "named-tool-secret-9Q"}]});
+        let template = json!({"uriTemplate": "mem://named-tool-secret-9Q/{id}", "name": "t"});
+        let mut items = vec![plain.clone(), leaky, prompt, template];
+        let flagged = screen_definitions("defs-server", &mut items);
+        assert_eq!(items[0], plain, "a definition with no secret is untouched");
+        assert_eq!(flagged.len(), 3, "{flagged:?}");
+        assert_eq!(
+            flagged[0],
+            (
+                "[secret:NAMED]".to_string(),
+                vec!["API_KEY".to_string(), "NAMED".to_string()]
+            )
+        );
+        let advertised = items[1].to_string() + &items[2].to_string() + &items[3].to_string();
+        assert!(
+            !advertised.contains("named-tool-secret") && !advertised.contains(secret),
+            "{advertised}"
+        );
+        assert_eq!(items[1]["description"], "Send [secret:API_KEY] as the key.");
+        assert_eq!(
+            items[1]["inputSchema"]["required"],
+            json!(["[secret:NAMED]", "path"])
+        );
+        // Routing: the client calls the advertised name with advertised keys; the
+        // server gets its own text back.
+        assert_eq!(
+            upstream_identifier("defs-server", "[secret:NAMED]"),
+            "named-tool-secret-9Q"
+        );
+        assert_eq!(
+            upstream_arguments("defs-server", json!({"[secret:NAMED]": "x", "path": "/a"})),
+            json!({"named-tool-secret-9Q": "x", "path": "/a"})
+        );
+        assert_eq!(
+            upstream_identifier("defs-server", "mem://[secret:NAMED]/42"),
+            "mem://named-tool-secret-9Q/42"
+        );
+        // Another server never gets this server's text.
+        assert_eq!(
+            upstream_identifier("other-server", "[secret:NAMED]"),
+            "[secret:NAMED]"
+        );
+        assert_eq!(
+            upstream_identifier("defs-server", "Tools-Read"),
+            "Tools-Read"
+        );
+    }
+
+    #[test]
     fn overlapping_secrets_leave_no_tail_of_either() {
         let m = m(&[("A", "xxxxyyyy1"), ("B", "yyyy1zzzz")]);
         let out = m.redact_text("<xxxxyyyy1zzzz>");
@@ -1717,14 +2185,14 @@ mod tests {
     }
 
     #[test]
-    fn json_lines_stay_valid_and_numbers_are_untouched() {
+    fn json_lines_stay_valid_and_other_numbers_are_untouched() {
         let m = m(&[("PIN", "1234"), ("Q", "quote\"and\\slash-secret")]);
-        let line = serde_json::json!({"durationMs":1234,"error":"bad pin 1234 and quote\"and\\slash-secret"}).to_string();
+        let line = serde_json::json!({"durationMs":12345,"error":"bad pin 1234 and quote\"and\\slash-secret"}).to_string();
         let out = m.redact_line(&line);
         let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["durationMs"], 1234);
+        assert_eq!(v["durationMs"], 12345);
         assert_eq!(v["error"], "bad pin [secret:PIN] and [secret:Q]");
-        let clean = serde_json::json!({"durationMs":1234,"ok":true}).to_string() + "\n";
+        let clean = serde_json::json!({"durationMs":12345,"ok":true}).to_string() + "\n";
         assert!(matches!(m.redact_line(&clean), Cow::Borrowed(_)));
         // Torn JSON is redacted as text, in escaped form too.
         let torn = r#"{"error":"quote\"and\\slash-secret"#;

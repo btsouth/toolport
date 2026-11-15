@@ -12282,7 +12282,7 @@ fn load_tool_cache(profile: Option<&str>) -> Vec<Value> {
         }
         // A cache an older build wrote may still hold a secret a server echoed
         // into a definition; serve it the way the live catalog now is.
-        conduit_lib::secret_redact::redact_value(tool);
+        conduit_lib::secret_redact::redact_definition(tool);
     }
     tools
 }
@@ -12366,7 +12366,7 @@ fn save_server_catalogs_for_launches(router: &Router, profile: Option<&str>, key
         })
     };
     if let Ok(raw) = raw {
-        let raw = conduit_lib::secret_redact::redact_line(&raw);
+        let raw = conduit_lib::secret_redact::redact_definition_line(&raw);
         let _ = registry::atomic_write(&path, &raw);
     }
 }
@@ -12385,7 +12385,7 @@ fn save_tool_cache(tools: &dyn ToolCatalog, profile: Option<&str>) {
         if let Ok(s) = serde_json::to_string(&wrapped) {
             // Atomic + unique temp: several gateways share this cache file, so a
             // torn or interleaved write would leave an inconsistent catalog.
-            let s = conduit_lib::secret_redact::redact_line(&s);
+            let s = conduit_lib::secret_redact::redact_definition_line(&s);
             let _ = registry::atomic_write(&path, &s);
         }
     }
