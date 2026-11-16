@@ -20,35 +20,52 @@ pub struct ReapOutcome {
 impl BridgeController {
     /// At start: bring back an endpoint the user left on. Never asks to
     /// unlock the keyring: while it is locked the endpoint shows as locked
-    /// and starts on the first unlock, or on the user's Retry.
+    /// and starts on the first unlock, or on the user's Retry; a start that
+    /// fails is tried again a few times while it shows the wait.
     pub fn restore(&self) -> Result<bool, String> {
-        // Under the lifecycle lock, so a Stop that turned the endpoint off
-        // while it waited is seen here and never undone.
+        match crate::http_bridge::restore_with_retries(
+            self.clone(),
+            Self::state_of,
+            Self::restore_once,
+            1,
+        ) {
+            crate::http_bridge::Restore::Running => Ok(true),
+            crate::http_bridge::Restore::Off | crate::http_bridge::Restore::Held => Ok(false),
+            crate::http_bridge::Restore::Failed(error) => Err(error),
+        }
+    }
+
+    fn state_of(&self) -> &crate::http_bridge::HttpBridgeState {
+        &self.state
+    }
+
+    /// One restore attempt. The lifecycle lock is held from the saved setting
+    /// through the start, so a Stop that turned the endpoint off is seen here
+    /// and never undone; no keyring call in it may ask to unlock.
+    fn restore_once(&self) -> crate::http_bridge::Restore {
+        use crate::http_bridge::Restore;
         let _lifecycle = LIFECYCLE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let registry = crate::registry::load()?;
-        if !registry.http_bridge_enabled {
-            return Ok(false);
-        }
-        if self.status().running {
-            return Ok(true);
-        }
-        if crate::http_bridge::hold_for_keyring(&self.state) {
-            let waiting = self.clone();
-            let later = self.clone();
-            crate::http_bridge::restore_after_unlock(
-                move || crate::http_bridge::waiting_for_keyring(&waiting.state),
-                move || {
-                    if let Err(error) = later.restore() {
-                        eprintln!("toolport: could not restore the native HTTP endpoint: {error}");
-                    }
-                },
-            );
-            return Ok(false);
-        }
-        self.start_locked(registry.http_bridge_port)?;
-        Ok(true)
+        crate::secrets::without_prompts(|| {
+            let registry = match crate::registry::load() {
+                Ok(registry) => registry,
+                Err(error) => return Restore::Failed(error),
+            };
+            if !registry.http_bridge_enabled {
+                return Restore::Off;
+            }
+            if self.status().running {
+                return Restore::Running;
+            }
+            if crate::http_bridge::hold_for_keyring(&self.state) {
+                return Restore::Held;
+            }
+            match self.start_locked(registry.http_bridge_port) {
+                Ok(_) => Restore::Running,
+                Err(error) => Restore::Failed(error),
+            }
+        })
     }
 
     /// The user's Retry on a locked endpoint: may ask to unlock the keyring.

@@ -3756,7 +3756,22 @@ fn stop_persisted_http_bridge(
 /// the keyring: while it would, the endpoint shows as locked (`Ok(false)`),
 /// and [`restore_http_bridge_on_start`] starts it on the first unlock.
 fn restore_persisted_http_bridge(state: &HttpBridgeState) -> Result<bool, String> {
-    restore_saved_http_bridge(state, false)
+    match restore_http_bridge_once(state) {
+        crate::http_bridge::Restore::Running => Ok(true),
+        crate::http_bridge::Restore::Off | crate::http_bridge::Restore::Held => Ok(false),
+        crate::http_bridge::Restore::Failed(error) => Err(error),
+    }
+}
+
+/// One restore attempt at start: no keyring call in it may ask to unlock.
+fn restore_http_bridge_once(state: &HttpBridgeState) -> crate::http_bridge::Restore {
+    use crate::http_bridge::Restore;
+    match secrets::without_prompts(|| restore_saved_http_bridge(state, false)) {
+        Ok(true) => Restore::Running,
+        Ok(false) if crate::http_bridge::waiting_for_keyring(state) => Restore::Held,
+        Ok(false) => Restore::Off,
+        Err(error) => Restore::Failed(error),
+    }
 }
 
 /// `may_prompt` only for the user's Retry.
@@ -3780,26 +3795,27 @@ fn restore_saved_http_bridge(state: &HttpBridgeState, may_prompt: bool) -> Resul
     Ok(true)
 }
 
-/// Restore the saved endpoint at start, and if the keyring is locked, again as
-/// soon as it is unlocked.
+/// Restore the saved endpoint at start: if the keyring is locked, again as
+/// soon as it is unlocked; if it fails, again a few times while it shows the
+/// wait.
 fn restore_http_bridge_on_start(app: AppHandle) {
-    let state = app.state::<HttpBridgeState>();
-    match restore_persisted_http_bridge(state.inner()) {
-        Ok(true) => eprintln!("toolport: restored the saved HTTP endpoint"),
-        Ok(false) if crate::http_bridge::waiting_for_keyring(state.inner()) => {
-            eprintln!("toolport: the saved HTTP endpoint waits for the keyring to unlock");
-            let waiting = app.clone();
-            crate::http_bridge::restore_after_unlock(
-                move || {
-                    crate::http_bridge::waiting_for_keyring(
-                        waiting.state::<HttpBridgeState>().inner(),
-                    )
-                },
-                move || restore_http_bridge_on_start(app),
-            );
+    fn state_of(app: &AppHandle) -> &HttpBridgeState {
+        app.state::<HttpBridgeState>().inner()
+    }
+    fn attempt(app: &AppHandle) -> crate::http_bridge::Restore {
+        restore_http_bridge_once(state_of(app))
+    }
+    match crate::http_bridge::restore_with_retries(app, state_of, attempt, 1) {
+        crate::http_bridge::Restore::Running => {
+            eprintln!("toolport: restored the saved HTTP endpoint")
         }
-        Ok(false) => {}
-        Err(error) => eprintln!("toolport: could not restore the saved HTTP endpoint: {error}"),
+        crate::http_bridge::Restore::Held => {
+            eprintln!("toolport: the saved HTTP endpoint waits for the keyring to unlock")
+        }
+        crate::http_bridge::Restore::Off => {}
+        crate::http_bridge::Restore::Failed(error) => {
+            eprintln!("toolport: could not restore the saved HTTP endpoint yet: {error}")
+        }
     }
 }
 
@@ -3867,9 +3883,17 @@ fn resume_http_bridge_after_update(
 }
 
 /// Report whether the HTTP bridge is running, reaping it if it has exited.
+/// Off the main thread: a start holds the bridge's state while it waits for
+/// the endpoint to come up.
 #[tauri::command]
-fn http_bridge_status(state: State<HttpBridgeState>) -> Result<HttpBridgeStatus, String> {
-    Ok(crate::http_bridge::status(state.inner()))
+async fn http_bridge_status(app: AppHandle) -> Result<HttpBridgeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(crate::http_bridge::status(
+            app.state::<HttpBridgeState>().inner(),
+        ))
+    })
+    .await
+    .map_err(|error| format!("HTTP endpoint task failed: {error}"))?
 }
 
 /// macOS only: show the Dock icon when a window is visible, and drop it (Accessory
@@ -5155,6 +5179,30 @@ mod tests {
             assert!(!crate::http_bridge::waiting_for_keyring(&state));
             // A late restore (the waiter after an unlock) keeps it off.
             assert_eq!(restore_persisted_http_bridge(&state), Ok(false));
+            assert!(!crate::http_bridge::status(&state).running);
+        });
+    }
+
+    /// A token read that fails at start (here: the store refuses it) is a
+    /// failed attempt the caller retries while it shows the wait, never a read
+    /// that asks to unlock.
+    #[test]
+    fn a_restore_whose_token_read_fails_is_a_failed_attempt() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            registry::save(&Registry {
+                http_bridge_enabled: true,
+                http_bridge_port: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+            let state = HttpBridgeState::default();
+            let outcome = crate::secrets::tests::with_failed_read(HTTP_BRIDGE_VAULT_KEY, || {
+                restore_http_bridge_once(&state)
+            });
+            assert!(
+                matches!(outcome, crate::http_bridge::Restore::Failed(_)),
+                "{outcome:?}"
+            );
             assert!(!crate::http_bridge::status(&state).running);
         });
     }
