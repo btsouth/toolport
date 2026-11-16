@@ -366,6 +366,11 @@ fn hits(s: &str) -> usize {
     s.matches(MARK).count()
 }
 
+/// Markers this redaction added to `input`.
+fn new_hits(_input: &str, output: &str) -> usize {
+    hits(output)
+}
+
 /// The input text each marker in `output` replaced, as best it can be lined up.
 fn hidden(input: &str, output: &str) -> Vec<String> {
     let mut segs: Vec<&str> = Vec::new();
@@ -426,7 +431,7 @@ fn run(c: &Corpus, secrets: &[(String, String)], t: &Thresholds, top: bool) -> T
     };
     for (src, line) in &c.lines {
         let text = m.redact_text(line);
-        let h = hits(&text);
+        let h = new_hits(line, &text);
         if h > 0 {
             tally.text_hits += h;
             tally.text_lines += 1;
@@ -439,7 +444,7 @@ fn run(c: &Corpus, secrets: &[(String, String)], t: &Thresholds, top: bool) -> T
             }
         }
         let frag = m.redact_fragment(line);
-        let h = hits(&frag);
+        let h = new_hits(line, &frag);
         if h > 0 {
             tally.frag_hits += h;
             tally.frag_lines += 1;
@@ -824,5 +829,22 @@ fn coverage(secrets: &[(String, String)]) {
             print!(" {verdict:>16}");
         }
         println!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Failure mode: a corpus line that already holds a marker (an earlier
+    /// redaction quoted in a log) counted as a hit and a changed line even
+    /// when redaction left it as it was.
+    #[test]
+    fn a_marker_already_in_the_input_is_not_a_hit() {
+        let line = "copied from a log: [secret:FPX_not_registered] and more";
+        assert_eq!(super::new_hits(line, line), 0);
+        let redacted = "copied from a log: [secret:FPX_not_registered] and [secret:FPX_1]";
+        assert_eq!(
+            super::new_hits(line.replace("more", "x").as_str(), redacted),
+            1
+        );
     }
 }
