@@ -210,6 +210,7 @@ mod tests {
             auth_required: false,
             failure: None,
             auth_target: None,
+            keyring_locked: false,
         }
     }
 

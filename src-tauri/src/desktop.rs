@@ -1299,11 +1299,17 @@ fn last_lines(text: &str, n: usize) -> String {
 /// UI resolves each row independently instead of waiting for the slowest - a cold
 /// `npx` install used to leave the whole grid "checking" for 30-60s. Still returns
 /// the full batch for callers that want it. Issue #252.
+///
+/// The window's own checks (on load, after a change) never ask to unlock the
+/// keyring: a server that keeps values in a locked one reports it locked.
+/// `interactive` is a Refresh or Retry the user chose, which may ask.
 #[tauri::command]
 async fn probe_servers(
     app: tauri::AppHandle,
     state: State<'_, RegistryState>,
+    interactive: Option<bool>,
 ) -> Result<Vec<ProbeResult>, String> {
+    let interactive = interactive.unwrap_or(false);
     // Snapshot which servers to probe, then drop the lock before any I/O.
     let servers = {
         let reg = state
@@ -1319,7 +1325,11 @@ async fn probe_servers(
             .map(|s| {
                 let app = app.clone();
                 std::thread::spawn(move || {
-                    let result = crate::server_runtime::probe_health_bounded(&s);
+                    let result = if interactive {
+                        crate::server_runtime::probe_one_bounded(&s)
+                    } else {
+                        crate::server_runtime::probe_health_bounded(&s)
+                    };
                     let _ = app.emit("server-probed", &result);
                     result
                 })

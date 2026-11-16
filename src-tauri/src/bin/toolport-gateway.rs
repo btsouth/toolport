@@ -10030,20 +10030,29 @@ fn server_credential_revision(server: &ServerEntry, generation: u64) -> String {
         return digest.clone();
     }
     let mut material = Vec::new();
+    let mut unreadable = false;
     for (key, vault_only) in keys {
+        // A router build is no use of the value: it must not ask to unlock the
+        // store (every role builds one at start). Locked, the value reads as
+        // unreadable, and the connect that first uses it asks.
         let value = if vault_only {
-            secrets::get_vault_secret_result(&server.id, &key)
+            secrets::get_vault_secret_without_prompt(&server.id, &key)
         } else {
-            secrets::get_secret_result(&server.id, &key)
+            secrets::get_secret_without_prompt(&server.id, &key)
         };
+        unreadable |= value.is_err();
         // Errors are represented without recording their possibly sensitive text.
         material.push(json!({"key":key,"value":value.as_ref().ok(),"unreadable":value.is_err()}));
     }
     let digest = registry::sha256_hex(&Value::Array(material).to_string());
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(cache_key, (generation, digest.clone()));
+    // Only a complete read is kept: one taken while the store was locked is
+    // read again by the next build.
+    if !unreadable {
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(cache_key, (generation, digest.clone()));
+    }
     digest
 }
 

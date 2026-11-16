@@ -233,6 +233,14 @@ function App() {
   const [starSurface, setStarSurface] = useState<StarSurface>(null);
   const lastProbeRef = useRef(0);
   const probeFlightRef = useRef(createSingleFlight<ProbeResult[]>());
+  // Set by a Refresh or Retry the user chose: the next probe may ask to unlock
+  // the keyring. The window's own probes never do.
+  const interactiveProbeRef = useRef(false);
+  const takeInteractive = () => {
+    const interactive = interactiveProbeRef.current;
+    interactiveProbeRef.current = false;
+    return interactive;
+  };
   const loadedOnce = useRef(false);
 
   // Probe health quietly (no toast). Used on load and after authenticating, so
@@ -245,7 +253,7 @@ function App() {
       lastProbeRef.current = Date.now();
       setProbing(true);
       try {
-        const results = await probeServers();
+        const results = await probeServers(takeInteractive());
         setHealth(Object.fromEntries(results.map((r) => [r.serverId, r])));
         setBackendReachable(true);
         return results;
@@ -266,7 +274,7 @@ function App() {
         lastProbeRef.current = Date.now();
         setProbing(true);
         try {
-          const results = await probeServers();
+          const results = await probeServers(takeInteractive());
           setHealth(Object.fromEntries(results.map((r) => [r.serverId, r])));
           setBackendReachable(true);
           return results;
@@ -279,6 +287,12 @@ function App() {
       }),
     [],
   );
+
+  // A row's Retry: the user asked, so it may ask to unlock the keyring.
+  const retryProbe = useCallback((): Promise<ProbeResult[]> => {
+    interactiveProbeRef.current = true;
+    return reprobeAfterMutation();
+  }, [reprobeAfterMutation]);
 
   const applyRegistryChange = useCallback(
     (next: Registry) => {
@@ -997,7 +1011,7 @@ function App() {
       onSwitchRef={registerServerSwitch}
       onRemove={() => handleRemove(server.id, server.name)}
       onRegistryChange={applyRegistryChange}
-      onReprobe={() => void reprobeAfterMutation().catch(() => {})}
+      onReprobe={() => void retryProbe().catch(() => {})}
     />
   );
 
@@ -1228,7 +1242,10 @@ function App() {
                 variant="outline"
                 size="sm"
                 className="shrink-0"
-                onClick={() => void reprobe().catch(() => {})}
+                onClick={() => {
+                  interactiveProbeRef.current = true;
+                  void reprobe().catch(() => {});
+                }}
                 disabled={probing}
               >
                 {" "}
@@ -1303,7 +1320,7 @@ function App() {
                         registry={registry}
                         onRegistryChange={applyRegistryChange}
                         health={health}
-                        onReprobe={() => void reprobeAfterMutation().catch(() => {})}
+                        onReprobe={() => void retryProbe().catch(() => {})}
                         onOpenServers={() => selectView("servers")}
                       />
                     ) : view === "settings" ? (
@@ -1338,7 +1355,7 @@ function App() {
                               backFromDetail("servers");
                           }}
                           onRegistryChange={applyRegistryChange}
-                          onReprobe={() => void reprobeAfterMutation().catch(() => {})}
+                          onReprobe={() => void retryProbe().catch(() => {})}
                         />
                       ) : (
                         <SharedEmptyState

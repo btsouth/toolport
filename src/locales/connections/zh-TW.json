@@ -252,6 +252,7 @@
   "Changed tool definitions are flagged for review, and results that look like prompt injection show up in Activity.": "工具定義發生變更時會標記為待審核；看起來像提示注入的結果會顯示在“活動”中。",
   "Changes: {changes}": "變化：{changes}",
   "Check cancelled": "檢查已取消",
+  "Keyring locked": "金鑰圈已鎖定",
   "Check that each server started on the main screen.": "在主畫面確認各伺服器已啟動。",
   "Checked Toolport status": "檢查 Toolport 狀態",
   "Checking {name}...": "正在檢查 {name} ...",

@@ -285,6 +285,8 @@ export interface ProbeResult {
       | "conflict";
     target?: string;
   } | null;
+  /** Not checked: the server keeps values in a locked keyring. */
+  keyringLocked?: boolean;
 }
 
 /** A tool as advertised by a downstream MCP server (raw `tools/list` entry). */

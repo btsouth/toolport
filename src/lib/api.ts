@@ -129,9 +129,11 @@ export function gatherDiagnostics(): Promise<string> {
   return invoke<string>("gather_diagnostics");
 }
 
-/** Connect to each enabled server and report health + tool count. */
-export function probeServers(): Promise<ProbeResult[]> {
-  return invoke<ProbeResult[]>("probe_servers");
+/** Connect to each enabled server and report health + tool count. Only an
+ * `interactive` check (a Refresh or Retry the user chose) may ask to unlock the
+ * keyring; otherwise a server that keeps values in a locked one says so. */
+export function probeServers(interactive = false): Promise<ProbeResult[]> {
+  return invoke<ProbeResult[]>("probe_servers", { interactive });
 }
 
 /** Connect to a (possibly unsaved) server entry to verify it works before

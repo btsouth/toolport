@@ -1071,6 +1071,25 @@ mod platform {
         }
     }
 
+    /// Whether any Toolport item is locked, by one search that never unlocks.
+    /// Unknown (the service is missing or busy) is false: those reads fail
+    /// without a prompt.
+    pub fn store_would_prompt() -> bool {
+        let search = || {
+            with_backup_service(|service| {
+                service
+                    .search_items(std::collections::HashMap::from([("service", SERVICE)]))
+                    .map(|found| !found.locked.is_empty())
+                    .map_err(|error| classify(&error))
+            })
+        };
+        if BACKUP_BATCH.with(|slot| slot.borrow().is_some()) {
+            search().unwrap_or(false)
+        } else {
+            with_backup_batch(search).unwrap_or(false)
+        }
+    }
+
     fn read_backup_item<T>(
         unlocked: usize,
         locked: usize,
@@ -1878,6 +1897,62 @@ fn read_stored(server_id: &str, key: &str) -> Result<Option<String>, String> {
     }
 }
 
+/// Whether reading a stored value now could ask the user to unlock the store:
+/// some Toolport item in it is locked. Asks nothing itself. Work nobody asked
+/// for (a health check at start, a cleanup) waits while it is true; the first
+/// real use of a value still asks. The encrypted file, the macOS
+/// data-protection keychain and Windows never prompt.
+pub fn store_would_prompt() -> bool {
+    if locked_store::locked() {
+        return true;
+    }
+    if file::active() {
+        return false;
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        platform::store_would_prompt()
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        false
+    }
+}
+
+/// [`get_secret_result`] for work nobody asked for: never asks to unlock the
+/// store, and a locked one is an error. Registers what it reads, the same way.
+pub fn get_secret_without_prompt(server_id: &str, key: &str) -> Result<Option<String>, String> {
+    if server_id == INTERNAL_SERVER_ID {
+        return Err("reserved Toolport secret namespace".to_string());
+    }
+    let owner = crate::local_auth::owner(server_id)?;
+    if let Some(value) = env_secret_override(key) {
+        return registered(owner.as_str(), key, Ok(Some(value)));
+    }
+    registered(
+        owner.as_str(),
+        key,
+        backup_secret_status(owner.as_str(), key).map_err(|error| error.to_string()),
+    )
+}
+
+/// [`get_vault_secret_result`] for work nobody asked for, like
+/// [`get_secret_without_prompt`].
+pub fn get_vault_secret_without_prompt(
+    server_id: &str,
+    key: &str,
+) -> Result<Option<String>, String> {
+    if server_id == INTERNAL_SERVER_ID {
+        return Err("reserved Toolport secret namespace".to_string());
+    }
+    let owner = crate::local_auth::owner(server_id)?;
+    registered(
+        owner.as_str(),
+        key,
+        backup_secret_status(owner.as_str(), key).map_err(|error| error.to_string()),
+    )
+}
+
 /// Test support: a store that is locked, so every read that would ask the user
 /// to unlock it is recorded (and fails) instead. Reads that never prompt see a
 /// locked store. Process-wide: hold the data-directory test lock around it.
@@ -2322,6 +2397,11 @@ fn retire(server_id: &str, key: &str, value: &str) -> Result<(), String> {
 /// succeeds are dropped from the vault. Returns how many still wait. Called at
 /// gateway start, so a value is redacted again before anything is written.
 pub fn retry_retired_scrubs() -> usize {
+    // The list lives in the store: reading it while locked would ask the user
+    // to unlock it at start. It waits for the next start that finds it open.
+    if store_would_prompt() {
+        return crate::secret_redact::RETIRED_PENDING.load(std::sync::atomic::Ordering::Relaxed);
+    }
     let entries = retired_load();
     if entries.is_empty() {
         crate::secret_redact::RETIRED_PENDING.store(0, std::sync::atomic::Ordering::Relaxed);

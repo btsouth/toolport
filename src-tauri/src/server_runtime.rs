@@ -19,11 +19,18 @@ pub struct ProbeResult {
     pub auth_required: bool,
     pub failure: Option<crate::call_failure::CallFailureKind>,
     pub auth_target: Option<crate::call_failure::AuthTarget>,
+    /// Not checked: the server keeps values in a locked keyring, and a check
+    /// nobody asked for does not ask to unlock it.
+    #[serde(default)]
+    pub keyring_locked: bool,
 }
 
 impl ProbeResult {
     pub fn failure_label(&self) -> &str {
         use crate::call_failure::{AuthTarget, CallFailureKind as K};
+        if self.keyring_locked {
+            return "Keyring locked";
+        }
         if self.auth_required {
             return match self.auth_target {
                 Some(AuthTarget::Scope) => "Permission required",
@@ -176,6 +183,7 @@ pub fn probe_one(server: &ServerEntry) -> ProbeResult {
             auth_required: false,
             failure: None,
             auth_target: None,
+            keyring_locked: false,
         },
         Err(error) => failed_probe(server, error),
     }
@@ -207,6 +215,7 @@ fn failed_probe(server: &ServerEntry, error: crate::call_failure::CallFailure) -
         },
         failure: Some(error.kind),
         error: Some(error.detail),
+        keyring_locked: false,
     }
 }
 
@@ -245,6 +254,7 @@ pub fn probe_one_bounded(server: &ServerEntry) -> ProbeResult {
             auth_required: false,
             failure: Some(crate::call_failure::CallFailureKind::Timeout { after_send: false }),
             auth_target: None,
+            keyring_locked: false,
         })
 }
 
@@ -257,7 +267,44 @@ pub fn probe_registered(server_id: &str) -> Result<ProbeResult, String> {
 /// The health check a shell runs on its own: at start, after a change, when a
 /// page comes back. Nobody asked for it, so it must not ask to unlock the store.
 pub fn probe_health_bounded(server: &ServerEntry) -> ProbeResult {
+    // One search that asks nothing: while a Toolport item is locked, any read
+    // of a stored value could raise the unlock prompt.
+    if keeps_values_in_store(server) && secrets::store_would_prompt() {
+        return ProbeResult {
+            server_id: server.id.clone(),
+            ok: false,
+            tool_count: 0,
+            error: Some("keyring locked".into()),
+            auth_required: false,
+            failure: None,
+            auth_target: None,
+            keyring_locked: true,
+        };
+    }
     probe_one_bounded(server)
+}
+
+/// Whether connecting may read a value from the store: a secret with no
+/// inline value and no outside source, or a remote server (its sign-in and
+/// token state live there). Generous on purpose: it only decides what is
+/// skipped while the store is locked.
+fn keeps_values_in_store(server: &ServerEntry) -> bool {
+    let stored = |secret: bool,
+                  value: &Option<String>,
+                  fields: &serde_json::Map<String, serde_json::Value>| {
+        secret && value.is_none() && !fields.contains_key("source")
+    };
+    server.url.is_some()
+        || server
+            .env
+            .iter()
+            .any(|entry| stored(entry.secret, &entry.value, &entry.unknown_fields))
+        || server.launch.as_ref().is_some_and(|launch| {
+            launch
+                .inputs
+                .iter()
+                .any(|input| stored(input.secret, &input.value, &input.unknown_fields))
+        })
 }
 
 /// [`probe_health_bounded`] for a saved server.

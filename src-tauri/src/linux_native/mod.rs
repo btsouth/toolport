@@ -2245,6 +2245,13 @@ impl ServerPage {
         self.probe_servers(health::ProbeReason::ConfigChanged);
     }
 
+    /// A row's Retry: the user asked, so this check may ask to unlock the
+    /// keyring.
+    fn retry_probe(&self, server_id: &str) {
+        self.health.borrow_mut().invalidate(server_id);
+        self.plan_probes(health::ProbeReason::ConfigChanged, Some(server_id));
+    }
+
     /// Retry for an unreadable registry. Without a window controller (tests),
     /// read it directly.
     fn reload_registry(&self) {
@@ -2571,6 +2578,13 @@ impl ServerPage {
     /// Probe the enabled servers the health cache says need it, in the
     /// background, and land each result on its live row.
     fn probe_servers(&self, reason: health::ProbeReason) {
+        self.plan_probes(reason, None);
+    }
+
+    /// Checks the page starts on its own never ask to unlock the keyring
+    /// (`probe_health_registered`); a Refresh, or a Retry on `retried`, is the
+    /// user's and may.
+    fn plan_probes(&self, reason: health::ProbeReason, retried: Option<&str>) {
         let Some(snapshot) = self.last_snapshot.borrow().clone() else {
             return;
         };
@@ -2601,18 +2615,24 @@ impl ServerPage {
                 row.copy_error.set_visible(false);
                 row.retry.set_visible(false);
             }
-            self.spawn_probe(ticket);
+            let interactive = reason == health::ProbeReason::Refresh
+                || retried == Some(ticket.server_id.as_str());
+            self.spawn_probe(ticket, interactive);
         }
         self.update_posture();
     }
 
-    fn spawn_probe(&self, ticket: health::ProbeTicket) {
+    fn spawn_probe(&self, ticket: health::ProbeTicket, interactive: bool) {
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
             let server_id = ticket.server_id.clone();
             let id_for_probe = server_id.clone();
             let result = gtk::gio::spawn_blocking(move || {
-                crate::server_runtime::probe_health_registered(&id_for_probe)
+                if interactive {
+                    crate::server_runtime::probe_registered(&id_for_probe)
+                } else {
+                    crate::server_runtime::probe_health_registered(&id_for_probe)
+                }
             })
             .await;
             let probe = match result {
@@ -2625,6 +2645,7 @@ impl ServerPage {
                     auth_required: false,
                     failure: None,
                     auth_target: None,
+                    keyring_locked: false,
                 },
                 Err(_) => crate::server_runtime::ProbeResult {
                     server_id: server_id.clone(),
@@ -2634,6 +2655,7 @@ impl ServerPage {
                     auth_required: false,
                     failure: None,
                     auth_target: None,
+                    keyring_locked: false,
                 },
             };
             let outcome = page.health.borrow_mut().complete(
@@ -2643,7 +2665,7 @@ impl ServerPage {
             );
             match outcome {
                 health::ProbeOutcome::Apply => page.apply_probe(&server_id, &probe),
-                health::ProbeOutcome::Rerun(next) => page.spawn_probe(next),
+                health::ProbeOutcome::Rerun(next) => page.spawn_probe(next, interactive),
                 health::ProbeOutcome::Discard => {}
             }
             page.update_posture();
@@ -10223,7 +10245,7 @@ fn server_row(
     };
     let page_for_retry = page.clone();
     let retry_id = server.id.clone();
-    retry.connect_clicked(move |_| page_for_retry.reprobe_after_auth_change(&retry_id));
+    retry.connect_clicked(move |_| page_for_retry.retry_probe(&retry_id));
     // Recovery actions sit with the status they recover from, as in React; the
     // name and meta lines ellipsize to make room for them.
     let health_actions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -18281,6 +18303,7 @@ mod tests {
             auth_required: auth,
             failure: None,
             auth_target: None,
+            keyring_locked: false,
         };
         assert_eq!(
             probe_status_line(&probe(true, 1, false)),
@@ -18316,6 +18339,7 @@ mod tests {
                 auth_required: true,
                 failure: None,
                 auth_target: Some(target),
+                keyring_locked: false,
             };
             assert_eq!(probe_status_line(&probe), (text.into(), "review"));
             assert_eq!(probe_auth_action(&probe), action);
