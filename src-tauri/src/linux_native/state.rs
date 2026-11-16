@@ -1057,6 +1057,27 @@ mod tests {
         assert_eq!(snapshot.servers[0].origin_label, "Sync conflict");
     }
 
+    /// A Run from a server's Tools tab, as the gateway records it: GTK names it
+    /// as Toolport's Tools tab, not the process or the gateway it spawned.
+    #[test]
+    fn a_tools_tab_run_is_named_as_toolport() {
+        let snapshot = super::ActivitySnapshot::from_entries(
+            vec![serde_json::json!({
+                "client": "adapter:toolport-tools-tab",
+                "clientName": "toolport-gtk",
+                "clientLabel": "toolport-gateway 2.3.6",
+                "server": "slow", "tool": "echo", "ok": true, "durationMs": 9200,
+            })],
+            10,
+        );
+        let row = &snapshot.recent[0];
+        assert_eq!(row.client.as_deref(), Some("Toolport Tools tab"));
+        assert_eq!(row.client_label, None);
+        let detail = super::super::activity_detail(row);
+        assert!(detail.starts_with("Toolport Tools tab · "), "{detail}");
+        assert!(!detail.contains("toolport-"), "{detail}");
+    }
+
     #[test]
     fn historical_caller_paths_do_not_reach_native_rows_or_tooltips() {
         let snapshot = super::ActivitySnapshot::from_entries(

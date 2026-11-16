@@ -692,6 +692,104 @@ describe("ServerDialog", () => {
     await waitFor(() => expect(toastError).toHaveBeenCalledWith(message));
   });
 
+  it("leaves the form as it was when a paste is refused", async () => {
+    const header = "Toolport can send only an Authorization: Bearer header for now.";
+    const variable =
+      "Replace the shell variable or ~ in the server name, command or URL.";
+    api.parseServerSnippet
+      .mockRejectedValueOnce(header)
+      .mockResolvedValueOnce([
+        {
+          name: "first",
+          transport: "stdio",
+          command: "npx",
+          args: ["a"],
+          url: null,
+          env: [],
+        },
+      ])
+      .mockRejectedValueOnce(variable);
+    const user = userEvent.setup();
+    render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    // The user starts on the name, then goes to the paste box instead.
+    await user.click(screen.getByLabelText("Name"));
+    const paste = async (text: string) => {
+      if (!screen.queryByPlaceholderText(/claude mcp add \.\.\. \//))
+        await user.click(
+          screen.getByRole("button", { name: "Paste from client config" }),
+        );
+      const box = screen.getByPlaceholderText(/claude mcp add \.\.\. \//);
+      await user.clear(box);
+      await user.type(box, text);
+      await user.click(screen.getByRole("button", { name: "Parse & fill" }));
+    };
+    await paste("refused header");
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith(header));
+    expect(screen.queryByText("Give the server a name.")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Name")).toHaveValue("");
+
+    await paste("good");
+    await waitFor(() => expect(screen.getByLabelText("Name")).toHaveValue("first"));
+    await paste("refused variable");
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith(variable));
+    // The earlier paste's fields stay, as they were before the refused one.
+    expect(screen.getByLabelText("Name")).toHaveValue("first");
+    expect(screen.getByLabelText("Command")).toHaveValue("npx");
+  });
+
+  it("shows only the refusal after a paste, whichever empty field was visited", async () => {
+    const header = "Toolport can send only an Authorization: Bearer header for now.";
+    api.parseServerSnippet.mockRejectedValue(header);
+    const user = userEvent.setup();
+    render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    await user.type(screen.getByLabelText("Name"), "alpha");
+    const paste = async () => {
+      if (!screen.queryByPlaceholderText(/claude mcp add \.\.\. \//))
+        await user.click(
+          screen.getByRole("button", { name: "Paste from client config" }),
+        );
+      await user.type(screen.getByPlaceholderText(/claude mcp add \.\.\. \//), "x");
+      await user.click(screen.getByRole("button", { name: "Parse & fill" }));
+      await waitFor(() => expect(toastError).toHaveBeenCalledWith(header));
+      vi.mocked(toastError).mockClear();
+    };
+    // Arguments shows the empty command's error once visited.
+    await user.click(screen.getByLabelText("Arguments"));
+    await paste();
+    expect(
+      screen.queryByText("Enter the command to run (e.g. npx)."),
+    ).not.toBeInTheDocument();
+    // After a switch to http, Arguments' visit would show the empty URL's.
+    await user.click(screen.getByLabelText("Arguments"));
+    await user.click(screen.getByLabelText("Transport"));
+    await user.click(screen.getByRole("option", { name: "http (remote)" }));
+    await user.click(screen.getByLabelText("URL"));
+    await paste();
+    expect(screen.queryByText("Enter the server URL.")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Name")).toHaveValue("alpha");
+  });
+
+  it("reads the form as it is when a paste is refused, not as it was when sent", async () => {
+    const refusal = deferred<never>();
+    api.parseServerSnippet.mockReturnValueOnce(refusal.promise);
+    const user = userEvent.setup();
+    render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    await user.type(screen.getByLabelText("Name"), "alpha");
+    await user.click(screen.getByRole("button", { name: "Paste from client config" }));
+    await user.type(screen.getByPlaceholderText(/claude mcp add \.\.\. \//), "x");
+    await user.click(screen.getByRole("button", { name: "Parse & fill" }));
+    // While the paste is parsed, the user empties the name and moves on.
+    await user.clear(screen.getByLabelText("Name"));
+    await user.click(screen.getByPlaceholderText(/claude mcp add \.\.\. \//));
+    expect(screen.getByText("Give the server a name.")).toBeVisible();
+    await act(async () => refusal.reject("refused"));
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("refused"));
+    expect(screen.queryByText("Give the server a name.")).not.toBeInTheDocument();
+  });
+
   it("keeps a newer result when tests resolve out of order after reopening", async () => {
     const first = deferred<ProbeResult>();
     const second = deferred<ProbeResult>();

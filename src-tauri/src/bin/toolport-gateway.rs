@@ -5436,11 +5436,15 @@ fn execute_call(
     let catalog_visible = |id: &str| {
         visible(id) && (candidates.is_empty() || candidates.iter().any(|owner| owner == id))
     };
+    // Activity counts the wait for the server to start in the call's duration:
+    // the caller waited for it too.
+    let mut start_wait = CARRIED_START_WAIT.with(std::cell::Cell::get);
     if view.authorize(DispatchTarget::Tool(name)).is_ok() {
         for owner in &candidates {
             view.prepare_lazy_use(owner);
             view.kick_pending(owner, |id| id == owner);
         }
+        let waiting = Instant::now();
         if view.route_of(name).is_some() {
             // A cached route proves identity, not current safety metadata. Keep
             // the existing readiness wait before classifying a known call.
@@ -5462,7 +5466,9 @@ fn execute_call(
                 cancel.as_ref(),
             );
         }
+        start_wait += waiting.elapsed();
     }
+    let mut start_wait_ms = start_wait.as_millis().min(u64::MAX as u128) as u64;
     let router = fresh.as_deref().unwrap_or(router);
     let fresh_catalog = fresh.as_ref().map(|view| view.shared_tools());
     let cached = fresh_catalog
@@ -5727,8 +5733,13 @@ fn execute_call(
                             held_ms,
                             downstream,
                             newly_approved,
+                            start_wait: asked_after,
                         },
                     )) => {
+                        // The start happened on the request that asked; this
+                        // retry found the server ready.
+                        start_wait_ms = start_wait_ms
+                            .saturating_add(asked_after.as_millis().min(u64::MAX as u128) as u64);
                         approval_reason = stored_reason;
                         active_modern_hitl = Some(token.to_string());
                         routed_mrtr = Some(downstream);
@@ -5770,7 +5781,10 @@ fn execute_call(
                             &arguments,
                             incoming,
                         ) {
-                            Ok(token) => return modern_hitl_input_required(&token),
+                            Ok(token) => {
+                                set_modern_hitl_start_wait(&token, start_wait);
+                                return modern_hitl_input_required(&token);
+                            }
                             Err(decision) => (decision, 0, current_fp.clone(), true),
                         }
                     }
@@ -6053,7 +6067,7 @@ fn execute_call(
                 server_id,
                 tool,
                 ok,
-                Some(ms),
+                Some(ms + start_wait_ms),
                 err.as_deref(),
                 client,
                 client_name,
@@ -6115,7 +6129,7 @@ fn execute_call(
                 server_id,
                 tool,
                 false,
-                Some(ms),
+                Some(ms + start_wait_ms),
                 Some(&defended_err),
                 client,
                 client_name,
@@ -6157,6 +6171,48 @@ fn with_shaped(
         *after.entry(name).or_default() += count;
     }
     after
+}
+
+thread_local! {
+    /// When the request being served arrived at the gateway.
+    static REQUEST_RECEIVED: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Holds [`REQUEST_RECEIVED`] for one request and clears it afterwards.
+struct RequestReceived(Option<Instant>);
+
+impl RequestReceived {
+    fn enter() -> Self {
+        Self(REQUEST_RECEIVED.with(|cell| cell.replace(Some(Instant::now()))))
+    }
+}
+
+impl Drop for RequestReceived {
+    fn drop(&mut self) {
+        REQUEST_RECEIVED.with(|cell| cell.set(self.0));
+    }
+}
+
+thread_local! {
+    /// How long the request being served already waited before [`execute_call`],
+    /// such as for its server to start, so Activity counts it in the duration.
+    static CARRIED_START_WAIT: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+/// Holds [`CARRIED_START_WAIT`] for one call and clears it afterwards.
+struct CarriedStartWait;
+
+impl CarriedStartWait {
+    fn enter(waited: Duration) -> Self {
+        CARRIED_START_WAIT.with(|cell| cell.set(waited));
+        Self
+    }
+}
+
+impl Drop for CarriedStartWait {
+    fn drop(&mut self) {
+        CARRIED_START_WAIT.with(|cell| cell.set(Duration::ZERO));
+    }
 }
 
 /// Flags for [`execute_call`] that would otherwise be adjacent bools (easy to swap).
@@ -9019,6 +9075,14 @@ fn handle_request_with_cancel(
                     .route_of(&name)
                     .is_some_and(|(server, _)| server_supports_mcp_app_html(router, server));
             let mrtr = MrtrRequest::from_params(params);
+            // Count what this call already waited for, such as its server
+            // starting, in its Activity duration.
+            let _start_wait = CarriedStartWait::enter(
+                REQUEST_RECEIVED
+                    .with(std::cell::Cell::get)
+                    .map(|received| received.elapsed())
+                    .unwrap_or_default(),
+            );
             let result = execute_call(
                 reg,
                 router,
@@ -16214,6 +16278,10 @@ struct ModernHitlApproval {
     approved_fingerprint: Option<String>,
     reason: approval::ApprovalReason,
     started: Instant,
+    /// How long the call waited for its server to start before asking. The
+    /// approved retry adds it to the call's Activity duration; the approval
+    /// wait itself is not counted.
+    start_wait: Duration,
     downstream: MrtrRequest,
     input_request: Value,
     status: ModernHitlStatus,
@@ -16247,6 +16315,7 @@ enum ModernHitlPoll {
         held_ms: u64,
         downstream: MrtrRequest,
         newly_approved: bool,
+        start_wait: Duration,
     },
 }
 
@@ -16352,6 +16421,7 @@ fn start_modern_hitl(
                 approved_fingerprint,
                 reason,
                 started: Instant::now(),
+                start_wait: Duration::ZERO,
                 downstream,
                 input_request: json!({
                     "method": "elicitation/create",
@@ -16459,6 +16529,7 @@ fn poll_modern_hitl(
                     held_ms: pending.started.elapsed().as_millis() as u64,
                     downstream: pending.downstream.clone(),
                     newly_approved,
+                    start_wait: pending.start_wait,
                 },
                 false,
             )
@@ -16468,6 +16539,13 @@ fn poll_modern_hitl(
         approvals.remove(token);
     }
     poll
+}
+
+/// Remember the start wait of the call this approval holds.
+fn set_modern_hitl_start_wait(token: &str, start_wait: Duration) {
+    session_tables().hitl().with(token, |pending| {
+        pending.start_wait = start_wait;
+    });
 }
 
 fn update_modern_hitl_downstream(token: &str, result: &mut Value) {
@@ -17245,6 +17323,11 @@ fn process_request(
     .map(GatewayResponse::into_value)
 }
 
+/// A Run from Toolport's own Tools tab, by the client ID it launches with.
+fn is_tools_tab_client(client: Option<&str>) -> bool {
+    client.map(|id| id.strip_prefix("adapter:").unwrap_or(id)) == Some(clients::TOOLS_TAB_CLIENT_ID)
+}
+
 fn catalog_wait_budget(
     discovery: DiscoveryMode,
     tool_search: bool,
@@ -17253,6 +17336,8 @@ fn catalog_wait_budget(
 ) -> Duration {
     if setup {
         downstream::SETUP_CATALOG_WAIT_BUDGET
+    } else if is_tools_tab_client(client) {
+        Duration::ZERO
     } else if discovery == DiscoveryMode::Full || tool_search {
         Duration::from_millis(
             clients::discovery_capabilities(client.unwrap_or("")).cold_full_list_wait_ms,
@@ -17548,6 +17633,7 @@ fn process_request_wire_inner(
         UpstreamTransport::Stdio
     });
     let _request = UpstreamRequestGuard::enter(client.map(str::to_string));
+    let _received = RequestReceived::enter();
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     // One deadline includes startup and rooted composition, rather than granting
     // each phase another budget. Warm tools lists never enter the catalog wait.
@@ -17555,10 +17641,13 @@ fn process_request_wire_inner(
     let search_server = tool_search
         .then(|| req["params"]["arguments"]["server"].as_str())
         .flatten();
+    // Direct stdio (the in-process fallback) passes no client; the process's
+    // own client ID names it then.
+    let request_client = client.or(state.client_id.as_deref());
     let tools_list_budget = catalog_wait_budget(
         discovery,
         tool_search,
-        client,
+        request_client,
         std::env::args().any(|arg| arg == "--setup-review"),
     );
     let tools_list_deadline = Instant::now() + tools_list_budget;
@@ -17597,6 +17686,9 @@ fn process_request_wire_inner(
     let _label = ClientLabelGuard::enter(session_label);
 
     let wait = match method {
+        // Toolport's own Tools tab never reads this list; it calls one tool,
+        // which waits for its server itself and counts that wait.
+        "tools/list" if is_tools_tab_client(request_client) => false,
         "tools/list" if discovery == DiscoveryMode::Full => true,
         "tools/list" => {
             let reg = state
@@ -28533,6 +28625,7 @@ mod tests {
                 input_request: json!({ "method": "elicitation/create" }),
                 status: ModernHitlStatus::AwaitingClient,
                 abandoned_audit: None,
+                start_wait: Duration::ZERO,
                 _cancel_guard: None,
             },
         );
@@ -28582,6 +28675,7 @@ mod tests {
                         input_request: json!({ "method": "elicitation/create" }),
                         status: ModernHitlStatus::AwaitingClient,
                         abandoned_audit: None,
+                        start_wait: Duration::ZERO,
                         _cancel_guard: None,
                     },
                 );
@@ -48659,6 +48753,69 @@ mod tests {
         host.http = false;
         state.host = Arc::new(host);
         state
+    }
+
+    /// The Tools tab's gateway can serve its own stdio when the shared daemon is
+    /// unavailable. There the request carries no client, and the process's
+    /// client ID still skips the catalog wait the Tools tab never reads.
+    #[test]
+    fn a_direct_stdio_tools_tab_does_not_wait_for_catalogs() {
+        let _env = DataDirTestEnv::new("direct-stdio-tools-tab");
+        let mut state = stdio_state();
+        state.client_id = Some(clients::TOOLS_TAB_CLIENT_ID.into());
+        state.ready.store(false, Ordering::SeqCst);
+        let started = Instant::now();
+        process_request(
+            &state,
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+            &SearchGuard::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            DiscoveryMode::Full,
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited {:?} for catalogs",
+            started.elapsed()
+        );
+    }
+
+    /// An approved retry finds the server ready; the start the asking request
+    /// waited for travels with the approval so the call's duration counts it.
+    #[test]
+    fn an_approval_carries_the_start_wait_to_the_approved_retry() {
+        let _env = DataDirTestEnv::new("approval-carries-start-wait");
+        session_tables().hitl().clear();
+        let arguments = json!({ "target": "x" });
+        let hash = audit::args_hash(&arguments);
+        let token = start_modern_hitl(
+            "s__wipe",
+            hash.clone(),
+            None,
+            approval::ApprovalReason::Destructive,
+            Some("cursor"),
+            "s",
+            "wipe",
+            &arguments,
+            MrtrRequest::default(),
+        )
+        .unwrap();
+        set_modern_hitl_start_wait(&token, Duration::from_millis(2500));
+        let approved = poll_modern_hitl(
+            &token,
+            "s__wipe",
+            &hash,
+            Some("cursor"),
+            Some(json!({"toolport_approval": {"action": "accept", "content": {"approved": true}}})),
+        );
+        let ModernHitlPoll::Approved { start_wait, .. } = approved else {
+            panic!("accepted approval should resume")
+        };
+        assert_eq!(start_wait, Duration::from_millis(2500));
     }
 
     #[test]

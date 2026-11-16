@@ -2862,9 +2862,17 @@ fn scan_roo_code_plugins() -> Vec<McpServer> {
 
 /// Resolve display identity from configured names, never clientInfo.
 /// Recorded friendly names remain authoritative for historical Activity rows.
+/// The client ID Toolport's own Tools tab Runs use, and the name Activity shows
+/// for them. The shells translate the name.
+pub const TOOLS_TAB_CLIENT_ID: &str = "toolport-tools-tab";
+pub const TOOLS_TAB_CLIENT_NAME: &str = "Toolport Tools tab";
+
 pub fn known_adapter_name(id: &str) -> Option<String> {
     if let Some(location) = locations::lookup(id) {
         return Some(location.name);
+    }
+    if id == TOOLS_TAB_CLIENT_ID {
+        return Some(TOOLS_TAB_CLIENT_NAME.into());
     }
     if id == "claude-code-secondary" {
         return Some("Claude Code (secondary)".into());
@@ -2914,6 +2922,10 @@ impl CallerNames {
         names.insert(
             "adapter:claude-code-secondary".into(),
             "Claude Code (secondary)".into(),
+        );
+        names.insert(
+            format!("adapter:{TOOLS_TAB_CLIENT_ID}"),
+            TOOLS_TAB_CLIENT_NAME.into(),
         );
         if entries.iter().any(|entry| {
             entry["client"]

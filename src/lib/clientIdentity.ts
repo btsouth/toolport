@@ -3,6 +3,9 @@ export const UNRECORDED_CLIENT_TOOLTIP = msg(
   "Older Toolport versions did not record callers for these rows.",
 );
 
+/** The client ID of a Run from a server's Tools tab in Toolport itself. */
+const TOOLS_TAB_CLIENT = "adapter:toolport-tools-tab";
+
 function hasTrustedName(name?: string | null): boolean {
   return (
     !!name && !["An AI client", "Unknown client", "Unrecorded client"].includes(name)
@@ -15,6 +18,8 @@ export function trustedClientName(client: {
   clientLabel?: string | null;
   client?: string | null;
 }): string {
+  // Toolport's own Tools tab Runs: a name Toolport gives, so it is translated.
+  if (client.client === TOOLS_TAB_CLIENT) return translate("Toolport Tools tab");
   if (hasTrustedName(client.clientName) && client.clientName) return client.clientName;
   if (client.clientLabel)
     return translate("{name} (reported)", { name: client.clientLabel });

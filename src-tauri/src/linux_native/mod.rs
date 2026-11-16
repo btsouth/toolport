@@ -7066,6 +7066,10 @@ fn activity_title(activity: &state::ActivityView) -> String {
 // cases are presentation sources; user-reported names are inserted verbatim.
 fn localized_caller_name(name: Option<&str>, label: Option<&str>) -> String {
     let canonical = crate::clients::display_caller_name(name, label);
+    // Toolport's own Tools tab Runs: a name Toolport gives, so it is translated.
+    if canonical == crate::clients::TOOLS_TAB_CLIENT_NAME {
+        return crate::i18n::tr("Toolport Tools tab");
+    }
     if name.is_some_and(|name| {
         !name.is_empty()
             && !matches!(
@@ -12392,6 +12396,9 @@ fn open_server_editor_prefilled(
     }
     form.append(&credentials);
 
+    // Set once the field checks exist: after a refused paste, an empty field
+    // shows no error, so the refusal is the only message (as in React).
+    let quiet_empty_fields: LateAction = Default::default();
     if !editing {
         let paste = {
             let widget = gtk::Expander::new(None);
@@ -12445,6 +12452,7 @@ fn open_server_editor_prefilled(
             .expect("Add server has a pasted env section");
         let credentials_for_fill = credentials.clone();
         let page_for_fill = page.clone();
+        let quiet_for_fill = quiet_empty_fields.clone();
         fill.connect_clicked(move |fill| {
             let buffer = snippet.buffer();
             let text = buffer
@@ -12513,6 +12521,11 @@ fn open_server_editor_prefilled(
                     l10n::bind_label_with(&feedback_for_fill, move || failure.message());
                     feedback_for_fill.remove_css_class("success");
                     feedback_for_fill.add_css_class("error");
+                    // The form stays as it was before this paste, and the
+                    // refusal is its only message.
+                    if let Some(quiet) = quiet_for_fill.borrow().clone() {
+                        quiet();
+                    }
                 }
             }
         });
@@ -12642,6 +12655,17 @@ fn open_server_editor_prefilled(
             test.set_sensitive(valid && !busy.get());
         })
     };
+    {
+        let (validation_errors, validate) = (validation_errors.clone(), validate.clone());
+        *quiet_empty_fields.borrow_mut() = Some(std::rc::Rc::new(move || {
+            for (entry, _, touched) in &validation_errors {
+                if entry.text().trim().is_empty() {
+                    touched.set(false);
+                }
+            }
+            validate();
+        }));
+    }
     // An edit makes an earlier result or error stale. Only edits clear it:
     // moving focus in and out of a field keeps a finished Test result.
     // Counts edits, so a Test that finishes after one knows its result is for
@@ -13340,6 +13364,9 @@ fn editor_timeout_ms(text: &str) -> Result<Option<u64>, String> {
     }
     Ok(Some(milliseconds as u64))
 }
+
+/// An action set after the widgets it needs exist.
+type LateAction = std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>>;
 
 /// The exact arguments behind the one-per-line box, until the user edits it.
 type ExactArgs = std::rc::Rc<std::cell::RefCell<Option<Vec<String>>>>;
@@ -17085,6 +17112,129 @@ mod tests {
         assert_eq!(filter_tool_identities(&identities, "search").len(), 1);
         assert_eq!(filter_tool_identities(&identities, "jira").len(), 1);
         assert_eq!(filter_tool_identities(&identities, "nothing").len(), 0);
+    }
+
+    /// A refused paste leaves Add server as it was before that paste and shows
+    /// only the refusal: no "Give the server a name." for the name the user
+    /// only left to use the paste box, and the fields of an earlier paste stay.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn a_refused_paste_leaves_the_form_and_shows_only_the_refusal() {
+        use super::*;
+        adw::init().unwrap();
+        let _data = crate::registry::DataDirTestEnv::new("gtk-refused-paste");
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.RefusedPaste")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gtk::gio::Cancellable::NONE).unwrap();
+        let parent = adw::ApplicationWindow::builder().application(&app).build();
+        let (content, page, _) = build_content(&app, crate::approval_broker::start_native());
+        parent.set_content(Some(&content));
+        parent.present();
+        let editor = open_server_editor_prefilled(None, None, page, None).unwrap();
+        fn widgets(widget: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+            out.push(widget.clone());
+            let mut child = widget.first_child();
+            while let Some(node) = child {
+                child = node.next_sibling();
+                widgets(&node, out);
+            }
+        }
+        let all = || {
+            let mut all = Vec::new();
+            widgets(editor.upcast_ref(), &mut all);
+            all
+        };
+        let expander = all()
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::Expander>().ok())
+            .unwrap();
+        expander.set_expanded(true);
+        let all = all();
+        let entry = |placeholder: &str| {
+            all.iter()
+                .filter_map(|w| w.downcast_ref::<gtk::Entry>())
+                .find(|e| e.placeholder_text().as_deref() == Some(placeholder))
+                .unwrap()
+                .clone()
+        };
+        let (name, command) = (entry("My MCP server"), entry("npx"));
+        let snippet = all
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::TextView>())
+            .find(|t| t.ancestor(gtk::Expander::static_type()).is_some())
+            .unwrap()
+            .clone();
+        let fill = all
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Button>())
+            .find(|b| b.label().as_deref() == Some("Fill from snippet"))
+            .unwrap()
+            .clone();
+        let name_error = all
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .find(|l| l.label() == "Give the server a name.")
+            .unwrap()
+            .clone();
+        let feedback = all
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .find(|l| l.has_css_class("toolport-feedback") && !l.has_css_class("warning"))
+            .unwrap()
+            .clone();
+        // Let the window map and take focus, as it does for a user.
+        let pump = || {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(200);
+            while std::time::Instant::now() < until {
+                gtk::glib::MainContext::default().iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        let paste = |text: &str| {
+            snippet.buffer().set_text(text);
+            fill.emit_clicked();
+            pump();
+        };
+
+        // The dialog opens on the name; the user goes to the paste box instead.
+        gtk::prelude::GtkWindowExt::set_focus(&editor, Some(&name));
+        pump();
+        snippet.grab_focus();
+        pump();
+        assert!(
+            name_error.is_visible(),
+            "leaving the empty name marks it, as in React"
+        );
+        paste("claude mcp add -t http demo https://example.com/mcp -H 'X-API-Key: abc'");
+        assert!(feedback.is_visible());
+        assert!(
+            feedback.label().contains("Authorization: Bearer"),
+            "{}",
+            feedback.label()
+        );
+        assert!(
+            !name_error.is_visible(),
+            "the refusal is the only message on the empty form"
+        );
+        assert!(!name.has_css_class("error"));
+        assert_eq!(name.text(), "");
+
+        paste("claude mcp add first -- npx a");
+        assert_eq!(name.text(), "first");
+        assert_eq!(command.text(), "npx");
+        paste("claude mcp add second -- $HOME/bin/server");
+        assert!(
+            feedback.label().contains("shell variable"),
+            "{}",
+            feedback.label()
+        );
+        // The earlier paste's fields stay, as they were before the refused one.
+        assert_eq!(name.text(), "first");
+        assert_eq!(command.text(), "npx");
+        assert!(!name_error.is_visible());
+        drop(editor);
     }
 
     #[test]

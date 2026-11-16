@@ -1131,9 +1131,21 @@ pub fn register_inline_secrets(server: &ServerEntry) {
     }
     // The mask also marks the value after a split flag (`--token` `value`).
     let mask = crate::registry::secret_arg_mask(&server.args);
-    for (arg, _) in server.args.iter().zip(mask).filter(|(_, masked)| *masked) {
+    // Named as an import names that argument's stored value, so Toolport calls
+    // one value by one name wherever it is redacted.
+    for (index, (arg, _)) in server
+        .args
+        .iter()
+        .zip(mask)
+        .enumerate()
+        .filter(|(_, (_, masked))| *masked)
+    {
         if let Some(credential) = arg_credential(arg) {
-            crate::secret_redact::register(&server.id, "arg", credential);
+            crate::secret_redact::register(
+                &server.id,
+                &crate::import_credentials::imported_arg_key(index),
+                credential,
+            );
         }
     }
     // Credential parts of a configured URL, never the bare URL or the username.
@@ -1390,11 +1402,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             out,
-            "split [secret:arg] joined [secret:arg] empty [secret:arg] --token= --verbose server.js"
+            "split [secret:IMPORTED_ARG_2] joined [secret:IMPORTED_ARG_3] empty [secret:IMPORTED_ARG_5] --token= --verbose server.js"
         );
         assert_eq!(
             headers,
-            "bare [secret:arg] and [secret:arg]; Authorization required, X-Api-Key missing"
+            "bare [secret:IMPORTED_ARG_8] and [secret:IMPORTED_ARG_9]; Authorization required, X-Api-Key missing"
         );
     }
 

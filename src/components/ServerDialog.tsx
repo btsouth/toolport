@@ -2,7 +2,7 @@ import { translate, useI18n, Trans } from "@/lib/i18n";
 import { envRowSyncs } from "@/lib/envRowSyncs";
 import { secretReferenceReview } from "@/lib/secretRefs";
 import { SecretReferenceField } from "@/components/SecretReferenceField";
-import { useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -89,6 +89,24 @@ type TestResult = Extract<TestState, { status: "ok" | "fail" }>;
 
 const IDLE_TEST: TestState = { status: "idle", message: "" };
 
+/** The field ids whose visit shows a "required" error the form has now: the
+ * same fields `addError` names below for an empty name, command or URL. */
+function emptyFieldErrorIds(form: {
+  name: string;
+  transport: string;
+  command: string;
+  url: string;
+}) {
+  const ids = new Set<string>();
+  if (!form.name.trim()) ids.add("srv-name");
+  if (form.transport === "stdio") {
+    if (!form.command.trim()) ["srv-cmd", "srv-args"].forEach((id) => ids.add(id));
+  } else if (!form.url.trim()) {
+    ["srv-url", "srv-args"].forEach((id) => ids.add(id));
+  }
+  return ids;
+}
+
 export function ServerDialog({
   trigger,
   onSaved,
@@ -157,6 +175,10 @@ export function ServerDialog({
   const [busy, setBusy] = useState(false);
   const [test, setTest] = useState<TestState>(IDLE_TEST);
   const testRequestId = useRef(0);
+  const formRef = useRef(form);
+  useEffect(() => {
+    formRef.current = form;
+  });
   const [partialEdit, setPartialEdit] = useState<{ id: string; name: string } | null>(
     null,
   );
@@ -303,6 +325,12 @@ export function ServerDialog({
       // The backend message is already in the user's language and never holds
       // pasted text; GTK shows the same sentence.
       toastError(String(e));
+      // The form stays as it was before this paste, and the refusal is its only
+      // message: an empty field it left the user in shows no error yet.
+      // Read the form as it is now: the user may have edited it while the
+      // paste was being parsed.
+      const quiet = emptyFieldErrorIds(formRef.current);
+      setTouched((previous) => new Set([...previous].filter((id) => !quiet.has(id))));
     } finally {
       setParsing(false);
     }

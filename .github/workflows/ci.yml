@@ -353,6 +353,7 @@ jobs:
             teams::tests::member_review_native_keeps_remaining_decisions_open \
             teams::tests::share_preview_explains_each_selection_and_its_route \
             tests::editor_validation_clears_feedback_and_keeps_test_result_outside_scroll \
+            tests::a_refused_paste_leaves_the_form_and_shows_only_the_refusal \
             teams::tests::share_preview_widgets_show_allowlisted_definitions \
             quiet_tooltips::tests::a_guarded_menu_silences_tooltips_before_it_is_presented \
             quiet_tooltips::tests::dropdowns_split_buttons_and_popovers_silence_tooltips_while_open \

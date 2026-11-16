@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, act, fireEvent, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ActivityView } from "./ActivityView";
+import { setLanguage } from "@/lib/i18n";
 import type { AuditEntry, SearchTrace } from "@/lib/types";
 import type { SecurityEvent } from "@/lib/api";
 
@@ -1327,6 +1328,34 @@ it("uses one server filter and one identity, time and wait meta line", async () 
   await user.click(screen.getByRole("combobox"));
   expect(screen.getAllByRole("option", { name: /^team_slack$/ })).toHaveLength(1);
   expect(screen.queryByRole("option", { name: /^team-slack$/ })).not.toBeInTheDocument();
+});
+
+it("names a Tools tab Run as Toolport and shows its whole duration", async () => {
+  const ts = Date.now() - 120000;
+  // As the backend returns it: the Tools tab's own ID and trusted name, no label.
+  getAuditLog.mockResolvedValue([
+    entry({
+      ts,
+      tool: "echo",
+      client: "adapter:toolport-tools-tab",
+      clientName: "Toolport Tools tab",
+      durationMs: 9200,
+    }),
+  ]);
+  render(<ActivityView refreshKey={0} registry={null} />);
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+  expect(detailLine("Toolport Tools tab · 2m ago · 9.2 s")).toBeVisible();
+  expect(
+    screen.queryByText(/toolport-gtk|toolport-gateway|reports/),
+  ).not.toBeInTheDocument();
+  // A name Toolport gives, so it follows the language.
+  await act(() => setLanguage("fr"));
+  try {
+    expect(screen.getByText("Toolport, onglet Outils")).toBeVisible();
+  } finally {
+    await act(() => setLanguage("en"));
+  }
 });
 
 /** The row's detail line, whose client name and time are separate spans. */
