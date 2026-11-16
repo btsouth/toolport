@@ -1,7 +1,10 @@
 name: CI
 
 on:
+  # Drafts run the Linux checks only (see ci-policy.mjs fullRun). Marking a PR
+  # ready for review starts the full run; so does every later push to it.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main, next/2.0]
   workflow_dispatch:
@@ -18,8 +21,14 @@ permissions:
 jobs:
   windows-installer:
     name: Windows NSIS bundle validation
-    needs: changes
-    if: needs.changes.outputs.installers == 'true'
+    # macOS and Windows runners are the scarce ones: start only after the cheap
+    # Linux gates pass, and never for a draft PR.
+    needs: [changes, frontend, clippy, rustfmt]
+    if: >-
+      ${{ !cancelled() && needs.changes.outputs.full == 'true' &&
+      needs.changes.outputs.installers == 'true' && needs.frontend.result == 'success' &&
+      (needs.changes.outputs.rust == 'false' ||
+      (needs.clippy.result == 'success' && needs.rustfmt.result == 'success')) }}
     runs-on: windows-latest
     timeout-minutes: 90
     # CI-only release-profile overrides reach both Tauri and prepare-sidecar.
@@ -74,8 +83,14 @@ jobs:
 
   macos-payload:
     name: macOS app payload validation
-    needs: changes
-    if: needs.changes.outputs.installers == 'true'
+    # macOS and Windows runners are the scarce ones: start only after the cheap
+    # Linux gates pass, and never for a draft PR.
+    needs: [changes, frontend, clippy, rustfmt]
+    if: >-
+      ${{ !cancelled() && needs.changes.outputs.full == 'true' &&
+      needs.changes.outputs.installers == 'true' && needs.frontend.result == 'success' &&
+      (needs.changes.outputs.rust == 'false' ||
+      (needs.clippy.result == 'success' && needs.rustfmt.result == 'success')) }}
     runs-on: macos-latest
     timeout-minutes: 90
     # CI-only release-profile overrides reach both Tauri and prepare-sidecar.
@@ -137,7 +152,7 @@ jobs:
   linux-appimage:
     name: Linux AppImage validation
     needs: changes
-    if: needs.changes.outputs.installers == 'true'
+    if: needs.changes.outputs.installers == 'true' && needs.changes.outputs.full == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     # Same CI-only overrides as the Windows and macOS installer jobs. The patch
@@ -200,6 +215,8 @@ jobs:
       rust: ${{ steps.select.outputs.rust }}
       linux_packages: ${{ steps.select.outputs.linux_packages }}
       installers: ${{ steps.select.outputs.installers }}
+      full: ${{ steps.select.outputs.full }}
+      headless_matrix: ${{ steps.select.outputs.headless_matrix }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -224,6 +241,7 @@ jobs:
           CI_EVENT: ${{ github.event_name }}
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           CI_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          CI_DRAFT: ${{ github.event.pull_request.draft }}
         run: node .github/scripts/ci-policy.mjs select
 
   frontend:
@@ -529,26 +547,30 @@ jobs:
           done
 
   cross-platform-rust:
-    needs: changes
+    # Waits for the cheap Linux gates so a push that fails them never takes a
+    # macOS or Windows runner. The matrix comes from ci-policy.mjs headlessMatrix:
+    # drafts get the two Linux entries only.
+    needs: [changes, frontend, clippy, rustfmt]
     if: needs.changes.outputs.rust == 'true'
     name: Headless Rust tests (${{ matrix.os }}, ${{ matrix.group }})
-    # 30 minutes covered macOS runs of 27:11 (626c17d6) and 27:25 (644a8199),
-    # but a35863c7 hit the cap at 30:10 as test compilation rose to 4:58.
-    # The test-only idle timer saves about five minutes, leaving about 25 minutes
-    # on that slower runner. Keep cold compilation margin on all three OSes.
-    timeout-minutes: 35
+    # Hang backstops, not targets. Linux and Windows run core and integration
+    # as separate jobs; 35 minutes keeps cold compilation margin for each.
+    # macOS runs both groups in one job to need one runner and one compile of
+    # the shared library. Over 25 recent green runs the split macOS jobs took
+    # 6 to 14 minutes (core) and 9 to 23 (integration), summing to 20 to 35
+    # (median 24) including two setups. Dropping one setup and one compile of
+    # the shared library, the combined job should take about 22, and about 32
+    # on the slowest run seen (integration compile 7.8 minutes). Before
+    # nextest, the single macOS job ran 27 minutes and once hit 30:10 (a35863c7).
+    # 45 keeps that cold-compile margin on the one job doing both groups.
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && 45 || 35 }}
     env:
       TOOLPORT_TEST_FAILURE_LOG_DIR: ${{ github.workspace }}/.verify/one-gateway-failures
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-latest, windows-latest]
-        group: [core, integration]
-        include:
-          - group: core
-            targets: --lib --bins
-          - group: integration
-            targets: --test '*'
+        # Groups: core is --lib --bins, integration is --test '*', all is both.
+        include: ${{ fromJSON(needs.changes.outputs.headless_matrix) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -564,7 +586,7 @@ jobs:
       # The signature tests compile their output with the repository's tsc and
       # fail in CI when it is missing.
       - name: Install frontend dependencies for the signature compile checks
-        if: matrix.group == 'core'
+        if: matrix.group != 'integration'
         run: npm ci
 
       # BGE uses Candle CPU on all release targets. No ONNX Runtime shared
@@ -586,8 +608,8 @@ jobs:
           workspaces: src-tauri
           key: ci-headless
           cache-bin: "false"
-          # Only one group saves the shared dependency cache, after desktop checks.
-          save-if: ${{ matrix.group == 'integration' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next/2.0') }}
+          # Only one group per OS saves the shared dependency cache, after desktop checks.
+          save-if: ${{ matrix.group != 'core' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next/2.0') }}
       - name: Compile Rust tests and record build timings
         if: matrix.os != 'windows-latest'
         run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support,search-static ${{ matrix.targets }} --no-run --timings
@@ -607,16 +629,16 @@ jobs:
         run: powershell -ExecutionPolicy Bypass -File scripts/test-rust-windows.ps1 -NoDefaultFeatures -TestGroup ${{ matrix.group }} -Nextest
 
       - name: Build headless gateway for cross-platform smoke
-        if: matrix.os != 'ubuntu-22.04' && matrix.group == 'integration'
+        if: matrix.os != 'ubuntu-22.04' && matrix.group != 'core'
         run: cargo build --manifest-path src-tauri/Cargo.toml --bin toolport-gateway --bin mock-mcp-server --no-default-features --features test-support,search-static
 
       - name: Headless gateway security smoke (macOS)
-        if: matrix.os == 'macos-latest' && matrix.group == 'integration'
+        if: matrix.os == 'macos-latest' && matrix.group != 'core'
         run: node scripts/smoke-headless.mjs
 
       # Report only: what starting the daemon on demand costs the first call.
       - name: First tool call with and without a running daemon (macOS, debug build)
-        if: matrix.os == 'macos-latest' && matrix.group == 'integration'
+        if: matrix.os == 'macos-latest' && matrix.group != 'core'
         continue-on-error: true
         env:
           TOOLPORT_BENCH_PROFILE: debug
@@ -628,16 +650,17 @@ jobs:
 
       # Approval OS toasts use desktop-only APIs. Headless checks cannot compile
       # the Windows/macOS notification branches.
+      # macOS (group all) already installed them for the signature checks.
       - name: Install frontend dependencies for desktop approval checks
-        if: matrix.os != 'ubuntu-22.04' && matrix.group == 'integration'
+        if: matrix.os == 'windows-latest' && matrix.group == 'integration'
         run: npm ci
 
       - name: Build frontend assets for desktop approval checks
-        if: matrix.os != 'ubuntu-22.04' && matrix.group == 'integration'
+        if: matrix.os != 'ubuntu-22.04' && matrix.group != 'core'
         run: npm run build
 
       - name: Compile desktop approval notifications (Windows and macOS)
-        if: matrix.os != 'ubuntu-22.04' && matrix.group == 'integration'
+        if: matrix.os != 'ubuntu-22.04' && matrix.group != 'core'
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml --lib
 
       # scripts/install.ps1 is piped into `iex` from a pinned commit, so a
@@ -669,6 +692,14 @@ jobs:
 
   installer-script:
     name: Installer script tests
+    needs: [changes, frontend, clippy, rustfmt]
+    # A Windows runner: same rule as the bundle validations above, minus the
+    # installer selection (this job always ran).
+    if: >-
+      ${{ !cancelled() && needs.changes.outputs.full == 'true' &&
+      needs.frontend.result == 'success' &&
+      (needs.changes.outputs.rust == 'false' ||
+      (needs.clippy.result == 'success' && needs.rustfmt.result == 'success')) }}
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -758,7 +789,10 @@ jobs:
   # install.ps1 Pester job could not block merge. This job keeps the required
   # name and requires all selected checks. Only unchanged native jobs on a
   # frontend-only PR may skip; failures, cancellations and unexpected skips
-  # block the gate. Clippy and changed-line Rust formatting are also required. Adding job names as
+  # block the gate. Clippy and changed-line Rust formatting are also required.
+  # A draft PR skips the macOS, Windows and installer jobs, so its gate always
+  # fails with a message saying so: a skipped or green gate would satisfy branch
+  # protection on that SHA until the ready-for-review run replaced it. Adding job names as
   # separate required contexts still needs a GitHub settings click; this file
   # cannot do that.
   merge-gate:

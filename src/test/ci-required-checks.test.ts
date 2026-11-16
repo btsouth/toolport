@@ -86,8 +86,26 @@ function needsOf(job: WorkflowJob): string[] {
 }
 
 /** The `strategy.matrix.os` list, or undefined when it is absent or dynamic. */
-function matrixOs(job: WorkflowJob): string[] | undefined {
-  const os = job.strategy?.matrix?.os;
+// cross-platform-rust takes its matrix from the select job, which writes
+// ci-policy.mjs headlessMatrix(full). Only that exact expression resolves; any
+// other dynamic matrix stays undefined.
+const POLICY_MATRIX = "${{ fromJSON(needs.changes.outputs.headless_matrix) }}";
+
+type MatrixEntry = { os: string };
+
+async function fullPolicyMatrix(): Promise<MatrixEntry[]> {
+  const path = join(process.cwd(), ".github/scripts/ci-policy.mjs");
+  const policy = (await import(/* @vite-ignore */ path)) as {
+    headlessMatrix: (full: boolean) => MatrixEntry[];
+  };
+  return policy.headlessMatrix(true);
+}
+
+function matrixOs(job: WorkflowJob, policy: MatrixEntry[] = []): string[] | undefined {
+  const matrix = job.strategy?.matrix;
+  if (matrix?.include === POLICY_MATRIX && matrix.os === undefined)
+    return policy.map((entry) => entry.os);
+  const os = matrix?.os;
   if (!Array.isArray(os)) return undefined;
   return os.map(String);
 }
@@ -304,12 +322,12 @@ describe("CI required merge gate (SBS-874)", () => {
     expect(script).toMatch(/exit 1/);
   });
 
-  it("still runs Windows keyring tests on a windows-latest matrix cell", () => {
+  it("still runs Windows keyring tests on a windows-latest matrix cell", async () => {
     const job = jobs["cross-platform-rust"];
     expect(job).toBeDefined();
     // The list itself, not a substring of the block: `windows-latest` also
     // appears in step `if:` guards, so those must not stand in for a cell.
-    expect(matrixOs(job)).toContain("windows-latest");
+    expect(matrixOs(job, await fullPolicyMatrix())).toContain("windows-latest");
     expect(runScripts(job).join("\n")).toContain("scripts/test-rust-windows.ps1");
   });
 });

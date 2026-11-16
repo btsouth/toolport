@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  DraftRun,
+  fullRun,
+  headlessMatrix,
   needsInstallers,
   needsLinuxPackages,
   needsRust,
@@ -10,6 +13,7 @@ import {
 test("frontend-only PRs skip unchanged native code", () => {
   for (const files of [
     ["src/App.tsx"],
+    ["src/locales/de.ts", "src/locales/GLOSSARY.md", "src/lib/api.ts"],
     ["public/logo.svg"],
     ["index.html", "vite.config.ts", "tsconfig.app.json"],
   ])
@@ -31,6 +35,13 @@ test("docs, packaging and non-CI workflow PRs skip native checks", () => {
 
 test("native, shared, unknown, empty diffs and main pushes run native checks", () => {
   for (const file of [
+    "src/locales/shell/en.json",
+    "src/locales/native/de.json",
+    "src/lib/personalSync.ts",
+    "src/lib/secretRefs.ts",
+    "src/lib/teamUrl.ts",
+    "src/lib/teamsPlan.ts",
+    "docs/clients.md",
     "src-tauri/src/lib.rs",
     "package-lock.json",
     "package.json",
@@ -51,47 +62,48 @@ test("native, shared, unknown, empty diffs and main pushes run native checks", (
   assert.equal(needsRust("push", ["src/App.tsx"]), true);
 });
 
-function results(selected, packages = "true", installers = "true") {
+const RUST_JOBS = [
+  "clippy",
+  "rustfmt",
+  "build-test",
+  "cross-platform-rust",
+  "linux-native",
+  "chaos",
+];
+const FULL_ONLY = ["windows-installer", "macos-payload", "linux-appimage"];
+
+function results(selected, packages = "true", installers = "true", full = "true") {
+  const expected = (job) => {
+    if (FULL_ONLY.includes(job))
+      return full === "true" && installers === "true" ? "success" : "skipped";
+    if (job === "installer-script") return full === "false" ? "skipped" : "success";
+    if (job === "linux-packages") return packages === "false" ? "skipped" : "success";
+    if (RUST_JOBS.includes(job)) return selected === "false" ? "skipped" : "success";
+    return "success";
+  };
   return Object.fromEntries(
     [
       "changes",
       "frontend",
       "linux-packages",
-      "windows-installer",
-      "macos-payload",
-      "linux-appimage",
+      ...FULL_ONLY,
       "installer-script",
       "installer-script-bash",
       "pinned-install-urls",
-      "clippy",
-      "rustfmt",
-      "build-test",
-      "cross-platform-rust",
-      "linux-native",
-      "chaos",
+      ...RUST_JOBS,
     ].map((job) => [
       job,
       {
-        result:
-          ["windows-installer", "macos-payload", "linux-appimage"].includes(job) &&
-          installers === "false"
-            ? "skipped"
-            : job === "linux-packages" && packages === "false"
-              ? "skipped"
-              : selected === "false" &&
-                  [
-                    "clippy",
-                    "rustfmt",
-                    "build-test",
-                    "cross-platform-rust",
-                    "linux-native",
-                    "chaos",
-                  ].includes(job)
-                ? "skipped"
-                : "success",
+        result: expected(job),
         outputs:
           job === "changes"
-            ? { rust: selected, linux_packages: packages, installers }
+            ? {
+                rust: selected,
+                linux_packages: packages,
+                installers,
+                full,
+                headless_matrix: JSON.stringify(headlessMatrix(full !== "false")),
+              }
             : {},
       },
     ]),
@@ -136,6 +148,66 @@ test("Linux packages only run for relevant PR and push changes", () => {
   assert.equal(needsLinuxPackages("release", ["README.md"]), true);
 });
 
+test("only an explicit draft pull request skips the full set", () => {
+  assert.equal(fullRun("pull_request", "true"), false);
+  for (const draft of ["false", "", undefined, "TRUE", "1"])
+    assert.equal(fullRun("pull_request", draft), true, String(draft));
+  for (const event of ["push", "workflow_dispatch", "merge_group", undefined])
+    assert.equal(fullRun(event, "true"), true, String(event));
+});
+
+test("full runs test macOS once and Linux and Windows split; drafts test Linux", () => {
+  const full = headlessMatrix(true);
+  assert.deepEqual(
+    full.map(({ os, group }) => `${os}/${group}`),
+    [
+      "ubuntu-22.04/core",
+      "ubuntu-22.04/integration",
+      "macos-latest/all",
+      "windows-latest/core",
+      "windows-latest/integration",
+    ],
+  );
+  const targets = (os) =>
+    full
+      .filter((entry) => entry.os === os)
+      .map((entry) => entry.targets)
+      .join(" ");
+  for (const os of ["ubuntu-22.04", "macos-latest", "windows-latest"])
+    assert.equal(targets(os), "--lib --bins --test '*'", os);
+  assert.deepEqual(headlessMatrix(false), full.slice(0, 2));
+});
+
+test("a draft gate stays red after its Linux checks pass", () => {
+  for (const rust of ["true", "false"])
+    for (const packages of ["true", "false"])
+      for (const installers of ["true", "false"])
+        assert.throws(
+          () => requireResults(results(rust, packages, installers, "false")),
+          (error) => error instanceof DraftRun && /ready for review/.test(error.message),
+        );
+});
+
+test("a draft gate still reports a failing Linux check first", () => {
+  const needs = results("true", "true", "true", "false");
+  needs["build-test"].result = "failure";
+  assert.throws(
+    () => requireResults(needs),
+    (error) => !(error instanceof DraftRun) && /build-test/.test(error.message),
+  );
+});
+
+test("a full run cannot pass without every headless OS in its matrix", () => {
+  for (const matrix of [headlessMatrix(false), [], undefined, "[]"]) {
+    const needs = results("true");
+    needs.changes.outputs.headless_matrix =
+      typeof matrix === "string" || matrix === undefined
+        ? matrix
+        : JSON.stringify(matrix);
+    assert.throws(() => requireResults(needs), /matrix/);
+  }
+});
+
 test("gate accepts successful selected checks and intentional skips", () => {
   for (const rust of ["true", "false"])
     for (const packages of ["true", "false"])
@@ -165,8 +237,24 @@ test("any failed, canceled, missing or unexpectedly skipped required check block
       }
     }
   }
+  for (const job of Object.keys(results("true", "true", "true", "false"))) {
+    const expected = results("true", "true", "true", "false")[job].result;
+    for (const result of ["success", "failure", "cancelled", undefined, "skipped"]) {
+      if (result === expected) continue;
+      const needs = results("true", "true", "true", "false");
+      needs[job].result = result;
+      assert.throws(
+        () => requireResults(needs),
+        (error) => !(error instanceof DraftRun),
+        `${job}: ${result}`,
+      );
+    }
+  }
   for (const invalid of [undefined, "maybe"]) {
     assert.throws(() => requireResults(results(invalid)));
+    const fullNeeds = results("true");
+    fullNeeds.changes.outputs.full = invalid;
+    assert.throws(() => requireResults(fullNeeds));
     const needs = results("true");
     needs.changes.outputs.linux_packages = invalid;
     assert.throws(() => requireResults(needs));
