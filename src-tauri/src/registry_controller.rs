@@ -2671,12 +2671,24 @@ pub(crate) fn disconnect_client_with(
 ) -> Result<ClientMutationResult, String> {
     let mut update_registry = Some(update_registry);
     let mut revoke = Some(revoke);
-    match disconnect_client_once(client_id, &mut update_registry, &mut revoke) {
+    let backups = clients::backup_dir(client_id);
+    let before = backups.as_deref().map(backup_names);
+    let first = clients::backup_vault::noninteractive(|| {
+        disconnect_client_once(client_id, &mut update_registry, &mut revoke)
+    });
+    match first {
         Err(error)
             if clients::backup_vault::is_locked_error(&error)
                 && update_registry.is_some()
                 && revoke.is_some() =>
         {
+            // Nothing changed but the backups this try made of a config it
+            // then left alone: remove them, so a refusal leaves no trace.
+            if let (Some(dir), Some(before)) = (&backups, &before) {
+                for name in backup_names(dir).difference(before) {
+                    let _ = std::fs::remove_file(dir.join(name));
+                }
+            }
             match clients::backup_vault::request_unlock() {
                 clients::backup_vault::Unlock::Open => {
                     disconnect_client_once(client_id, &mut update_registry, &mut revoke)
@@ -2686,6 +2698,15 @@ pub(crate) fn disconnect_client_with(
         }
         other => other,
     }
+}
+
+fn backup_names(dir: &Path) -> std::collections::BTreeSet<std::ffi::OsString> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect()
 }
 
 /// Disconnect's answer when the unlock it asked for was cancelled.
@@ -2742,7 +2763,10 @@ where
     let revoke = revoke
         .take()
         .ok_or_else(|| "Disconnect already revoked the token".to_string())?;
-    finish_http_disconnect(client_id, &mut result, revoke)?;
+    // The user asked for this delete; it may ask to unlock like any other.
+    finish_http_disconnect(client_id, &mut result, || {
+        clients::backup_vault::interactive(revoke)
+    })?;
     Ok(result)
 }
 
@@ -6502,7 +6526,10 @@ API_KEY = "synthetic-first-origin"
     /// A 2.3.5 Connect left Claude Code's recovery files unsealed; since then
     /// the user flagged PLANET secret in Toolport and changed its value in the
     /// client. That value is new, so it can never be written in plain text.
-    fn locked_disconnect_with_a_new_flagged_secret() -> MoveFixture {
+    /// `vaulted`: Toolport holds the new value (set through Toolport). If
+    /// not, the user added a server with that secret name to the client by
+    /// hand, and the vault has no copy to find.
+    fn locked_disconnect_fixture(vaulted: bool) -> MoveFixture {
         let fixture = MoveFixture::new(&Registry::default());
         std::fs::write(
             fixture.claude(),
@@ -6527,11 +6554,17 @@ API_KEY = "synthetic-first-origin"
             Ok(())
         })
         .unwrap();
-        crate::secrets::set_secret("orbit", "PLANET", "mercury-new-fixture").unwrap();
         let mut config = json_file(&fixture.claude());
-        config["mcpServers"]["orbit"] = serde_json::json!({
-            "command":"echo","env":{"PLANET":"mercury-new-fixture"}
-        });
+        if vaulted {
+            crate::secrets::set_secret("orbit", "PLANET", "mercury-new-fixture").unwrap();
+            config["mcpServers"]["orbit"] = serde_json::json!({
+                "command":"echo","env":{"PLANET":"mercury-new-fixture"}
+            });
+        } else {
+            config["mcpServers"]["planet-notes"] = serde_json::json!({
+                "command":"true","env":{"PLANET":"mercury-new-fixture"}
+            });
+        }
         std::fs::write(fixture.claude(), config.to_string()).unwrap();
         fixture
     }
@@ -6551,12 +6584,27 @@ API_KEY = "synthetic-first-origin"
     /// words and leaves the config, registry and every backup unchanged.
     #[test]
     fn locked_disconnect_asks_once_and_cancel_changes_nothing() {
-        let fixture = locked_disconnect_with_a_new_flagged_secret();
+        locked_cancel_changes_nothing(true);
+    }
+
+    /// The box case: a server added to the client by hand under a name
+    /// Toolport flags secret, with no vault copy. A locked keyring still
+    /// answers "no such item", so only the flag keeps it out of plain text.
+    #[test]
+    fn locked_disconnect_of_a_hand_added_secret_asks_once_and_cancel_changes_nothing() {
+        locked_cancel_changes_nothing(false);
+    }
+
+    fn locked_cancel_changes_nothing(vaulted: bool) {
+        let fixture = locked_disconnect_fixture(vaulted);
         let before = locked_disconnect_snapshot(&fixture);
         let mut result = None;
         let calls = clients::backup_vault::fake::locked_store(
             clients::backup_vault::Unlock::StillLocked,
-            || result = Some(disconnect_client("claude-code")),
+            || {
+                clients::backup_vault::fake::set_absent_readable();
+                result = Some(disconnect_client("claude-code"));
+            },
         );
         let error = result.unwrap().unwrap_err();
         assert_eq!(error, "Unlock your keyring to disconnect Claude Code.");
@@ -6577,11 +6625,21 @@ API_KEY = "synthetic-first-origin"
     /// is sealed, never written in plain text.
     #[test]
     fn locked_disconnect_unlocked_once_seals_the_new_secret() {
-        let fixture = locked_disconnect_with_a_new_flagged_secret();
+        locked_unlock_seals(true);
+    }
+
+    #[test]
+    fn locked_disconnect_unlocked_once_seals_a_hand_added_secret() {
+        locked_unlock_seals(false);
+    }
+
+    fn locked_unlock_seals(vaulted: bool) {
+        let fixture = locked_disconnect_fixture(vaulted);
         let mut result = None;
         let calls =
             clients::backup_vault::fake::locked_store(clients::backup_vault::Unlock::Open, || {
-                result = Some(disconnect_client("claude-code"))
+                clients::backup_vault::fake::set_absent_readable();
+                result = Some(disconnect_client("claude-code"));
             });
         result.unwrap().unwrap();
         assert_eq!(

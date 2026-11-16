@@ -324,22 +324,29 @@ fn encode_internal(
     source: Option<&Path>,
 ) -> Result<String, String> {
     let mut values = IMPORTS.with(|v| v.borrow().clone());
+    // A 2.3.5 install upgraded in place keeps this client's recovery files
+    // unsealed until the keyring first opens. A Disconnect may write them the
+    // same way only when that provably adds no value that is not already
+    // there in plain text; the start-up seal (`upgrade_legacy_once_open`,
+    // under the same mutation lock) seals them all once it opens.
+    let mut proven_plain = None;
+    let mut proven = || *proven_plain.get_or_insert_with(|| awaiting_seal(path, text));
     if !missing() || !disconnecting {
         match vaulted_credentials(text) {
             Ok(vaulted) => values.extend(vaulted),
-            // A 2.3.5 install upgraded in place keeps this client's recovery
-            // files unsealed until the keyring first opens. A Disconnect while
-            // it is locked writes them the same way, adding no value that is
-            // not already there in plain text; the start-up seal
-            // (`upgrade_legacy_once_open`, under the same mutation lock) seals
-            // them all once it opens.
             Err(error) if disconnecting && backup_vault::is_locked_error(&error) => {
-                if !awaiting_seal(path, text) {
+                if !proven() {
                     return Err(error);
                 }
             }
             Err(error) => return Err(error),
         }
+    }
+    // A value under a name Toolport stores as secret is sealed even when the
+    // vault holds no copy of it (a server added to the client by hand), never
+    // left in plain text unless it already is.
+    if !(disconnecting && proven()) {
+        values.extend(flagged_secret_values(text));
     }
     let mut generations = Vec::new();
     // Rewrites of an existing snapshot must retain its protection even outside
@@ -1282,30 +1289,68 @@ fn string_leaves(text: &str, depth: usize, out: &mut Vec<Leaf>) -> bool {
     }
 }
 
-/// Names of every value Toolport stores as secret, for any server.
-fn registry_secret_names() -> std::collections::HashSet<String> {
-    crate::registry::resolved_path()
+/// Every value in `text` under a name Toolport stores as secret (a secret env
+/// or launch input of any server), with that server as its reference.
+fn flagged_secret_values(text: &str) -> Vec<(Reference, String)> {
+    let owners = registry_secret_owners();
+    if owners.is_empty() {
+        return Vec::new();
+    }
+    let mut leaves = Vec::new();
+    if !string_leaves(text, 0, &mut leaves) {
+        return Vec::new();
+    }
+    leaves
+        .into_iter()
+        .filter(|leaf| {
+            !leaf.value.is_empty() && !leaf.value.starts_with("TOOLPORT_MISSING_CREDENTIAL_")
+        })
+        .filter_map(|leaf| {
+            let key = leaf.key?;
+            let server = owners.get(&secret_name_key(&key))?;
+            Some((
+                Reference {
+                    server: server.clone(),
+                    key,
+                },
+                leaf.value,
+            ))
+        })
+        .collect()
+}
+
+/// Each secret name Toolport stores, with the first server that stores it.
+fn registry_secret_owners() -> std::collections::HashMap<String, String> {
+    let mut owners = std::collections::HashMap::new();
+    for server in crate::registry::resolved_path()
         .and_then(|path| std::fs::read(path).ok())
         .and_then(|raw| serde_json::from_slice::<crate::registry::Registry>(&raw).ok())
         .into_iter()
         .flat_map(|registry| registry.servers)
-        .flat_map(|server| {
-            let env = server
-                .env
-                .into_iter()
-                .filter(|env| env.secret)
-                .map(|env| env.key);
-            let inputs = server
-                .launch
-                .into_iter()
-                .flat_map(|launch| launch.inputs)
-                .filter(|input| input.secret)
-                .map(|input| input.key);
-            env.chain(inputs)
-                .map(|name| secret_name_key(&name))
-                .collect::<Vec<_>>()
-        })
-        .collect()
+    {
+        let env = server
+            .env
+            .iter()
+            .filter(|env| env.secret)
+            .map(|env| &env.key);
+        let inputs = server
+            .launch
+            .iter()
+            .flat_map(|launch| &launch.inputs)
+            .filter(|input| input.secret)
+            .map(|input| &input.key);
+        for name in env.chain(inputs) {
+            owners
+                .entry(secret_name_key(name))
+                .or_insert_with(|| server.id.clone());
+        }
+    }
+    owners
+}
+
+/// Names of every value Toolport stores as secret, for any server.
+fn registry_secret_names() -> std::collections::HashSet<String> {
+    registry_secret_owners().into_keys().collect()
 }
 
 fn discovered_credentials(text: &str, client: &str) -> Vec<(Reference, String)> {
@@ -2041,6 +2086,28 @@ mod tests {
             ] {
                 assert!(!awaiting_seal(&path, text), "{text}");
             }
+        });
+    }
+
+    /// A value under a name Toolport flags secret is sealed even when the
+    /// vault holds no copy of it, such as a server added to the client by hand.
+    #[test]
+    fn flagged_secret_names_are_sealed_without_a_vault_copy() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            clear();
+            let registry = serde_json::from_value(serde_json::json!({"version":3,"profiles":[],"servers":[
+                {"id":"orbit","name":"Orbit","transport":"stdio","env":[{"key":"PLANET","secret":true}]}
+            ]}))
+            .unwrap();
+            crate::registry::save(&registry).unwrap();
+            let path = crate::registry::conduit_dir()
+                .unwrap()
+                .join("backups/cursor/1-mcp.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let original = r#"{"mcpServers":{"notes":{"env":{"PLANET":"mercury-hand-added"}}}}"#;
+            let raw = encode(&path, original).unwrap();
+            assert!(!raw.contains("mercury-hand-added"), "{raw}");
+            assert_eq!(decode(&raw).unwrap(), original);
         });
     }
 

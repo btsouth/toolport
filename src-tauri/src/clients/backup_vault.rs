@@ -37,6 +37,18 @@ pub(crate) fn locked_error() -> String {
 }
 
 /// True when `error` came from a locked keyring rather than a real failure.
+/// Undo any enclosing [`noninteractive`] for `f`, a step the user asked for.
+pub(crate) fn interactive<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NONINTERACTIVE.with(|depth| depth.set(self.0));
+        }
+    }
+    let _restore = Restore(NONINTERACTIVE.with(|depth| depth.replace(0)));
+    crate::secrets::with_prompts(f)
+}
+
 pub(crate) fn is_locked_error(error: &str) -> bool {
     // The store's own refusal of a background write while it would ask.
     const STORE_WAITS: &str = "the keyring is locked; this background write waits for it";
@@ -281,6 +293,7 @@ pub(crate) mod fake {
         calls: Vec<String>,
         startup_deferred: Option<bool>,
         check_times_out: bool,
+        absent_readable: bool,
     }
     thread_local! {
         static STORE: RefCell<Option<Store>> = const { RefCell::new(None) };
@@ -306,6 +319,7 @@ pub(crate) mod fake {
                 calls: Vec::new(),
                 startup_deferred: Some(true),
                 check_times_out: false,
+                absent_readable: false,
             })
         });
         let _clear = Clear;
@@ -327,11 +341,26 @@ pub(crate) mod fake {
         _server: &str,
         key: &str,
     ) -> Option<Result<Option<String>, BackupSecretError>> {
-        with(|store| {
+        let (locked, absent_readable) = with(|store| {
             store.calls.push(format!("read {key}"));
-            store.locked.then_some(Err(BackupSecretError::Locked))
-        })
-        .flatten()
+            (store.locked, store.absent_readable)
+        })?;
+        if !locked {
+            return None;
+        }
+        // Secret Service finds items in a locked collection without asking;
+        // only reading a value it holds needs the unlock.
+        if absent_readable && matches!(crate::secrets::backup_secret_status(_server, key), Ok(None))
+        {
+            return Some(Ok(None));
+        }
+        Some(Err(BackupSecretError::Locked))
+    }
+
+    /// Inside [`locked_store`]: a read of an item the store does not hold
+    /// answers "none" while locked, as Secret Service does.
+    pub(crate) fn set_absent_readable() {
+        with(|store| store.absent_readable = true);
     }
 
     pub(super) fn write(_server: &str, key: &str, quiet: bool) -> Option<Result<(), String>> {
