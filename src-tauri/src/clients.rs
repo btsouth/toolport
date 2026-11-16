@@ -3994,15 +3994,14 @@ pub fn parse_snippet_for_user(content: &str) -> Result<Vec<ParsedSnippetServer>,
 /// token. A remote paste reaching this point has no plain variables, so a row
 /// without a value is its `bearerTokenEnvVar`: the token, named as one.
 fn name_the_bearer_row(server: &mut ParsedSnippetServer) {
-    if server.transport == "stdio"
-        || server
-            .env
-            .iter()
-            .any(|row| row.key.eq_ignore_ascii_case("authorization"))
-    {
+    if server.transport == "stdio" {
         return;
     }
-    if let [row] = server.env.as_mut_slice() {
+    let header = |row: &SnippetEnvVar| row.key.eq_ignore_ascii_case("authorization");
+    if server.env.iter().any(header) {
+        // The header already carries the token.
+        server.env.retain(|row| header(row) || row.value.is_some());
+    } else if let [row] = server.env.as_mut_slice() {
         if row.value.is_none() {
             row.key = "Authorization".into();
         }
@@ -16751,13 +16750,8 @@ command = "npx"
         assert_eq!(authed.env[0].key, "MY_MCP_TOKEN");
         let header = r#"{"mcpServers":{"h":{"url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer abc"},"bearerTokenEnvVar":"MY_MCP_TOKEN"}}}"#;
         let server = parse_snippet_for_user(header).unwrap().remove(0);
+        assert_eq!(server.env.len(), 1, "the header carries the token");
         assert_eq!(server.env[0].key, "Authorization");
-        assert_eq!(
-            server.env.len(),
-            2,
-            "a header keeps its own row: {:?}",
-            server.env.iter().map(|e| &e.key).collect::<Vec<_>>()
-        );
     }
 
     #[test]

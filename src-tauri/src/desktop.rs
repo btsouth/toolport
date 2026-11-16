@@ -147,6 +147,13 @@ fn clear_update_http_bridge_intent_at(path: &std::path::Path) -> Result<(), Stri
 /// for an edit the entry keeps its id so already-vaulted secrets resolve.
 #[tauri::command]
 async fn test_server(entry: ServerEntry) -> Result<ProbeResult, String> {
+    // A test connects as a save would, so it refuses what a save refuses: a
+    // variable a remote server would receive as its bearer token.
+    let saved = crate::registry::load()?
+        .servers
+        .into_iter()
+        .find(|server| !entry.id.is_empty() && server.id == entry.id);
+    crate::registry_controller::refuse_new_remote_env(saved.as_ref(), &entry)?;
     tauri::async_runtime::spawn_blocking(move || probe_one(&entry))
         .await
         .map_err(|e| e.to_string())

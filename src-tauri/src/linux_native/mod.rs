@@ -12543,8 +12543,13 @@ fn open_server_editor_prefilled(
     let cwd_row_for_transport = cwd_row.clone();
     let url_row_for_transport = url_row.clone();
     let env_section = plain_env.as_ref().map(|(section, _)| section.clone());
+    // A remote server has no environment, but variables a stdio server had
+    // stay in view after a switch, so they can be removed before saving.
+    let had_plain = server
+        .as_ref()
+        .is_some_and(|server| !server.plain_env.is_empty());
     if let Some(section) = &env_section {
-        section.set_visible(transport.selected() == 0);
+        section.set_visible(transport.selected() == 0 || had_plain);
     }
     transport.connect_selected_notify(move |transport| {
         update_editor_transport(
@@ -12555,7 +12560,7 @@ fn open_server_editor_prefilled(
             &url_row_for_transport,
         );
         if let Some(section) = &env_section {
-            section.set_visible(transport.selected() == 0);
+            section.set_visible(transport.selected() == 0 || had_plain);
         }
     });
     let plain_env = plain_env.map(|(_, rows)| rows);

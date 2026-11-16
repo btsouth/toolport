@@ -742,12 +742,24 @@ pub fn refuse_new_remote_env(
     previous: Option<&ServerEntry>,
     next: &ServerEntry,
 ) -> Result<(), String> {
-    if next.transport == "stdio" {
+    // The same test connections use to pick a remote connection.
+    let remote = |entry: &ServerEntry| {
+        entry.transport != "stdio" || (entry.command.is_none() && entry.url.is_some())
+    };
+    if !remote(next) {
         return Ok(());
     }
-    let kept = |key: &str| {
+    // A row that can be sent (a secret or a reference) is kept only if it
+    // already could be: a plain row turned secret is a new token.
+    let sendable =
+        |env: &crate::registry::EnvVar| env.secret || env.unknown_fields.contains_key("source");
+    let kept = |row: &crate::registry::EnvVar| {
         previous.is_some_and(|previous| {
-            previous.transport != "stdio" && previous.env.iter().any(|e| e.key == key)
+            remote(previous)
+                && previous
+                    .env
+                    .iter()
+                    .any(|e| e.key == row.key && (sendable(e) || !sendable(row)))
         })
     };
     let header = |key: &str| {
@@ -758,16 +770,38 @@ pub fn refuse_new_remote_env(
     };
     let typed = next.env.iter().find(|env| {
         let key = env.key.as_str();
+        // The imported URL is never sent as a token unless it is a reference.
+        let imported_url =
+            key == crate::secrets::IMPORTED_URL_KEY && !env.unknown_fields.contains_key("source");
         !(key == crate::secrets::HTTP_AUTH_KEY
-            || key == crate::secrets::IMPORTED_URL_KEY
+            || imported_url
             || key.eq_ignore_ascii_case("authorization")
-            || kept(key)
+            || kept(env)
             || header(key))
     });
     match typed {
         Some(env) => Err(remote_env_refusal(&env.key)),
         None => Ok(()),
     }
+}
+
+/// `server` with `key` as a stored secret, or a reference: the row a declaration
+/// would leave, for [`refuse_new_remote_env`].
+fn with_sent_row(server: &ServerEntry, key: &str, reference: Option<&str>) -> ServerEntry {
+    let mut declared = server.clone();
+    declared.env.retain(|env| env.key != key);
+    let mut row = crate::registry::EnvVar {
+        key: key.to_string(),
+        value: None,
+        secret: true,
+        unknown_fields: Default::default(),
+    };
+    if let Some(reference) = reference {
+        row.unknown_fields
+            .insert("source".into(), serde_json::json!({ "ref": reference }));
+    }
+    declared.env.push(row);
+    declared
 }
 
 fn remote_env_refusal(key: &str) -> String {
@@ -1330,12 +1364,20 @@ pub fn server_entry_for_probe(
     match server_id {
         Some(server_id) => {
             let mut registry = read_registry_exact()?;
+            let previous = registry
+                .servers
+                .iter()
+                .find(|server| server.id == server_id)
+                .cloned();
             apply_update_server_fields(&mut registry, server_id, fields)?;
-            registry
+            let probe = registry
                 .servers
                 .into_iter()
                 .find(|server| server.id == server_id)
-                .ok_or_else(|| format!("No server with id '{server_id}'"))
+                .ok_or_else(|| format!("No server with id '{server_id}'"))?;
+            // A test connects as a save would, stored secrets included.
+            refuse_new_remote_env(previous.as_ref(), &probe)?;
+            Ok(probe)
         }
         None => {
             let fields = fields.normalized()?;
@@ -3063,17 +3105,8 @@ pub fn apply_secret_declaration(
         .iter_mut()
         .find(|server| server.id == server_id)
         .ok_or_else(|| format!("No server with id '{server_id}'"))?;
-    // A new key on a remote server would become its bearer token.
-    if !server.env.iter().any(|entry| entry.key == key) {
-        let mut declared = server.clone();
-        declared.env.push(crate::registry::EnvVar {
-            key: key.to_string(),
-            value: None,
-            secret: true,
-            unknown_fields: Default::default(),
-        });
-        refuse_new_remote_env(Some(server), &declared)?;
-    }
+    // A new secret on a remote server would become its bearer token.
+    refuse_new_remote_env(Some(server), &with_sent_row(server, key, None))?;
     if let Some(overrides) = server
         .unknown_fields
         .get_mut("memberSecretRefs")
@@ -3613,6 +3646,8 @@ pub fn apply_secret_reference(
     {
         header["source"] = serde_json::json!({"ref": reference});
     } else {
+        // A reference on a remote server is sent as its bearer token.
+        refuse_new_remote_env(Some(server), &with_sent_row(server, &key, Some(reference)))?;
         if !server.env.iter().any(|e| e.key == key) {
             server.env.push(crate::registry::EnvVar {
                 key: key.clone(),
@@ -5683,6 +5718,34 @@ API_KEY = "synthetic-first-origin"
             assert!(crate::secrets::get_secret_result(&id, "OTHER_KEY")
                 .unwrap()
                 .is_none());
+            // A password manager reference would be sent the same way.
+            let reference = registry::update(|r| {
+                apply_secret_reference(r, &id, "OTHER_KEY", "op://Private/Resend/key")
+            });
+            assert!(reference.unwrap_err().contains("OTHER_KEY"));
+            // A plain value it already had is not a token; making it secret
+            // would send it.
+            registry::update(|r| {
+                let server = r.servers.iter_mut().find(|s| s.id == id).unwrap();
+                server.env.push(registry::EnvVar {
+                    key: "REGION".into(),
+                    value: Some("eu".into()),
+                    secret: false,
+                    unknown_fields: Default::default(),
+                });
+                Ok(())
+            })
+            .unwrap();
+            let secret = set_server_secret_with(&id, "REGION", "eu", |id, key| {
+                Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0)
+            });
+            assert!(secret.unwrap_err().contains("REGION"));
+            registry::update(|r| {
+                let server = r.servers.iter_mut().find(|s| s.id == id).unwrap();
+                server.env.retain(|e| e.key != "REGION");
+                Ok(())
+            })
+            .unwrap();
             // The bearer slot and Authorization still work.
             set_server_secret_with(&id, "Authorization", "Bearer typed", |id, key| {
                 Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0)
@@ -5723,6 +5786,14 @@ API_KEY = "synthetic-first-origin"
             react.command = None;
             react.url = Some("https://example.com/mcp".into());
             assert!(registry::update(|r| apply_update_entry(r, react.clone())).is_err());
+            // A test connects with the stored values, so it refuses the same.
+            let probe = server_entry_for_probe(Some(&id), fields("switch", "http"));
+            assert!(probe.unwrap_err().contains("API_KEY"));
+            // So does an entry that says stdio but has only a URL, which
+            // connects as a remote server.
+            let mut disguised = react.clone();
+            disguised.transport = "stdio".into();
+            assert!(registry::update(|r| apply_update_entry(r, disguised.clone())).is_err());
             react.env.clear();
             registry::update(|r| apply_update_entry(r, react.clone())).unwrap();
         });
