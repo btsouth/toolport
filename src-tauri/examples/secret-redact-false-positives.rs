@@ -366,9 +366,13 @@ fn hits(s: &str) -> usize {
     s.matches(MARK).count()
 }
 
-/// Markers this redaction added to `input`.
-fn new_hits(_input: &str, output: &str) -> usize {
-    hits(output)
+/// Markers this redaction added to `input`: a line it left as it was adds
+/// none, whatever markers it already held.
+fn new_hits(input: &str, output: &str) -> usize {
+    if output == input {
+        return 0;
+    }
+    hits(output).saturating_sub(hits(input))
 }
 
 /// The input text each marker in `output` replaced, as best it can be lined up.
