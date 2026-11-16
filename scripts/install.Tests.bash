@@ -399,6 +399,21 @@ set -e
 check "signature failure suggests populating the keyring" "If your keyring is new or missing keys, run: sudo pacman-key --populate" "$result"
 check "signature failure suggests a retry for a damaged download" "If a download was damaged, pacman has removed it: run this installer again." "$result"
 if [ "$rc" != 0 ]; then pass=$((pass+1)); else echo "  FAIL: signature failure exited 0"; fail=$((fail+1)); fi
+# pacman prints in the user's language, so a German signature error matches none
+# of the English patterns. The generic failure must still carry the hint.
+cat > "$arch_shim/pacman" <<'EOF'
+#!/usr/bin/env bash
+echo "Fehler: core: Signatur von \"Arch Builder\" ist von unbekanntem Vertrauen"
+echo "Fehler: Konnte den Vorgang nicht durchführen (Ungültiges oder beschädigtes Paket (PGP-Signatur))"
+exit 1
+EOF
+set +e
+result="$(PATH="$arch_shim:$PATH" HOME="$arch_home" TOOLPORT_OS_RELEASE="$arch_shim/os-release-arch" TOOLPORT_PACMAN_CONF="$arch_conf" TOOLPORT_REPO_KEY_ID="DEADBEEFDEADBEEF" bash "$INSTALL_SH" 2>&1)"
+rc=$?
+set -e
+check "translated failure keeps the generic line" "pacman could not install toolport. Check the output above." "$result"
+check "translated failure still names the keyring fix" "If the output above mentions signatures or keys, run: sudo pacman-key --populate, then run this installer again." "$result"
+if [ "$rc" != 0 ]; then pass=$((pass+1)); else echo "  FAIL: translated signature failure exited 0"; fail=$((fail+1)); fi
 printf '#!/bin/sh\nexit 1\n' > "$arch_shim/pacman-key"
 set +e
 result="$(PATH="$arch_shim:$PATH" HOME="$arch_home" TOOLPORT_OS_RELEASE="$arch_shim/os-release-arch" TOOLPORT_PACMAN_CONF="$arch_conf" bash "$INSTALL_SH" 2>&1)"

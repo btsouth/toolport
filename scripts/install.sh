@@ -404,7 +404,10 @@ install_arch_repo() {
         "If your keyring is new or missing keys, run: sudo pacman-key --populate" \
         "If a download was damaged, pacman has removed it: run this installer again."
     fi
-    err "pacman could not install toolport. Check the output above."
+    # The patterns above are pacman's English text. pacman keeps the user's
+    # language, so a translated signature error lands here: say it anyway.
+    err "pacman could not install toolport. Check the output above." \
+      "If the output above mentions signatures or keys, run: sudo pacman-key --populate, then run this installer again."
   fi
 
   say "Installed. Launch Toolport from your app menu, or run: toolport-gtk"
