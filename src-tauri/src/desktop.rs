@@ -3645,10 +3645,40 @@ async fn start_http_bridge(app: AppHandle, port: Option<u16>) -> Result<HttpBrid
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<HttpBridgeState>();
         let registry = app.state::<RegistryState>();
+        if let Some(held) = hold_http_bridge_turned_on(state.inner(), registry.inner(), port)? {
+            // Starts on the first unlock, like one left on; Retry may ask.
+            restore_http_bridge_on_start(app.clone());
+            return Ok(held);
+        }
         start_persisted_http_bridge(state.inner(), registry.inner(), port)
     })
     .await
     .map_err(|error| format!("HTTP endpoint task failed: {error}"))?
+}
+
+/// Turning the endpoint on while the keyring is locked saves the setting and
+/// waits, like an endpoint left on at start: it shows "Keyring locked", and
+/// only Retry may ask to unlock. `None`: the keyring would not ask; start it.
+fn hold_http_bridge_turned_on(
+    state: &HttpBridgeState,
+    registry: &RegistryState,
+    port: Option<u16>,
+) -> Result<Option<HttpBridgeStatus>, String> {
+    let _lifecycle = HTTP_BRIDGE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if crate::http_bridge::status(state).running || !secrets::store_would_prompt() {
+        return Ok(None);
+    }
+    write_registry(registry, |reg| {
+        reg.http_bridge_enabled = true;
+        if port.is_some() {
+            reg.http_bridge_port = port;
+        }
+        Ok(())
+    })?;
+    crate::http_bridge::mark_waiting(state, true);
+    Ok(Some(crate::http_bridge::status(state)))
 }
 
 /// Start the endpoint and durably remember the user's intent. Shared HTTP client
@@ -3755,6 +3785,7 @@ fn stop_persisted_http_bridge(
 /// At start: bring back an endpoint the user left on. Never asks to unlock
 /// the keyring: while it would, the endpoint shows as locked (`Ok(false)`),
 /// and [`restore_http_bridge_on_start`] starts it on the first unlock.
+#[cfg(test)]
 fn restore_persisted_http_bridge(state: &HttpBridgeState) -> Result<bool, String> {
     match restore_http_bridge_once(state) {
         crate::http_bridge::Restore::Running => Ok(true),
@@ -5204,6 +5235,30 @@ mod tests {
                 "{outcome:?}"
             );
             assert!(!crate::http_bridge::status(&state).running);
+        });
+    }
+
+    /// Turning it on while the keyring is locked never asks: it saves the
+    /// setting and shows the wait; Retry is the one that may ask.
+    #[test]
+    fn turning_the_endpoint_on_while_the_keyring_is_locked_waits() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            registry::save(&Registry::default()).unwrap();
+            let state = HttpBridgeState::default();
+            let registry_state = Mutex::new(registry::load().unwrap());
+            let mut held = None;
+            let prompts = crate::secrets::locked_store::prompts_during(|| {
+                held = Some(hold_http_bridge_turned_on(&state, &registry_state, None));
+            });
+            assert!(prompts.is_empty(), "{prompts:?}");
+            let held = held.unwrap().unwrap().expect("held while locked");
+            assert!(held.keyring_locked && !held.running, "{held:?}");
+            assert!(registry::load().unwrap().http_bridge_enabled);
+            // Unlocked: nothing to hold, so the switch starts it.
+            assert!(hold_http_bridge_turned_on(&state, &registry_state, None)
+                .unwrap()
+                .is_none());
+            crate::http_bridge::mark_waiting(&state, false);
         });
     }
 

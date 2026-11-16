@@ -1174,7 +1174,7 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
                 } else if retry {
                     bridge.retry_restore()
                 } else {
-                    bridge.start(None)
+                    bridge.turn_on(None)
                 }
             })
             .await;
@@ -1185,17 +1185,24 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
             page.endpoint_retry.set_sensitive(true);
             match result {
                 Ok(Ok(status)) => {
+                    // Waiting for the keyring: the status line says so; it
+                    // has not started yet.
+                    let waiting = !running && status.keyring_locked;
                     page.render_endpoint(status);
-                    l10n::bind_label(
-                        &page.feedback,
-                        if running {
-                            msg("Shared HTTP endpoint stopped")
-                        } else {
-                            msg("Shared HTTP endpoint started")
-                        },
-                    );
-                    page.feedback.remove_css_class("error");
-                    page.feedback.add_css_class("success");
+                    if waiting {
+                        page.feedback.set_label("");
+                    } else {
+                        l10n::bind_label(
+                            &page.feedback,
+                            if running {
+                                msg("Shared HTTP endpoint stopped")
+                            } else {
+                                msg("Shared HTTP endpoint started")
+                            },
+                        );
+                        page.feedback.remove_css_class("error");
+                        page.feedback.add_css_class("success");
+                    }
                 }
                 Ok(Err(error)) => page.show_error(&error),
                 Err(_) => page.show_error(&tr("the endpoint operation stopped unexpectedly")),
@@ -1736,8 +1743,10 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
 
     fn render_endpoint(&self, status: crate::http_bridge::HttpBridgeStatus) {
         *self.endpoint_shown.borrow_mut() = Some(status.clone());
-        self.endpoint_on.set(status.running || status.keyring_locked);
-        self.endpoint_locked.set(!status.running && status.keyring_locked);
+        self.endpoint_on
+            .set(status.running || status.keyring_locked);
+        self.endpoint_locked
+            .set(!status.running && status.keyring_locked);
         if let Some(url) = status.url {
             l10n::bind_formatted_label(
                 &self.endpoint_status,

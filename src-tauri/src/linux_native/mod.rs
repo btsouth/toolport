@@ -18692,6 +18692,7 @@ mod tests {
             auth_required,
             failure: None,
             auth_target: None,
+            keyring_locked: false,
         };
         page.apply_probe(
             "cloudflare",

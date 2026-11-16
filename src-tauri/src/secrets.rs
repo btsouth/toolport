@@ -1342,7 +1342,11 @@ mod platform {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let started = std::time::Instant::now();
             assert!(store_would_prompt(), "unknown must wait, not read");
-            assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{:?}",
+                started.elapsed()
+            );
         }
 
         #[test]

@@ -372,7 +372,11 @@ mod tests {
     }
     /// Fails its first `fixture.0.2` attempts, then runs.
     fn fixture_attempt(fixture: &Fixture) -> super::Restore {
-        let tried = fixture.0 .1.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let tried = fixture
+            .0
+             .1
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
         if tried > fixture.0 .2 {
             super::Restore::Running
         } else {
@@ -391,14 +395,13 @@ mod tests {
                 std::sync::atomic::AtomicU32::new(0),
                 1,
             )));
-            let first = super::restore_with_retries(
-                fixture.clone(),
-                fixture_state,
-                fixture_attempt,
-                1,
-            );
+            let first =
+                super::restore_with_retries(fixture.clone(), fixture_state, fixture_attempt, 1);
             assert!(matches!(first, super::Restore::Failed(_)), "{first:?}");
-            assert!(super::status(&fixture.0 .0).keyring_locked, "shows the wait");
+            assert!(
+                super::status(&fixture.0 .0).keyring_locked,
+                "shows the wait"
+            );
             let deadline = std::time::Instant::now() + super::KEYRING_POLL * 3;
             while fixture.0 .1.load(std::sync::atomic::Ordering::SeqCst) < 2 {
                 assert!(std::time::Instant::now() < deadline, "never tried again");

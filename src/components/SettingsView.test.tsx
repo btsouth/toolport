@@ -305,6 +305,9 @@ describe("SettingsView HTTP endpoint", () => {
 
 describe("SettingsView HTTP endpoint waiting for the keyring", () => {
   it("turns it off from the switch, without starting it", async () => {
+    vi.mocked(startHttpBridge).mockClear();
+    vi.mocked(stopHttpBridge).mockClear();
+    vi.mocked(retryHttpBridge).mockClear();
     const stopped = { running: false, port: null, url: null, token: null };
     vi.mocked(httpBridgeStatus).mockResolvedValueOnce({
       ...stopped,
@@ -332,7 +335,9 @@ describe("SettingsView HTTP endpoint status reads", () => {
     try {
       const stopped = { running: false, port: null, url: null, token: null };
       let pollStarted = false;
-      let answerPoll: (status: typeof stopped & { keyringLocked: boolean }) => void = () => {};
+      let answerPoll: (
+        status: typeof stopped & { keyringLocked: boolean },
+      ) => void = () => {};
       vi.mocked(httpBridgeStatus)
         .mockResolvedValueOnce({ ...stopped, keyringLocked: true })
         .mockImplementationOnce(

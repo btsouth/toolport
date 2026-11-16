@@ -81,11 +81,30 @@ impl BridgeController {
         self.start_locked(registry.http_bridge_port)
     }
 
-    pub fn start(&self, port: Option<u16>) -> Result<crate::http_bridge::HttpBridgeStatus, String> {
-        let _lifecycle = LIFECYCLE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.start_locked(port)
+    /// The user's Start. While the keyring is locked it never asks: it saves
+    /// the setting and waits like an endpoint left on (shows "Keyring locked",
+    /// starts on the first unlock); Retry is the one that may ask.
+    pub fn turn_on(
+        &self,
+        port: Option<u16>,
+    ) -> Result<crate::http_bridge::HttpBridgeStatus, String> {
+        {
+            let _lifecycle = LIFECYCLE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.status().running || !crate::secrets::store_would_prompt() {
+                return self.start_locked(port);
+            }
+            crate::registry::update(|registry| {
+                registry.http_bridge_enabled = true;
+                if port.is_some() {
+                    registry.http_bridge_port = port;
+                }
+                Ok(())
+            })?;
+        }
+        self.restore()?;
+        Ok(self.status())
     }
 
     fn start_locked(
@@ -226,6 +245,26 @@ mod tests {
             assert!(!bridge.status().running);
             // End its wait for an unlock inside this test's data dir.
             crate::http_bridge::stop(&bridge.state).unwrap();
+        });
+    }
+
+    /// Start while the keyring is locked never asks: it waits, shown as
+    /// locked; Stop ends that wait.
+    #[test]
+    fn starting_the_endpoint_while_the_keyring_is_locked_waits() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            crate::registry::save(&crate::registry::Registry::default()).unwrap();
+            let bridge = super::BridgeController::default();
+            let mut started = None;
+            let prompts = crate::secrets::locked_store::prompts_during(|| {
+                started = Some(bridge.turn_on(None));
+            });
+            assert!(prompts.is_empty(), "{prompts:?}");
+            let status = started.unwrap().unwrap();
+            assert!(status.keyring_locked && !status.running, "{status:?}");
+            assert!(crate::registry::load().unwrap().http_bridge_enabled);
+            bridge.stop().unwrap();
+            assert!(!crate::registry::load().unwrap().http_bridge_enabled);
         });
     }
 
