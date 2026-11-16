@@ -6592,6 +6592,64 @@ API_KEY = "synthetic-first-origin"
         );
     }
 
+    /// Every connect and disconnect path names the config in an operating system error.
+    #[cfg(unix)]
+    #[test]
+    fn connect_and_disconnect_errors_name_the_config_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = MoveFixture::new(&Registry::default());
+        let config = fixture.claude();
+        let folder = config.parent().unwrap().to_path_buf();
+        let shown = config.display().to_string();
+        let named = |error: Option<String>, what: &str| {
+            let error = error.unwrap_or_else(|| panic!("{what} should fail"));
+            assert!(
+                error.contains("(os error") && error.contains(&shown),
+                "{what}: {error}"
+            );
+        };
+        let mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        std::fs::write(&config, r#"{"mcpServers":{"one":{"command":"one"}}}"#).unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        let reviewed = |names: &[String]| {
+            migrate_client_reviewed_with(
+                "claude-code",
+                None,
+                false,
+                names,
+                &review.revision,
+                |_, _, _, _| Ok(Vec::new().into()),
+            )
+            .err()
+        };
+
+        // The file is read-only and its folder cannot be written: the write fails.
+        mode(&config, 0o444);
+        mode(&folder, 0o555);
+        let connect = connect_client_stdio("claude-code", None, false).err();
+        let moved = reviewed(&["one".into()]);
+        mode(&folder, 0o755);
+        mode(&config, 0o644);
+        named(connect, "connect");
+        named(moved, "reviewed connect");
+
+        connect_client_stdio("claude-code", None, false).unwrap();
+        mode(&folder, 0o555);
+        let disconnect = disconnect_client("claude-code").err();
+        mode(&folder, 0o755);
+        named(disconnect, "disconnect");
+
+        // The config cannot be read: the review and the connect both say which file.
+        mode(&config, 0o000);
+        let preview = preview_client_setup("claude-code").err();
+        let moved = reviewed(&[]);
+        mode(&config, 0o644);
+        named(preview, "review");
+        named(moved, "reviewed connect of an unreadable config");
+    }
+
     /// A scratch home for Claude Code and Codex configs plus an overridden data dir
     /// (registry, config backups, move records). Fields drop in order, so the env
     /// vars and data dir are put back before the locks are released.

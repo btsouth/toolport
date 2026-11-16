@@ -5948,7 +5948,31 @@ fn is_toolport_backup(path: &Path) -> bool {
     canonical(parent) == canonical(&root)
 }
 
+/// An operating system error ("Permission denied (os error 13)") names no file, so say
+/// which config it was about. Toolport's own messages are left as they are.
+pub(crate) fn name_file_in_error(path: &Path, error: String) -> String {
+    if !error.contains("(os error") {
+        return error;
+    }
+    let shown = home()
+        .and_then(|home| {
+            path.strip_prefix(&home)
+                .ok()
+                .map(|rest| format!("~/{}", rest.display()))
+        })
+        .unwrap_or_else(|| path.display().to_string());
+    if !error.contains(&shown) && !error.contains(&*path.to_string_lossy()) {
+        format!("{shown}: {error}")
+    } else {
+        error
+    }
+}
+
 fn read_config_file_disk(path: &Path) -> Result<String, String> {
+    read_config_file_unnamed(path).map_err(|error| name_file_in_error(path, error))
+}
+
+fn read_config_file_unnamed(path: &Path) -> Result<String, String> {
     // `metadata` follows symlinks, so this reflects the real target's type/size.
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
     if !meta.is_file() {
@@ -11123,6 +11147,74 @@ mod tests {
             assert_eq!(read_config_file_disk(&path).unwrap(), text);
             std::fs::remove_dir_all(root).unwrap();
         });
+    }
+
+    #[test]
+    fn operating_system_errors_name_the_config_file() {
+        let path = home().unwrap().join(".cursor").join("mcp.json");
+        let shown = format!("~/{}", Path::new(".cursor").join("mcp.json").display());
+        let denied = "Permission denied (os error 13)".to_string();
+        assert_eq!(
+            name_file_in_error(&path, denied.clone()),
+            format!("{shown}: {denied}")
+        );
+        // Named once, whichever form the error already uses.
+        for named in [
+            format!("{shown}: {denied}"),
+            format!("could not open {}: {denied}", path.display()),
+        ] {
+            assert_eq!(name_file_in_error(&path, named.clone()), named);
+        }
+        // Toolport's own messages are left as they are.
+        let own = "Client config changed. Review it again.".to_string();
+        assert_eq!(name_file_in_error(&path, own.clone()), own);
+        let outside = std::env::temp_dir().join("toolport-outside-home.json");
+        assert_eq!(
+            name_file_in_error(&outside, denied.clone()),
+            format!("{}: {denied}", outside.display())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unwritable_or_unreadable_configs_name_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "toolport-unwritable-config-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        let folder = root.join("client");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("mcp.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let revision = crate::registry::client_file::read(&path).unwrap();
+        mode(&path, 0o444);
+        mode(&folder, 0o555);
+        let write = crate::registry::client_file::commit(&path, &revision, Some("{\"a\":1}"));
+        let remove = crate::registry::client_file::commit(&path, &revision, None);
+        mode(&folder, 0o755);
+        mode(&path, 0o000);
+        let read = crate::registry::client_file::read(&path).map(|_| ());
+        let disk = read_config_file_disk(&path).map(|_| ());
+        mode(&path, 0o644);
+        std::fs::remove_dir_all(&root).unwrap();
+        let shown = path.display().to_string();
+        for (what, result) in [
+            ("write", write),
+            ("remove", remove),
+            ("read", read),
+            ("disk read", disk),
+        ] {
+            let error = result.expect_err(what);
+            assert!(
+                error.contains("(os error") && error.contains(&shown),
+                "{what}: {error}"
+            );
+        }
     }
 
     #[test]
