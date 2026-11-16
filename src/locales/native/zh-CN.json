@@ -1205,5 +1205,6 @@
   "Showing {value0} matching entries from the latest {value1}.": "显示最新 {value1} 条记录中匹配的 {value0} 条。",
   "Showing {value0} of the latest {value1} entries.": "显示最新 {value1} 条记录中的 {value0} 条。",
   "Showing 1 matching entry from the latest {value1}.": "显示最新 {value1} 条记录中匹配的 1 条。",
-  "Show all {value0} entries": "显示全部 {value0} 条记录"
+  "Show all {value0} entries": "显示全部 {value0} 条记录",
+  "Import as {value0}": "导入为 {value0}"
 }

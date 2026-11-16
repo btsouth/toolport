@@ -1205,5 +1205,6 @@
   "Showing {value0} matching entries from the latest {value1}.": "最新の {value1} 件のうち、一致する {value0} 件を表示しています。",
   "Showing {value0} of the latest {value1} entries.": "最新の {value1} 件のうち {value0} 件を表示しています。",
   "Showing 1 matching entry from the latest {value1}.": "最新の {value1} 件のうち、一致する 1 件を表示しています。",
-  "Show all {value0} entries": "{value0} 件をすべて表示"
+  "Show all {value0} entries": "{value0} 件をすべて表示",
+  "Import as {value0}": "{value0} としてインポート"
 }
