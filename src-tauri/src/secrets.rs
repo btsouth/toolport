@@ -1094,18 +1094,23 @@ mod platform {
     fn would_prompt(write: bool) -> bool {
         let search = || {
             let found = with_backup_service(|service| {
-                let locked = service
-                    .search_items(std::collections::HashMap::from([("service", SERVICE)]))
-                    .map(|found| !found.locked.is_empty())
-                    .map_err(|error| classify(&error))?;
-                if locked || !write {
-                    return Ok(locked);
-                }
-                match service.get_default_collection() {
-                    Ok(collection) => collection.is_locked().map_err(|error| classify(&error)),
-                    Err(dbus_secret_service::Error::NoResult) => Ok(true),
-                    Err(error) => Err(classify(&error)),
-                }
+                super::would_prompt_by(
+                    write,
+                    || match service.get_default_collection() {
+                        Ok(collection) => collection
+                            .is_locked()
+                            .map(Some)
+                            .map_err(|error| classify(&error)),
+                        Err(dbus_secret_service::Error::NoResult) => Ok(None),
+                        Err(error) => Err(classify(&error)),
+                    },
+                    || {
+                        service
+                            .search_items(std::collections::HashMap::from([("service", SERVICE)]))
+                            .map(|found| !found.locked.is_empty())
+                            .map_err(|error| classify(&error))
+                    },
+                )
             });
             let no_service = || {
                 BACKUP_BATCH.with(|slot| {
@@ -1979,7 +1984,7 @@ fn read_stored(server_id: &str, key: &str) -> Result<Option<String>, String> {
 /// real use of a value still asks. The encrypted file, the macOS
 /// data-protection keychain and Windows never prompt.
 pub fn store_would_prompt() -> bool {
-    if locked_store::locked() {
+    if locked_store::locked() || locked_store::collection_locked() {
         return true;
     }
     if file::active() {
@@ -2209,6 +2214,26 @@ fn read_must_not_prompt() -> bool {
     !prompts_allowed()
         && (locked_store::locked()
             || (cfg!(all(not(target_os = "macos"), not(target_os = "windows"))) && !file::active()))
+}
+
+/// The background check: `default_locked` reads the default collection's
+/// `Locked` property (`None`: there is none), which never asks; `search`
+/// looks for locked Toolport items, which KeePassXC answers with its unlock
+/// dialog while its database is locked. So a locked default collection is
+/// the answer without a search, and the polls that repeat this check every
+/// few seconds never raise that dialog. A write also asks with no default
+/// collection to put a new item in.
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+fn would_prompt_by<E>(
+    write: bool,
+    default_locked: impl FnOnce() -> Result<Option<bool>, E>,
+    search: impl FnOnce() -> Result<bool, E>,
+) -> Result<bool, E> {
+    match default_locked()? {
+        Some(true) => Ok(true),
+        None if write => Ok(true),
+        _ => search(),
+    }
 }
 
 /// A write or delete inside [`without_prompts`] while the store would ask.
@@ -2987,6 +3012,41 @@ pub(crate) mod tests {
         test();
     }
 
+    /// Failure mode: every check searched the store, and KeePassXC answers a
+    /// search with its unlock dialog while its database is locked, so the 3 s
+    /// polls raised it again after every cancel.
+    #[test]
+    fn polls_never_search_while_the_default_collection_is_locked() {
+        let searches = std::cell::Cell::new(0);
+        let search = || {
+            searches.set(searches.get() + 1);
+            Ok::<_, ()>(false)
+        };
+        for _ in 0..20 {
+            for write in [false, true] {
+                assert_eq!(would_prompt_by(write, || Ok(Some(true)), search), Ok(true));
+            }
+        }
+        assert_eq!(
+            searches.get(),
+            0,
+            "searched while the default collection was locked"
+        );
+        // Open: the search still finds locked items in another collection.
+        assert_eq!(
+            would_prompt_by(false, || Ok(Some(false)), || Ok::<_, ()>(true)),
+            Ok(true)
+        );
+        assert_eq!(
+            would_prompt_by(false, || Ok(Some(false)), search),
+            Ok(false)
+        );
+        // No default collection: a read searches, a write would ask.
+        assert_eq!(would_prompt_by(false, || Ok(None), search), Ok(false));
+        assert_eq!(would_prompt_by(true, || Ok(None), search), Ok(true));
+        assert_eq!(searches.get(), 2);
+    }
+
     /// Failure mode: the background write gate asked only whether a Toolport
     /// item was locked, so with none in the store a new item's write to the
     /// locked default collection asked to unlock it.
@@ -2995,7 +3055,6 @@ pub(crate) mod tests {
         with_isolated_vault(|| {
             let mut written = None;
             let prompts = locked_store::write_prompts_during(|| {
-                assert!(!store_would_prompt(), "reads find nothing to unlock");
                 written = Some(without_prompts(|| {
                     set_secret("srv", "API_KEY", "collection-locked-value")
                 }));
