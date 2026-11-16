@@ -102,10 +102,15 @@ jobs:
             echo "built $pkg"
             namcap "$pkg" || true
             bsdtar -tf "$pkg" | tee contents.txt
-            unexpected=$(grep -E "^usr/bin/[^/]+$" contents.txt | grep -Ev "^usr/bin/(toolport-gtk|toolport-gateway)$" || true)
+            unexpected=$(grep -E "^usr/bin/[^/]+$" contents.txt | grep -Ev "^usr/bin/(toolport-gtk|toolport-gateway|toolport|conduit)$" || true)
             test -z "$unexpected" || { echo "::error::Unexpected binaries: $unexpected"; exit 1; }
-            for want in usr/bin/toolport-gtk usr/bin/toolport-gateway; do
+            for want in usr/bin/toolport-gtk usr/bin/toolport-gateway usr/bin/toolport usr/bin/conduit; do
               grep -qx "$want" contents.txt || { echo "::error::$want missing from $pkg"; exit 1; }
+            done
+            # toolport and conduit are command aliases (#1342), same as the deb and rpm.
+            for alias in toolport conduit; do
+              bsdtar -tvf "$pkg" "usr/bin/$alias" | grep -q "^l.* usr/bin/$alias -> toolport-gtk$" \
+                || { echo "::error::usr/bin/$alias is not a symlink to toolport-gtk in $pkg"; exit 1; }
             done
             grep -q "^usr/share/applications/com.tsout.Toolport.desktop$" contents.txt \
               || { echo "::error::desktop entry missing from $pkg"; exit 1; }
