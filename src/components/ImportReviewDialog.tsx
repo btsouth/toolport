@@ -1,7 +1,8 @@
 import { useI18n, Trans } from "@/lib/i18n";
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Check, Loader2, ShieldAlert } from "lucide-react";
+import { Check, ChevronRight, Loader2, ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Dialog,
   DialogContent,
@@ -10,6 +11,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import type { ImportItem } from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 import { runsShell, isPrivateHostUrl } from "@/lib/importReview";
 
@@ -36,9 +38,36 @@ interface Props {
   ) => void;
 }
 
-/** A disclosure toggle with the same hover and focus ring as the dialog's buttons. */
+/** A disclosure toggle with the same hover and focus ring as the dialog's buttons. The
+ * browser's marker is hidden (flex drops it in Chromium, the pseudo-element in WebKit). */
 export const disclosureSummary =
-  "w-fit cursor-pointer rounded-md -mx-1 px-1 transition-colors outline-none hover:bg-muted hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50";
+  "flex w-fit cursor-pointer list-none items-center gap-1 rounded-md -mx-1 px-1 transition-colors outline-none hover:bg-muted hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden";
+
+/** Section title in the connect-flow dialogs (spec §2: 17 / 600). */
+export const connectDialogTitle = "text-[17px] font-semibold";
+
+/** Paths in the Details folds (spec §2 mono: 13 / 400). */
+export const pathText = "font-mono text-[13px] font-normal";
+
+/** A fold's summary: a 16px chevron that turns 90° when the fold opens. */
+export function DisclosureSummary({
+  className,
+  children,
+}: {
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <summary className={cn(disclosureSummary, className)}>
+      <ChevronRight
+        aria-hidden="true"
+        data-slot="disclosure-chevron"
+        className="size-4 shrink-0 transition-transform [details[open]>summary>&]:rotate-90"
+      />
+      {children}
+    </summary>
+  );
+}
 
 /** Review and choose detected client servers before adding them to Toolport. */
 export function ImportReviewDialog({
@@ -132,6 +161,15 @@ function ImportReviewContent({
   >({});
   const [editing, setEditing] = useState<{ name: string; key: string } | null>(null);
   const [value, setValue] = useState("");
+  const applyValue = () => {
+    if (!editing) return;
+    setCredentialInputs((previous) => ({
+      ...previous,
+      [editing.name]: { ...previous[editing.name], [editing.key]: value },
+    }));
+    setValue("");
+    setEditing(null);
+  };
   const selectedCount = selected.size;
   const missingRequired = requireCredentials
     ? keyedItems.flatMap(({ item, key }) =>
@@ -167,7 +205,9 @@ function ImportReviewContent({
       onCloseAutoFocus={onCloseAutoFocus}
     >
       <DialogHeader>
-        <DialogTitle>{title ?? t("Review servers to import")}</DialogTitle>
+        <DialogTitle className={connectDialogTitle}>
+          {title ?? t("Review servers to import")}
+        </DialogTitle>
       </DialogHeader>
       <div className="flex flex-col gap-4 py-1">
         <p className="text-meta text-muted-foreground">
@@ -179,8 +219,10 @@ function ImportReviewContent({
         {notice}
         {details && (
           <details>
-            <summary className={`text-meta ${disclosureSummary}`}>{t("Details")}</summary>
-            <p className="mt-2 whitespace-pre-wrap break-all text-meta text-muted-foreground">
+            <DisclosureSummary className="text-meta">{t("Details")}</DisclosureSummary>
+            <p
+              className={`mt-2 whitespace-pre-wrap break-all text-muted-foreground ${pathText}`}
+            >
               {details}
             </p>
           </details>
@@ -256,9 +298,9 @@ function ImportReviewContent({
                 </button>
                 {!!item.credentials?.length && (
                   <details className="px-3 pb-3 text-meta">
-                    <summary className={disclosureSummary}>
+                    <DisclosureSummary>
                       {item.name} {t("credentials and settings")}
-                    </summary>
+                    </DisclosureSummary>
                     <div className="flex flex-col gap-2 pt-2">
                       {item.credentials.map((env) => (
                         <div key={env.key} className="flex items-center gap-2">
@@ -333,40 +375,38 @@ function ImportReviewContent({
         >
           <DialogContent>
             <DialogHeader>
-              <DialogTitle>
+              <DialogTitle className={connectDialogTitle}>
                 {editing.name} {t("credentials")}
               </DialogTitle>
             </DialogHeader>
-            <p className="text-sm text-muted-foreground">
+            <p className="text-meta text-muted-foreground">
               {t(
                 "This value is used only for the selected server. It is saved only if connection succeeds.",
               )}
             </p>
-            <label className="flex flex-col gap-2 text-sm">
+            <label className="flex flex-col gap-2 text-meta">
               {editing.key}
-              <input
+              {/* Spec §13: surface fill and a 2px accent focus ring. */}
+              <Input
                 type="password"
                 autoComplete="off"
-                className="rounded-md border bg-background px-3 py-2"
+                className="bg-card focus-visible:ring-2 dark:bg-card"
                 value={value}
                 onChange={(e) => setValue(e.target.value)}
+                onKeyDown={(e) => {
+                  // Return uses the value, as the GTK prompt's default button does.
+                  if (e.key === "Enter" && value.trim()) {
+                    e.preventDefault();
+                    applyValue();
+                  }
+                }}
               />
             </label>
             <DialogFooter>
               <Button variant="ghost" onClick={() => setEditing(null)}>
                 {t("Cancel")}
               </Button>
-              <Button
-                disabled={!value.trim()}
-                onClick={() => {
-                  setCredentialInputs((previous) => ({
-                    ...previous,
-                    [editing.name]: { ...previous[editing.name], [editing.key]: value },
-                  }));
-                  setValue("");
-                  setEditing(null);
-                }}
-              >
+              <Button disabled={!value.trim()} onClick={applyValue}>
                 {t("Use for connection")}
               </Button>
             </DialogFooter>

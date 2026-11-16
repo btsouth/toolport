@@ -319,7 +319,6 @@
   "Enter a value first.": "먼저 값을 입력하세요.",
   "Enter both a variable name and a secret value.": "변수 이름과 비밀 값을 모두 입력합니다.",
   "Enter the sync service URL and manual code": "동기화 서비스 URL과 수동 코드를 입력하세요.",
-  "Enter {value0}. This value is used only for the selected server. It is saved only if connection succeeds.": "{value0}를 입력하세요. 이 값은 선택한 서버에만 사용됩니다. 연결이 성공한 경우에만 저장됩니다.",
   "Environment / credential keys": "환경 / 자격 증명 키",
   "Every device keeps syncing for {count} more days": "모든 기기는 {count}일 동안 계속 동기화됩니다.",
   "Everything is included unless you uncheck it.": "체크를 해제하지 않는 한 모든 것이 포함되어 있습니다.",

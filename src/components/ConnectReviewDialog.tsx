@@ -4,7 +4,12 @@ import { Check, Loader2 } from "lucide-react";
 import { migrateClient, previewClientSetup } from "@/lib/api";
 import type { ClientSetupReview, MigrateResult, Registry } from "@/lib/types";
 import { GatewaySettingsNotice } from "./GatewaySettingsNotice";
-import { disclosureSummary, ImportReviewDialog } from "./ImportReviewDialog";
+import {
+  connectDialogTitle,
+  DisclosureSummary,
+  ImportReviewDialog,
+  pathText,
+} from "./ImportReviewDialog";
 import {
   Dialog,
   DialogContent,
@@ -98,9 +103,9 @@ export function ConnectReviewDialog({
           if (!open && !busy) close();
         }}
       >
-        <DialogContent onCloseAutoFocus={restoreFocus}>
+        <DialogContent className="sm:max-w-lg" onCloseAutoFocus={restoreFocus}>
           <DialogHeader>
-            <DialogTitle>
+            <DialogTitle className={connectDialogTitle}>
               {result
                 ? t("{value0} connected", { value0: clientName })
                 : t("Connect {value0}", { value0: clientName })}
@@ -140,9 +145,7 @@ export function ConnectReviewDialog({
                 </p>
               ))}
               <details>
-                <summary className={disclosureSummary}>
-                  {t("What your agent sees")}
-                </summary>
+                <DisclosureSummary>{t("What your agent sees")}</DisclosureSummary>
                 {/* Said when nothing moved, rather than opening on nothing; GTK says
                     the same. */}
                 {result.tools.length === 0 ? (
@@ -158,8 +161,8 @@ export function ConnectReviewDialog({
                 )}
               </details>
               <details>
-                <summary className={disclosureSummary}>{t("Details")}</summary>
-                <p className="mt-2 break-all">
+                <DisclosureSummary>{t("Details")}</DisclosureSummary>
+                <p className={`mt-2 break-all ${pathText}`}>
                   {t("Config: {path}", { path: result.outcome.path })}
                 </p>
                 {result.outcome.backup && (
@@ -171,7 +174,7 @@ export function ConnectReviewDialog({
                           })
                         : t("Backup saved")}
                     </p>
-                    <p className="break-all">
+                    <p className={`break-all ${pathText}`}>
                       {t("Backup: {path}", { path: result.outcome.backup })}
                     </p>
                   </>

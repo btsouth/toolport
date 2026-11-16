@@ -1306,7 +1306,11 @@ button.toolport-catalog-action {{
 toast {{ background: @toolport_raised; color: @toolport_fg; border: 1px solid @toolport_border; border-radius: 12px; }}
 statuspage.toolport-success image.icon {{ color: @toolport_success; opacity: 1; }}
 /* Review and connect: React's dialog title (20px, 600) and its success check. */
-.toolport-dialog-title {{ font-size: 20px; font-weight: 600; }}
+/* Spec §2: a dialog title is 17/600, its description 13px secondary, paths mono 13. */
+.toolport-dialog-title {{ font-size: 17px; font-weight: 600; }}
+.toolport-dialog-lede {{ font-size: 13px; color: @toolport_text_secondary; }}
+.toolport-field-label {{ font-size: 13px; }}
+.toolport-path-text {{ font-family: monospace; font-size: 13px; font-weight: 400; }}
 image.toolport-success-icon {{ color: @toolport_success; opacity: 1; }}
 /* React's review item: the whole row is the toggle, with a 12px round dot that fills
    green when selected and a green ring around the selected row. */
