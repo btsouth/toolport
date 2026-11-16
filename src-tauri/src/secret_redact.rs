@@ -5857,6 +5857,34 @@ mod tests {
         });
     }
 
+    /// Failure mode: a stored value that is damaged (a broken chunk manifest,
+    /// a missing chunk, an undecodable item) can never be read back, so it has
+    /// nothing to scrub or keep, yet its replace and delete were refused: the
+    /// user could never fix or remove it.
+    #[test]
+    fn a_damaged_stored_value_can_still_be_replaced_and_deleted() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            crate::secrets::set_secret("damaged-srv", "DAMAGED_KEY", "damaged-old-3Pq8Ln").unwrap();
+            let replaced = crate::secrets::tests::with_damaged_read("DAMAGED_KEY", || {
+                crate::secrets::set_secret("damaged-srv", "DAMAGED_KEY", "damaged-new-7Ws2Kd")
+            });
+            assert_eq!(replaced, Ok(()));
+            assert_eq!(
+                crate::secrets::get_secret("damaged-srv", "DAMAGED_KEY").as_deref(),
+                Some("damaged-new-7Ws2Kd")
+            );
+            let deleted = crate::secrets::tests::with_damaged_read("DAMAGED_KEY", || {
+                crate::secrets::delete_secret("damaged-srv", "DAMAGED_KEY")
+            });
+            assert_eq!(deleted, Ok(()));
+            assert_eq!(
+                crate::secrets::get_secret("damaged-srv", "DAMAGED_KEY"),
+                None
+            );
+            assert_eq!(crate::secrets::retired_scrubs_pending(), 0);
+        });
+    }
+
     /// Failure mode: the retired list itself was registered as a secret on
     /// every save and load, a new registry entry and matcher rebuild each time.
     #[test]

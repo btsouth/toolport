@@ -2045,6 +2045,8 @@ fn scrub_previous(server_id: &str, key: &str, replacement: Option<&str>) -> Resu
     #[cfg(test)]
     let stored = if tests::read_is_injected_failure(key) {
         Err("injected secret read failure".to_string())
+    } else if tests::read_is_injected_damage(key) {
+        Err("injected damaged secret".to_string())
     } else {
         stored
     };
@@ -2439,6 +2441,27 @@ pub(crate) mod tests {
         READS.with(|reads| reads.borrow_mut().clear());
         test();
         READS.with(|reads| std::mem::take(&mut *reads.borrow_mut()))
+    }
+
+    thread_local! {
+        static DAMAGED_READ: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(crate) fn read_is_injected_damage(key: &str) -> bool {
+        DAMAGED_READ.with(|damaged| damaged.get() == Some(key))
+    }
+
+    /// Reads of `key`'s stored value find it damaged (a broken chunk manifest,
+    /// an undecodable item) while `test` runs: nothing can ever read it back.
+    pub(crate) fn with_damaged_read<T>(key: &'static str, test: impl FnOnce() -> T) -> T {
+        struct Restore(Option<&'static str>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                DAMAGED_READ.with(|damaged| damaged.set(self.0));
+            }
+        }
+        let _restore = Restore(DAMAGED_READ.with(|damaged| damaged.replace(Some(key))));
+        test()
     }
 
     pub(crate) fn read_is_injected_failure(key: &str) -> bool {
