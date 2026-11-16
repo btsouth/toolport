@@ -292,6 +292,93 @@ fn spans(format: Format, text: &str) -> Result<Vec<Span>, String> {
         _ => json_spans(text),
     }
 }
+/// Names on the way to every string in `text` that holds `marker`: object keys
+/// and entry `name` fields, so the config entries a saved value sits under.
+fn marker_owners(format: Format, text: &str, marker: &str) -> Result<Vec<String>, String> {
+    fn walk(
+        value: &serde_json::Value,
+        marker: &str,
+        path: &mut Vec<String>,
+        out: &mut Vec<String>,
+    ) {
+        match value {
+            serde_json::Value::String(text) if contains_marker(text, marker) => {
+                for name in path.iter() {
+                    if !out.contains(name) {
+                        out.push(name.clone());
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, marker, path, out);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                let named = map.get("name").and_then(serde_json::Value::as_str);
+                if let Some(name) = named {
+                    path.push(name.to_string());
+                }
+                for (key, item) in map {
+                    path.push(key.clone());
+                    walk(item, marker, path, out);
+                    path.pop();
+                }
+                if named.is_some() {
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(
+        &mutation::value(format, Some(text))?,
+        marker,
+        &mut Vec::new(),
+        &mut out,
+    );
+    Ok(out)
+}
+
+/// Which of `refs` (reference and marker pairs from one receipt) belong to
+/// this config. One saved value can equal the stored secret of several
+/// Toolport servers with the same key, and the receipt then lists all of them
+/// for one marker. Only the servers whose entry holds that marker own it; when
+/// none does (or the marker is gone), the first listed keeps it. Returns the
+/// indexes to keep, in order.
+pub(super) fn owned(
+    format: Format,
+    text: Option<&str>,
+    refs: &[(&backup_storage::Reference, &str)],
+) -> Vec<usize> {
+    let mut keep = Vec::new();
+    for (index, (_, marker)) in refs.iter().enumerate() {
+        let group: Vec<usize> = (0..refs.len()).filter(|&i| refs[i].1 == *marker).collect();
+        if group[0] != index {
+            continue;
+        }
+        if group.len() == 1 {
+            keep.push(index);
+            continue;
+        }
+        let owners = text
+            .and_then(|text| marker_owners(format, text, marker).ok())
+            .unwrap_or_default();
+        let matching: Vec<usize> = group
+            .iter()
+            .copied()
+            .filter(|&i| owners.contains(&refs[i].0.server))
+            .collect();
+        if matching.is_empty() {
+            keep.push(index);
+        } else {
+            keep.extend(matching);
+        }
+    }
+    keep.sort_unstable();
+    keep
+}
 pub(super) fn present(format: Format, text: &str, marker: &str) -> Result<bool, String> {
     Ok(spans(format, text)?
         .iter()
@@ -382,7 +469,12 @@ pub(super) fn remember_progress(
     resolved: &[String],
 ) -> Result<(), String> {
     let mut refs = std::collections::BTreeMap::<(String, String), (bool, bool)>::new();
-    for v in values {
+    let pairs: Vec<_> = values
+        .iter()
+        .map(|v| (&v.reference, v.marker.as_str()))
+        .collect();
+    let owned = owned(format, before, &pairs);
+    for v in owned.iter().map(|&i| &values[i]) {
         let b = before
             .map(|t| present(format, t, &v.marker))
             .transpose()?
@@ -410,6 +502,39 @@ pub(super) fn remember_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shared_marker_belongs_to_the_entries_that_hold_it() {
+        let reference = |server: &str| backup_storage::Reference {
+            server: server.into(),
+            key: "API_KEY".into(),
+        };
+        let (a, b, c) = (
+            reference("weather"),
+            reference("weather-demo"),
+            reference("other"),
+        );
+        let m = "TOOLPORT_MISSING_CREDENTIAL_0";
+        let one = r#"{"mcpServers":{"weather-demo":{"env":{"API_KEY":"TOOLPORT_MISSING_CREDENTIAL_0"}}}}"#;
+        let both = r#"{"mcpServers":{"weather":{"env":{"API_KEY":"TOOLPORT_MISSING_CREDENTIAL_0"}},"weather-demo":{"env":{"API_KEY":"TOOLPORT_MISSING_CREDENTIAL_0"}}}}"#;
+        let named = "servers:\n  - name: weather-demo\n    env:\n      API_KEY: TOOLPORT_MISSING_CREDENTIAL_0\n";
+        let refs = [(&a, m), (&b, m), (&c, "TOOLPORT_MISSING_CREDENTIAL_1")];
+        assert_eq!(owned(Format::JsonMcpServers, Some(one), &refs), vec![1, 2]);
+        assert_eq!(
+            owned(Format::JsonMcpServers, Some(both), &refs),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            owned(Format::YamlMcpServersList, Some(named), &refs),
+            vec![1, 2]
+        );
+        // No entry holds it (or the config is gone): the first listed keeps it.
+        assert_eq!(owned(Format::JsonMcpServers, None, &refs), vec![0, 2]);
+        assert_eq!(
+            owned(Format::JsonMcpServers, Some("{}"), &refs[..2]),
+            vec![0]
+        );
+    }
     #[test]
     fn complete_marker_ids_do_not_match_prefixes_or_cascade_into_saved_values() {
         let m = |n| format!("TOOLPORT_MISSING_CREDENTIAL_{n}");

@@ -318,6 +318,18 @@ fn read_receipt(id: &str, name: &str, file: &Path) -> Result<Option<Receipt>, &'
             discard_values.push(name);
         }
     }
+    // A value that equals another server's stored secret is listed for both
+    // in the receipt; the card shows only the server whose entry holds it.
+    let markers = {
+        let pairs: Vec<_> = markers.iter().map(|(r, m)| (r, m.as_str())).collect();
+        let keep = recovery_values::owned(format, current.as_deref(), &pairs);
+        markers
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| keep.contains(index))
+            .map(|(_, pair)| pair)
+            .collect::<Vec<_>>()
+    };
     let mut missing = Vec::new();
     let mut value_lines = Vec::new();
     let mut instructions = Vec::new();
@@ -1173,6 +1185,78 @@ mod tests {
             assert!(!rows
                 .iter()
                 .any(|r| r.backup_path.ends_with(moved::RECORD_NAME)));
+        });
+    }
+
+    /// A saved value that equals another server's stored secret (same key, same
+    /// value) is listed for both in the receipt. The card and the Retry tally
+    /// name only the server whose entry holds it in this config, in both shells.
+    #[test]
+    fn a_card_lists_only_the_server_whose_entry_holds_the_value() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let path = data.join("shared-value.json");
+            let original = "{\n \"mcpServers\":{\"weather-demo\":{\"command\":\"echo\",\"env\":{\"WEATHER_API_KEY\":\"wx-shared-fixture-value\"}}}\n}\n";
+            let registry = serde_json::from_value(serde_json::json!({"version":3,"profiles":[],"servers":[
+                {"id":"weather","name":"Weather","transport":"stdio","env":[{"key":"WEATHER_API_KEY","secret":true}]},
+                {"id":"weather-demo","name":"Weather demo","transport":"stdio","env":[{"key":"WEATHER_API_KEY","secret":true}]}
+            ]}))
+            .unwrap();
+            crate::registry::save(&registry).unwrap();
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            for server in ["weather", "weather-demo"] {
+                crate::secrets::set_secret(server, "WEATHER_API_KEY", "wx-shared-fixture-value")
+                    .unwrap();
+            }
+            std::fs::write(&path, original).unwrap();
+            mutation::run("cursor", &path, Format::JsonMcpServers, || {
+                backup_file("cursor", &path)?;
+                write_format(Format::JsonMcpServers, &path, &[], true)
+            })
+            .unwrap();
+            std::env::set_var("TOOLPORT_SECRET_KEY", "locked-state-fixture");
+            disconnect::restore_path("cursor", &path, Format::JsonMcpServers, None).unwrap();
+            let card = list()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.path == path.to_string_lossy())
+                .expect("the unreadable saved value leaves a card");
+            let servers: Vec<_> = card.missing.iter().map(|r| r.server.as_str()).collect();
+            assert_eq!(servers, vec!["weather-demo"], "{:?}", card.value_lines);
+            assert_eq!(card.value_lines.len(), 1, "{:?}", card.value_lines);
+            assert!(card.value_lines[0].starts_with("WEATHER_API_KEY for weather-demo:"));
+
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            let done = retry_with_report(&card.id).unwrap();
+            assert_eq!((done.restored, done.remaining), (1, 0), "{}", done.message);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        });
+    }
+
+    /// The user's unlock is what the deferred start-up refreshes wait for, so
+    /// they run even when the restore after it fails.
+    #[test]
+    fn a_failed_restore_after_an_unlock_still_runs_the_deferred_refresh() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let path = data.join("broken.json");
+            let card = locked_card_fixture("cursor", &path);
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            std::fs::write(&path, "{ not json").unwrap();
+            let mut outcome = None;
+            let calls = backup_vault::fake::locked_store(backup_vault::Unlock::Open, || {
+                outcome = Some(retry_with_report(&card.id));
+            });
+            assert!(
+                outcome.unwrap().is_err(),
+                "a config that cannot be parsed fails the restore"
+            );
+            assert_eq!(calls.first().map(String::as_str), Some("unlock prompt"));
+            assert!(
+                calls.iter().any(|c| c == "refresh deferred client configs"),
+                "{calls:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
         });
     }
 
