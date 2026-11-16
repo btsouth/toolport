@@ -19056,25 +19056,63 @@ mod tests {
                     let chip = label.parent().unwrap();
                     let chip_at = placed.iter().position(|(w, _, _)| *w == chip).unwrap();
                     assert_eq!(chip_at, 0, "{language} at {width}: the chip comes first");
-                    if placed.len() > 1 {
-                        let mut middles = placed.iter().map(|(_, y, _)| *y).collect::<Vec<_>>();
-                        middles.dedup_by(|a, b| (*a - *b).abs() <= 2);
-                        for middle in middles {
-                            let on_line = placed
+                    // Controls alone on a line: no more than the fewest any
+                    // in-order split of these widths allows, and never the
+                    // switch and menu (they always fit beside the action before).
+                    let mut middles = placed.iter().map(|(_, y, _)| *y).collect::<Vec<_>>();
+                    middles.dedup_by(|a, b| (*a - *b).abs() <= 2);
+                    let per_line = middles
+                        .iter()
+                        .map(|middle| {
+                            placed
                                 .iter()
                                 .filter(|(_, y, _)| (*y - middle).abs() <= 2)
-                                .count();
-                            assert!(
-                                on_line > 1,
-                                "{language} at {width}: one control alone on a line ({what}): {:?} in {}",
-                                placed
-                                    .iter()
-                                    .map(|(w, y, x)| (w.type_().name(), *y, *x, w.width()))
-                                    .collect::<Vec<_>>(),
-                                flow.width()
-                            );
-                        }
-                    }
+                                .count()
+                        })
+                        .collect::<Vec<_>>();
+                    let widths = placed.iter().map(|(w, _, _)| w.width()).collect::<Vec<_>>();
+                    let fewest_alone = (0u32..1 << (widths.len() - 1))
+                        .filter_map(|breaks| {
+                            let mut lines = vec![vec![widths[0]]];
+                            for (index, w) in widths.iter().enumerate().skip(1) {
+                                if breaks & (1 << (index - 1)) != 0 {
+                                    lines.push(vec![*w]);
+                                } else {
+                                    lines.last_mut().unwrap().push(*w);
+                                }
+                            }
+                            lines
+                                .iter()
+                                .all(|line| {
+                                    line.len() == 1
+                                        || line.iter().sum::<i32>() + 8 * (line.len() as i32 - 1)
+                                            <= flow.width()
+                                })
+                                .then(|| lines.iter().filter(|line| line.len() == 1).count())
+                        })
+                        .min()
+                        .unwrap();
+                    let layout = || {
+                        format!(
+                            "{:?} in {}",
+                            placed
+                                .iter()
+                                .map(|(w, y, x)| (w.type_().name(), *y, *x, w.width()))
+                                .collect::<Vec<_>>(),
+                            flow.width()
+                        )
+                    };
+                    assert_eq!(
+                        per_line.iter().filter(|count| **count == 1).count(),
+                        fewest_alone,
+                        "{language} at {width}: a control alone on a line that could share one ({what}): {}",
+                        layout()
+                    );
+                    assert!(
+                        placed.len() == 1 || *per_line.last().unwrap() > 1,
+                        "{language} at {width}: the switch and menu alone on the last line ({what}): {}",
+                        layout()
+                    );
                     let in_card = last.compute_bounds(card).unwrap();
                     let line = flow.parent().unwrap();
                     let line_end = line.compute_bounds(card).unwrap();

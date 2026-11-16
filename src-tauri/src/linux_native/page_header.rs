@@ -354,35 +354,71 @@ mod flow_imp {
             line.height = line.height.max(height);
             used += child_width;
         }
-        if balance && width >= 0 {
-            balance_last_line(&mut out, width);
+        if balance && width >= 0 && (2..=16).contains(&children.len()) {
+            let widths = out
+                .iter()
+                .flat_map(|line| line.items.iter().map(|(_, w, _)| *w))
+                .collect::<Vec<_>>();
+            let items = out
+                .into_iter()
+                .flat_map(|line| line.items)
+                .collect::<Vec<_>>();
+            let mut items = items.into_iter();
+            return super::balanced_lines(&widths, super::ACTION_SPACING, width)
+                .into_iter()
+                .map(|count| {
+                    let items = items.by_ref().take(count).collect::<Vec<_>>();
+                    let height = items.iter().map(|(_, _, h)| *h).max().unwrap_or(0);
+                    Line { items, height }
+                })
+                .collect();
         }
         out
-    }
-
-    /// Never leave the last control alone on its line: take the one before it
-    /// down too, when the line above keeps at least two and the pair fits.
-    fn balance_last_line(out: &mut [Line], width: i32) {
-        let count = out.len();
-        if count < 2 || out[count - 1].items.len() != 1 || out[count - 2].items.len() < 3 {
-            return;
-        }
-        let (above, last) = out.split_at_mut(count - 1);
-        let (above, last) = (&mut above[count - 2], &mut last[0]);
-        let moved = above.items.last().expect("the line has items").clone();
-        let alone = last.items[0].1;
-        if moved.1 + super::ACTION_SPACING + alone > width {
-            return;
-        }
-        above.items.pop();
-        last.items.insert(0, moved);
-        above.height = above.items.iter().map(|(_, _, h)| *h).max().unwrap_or(0);
-        last.height = last.items.iter().map(|(_, _, h)| *h).max().unwrap_or(0);
     }
 }
 
 /// Space between page actions, across and between lines.
 const ACTION_SPACING: i32 = 8;
+
+/// How many controls go on each line, in order, so that as few controls as
+/// possible sit alone on a line and the last one (a row's switch and menu) is
+/// alone only when nothing else fits; then the fewest lines, fullest first.
+pub(super) fn balanced_lines(widths: &[i32], spacing: i32, width: i32) -> Vec<usize> {
+    let count = widths.len();
+    if count <= 1 {
+        return vec![count];
+    }
+    (0u32..(1 << (count - 1)))
+        .map(|breaks| {
+            let mut lines = vec![1usize];
+            for index in 1..count {
+                if breaks & (1 << (index - 1)) != 0 {
+                    lines.push(1);
+                } else {
+                    *lines.last_mut().expect("a line") += 1;
+                }
+            }
+            lines
+        })
+        .filter(|lines| {
+            let mut start = 0;
+            lines.iter().all(|&len| {
+                let used =
+                    widths[start..start + len].iter().sum::<i32>() + spacing * (len as i32 - 1);
+                start += len;
+                len == 1 || used <= width
+            })
+        })
+        .min_by_key(|lines| {
+            (
+                lines.iter().filter(|&&len| len == 1).count(),
+                lines.last() == Some(&1),
+                lines.len(),
+                std::cmp::Reverse(lines.clone()),
+            )
+        })
+        .unwrap_or_else(|| vec![1; count])
+}
 
 glib::wrapper! {
     /// The page actions, left to right at natural width, wrapping onto more lines
@@ -558,6 +594,24 @@ impl PageHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_controls_split_so_no_control_is_left_alone_when_another_split_exists() {
+        // CI's German "Service key required" row at a 480 px window: chip, Edit
+        // service key, View log, then the switch and menu, in 404 px.
+        assert_eq!(super::balanced_lines(&[191, 205, 136, 88], 8, 404), [2, 2]);
+        // One pixel wider and the chip cannot share its line: it stays alone,
+        // and the switch and menu still get company.
+        assert_eq!(
+            super::balanced_lines(&[191, 206, 136, 88], 8, 404),
+            [1, 1, 2]
+        );
+        // English at 480: chip and Sign in, then View log with the switch.
+        assert_eq!(super::balanced_lines(&[105, 70, 80, 88], 8, 338), [2, 2]);
+        // Everything fits: one line.
+        assert_eq!(super::balanced_lines(&[105, 88], 8, 404), [2]);
+        assert_eq!(super::balanced_lines(&[105], 8, 404), [1]);
+    }
 
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
