@@ -4136,6 +4136,23 @@ fn connected_client_actions_menu(client: state::ClientView, page: ClientPage) ->
     menu
 }
 
+/// A client row's access menu label: one line, ending in "…" (the tooltip and
+/// the details page show all of it). It keeps the width it asked for when it
+/// wrapped, its widest line at 24 characters, because the row moves its
+/// controls under the name once they do not fit beside it: any wider and they
+/// move down at wider windows. Wrapping put "Default access (from" /
+/// "Settings)" on two lines.
+fn client_access_menu_label(label: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .label(label)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::Word)
+        .max_width_chars(24)
+        .lines(1)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build()
+}
+
 fn client_scope_menu(client: state::ClientView, page: ClientPage) -> gtk::MenuButton {
     let label = client
         .scope_name
@@ -4155,15 +4172,7 @@ fn client_scope_menu(client: state::ClientView, page: ClientPage) -> gtk::MenuBu
     };
     let menu = gtk::MenuButton::builder()
         .always_show_arrow(true)
-        .child(
-            // Wraps between words in a narrow window rather than cutting the access name.
-            &gtk::Label::builder()
-                .label(&label)
-                .wrap(true)
-                .wrap_mode(gtk::pango::WrapMode::Word)
-                .max_width_chars(24)
-                .build(),
-        )
+        .child(&client_access_menu_label(&label))
         .tooltip_text(crate::i18n::trf(
             "Choose this client's access to enabled servers: {value0}",
             &[("value0", &label.to_string())],
@@ -16686,6 +16695,138 @@ mod tests {
             out.extend(fixture_descendants(&widget));
         }
         out
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn client_access_menu_stays_on_one_line_in_every_language() {
+        // Read from the label's settings, not measured, so fonts do not decide
+        // it: one line ending in "…", and no wider than before so
+        // the controls move under the name at the same window widths.
+        adw::init().unwrap();
+        let scratch =
+            std::env::temp_dir().join(format!("toolport-access-label-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&scratch);
+        for language in [
+            "en", "de", "es", "fr", "pt-BR", "ja", "ko", "zh-CN", "zh-TW",
+        ] {
+            crate::i18n::set_language(language).unwrap();
+            let text = crate::i18n::tr("Default access (from Settings)");
+            let label = super::client_access_menu_label(&text);
+            // One line, ending in "…".
+            assert_eq!(label.lines(), 1, "{language}: \"{text}\" takes two lines");
+            assert_eq!(label.ellipsize(), gtk::pango::EllipsizeMode::End);
+            // Measured as before: the widest line of the text wrapped at 24
+            // characters, so the row's controls move down at the same widths.
+            assert!(label.wraps());
+            assert_eq!(label.wrap_mode(), gtk::pango::WrapMode::Word);
+            assert_eq!(label.max_width_chars(), 24, "{language}: as wide as before");
+            assert_eq!(label.label(), text, "{language}: the whole text is kept");
+            // The open Access list never breaks a choice inside a word.
+            let choice = super::details::checked_list_label();
+            assert!(!choice.wraps() && choice.is_single_line_mode());
+            assert_eq!(choice.ellipsize(), gtk::pango::EllipsizeMode::None);
+        }
+        crate::i18n::set_language("en").unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn a_connected_row_with_a_migration_fits_a_narrow_window_in_every_language() {
+        use super::*;
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.MigrationRowFixture")
+            .build();
+        let server_page = ServerPage {
+            details: Default::default(),
+            app: app.clone(),
+            share_requests: Default::default(),
+            server_count: gtk::Label::new(None),
+            section_title: gtk::Label::new(None),
+            posture: gtk::Label::new(None),
+            search: gtk::SearchEntry::new(),
+            feedback: gtk::Label::new(None),
+            list: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            last_snapshot: Default::default(),
+            feedback_timer: Default::default(),
+            health_rows: Default::default(),
+            rows: Default::default(),
+            no_matches: Default::default(),
+            off_heading: Default::default(),
+            health: Default::default(),
+            registry_reload: Default::default(),
+        };
+        let page = ClientPage::new(&app, server_page);
+        let mut client = state::ClientView {
+            detected: None,
+            imported_names: Vec::new(),
+            id: "cursor".into(),
+            name: "Cursor".into(),
+            app_present: true,
+            config_exists: true,
+            uses_connectors: false,
+            server_count: 2,
+            movable_server_count: 0,
+            other_server_count: 2,
+            gateway_state: state::ClientGatewayState::Disconnected,
+            shared_http: false,
+            legacy_bearer_argv: false,
+            scope_id: None,
+            scope_name: None,
+            discovery_mode: None,
+            inherited_discovery: None,
+            config_error: false,
+            location_removable: false,
+            location_kept_by_t3_code: false,
+            claude_profile: None,
+            t3_code: Vec::new(),
+        };
+        client.gateway_state = state::ClientGatewayState::Connected;
+        client.shared_http = true;
+        client.legacy_bearer_argv = true;
+        let scratch =
+            std::env::temp_dir().join(format!("toolport-migration-row-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&scratch);
+        for language in [
+            "en", "de", "es", "fr", "pt-BR", "ja", "ko", "zh-CN", "zh-TW",
+        ] {
+            crate::i18n::set_language(language).unwrap();
+            client.scope_name = Some(crate::i18n::tr("Default access (from Settings)"));
+            let row = client_rows::client_row(&client, page.clone(), client_rows::RowStyle::Line);
+            let controls = fixture_descendants(row.upcast_ref())
+                .into_iter()
+                .find(|w| w.has_css_class("toolport-client-controls"))
+                .expect("row controls");
+            // The controls wrap onto lines rather than adding up their widths:
+            // the row asks for no more than its widest single control, so it
+            // fits a narrow window (432 px in a 480 px one) instead of pushing
+            // the page past the window edge.
+            let widest = {
+                let mut widest = 0;
+                let mut child = controls.first_child();
+                while let Some(widget) = child {
+                    widest = widest.max(widget.measure(gtk::Orientation::Horizontal, -1).0);
+                    child = widget.next_sibling();
+                }
+                widest
+            };
+            assert_eq!(
+                controls.measure(gtk::Orientation::Horizontal, -1).0,
+                widest,
+                "{language}: the controls ask for their widest control, not their sum"
+            );
+            let (min, _, _, _) = row.measure(gtk::Orientation::Horizontal, -1);
+            assert!(min <= 432, "{language}: the migration row needs {min} px");
+            // The access menu and ⋮ are one group, so neither is left alone.
+            let menu = fixture_descendants(row.upcast_ref())
+                .into_iter()
+                .find(|w| w.is::<gtk::MenuButton>())
+                .unwrap();
+            assert_eq!(menu.parent().unwrap().parent().as_ref(), Some(&controls));
+            assert_eq!(menu.parent().unwrap().observe_children().n_items(), 2);
+        }
+        crate::i18n::set_language("en").unwrap();
     }
 
     #[test]
