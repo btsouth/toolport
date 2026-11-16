@@ -3595,6 +3595,7 @@ mod tests {
             &mut after,
             crate::registry_controller::ServerFields {
                 sync_local_only: true,
+                initialize_timeout_ms: None,
                 name: "Private".into(),
                 transport: "stdio".into(),
                 command: Some("echo".into()),

@@ -170,6 +170,8 @@ pub(crate) fn acquire_auth_owner_lock(owner: &str) -> Result<AuthMutationLock, S
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerFields {
     pub sync_local_only: bool,
+    /// None preserves the current value; Some(None) restores the default.
+    pub initialize_timeout_ms: Option<Option<u64>>,
     pub name: String,
     pub transport: String,
     pub command: Option<String>,
@@ -337,6 +339,15 @@ impl ClientConfigReceipt {
 
 impl ServerFields {
     fn normalized(mut self) -> Result<Self, String> {
+        if self
+            .initialize_timeout_ms
+            .flatten()
+            .is_some_and(|ms| ms == 0 || ms > 86_400_000)
+        {
+            return Err(
+                "Startup timeout must be greater than 0 and at most 86,400 seconds.".into(),
+            );
+        }
         self.name = self.name.trim().to_string();
         if self.name.is_empty() {
             return Err("give the server a name".into());
@@ -400,7 +411,7 @@ fn entry_from_fields(fields: ServerFields) -> Result<ServerEntry, String> {
         hide_prompts: fields.hide_prompts.unwrap_or(false),
         client_credentials: None,
         request_timeout_ms: None,
-        initialize_timeout_ms: None,
+        initialize_timeout_ms: fields.initialize_timeout_ms.flatten(),
         launch: None,
         unknown_fields: if fields.sync_local_only {
             serde_json::Map::from_iter([("syncLocalOnly".into(), serde_json::json!(true))])
@@ -750,6 +761,9 @@ pub fn apply_update_server_fields(
         }
         server.launch = None;
     }
+    if let Some(timeout) = fields.initialize_timeout_ms {
+        server.initialize_timeout_ms = timeout;
+    }
     server.name = fields.name;
     server.transport = fields.transport;
     server.command = fields.command;
@@ -967,6 +981,7 @@ pub fn add_snippet_servers_inputs(
         }
         let entry = entry_from_fields(ServerFields {
             sync_local_only: false,
+            initialize_timeout_ms: None,
             name: server.name,
             transport: server.transport,
             command: server.command,
@@ -1172,7 +1187,7 @@ pub fn server_entry_for_probe(
                 hide_prompts: false,
                 client_credentials: None,
                 request_timeout_ms: None,
-                initialize_timeout_ms: None,
+                initialize_timeout_ms: fields.initialize_timeout_ms.flatten(),
                 launch: None,
                 unknown_fields: serde_json::Map::new(),
             })
@@ -4413,6 +4428,25 @@ API_KEY = "synthetic-first-origin"
     }
 
     #[test]
+    fn startup_timeout_fields_validate_save_clear_and_preserve() {
+        let mut registry = Registry::default();
+        let mut input = fields("slow", "stdio");
+        input.initialize_timeout_ms = Some(Some(125_000));
+        let id = apply_add_server(&mut registry, input.clone()).unwrap();
+        assert_eq!(registry.servers[0].initialize_timeout_ms, Some(125_000));
+        input.initialize_timeout_ms = None;
+        apply_update_server_fields(&mut registry, &id, input.clone()).unwrap();
+        assert_eq!(registry.servers[0].initialize_timeout_ms, Some(125_000));
+        input.initialize_timeout_ms = Some(None);
+        apply_update_server_fields(&mut registry, &id, input.clone()).unwrap();
+        assert_eq!(registry.servers[0].initialize_timeout_ms, None);
+        for timeout in [0, 86_400_001] {
+            input.initialize_timeout_ms = Some(Some(timeout));
+            assert!(apply_update_server_fields(&mut registry, &id, input.clone()).is_err());
+        }
+    }
+
+    #[test]
     fn reviewed_import_vaults_values_and_failed_vault_keeps_native_config() {
         let fixture = MoveFixture::new(&Registry::default());
         let original = r#"{"mcpServers":{"one":{"command":"fixture","env":{"PAT":"synthetic-native-pat","PORT":3000}}}}"#;
@@ -5099,6 +5133,7 @@ API_KEY = "synthetic-first-origin"
     fn fields(name: &str, transport: &str) -> ServerFields {
         ServerFields {
             sync_local_only: false,
+            initialize_timeout_ms: None,
             name: name.into(),
             transport: transport.into(),
             command: (transport == "stdio").then(|| "npx".into()),
@@ -5428,6 +5463,7 @@ API_KEY = "synthetic-first-origin"
         registry.servers.push(existing);
         let same = ServerFields {
             sync_local_only: false,
+            initialize_timeout_ms: None,
             name: "Renamed".into(),
             transport: "stdio".into(),
             command: Some("npx".into()),
@@ -5472,6 +5508,7 @@ API_KEY = "synthetic-first-origin"
                 "one",
                 ServerFields {
                     sync_local_only: false,
+                    initialize_timeout_ms: None,
                     name: "Broken".into(),
                     transport: "http".into(),
                     command: None,
