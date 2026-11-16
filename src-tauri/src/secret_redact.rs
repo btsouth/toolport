@@ -5460,6 +5460,35 @@ mod tests {
         );
     }
 
+    /// Windows: the relay cannot reach a library with its own C runtime or a
+    /// handle saved before the swap, so status says what it covers rather than
+    /// calling stderr protected. Elsewhere a relayed stderr needs no note.
+    #[test]
+    fn status_says_what_the_relay_covers_on_windows() {
+        crate::daemon_log::set_stderr_redaction_state_for_test(
+            crate::daemon_log::StderrRedaction::Relayed,
+        );
+        let notes = status_notes();
+        crate::daemon_log::set_stderr_redaction_state_for_test(
+            crate::daemon_log::StderrRedaction::NotInstalled,
+        );
+        let coverage = notes
+            .iter()
+            .find(|n| n.starts_with("stderr is redacted for this process"));
+        assert_eq!(coverage.is_some(), cfg!(windows), "{notes:?}");
+        if let Some(coverage) = coverage {
+            assert!(coverage.contains("own C runtime"), "{coverage}");
+            assert!(
+                coverage.contains("saved the standard error handle"),
+                "{coverage}"
+            );
+        }
+        assert!(
+            !notes.iter().any(|n| n.contains("not redacted")),
+            "{notes:?}"
+        );
+    }
+
     #[test]
     fn status_reports_stderr_that_is_not_relayed() {
         let silenced = crate::daemon_log::StderrRedaction::Silenced {
