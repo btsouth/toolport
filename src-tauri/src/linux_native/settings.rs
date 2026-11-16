@@ -1757,8 +1757,13 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
             self.endpoint_button.remove_css_class("suggested-action");
             self.endpoint_button.add_css_class("toolport-destructive");
             self.copy_endpoint.set_sensitive(true);
-            self.copy_endpoint_token.set_sensitive(true);
-            self.reveal_endpoint_token.set_sensitive(true);
+            // The token buttons wait until the token can be read.
+            let token = status.token.is_some();
+            self.copy_endpoint_token.set_sensitive(token);
+            self.reveal_endpoint_token.set_sensitive(token);
+            if !token {
+                self.reveal_endpoint_token.set_active(false);
+            }
             if self.reveal_endpoint_token.is_active() {
                 self.endpoint_token_value
                     .set_label(status.token.as_deref().unwrap_or(""));
@@ -3743,6 +3748,23 @@ mod tests {
         page.render_endpoint(running());
         assert_action(true, "Stop");
         assert!(!page.endpoint_retry.is_visible());
+        assert!(
+            page.copy_endpoint_token.is_sensitive() && page.reveal_endpoint_token.is_sensitive()
+        );
+        // Show token and Copy token stay off while locked, and until the
+        // token can be read.
+        let mut locked = stopped();
+        locked.keyring_locked = true;
+        page.render_endpoint(locked);
+        assert!(
+            !page.copy_endpoint_token.is_sensitive() && !page.reveal_endpoint_token.is_sensitive()
+        );
+        page.render_endpoint(crate::http_bridge::HttpBridgeStatus::new(Some(54321), None));
+        assert!(
+            !page.copy_endpoint_token.is_sensitive() && !page.reveal_endpoint_token.is_sensitive()
+        );
+        assert!(!page.reveal_endpoint_token.is_active());
+        page.render_endpoint(running());
         crate::i18n::set_language("fr").unwrap();
         l10n::refresh_bindings();
         assert_action(true, "Arrêter");

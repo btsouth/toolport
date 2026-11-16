@@ -133,8 +133,18 @@ mod imp {
             let indent = self.indent();
             let actions_width = (width - indent).min(actions_nat).max(actions_min);
             let top = title_height + ROW_GAP;
+            // Actions that keep to the right edge (server rows, as React's) sit
+            // there on their own line too.
+            let right = actions
+                .downcast_ref::<super::ActionFlow>()
+                .is_some_and(|flow| flow.imp().lines_end.get());
+            let left = if right {
+                (width - actions_width).max(indent)
+            } else {
+                indent
+            };
             actions.size_allocate(
-                &gtk::Allocation::new(indent, top, actions_width, (height - top).max(0)),
+                &gtk::Allocation::new(left, top, actions_width, (height - top).max(0)),
                 -1,
             );
         }
@@ -227,7 +237,10 @@ mod flow_imp {
     use super::*;
 
     #[derive(Default)]
-    pub struct ActionFlow;
+    pub struct ActionFlow {
+        /// Each line sits at the right edge, as React's row controls do.
+        pub(super) lines_end: std::cell::Cell<bool>,
+    }
 
     #[glib::object_subclass]
     impl ObjectSubclass for ActionFlow {
@@ -257,7 +270,7 @@ mod flow_imp {
                     + super::ACTION_SPACING * (children.len() as i32 - 1).max(0);
                 return (min, nat, -1, -1);
             }
-            let lines = lines(&children, for_size);
+            let lines = lines(&children, for_size, self.lines_end.get());
             let height = lines.iter().map(|line| line.height).sum::<i32>()
                 + super::ACTION_SPACING * (lines.len() as i32 - 1).max(0);
             (height, height, -1, -1)
@@ -266,8 +279,13 @@ mod flow_imp {
         fn size_allocate(&self, width: i32, _height: i32, _baseline: i32) {
             let children = self.children();
             let mut top = 0;
-            for line in lines(&children, width) {
+            for line in lines(&children, width, self.lines_end.get()) {
                 let mut left = 0;
+                if self.lines_end.get() {
+                    let used = line.items.iter().map(|(_, w, _)| *w).sum::<i32>()
+                        + super::ACTION_SPACING * (line.items.len() as i32 - 1).max(0);
+                    left = (width - used).max(0);
+                }
                 for (child, child_width, child_height) in line.items {
                     child.size_allocate(
                         &gtk::Allocation::new(
@@ -308,7 +326,7 @@ mod flow_imp {
 
     /// Children at natural width, left to right, starting a new line when the
     /// next one would pass `width` (any width when `width` is negative).
-    fn lines(children: &[(gtk::Widget, i32, i32)], width: i32) -> Vec<Line> {
+    fn lines(children: &[(gtk::Widget, i32, i32)], width: i32, balance: bool) -> Vec<Line> {
         let mut out: Vec<Line> = Vec::new();
         let mut used = 0;
         for (widget, min, nat) in children {
@@ -336,12 +354,71 @@ mod flow_imp {
             line.height = line.height.max(height);
             used += child_width;
         }
+        if balance && width >= 0 && (2..=16).contains(&children.len()) {
+            let widths = out
+                .iter()
+                .flat_map(|line| line.items.iter().map(|(_, w, _)| *w))
+                .collect::<Vec<_>>();
+            let items = out
+                .into_iter()
+                .flat_map(|line| line.items)
+                .collect::<Vec<_>>();
+            let mut items = items.into_iter();
+            return super::balanced_lines(&widths, super::ACTION_SPACING, width)
+                .into_iter()
+                .map(|count| {
+                    let items = items.by_ref().take(count).collect::<Vec<_>>();
+                    let height = items.iter().map(|(_, _, h)| *h).max().unwrap_or(0);
+                    Line { items, height }
+                })
+                .collect();
+        }
         out
     }
 }
 
 /// Space between page actions, across and between lines.
 const ACTION_SPACING: i32 = 8;
+
+/// How many controls go on each line, in order, so that as few controls as
+/// possible sit alone on a line and the last one (a row's switch and menu) is
+/// alone only when nothing else fits; then the fewest lines, fullest first.
+pub(super) fn balanced_lines(widths: &[i32], spacing: i32, width: i32) -> Vec<usize> {
+    let count = widths.len();
+    if count <= 1 {
+        return vec![count];
+    }
+    (0u32..(1 << (count - 1)))
+        .map(|breaks| {
+            let mut lines = vec![1usize];
+            for index in 1..count {
+                if breaks & (1 << (index - 1)) != 0 {
+                    lines.push(1);
+                } else {
+                    *lines.last_mut().expect("a line") += 1;
+                }
+            }
+            lines
+        })
+        .filter(|lines| {
+            let mut start = 0;
+            lines.iter().all(|&len| {
+                let used =
+                    widths[start..start + len].iter().sum::<i32>() + spacing * (len as i32 - 1);
+                start += len;
+                len == 1 || used <= width
+            })
+        })
+        .min_by_key(|lines| {
+            (
+                lines.iter().filter(|&&len| len == 1).count(),
+                lines.last() == Some(&1),
+                lines.len(),
+                std::cmp::Reverse(lines.clone()),
+            )
+        })
+        .unwrap_or_else(|| vec![1; count])
+}
 
 glib::wrapper! {
     /// The page actions, left to right at natural width, wrapping onto more lines
@@ -358,6 +435,12 @@ impl ActionFlow {
 
     pub(super) fn append(&self, widget: &impl IsA<gtk::Widget>) {
         widget.insert_before(self, None::<&gtk::Widget>);
+    }
+
+    /// Put each line at the right edge instead of the left.
+    pub(super) fn set_lines_end(&self, end: bool) {
+        self.imp().lines_end.set(end);
+        self.queue_allocate();
     }
 }
 
@@ -511,6 +594,25 @@ impl PageHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_controls_split_so_no_control_is_left_alone_when_another_split_exists() {
+        // CI's German "Service key required" row in a 480 px window, as laid out
+        // there (border boxes): chip, Edit service key, View log, then the
+        // switch and menu, in 404 px. The chip cannot share its line, and the
+        // switch and menu go with View log instead of alone on a third line.
+        assert_eq!(
+            super::balanced_lines(&[191, 239, 156, 88], 8, 404),
+            [1, 1, 2]
+        );
+        // When the chip and the first action fit together, they share.
+        assert_eq!(super::balanced_lines(&[191, 205, 156, 88], 8, 404), [2, 2]);
+        // English at 480: chip and Sign in, then View log with the switch.
+        assert_eq!(super::balanced_lines(&[105, 70, 80, 88], 8, 338), [2, 2]);
+        // Everything fits: one line.
+        assert_eq!(super::balanced_lines(&[105, 88], 8, 404), [2]);
+        assert_eq!(super::balanced_lines(&[105], 8, 404), [1]);
+    }
 
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]

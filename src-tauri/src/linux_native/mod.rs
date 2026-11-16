@@ -10162,7 +10162,10 @@ fn server_row(
     // The logo and text; the controls join them on one line in a HeaderWrap,
     // and move under the text in a narrow window, as on the Clients page.
     let lead = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    // The controls flow onto a second line when the row is too narrow for all of
+    // them, so no control (above all the status chip) is squeezed.
+    let controls = page_header::ActionFlow::new();
+    controls.set_lines_end(true);
     controls.set_valign(gtk::Align::Center);
     controls.set_halign(gtk::Align::End);
     let icon = branding::server_logo(&server.name, &server.transport);
@@ -10242,17 +10245,20 @@ fn server_row(
         });
     }
     // The status chip: the probe result for an enabled server, Off otherwise.
+    // Whole words on one line, as React's chip: never wrapped or cut. The name
+    // gives up its width first, and the controls move to their own line.
     let health = gtk::Label::builder()
         .valign(gtk::Align::Center)
-        .max_width_chars(28)
+        .single_line_mode(true)
+        .wrap(false)
+        .ellipsize(gtk::pango::EllipsizeMode::None)
         .css_classes(["toolport-server-state"])
         .build();
-    client_rows::wrap_row_text(&health);
     // The pill holds the status color; a dot in it, as in React.
     let chip = gtk::Box::builder()
         .spacing(4)
         .valign(gtk::Align::Center)
-        .css_classes(["toolport-badge", "toolport-badge-wraps"])
+        .css_classes(["toolport-badge"])
         .build();
     let dot = gtk::Box::builder()
         .valign(gtk::Align::Center)
@@ -10320,12 +10326,16 @@ fn server_row(
     retry.connect_clicked(move |_| page_for_retry.retry_probe(&retry_id));
     // Recovery actions sit with the status they recover from, as in React; the
     // name and meta lines ellipsize to make room for them.
-    let health_actions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    health_actions.set_valign(gtk::Align::Center);
-    health_actions.append(&authenticate);
-    health_actions.append(&retry);
-    health_actions.append(&copy_error);
-    controls.append(&health_actions);
+    // Each recovery action is its own item in the row's controls, so a narrow
+    // row can split them over two lines instead of leaving one control alone.
+    let health_actions = [authenticate.clone(), retry.clone(), copy_error.clone()];
+    for action in &health_actions {
+        action.set_valign(gtk::Align::Center);
+    }
+    // The switch and the row menu stay side by side at the right end, so a
+    // narrow row never leaves one of them alone on a line.
+    let trailing = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    trailing.set_valign(gtk::Align::Center);
     if server.enabled && !server.requires_review {
         let mut all_rows = page.health_rows.borrow_mut();
         let rows = all_rows.entry(server.id.clone()).or_default();
@@ -10386,6 +10396,9 @@ fn server_row(
         // A server synced from another machine is reviewed right here; only
         // team servers still go to the Teams page.
         badge.set_visible(!personal);
+        for action in &health_actions {
+            controls.append(action);
+        }
         controls.append(&badge);
         let review = l10n::button(if personal {
             crate::i18n::msg("Review and enable")
@@ -10484,7 +10497,11 @@ l10n::bind_dialog_response(&dialog, "enable", "Enable");
         // No "Enabled" label beside the switch: the chip says the state, and the
         // switch's accessible name says what it changes (spec 6).
         let status = health.clone();
+        // React's order: the status chip, then what recovers from it.
         controls.append(&chip);
+        for action in &health_actions {
+            controls.append(action);
+        }
         let toggle = gtk::Switch::builder()
             .active(server.enabled)
             .valign(gtk::Align::Center)
@@ -10589,7 +10606,7 @@ l10n::bind_dialog_response(&dialog, "enable", "Enable");
             });
             gtk::glib::Propagation::Stop
         });
-        controls.append(&toggle);
+        trailing.append(&toggle);
     }
     let actions = server_actions(server, page, true);
     let popover = gtk::Popover::new();
@@ -10641,7 +10658,10 @@ l10n::bind_dialog_response(&dialog, "enable", "Enable");
         .build();
     quiet_tooltips::guard_menu(&menu);
     if !detail {
-        controls.append(&menu);
+        trailing.append(&menu);
+    }
+    if trailing.first_child().is_some() {
+        controls.append(&trailing);
     }
     let line = page_header::HeaderWrap::row(
         &lead,
@@ -18859,6 +18879,342 @@ mod tests {
 
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn server_status_chips_keep_whole_words_on_one_line_in_narrow_windows() {
+        adw::init().unwrap();
+        let scratch =
+            std::env::temp_dir().join(format!("toolport-status-chips-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&scratch);
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.StatusChips")
+            .build();
+        let page = ServerPage {
+            details: Default::default(),
+            app: app.clone(),
+            share_requests: Default::default(),
+            server_count: gtk::Label::new(None),
+            section_title: gtk::Label::new(None),
+            posture: gtk::Label::new(None),
+            search: gtk::SearchEntry::new(),
+            feedback: gtk::Label::new(None),
+            list: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            last_snapshot: Default::default(),
+            feedback_timer: Default::default(),
+            health_rows: Default::default(),
+            rows: Default::default(),
+            no_matches: Default::default(),
+            off_heading: Default::default(),
+            health: Default::default(),
+            registry_reload: Default::default(),
+        };
+        let mut view = server("Clerk (Full API)", "Local stdio");
+        view.id = "clerk".into();
+        let mut off = server("Cloudflare (Full API)", "Local stdio");
+        off.id = "cloudflare".into();
+        off.enabled = false;
+        let probe = |auth: Option<crate::call_failure::AuthTarget>, locked: bool, error: &str| {
+            crate::server_runtime::ProbeResult {
+                server_id: "clerk".into(),
+                ok: false,
+                tool_count: 0,
+                error: Some(error.into()),
+                auth_required: auth.is_some(),
+                failure: None,
+                auth_target: auth,
+                keyring_locked: locked,
+            }
+        };
+        use crate::call_failure::AuthTarget;
+        let ready = crate::server_runtime::ProbeResult {
+            ok: true,
+            tool_count: 12,
+            error: None,
+            ..probe(None, false, "")
+        };
+        let probes = [
+            probe(Some(AuthTarget::ServiceCredential), false, "401"),
+            probe(Some(AuthTarget::Endpoint), false, "401"),
+            probe(Some(AuthTarget::Scope), false, "403"),
+            probe(None, true, "keyring locked"),
+            probe(None, false, "ENOENT: no such file"),
+            probe(None, false, "downstream server exited"),
+            probe(None, false, "connection refused"),
+            ready,
+        ];
+        let state = |card: &gtk::Box| {
+            fn find(widget: &gtk::Widget) -> Option<gtk::Label> {
+                if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                    if label.has_css_class("toolport-server-state") {
+                        return Some(label.clone());
+                    }
+                }
+                let mut child = widget.first_child();
+                while let Some(next) = child {
+                    if let Some(found) = find(&next) {
+                        return Some(found);
+                    }
+                    child = next.next_sibling();
+                }
+                None
+            }
+            find(card.upcast_ref()).unwrap()
+        };
+        // The card's width in a 480 px window (no sidebar) and a 720 px one
+        // (after the sidebar), and at full width.
+        for width in [432, 452, 900] {
+            for language in [
+                "en", "de", "es", "fr", "pt-BR", "ja", "ko", "zh-CN", "zh-TW",
+            ] {
+                crate::i18n::set_language(language).unwrap();
+                let card = server_card(&view, "default", page.clone());
+                let off_card = server_card(&off, "default", page.clone());
+                let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                column.append(&card);
+                column.append(&off_card);
+                let window = gtk::Window::builder()
+                    .default_width(width)
+                    .default_height(400)
+                    .child(&column)
+                    .build();
+                window.present();
+                let check = |card: &gtk::Box, what: &str| {
+                    let label = state(card);
+                    let flow = label.parent().and_then(|chip| chip.parent()).unwrap();
+                    let chip = label.parent().unwrap();
+                    // Sizes as the flow lays them out: natural widths from
+                    // measure and border-box bounds, both with CSS padding and
+                    // borders (Widget::width() leaves those out).
+                    let natural_width =
+                        |widget: &gtk::Widget| widget.measure(gtk::Orientation::Horizontal, -1).1;
+                    let laid_width = |widget: &gtk::Widget| {
+                        widget
+                            .compute_bounds(&flow)
+                            .map_or(0, |at| at.width().round() as i32)
+                    };
+                    let shown = || {
+                        let mut out = Vec::new();
+                        let mut child = flow.first_child();
+                        while let Some(widget) = child {
+                            if widget.should_layout() {
+                                out.push(widget.clone());
+                            }
+                            child = widget.next_sibling();
+                        }
+                        out
+                    };
+                    // Wait for the layout of the new status, then for one whole
+                    // frame after it: a frame runs every pending layout before it
+                    // paints, so no control keeps its place from the last status.
+                    let painted = std::rc::Rc::new(std::cell::Cell::new(0u32));
+                    let clock = window.frame_clock().unwrap();
+                    let counter = clock.connect_after_paint({
+                        let painted = painted.clone();
+                        move |_| painted.set(painted.get() + 1)
+                    });
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let mut settled_at = None;
+                    loop {
+                        while gtk::glib::MainContext::default().iteration(false) {}
+                        let laid_out = laid_width(label.upcast_ref())
+                            == natural_width(label.upcast_ref())
+                            && card.width() > 0
+                            && shown()
+                                .iter()
+                                .all(|w| laid_width(w) == natural_width(w) && laid_width(w) > 0);
+                        match settled_at {
+                            _ if !laid_out => settled_at = None,
+                            Some(frame) if painted.get() > frame => break,
+                            Some(_) => {}
+                            None => {
+                                settled_at = Some(painted.get());
+                                window.queue_allocate();
+                                window.queue_draw();
+                            }
+                        }
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "{language} at {width}: no settled frame for {what}: painted {} settled {:?} label {}/{} card {} {:?}",
+                            painted.get(),
+                            settled_at,
+                            laid_width(label.upcast_ref()),
+                            natural_width(label.upcast_ref()),
+                            card.width(),
+                            shown()
+                                .iter()
+                                .map(|w| (w.type_().name(), laid_width(w), natural_width(w)))
+                                .collect::<Vec<_>>()
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    clock.disconnect(counter);
+                    // The chip is one line of whole words: one Pango line, not
+                    // ellipsized, and exactly one line tall.
+                    assert!(
+                        label.layout().line_count() == 1 && !label.layout().is_ellipsized(),
+                        "{language} at {width}: \"{}\" ({what}) takes {} lines in {} px",
+                        label.text(),
+                        label.layout().line_count(),
+                        label.width()
+                    );
+                    assert_eq!(
+                        label
+                            .compute_bounds(&flow)
+                            .map_or(0, |at| at.height().round() as i32),
+                        label.measure(gtk::Orientation::Vertical, -1).1,
+                        "{language} at {width}: \"{}\" ({what}) is taller than one line",
+                        label.text()
+                    );
+                    let (min, _, _, _) = card.measure(gtk::Orientation::Horizontal, -1);
+                    assert!(
+                        min <= width,
+                        "{language}: the row needs {min} px of {width}"
+                    );
+                    // Each control with its line (grouped through its middle: a
+                    // short chip is centered on a line of taller buttons).
+                    let placed = shown()
+                        .into_iter()
+                        .map(|widget| {
+                            let at = widget.compute_bounds(&flow).unwrap();
+                            let middle = (at.y() + at.height() / 2.0).round() as i32;
+                            (widget, middle, at)
+                        })
+                        .collect::<Vec<_>>();
+                    let layout = || {
+                        format!(
+                            "{:?} in {}",
+                            placed
+                                .iter()
+                                .map(|(w, y, at)| (w.type_().name(), *y, at.x(), at.width()))
+                                .collect::<Vec<_>>(),
+                            flow.width()
+                        )
+                    };
+                    let mut lines: Vec<Vec<usize>> = Vec::new();
+                    for (index, (_, middle, _)) in placed.iter().enumerate() {
+                        match lines.last_mut() {
+                            Some(line) if (placed[line[0]].1 - middle).abs() <= 2 => {
+                                line.push(index)
+                            }
+                            _ => lines.push(vec![index]),
+                        }
+                    }
+                    // Every control inside the row, and every line, also one of
+                    // its own, against the right edge as in React.
+                    let flow_in_card = flow.compute_bounds(card).unwrap();
+                    assert!(
+                        flow_in_card.x() >= 0.0
+                            && (flow_in_card.x() + flow_in_card.width()).round() as i32
+                                <= card.width(),
+                        "{language} at {width}: the controls leave the card ({what})"
+                    );
+                    for line in &lines {
+                        for &index in line {
+                            let at = &placed[index].2;
+                            assert!(
+                                at.x() >= 0.0
+                                    && (at.x() + at.width()).round() as i32 <= flow.width(),
+                                "{language} at {width}: a control leaves the row ({what}): {}",
+                                layout()
+                            );
+                        }
+                        let end = &placed[*line.last().unwrap()].2;
+                        assert_eq!(
+                            (end.x() + end.width()).round() as i32,
+                            flow.width(),
+                            "{language} at {width}: a line leaves the right edge ({what}): {}",
+                            layout()
+                        );
+                    }
+                    // React's order: the chip, then what recovers from it, then
+                    // the switch and the menu, one group that no width splits.
+                    assert!(
+                        placed[0].0 == chip,
+                        "{language} at {width}: the chip comes first"
+                    );
+                    let pair = &placed.last().unwrap().0;
+                    let mut kinds = Vec::new();
+                    let mut middles = Vec::new();
+                    let mut child = pair.first_child();
+                    while let Some(widget) = child {
+                        kinds.push(widget.type_().name());
+                        let at = widget.compute_bounds(&flow).unwrap();
+                        middles.push((at.y() + at.height() / 2.0).round() as i32);
+                        child = widget.next_sibling();
+                    }
+                    assert_eq!(
+                        kinds,
+                        ["GtkSwitch", "GtkMenuButton"],
+                        "{language} at {width}: the switch and the menu stay together"
+                    );
+                    assert!(
+                        (middles[0] - middles[1]).abs() <= 2,
+                        "{language} at {width}: the switch and the menu share a line"
+                    );
+                    // A control is alone on a line only when this run's natural
+                    // widths leave no in-order split with fewer lone controls;
+                    // and the switch and menu are alone only when the control
+                    // before them cannot fit beside them.
+                    let widths = placed
+                        .iter()
+                        .map(|(w, _, _)| natural_width(w))
+                        .collect::<Vec<_>>();
+                    let fits = |line: &[i32]| {
+                        line.len() == 1
+                            || line.iter().sum::<i32>() + 8 * (line.len() as i32 - 1)
+                                <= flow.width()
+                    };
+                    let fewest_alone = (0u32..1 << (widths.len() - 1))
+                        .filter_map(|breaks| {
+                            let mut split = vec![vec![widths[0]]];
+                            for (index, w) in widths.iter().enumerate().skip(1) {
+                                if breaks & (1 << (index - 1)) != 0 {
+                                    split.push(vec![*w]);
+                                } else {
+                                    split.last_mut().unwrap().push(*w);
+                                }
+                            }
+                            split
+                                .iter()
+                                .all(|line| fits(line))
+                                .then(|| split.iter().filter(|line| line.len() == 1).count())
+                        })
+                        .min()
+                        .unwrap();
+                    assert_eq!(
+                        lines.iter().filter(|line| line.len() == 1).count(),
+                        fewest_alone,
+                        "{language} at {width}: a control alone on a line that could share one ({what}): {}",
+                        layout()
+                    );
+                    if widths.len() > 1 && fits(&widths[widths.len() - 2..]) {
+                        assert!(
+                            lines.last().unwrap().len() > 1,
+                            "{language} at {width}: the switch and menu alone on the last line ({what}): {}",
+                            layout()
+                        );
+                    }
+                    let in_card = pair.compute_bounds(card).unwrap();
+                    let line = flow.parent().unwrap();
+                    let line_end = line.compute_bounds(card).unwrap();
+                    assert_eq!(
+                        (in_card.x() + in_card.width()).round() as i32,
+                        (line_end.x() + line_end.width()).round() as i32,
+                        "{language} at {width}: the controls leave the row's right edge"
+                    );
+                };
+                for probe in &probes {
+                    page.apply_probe("clerk", probe);
+                    check(&card, probe.failure_label());
+                }
+                check(&off_card, "off");
+                window.set_child(None::<&gtk::Widget>);
+                window.close();
+            }
+        }
+        crate::i18n::set_language("en").unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn b4_server_rows_sit_in_row_groups_and_move_between_them() {
         adw::init().unwrap();
         let app = adw::Application::builder()
@@ -18932,8 +19288,8 @@ mod tests {
         assert!(!labels
             .iter()
             .any(|text| text == "Enabled" || text == "Disabled"));
-        // The status chip, then the switch, then the menu, at the trailing edge
-        // (one box, which a narrow window moves under the name).
+        // The status chip, then the switch and the menu side by side, at the
+        // trailing edge (a narrow window moves them under the name).
         fn holding_switch(widget: &gtk::Widget) -> Option<gtk::Widget> {
             let mut child = widget.first_child();
             while let Some(current) = child {
@@ -18947,18 +19303,22 @@ mod tests {
             }
             None
         }
-        let trailing = children(&holding_switch(&row).expect("the row controls"));
+        let pair = holding_switch(&row).expect("the switch and menu");
+        let trailing = children(&pair);
         let switch = trailing
             .iter()
             .position(|widget| widget.is::<gtk::Switch>())
             .expect("switch");
-        let chip = trailing
+        assert!(switch < trailing.len() - 1, "the menu trails the switch");
+        let controls = children(&pair.parent().expect("the row controls"));
+        let chip = controls
             .iter()
             .position(|widget| widget.has_css_class("toolport-badge"))
             .expect("status chip");
-        assert!(chip < switch);
-        assert!(switch < trailing.len() - 1, "the menu trails the switch");
-        let off_chip = children(&holding_switch(&off_rows[0]).expect("the off row controls"))
+        let pair_at = controls.iter().position(|widget| *widget == pair).unwrap();
+        assert!(chip < pair_at);
+        let off_pair = holding_switch(&off_rows[0]).expect("the off row switch");
+        let off_chip = children(&off_pair.parent().expect("the off row controls"))
             .into_iter()
             .find(|widget| widget.has_css_class("toolport-badge"))
             .unwrap();
