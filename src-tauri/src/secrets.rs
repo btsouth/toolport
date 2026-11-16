@@ -1141,33 +1141,50 @@ mod platform {
         }
     }
 
-    /// Owners with a locked Toolport value in any collection, from property
-    /// reads alone (collections, their items, each item's attributes and
-    /// `Locked`): no search, so KeePassXC opens no dialog, and no unlock.
-    /// `None`: unknown (busy, timed out, a failed read).
+    /// Owners with a locked Toolport value in any collection, never asking.
+    /// The default collection open: the one search, as before. Locked (where
+    /// KeePassXC answers a search with its dialog): property reads of the
+    /// locked collections' items only. `None`: unknown (busy, timed out, a
+    /// failed read); the next probe round checks again.
     pub fn owners_with_locked_values() -> Option<std::collections::HashSet<String>> {
         let read = || {
             let found = with_backup_service(|service| {
                 let failed = |error: dbus_secret_service::Error| classify(&error);
-                let mut owners = std::collections::HashSet::new();
-                for collection in service.get_all_collections().map_err(failed)? {
-                    for item in collection.get_all_items().map_err(failed)? {
-                        let attributes = item.get_attributes().map_err(failed)?;
-                        if attributes.get("service").map(String::as_str) != Some(SERVICE) {
-                            continue;
-                        }
-                        let owner = attributes
-                            .get("username")
-                            .and_then(|account| account.split_once("::"))
-                            .map(|(owner, _)| owner.to_string());
-                        if let Some(owner) = owner {
-                            if item.is_locked().map_err(failed)? {
-                                owners.insert(owner);
-                            }
-                        }
-                    }
-                }
-                Ok(owners)
+                let owner_of = |item: &dbus_secret_service::Item| {
+                    item.get_attributes().map_err(failed).map(|attributes| {
+                        (attributes.get("service").map(String::as_str) == Some(SERVICE))
+                            .then(|| attributes.get("username").cloned())
+                            .flatten()
+                    })
+                };
+                super::owners_with_locked_by(
+                    || match service.get_default_collection() {
+                        Ok(collection) => collection.is_locked().map(Some).map_err(failed),
+                        Err(dbus_secret_service::Error::NoResult) => Ok(None),
+                        Err(error) => Err(failed(error)),
+                    },
+                    || {
+                        let found = service
+                            .search_items(std::collections::HashMap::from([("service", SERVICE)]))
+                            .map_err(failed)?;
+                        found.locked.iter().map(owner_of).collect()
+                    },
+                    || {
+                        let collections = service.get_all_collections().map_err(failed)?;
+                        super::accounts_in_locked(
+                            &collections,
+                            |collection| collection.is_locked().map_err(failed),
+                            |collection| {
+                                collection
+                                    .get_all_items()
+                                    .map_err(failed)?
+                                    .iter()
+                                    .map(owner_of)
+                                    .collect()
+                            },
+                        )
+                    },
+                )
             });
             let no_service = BACKUP_BATCH.with(|slot| {
                 slot.borrow()
@@ -2351,6 +2368,46 @@ fn would_prompt_by<E>(
     }
 }
 
+/// [`owners_with_locked_values`]'s plan: `default_locked` is a property read;
+/// open, `search` returns the accounts of the locked Toolport items it finds
+/// (in other collections), one call however large the store; locked or
+/// missing (no search: KeePassXC opens its dialog for one), `walk` reads the
+/// accounts in the locked collections. An account is `owner::key`.
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+fn owners_with_locked_by<E>(
+    default_locked: impl FnOnce() -> Result<Option<bool>, E>,
+    search: impl FnOnce() -> Result<Vec<Option<String>>, E>,
+    walk: impl FnOnce() -> Result<Vec<Option<String>>, E>,
+) -> Result<std::collections::HashSet<String>, E> {
+    let accounts = match default_locked()? {
+        Some(false) => search()?,
+        Some(true) | None => walk()?,
+    };
+    Ok(accounts
+        .into_iter()
+        .flatten()
+        .filter_map(|account| account.split_once("::").map(|(owner, _)| owner.to_string()))
+        .collect())
+}
+
+/// The accounts of the items in the locked `collections`: every item of a
+/// locked collection is locked, and an open one is skipped without listing
+/// its items.
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+fn accounts_in_locked<C, E>(
+    collections: &[C],
+    locked: impl Fn(&C) -> Result<bool, E>,
+    accounts: impl Fn(&C) -> Result<Vec<Option<String>>, E>,
+) -> Result<Vec<Option<String>>, E> {
+    let mut found = Vec::new();
+    for collection in collections {
+        if locked(collection)? {
+            found.extend(accounts(collection)?);
+        }
+    }
+    Ok(found)
+}
+
 /// A write or delete inside [`without_prompts`] while the store would ask.
 fn write_would_prompt() -> bool {
     !prompts_allowed() && write_would_ask()
@@ -3125,6 +3182,77 @@ pub(crate) mod tests {
         let _cleanup = Cleanup(dir, std::env::var_os("TOOLPORT_SECRET_KEY"));
         std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
         test();
+    }
+
+    /// Failure mode: the owner check listed every item of every collection on
+    /// each probe round, which a large keyring could stretch past its 2 s
+    /// deadline, and then every server showed "Keyring locked" though the
+    /// keyring was open.
+    #[test]
+    fn an_open_default_collection_is_one_search_and_a_locked_one_walks_locked_collections() {
+        let (searches, walks) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+        let owners = owners_with_locked_by(
+            || Ok::<_, ()>(Some(false)),
+            || {
+                searches.set(searches.get() + 1);
+                Ok(vec![Some("other-collection::API_KEY".into())])
+            },
+            || {
+                walks.set(walks.get() + 1);
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+        assert_eq!((searches.get(), walks.get()), (1, 0));
+        assert_eq!(owners, ["other-collection".to_string()].into());
+
+        // Locked: no search; only the locked collections are listed.
+        let listed = std::cell::RefCell::new(Vec::new());
+        let collections = [("login", true), ("open", false), ("second", true)];
+        let owners = owners_with_locked_by(
+            || Ok::<_, ()>(Some(true)),
+            || {
+                searches.set(searches.get() + 1);
+                Ok(Vec::new())
+            },
+            || {
+                accounts_in_locked(
+                    &collections,
+                    |(_, locked)| Ok(*locked),
+                    |(name, _)| {
+                        listed.borrow_mut().push(*name);
+                        Ok(vec![Some(format!("{name}-server::KEY")), None])
+                    },
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(searches.get(), 1, "searched while the default was locked");
+        assert_eq!(*listed.borrow(), ["login", "second"]);
+        assert_eq!(
+            owners,
+            ["login-server".to_string(), "second-server".to_string()].into()
+        );
+    }
+
+    /// Times one owner check against the session's real keyring. Run in a
+    /// box with a filled keyring:
+    /// `cargo test ... -- --ignored --exact secrets::tests::time_owner_check --nocapture`
+    #[test]
+    #[ignore = "times the session keyring; run in omabox"]
+    fn time_owner_check() {
+        let _data = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("toolport-owner-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        std::env::remove_var("TOOLPORT_SECRET_KEY");
+        let started = std::time::Instant::now();
+        let owners = owners_with_locked_values();
+        println!(
+            "owner check: {:?} in {} ms",
+            owners.map(|owners| owners.len()),
+            started.elapsed().as_millis()
+        );
     }
 
     /// Failure mode: every check searched the store, and KeePassXC answers a
