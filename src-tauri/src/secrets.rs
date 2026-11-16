@@ -1021,8 +1021,7 @@ mod platform {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _across_processes = cross_process_guard();
-        super::note_store_call();
-        match op() {
+        let result = match op() {
             Err(e) if is_transient(&e) => {
                 // Say so. Otherwise the only evidence that SBS-815 recovery ran
                 // is a 1.2-1.7s stall, and a vault failure that persists past the
@@ -1037,7 +1036,12 @@ mod platform {
                 retried
             }
             other => other,
+        };
+        // Locked, or its unlock dialog dismissed: this call asked and was refused.
+        if matches!(result, Err(keyring::Error::NoStorageAccess(_))) {
+            super::note_refused_ask();
         }
+        result
     }
 
     pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
@@ -2256,7 +2260,7 @@ pub mod locked_store {
 
     /// Record a read that would have prompted; its error.
     pub(crate) fn prompted(server_id: &str, key: &str) -> String {
-        super::note_store_call();
+        super::note_refused_ask();
         #[cfg(any(test, feature = "test-support"))]
         PROMPTS
             .lock()
@@ -2351,29 +2355,40 @@ pub fn with_prompts<T>(f: impl FnOnce() -> T) -> T {
 }
 
 fn prompts_allowed() -> bool {
-    WITHOUT_PROMPTS.with(|depth| depth.get() == 0)
+    WITHOUT_PROMPTS.with(|depth| depth.get() == 0) && !ask_spent()
 }
 
 thread_local! {
-    static STORE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static REFUSED_ASKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static ONE_ASK_FROM: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
-/// A call into a store that can ask to unlock (Secret Service, or the test store).
-fn note_store_call() {
-    STORE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+/// A call on this thread asked to unlock the store and was refused: the store
+/// was locked and its unlock dialog dismissed (or, in the test store, recorded).
+fn note_refused_ask() {
+    REFUSED_ASKS.with(|asks| asks.set(asks.get().saturating_add(1)));
 }
 
-/// `f`'s result and how many calls it made, on this thread, into a store that can ask to
-/// unlock. With the store still locked afterwards, a call on the asking path asked.
-pub fn count_store_calls<T>(f: impl FnOnce() -> T) -> (T, u32) {
-    let before = STORE_CALLS.with(std::cell::Cell::get);
+/// Run `f` so that it asks to unlock the store at most once on this thread: after
+/// one refused ask, the rest of `f` runs as in [`without_prompts`]. Returns whether
+/// an ask in `f` was refused.
+pub fn asking_once<T>(f: impl FnOnce() -> T) -> (T, bool) {
+    struct Restore(Option<u32>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ONE_ASK_FROM.with(|from| from.set(self.0));
+        }
+    }
+    let before = REFUSED_ASKS.with(std::cell::Cell::get);
+    let _restore = Restore(ONE_ASK_FROM.with(|from| from.replace(Some(before))));
     let result = f();
-    (
-        result,
-        STORE_CALLS
-            .with(std::cell::Cell::get)
-            .saturating_sub(before),
-    )
+    (result, REFUSED_ASKS.with(std::cell::Cell::get) > before)
+}
+
+fn ask_spent() -> bool {
+    ONE_ASK_FROM
+        .with(std::cell::Cell::get)
+        .is_some_and(|from| REFUSED_ASKS.with(std::cell::Cell::get) > from)
 }
 
 /// Inside [`without_prompts`] on this thread, so work it hands to another thread can

@@ -2306,10 +2306,11 @@ pub fn connect_step<T>(quiet: bool, f: impl FnOnce() -> Result<T, String>) -> Re
     })
 }
 
-/// A connect step's review, read under [`connect_step`]'s rule. When a review that may ask
-/// did ask (it called the store and the store is still locked), it says so in
-/// `keyring_asked`: that ask was the run's one, so the step's Connect is quiet and a Retry
-/// the user chooses may ask again. A dismissed ask does not come back in the same step.
+/// A connect step's review, read under [`connect_step`]'s rule. A review that may ask asks
+/// at most once: after one refused unlock, its other reads do not ask. A refused ask is
+/// reported in `keyring_asked`: that ask was the run's one, so the step's Connect is quiet
+/// and a Retry the user chooses may ask again. A dismissed ask does not come back in the
+/// same step.
 pub fn preview_step(client_id: &str, quiet: bool) -> Result<ClientSetupReview, String> {
     review_step(quiet, || preview_client_setup(client_id))
 }
@@ -2319,9 +2320,9 @@ fn review_step(
     read: impl FnOnce() -> Result<ClientSetupReview, String>,
 ) -> Result<ClientSetupReview, String> {
     connect_step(quiet, || {
-        let (review, calls) = crate::secrets::count_store_calls(read);
+        let (review, refused) = crate::secrets::asking_once(read);
         let mut review = review?;
-        review.keyring_asked = !quiet && calls > 0 && keyring_locked_after("");
+        review.keyring_asked = !quiet && refused && keyring_locked_after("");
         Ok(review)
     })
 }
@@ -5015,19 +5016,28 @@ API_KEY = "synthetic-first-origin"
     /// F25: a Connect all step's review that asks to unlock the keyring, dismissed, is the
     /// run's one ask. The review says so, and that step's Connect (quiet, as the batch
     /// then makes it) asks nothing more and says to unlock and choose Retry. Unlocked, the
-    /// review asks nothing and says nothing.
+    /// review asks nothing and says nothing. A review that reads several stored values asks
+    /// once, and a locked default collection with nothing to unlock is no ask.
     #[test]
     fn a_review_that_asked_makes_its_steps_connect_quiet() {
         let fixture = MoveFixture::new(&Registry::default());
         // The server has a value Toolport moves into the keyring when it connects.
         let claude = r#"{"mcpServers":{"second":{"command":"second","env":{"PAT":"synthetic"}}}}"#;
         std::fs::write(fixture.claude(), claude).unwrap();
-        // A review that reads a stored value and still opens when that read is refused.
+        // A review that reads stored values (two servers' here) and still opens when those
+        // reads are refused.
         let read = || {
             let _ = crate::secrets::get_vault_secret_result("second", "PAT");
+            let _ = crate::secrets::get_vault_secret_result("third", "TOKEN");
             preview_client_setup("claude-code")
         };
         assert!(!review_step(false, read).unwrap().keyring_asked);
+        // Only the collection a new item would go into is locked: the reads find nothing to
+        // unlock, so nothing asked.
+        let prompts = crate::secrets::locked_store::write_prompts_during(|| {
+            assert!(!review_step(false, read).unwrap().keyring_asked);
+        });
+        assert!(prompts.is_empty(), "{prompts:?}");
         // A quiet review (a later step's) asks nothing, so it says nothing.
         let prompts = crate::secrets::locked_store::prompts_during(|| {
             assert!(!review_step(true, read).is_ok_and(|review| review.keyring_asked));
@@ -5037,7 +5047,7 @@ API_KEY = "synthetic-first-origin"
         let prompts = crate::secrets::locked_store::prompts_during(|| {
             review = Some(review_step(false, read));
         });
-        assert_eq!(prompts.len(), 1, "the review asks once: {prompts:?}");
+        assert_eq!(prompts, ["second/PAT"], "the review asks once");
         let review = review.unwrap().unwrap();
         assert!(review.keyring_asked);
         let mut error = None;
