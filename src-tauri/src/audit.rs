@@ -760,6 +760,14 @@ pub fn activity_client_name(mut entry: Value, names: &crate::clients::CallerName
     if !entry.is_object() {
         return entry;
     }
+    // Toolport's own Tools tab reports the gateway it spawned; that adds nothing.
+    if entry["client"].as_str() == Some(&format!("adapter:{}", crate::clients::TOOLS_TAB_CLIENT_ID))
+    {
+        if let Some(entry) = entry.as_object_mut() {
+            entry.remove("clientLabel");
+            entry.remove("clientName");
+        }
+    }
     if entry.get("client").is_some() || entry.get("clientName").is_some() {
         entry["clientName"] = json!(names.trusted_name(
             entry.get("client").and_then(Value::as_str),

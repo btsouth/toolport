@@ -116,6 +116,16 @@ pub fn call_tool(
     // human approval and result inspection. Never call the downstream directly.
     let gateway = crate::clients::resolve_gateway_path_readonly()
         .ok_or("Could not locate the toolport-gateway binary")?;
+    call_tool_with_gateway(&gateway, server_id, tool, arguments)
+}
+
+/// [`call_tool`] through a given gateway binary.
+pub fn call_tool_with_gateway(
+    gateway: &std::path::Path,
+    server_id: &str,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     let registry = crate::registry::load()?;
     let env = vec![
         (
@@ -126,6 +136,11 @@ pub fn call_tool(
                 .into_owned(),
         ),
         ("TOOLPORT_PROFILE".to_string(), registry.default_access_id()),
+        // Activity lists the Run as Toolport's Tools tab, not as this process.
+        (
+            "TOOLPORT_CLIENT_ID".to_string(),
+            crate::clients::TOOLS_TAB_CLIENT_ID.to_string(),
+        ),
     ];
     let transport = crate::downstream::StdioTransport::spawn(
         &gateway.to_string_lossy(),

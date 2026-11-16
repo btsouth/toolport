@@ -5436,11 +5436,15 @@ fn execute_call(
     let catalog_visible = |id: &str| {
         visible(id) && (candidates.is_empty() || candidates.iter().any(|owner| owner == id))
     };
+    // Activity counts the wait for the server to start in the call's duration:
+    // the caller waited for it too.
+    let mut start_wait = CARRIED_START_WAIT.with(std::cell::Cell::get);
     if view.authorize(DispatchTarget::Tool(name)).is_ok() {
         for owner in &candidates {
             view.prepare_lazy_use(owner);
             view.kick_pending(owner, |id| id == owner);
         }
+        let waiting = Instant::now();
         if view.route_of(name).is_some() {
             // A cached route proves identity, not current safety metadata. Keep
             // the existing readiness wait before classifying a known call.
@@ -5462,7 +5466,9 @@ fn execute_call(
                 cancel.as_ref(),
             );
         }
+        start_wait += waiting.elapsed();
     }
+    let start_wait_ms = start_wait.as_millis().min(u64::MAX as u128) as u64;
     let router = fresh.as_deref().unwrap_or(router);
     let fresh_catalog = fresh.as_ref().map(|view| view.shared_tools());
     let cached = fresh_catalog
@@ -6053,7 +6059,7 @@ fn execute_call(
                 server_id,
                 tool,
                 ok,
-                Some(ms),
+                Some(ms + start_wait_ms),
                 err.as_deref(),
                 client,
                 client_name,
@@ -6115,7 +6121,7 @@ fn execute_call(
                 server_id,
                 tool,
                 false,
-                Some(ms),
+                Some(ms + start_wait_ms),
                 Some(&defended_err),
                 client,
                 client_name,
@@ -6157,6 +6163,48 @@ fn with_shaped(
         *after.entry(name).or_default() += count;
     }
     after
+}
+
+thread_local! {
+    /// When the request being served arrived at the gateway.
+    static REQUEST_RECEIVED: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Holds [`REQUEST_RECEIVED`] for one request and clears it afterwards.
+struct RequestReceived(Option<Instant>);
+
+impl RequestReceived {
+    fn enter() -> Self {
+        Self(REQUEST_RECEIVED.with(|cell| cell.replace(Some(Instant::now()))))
+    }
+}
+
+impl Drop for RequestReceived {
+    fn drop(&mut self) {
+        REQUEST_RECEIVED.with(|cell| cell.set(self.0));
+    }
+}
+
+thread_local! {
+    /// How long the request being served already waited before [`execute_call`],
+    /// such as for its server to start, so Activity counts it in the duration.
+    static CARRIED_START_WAIT: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+/// Holds [`CARRIED_START_WAIT`] for one call and clears it afterwards.
+struct CarriedStartWait;
+
+impl CarriedStartWait {
+    fn enter(waited: Duration) -> Self {
+        CARRIED_START_WAIT.with(|cell| cell.set(waited));
+        Self
+    }
+}
+
+impl Drop for CarriedStartWait {
+    fn drop(&mut self) {
+        CARRIED_START_WAIT.with(|cell| cell.set(Duration::ZERO));
+    }
 }
 
 /// Flags for [`execute_call`] that would otherwise be adjacent bools (easy to swap).
@@ -9019,6 +9067,14 @@ fn handle_request_with_cancel(
                     .route_of(&name)
                     .is_some_and(|(server, _)| server_supports_mcp_app_html(router, server));
             let mrtr = MrtrRequest::from_params(params);
+            // Count what this call already waited for, such as its server
+            // starting, in its Activity duration.
+            let _start_wait = CarriedStartWait::enter(
+                REQUEST_RECEIVED
+                    .with(std::cell::Cell::get)
+                    .map(|received| received.elapsed())
+                    .unwrap_or_default(),
+            );
             let result = execute_call(
                 reg,
                 router,
@@ -17245,6 +17301,11 @@ fn process_request(
     .map(GatewayResponse::into_value)
 }
 
+/// A Run from Toolport's own Tools tab, by the client ID it launches with.
+fn is_tools_tab_client(client: Option<&str>) -> bool {
+    client.map(|id| id.strip_prefix("adapter:").unwrap_or(id)) == Some(clients::TOOLS_TAB_CLIENT_ID)
+}
+
 fn catalog_wait_budget(
     discovery: DiscoveryMode,
     tool_search: bool,
@@ -17253,6 +17314,8 @@ fn catalog_wait_budget(
 ) -> Duration {
     if setup {
         downstream::SETUP_CATALOG_WAIT_BUDGET
+    } else if is_tools_tab_client(client) {
+        Duration::ZERO
     } else if discovery == DiscoveryMode::Full || tool_search {
         Duration::from_millis(
             clients::discovery_capabilities(client.unwrap_or("")).cold_full_list_wait_ms,
@@ -17548,6 +17611,7 @@ fn process_request_wire_inner(
         UpstreamTransport::Stdio
     });
     let _request = UpstreamRequestGuard::enter(client.map(str::to_string));
+    let _received = RequestReceived::enter();
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     // One deadline includes startup and rooted composition, rather than granting
     // each phase another budget. Warm tools lists never enter the catalog wait.
@@ -17597,6 +17661,9 @@ fn process_request_wire_inner(
     let _label = ClientLabelGuard::enter(session_label);
 
     let wait = match method {
+        // Toolport's own Tools tab never reads this list; it calls one tool,
+        // which waits for its server itself and counts that wait.
+        "tools/list" if is_tools_tab_client(client) => false,
         "tools/list" if discovery == DiscoveryMode::Full => true,
         "tools/list" => {
             let reg = state

@@ -494,7 +494,7 @@ impl Import {
             if !secret || launch.bindings.iter().any(|binding| binding.index == index) {
                 continue;
             }
-            let key = format!("IMPORTED_ARG_{index}");
+            let key = imported_arg_key(index);
             values.push((
                 key.clone(),
                 Some(std::mem::replace(
@@ -745,6 +745,12 @@ pub(crate) fn ready(server: &ServerEntry) -> Result<bool, String> {
         }
     }
     Ok(true)
+}
+
+/// The stored name of a secret launch argument at `index`, as an import names
+/// it. Redaction uses the same name for that argument's value.
+pub(crate) fn imported_arg_key(index: usize) -> String {
+    format!("IMPORTED_ARG_{index}")
 }
 
 #[cfg(test)]

@@ -1469,7 +1469,7 @@ fn open_json_action(
             }
             dialog.close();
             match result {
-                Ok(Ok(value)) => show_output(&page, "Tools result", value),
+                Ok(Ok(value)) => show_call_result(&page, value),
                 Ok(Err(error)) => page.show_error(&error),
                 Err(_) => page.show_error(&crate::i18n::tr("the tool call stopped unexpectedly")),
             }
@@ -1494,7 +1494,50 @@ fn run_output(
     });
 }
 
+/// A Run's result, shown as the React Tools tab shows it: what the tool
+/// returned first, with Toolport's provenance metadata left out of the way.
+fn show_call_result(page: &ServerToolsPanel, value: serde_json::Value) {
+    if value.get("content").is_none() {
+        // Not a tool result (a prompt's messages): show it whole.
+        return show_output(page, &crate::i18n::tr("Result"), value);
+    }
+    let title = if value.get("isError").and_then(serde_json::Value::as_bool) == Some(true) {
+        crate::i18n::tr("Tool returned an error")
+    } else {
+        crate::i18n::tr("Result")
+    };
+    show_text(page, &title, render_tool_result(&value));
+}
+
+/// The text of a tool result's content blocks, the same as React's
+/// `renderResult`: text blocks as written, other blocks as JSON, and the whole
+/// result as JSON when it has no content.
+fn render_tool_result(value: &serde_json::Value) -> String {
+    let blocks = value
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .filter(|blocks| !blocks.is_empty());
+    let Some(blocks) = blocks else {
+        return serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    };
+    blocks
+        .iter()
+        .map(
+            |block| match (block["type"].as_str(), block["text"].as_str()) {
+                (Some("text"), Some(text)) => text.to_string(),
+                _ => serde_json::to_string_pretty(block).unwrap_or_else(|_| block.to_string()),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn show_output(page: &ServerToolsPanel, title: &str, value: serde_json::Value) {
+    let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+    show_text(page, title, text);
+}
+
+fn show_text(page: &ServerToolsPanel, title: &str, text: String) {
     let Some(parent) = page.app.active_window() else {
         return;
     };
@@ -1506,7 +1549,6 @@ fn show_output(page: &ServerToolsPanel, title: &str, value: serde_json::Value) {
         .default_height(560)
         .build();
     super::close_on_escape(&dialog);
-    let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let header = adw::HeaderBar::new();
     let copy = l10n::button("Copy");
@@ -1531,6 +1573,10 @@ fn show_output(page: &ServerToolsPanel, title: &str, value: serde_json::Value) {
     output.set_cursor_visible(false);
     output.set_monospace(true);
     output.set_wrap_mode(gtk::WrapMode::WordChar);
+    output.set_left_margin(12);
+    output.set_right_margin(12);
+    output.set_top_margin(12);
+    output.set_bottom_margin(12);
     output.buffer().set_text(&text);
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
@@ -1546,6 +1592,29 @@ fn show_output(page: &ServerToolsPanel, title: &str, value: serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GTK shows a Run's result as React's `renderResult` does: the text the
+    /// tool returned, without Toolport's provenance metadata.
+    #[test]
+    fn a_run_result_shows_what_the_tool_returned() {
+        let meta =
+            serde_json::json!({"app.toolport/provenance": {"server": "s", "trust": "untrusted"}});
+        let result = serde_json::json!({
+            "_meta": meta,
+            "content": [
+                {"type": "text", "text": "hello", "_meta": meta},
+                {"type": "image", "data": "AAA", "mimeType": "image/png"},
+            ],
+            "isError": false,
+        });
+        let text = render_tool_result(&result);
+        assert!(text.starts_with("hello\n{"), "{text}");
+        assert!(!text.contains("provenance"), "{text}");
+        assert!(text.contains("image/png"), "{text}");
+        // No content: the whole result, as React shows it.
+        let empty = serde_json::json!({"content": [], "structuredContent": {"n": 1}});
+        assert!(render_tool_result(&empty).contains("structuredContent"));
+    }
 
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]

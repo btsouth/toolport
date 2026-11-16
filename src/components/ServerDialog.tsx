@@ -303,6 +303,14 @@ export function ServerDialog({
       // The backend message is already in the user's language and never holds
       // pasted text; GTK shows the same sentence.
       toastError(String(e));
+      // The form stays as it was before this paste, and the refusal is its only
+      // message: an empty field it left the user in shows no error yet.
+      const empty: Record<string, boolean> = {
+        "srv-name": !form.name.trim(),
+        "srv-cmd": !form.command.trim(),
+        "srv-url": !form.url.trim(),
+      };
+      setTouched((previous) => new Set([...previous].filter((id) => !empty[id])));
     } finally {
       setParsing(false);
     }
