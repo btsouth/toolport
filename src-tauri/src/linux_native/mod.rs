@@ -12236,7 +12236,7 @@ fn open_server_editor_prefilled(
     let busy = std::rc::Rc::new(std::cell::Cell::new(false));
     let validate: std::rc::Rc<dyn Fn()> = {
         let busy = busy.clone();
-        let (name, command, url, transport, timeout, save, test, feedback) = (
+        let (name, command, url, transport, timeout, save, test) = (
             name.clone(),
             command.clone(),
             url.clone(),
@@ -12244,7 +12244,6 @@ fn open_server_editor_prefilled(
             timeout.clone(),
             save.clone(),
             test.clone(),
-            feedback.clone(),
         );
         let validation_errors = validation_errors.clone();
         std::rc::Rc::new(move || {
@@ -12277,9 +12276,17 @@ fn open_server_editor_prefilled(
             );
             save.set_sensitive(valid && !busy.get());
             test.set_sensitive(valid && !busy.get());
+        })
+    };
+    // An edit makes an earlier result or error stale. Only edits clear it:
+    // moving focus in and out of a field keeps a finished Test result.
+    let edited: std::rc::Rc<dyn Fn()> = {
+        let (busy, feedback, validate) = (busy.clone(), feedback.clone(), validate.clone());
+        std::rc::Rc::new(move || {
             if !busy.get() {
                 feedback.set_visible(false);
             }
+            validate();
         })
     };
     // Empty means the default, except when editing a server whose saved
@@ -12294,11 +12301,11 @@ fn open_server_editor_prefilled(
         })
     };
     for (entry, _, touched) in &validation_errors {
-        let validate_change = validate.clone();
+        let edited_change = edited.clone();
         let touched_change = touched.clone();
         entry.connect_changed(move |_| {
             touched_change.set(true);
-            validate_change();
+            edited_change();
         });
         let focus = gtk::EventControllerFocus::new();
         let (touched, validate) = (touched.clone(), validate.clone());
@@ -12308,12 +12315,12 @@ fn open_server_editor_prefilled(
         });
         entry.add_controller(focus);
     }
-    let validate_args = validate.clone();
-    args.buffer().connect_changed(move |_| validate_args());
-    let validate_cwd = validate.clone();
-    cwd.connect_changed(move |_| validate_cwd());
-    let validate_transport = validate.clone();
-    transport.connect_selected_notify(move |_| validate_transport());
+    let edited_args = edited.clone();
+    args.buffer().connect_changed(move |_| edited_args());
+    let edited_cwd = edited.clone();
+    cwd.connect_changed(move |_| edited_cwd());
+    let edited_transport = edited;
+    transport.connect_selected_notify(move |_| edited_transport());
     validate();
     // The default shown matches React: 10 seconds for a local command, 120
     // when it downloads its package first, the request timeout for a remote.
@@ -12326,12 +12333,7 @@ fn open_server_editor_prefilled(
         );
         std::rc::Rc::new(move || {
             let milliseconds = if transport.selected() == 0 {
-                let argv = editor_args(&args);
-                if crate::clients::is_download_launcher(command.text().trim(), &argv) {
-                    120_000
-                } else {
-                    10_000
-                }
+                suggested_startup_timeout_ms(command.text().trim(), &editor_args(&args))
             } else {
                 match saved_timeouts {
                     Some((_, request, false)) => request.unwrap_or(30_000),
@@ -12411,6 +12413,10 @@ fn open_server_editor_prefilled(
         let validate = validate_for_test.clone();
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || {
+                #[cfg(test)]
+                if let Some(error) = editor_gate::hold() {
+                    return Err(error);
+                }
                 let mut entry = crate::registry_controller::server_entry_for_probe(
                     server_id.as_deref(),
                     fields,
@@ -12537,6 +12543,10 @@ fn open_server_editor_prefilled(
         let editor = editor_for_save.clone();
         gtk::glib::spawn_future_local(async move {
             let update = gtk::gio::spawn_blocking(move || {
+                #[cfg(test)]
+                if let Some(error) = editor_gate::hold() {
+                    return Err(error);
+                }
                 if binding_changed
                     && launch_definition.is_some()
                     && fields.args.iter().any(|arg| arg == "<launch-input>")
@@ -12852,6 +12862,26 @@ fn server_saved_feedback(
         ));
     }
     message
+}
+
+/// The startup timeout a local command gets when the field is empty: the
+/// backend's own default, so the hint can never differ from what happens.
+fn suggested_startup_timeout_ms(command: &str, args: &[String]) -> u64 {
+    crate::downstream::stdio_connect_timeout(command, args).as_millis() as u64
+}
+
+/// Tests hold the editor's Test or Save here to check the busy state. When a
+/// test has set the gate, the operation waits and then fails with the
+/// message the test sends.
+#[cfg(test)]
+mod editor_gate {
+    pub(super) static GATE: std::sync::Mutex<Option<std::sync::mpsc::Receiver<String>>> =
+        std::sync::Mutex::new(None);
+
+    pub(super) fn hold() -> Option<String> {
+        let gate = GATE.lock().unwrap().take()?;
+        Some(gate.recv().unwrap_or_default())
+    }
 }
 
 fn editor_timeout_ms(text: &str) -> Result<Option<u64>, String> {
@@ -16163,6 +16193,18 @@ mod tests {
         assert_eq!(timeout.placeholder_text().as_deref(), Some("10"));
         command.set_text("npx -y @scope/slow-server");
         assert_eq!(timeout.placeholder_text().as_deref(), Some("120"));
+        // `npx -- @scope/server` downloads too; the hint is the backend default.
+        let args = all
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::TextView>())
+            .next()
+            .unwrap()
+            .clone();
+        command.set_text("npx");
+        args.buffer().set_text("--\n@scope/server");
+        assert_eq!(timeout.placeholder_text().as_deref(), Some("120"));
+        args.buffer().set_text("");
+        command.set_text("npx -y @scope/slow-server");
         timeout.set_text("0");
         assert!(!save.is_sensitive());
         assert!(timeout.has_css_class("error"));
@@ -16198,8 +16240,73 @@ mod tests {
         url.set_text("https://example.com/mcp");
         assert!(!url_error().is_visible());
         assert!(save.is_sensitive());
+
+        let settle = |ready: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !ready() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "editor did not settle"
+                );
+                gtk::glib::MainContext::default().iteration(false);
+            }
+        };
+        // A finished result stays when focus only passes through a field, and
+        // goes away on an edit.
+        feedback.set_label("Earlier result");
+        feedback.set_visible(true);
+        name.grab_focus();
+        url.grab_focus();
+        settle(&|| url.has_focus() || url.focus_child().is_some());
+        name.grab_focus();
+        settle(&|| name.focus_child().is_some());
+        for _ in 0..50 {
+            gtk::glib::MainContext::default().iteration(false);
+        }
+        assert!(feedback.is_visible(), "focus alone cleared the result");
+        name.set_text("fixture edited");
+        assert!(!feedback.is_visible());
+
+        // While a Test or Save runs, edits never turn its buttons back on, so
+        // a second click cannot start a second test or add the server twice.
+        // Each held operation then fails and the buttons come back.
+        for (start, failed) in [
+            (&test, "Could not test: synthetic test failure"),
+            (&save, "Could not save: synthetic save failure"),
+        ] {
+            let (release, gate) = std::sync::mpsc::channel::<String>();
+            *editor_gate::GATE.lock().unwrap() = Some(gate);
+            start.emit_clicked();
+            assert!(!save.is_sensitive() && !test.is_sensitive());
+            name.set_text("edited while busy");
+            url.set_text("https://example.com/other");
+            assert!(!save.is_sensitive() && !test.is_sensitive());
+            release
+                .send(failed.split(": ").nth(1).unwrap().to_string())
+                .unwrap();
+            settle(&|| save.is_sensitive());
+            assert!(test.is_sensitive());
+            assert!(feedback.is_visible());
+            assert_eq!(feedback.label(), failed);
+            assert!(editor.is_visible(), "a failed save keeps the editor open");
+        }
+        assert!(crate::registry::load().unwrap().servers.is_empty());
         editor.close();
         parent.close();
+    }
+
+    #[test]
+    fn startup_timeout_hint_is_the_backend_default() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            suggested_startup_timeout_ms("npx", &args(&["--", "@scope/server"])),
+            120_000
+        );
+        assert_eq!(
+            suggested_startup_timeout_ms("npx -y @scope/slow-server", &[]),
+            120_000
+        );
+        assert_eq!(suggested_startup_timeout_ms("fixture-command", &[]), 10_000);
     }
 
     #[test]

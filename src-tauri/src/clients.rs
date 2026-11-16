@@ -3913,13 +3913,6 @@ fn launcher_base(command: &str) -> String {
     lower
 }
 
-/// Whether the command downloads its package on first start (npx, uvx and
-/// the like). Mirrors `isDownloadLauncher` in the frontend.
-#[cfg(all(target_os = "linux", feature = "gtk-desktop"))]
-pub(crate) fn is_download_launcher(command: &str, args: &[String]) -> bool {
-    launcher_package_arg(command, args).is_some()
-}
-
 /// If the command is a package runner (npx, uvx, bunx, pnpm/yarn dlx, npm exec/x,
 /// pipx run), return the package it runs - the meaningful identity - rather than
 /// the runner. Mirrors `isDownloadLauncher` in the frontend. `None` when the
