@@ -1206,5 +1206,7 @@
   "Showing {value0} of the latest {value1} entries.": "顯示最新 {value1} 筆記錄中的 {value0} 筆。",
   "Showing 1 matching entry from the latest {value1}.": "顯示最新 {value1} 筆記錄中符合的 1 筆。",
   "Show all {value0} entries": "顯示全部 {value0} 筆記錄",
-  "Import as {value0}": "匯入為 {value0}"
+  "Import as {value0}": "匯入為 {value0}",
+  "Open the review to check whether this is already in Toolport.": "開啟審核，檢查它是否已在 Toolport 中。",
+  "{value0} is already in Toolport.": "{value0} 已在 Toolport 中。"
 }

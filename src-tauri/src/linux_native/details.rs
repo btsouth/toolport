@@ -875,11 +875,13 @@ struct ImportRow<'a> {
     connection: Option<&'a str>,
     plugin: bool,
     imported: bool,
+    /// Only the keychain could tell whether it is in Toolport; review checks.
+    unconfirmed: bool,
 }
 
-/// What Import would add (named as it would be saved), then the client's servers
-/// already in Toolport, as React's ClientDetail lists them. Both come from the
-/// backend identity rule; a server it could not confirm is in neither.
+/// What Import would add (named as it would be saved), then what only review can
+/// check, then the client's servers already in Toolport, as React's ClientDetail
+/// lists them. All come from the backend identity rule.
 fn import_rows<'a>(
     detected: &'a state::ClientDetailData,
     imported_names: &[String],
@@ -900,18 +902,29 @@ fn import_rows<'a>(
             connection: None,
             plugin,
             imported: true,
+            unconfirmed: false,
         });
-    detected
-        .1
-        .iter()
-        .map(|(server, plugin, connection)| ImportRow {
-            server,
-            connection: Some(connection),
-            plugin: *plugin,
-            imported: false,
-        })
+    let listed = |rows: &'a Vec<_>, unconfirmed| {
+        rows.iter().map(
+            move |(server, plugin, connection): &'a (_, bool, String)| ImportRow {
+                server,
+                connection: Some(connection.as_str()),
+                plugin: *plugin,
+                imported: false,
+                unconfirmed,
+            },
+        )
+    };
+    listed(&detected.1, false)
+        .chain(listed(&detected.2, true))
         .chain(imported)
         .collect()
+}
+
+/// Whether the list may say everything here is already in Toolport: not while review
+/// still has to check a server.
+fn everything_in_toolport(rows: &[ImportRow]) -> bool {
+    rows.iter().all(|row| row.imported)
 }
 
 fn client_imports(
@@ -951,6 +964,7 @@ fn client_imports(
     import.set_sensitive(writable);
     let keys = servers
         .iter()
+        .filter(|row| !row.unconfirmed)
         .filter_map(|row| {
             Some(ImportSelection::new(
                 &detected.id,
@@ -968,7 +982,7 @@ fn client_imports(
             &[("value1", ""), ("value2", &count.to_string())],
         )
     });
-    let all_imported = keys.is_empty();
+    let all_imported = everything_in_toolport(&servers);
     let p = page.clone();
     import.connect_clicked(move |_| review_imports(&p, keys.clone()));
     all.append(&import);
@@ -1003,6 +1017,7 @@ fn client_imports(
         connection,
         plugin,
         imported,
+        unconfirmed,
     } in servers
     {
         let row = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -1030,11 +1045,25 @@ fn client_imports(
             badge.set_halign(gtk::Align::Start);
             copy.append(&badge);
         }
-        let import = l10n::button(if imported { "in Toolport" } else { "Import" });
+        if unconfirmed {
+            copy.append(&message(
+                "Open the review to check whether this is already in Toolport.",
+            ));
+        }
+        let import = l10n::button(if imported {
+            "in Toolport"
+        } else if unconfirmed {
+            "Review"
+        } else {
+            "Import"
+        });
         import.add_css_class("toolport-secondary-action");
         import.set_halign(gtk::Align::End);
         import.set_sensitive(writable && !imported);
-        let key = ImportSelection::new(&detected.id, server, connection.unwrap_or_default());
+        let mut key = ImportSelection::new(&detected.id, server, connection.unwrap_or_default());
+        if unconfirmed {
+            key.unconfirmed = Some(server.name.clone());
+        }
         let p = page.clone();
         import.connect_clicked(move |_| review_imports(&p, vec![key.clone()]));
         row.append(&page_header::HeaderWrap::new(&copy, &import));
@@ -1065,6 +1094,8 @@ fn client_imports(
 struct ImportSelection {
     client_id: String,
     connection: String,
+    /// The shown name of a server only review can check.
+    unconfirmed: Option<String>,
     command: Option<String>,
     args: Vec<String>,
     url: Option<String>,
@@ -1075,6 +1106,7 @@ impl ImportSelection {
         Self {
             client_id: client_id.into(),
             connection: connection.into(),
+            unconfirmed: None,
             command: server.command.as_ref().map(|c| {
                 if crate::registry::arg_looks_secret(c) {
                     "<command>".into()
@@ -1096,21 +1128,35 @@ impl ImportSelection {
     }
 }
 
+/// The review items for `keys`, and the names of unconfirmed servers review found
+/// already in Toolport (it lists only what Import would change).
 fn selected_imports(
     keys: &[ImportSelection],
     items: Vec<crate::registry_controller::ClientImportCandidate>,
-) -> Result<Vec<crate::registry_controller::ClientImportCandidate>, String> {
-    keys.iter()
-        .map(|key| {
-            items
-                .iter()
-                .find(|item| key.matches(item))
-                .cloned()
-                .ok_or_else(|| {
-                    crate::i18n::tr("Server changed. Refresh the client and review again.")
-                })
-        })
-        .collect()
+) -> Result<
+    (
+        Vec<crate::registry_controller::ClientImportCandidate>,
+        Vec<String>,
+    ),
+    String,
+> {
+    let mut picked = Vec::new();
+    let mut in_toolport = Vec::new();
+    for key in keys {
+        match (
+            items.iter().find(|item| key.matches(item)),
+            &key.unconfirmed,
+        ) {
+            (Some(item), _) => picked.push(item.clone()),
+            (None, Some(name)) => in_toolport.push(name.clone()),
+            (None, None) => {
+                return Err(crate::i18n::tr(
+                    "Server changed. Refresh the client and review again.",
+                ))
+            }
+        }
+    }
+    Ok((picked, in_toolport))
 }
 
 fn review_imports(page: &ClientPage, keys: Vec<ImportSelection>) {
@@ -1126,7 +1172,13 @@ fn review_imports(page: &ClientPage, keys: Vec<ImportSelection>) {
         })
         .await
         {
-            Ok(Ok(items)) if !items.is_empty() => page.show_import_review(items),
+            Ok(Ok((items, _))) if !items.is_empty() => page.show_import_review(items),
+            Ok(Ok((_, in_toolport))) if !in_toolport.is_empty() => {
+                page.show_confirmation(&crate::i18n::trf(
+                    "{value0} is already in Toolport.",
+                    &[("value0", &in_toolport.join(", "))],
+                ))
+            }
             Ok(Ok(_)) => page.show_confirmation(&crate::i18n::tr("Nothing new to import")),
             Ok(Err(e)) => page.show_error(&e),
             Err(_) => page.show_error(&crate::i18n::tr("The import scan stopped unexpectedly.")),
@@ -1257,7 +1309,14 @@ mod tests {
             vec![candidate, changed.clone()]
         )
         .is_ok());
-        assert!(selected_imports(&[selection], vec![changed]).is_err());
+        assert!(selected_imports(std::slice::from_ref(&selection), vec![changed.clone()]).is_err());
+        // An unconfirmed server review leaves out is already in Toolport, not changed.
+        let mut unconfirmed = selection;
+        unconfirmed.unconfirmed = Some("Notes".into());
+        assert_eq!(
+            selected_imports(&[unconfirmed], vec![changed]).unwrap(),
+            (Vec::new(), vec!["Notes".to_string()])
+        );
     }
     #[test]
     fn rows_whose_secrets_redact_alike_review_their_own_server() {
@@ -1289,9 +1348,11 @@ mod tests {
         ];
         let work = ImportSelection::new("claude-code", &twin("work", "B"), "connection:b");
         let personal = ImportSelection::new("claude-code", &twin("personal", "A"), "connection:a");
-        let picked = selected_imports(std::slice::from_ref(&work), items.clone()).unwrap();
+        let picked = selected_imports(std::slice::from_ref(&work), items.clone())
+            .unwrap()
+            .0;
         assert_eq!(picked[0].name, "work");
-        let picked = selected_imports(&[personal, work], items).unwrap();
+        let picked = selected_imports(&[personal, work], items).unwrap().0;
         let keys = picked.iter().map(|i| i.key.as_str()).collect::<Vec<_>>();
         assert_eq!(keys, ["key-personal", "key-work"]);
     }
@@ -1336,22 +1397,38 @@ mod tests {
                     "connection:linear".into(),
                 ),
             ],
+            vec![(
+                server("unconfirmed", "vaulted"),
+                false,
+                "connection:unconfirmed".into(),
+            )],
         );
         let rows = import_rows(&detected, &["notes".into()]);
         let shown = rows
             .iter()
-            .map(|row| (row.server.name.as_str(), row.plugin, row.imported))
+            .map(|row| {
+                (
+                    row.server.name.as_str(),
+                    row.plugin,
+                    row.imported,
+                    row.unconfirmed,
+                )
+            })
             .collect::<Vec<_>>();
         // The remote github is offered despite the name, the plugin keeps its badge,
-        // notes is listed once as in Toolport, and an unconfirmed server is neither.
+        // a server only review can check is listed as such, and notes is listed once
+        // as in Toolport.
         assert_eq!(
             shown,
             [
-                ("github (2)", false, false),
-                ("linear", true, false),
-                ("notes", false, true)
+                ("github (2)", false, false, false),
+                ("linear", true, false, false),
+                ("unconfirmed", false, false, true),
+                ("notes", false, true, false)
             ]
         );
+        assert!(!everything_in_toolport(&rows[2..]));
+        assert!(everything_in_toolport(&rows[3..]));
     }
     fn widgets(root: &gtk::Widget) -> Vec<gtk::Widget> {
         let mut all = vec![root.clone()];

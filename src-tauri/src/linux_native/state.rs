@@ -469,14 +469,16 @@ pub(super) enum ClientGatewayState {
 /// Detail inventory stays out of debug logs, just as it did before details existed.
 /// The second field is what Import would add, each named as it would be saved, marked
 /// when it came from a plugin, and with the connection id its review item carries.
+/// The third lists, the same way, servers only the keychain could match to Toolport's.
 #[derive(Clone)]
 pub(super) struct ClientDetailData(
     pub(super) crate::clients::DetectedClient,
     pub(super) Vec<(crate::clients::McpServer, bool, String)>,
+    pub(super) Vec<(crate::clients::McpServer, bool, String)>,
 );
 impl ClientDetailData {
     pub(super) fn new(client: crate::clients::DetectedClient) -> Self {
-        Self(client, Vec::new())
+        Self(client, Vec::new(), Vec::new())
     }
 }
 impl std::fmt::Debug for ClientDetailData {
@@ -697,6 +699,10 @@ pub(super) fn apply_import_state(client: &mut ClientView, registry: &crate::regi
     // the gateway, in Toolport already or not, as React counts it.
     client.imported_names = crate::clients::managed_server_names(&detected.0, registry);
     detected.1 = slots
+        .into_iter()
+        .map(|(index, server, key)| (server, index >= configured, key))
+        .collect();
+    detected.2 = crate::clients::unconfirmed_server_slots(&detected.0, registry)
         .into_iter()
         .map(|(index, server, key)| (server, index >= configured, key))
         .collect();
@@ -1182,8 +1188,25 @@ pub(super) mod tests {
             entry.id = name.into();
             registry.servers.push(entry);
         }
+        // Imported earlier with its token moved to the keychain.
+        let mut docs = crate::registry_controller::server_from_detected(
+            &mcp("docs", None, &[], Some("https://docs.example.invalid/mcp")),
+            "other",
+        );
+        docs.id = "docs".into();
+        docs.unknown_fields.insert(
+            "importedUrlKey".into(),
+            crate::secrets::IMPORTED_URL_KEY.into(),
+        );
+        registry.servers.push(docs);
         let detected = detected_fixture(
             vec![
+                mcp(
+                    "docs",
+                    None,
+                    &[],
+                    Some("https://docs.example.invalid/mcp?token=synthetic"),
+                ),
                 mcp(
                     "github",
                     None,
@@ -1206,10 +1229,20 @@ pub(super) mod tests {
         );
         let mut client = super::ClientView::from_detected(detected);
         super::apply_import_state(&mut client, &registry);
-        // "Move N servers" counts what the move migrates: both config servers, the
-        // one already in Toolport too, as React does. The gateway is not one.
-        assert_eq!(client.movable_server_count, 2);
+        // "Move N servers" counts what the move migrates: every config server, those
+        // already in Toolport and the one only the keychain could match too, as React
+        // does. The gateway is not one.
+        assert_eq!(client.movable_server_count, 3);
         assert_eq!(client.imported_names, ["my-notes"]);
+        // Only the keychain could tell; listed for review, not imported or counted.
+        let unconfirmed = &client.detected.as_ref().unwrap().2;
+        assert_eq!(
+            unconfirmed
+                .iter()
+                .map(|(server, plugin, _)| (server.name.as_str(), *plugin))
+                .collect::<Vec<_>>(),
+            [("docs", false)]
+        );
         let importable = client
             .detected
             .as_ref()

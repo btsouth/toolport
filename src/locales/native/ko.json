@@ -1206,5 +1206,7 @@
   "Showing {value0} of the latest {value1} entries.": "최신 항목 {value1}개 중 {value0}개를 표시하고 있습니다.",
   "Showing 1 matching entry from the latest {value1}.": "최신 항목 {value1}개 중 일치하는 1개를 표시하고 있습니다.",
   "Show all {value0} entries": "항목 {value0}개 모두 표시",
-  "Import as {value0}": "{value0}(으)로 가져오기"
+  "Import as {value0}": "{value0}(으)로 가져오기",
+  "Open the review to check whether this is already in Toolport.": "검토를 열어 이미 Toolport에 있는지 확인하세요.",
+  "{value0} is already in Toolport.": "{value0}은(는) 이미 Toolport에 있습니다."
 }
