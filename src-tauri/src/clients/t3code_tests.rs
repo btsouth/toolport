@@ -262,6 +262,7 @@ fn a_key_in_the_settings_never_reaches_any_output() {
             error: None,
             claude_profile: None,
             t3_code: Vec::new(),
+            shared: None,
         })
         .collect();
     // The default Claude Code and Codex rows: a home behind a hidden variable is never

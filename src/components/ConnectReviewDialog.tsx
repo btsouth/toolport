@@ -200,7 +200,10 @@ export function ConnectReviewDialog({
         value1: review.backupDir,
       })}
       notice={
-        <GatewaySettingsNotice clientName={clientName} lines={review.gatewaySettings} />
+        <>
+          {review.sharedNotice && <p>{review.sharedNotice}</p>}
+          <GatewaySettingsNotice clientName={clientName} lines={review.gatewaySettings} />
+        </>
       }
       title={t("Review and connect {value0}", { value0: clientName })}
       confirmLabel={

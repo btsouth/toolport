@@ -1689,6 +1689,22 @@ mod file {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(super) fn backup_len() -> usize {
+        load().map_or(0, |store| {
+            store
+                .keys()
+                .filter(|key| key.starts_with("client-backup-"))
+                .count()
+        })
+    }
+}
+
+/// Client backup credentials in the synthetic test vault.
+#[cfg(test)]
+pub(crate) fn file_vault_backups() -> usize {
+    file::backup_len()
 }
 
 fn set_secret_raw(server_id: &str, key: &str, value: &str) -> Result<(), String> {

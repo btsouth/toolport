@@ -77,7 +77,7 @@ struct PlainBackup {
 /// (symlinks, Windows 8.3 short names) and the missing rest appended, so a
 /// hash taken before the client's backup folder exists matches one taken
 /// after. On Windows the verbatim prefix, separators and case are folded.
-fn path_identity(path: &Path) -> String {
+pub(super) fn path_identity(path: &Path) -> String {
     let resolved = path
         .parent()
         .into_iter()

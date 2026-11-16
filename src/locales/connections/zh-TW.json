@@ -1085,5 +1085,19 @@
   "net token change": "Token 淨變化",
   "extra tokens": "額外的 Token",
   "Toolport measured a net token change of {tokens} across {sessions} client sessions. Full catalog baselines minus all catalog and search responses, counted locally with cl100k_base; not a billing figure. toolport.app": "Toolport 測得，在 {sessions} 個用戶端會話中 Token 淨變化為 {tokens}。以完整工具目錄為基線，減去所有目錄和搜尋響應，使用 cl100k_base 在本機計數；此數值不代表賬單用量。toolport.app",
-  "{baseline} baseline tokens − {catalog} catalog response tokens − {search} search response tokens = {net} net token change. A negative change means responses used more tokens than the baseline.": "{baseline} 個基線 Token − {catalog} 個目錄響應 Token − {search} 個搜尋響應 Token = Token 淨變化 {net}。負值表示響應使用的 Token 多於基線。"
+  "{baseline} baseline tokens − {catalog} catalog response tokens − {search} search response tokens = {net} net token change. A negative change means responses used more tokens than the baseline.": "{baseline} 個基線 Token − {catalog} 個目錄響應 Token − {search} 個搜尋響應 Token = Token 淨變化 {net}。負值表示響應使用的 Token 多於基線。",
+  "Shared with {client}": "與{client}共用",
+  "Uses {client}'s access settings (they share one config file).": "使用{client}的存取設定（它們共用一個設定檔案）。",
+  "Uses the Toolport entry {carrier} added. Both apps use the same access settings.": "使用{carrier}新增的 Toolport 項目。兩個應用程式使用相同的存取設定。",
+  "{client}'s own settings (access: {scope}, discovery: {mode}) will be replaced by {carrier}'s, because they share one config file.": "{client}自己的設定（存取：{scope}，工具探索：{mode}）將被{carrier}的設定取代，因為它們共用一個設定檔案。",
+  "{member} uses the same config file, so Toolport stays in it for {member}, with the same access settings. This disconnects only {client}.": "{member}使用同一個設定檔案，因此 Toolport 會以相同的存取設定為{member}保留在其中。此操作只會中斷{client}的連線。",
+  "{carrier} is connected to this file through Shared HTTP. Toolport can't share that entry yet. Disconnect {carrier} first or connect it with the standard entry.": "{carrier}透過 Shared HTTP 連線到此檔案。Toolport 目前還無法共用該項目。請先中斷{carrier}的連線，或使用標準項目連線。",
+  "{owner}'s Toolport entry in {file} was changed or removed. Disconnect or reconnect {owner} first.": "{owner}在{file}中的 Toolport 項目已被變更或移除。請先中斷或重新連線{owner}。",
+  "{owner} still has saved recovery values for {file}, which {client} shares. Choose Retry on {owner}'s recovery to put them back, or Discard these saved values, first. Nothing was changed.": "{owner}仍有{file}的已儲存復原值，{client}也在使用此檔案。請先在{owner}的復原中選擇「重試」以放回這些值，或捨棄這些已儲存的值。未做任何變更。",
+  "Toolport can't read the recovery file for {file}, which {client} shares, so it won't change that file. Repair or discard the recovery file first. Nothing was changed.": "Toolport 無法讀取{file}的復原檔案（{client}也在使用此檔案），因此不會變更該檔案。請先修復或捨棄復原檔案。未做任何變更。",
+  "Unlock your keyring, then try again. Nothing was changed.": "請解鎖鑰匙圈，然後再試一次。未做任何變更。",
+  "{other} already uses {file}. Toolport can connect only one of them to that file for now. Disconnect {other} first, or point one of them at another file.": "{other}已在使用{file}。目前 Toolport 只能將其中一個連線到該檔案。請先中斷{other}的連線，或讓其中一個使用其他檔案。",
+  "Toolport removed its entry. The file from before Toolport is no longer saved, because its recovery file was discarded.": "Toolport 已移除其項目。由於復原檔案已被捨棄，Toolport 之前的檔案已不再儲存。",
+  "Restored with {owner}.": "已與{owner}一起還原。",
+  "Stays in the file": "保留在檔案中"
 }

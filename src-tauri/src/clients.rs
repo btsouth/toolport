@@ -50,6 +50,7 @@ mod paths_tests;
 pub mod recovery;
 mod relocate;
 mod restore;
+pub(crate) mod shared;
 mod toml_preservation;
 #[cfg(test)]
 mod typed_entries_tests;
@@ -137,6 +138,17 @@ pub struct DetectedClient {
     /// The T3 Code provider instances that use this config. Empty without T3 Code.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub t3_code: Vec<T3CodeUse>,
+    /// Set when this client's config file holds one Toolport entry for several clients.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared: Option<SharedEntry>,
+}
+
+/// A joined client shows whose entry it uses; the carrier lists who stays on it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedEntry {
+    pub joined: bool,
+    pub with: String,
 }
 
 fn serialize_config_error<S: serde::Serializer>(
@@ -4860,6 +4872,7 @@ fn read_client(def: &ClientDef) -> DetectedClient {
             error,
             claude_profile: None,
             t3_code: Vec::new(),
+            shared: None,
         }
     };
 
@@ -5004,6 +5017,7 @@ fn config_error_row(id: &str, name: &str, path: String, error: String) -> Detect
         error: Some(error),
         claude_profile: None,
         t3_code: Vec::new(),
+        shared: None,
     }
 }
 
@@ -5152,6 +5166,22 @@ fn detect_clients_for_display_in(
 }
 
 fn location_launch_id(format: Format, name: &str, text: &str) -> Result<Option<String>, String> {
+    entry_env_value(
+        format,
+        name,
+        text,
+        crate::brand::CLIENT_ID,
+        crate::brand::CLIENT_ID_LEGACY,
+    )
+}
+
+fn entry_env_value(
+    format: Format,
+    name: &str,
+    text: &str,
+    key: &str,
+    legacy: &str,
+) -> Result<Option<String>, String> {
     let value = mutation::value(format, Some(text))?;
     let container = moved::server_container(format, &value);
     let entry = if matches!(format, Format::YamlMcpServersList) {
@@ -5169,8 +5199,8 @@ fn location_launch_id(format: Format, name: &str, text: &str) -> Result<Option<S
     Ok(entry
         .and_then(|entry| {
             entry[env_key]
-                .get(crate::brand::CLIENT_ID)
-                .or_else(|| entry[env_key].get(crate::brand::CLIENT_ID_LEGACY))
+                .get(key)
+                .or_else(|| entry[env_key].get(legacy))
         })
         .and_then(|value| value.as_str())
         .map(str::to_string))
@@ -5230,6 +5260,7 @@ pub fn client_metadata() -> Vec<DetectedClient> {
                 error: None,
                 claude_profile: None,
                 t3_code: Vec::new(),
+                shared: None,
             }
         })
         .collect()
@@ -5395,6 +5426,7 @@ pub fn apply_entry_states(clients: &mut [DetectedClient], managed: &HashMap<Stri
         // Keep gateway_installed aligned with identity presence (not ownership).
         client.gateway_installed = client.entry_state != GatewayEntryState::Absent;
     }
+    shared::classify(clients, managed);
 }
 
 // ---------------------------------------------------------------------------
@@ -5435,6 +5467,23 @@ pub struct WriteOutcome {
     pub existed_before: bool,
 }
 
+impl WriteOutcome {
+    /// An outcome for `path` that wrote nothing.
+    pub(crate) fn unchanged(path: &Path) -> Self {
+        Self {
+            existed_before: true,
+            path: path.display().to_string(),
+            backup: None,
+            managed: None,
+            restored: Vec::new(),
+            used_move_record: false,
+            revision: None,
+            warnings: Vec::new(),
+            recovery_path: None,
+        }
+    }
+}
+
 fn revision_outcome(
     client_id: &str,
     path: &Path,
@@ -5443,6 +5492,9 @@ fn revision_outcome(
     let existed_before = mutation::exists(path);
     let mut outcome = write()?;
     outcome.existed_before = existed_before;
+    if let Some(managed) = outcome.managed.as_mut() {
+        managed.config_path = Some(path.to_string_lossy().into_owned());
+    }
     let path = Path::new(&outcome.path);
     outcome.recovery_path = Some(restore::record_path(client_id, path)?);
     outcome.revision = if mutation::exists(path) {
@@ -9439,6 +9491,9 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
         });
     }
     let mut outcome = install_or_remove(client_id, None)?;
+    if shared::discarded(client_id, &path) {
+        outcome.warnings.push(crate::i18n::tr("Toolport removed its entry. The file from before Toolport is no longer saved, because its recovery file was discarded."));
+    }
     if let Some(restored) = restored {
         // A rollback must undo the restore too, so point at the copy taken before it.
         if let Some(backup) = restored.backup {
@@ -13061,6 +13116,7 @@ bad = "not-a-table"
                 url: Some("http://127.0.0.1:8765/mcp".into()),
                 updated_at: 1,
                 codex_settings: Vec::new(),
+                config_path: None,
                 unknown_fields: Default::default(),
             };
             // Even an old ownership record must not authorize a startup conversion.
@@ -13099,6 +13155,7 @@ bad = "not-a-table"
             error: None,
             claude_profile: None,
             t3_code: Vec::new(),
+            shared: None,
         }
     }
 
@@ -13214,6 +13271,7 @@ bad = "not-a-table"
             url: None,
             updated_at: 1,
             codex_settings: Vec::new(),
+            config_path: None,
             unknown_fields: Default::default(),
         };
         let matching = McpServer {
@@ -13279,6 +13337,7 @@ bad = "not-a-table"
             url: None,
             updated_at: 0,
             codex_settings: Vec::new(),
+            config_path: None,
             unknown_fields: Default::default(),
         }
     }

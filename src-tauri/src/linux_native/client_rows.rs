@@ -428,7 +428,15 @@ pub(super) fn client_row(
         }
         state::ClientGatewayState::Customized => {}
         state::ClientGatewayState::Connected => {
-            controls.append(&client_scope_menu(client.clone(), page.clone()));
+            let menu = client_scope_menu(client.clone(), page.clone());
+            // A joined client uses the carrier's access settings.
+            menu.set_sensitive(
+                !client
+                    .detected
+                    .as_ref()
+                    .is_some_and(|d| d.shared.as_ref().is_some_and(|shared| shared.joined)),
+            );
+            controls.append(&menu);
             controls.append(&connected_client_actions_menu(client.clone(), page.clone()));
         }
     }

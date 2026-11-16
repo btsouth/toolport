@@ -369,6 +369,15 @@ pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
     let body = page_body(24);
     let info = gtk::Box::new(gtk::Orientation::Vertical, 8);
     info.append(&client_rows::status_badge(client));
+    let shared = client.detected.as_ref().and_then(|d| d.shared.clone());
+    let joined = shared.as_ref().filter(|s| s.joined).map(|s| s.with.clone());
+    if let Some(carrier) = &joined {
+        info.append(&formatted_message(
+            "Shared with {client}",
+            &[("client", carrier)],
+            &[],
+        ));
+    }
     if let Some(detected) = &client.detected {
         info.append(&text(&detected.config_path, true));
     } else if let Some(profile) = &client.claude_profile {
@@ -390,7 +399,7 @@ pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
             .unwrap_or(0) as u32,
     );
     bound_dropdown(&scope);
-    scope.set_sensitive(writable && !customized);
+    scope.set_sensitive(writable && !customized && joined.is_none());
     scope.update_property(&[gtk::accessible::Property::Label(&crate::i18n::tr("Access"))]);
     let selected_scope = Rc::new(RefCell::new(client.scope_id.clone()));
     let saved = selected_scope.clone();
@@ -404,7 +413,14 @@ pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
     access_label.set_valign(gtk::Align::Center);
     actions.append(&access_label);
     actions.append(&scope);
-    if connected && !customized {
+    if let Some(carrier) = &joined {
+        actions.append(&formatted_message(
+            "Uses {client}'s access settings (they share one config file).",
+            &[("client", carrier)],
+            &[],
+        ));
+    }
+    if connected && !customized && joined.is_none() {
         let apply = l10n::button("Apply");
         apply.add_css_class("toolport-secondary-action");
         apply.set_sensitive(false);
@@ -2108,6 +2124,7 @@ mod tests {
                     .then(|| "Synthetic unreadable config".into()),
                 claude_profile: None,
                 t3_code: Vec::new(),
+                shared: None,
             }));
             clients.render(snapshot(vec![selected.clone()]));
             stack.set_visible_child_name("clients");

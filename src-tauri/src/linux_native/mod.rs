@@ -4110,7 +4110,16 @@ fn confirm_client_disconnect(client: &state::ClientView, button: gtk::Button, pa
         Some(&crate::i18n::tr(body)),
     );
     l10n::bind_formatted_dialog_heading(&dialog, heading, &values);
-    l10n::bind_dialog_body(&dialog, body);
+    // The other clients on a shared entry keep it (section 6.4).
+    match client
+        .detected
+        .as_ref()
+        .and_then(|d| d.shared.clone())
+        .filter(|s| !s.joined)
+    {
+        Some(shared) => dialog.set_body(&crate::i18n::trf("{member} uses the same config file, so Toolport stays in it for {member}, with the same access settings. This disconnects only {client}.", &[("member", &shared.with), ("client", &client.name.to_string())])),
+        None => l10n::bind_dialog_body(&dialog, body),
+    }
     dialog.add_response("cancel", &crate::i18n::tr("Cancel"));
     l10n::bind_dialog_response(&dialog, "cancel", "Cancel");
     dialog.add_response("disconnect", &crate::i18n::tr("Disconnect"));

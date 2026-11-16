@@ -1475,6 +1475,10 @@ pub struct ManagedEntry {
     /// own state, never in the client's config.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub codex_settings: Vec<String>,
+    /// The config file this entry was written to. Shared files derive their
+    /// members from it; it never leaves this machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
     /// Fields from newer builds, preserved on every registry save.
     #[serde(flatten)]
     pub unknown_fields: serde_json::Map<String, serde_json::Value>,
@@ -1523,6 +1527,7 @@ impl ManagedEntry {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             codex_settings: Vec::new(),
+            config_path: None,
             unknown_fields: Default::default(),
         }
     }
@@ -6224,6 +6229,7 @@ pub(crate) mod tests {
             url: None,
             updated_at: 42,
             codex_settings: Vec::new(),
+            config_path: None,
             unknown_fields: Default::default(),
         };
         r.set_client_managed_entry("claude-desktop", entry.clone());

@@ -552,11 +552,19 @@ async fn install_gateway(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .client_managed_entries
             .clone();
+        let update = |change: &dyn Fn(&mut Registry)| {
+            write_registry(state.inner(), |registry| {
+                change(registry);
+                Ok(())
+            })
+            .map(|(registry, ())| registry)
+        };
         crate::registry_controller::connect_client_stdio_with(
             &client_id,
             profile.as_deref(),
             force.unwrap_or(false),
             &managed,
+            &update,
             |managed_entry| {
                 write_registry(state.inner(), |registry| {
                     Ok(crate::registry_controller::apply_client_stdio_update(
@@ -697,6 +705,20 @@ async fn uninstall_gateway(
 ) -> Result<clients::WriteOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<RegistryState>();
+        let _path = clients::shared::lock_client(&client_id)?;
+        let update = |change: &dyn Fn(&mut Registry)| {
+            write_registry(state.inner(), |registry| {
+                change(registry);
+                Ok(())
+            })
+            .map(|(registry, ())| registry)
+        };
+        if let Some(done) = crate::registry_controller::disconnect_shared(&client_id, &update)? {
+            return crate::registry_controller::finish_shared(done, || {
+                crate::secrets::delete_secret("__toolport_http_clients__", &client_id)
+            })
+            .map(|result| result.outcome);
+        }
         let mut outcome = clients::uninstall_gateway(&client_id)?;
         // Config entry is gone; also revoke the bridge bearer so a leftover backup or
         // stale token cannot keep authenticating (WS3-4). A vault or registry
@@ -5377,6 +5399,7 @@ mod tests {
             error: None,
             claude_profile: None,
             t3_code: Vec::new(),
+            shared: None,
         }
     }
 

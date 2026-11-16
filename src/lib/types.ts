@@ -58,6 +58,9 @@ export interface DetectedClient {
   claudeProfile?: ClaudeProfile;
   /** T3 Code instances that run this client as a provider. Omitted when none. */
   t3Code?: T3CodeUse[];
+  /** One Toolport entry shared through one config file: `joined` uses the entry
+   * `with` names; otherwise `with` lists the clients that stay on it. */
+  shared?: { joined: boolean; with: string };
 }
 
 /** A T3 Code instance that uses a client row (src-tauri/src/clients/t3code.rs). */
@@ -95,6 +98,8 @@ export interface ClientSetupReview {
   items: ImportItem[];
   /** TOML lines Toolport adds to its own entry for this client, each only when unset. */
   gatewaySettings?: string[];
+  /** Set when this Connect uses another client's entry in a shared file. */
+  sharedNotice?: string;
 }
 
 export interface MigrateResult {

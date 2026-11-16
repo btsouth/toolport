@@ -1085,5 +1085,19 @@
   "net token change": "正味のToken変化量",
   "extra tokens": "追加のToken",
   "Toolport measured a net token change of {tokens} across {sessions} client sessions. Full catalog baselines minus all catalog and search responses, counted locally with cl100k_base; not a billing figure. toolport.app": "Toolportはクライアントセッション{sessions}件で、正味のToken変化量 {tokens} を計測しました。全カタログの基準値から、すべてのカタログ応答と検索応答を差し引き、cl100k_baseでローカルに計算しています。請求額を示す数値ではありません。toolport.app",
-  "{baseline} baseline tokens − {catalog} catalog response tokens − {search} search response tokens = {net} net token change. A negative change means responses used more tokens than the baseline.": "基準のToken数 {baseline} − カタログ応答のToken数 {catalog} − 検索応答のToken数 {search} = 正味のToken変化量 {net}。マイナスの場合、応答で使われたToken数が基準を上回ったことを示します。"
+  "{baseline} baseline tokens − {catalog} catalog response tokens − {search} search response tokens = {net} net token change. A negative change means responses used more tokens than the baseline.": "基準のToken数 {baseline} − カタログ応答のToken数 {catalog} − 検索応答のToken数 {search} = 正味のToken変化量 {net}。マイナスの場合、応答で使われたToken数が基準を上回ったことを示します。",
+  "Shared with {client}": "{client} と共有",
+  "Uses {client}'s access settings (they share one config file).": "{client} のアクセス設定を使用します (1 つの設定ファイルを共有しています)。",
+  "Uses the Toolport entry {carrier} added. Both apps use the same access settings.": "{carrier} が追加した Toolport のエントリを使用します。両方のアプリが同じアクセス設定を使用します。",
+  "{client}'s own settings (access: {scope}, discovery: {mode}) will be replaced by {carrier}'s, because they share one config file.": "{client} 独自の設定 (アクセス: {scope}、ツール探索: {mode}) は、1 つの設定ファイルを共有しているため {carrier} の設定に置き換えられます。",
+  "{member} uses the same config file, so Toolport stays in it for {member}, with the same access settings. This disconnects only {client}.": "{member} が同じ設定ファイルを使用しているため、Toolport は {member} のために同じアクセス設定のままファイルに残ります。切断されるのは {client} だけです。",
+  "{carrier} is connected to this file through Shared HTTP. Toolport can't share that entry yet. Disconnect {carrier} first or connect it with the standard entry.": "{carrier} は Shared HTTP でこのファイルに接続されています。Toolport はまだこのエントリを共有できません。先に {carrier} を切断するか、標準のエントリで接続してください。",
+  "{owner}'s Toolport entry in {file} was changed or removed. Disconnect or reconnect {owner} first.": "{file} 内の {owner} の Toolport エントリが変更または削除されました。先に {owner} を切断するか再接続してください。",
+  "{owner} still has saved recovery values for {file}, which {client} shares. Choose Retry on {owner}'s recovery to put them back, or Discard these saved values, first. Nothing was changed.": "{owner} には、{client} も使用している {file} の保存済み復元値がまだあります。先に {owner} の復元で「再試行」を選んで値を戻すか、これらの保存済みの値を破棄してください。何も変更されていません。",
+  "Toolport can't read the recovery file for {file}, which {client} shares, so it won't change that file. Repair or discard the recovery file first. Nothing was changed.": "{client} も使用している {file} の復元ファイルを Toolport が読み取れないため、このファイルは変更しません。先に復元ファイルを修復するか破棄してください。何も変更されていません。",
+  "Unlock your keyring, then try again. Nothing was changed.": "キーリングのロックを解除してから、もう一度お試しください。何も変更されていません。",
+  "{other} already uses {file}. Toolport can connect only one of them to that file for now. Disconnect {other} first, or point one of them at another file.": "{other} がすでに {file} を使用しています。現在、Toolport がこのファイルに接続できるのはどちらか一方だけです。先に {other} を切断するか、どちらかを別のファイルに向けてください。",
+  "Toolport removed its entry. The file from before Toolport is no longer saved, because its recovery file was discarded.": "Toolport はエントリを削除しました。復元ファイルが破棄されたため、Toolport 導入前のファイルはもう保存されていません。",
+  "Restored with {owner}.": "{owner} と一緒に復元しました。",
+  "Stays in the file": "ファイルに残ります"
 }

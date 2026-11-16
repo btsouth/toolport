@@ -4234,6 +4234,7 @@ fn detected_profile(
         error: None,
         claude_profile: None,
         t3_code: Vec::new(),
+        shared: None,
     }
 }
 

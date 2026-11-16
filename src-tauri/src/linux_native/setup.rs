@@ -798,6 +798,10 @@ pub(super) fn connect(
                         ("value1", &preview.backup_dir.to_string()),
                     ],
                 );
+                let disclosure = match &preview.shared_notice {
+                    Some(shared) => format!("{shared}\n{disclosure}"),
+                    None => disclosure,
+                };
                 let notice = gateway_settings_notice(&client_name, &preview.gateway_settings);
                 review_with_notice(
                     &parent,

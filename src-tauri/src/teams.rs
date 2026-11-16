@@ -5570,6 +5570,40 @@ mod tests {
         });
     }
     #[test]
+    fn activation_report_carries_no_client_paths() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let endpoint = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let mut reg = publisher_registry();
+            let conn = reg.team.as_mut().unwrap();
+            conn.server_url = format!("http://{}", endpoint.server_addr());
+            conn.reporting_device_id = "0123456789abcdef0123456789abcdef".into();
+            let conn = conn.clone();
+            let mut record: crate::registry::ManagedEntry =
+                serde_json::from_value(json!({"command": "/private/bin/toolport-gateway"}))
+                    .unwrap();
+            record.config_path = Some("/private/devin/mcp_config.json".into());
+            reg.set_client_managed_entry("windsurf", record);
+            crate::registry::save(&reg).unwrap();
+            let worker = std::thread::spawn(move || {
+                let mut request = endpoint
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).unwrap();
+                assert!(!body.contains("/private/"), "{body}");
+                let body: Value = serde_json::from_str(&body).unwrap();
+                request
+                    .respond(tiny_http::Response::from_string(
+                        json!({"acknowledgedRevision":body["revision"]}).to_string(),
+                    ))
+                    .unwrap();
+            });
+            report_activation(&conn, "fixture-token").unwrap();
+            worker.join().unwrap();
+        });
+    }
+    #[test]
     fn member_override_wins_over_shared_reference_and_is_never_exported() {
         let mut reg = base_registry();
         let config = json!({"servers":[{"id":"service","name":"Service","transport":"stdio","command":"fixture","env":[{"key":"TOKEN","source":{"ref":"op://Team/Token/key"}}]}]});

@@ -154,19 +154,23 @@ fn all_with_clients(
     Ok(results)
 }
 
-pub(super) fn restore_path(
+/// Restore `path` from `id`'s receipt and move record without releasing them,
+/// so a failed registry write can still roll the file back from the backup.
+pub(super) fn restore_write(
     id: &str,
     path: &Path,
     format: Format,
     managed: Option<&ManagedEntry>,
-) -> Result<Vec<String>, String> {
+) -> Result<WriteOutcome, String> {
     backup_storage::reset_missing();
     recovery_values::reset_progress();
-    let (revision, used_move_record) = restore::run(id, path, format, || {
+    let outcome = restore::run(id, path, format, || {
+        let mut outcome = WriteOutcome::unchanged(path);
+        outcome.existed_before = mutation::exists(path);
         mutation::disconnecting();
         restore::prepare_disconnect(id, path)?;
         if !restore::pending_values(id, path)? {
-            backup_file(id, path)?;
+            outcome.backup = backup_file(id, path)?.map(|p| p.display().to_string());
         }
         if !restore::apply(id, format, path)? {
             restore::check_legacy_gateway(format, path, managed)?;
@@ -175,11 +179,13 @@ pub(super) fn restore_path(
         } else if restore::needs_moved(id, path)? {
             moved::restore(id, format, path)?;
         }
-        let revision = mutation::read(path)
+        outcome.revision = mutation::read(path)
             .flatten()
             .as_deref()
             .map(crate::registry::sha256_hex);
-        Ok((revision, moved::matches_path(id, path)?))
+        outcome.used_move_record = moved::matches_path(id, path)?;
+        outcome.recovery_path = Some(restore::record_path(id, path)?);
+        Ok(outcome)
     })?;
     #[cfg(test)]
     AFTER_RESTORE.with(|slot| {
@@ -187,6 +193,16 @@ pub(super) fn restore_path(
             hook(path);
         }
     });
+    Ok(outcome)
+}
+
+pub(super) fn restore_path(
+    id: &str,
+    path: &Path,
+    format: Format,
+    managed: Option<&ManagedEntry>,
+) -> Result<Vec<String>, String> {
+    let outcome = restore_write(id, path, format, managed)?;
     let mut warnings = disconnect_warnings(format, path)
         .map_err(|error| {
             eprintln!(
@@ -195,20 +211,7 @@ pub(super) fn restore_path(
             )
         })
         .unwrap_or_default();
-    let recovery_warnings = finish_uninstall_with_warnings(
-        id,
-        &WriteOutcome {
-            existed_before: true,
-            path: path.to_string_lossy().into_owned(),
-            backup: None,
-            managed: None,
-            restored: Vec::new(),
-            used_move_record,
-            revision,
-            warnings: Vec::new(),
-            recovery_path: None,
-        },
-    )?;
+    let recovery_warnings = finish_uninstall_with_warnings(id, &outcome)?;
     warnings.extend(recovery_warnings);
     Ok(warnings)
 }
@@ -465,6 +468,7 @@ mod tests {
             error: None,
             claude_profile: None,
             t3_code: Vec::new(),
+            shared: None,
             location_removable: false,
         };
         let results = all_with_clients(false, true, || vec![client]).unwrap();

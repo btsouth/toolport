@@ -108,6 +108,8 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   }, [resetRequest, client.id]);
   const installed = client.gatewayInstalled;
   const customized = client.entryState === "customized";
+  const joined = client.shared?.joined ? client.shared.with : null;
+  const keeps = client.shared && !client.shared.joined ? client.shared.with : null;
   const legacyBearer = client.servers.some(hasLegacyBearerArgv);
   // Whether the client app is actually on this machine. We allow Disconnect even
   // when absent (to clean up a stale entry), but block a fresh Connect, writing a
@@ -442,6 +444,11 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               {t("Not installed")}
             </Badge>
           )}
+          {joined && (
+            <Badge variant="info" className="mb-1 ml-1">
+              {t("Shared with {client}", { client: joined })}
+            </Badge>
+          )}
           <p className="truncate font-mono text-meta text-muted-foreground">
             {client.configExists
               ? client.configPath
@@ -530,7 +537,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             >
               <SelectTrigger
                 aria-label={translate("Access")}
-                disabled={busy || !!client.error}
+                disabled={busy || !!client.error || !!joined}
                 size="sm"
                 className="w-auto max-w-full min-w-[min(13rem,100%)]"
               >
@@ -549,7 +556,14 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               </SelectContent>
             </Select>
           )}
-          {installed && !customized && profile !== currentScope && (
+          {joined && (
+            <span className="text-meta text-muted-foreground">
+              {t("Uses {client}'s access settings (they share one config file).", {
+                client: joined,
+              })}
+            </span>
+          )}
+          {installed && !customized && !joined && profile !== currentScope && (
             <Button size="sm" onClick={applyScope} disabled={busy || !!client.error}>
               <Check className="size-4" />
               {translate("Apply access")}
@@ -616,13 +630,18 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               }
               title={t("Disconnect Toolport from {value1}?", { value1: client.name })}
               description={
-                customized
+                keeps
                   ? t(
-                      "This removes the custom toolport entry from the client's MCP config. You can reconnect anytime.",
+                      "{member} uses the same config file, so Toolport stays in it for {member}, with the same access settings. This disconnects only {client}.",
+                      { member: keeps, client: client.name },
                     )
-                  : t(
-                      "This rewrites the client's MCP config to remove the gateway and puts back any servers Toolport moved out of it. You can reconnect anytime.",
-                    )
+                  : customized
+                    ? t(
+                        "This removes the custom toolport entry from the client's MCP config. You can reconnect anytime.",
+                      )
+                    : t(
+                        "This rewrites the client's MCP config to remove the gateway and puts back any servers Toolport moved out of it. You can reconnect anytime.",
+                      )
               }
               confirmLabel={t("Disconnect")}
               destructive

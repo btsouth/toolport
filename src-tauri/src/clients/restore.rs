@@ -85,7 +85,7 @@ pub(super) fn record_path(client_id: &str, path: &Path) -> Result<PathBuf, Strin
         .join(format!("original-{hash}.json")))
 }
 
-fn released_path(client_id: &str, path: &Path) -> Result<PathBuf, String> {
+pub(super) fn released_path(client_id: &str, path: &Path) -> Result<PathBuf, String> {
     let original = record_path(client_id, path)?;
     Ok(
         original.with_file_name(original.file_name().unwrap().to_string_lossy().replacen(
@@ -674,7 +674,15 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
         && record.vault_recovery.is_none()
         && record.disconnect_before.is_none()
     {
-        return Ok(true);
+        // Cause 2: the recovery was discarded (a Discard tombstone has no capture
+        // time) while Toolport's entry stayed. With nobody else on this file, the
+        // caller removes the entry instead. A normal release keeps main's rule.
+        let entry = record.captured_at == 0
+            && current.as_deref().is_some_and(|text| {
+                parse_client_content(format, text)
+                    .is_ok_and(|servers| gateway_entry_for_client(client_id, &servers).is_some())
+            });
+        return Ok(!entry || shared::others_use(client_id, path).unwrap_or(true));
     }
     if record.disconnected {
         let receipt = record_path(client_id, path)?;

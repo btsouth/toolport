@@ -2859,10 +2859,15 @@ mod tests {
             .client_scopes
             .insert(id.clone(), "private-access".into());
         registry.client_discovery.insert(id, "lazy".into());
+        let mut record: crate::registry::ManagedEntry =
+            serde_json::from_value(serde_json::json!({"command": "toolport-gateway"})).unwrap();
+        record.config_path = Some("/private/devin/mcp_config.json".into());
+        registry.set_client_managed_entry("windsurf", record);
         assert_eq!(definitions(&registry), before);
         let export = serde_json::to_string(&definitions(&registry)).unwrap();
         assert!(!export.contains(folder.to_str().unwrap()));
         assert!(!export.contains("private-access"));
+        assert!(!export.contains("/private/devin"));
         assert!(!serde_json::to_value(&registry)
             .unwrap()
             .as_object()

@@ -1354,8 +1354,21 @@ pub fn connect_client_stdio_with(
     profile: Option<&str>,
     force: bool,
     managed: &HashMap<String, ManagedEntry>,
+    update: RegistryUpdate,
     write_registry: impl FnOnce(Option<ManagedEntry>) -> Result<(Registry, bool), String>,
 ) -> Result<ClientMutationResult, String> {
+    let _path = clients::shared::lock_client(client_id)?;
+    match plan_shared_connect(client_id, &read_registry_exact_or_default()?)? {
+        SharedConnect::Join(group, carrier) => {
+            return join_shared(client_id, &group, &carrier, update)
+        }
+        SharedConnect::Rewrite(group) => {
+            let _lock = acquire_auth_lock(&format!("client-config:{client_id}"))?;
+            let outcome = group.rewrite(client_id, profile)?;
+            return finish_client_stdio_mutation(client_id, outcome, write_registry);
+        }
+        SharedConnect::Main => {}
+    }
     refuse_customized_client(client_gateway_state(managed, client_id), force)?;
     let _lock = acquire_auth_lock(&format!("client-config:{client_id}"))?;
     // Only an explicit reset (force) writes every Codex default again; an access
@@ -1952,6 +1965,9 @@ pub struct ClientSetupReview {
     /// Client settings the connect adds to Toolport's own entry, as TOML lines, each
     /// only when it is not set. Empty for clients that get none.
     pub gateway_settings: Vec<String>,
+    /// Set when this Connect joins another client's entry in a shared file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_notice: Option<String>,
 }
 
 pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String> {
@@ -1961,6 +1977,10 @@ pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String
         return Err("Could not read this client config. Fix it before connecting.".into());
     }
     let registry = read_registry_exact_or_default()?;
+    let shared_notice = match plan_shared_connect(client_id, &registry)? {
+        SharedConnect::Join(_, carrier) => Some(join_notice(client_id, &carrier, &registry)),
+        _ => None,
+    };
     let items = client
         .servers
         .iter()
@@ -2003,6 +2023,11 @@ pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String
                 ),
                 Err(error) => (Vec::new(), Some(error)),
             };
+            // Joining moves nothing: every server stays in the shared file.
+            let unsupported = match shared_notice {
+                Some(_) => Some(crate::i18n::tr("Stays in the file")),
+                None => unsupported,
+            };
             Ok(SetupItem {
                 updates,
                 credentials,
@@ -2035,6 +2060,7 @@ pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String
         revision,
         items,
         gateway_settings: clients::codex_gateway_settings_for_connect(client_id),
+        shared_notice,
         backup_dir: clients::backup_dir(client_id)
             .ok_or("Could not resolve backup directory")?
             .display()
@@ -2277,7 +2303,39 @@ fn migrate_client_reviewed_inputs_with(
         Option<&str>,
     ) -> Result<SetupVerification, String>,
 ) -> Result<MigrateOutcome, String> {
+    let _path = clients::shared::lock_client(client_id)?;
     let current = read_registry_exact_or_default()?;
+    let shared = match plan_shared_connect(client_id, &current)? {
+        SharedConnect::Join(group, carrier) => Some(join_shared(
+            client_id,
+            &group,
+            &carrier,
+            &update_registry_on_disk,
+        )?),
+        SharedConnect::Rewrite(group) => {
+            let _lock = acquire_auth_lock(&format!("client-config:{client_id}"))?;
+            let outcome = group.rewrite(client_id, profile)?;
+            Some(finish_client_stdio_mutation(
+                client_id,
+                outcome,
+                |managed| {
+                    registry::update(|r| {
+                        Ok(apply_client_stdio_update(r, client_id, profile, managed))
+                    })
+                },
+            )?)
+        }
+        SharedConnect::Main => None,
+    };
+    if let Some(result) = shared {
+        return Ok(MigrateOutcome {
+            result,
+            imported: 0,
+            moved: Vec::new(),
+            tools: Vec::new(),
+            servers: Vec::new(),
+        });
+    }
     refuse_customized_client(
         client_gateway_state(&current.client_managed_entries, client_id),
         force,
@@ -2530,16 +2588,24 @@ pub fn connect_client_stdio(
 ) -> Result<ClientMutationResult, String> {
     let current = read_registry_exact()?;
     let managed = current.client_managed_entries.clone();
-    connect_client_stdio_with(client_id, profile, force, &managed, |managed_entry| {
-        registry::update(|registry| {
-            Ok(apply_client_stdio_update(
-                registry,
-                client_id,
-                profile,
-                managed_entry,
-            ))
-        })
-    })
+    let update = update_registry_on_disk;
+    connect_client_stdio_with(
+        client_id,
+        profile,
+        force,
+        &managed,
+        &update,
+        |managed_entry| {
+            registry::update(|registry| {
+                Ok(apply_client_stdio_update(
+                    registry,
+                    client_id,
+                    profile,
+                    managed_entry,
+                ))
+            })
+        },
+    )
 }
 
 const CLIENT_HTTP_VAULT_SERVER: &str = "__toolport_http_clients__";
@@ -2580,6 +2646,10 @@ fn disconnect_client_with_revocation(
     client_id: &str,
     revoke: impl FnOnce() -> Result<(), String>,
 ) -> Result<ClientMutationResult, String> {
+    let _path = clients::shared::lock_client(client_id)?;
+    if let Some(done) = disconnect_shared(client_id, &update_registry_on_disk)? {
+        return finish_shared(done, revoke);
+    }
     let current = read_registry_exact_or_default()?;
     let http_id = format!("client:{client_id}");
     let has_shared_http_token = current
@@ -2613,6 +2683,12 @@ fn disconnect_client_with_revocation(
 }
 
 pub fn disconnect_client_stdio(client_id: &str) -> Result<ClientMutationResult, String> {
+    let _path = clients::shared::lock_client(client_id)?;
+    if let Some(done) = disconnect_shared(client_id, &update_registry_on_disk)? {
+        return finish_shared(done, || {
+            crate::secrets::delete_secret(CLIENT_HTTP_VAULT_SERVER, client_id)
+        });
+    }
     let current = read_registry_exact()?;
     let http_id = format!("client:{client_id}");
     let has_shared_http_token = current
@@ -2626,6 +2702,254 @@ pub fn disconnect_client_stdio(client_id: &str) -> Result<ClientMutationResult, 
             Ok(())
         })?;
         Ok(registry)
+    })
+}
+
+/// Applies one change to the registry the calling shell keeps (disk or app state).
+pub(crate) type RegistryUpdate<'a> = &'a dyn Fn(&dyn Fn(&mut Registry)) -> Result<Registry, String>;
+
+pub(crate) fn update_registry_on_disk(change: &dyn Fn(&mut Registry)) -> Result<Registry, String> {
+    registry::update(|registry| {
+        change(registry);
+        Ok(())
+    })
+    .map(|(registry, ())| registry)
+}
+
+fn lock_clients(ids: &[&str]) -> Result<Vec<AuthMutationLock>, String> {
+    let mut ids = ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.into_iter()
+        .map(|id| acquire_auth_lock(&format!("client-config:{id}")))
+        .collect()
+}
+
+pub(crate) enum SharedConnect {
+    Main,
+    /// Section 6.2: no file write, the client uses the carrier's entry.
+    Join(clients::shared::Group, String),
+    /// The carrier is not the owner: write against the owner's receipt.
+    Rewrite(clients::shared::Group),
+}
+
+pub(crate) fn plan_shared_connect(
+    client_id: &str,
+    current: &Registry,
+) -> Result<SharedConnect, String> {
+    let managed = &current.client_managed_entries;
+    clients::shared::refuse_new_share(client_id, managed)?;
+    let Some(group) = clients::shared::derive(client_id, managed)? else {
+        return Ok(SharedConnect::Main);
+    };
+    let other_owner = group.owner.clone().filter(|owner| owner != client_id);
+    match group.carrier.clone() {
+        Some(carrier) if carrier != client_id && group.connected.contains(&carrier) => {
+            if group.shared_http {
+                let carrier = clients::shared::name(&carrier);
+                return Err(crate::i18n::trf("{carrier} is connected to this file through Shared HTTP. Toolport can't share that entry yet. Disconnect {carrier} first or connect it with the standard entry.", &[("carrier", &carrier)]));
+            }
+            group.check_owner(client_id)?;
+            Ok(SharedConnect::Join(group, carrier))
+        }
+        Some(carrier) if carrier == client_id && other_owner.is_some() => {
+            group.check_owner(client_id)?;
+            Ok(SharedConnect::Rewrite(group))
+        }
+        _ => match other_owner {
+            Some(owner) if group.connected.is_empty() => {
+                let owner = clients::shared::name(&owner);
+                Err(crate::i18n::trf("{owner}'s Toolport entry in {file} was changed or removed. Disconnect or reconnect {owner} first.", &[("owner", &owner), ("file", &group.file())]))
+            }
+            _ => Ok(SharedConnect::Main),
+        },
+    }
+}
+
+/// The review text for a join (sections 6.2 and 11d).
+pub(crate) fn join_notice(client_id: &str, carrier: &str, current: &Registry) -> String {
+    let carrier_name = clients::shared::name(carrier);
+    let mut text = crate::i18n::trf(
+        "Uses the Toolport entry {carrier} added. Both apps use the same access settings.",
+        &[("carrier", &carrier_name)],
+    );
+    let scope = |id: &str| {
+        current
+            .client_scopes
+            .get(id)
+            .filter(|s| !s.is_empty())
+            .cloned()
+    };
+    let mode = |id: &str| current.client_discovery_mode(id).map(str::to_string);
+    let differs = |own: Option<String>, theirs: Option<String>| own.is_some() && own != theirs;
+    if differs(scope(client_id), scope(carrier)) || differs(mode(client_id), mode(carrier)) {
+        let access = scope(client_id).map_or_else(
+            || crate::i18n::tr("Default access"),
+            |id| {
+                current
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == id)
+                    .map_or(id, |profile| profile.name.clone())
+            },
+        );
+        let discovery = mode(client_id).unwrap_or_else(|| crate::i18n::tr("Auto"));
+        text.push(' ');
+        text.push_str(&crate::i18n::trf("{client}'s own settings (access: {scope}, discovery: {mode}) will be replaced by {carrier}'s, because they share one config file.", &[("client", &clients::shared::name(client_id)), ("scope", &access), ("mode", &discovery), ("carrier", &carrier_name)]));
+    }
+    text
+}
+
+fn join_shared(
+    client_id: &str,
+    group: &clients::shared::Group,
+    carrier: &str,
+    update: RegistryUpdate,
+) -> Result<ClientMutationResult, String> {
+    let _lock = lock_clients(&[client_id])?;
+    let current = read_registry_exact_or_default()?;
+    let carrier_record = current
+        .client_managed_entries
+        .get(carrier)
+        .ok_or("The shared Toolport entry changed. Review the client again.")?;
+    let record = clients::shared::join_record(group, carrier_record);
+    let registry = update(&|registry| {
+        registry.set_client_managed_entry(client_id, record.clone());
+        clients::shared::copy_access(registry, carrier, client_id);
+    })?;
+    let mut outcome = WriteOutcome::unchanged(&group.path);
+    outcome.managed = Some(record);
+    Ok(ClientMutationResult { registry, outcome })
+}
+
+/// What `disconnect_shared` did; `finish_shared` completes it.
+pub(crate) struct SharedDisconnect {
+    result: ClientMutationResult,
+    /// A Shared HTTP row was dropped, so its keychain copy goes too.
+    had_row: bool,
+    /// The receipt owner whose recovery is released after the registry write.
+    release: Option<String>,
+}
+
+/// Sections 6.3 to 6.5: Disconnect while another client shares this client's
+/// file. `None` means main's path applies.
+pub(crate) fn disconnect_shared(
+    client_id: &str,
+    update: RegistryUpdate,
+) -> Result<Option<SharedDisconnect>, String> {
+    let current = read_registry_exact_or_default()?;
+    let Some(group) = clients::shared::derive(client_id, &current.client_managed_entries)? else {
+        return Ok(None);
+    };
+    let others: Vec<String> = group
+        .connected
+        .iter()
+        .filter(|member| *member != client_id)
+        .cloned()
+        .collect();
+    let http_id = format!("client:{client_id}");
+    let had_row = current.http_clients.iter().any(|row| row.id == http_id);
+    let leave = |registry: &mut Registry| {
+        registry.set_client_scope(client_id, None);
+        registry.clear_client_managed_entry(client_id);
+        registry.http_clients.retain(|row| row.id != http_id);
+    };
+    let mut release = None;
+    let result = if others.is_empty() {
+        // Last out, not the owner: restore with the owner's receipt, and
+        // release it only after the registry write (F1 rolls the file back).
+        let Some(owner) = group.owner.clone().filter(|owner| owner != client_id) else {
+            return Ok(None);
+        };
+        let _locks = lock_clients(&[client_id, &owner])?;
+        let managed = current.client_managed_entries.get(&owner);
+        let outcome = group.restore_owner(
+            &owner,
+            managed.or_else(|| current.client_managed_entries.get(client_id)),
+        )?;
+        let result = finish_client_config_mutation(outcome, |_| update(&leave))?;
+        release = Some(owner);
+        result
+    } else {
+        group.check_owner(client_id)?;
+        let leave = |registry: &mut Registry| {
+            leave(registry);
+            registry.set_client_discovery(client_id, None);
+        };
+        if group.carrier.as_deref() == Some(client_id) {
+            handover(client_id, &group, &others, &current, update, &leave)?
+        } else {
+            let _locks = lock_clients(&[client_id])?;
+            ClientMutationResult {
+                registry: update(&leave)?,
+                outcome: WriteOutcome::unchanged(&group.path),
+            }
+        }
+    };
+    Ok(Some(SharedDisconnect {
+        result,
+        had_row,
+        release,
+    }))
+}
+
+/// Release the owner's recovery and the keychain copy of a dropped bearer.
+/// Both run even when one fails, and both results are reported.
+pub(crate) fn finish_shared(
+    done: SharedDisconnect,
+    revoke: impl FnOnce() -> Result<(), String>,
+) -> Result<ClientMutationResult, String> {
+    let mut result = done.result;
+    let finished = done.release.map_or(Ok(Vec::new()), |owner| {
+        clients::finish_uninstall_with_warnings(&owner, &result.outcome)
+    });
+    let revoked = if done.had_row { revoke() } else { Ok(()) }.map_err(|error| {
+        format!("config restored; could not remove the revoked keychain token: {error}")
+    });
+    match (finished, revoked) {
+        (Ok(more), Ok(())) => result.outcome.warnings.extend(more),
+        (Ok(more), Err(keychain)) => {
+            result.outcome.warnings.extend(more);
+            result.outcome.warnings.push(keychain);
+        }
+        (Err(error), Ok(())) => return Err(error),
+        (Err(error), Err(keychain)) => return Err(format!("{error}\n\n{keychain}")),
+    }
+    Ok(result)
+}
+
+/// Section 6.4: copy access to the successor, point the entry at it, then drop
+/// the carrier. A failed last write puts the entry back to the carrier.
+fn handover(
+    client_id: &str,
+    group: &clients::shared::Group,
+    others: &[String],
+    current: &Registry,
+    update: RegistryUpdate,
+    leave: &dyn Fn(&mut Registry),
+) -> Result<ClientMutationResult, String> {
+    let age = |id: &String| {
+        let updated = current
+            .client_managed_entries
+            .get(id)
+            .map_or(0, |r| r.updated_at);
+        (updated, id.clone())
+    };
+    let successor = others
+        .iter()
+        .min_by_key(|id| age(id))
+        .cloned()
+        .ok_or("No client is left on the shared entry")?;
+    let _locks = lock_clients(&[client_id, &successor])?;
+    update(&|registry| clients::shared::copy_access(registry, client_id, &successor))?;
+    let outcome = group.rewrite(&successor, group.profile.as_deref())?;
+    finish_client_config_mutation(outcome, |managed| {
+        update(&|registry| {
+            leave(registry);
+            if let Some(managed) = managed.clone() {
+                registry.set_client_managed_entry(&successor, managed);
+            }
+        })
     })
 }
 
@@ -3564,6 +3888,7 @@ mod tests {
                     error: None,
                     claude_profile: None,
                     t3_code: Vec::new(),
+                    shared: None,
                 },
             }
         }
@@ -6600,3 +6925,7 @@ DOCS_TOKEN = "tok"
         assert!(!fixture.move_record("claude-code").exists());
     }
 }
+
+#[cfg(test)]
+#[path = "shared_config_tests.rs"]
+mod shared_config_tests;

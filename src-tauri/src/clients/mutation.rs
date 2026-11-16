@@ -22,6 +22,25 @@ struct Pending {
 
 thread_local! {
     static PENDING: RefCell<Option<Pending>> = const { RefCell::new(None) };
+    static UNRECORDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run a write that updates no receipt: the owner's recovery was discarded, so
+/// the operation's own backup is its only rollback source.
+pub(super) fn without_receipt<T>(write: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            UNRECORDED.with(|flag| flag.set(false));
+        }
+    }
+    UNRECORDED.with(|flag| flag.set(true));
+    let _reset = Reset;
+    write()
+}
+
+fn recorded() -> bool {
+    !UNRECORDED.with(std::cell::Cell::get)
 }
 
 struct Clear;
@@ -325,6 +344,9 @@ fn run_inner<T>(
         let pending = PENDING.with(|slot| slot.borrow_mut().take().unwrap());
         drop(clear);
         if pending.output.is_none() && !pending.remove {
+            if !recorded() {
+                return Ok(result);
+            }
             super::restore::remember(
                 client_id,
                 path,
@@ -366,19 +388,23 @@ fn run_inner<T>(
                     &backup_storage::encode_recovery(&auxiliary, &text, pending.disconnecting)?,
                 )?;
             }
-            let recovery = super::restore::remember(
-                client_id,
-                path,
-                format,
-                original.as_deref(),
-                output.as_deref(),
-                pending.disconnecting,
-                jsonc_settings,
-            )?;
+            let recovery = recorded()
+                .then(|| {
+                    super::restore::remember(
+                        client_id,
+                        path,
+                        format,
+                        original.as_deref(),
+                        output.as_deref(),
+                        pending.disconnecting,
+                        jsonc_settings,
+                    )
+                })
+                .transpose()?;
             let commit = super::locations::validate_mutation(client_id, path).and_then(|()| {
                 crate::registry::client_file::commit(path, &revision, output.as_deref())
             });
-            if commit.is_err() {
+            if let Some(recovery) = recovery.filter(|_| commit.is_err()) {
                 recovery.rollback()?;
             }
             commit
