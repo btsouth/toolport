@@ -129,6 +129,8 @@ export interface ClientSetupReview {
   items: ImportItem[];
   /** TOML lines Toolport adds to its own entry for this client, each only when unset. */
   gatewaySettings?: string[];
+  /** Reading this review asked to unlock the keyring and the ask was dismissed. */
+  keyringAsked?: boolean;
 }
 
 export interface MigrateResult {

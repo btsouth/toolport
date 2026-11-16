@@ -797,9 +797,7 @@ async fn preview_client_setup(
 ) -> Result<crate::registry_controller::ClientSetupReview, String> {
     tauri::async_runtime::spawn_blocking(move || {
         // `quiet`: a Connect all step after the keyring stayed locked (see `connect_step`).
-        crate::registry_controller::connect_step(quiet.unwrap_or(false), || {
-            crate::registry_controller::preview_client_setup(&client_id)
-        })
+        crate::registry_controller::preview_step(&client_id, quiet.unwrap_or(false))
     })
     .await
     .map_err(|_| "Client review stopped".to_string())?
