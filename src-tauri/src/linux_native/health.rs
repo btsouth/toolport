@@ -37,6 +37,9 @@ pub(super) struct Tally {
 pub(super) struct ProbeTicket {
     pub(super) server_id: String,
     token: u64,
+    /// The user asked for this check (Refresh, or Retry on this server), so it
+    /// may ask to unlock the keyring. Checks the page starts never do.
+    pub(super) interactive: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -63,6 +66,11 @@ struct InFlight {
     /// The definition to probe once this probe finishes, when it went stale
     /// while running. Probing again only then keeps one process per server.
     rerun: Option<u64>,
+    /// This probe was the user's.
+    interactive: bool,
+    /// A user's Refresh or Retry is waiting for this probe to finish: the
+    /// rerun is theirs, not this probe's.
+    rerun_interactive: bool,
 }
 
 #[derive(Default)]
@@ -93,11 +101,25 @@ impl HealthCache {
 
     /// Decide which enabled servers need a probe. `enabled` pairs each enabled
     /// server id with its definition fingerprint.
+    #[cfg(test)]
     pub(super) fn plan(
         &mut self,
         enabled: &[(&str, u64)],
         reason: ProbeReason,
         now: Instant,
+    ) -> Vec<ProbeTicket> {
+        self.plan_asked(enabled, reason, now, None)
+    }
+
+    /// [`Self::plan`] for a check the user asked for: a Refresh asks for every
+    /// server, a Retry for `retried`. Their tickets, and a rerun queued behind a
+    /// probe already running, are interactive.
+    pub(super) fn plan_asked(
+        &mut self,
+        enabled: &[(&str, u64)],
+        reason: ProbeReason,
+        now: Instant,
+        retried: Option<&str>,
     ) -> Vec<ProbeTicket> {
         self.results
             .retain(|id, _| enabled.iter().any(|(enabled_id, _)| enabled_id == id));
@@ -110,6 +132,7 @@ impl HealthCache {
 
         let mut tickets = Vec::new();
         for &(id, fingerprint) in enabled {
+            let asked = reason == ProbeReason::Refresh || retried == Some(id);
             let needed = match self.results.get(id) {
                 None => true,
                 Some(cached) => {
@@ -123,16 +146,18 @@ impl HealthCache {
             if let Some(flight) = self.in_flight.get_mut(id) {
                 if flight.rerun.is_some() {
                     flight.rerun = Some(fingerprint);
-                } else if flight.fingerprint == fingerprint && reason != ProbeReason::Refresh {
+                    flight.rerun_interactive |= asked;
+                } else if flight.fingerprint == fingerprint && !asked {
                     flight.wanted = true;
-                } else if needed {
+                } else if needed || asked {
                     flight.wanted = false;
                     flight.rerun = Some(fingerprint);
+                    flight.rerun_interactive |= asked;
                 }
                 continue;
             }
             if needed {
-                tickets.push(self.start(id, fingerprint));
+                tickets.push(self.start(id, fingerprint, asked));
             }
         }
         tickets
@@ -155,7 +180,10 @@ impl HealthCache {
             .remove(&ticket.server_id)
             .expect("the in-flight entry was just found");
         if let Some(fingerprint) = flight.rerun {
-            return ProbeOutcome::Rerun(self.start(&ticket.server_id, fingerprint));
+            // A rerun that replaces the user's probe, or that the user queued,
+            // is still theirs.
+            let interactive = flight.interactive || flight.rerun_interactive;
+            return ProbeOutcome::Rerun(self.start(&ticket.server_id, fingerprint, interactive));
         }
         if !flight.wanted {
             return ProbeOutcome::Discard;
@@ -188,7 +216,7 @@ impl HealthCache {
         tally
     }
 
-    fn start(&mut self, server_id: &str, fingerprint: u64) -> ProbeTicket {
+    fn start(&mut self, server_id: &str, fingerprint: u64, interactive: bool) -> ProbeTicket {
         self.next_token = self.next_token.wrapping_add(1);
         self.in_flight.insert(
             server_id.to_string(),
@@ -197,11 +225,14 @@ impl HealthCache {
                 fingerprint,
                 wanted: true,
                 rerun: None,
+                interactive,
+                rerun_interactive: false,
             },
         );
         ProbeTicket {
             server_id: server_id.to_string(),
             token: self.next_token,
+            interactive,
         }
     }
 }
@@ -331,6 +362,55 @@ mod tests {
             ids(&cache.plan(&[("b", 1)], ProbeReason::ConfigChanged, now)),
             ["b"]
         );
+    }
+
+    /// Failure mode: a Refresh or Retry during a check the page started only
+    /// queued a rerun, and the rerun took the finished check's
+    /// `interactive = false`, so a locked keyring stayed "Keyring locked".
+    #[test]
+    fn a_refresh_or_retry_queued_behind_an_automatic_probe_stays_the_users() {
+        let mut cache = HealthCache::default();
+        let now = Instant::now();
+        let first = cache.plan(&[("a", 1), ("b", 1)], ProbeReason::ConfigChanged, now);
+        assert!(first.iter().all(|ticket| !ticket.interactive));
+
+        // Refresh while both run: nothing starts now, both reruns are the user's.
+        assert!(cache
+            .plan_asked(&[("a", 1), ("b", 1)], ProbeReason::Refresh, now, None)
+            .is_empty());
+        for ticket in &first {
+            let ProbeOutcome::Rerun(next) = cache.complete(ticket, ok(&ticket.server_id), now)
+            else {
+                panic!("a refresh during a probe must rerun it");
+            };
+            assert!(next.interactive, "{next:?}");
+            assert_eq!(
+                cache.complete(&next, ok(&next.server_id), now),
+                ProbeOutcome::Apply
+            );
+        }
+
+        // A row's Retry on one server while the page checks both again.
+        let again = cache.plan(&[("a", 2), ("b", 2)], ProbeReason::ConfigChanged, now);
+        cache.invalidate("a");
+        assert!(cache
+            .plan_asked(
+                &[("a", 2), ("b", 2)],
+                ProbeReason::ConfigChanged,
+                now,
+                Some("a")
+            )
+            .is_empty());
+        for ticket in &again {
+            match cache.complete(ticket, ok(&ticket.server_id), now) {
+                ProbeOutcome::Rerun(next) => {
+                    assert_eq!(next.server_id, "a");
+                    assert!(next.interactive, "the retried server's rerun is the user's");
+                }
+                ProbeOutcome::Apply => assert_eq!(ticket.server_id, "b"),
+                ProbeOutcome::Discard => panic!("nothing was removed"),
+            }
+        }
     }
 
     #[test]

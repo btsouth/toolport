@@ -2593,10 +2593,12 @@ impl ServerPage {
             .filter(|server| server.enabled)
             .map(|server| (server.id.as_str(), server.probe_fingerprint))
             .collect::<Vec<_>>();
-        let tickets = self
-            .health
-            .borrow_mut()
-            .plan(&enabled, reason, std::time::Instant::now());
+        let tickets = self.health.borrow_mut().plan_asked(
+            &enabled,
+            reason,
+            std::time::Instant::now(),
+            retried,
+        );
         for ticket in tickets {
             for row in self
                 .health_rows
@@ -2614,14 +2616,13 @@ impl ServerPage {
                 row.copy_error.set_visible(false);
                 row.retry.set_visible(false);
             }
-            let interactive = reason == health::ProbeReason::Refresh
-                || retried == Some(ticket.server_id.as_str());
-            self.spawn_probe(ticket, interactive);
+            self.spawn_probe(ticket);
         }
         self.update_posture();
     }
 
-    fn spawn_probe(&self, ticket: health::ProbeTicket, interactive: bool) {
+    fn spawn_probe(&self, ticket: health::ProbeTicket) {
+        let interactive = ticket.interactive;
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
             let server_id = ticket.server_id.clone();
@@ -2664,7 +2665,7 @@ impl ServerPage {
             );
             match outcome {
                 health::ProbeOutcome::Apply => page.apply_probe(&server_id, &probe),
-                health::ProbeOutcome::Rerun(next) => page.spawn_probe(next, interactive),
+                health::ProbeOutcome::Rerun(next) => page.spawn_probe(next),
                 health::ProbeOutcome::Discard => {}
             }
             page.update_posture();
