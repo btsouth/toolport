@@ -535,22 +535,13 @@ pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
         ));
     }
     page.append_recoveries(&body, Some(&client.id));
-    if let Some((id, notice)) = page.detail_notice.borrow().as_ref() {
+    if let Some((id, title, notice)) = page.detail_notice.borrow().as_ref() {
         if id == &client.id {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            let label = text(notice, false);
-            label.set_hexpand(true);
-            row.append(&label);
-            let dismiss = header_icon_button("window-close-symbolic");
-            l10n::bind_tooltip(&dismiss, "Dismiss restart reminder");
             let p = page.clone();
-            let row_for_dismiss = row.clone();
-            dismiss.connect_clicked(move |_| {
+            body.append(&super::restart_notice(title, notice, move || {
                 p.detail_notice.borrow_mut().take();
-                row_for_dismiss.set_visible(false);
-            });
-            row.append(&dismiss);
-            body.append(&row);
+                p.clear_list_notice();
+            }));
         }
     }
     if customized {

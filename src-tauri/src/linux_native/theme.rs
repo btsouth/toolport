@@ -1542,6 +1542,13 @@ button.toolport-skill-chip:hover {{ background-color: alpha(@toolport_fg, 0.13);
   color: @toolport_fg;
 }}
 .toolport-feedback .heading {{ color: @toolport_fg; }}
+/* React's info notice (the restart reminder): muted bar, bold title, muted text. */
+.toolport-feedback.info {{
+  border-color: @toolport_info;
+  background-color: alpha(@toolport_info, 0.08);
+  color: @toolport_info;
+}}
+.toolport-feedback.info .heading {{ font-weight: 600; }}
 .toolport-recovery-values {{ border-radius: 6px; }}
 .toolport-recovery-values:focus-within {{ outline: 2px solid alpha(@toolport_accent, 0.50); outline-offset: 2px; }}
 .toolport-recovery-values textview,
