@@ -552,3 +552,245 @@ fn the_group_comes_from_facts_after_the_owner_moves_off_the_file() {
         assert_restored(&fx.path);
     });
 }
+
+const NEW_GATEWAY: &str = "/opt/new/toolport-gateway";
+
+/// The launch repair pass, with its records saved as the caller saves them.
+fn repoint(gateway: &str, unread: bool) -> clients::RepointOutcome {
+    let managed = read_registry_exact().unwrap().client_managed_entries;
+    let outcome = clients::repoint_for_test(gateway, &managed, unread);
+    update_registry_on_disk(&|r| {
+        for (id, entry) in &outcome.repointed {
+            r.set_client_managed_entry(id, entry.clone());
+        }
+    })
+    .unwrap();
+    outcome
+}
+
+fn command(path: &Path) -> Option<String> {
+    let root: serde_json::Value = serde_json::from_str(&read(path)).unwrap();
+    root["mcpServers"]["toolport"]["command"]
+        .as_str()
+        .map(str::to_string)
+}
+
+fn state(id: &str) -> GatewayEntryState {
+    let mut detected = clients::detect_clients();
+    clients::apply_entry_states(
+        &mut detected,
+        &read_registry_exact().unwrap().client_managed_entries,
+    );
+    let client = detected.into_iter().find(|client| client.id == id).unwrap();
+    client.entry_state
+}
+
+#[test]
+fn a_re_point_writes_the_shared_entry_once_against_the_owner() {
+    let (a, b) = ("windsurf", "devin-cli");
+    for handed_over in [false, true] {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let fx = fixture();
+            joined(a, b);
+            if handed_over {
+                disconnect_client(a).unwrap();
+            }
+            let carrying = if handed_over { b } else { a };
+            let outcome = repoint(NEW_GATEWAY, false);
+            assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+            assert!(outcome.customized.is_empty());
+            let ids: Vec<_> = outcome
+                .repointed
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect();
+            assert_eq!(ids, [carrying]);
+            assert_eq!(command(&fx.path).as_deref(), Some(NEW_GATEWAY));
+            assert_eq!(carrier(&fx.path).as_deref(), Some(carrying));
+            assert!(receipt(a, &fx.path, "original").exists());
+            assert!(backups(b).is_empty(), "{:?}", backups(b));
+            assert_eq!(state(carrying), GatewayEntryState::Managed);
+            if !handed_over {
+                assert_eq!(state(b), GatewayEntryState::Managed);
+                assert_eq!(shared(b).map(|s| s.joined), Some(true));
+            }
+            assert!(repoint(NEW_GATEWAY, false).repointed.is_empty());
+            if !handed_over {
+                disconnect_client(b).unwrap();
+            }
+            disconnect_client(if handed_over { b } else { a }).unwrap();
+            assert_restored(&fx.path);
+        });
+    }
+}
+
+#[test]
+fn a_relocated_client_joins_the_entry_another_client_carries() {
+    crate::secrets::tests::with_isolated_vault(|| {
+        let fx = fixture();
+        connect("devin-cli").unwrap();
+        let s1 = read(&fx.path);
+        // Windsurf's entry from an older Toolport, in the file Devin Desktop left.
+        let legacy = clients::home()
+            .unwrap()
+            .join(".codeium/windsurf/mcp_config.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let root: serde_json::Value = serde_json::from_str(&s1).unwrap();
+        let mut entry = root["mcpServers"]["toolport"].clone();
+        entry["env"][crate::brand::CLIENT_ID] = "windsurf".into();
+        let text = serde_json::json!({"mcpServers": {"toolport": entry}}).to_string();
+        std::fs::write(&legacy, text).unwrap();
+        update_registry_on_disk(&|r| {
+            let mut record = r.client_managed_entries["devin-cli"].clone();
+            if let Some(id) = record.env.get_mut(crate::brand::CLIENT_ID) {
+                *id = "windsurf".into();
+            }
+            record.config_path = Some(legacy.to_string_lossy().into_owned());
+            r.set_client_managed_entry("windsurf", record);
+        })
+        .unwrap();
+        let outcome = repoint(&command(&fx.path).unwrap(), true);
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        assert_eq!(read(&fx.path), s1);
+        assert!(!legacy.exists() || !read(&legacy).contains("toolport"));
+        assert!(!receipt("windsurf", &fx.path, "original").exists());
+        assert_eq!(
+            read_registry_exact().unwrap().client_managed_entries["windsurf"]
+                .config_path
+                .as_deref(),
+            Some(fx.path.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            shared("windsurf"),
+            Some(clients::SharedEntry {
+                joined: true,
+                with: clients::shared::name("devin-cli")
+            })
+        );
+        disconnect_client("windsurf").unwrap();
+        assert_eq!(read(&fx.path), s1);
+        disconnect_client("devin-cli").unwrap();
+        assert_restored(&fx.path);
+    });
+}
+
+#[test]
+fn disconnect_all_restores_a_shared_file_once() {
+    // A readable registry: the joined member leaves before the carrier.
+    for (a, b) in [("windsurf", "devin-cli"), ("devin-cli", "windsurf")] {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let fx = fixture();
+            joined(a, b);
+            let results = clients::disconnect_all_for_purge(false).unwrap();
+            assert!(results.iter().all(|r| r.error.is_none()), "{results:?}");
+            let ids: Vec<_> = results.iter().map(|r| r.client_id.as_str()).collect();
+            assert_eq!(ids, [b, a]);
+            assert_restored(&fx.path);
+        });
+    }
+    // An unreadable registry in S3: only the owner restores, and the file ends as
+    // a single client's purge leaves it; the carrier is told so.
+    let kinds = |id: &str| -> Vec<String> {
+        let names = backups(id);
+        // Timestamped backups aside: the handover wrote one more.
+        let kinds = names.iter().map(|name| name.split('-').next().unwrap());
+        kinds
+            .filter(|kind| !kind.starts_with(|c: char| c.is_ascii_digit()))
+            .map(str::to_string)
+            .collect()
+    };
+    let (mut alone, mut alone_files) = (String::new(), Vec::new());
+    crate::secrets::tests::with_isolated_vault(|| {
+        let fx = fixture();
+        connect("windsurf").unwrap();
+        std::fs::write(registry::registry_path().unwrap(), "{ not json").unwrap();
+        clients::disconnect_all_for_purge(true).unwrap();
+        alone = read(&fx.path);
+        alone_files = kinds("windsurf");
+    });
+    crate::secrets::tests::with_isolated_vault(|| {
+        let fx = fixture();
+        let (a, b) = ("windsurf", "devin-cli");
+        joined(a, b);
+        disconnect_client(a).unwrap();
+        std::fs::write(registry::registry_path().unwrap(), "{ not json").unwrap();
+        let results = clients::disconnect_all_for_purge(true).unwrap();
+        assert!(results.iter().all(|r| r.error.is_none()), "{results:?}");
+        assert_eq!(results.iter().filter(|r| r.client_id == a).count(), 1);
+        let carried = results.iter().find(|r| r.client_id == b).unwrap();
+        assert_eq!(
+            carried.warnings,
+            [format!("Restored with {}.", clients::shared::name(a))]
+        );
+        assert_eq!(read(&fx.path), alone);
+        assert_eq!(carrier(&fx.path), None);
+        assert_eq!(kinds(a), alone_files);
+        assert!(backups(b).is_empty(), "{:?}", backups(b));
+    });
+}
+
+#[test]
+fn recovery_retry_and_discard_wait_for_the_path_lock() {
+    for discarding in [false, true] {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let fx = fixture();
+            connect("windsurf").unwrap();
+            // A locked vault leaves the restore pending: a recovery row.
+            std::env::set_var("TOOLPORT_SECRET_KEY", "locked-shared-fixture");
+            let _ = disconnect_client("windsurf");
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            let pending = || {
+                clients::recovery::list()
+                    .unwrap()
+                    .into_iter()
+                    .find(|row| row.path == fx.path.to_string_lossy())
+            };
+            let id = pending().expect("a pending recovery").id;
+            let before = read(&fx.path);
+            let held = clients::shared::lock(&fx.path).unwrap();
+            let xdg = fx.path.parent().unwrap().parent().unwrap().to_path_buf();
+            let worker = std::thread::spawn(move || {
+                let _xdg = clients::EnvRestore::set("XDG_CONFIG_HOME", &xdg);
+                if discarding {
+                    clients::recovery::discard(&id)
+                } else {
+                    clients::recovery::retry(&id).map(|_| ())
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            assert_eq!(read(&fx.path), before, "it waits for the path lock");
+            assert!(pending().is_some());
+            drop(held);
+            worker.join().unwrap().unwrap();
+            assert!(pending().is_none());
+            if !discarding {
+                assert_eq!(read(&fx.path), ORIGINAL);
+            }
+        });
+    }
+}
+
+#[test]
+fn three_members_hand_over_in_turn_and_the_last_restores() {
+    crate::secrets::tests::with_isolated_vault(|| {
+        let fx = fixture();
+        clients::shared::THREE.with(|three| three.set(true));
+        let _cline = clients::EnvRestore::set("CLINE_MCP_SETTINGS_PATH", &fx.path);
+        let s2 = joined("windsurf", "devin-cli");
+        connect_client_stdio("cline", None, false).unwrap();
+        assert_eq!(read(&fx.path), s2);
+        assert_eq!(records(), ["cline", "devin-cli", "windsurf"]);
+        assert_eq!(shared("cline").map(|s| s.joined), Some(true));
+        disconnect_client("windsurf").unwrap();
+        let next = carrier(&fx.path).unwrap();
+        assert!(["devin-cli", "cline"].contains(&next.as_str()), "{next}");
+        disconnect_client(&next).unwrap();
+        let last = carrier(&fx.path).unwrap();
+        assert!(last != next && ["devin-cli", "cline"].contains(&last.as_str()));
+        assert_eq!(records(), [last.as_str()]);
+        disconnect_client(&last).unwrap();
+        assert_restored(&fx.path);
+        assert!(backups("devin-cli").is_empty() && backups("cline").is_empty());
+        clients::shared::THREE.with(|three| three.set(false));
+    });
+}

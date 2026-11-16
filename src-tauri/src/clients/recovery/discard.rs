@@ -238,6 +238,7 @@ pub fn discard_confirmed(id: &str, manifest: &str) -> Result<String, String> {
     if !receipt.notice.can_discard && !receipt.notice.can_discard_file {
         return Err(untrusted());
     }
+    let _path = crate::clients::shared::lock(Path::new(&receipt.notice.path))?;
     let _auth = crate::registry_controller::acquire_auth_lock(&format!(
         "client-config:{}",
         receipt.notice.client_id

@@ -323,7 +323,15 @@ pub(super) fn relocate_all(
                     eprintln!("{msg}");
                     crate::gatewaylog::append(&msg);
                 }
-                if let Some(entry) = moved.managed {
+                let joined = if moved.managed.is_none() && !moved.cleaned.is_empty() {
+                    shared::join_relocated(id, managed).unwrap_or_else(|error| {
+                        outcome.failed.push((id.to_string(), error));
+                        None
+                    })
+                } else {
+                    None
+                };
+                if let Some(entry) = moved.managed.or(joined) {
                     outcome.repointed.push((id.to_string(), entry));
                 }
             }

@@ -2,8 +2,23 @@
 //! Membership is derived from receipts, registry records and the entry itself.
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    /// Adds Cline to the Devin pair, for the three-member tests.
+    pub(crate) static THREE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Clients whose definitions may share one Toolport entry in one file.
 pub(crate) fn shares_entry_with(id: &str) -> &'static [&'static str] {
+    #[cfg(test)]
+    if THREE.with(std::cell::Cell::get) {
+        return match id {
+            "windsurf" => &["devin-cli", "cline"],
+            "devin-cli" => &["windsurf", "cline"],
+            "cline" => &["windsurf", "devin-cli"],
+            _ => &[],
+        };
+    }
     match id {
         "windsurf" => &["devin-cli"],
         "devin-cli" => &["windsurf"],
@@ -141,13 +156,21 @@ pub(crate) fn derive(
     id: &str,
     managed: &HashMap<String, ManagedEntry>,
 ) -> Result<Option<Group>, String> {
+    derive_at(id, managed, None)
+}
+
+fn derive_at(
+    id: &str,
+    managed: &HashMap<String, ManagedEntry>,
+    at: Option<&Path>,
+) -> Result<Option<Group>, String> {
     let partners = shares_entry_with(id);
     let def = match find_def(id).filter(|def| def.location.is_none()) {
         Some(def) if !partners.is_empty() => def,
         _ => return Ok(None),
     };
     let allowed = |other: &str| other == id || partners.contains(&other);
-    let Some(path) = own_path(id, managed) else {
+    let Some(path) = at.map(Path::to_path_buf).or_else(|| own_path(id, managed)) else {
         return Ok(None);
     };
     let live = holders(&path, true);
@@ -414,6 +437,20 @@ pub(super) fn classify(clients: &mut [DetectedClient], managed: &HashMap<String,
     }
 }
 
+/// Clients `--disconnect-all` should skip with an unreadable registry, each
+/// with the receipt owner that restores their shared file.
+pub(super) fn restored_with(ids: &[String]) -> HashMap<String, String> {
+    let mut skipped = HashMap::new();
+    for id in ids {
+        if let Ok(Some(group)) = derive(id, &HashMap::new()) {
+            if let Some(owner) = group.owner.filter(|owner| owner != id) {
+                skipped.insert(id.clone(), owner);
+            }
+        }
+    }
+    skipped
+}
+
 /// Whether any other client has a record or receipt for `path` (section 11a).
 pub(super) fn others_use(id: &str, path: &Path) -> Result<bool, String> {
     let current = crate::registry_controller::registry_for_disconnect()?;
@@ -451,4 +488,34 @@ pub(crate) fn join_record(group: &Group, carrier: &ManagedEntry) -> ManagedEntry
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
     record
+}
+
+/// Section 6.10: a client whose entry moved out of a legacy file into a file
+/// whose entry another client carries joins that entry instead of writing.
+pub(super) fn join_relocated(
+    id: &str,
+    managed: &HashMap<String, ManagedEntry>,
+) -> Result<Option<ManagedEntry>, String> {
+    let Some(path) = find_def(id).and_then(|def| resolved_definition_path(&def).ok()) else {
+        return Ok(None);
+    };
+    let _lock = lock(&path)?;
+    let Some(group) = derive_at(id, managed, Some(&path))? else {
+        return Ok(None);
+    };
+    let Some(carrier) = group
+        .carrier
+        .as_deref()
+        .filter(|carrier| *carrier != id && group.connected.iter().any(|m| m == carrier))
+        .filter(|_| !group.shared_http)
+    else {
+        return Ok(None);
+    };
+    let record = join_record(&group, &managed[carrier]);
+    crate::registry::update(|registry| {
+        registry.set_client_managed_entry(id, record.clone());
+        copy_access(registry, carrier, id);
+        Ok(())
+    })?;
+    Ok(Some(record))
 }

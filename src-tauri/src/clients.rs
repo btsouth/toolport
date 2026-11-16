@@ -9332,8 +9332,9 @@ fn backfill_gateway_identity(
     path: &Path,
     entry_name: &str,
     id: &str,
+    writer: &str,
 ) -> Result<(), String> {
-    backup_file(id, path)?;
+    backup_file(writer, path)?;
     moved::backfill_identity(def.format, path, entry_name, id)
 }
 
@@ -10070,6 +10071,27 @@ fn cleanup_legacy_gateway_copies(current: &Path, dir: &Path, references: Option<
     }
 }
 
+/// The launch repair pass without its binary checks: relocation (with the old
+/// file read or not), then the re-point.
+#[cfg(test)]
+pub(crate) fn repoint_for_test(
+    current: &str,
+    managed: &HashMap<String, ManagedEntry>,
+    unread: bool,
+) -> RepointOutcome {
+    relocate::STATUS_OVERRIDE.with(|status| {
+        status.set(unread.then_some(relocate::OldFile::Unread("test")));
+    });
+    let relocated = relocate::relocate_all(current, managed);
+    relocate::STATUS_OVERRIDE.with(|status| status.set(None));
+    let mut managed = managed.clone();
+    managed.extend(relocated.repointed.iter().cloned());
+    let mut outcome = repoint_stale_gateways_in(current, detect_clients(), &managed);
+    outcome.repointed.splice(0..0, relocated.repointed);
+    outcome.failed.extend(relocated.failed);
+    outcome
+}
+
 fn repoint_stale_gateways_in(
     current: &str,
     clients: Vec<DetectedClient>,
@@ -10101,6 +10123,32 @@ fn repoint_stale_gateways_in(
         if !client.config_exists || client.error.is_some() {
             continue;
         }
+        // A shared entry is written once, by its carrier against the owner's
+        // receipt (section 6.8). A joined member never writes.
+        let path_lock = if shared::shares_entry_with(&client.id).is_empty() {
+            Ok(None)
+        } else {
+            shared::lock_client(&client.id)
+        };
+        let _path_lock = match path_lock {
+            Ok(lock) => lock,
+            Err(error) => {
+                outcome.failed.push((client.id.clone(), error));
+                continue;
+            }
+        };
+        let group = shared::derive(&client.id, managed).ok().flatten();
+        let carrier = group.as_ref().and_then(|group| group.carrier.clone());
+        if carrier
+            .as_ref()
+            .is_some_and(|carrier| *carrier != client.id)
+        {
+            continue;
+        }
+        let writer = group
+            .and_then(|group| group.owner)
+            .filter(|_| carrier.is_some())
+            .unwrap_or_else(|| client.id.clone());
         // Find our entry by identity (recognizes the legacy `conduit` name too), so
         // a pre-rename entry is migrated rather than missed.
         let entry = gateway_entry_for_client(&client.id, &client.servers);
@@ -10196,7 +10244,7 @@ fn repoint_stale_gateways_in(
             .ok_or("Unknown client".to_string())
             .and_then(|def| {
                 let path = resolved_definition_path(&def)?;
-                mutation::run(&client.id, &path, def.format, || {
+                mutation::run(&writer, &path, def.format, || {
                     let fresh = read_client(&def);
                     if entry_state_for(
                         gateway_entry_for_client(&client.id, &fresh.servers),
@@ -10227,7 +10275,7 @@ fn repoint_stale_gateways_in(
                             handled,
                         )
                     {
-                        backfill_gateway_identity(&def, &path, entry_name, &client.id)?;
+                        backfill_gateway_identity(&def, &path, entry_name, &client.id, &writer)?;
                         let mut updated =
                             repair_gateway_entry(def.format, &path, entry_name, &client.id)?;
                         updated.command = Some(current.to_string());
@@ -10283,7 +10331,17 @@ fn repoint_stale_gateways_in(
                             handled,
                             &mut entry,
                         );
-                        install_or_remove(&client.id, Some(&entry))
+                        if writer == client.id {
+                            install_or_remove(&client.id, Some(&entry))
+                        } else {
+                            shared::write_entry(
+                                Some(&writer),
+                                &client.id,
+                                &path,
+                                def.format,
+                                &entry,
+                            )
+                        }
                     }
                 })
             });
@@ -14146,7 +14204,7 @@ command = "npx"
                     (profile, tools)
                 };
                 let before = read_env();
-                backfill_gateway_identity(&def, &path, GATEWAY_ENTRY_NAME, def.id).unwrap();
+                backfill_gateway_identity(&def, &path, GATEWAY_ENTRY_NAME, def.id, def.id).unwrap();
                 let after = read_env();
                 assert_eq!(
                     effective_launch(&before),

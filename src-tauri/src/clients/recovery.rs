@@ -700,6 +700,7 @@ pub fn retry(id: &str) -> Result<Option<ClientRecovery>, String> {
             hook();
         }
     });
+    let _path = super::shared::lock(Path::new(&receipt.notice.path))?;
     let _lock = crate::registry_controller::acquire_auth_lock(&format!(
         "client-config:{}",
         receipt.notice.client_id

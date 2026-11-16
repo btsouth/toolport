@@ -1828,7 +1828,7 @@ mod tests {
         std::fs::write(&path, raw.to_string()).unwrap();
         let id = add_client_location("claude-code", folder.path().to_str().unwrap()).unwrap();
         mutation::run(&id, &path, Format::JsonMcpServers, || {
-            backfill_gateway_identity(&find_def(&id).unwrap(), &path, "toolport", &id)
+            backfill_gateway_identity(&find_def(&id).unwrap(), &path, "toolport", &id, &id)
         })
         .unwrap();
         let mut after: serde_json::Value =

@@ -78,7 +78,28 @@ fn all_with_clients(
             Some((client.id, client.config_path))
         }
     });
+    // Section 6.12: joined members leave before the client carrying a shared
+    // entry, and without a registry only the receipt owner restores the file.
+    let mut targets: Vec<_> = targets.collect();
+    targets.sort_by_key(|(id, _)| {
+        shared::derive(id, &current.client_managed_entries)
+            .ok()
+            .flatten()
+            .is_some_and(|group| group.carrier.as_deref() == Some(id.as_str()))
+    });
+    let restored_with = if recovery_only {
+        shared::restored_with(&targets.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>())
+    } else {
+        HashMap::new()
+    };
     let mut results = run(targets, dry_run, |id, path| {
+        if let Some(owner) = restored_with.get(id) {
+            let owner = shared::name(owner);
+            return Ok(vec![crate::i18n::trf(
+                "Restored with {owner}.",
+                &[("owner", &owner)],
+            )]);
+        }
         if recovery_only {
             // Global removal can use the independent client snapshots without
             // loading, migrating or overwriting a corrupt registry.
