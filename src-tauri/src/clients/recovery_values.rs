@@ -307,29 +307,47 @@ const ENTRY_FIELDS: &[&str] = &[
     "headers",
 ];
 
-fn marker_owners(format: Format, text: &str, marker: &str) -> Result<Vec<String>, String> {
+/// Where `marker` sits in `text`: for each occurrence, the server entries on
+/// the way to it (object keys of server entries and entry `name` fields) and
+/// the field that holds it (an env or header key, or a `name`/`key` beside a
+/// `value`).
+fn marker_owners(
+    format: Format,
+    text: &str,
+    marker: &str,
+) -> Result<Vec<(String, Option<String>)>, String> {
     fn walk(
         value: &serde_json::Value,
         marker: &str,
+        field: Option<&str>,
         path: &mut Vec<String>,
-        out: &mut Vec<String>,
+        out: &mut Vec<(String, Option<String>)>,
     ) {
         match value {
             serde_json::Value::String(text) if contains_marker(text, marker) => {
                 for name in path.iter() {
-                    if !out.contains(name) {
-                        out.push(name.clone());
+                    let owner = (name.clone(), field.map(str::to_string));
+                    if !out.contains(&owner) {
+                        out.push(owner);
                     }
                 }
             }
             serde_json::Value::Array(items) => {
                 for item in items {
-                    walk(item, marker, path, out);
+                    walk(item, marker, field, path, out);
                 }
             }
             serde_json::Value::Object(map) => {
                 let named = map.get("name").and_then(serde_json::Value::as_str);
-                if let Some(name) = named {
+                // `{"name": KEY, "value": ...}` names the field, not a server.
+                let pair = map.contains_key("value");
+                let pair_key = map
+                    .get("key")
+                    .or_else(|| map.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|_| pair);
+                let server = named.filter(|_| !pair);
+                if let Some(name) = server {
                     path.push(name.to_string());
                 }
                 for (key, item) in map {
@@ -341,12 +359,17 @@ fn marker_owners(format: Format, text: &str, marker: &str) -> Result<Vec<String>
                     if entry {
                         path.push(key.clone());
                     }
-                    walk(item, marker, path, out);
+                    let field = if key == "value" {
+                        pair_key
+                    } else {
+                        Some(key.as_str())
+                    };
+                    walk(item, marker, field, path, out);
                     if entry {
                         path.pop();
                     }
                 }
-                if named.is_some() {
+                if server.is_some() {
                     path.pop();
                 }
             }
@@ -357,6 +380,7 @@ fn marker_owners(format: Format, text: &str, marker: &str) -> Result<Vec<String>
     walk(
         &mutation::value(format, Some(text))?,
         marker,
+        None,
         &mut Vec::new(),
         &mut out,
     );
@@ -365,10 +389,11 @@ fn marker_owners(format: Format, text: &str, marker: &str) -> Result<Vec<String>
 
 /// Which of `refs` (reference and marker pairs from one receipt) belong to
 /// this config. One saved value can equal the stored secret of several
-/// Toolport servers with the same key, and the receipt then lists all of them
-/// for one marker. Only the servers whose entry holds that marker own it; when
-/// none does (or the marker is gone), the first listed keeps it. Returns the
-/// indexes to keep, in order.
+/// Toolport servers or keys, and the receipt then lists all of them for one
+/// marker. A reference whose server entry holds the marker under its own key
+/// owns it; failing that, one whose server entry holds it under another field
+/// (a header, say); when none does (or the marker is gone), the first listed
+/// keeps it. Returns the indexes to keep, in order.
 pub(super) fn owned(
     format: Format,
     text: Option<&str>,
@@ -387,11 +412,20 @@ pub(super) fn owned(
         let owners = text
             .and_then(|text| marker_owners(format, text, marker).ok())
             .unwrap_or_default();
-        let matching: Vec<usize> = group
-            .iter()
-            .copied()
-            .filter(|&i| owners.contains(&refs[i].0.server))
-            .collect();
+        let by = |exact: bool| -> Vec<usize> {
+            group
+                .iter()
+                .copied()
+                .filter(|&i| {
+                    let r = refs[i].0;
+                    owners.iter().any(|(server, field)| {
+                        server == &r.server && (!exact || field.as_deref() == Some(r.key.as_str()))
+                    })
+                })
+                .collect()
+        };
+        let exact = by(true);
+        let matching = if exact.is_empty() { by(false) } else { exact };
         if matching.is_empty() {
             keep.push(index);
         } else {
@@ -558,6 +592,20 @@ mod tests {
         assert_eq!(
             owned(Format::JsonMcpServers, Some(weather), &structural),
             vec![1]
+        );
+        // Same server, another key with the same value: only the key that holds it.
+        let token = backup_storage::Reference {
+            server: "weather".into(),
+            key: "TOKEN".into(),
+        };
+        let keyed = [(&a, m), (&token, m)];
+        let api = r#"{"mcpServers":{"weather":{"command":"w","env":{"API_KEY":"TOOLPORT_MISSING_CREDENTIAL_0"}}}}"#;
+        assert_eq!(owned(Format::JsonMcpServers, Some(api), &keyed), vec![0]);
+        // A header that is no reference's key falls back to the server.
+        let header = r#"{"mcpServers":{"weather":{"url":"u","headers":{"Authorization":"Bearer TOOLPORT_MISSING_CREDENTIAL_0"}}}}"#;
+        assert_eq!(
+            owned(Format::JsonMcpServers, Some(header), &keyed),
+            vec![0, 1]
         );
         // No entry holds it (or the config is gone): the first listed keeps it.
         assert_eq!(owned(Format::JsonMcpServers, None, &refs), vec![0, 2]);

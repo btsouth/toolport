@@ -1383,6 +1383,27 @@ mod tests {
         });
     }
 
+    /// The locked Retry result is translated by the backend in the user's
+    /// language, so both shells show it as is. Headless builds carry no
+    /// catalogs and stay English.
+    #[cfg(any(feature = "desktop", feature = "gtk-desktop"))]
+    #[test]
+    fn the_locked_retry_message_follows_the_language() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            crate::i18n::set_language("zh-CN").unwrap();
+            let chinese = still_locked_message();
+            crate::i18n::set_language("en").unwrap();
+            assert_eq!(
+                chinese,
+                "密钥环已锁定。没有恢复任何内容。请解锁密钥环，然后选择“重试”。"
+            );
+            assert_eq!(
+                still_locked_message(),
+                "Keyring locked. Nothing was restored. Unlock your keyring, then choose Retry."
+            );
+        });
+    }
+
     /// F6: Retry is the one place an unlock prompt is wanted. It asks, and when
     /// the keyring stays locked it says so in plain words instead of a tally.
     #[test]

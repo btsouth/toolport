@@ -40,7 +40,10 @@ pub(crate) fn locked_error() -> String {
 pub(crate) fn is_locked_error(error: &str) -> bool {
     // The store's own refusal of a background write while it would ask.
     const STORE_WAITS: &str = "the keyring is locked; this background write waits for it";
-    error.contains(&locked_error()) || error.contains(STORE_WAITS)
+    // Release and cleanup failures carry the Locked repair step instead.
+    error.contains(&locked_error())
+        || error.contains(STORE_WAITS)
+        || super::recovery::state_for_instructions(error) == Some(BackupSecretError::Locked)
 }
 
 pub(crate) fn status(server: &str, key: &str) -> Result<Option<String>, BackupSecretError> {
@@ -412,6 +415,18 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A release or cleanup refused by the locked keyring reports the Locked
+    /// repair step, which counts as locked too (Retry then asks to unlock).
+    #[test]
+    fn the_locked_repair_step_counts_as_a_locked_error() {
+        for discard_all in [false, true] {
+            let step = super::super::recovery::next_step(BackupSecretError::Locked, discard_all);
+            assert!(is_locked_error(&step), "{step}");
+        }
+        let other = super::super::recovery::next_step(BackupSecretError::Corrupt, false);
+        assert!(!is_locked_error(&other), "{other}");
+    }
 
     /// K2: the start-up waiter checks without asking, refreshes once the
     /// store opens, and stops when nothing is waiting any more.
