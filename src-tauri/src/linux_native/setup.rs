@@ -1247,6 +1247,18 @@ pub(super) fn review_with_notice(
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || action(chosen, choices, inputs)).await;
             busy.set(false);
+            // Closed while it ran: refresh after a success, but build no result
+            // page for a window that is gone (D136).
+            if !button
+                .root()
+                .and_downcast::<gtk::Window>()
+                .is_some_and(|window| window.is_visible())
+            {
+                if matches!(result, Ok(Ok(_))) {
+                    finished();
+                }
+                return;
+            }
             for (name, key, choice) in credential_choices.iter() {
                 choice.set_sensitive(
                     !key.starts_with("__")
@@ -1457,6 +1469,9 @@ pub(super) fn review_with_notice(
                     // Return activates Next or Done without first tabbing through the
                     // results; the button was disabled while the step ran, which dropped
                     // focus and its ring.
+                    if let Some(window) = button.root().and_downcast::<gtk::Window>() {
+                        window.set_default_widget(Some(&button));
+                    }
                     focus_with_ring(&shown, &button, keyboard.get());
                     finished();
                 }
@@ -3017,6 +3032,9 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(connect.label().as_deref(), Some("Done"));
+        let done = Some(connect.clone().upcast::<gtk::Widget>());
+        assert_eq!(window.default_widget(), done);
+        assert_eq!(gtk::prelude::GtkWindowExt::focus(&window), done);
         let widgets = descendants(window.upcast_ref());
         assert!(widgets
             .iter()
@@ -3032,6 +3050,53 @@ mod tests {
             .iter()
             .filter_map(|w| w.downcast_ref::<gtk::Button>())
             .any(|b| b.label().as_deref() == Some("Connect")));
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn a_review_closed_while_connecting_only_refreshes() {
+        adw::init().unwrap();
+        let parent = gtk::Window::new();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let wait = std::sync::Mutex::new(wait);
+        let refreshed = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = refreshed.clone();
+        review(
+            &parent,
+            "Closed fixture",
+            Vec::new(),
+            "Fixture",
+            "Connect",
+            true,
+            move |_, _, _| {
+                let _ = wait.lock().unwrap().recv();
+                Ok("Claude Code connected. Restart it to load Toolport.".into())
+            },
+            move || count.set(count.get() + 1),
+            None,
+        );
+        let window = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .find(|w| w.title().as_deref() == Some("Closed fixture"))
+            .unwrap();
+        let connect = descendants(window.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .find(|b| b.label().as_deref() == Some("Connect"))
+            .unwrap();
+        connect.emit_clicked();
+        window.set_visible(false);
+        release.send(()).unwrap();
+        let context = gtk::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while refreshed.get() == 0 && std::time::Instant::now() < deadline {
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+        assert_eq!(refreshed.get(), 1, "a success still refreshes the page");
+        assert_eq!(connect.label().as_deref(), Some("Connect"));
         window.close();
     }
 

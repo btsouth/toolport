@@ -383,7 +383,9 @@ jobs:
             setup_import_share_tests::client_import_review_clears_the_scan_line \
             setup_import_share_tests::paste_import_starts_in_the_editor_and_needs_text \
             setup_import_share_tests::share_actions_stay_pinned_and_need_a_server \
-            setup_import_share_tests::setup_file_dialogs_start_in_downloads_and_list_setups_first
+            setup_import_share_tests::setup_file_dialogs_start_in_downloads_and_list_setups_first \
+            setup::tests::successful_review_shows_restart_and_only_done \
+            setup::tests::a_review_closed_while_connecting_only_refreshes
           do
             xvfb-run -a dbus-run-session -- cargo test \
               --manifest-path src-tauri/Cargo.toml --no-default-features \
