@@ -943,6 +943,97 @@ pub fn add_snippet_server(
     add_snippet_server_choices(fields, env, &Default::default())
 }
 
+/// One value row of Add server, as both shells collect it.
+#[derive(Debug, Clone, Default)]
+pub struct ValueRow {
+    pub key: String,
+    pub value: String,
+    /// Kept in the keychain (or read from a password manager).
+    pub secret: bool,
+    /// A password manager reference, when the row reads its value from one.
+    pub reference: Option<String>,
+    /// "Same on every machine", only once chosen: until then sync's default applies.
+    pub portable: Option<bool>,
+}
+
+/// What [`add_server_with_rows`] saved.
+pub struct RowsAddOutcome {
+    pub registry: Registry,
+    /// Keys whose typed secret could not be stored.
+    pub failed: Vec<String>,
+}
+
+/// Add a server the way the React dialog saves one: the entry with its plain
+/// values and references, then each typed secret into the keychain, then switch
+/// the server on once every row has a value.
+pub fn add_server_with_rows(
+    fields: ServerFields,
+    rows: Vec<ValueRow>,
+) -> Result<RowsAddOutcome, String> {
+    let rows: Vec<ValueRow> = rows
+        .into_iter()
+        .filter(|row| !row.key.trim().is_empty())
+        .map(|row| ValueRow {
+            key: row.key.trim().to_string(),
+            ..row
+        })
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    if let Some(row) = rows.iter().find(|row| !seen.insert(row.key.as_str())) {
+        return Err(crate::i18n::trf(
+            "Use each variable name once. Rename or remove the second {value0}.",
+            &[("value0", &row.key)],
+        ));
+    }
+    let mut entry = entry_from_fields(fields)?;
+    entry.env = rows
+        .iter()
+        .map(|row| {
+            let mut unknown_fields = serde_json::Map::new();
+            if let Some(reference) = &row.reference {
+                unknown_fields.insert("source".into(), serde_json::json!({"ref": reference}));
+            } else if !row.secret {
+                if let Some(portable) = row.portable {
+                    unknown_fields.insert(
+                        "portable".into(),
+                        serde_json::json!(
+                            portable && !crate::personal_sync::risky_sync_env(&row.key)
+                        ),
+                    );
+                }
+            }
+            registry::EnvVar {
+                key: row.key.clone(),
+                value: (row.reference.is_none() && !row.secret && !row.value.is_empty())
+                    .then(|| row.value.clone()),
+                secret: row.reference.is_some() || row.secret,
+                unknown_fields,
+            }
+        })
+        .collect();
+    let (mut registry, id) = add_reviewed_entry(entry)?;
+    let mut failed = Vec::new();
+    for row in &rows {
+        if row.reference.is_some() || row.value.is_empty() || !row.secret {
+            continue;
+        }
+        match set_server_secret_with(&id, &row.key, &row.value, |id, key| {
+            Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0)
+        }) {
+            Ok(saved) => registry = saved,
+            Err(_) => failed.push(row.key.clone()),
+        }
+    }
+    if failed.is_empty() && rows.iter().all(|row| !row.value.trim().is_empty()) {
+        registry = registry::update(|r| {
+            let profile = r.default_access_id();
+            apply_server_enabled(r, &profile, &id, true, false)
+        })?
+        .0;
+    }
+    Ok(RowsAddOutcome { registry, failed })
+}
+
 /// [`add_snippet_server`] with the user's Keychain choice per key; a key absent
 /// from `keychain` keeps the import's own secret detection.
 pub fn add_snippet_server_choices(
@@ -3068,6 +3159,8 @@ pub fn set_server_secret_with(
     value: &str,
     write_registry: impl FnOnce(&str, &str) -> Result<Registry, String>,
 ) -> Result<Registry, String> {
+    // Both shells store through here, so both get the same rules.
+    let (key, value) = credential_slot(server_id, key, value)?;
     let key = normalize_secret_key(key)?;
     let _lock = acquire_auth_lock(server_id)?;
     set_server_secret_using(
@@ -3099,6 +3192,20 @@ pub fn delete_server_secret_with(
 }
 
 pub fn set_server_secret(server_id: &str, key: &str, value: &str) -> Result<Registry, String> {
+    set_server_secret_with(server_id, key, value, |server_id, key| {
+        let (registry, ()) =
+            registry::update(|registry| apply_secret_declaration(registry, server_id, key))?;
+        Ok(registry)
+    })
+}
+
+/// The key and value a typed credential is stored under. A remote server's
+/// Authorization header is its bearer token, kept where sign-in keeps it.
+fn credential_slot<'a>(
+    server_id: &str,
+    key: &'a str,
+    value: &'a str,
+) -> Result<(&'a str, &'a str), String> {
     if !crate::import_credentials::provided(value) {
         return Err("Enter a credential value. Placeholder values cannot be saved.".into());
     }
@@ -3108,7 +3215,7 @@ pub fn set_server_secret(server_id: &str, key: &str, value: &str) -> Result<Regi
         .iter()
         .find(|s| s.id == server_id)
         .is_some_and(|s| s.transport != "stdio");
-    let (key, value) = if remote && key.eq_ignore_ascii_case("authorization") {
+    if remote && key.trim().eq_ignore_ascii_case("authorization") {
         let (scheme, token) = value
             .split_once(' ')
             .ok_or("Enter a Bearer token for Authorization")?;
@@ -3117,15 +3224,10 @@ pub fn set_server_secret(server_id: &str, key: &str, value: &str) -> Result<Regi
                 "Only Bearer authentication is supported for imported Authorization headers".into(),
             );
         }
-        (crate::secrets::HTTP_AUTH_KEY, token)
+        Ok((crate::secrets::HTTP_AUTH_KEY, token))
     } else {
-        (key, value)
-    };
-    set_server_secret_with(server_id, key, value, |server_id, key| {
-        let (registry, ()) =
-            registry::update(|registry| apply_secret_declaration(registry, server_id, key))?;
-        Ok(registry)
-    })
+        Ok((key, value))
+    }
 }
 
 /// Vault a launch argument input without declaring an environment variable.
@@ -5247,7 +5349,7 @@ API_KEY = "synthetic-first-origin"
     enum AddPath {
         /// React: `add_server` with the form's rows, then `set_secret` per vaulted value.
         React,
-        /// GTK: `add_snippet_server_choices` with the pasted rows.
+        /// GTK: `add_server_with_rows` with the pasted rows.
         Gtk,
     }
 
@@ -5276,17 +5378,17 @@ API_KEY = "synthetic-first-origin"
         };
         let id = match path {
             AddPath::Gtk => {
-                let env = parsed
+                let rows = parsed
                     .env
                     .iter()
-                    .map(|e| (e.key.clone(), e.value.clone()))
+                    .map(|e| ValueRow {
+                        key: e.key.clone(),
+                        value: e.value.clone().unwrap_or_default(),
+                        secret: secret(e),
+                        ..Default::default()
+                    })
                     .collect();
-                let keychain = parsed
-                    .env
-                    .iter()
-                    .map(|e| (e.key.clone(), secret(e)))
-                    .collect();
-                add_snippet_server_choices(fields, env, &keychain)?;
+                add_server_with_rows(fields, rows)?;
                 registry::load()?
                     .servers
                     .iter()
@@ -5312,6 +5414,17 @@ API_KEY = "synthetic-first-origin"
                     let Some(value) = &e.value else { continue };
                     set_server_secret_with(&id, &e.key, value, |id, key| {
                         Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0)
+                    })?;
+                }
+                // Then the dialog switches it on, once every row has a value.
+                if parsed
+                    .env
+                    .iter()
+                    .all(|e| e.value.as_deref().is_some_and(|v| !v.trim().is_empty()))
+                {
+                    registry::update(|r| {
+                        let profile = r.default_access_id();
+                        apply_server_enabled(r, &profile, &id, true, false)
                     })?;
                 }
                 id
@@ -5383,6 +5496,110 @@ API_KEY = "synthetic-first-origin"
         assert_eq!(
             error,
             "Use each variable name once. Rename or remove the second API_KEY."
+        );
+        let rows = ["API_KEY", " API_KEY "]
+            .map(|key| ValueRow {
+                key: key.into(),
+                ..Default::default()
+            })
+            .to_vec();
+        let Err(error) = add_server_with_rows(fields("dup", "stdio"), rows) else {
+            panic!("a repeated name is refused");
+        };
+        assert_eq!(
+            error,
+            "Use each variable name once. Rename or remove the second API_KEY."
+        );
+    }
+
+    /// GTK's Add server saves its rows exactly as the React dialog's sequence
+    /// does (add the entry, store each typed secret, switch it on): the same
+    /// saved entry, vault and enabled state, for every kind of row.
+    #[test]
+    fn gtk_rows_save_like_the_react_dialog() {
+        let rows = vec![
+            ValueRow {
+                key: "API_KEY".into(),
+                value: "sk-live-typed".into(),
+                secret: true,
+                ..Default::default()
+            },
+            ValueRow {
+                key: "VAULT_TOKEN".into(),
+                secret: true,
+                reference: Some("op://Private/Server/token".into()),
+                ..Default::default()
+            },
+            ValueRow {
+                key: "REGION".into(),
+                value: "eu".into(),
+                portable: Some(false),
+                ..Default::default()
+            },
+            ValueRow {
+                key: "NOTES_DIR".into(),
+                value: "/home/me/notes".into(),
+                portable: Some(true),
+                ..Default::default()
+            },
+            ValueRow {
+                key: "NODE_OPTIONS".into(),
+                value: "--max-old-space-size=4096".into(),
+                portable: Some(true),
+                ..Default::default()
+            },
+            ValueRow {
+                key: "PLAIN".into(),
+                value: "1".into(),
+                ..Default::default()
+            },
+        ];
+        // React's entry for these rows (`buildEntry(false)`), and its save calls.
+        let react_env = serde_json::json!([
+            {"key": "API_KEY", "value": null, "secret": true},
+            {"key": "VAULT_TOKEN", "value": null, "secret": true,
+             "source": {"ref": "op://Private/Server/token"}},
+            {"key": "REGION", "value": "eu", "secret": false, "portable": false},
+            {"key": "NOTES_DIR", "value": "/home/me/notes", "secret": false, "portable": true},
+            {"key": "NODE_OPTIONS", "value": "--max-old-space-size=4096", "secret": false, "portable": false},
+            {"key": "PLAIN", "value": "1", "secret": false},
+        ]);
+        let saved = |shell: &str| {
+            let mut result = None;
+            crate::secrets::tests::with_isolated_vault(|| {
+                let fields = fields("demo", "stdio");
+                let id = if shell == "gtk" {
+                    let outcome = add_server_with_rows(fields, rows.clone()).unwrap();
+                    assert!(outcome.failed.is_empty());
+                    outcome.registry.servers[0].id.clone()
+                } else {
+                    let mut entry = entry_from_fields(fields).unwrap();
+                    entry.env = serde_json::from_value(react_env.clone()).unwrap();
+                    entry.enabled = false;
+                    let (_, id) = add_reviewed_entry(entry).unwrap();
+                    set_server_secret_with(&id, "API_KEY", "sk-live-typed", |id, key| {
+                        Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0)
+                    })
+                    .unwrap();
+                    // A reference row has no typed value, so React leaves it off.
+                    id
+                };
+                let registry = registry::load().unwrap();
+                let server = registry.servers[0].clone();
+                result = Some((
+                    serde_json::to_value(&server.env).unwrap(),
+                    crate::secrets::get_secret_result(&id, "API_KEY").unwrap(),
+                    registry.is_enabled(&registry.default_access_id(), &id),
+                ));
+            });
+            result.unwrap()
+        };
+        let (gtk, react) = (saved("gtk"), saved("react"));
+        assert_eq!(gtk, react);
+        assert_eq!(gtk.1.as_deref(), Some("sk-live-typed"));
+        assert!(
+            !gtk.2,
+            "a reference row has no typed value, so neither shell switches it on"
         );
     }
 
