@@ -224,3 +224,147 @@ it("keeps focus in the dialog and turns Close off while the check runs", async (
   await userEvent.keyboard("{Escape}");
   expect(screen.getByRole("dialog")).toBeInTheDocument();
 });
+
+it("shows a batch step line and tells a cancelled review from a finished connect", async () => {
+  api.migrateClient.mockResolvedValue({
+    registry: { servers: [] },
+    outcome: { path: "/fixture/config", backup: null },
+    tools: [],
+    servers: [],
+  });
+  const close = vi.fn();
+  const { unmount } = render(
+    <ConnectReviewDialog
+      clientId="fixture"
+      clientName="Fixture"
+      step="Step 1 of 2: Claude Work"
+      onClose={close}
+      onConnected={vi.fn()}
+    />,
+  );
+  await screen.findByRole("button", { name: /one/ });
+  expect(screen.getByText("Step 1 of 2: Claude Work")).toBeVisible();
+  await userEvent.keyboard("{Escape}");
+  expect(close).toHaveBeenLastCalledWith(false, false);
+  unmount();
+
+  render(
+    <ConnectReviewDialog
+      clientId="fixture"
+      clientName="Fixture"
+      step="Step 2 of 2: Home"
+      onClose={close}
+      onConnected={vi.fn()}
+    />,
+  );
+  await screen.findByRole("button", { name: /one/ });
+  await userEvent.click(screen.getByRole("button", { name: "Connect to Toolport" }));
+  await screen.findByRole("button", { name: "Done" });
+  expect(screen.getByText("Step 2 of 2: Home")).toBeVisible();
+  await userEvent.click(screen.getByRole("button", { name: "Done" }));
+  expect(close).toHaveBeenLastCalledWith(true, true);
+});
+
+it("focuses Next in the footer when a step connects, and Escape there does not advance", async () => {
+  api.migrateClient.mockResolvedValue({
+    registry: { servers: [] },
+    outcome: { path: "/fixture/config", backup: null },
+    tools: [],
+    servers: [],
+  });
+  const close = vi.fn();
+  render(
+    <ConnectReviewDialog
+      clientId="fixture"
+      clientName="Fixture"
+      step="Step 1 of 2: Claude Work"
+      hasNext
+      onClose={close}
+      onConnected={vi.fn()}
+    />,
+  );
+  await screen.findByRole("button", { name: /one/ });
+  await userEvent.click(screen.getByRole("button", { name: "Connect to Toolport" }));
+  const next = await screen.findByRole("button", { name: "Next" });
+  await waitFor(() => expect(next).toHaveFocus());
+  // Outside the scrolling body, so its focus ring is never cut off.
+  expect(next.closest("[data-slot=dialog-footer]")).not.toBeNull();
+  await userEvent.keyboard("{Escape}");
+  expect(close).toHaveBeenLastCalledWith(true, false);
+});
+
+it("shows no step line outside a batch", async () => {
+  render(
+    <ConnectReviewDialog
+      clientId="fixture"
+      clientName="Fixture"
+      onClose={vi.fn()}
+      onConnected={vi.fn()}
+    />,
+  );
+  await screen.findByRole("button", { name: /one/ });
+  expect(screen.queryByText(/^Step /)).not.toBeInTheDocument();
+});
+
+it("offers Skip after a failure only inside a batch, and focuses Retry", async () => {
+  api.migrateClient.mockRejectedValue(new Error("Permission denied"));
+  const { unmount } = render(
+    <ConnectReviewDialog
+      clientId="fixture"
+      clientName="Fixture"
+      onClose={vi.fn()}
+      onConnected={vi.fn()}
+    />,
+  );
+  await userEvent.click(
+    await screen.findByRole("button", { name: "Connect to Toolport" }),
+  );
+  expect(await screen.findByText(/Permission denied/)).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Skip" })).not.toBeInTheDocument();
+  unmount();
+
+  const skip = vi.fn();
+  render(
+    <ConnectReviewDialog
+      clientId="fixture"
+      clientName="Fixture"
+      step="Step 1 of 2: One"
+      onSkip={skip}
+      onClose={vi.fn()}
+      onConnected={vi.fn()}
+    />,
+  );
+  await userEvent.click(
+    await screen.findByRole("button", { name: "Connect to Toolport" }),
+  );
+  expect(await screen.findByText(/Permission denied/)).toBeVisible();
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Retry" })).toHaveFocus(),
+  );
+  await userEvent.click(screen.getByRole("button", { name: "Skip" }));
+  expect(skip).toHaveBeenCalledTimes(1);
+});
+
+it("offers Skip, Retry and Cancel in the footer when a step's config can't be read", async () => {
+  api.previewClientSetup.mockRejectedValue("unreadable");
+  const close = vi.fn();
+  const skip = vi.fn();
+  render(
+    <ConnectReviewDialog
+      clientId="fixture"
+      clientName="Fixture"
+      step="Step 1 of 1: One"
+      onSkip={skip}
+      onClose={close}
+      onConnected={vi.fn()}
+    />,
+  );
+  expect(await screen.findByText("unreadable")).toBeVisible();
+  const retry = screen.getByRole("button", { name: "Retry" });
+  await waitFor(() => expect(retry).toHaveFocus());
+  expect(retry.closest("[data-slot=dialog-footer]")).not.toBeNull();
+  await userEvent.click(screen.getByRole("button", { name: "Skip" }));
+  expect(skip).toHaveBeenCalledTimes(1);
+  await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(close).toHaveBeenLastCalledWith(false, false);
+});

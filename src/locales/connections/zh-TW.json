@@ -2,7 +2,6 @@
   "Used by T3 Code: {names}": "T3 Code 使用中：{names}",
   "{name} (off)": "{name}（已關閉）",
   "{name} is on in T3 Code": "{name} 在 T3 Code 中已開啟",
-  "{name} is off in T3 Code": "{name} 在 T3 Code 中已關閉",
   "T3 Code runs these clients as providers. Each reads its own MCP config, so Toolport connects to them, not to T3 Code.": "T3 Code 會將這些用戶端作為提供者執行。每個用戶端會讀取自己的 MCP 設定，因此 Toolport 連線的是這些用戶端，而不是 T3 Code。",
   "Every enabled T3 Code instance is connected.": "所有已啟用的 T3 Code 執行個體都已連線。",
   "{count} enabled T3 Code instance is not connected.": "{count} 個已啟用的 T3 Code 執行個體未連線。",
@@ -1124,5 +1123,13 @@
   "Latest {count} entries available.": "可查看最新的 {count} 筆記錄。",
   "Showing 1 matching entry from the latest {total}.": "顯示最新 {total} 筆記錄中符合的 1 筆。",
   "No errors in the latest entry.": "最新的 1 筆記錄無錯誤。",
-  "No errors in the latest {count} entries.": "最新的 {count} 筆記錄均無錯誤。"
+  "No errors in the latest {count} entries.": "最新的 {count} 筆記錄均無錯誤。",
+  "{name} is off in T3 Code. Connect all skips it; you can still connect it here.": "{name} 在 T3 Code 中已關閉。「全部連線」會略過它；你仍可在此連線。",
+  "Connect all": "全部連線",
+  "Step {index} of {total}: {names}": "第 {index} 步，共 {total} 步：{names}",
+  "Connect all stopped.": "已停止全部連線。",
+  "Connected {connected} of {total} T3 Code instance.": "已連線 {connected}/{total} 個 T3 Code 執行個體。",
+  "Connected {connected} of {total} T3 Code instances.": "已連線 {connected}/{total} 個 T3 Code 執行個體。",
+  "Not connected: {names}.": "未連線：{names}。",
+  "Skip": "略過"
 }

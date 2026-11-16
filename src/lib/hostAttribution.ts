@@ -54,6 +54,30 @@ export function t3CodeTargets(clients: DetectedClient[]): DetectedClient[] {
   );
 }
 
+/** By code point, the order Rust's `str` comparison uses. */
+function compareCodePoints(a: string, b: string): number {
+  const left = [...a];
+  const right = [...b];
+  for (let index = 0; index < Math.min(left.length, right.length); index++) {
+    const difference = left[index].codePointAt(0)! - right[index].codePointAt(0)!;
+    if (difference !== 0) return difference;
+  }
+  return left.length - right.length;
+}
+
+/** The order rows (and so Connect all's steps) are listed in among rows of the same
+ * status, and a group's profiles by command or folder: by Unicode lowercase text, then by
+ * id. GTK's `state::name_order` is the same rule. */
+export function compareClientNames(
+  a: { name: string; id: string },
+  b: { name: string; id: string },
+): number {
+  return (
+    compareCodePoints(a.name.toLowerCase(), b.name.toLowerCase()) ||
+    compareCodePoints(a.id, b.id)
+  );
+}
+
 /** Enabled instances on the given rows; the card counts instances, not rows. */
 export function t3CodeInstanceCount(targets: DetectedClient[]): number {
   return targets.reduce(
@@ -367,8 +391,103 @@ export function t3CodeBadge(uses: T3CodeUse[]): { text: string; title: string } 
       .map((use) =>
         use.enabled
           ? translate("{name} is on in T3 Code", { name: use.displayName })
-          : translate("{name} is off in T3 Code", { name: use.displayName }),
+          : translate(
+              "{name} is off in T3 Code. Connect all skips it; you can still connect it here.",
+              { name: use.displayName },
+            ),
       )
       .join("\n"),
+  };
+}
+
+/** The enabled instances on a row, by name, as each Connect all step lists them. */
+export function t3CodeEnabledNames(client: DetectedClient | undefined): string[] {
+  return (client?.t3Code ?? [])
+    .filter((use) => use.enabled)
+    .map((use) => use.displayName);
+}
+
+/** What `connectAllSummary` reports, worked out when the batch ends against the rows as
+ * they are then: an instance turned off or removed during the batch is neither counted
+ * nor named. `connectedIds` are the rows connected, `notConnectedIds` the rows skipped,
+ * failed or never reached, in step order. Left-out rows are found again, without the
+ * batch's own rows. GTK's `t3_code_batch_result` does the same. */
+export function connectAllOutcome(
+  clients: DetectedClient[],
+  connectedIds: string[],
+  notConnectedIds: string[],
+): { connected: number; total: number; notConnected: string[]; leftOut: string[] } {
+  const byId = (id: string) => clients.find((client) => client.id === id);
+  // The rescan decides, as the row shows it: connected when its entry is Toolport's and
+  // not customized, whatever the step reported (a connect that took effect but reported
+  // a failure counts; one undone since does not).
+  const connectedNow = (id: string) => {
+    const client = byId(id);
+    return client?.gatewayInstalled === true && client.entryState !== "customized";
+  };
+  const rows = [...connectedIds, ...notConnectedIds];
+  const connected = rows
+    .filter(connectedNow)
+    .reduce((sum, id) => sum + t3CodeEnabledNames(byId(id)).length, 0);
+  const notConnected = rows
+    .filter((id) => !connectedNow(id))
+    .flatMap((id) => t3CodeEnabledNames(byId(id)));
+  const batchIds = new Set([...connectedIds, ...notConnectedIds]);
+  return {
+    connected,
+    total: connected + notConnected.length,
+    notConnected,
+    leftOut: t3CodeLeftOutLines(
+      t3CodeLeftOut(clients).filter((row) => !batchIds.has(row.client.id)),
+    ),
+  };
+}
+
+/** The summary when Connect all ends: "[Connect all stopped. ]Connected X of Y T3 Code
+ * instance(s).[ Not connected: NAMES.][ LEFT OUT LINES]". `stopped` is true when the user
+ * ended it (Cancel, close or Escape). A full success only when nothing was stopped, left
+ * unconnected or left out. GTK's `t3_code_batch_summary` builds the same text. */
+export function connectAllSummary({
+  connected,
+  total,
+  stopped,
+  notConnected,
+  leftOut = [],
+}: {
+  connected: number;
+  total: number;
+  stopped: boolean;
+  notConnected: string[];
+  leftOut?: string[];
+}): {
+  text: string;
+  title: string;
+  detail: string;
+  success: boolean;
+  tone: "success" | "warning" | "info";
+} {
+  const parts = [
+    stopped && translate("Connect all stopped."),
+    translate(
+      total === 1
+        ? msg("Connected {connected} of {total} T3 Code instance.")
+        : msg("Connected {connected} of {total} T3 Code instances."),
+      { connected, total },
+    ),
+    notConnected.length > 0 &&
+      translate("Not connected: {names}.", { names: notConnected.join(", ") }),
+    ...leftOut,
+  ].filter(Boolean) as string[];
+  // The card's title is the first sentence; the rest is its detail. GTK splits the same.
+  const [title, ...rest] = parts;
+  const success = !stopped && notConnected.length === 0 && leftOut.length === 0;
+  return {
+    text: parts.join(" "),
+    title,
+    detail: rest.join(" "),
+    success,
+    // Neutral when nothing was left to count (every row gone or off by the end), not a
+    // green "0 of 0". GTK picks the same tone.
+    tone: success ? (total === 0 ? "info" : "success") : "warning",
   };
 }

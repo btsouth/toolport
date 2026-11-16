@@ -2,7 +2,6 @@
   "Used by T3 Code: {names}": "Von T3 Code verwendet: {names}",
   "{name} (off)": "{name} (aus)",
   "{name} is on in T3 Code": "{name} ist in T3 Code eingeschaltet",
-  "{name} is off in T3 Code": "{name} ist in T3 Code ausgeschaltet",
   "T3 Code runs these clients as providers. Each reads its own MCP config, so Toolport connects to them, not to T3 Code.": "T3 Code führt diese Clients als Anbieter aus. Jeder liest seine eigene MCP-Konfiguration, daher verbindet sich Toolport mit ihnen, nicht mit T3 Code.",
   "Every enabled T3 Code instance is connected.": "Alle aktivierten T3 Code-Instanzen sind verbunden.",
   "{count} enabled T3 Code instance is not connected.": "{count} aktivierte T3 Code-Instanz ist nicht verbunden.",
@@ -1124,5 +1123,13 @@
   "Latest {count} entries available.": "Neueste {count} Einträge verfügbar.",
   "Showing 1 matching entry from the latest {total}.": "Zeigt 1 passenden Eintrag aus den neuesten {total}.",
   "No errors in the latest entry.": "Keine Fehler im neuesten Eintrag.",
-  "No errors in the latest {count} entries.": "Keine Fehler in den neuesten {count} Einträgen."
+  "No errors in the latest {count} entries.": "Keine Fehler in den neuesten {count} Einträgen.",
+  "{name} is off in T3 Code. Connect all skips it; you can still connect it here.": "{name} ist in T3 Code ausgeschaltet. Alle verbinden überspringt es; hier können Sie es trotzdem verbinden.",
+  "Connect all": "Alle verbinden",
+  "Step {index} of {total}: {names}": "Schritt {index} von {total}: {names}",
+  "Connect all stopped.": "Alle verbinden wurde gestoppt.",
+  "Connected {connected} of {total} T3 Code instance.": "{connected} von {total} T3 Code-Instanz verbunden.",
+  "Connected {connected} of {total} T3 Code instances.": "{connected} von {total} T3 Code-Instanzen verbunden.",
+  "Not connected: {names}.": "Nicht verbunden: {names}.",
+  "Skip": "Überspringen"
 }

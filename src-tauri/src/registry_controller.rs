@@ -1375,13 +1375,21 @@ fn finish_client_stdio_mutation(
     write_registry: impl FnOnce(Option<ManagedEntry>) -> Result<(Registry, bool), String>,
 ) -> Result<ClientMutationResult, String> {
     let mut revoked = false;
-    let result = finish_client_config_mutation(outcome, |managed_entry| {
+    let mut result = finish_client_config_mutation(outcome, |managed_entry| {
         let (registry, removed_http_row) = write_registry(managed_entry)?;
         revoked = removed_http_row;
         Ok(registry)
     })?;
+    // The config and the registry are both written by now, so this cleanup can't fail the
+    // change: an error here would report a connect as failed after it took effect. The
+    // token's row is gone, so a token left behind (say, with the keyring locked) is unused.
+    // Reported as a warning, as Disconnect reports the same cleanup.
     if revoked {
-        crate::secrets::delete_secret(CLIENT_HTTP_VAULT_SERVER, client_id)?;
+        if let Err(error) = crate::secrets::delete_secret(CLIENT_HTTP_VAULT_SERVER, client_id) {
+            result.outcome.warnings.push(format!(
+                "connected; could not remove the old keychain token: {error}"
+            ));
+        }
     }
     Ok(result)
 }
@@ -2255,6 +2263,52 @@ pub fn migrate_client_reviewed_choices(
     )
 }
 
+/// What a reviewed connect's rollback says when it could not undo everything.
+const ROLLBACK_KEPT_EDITS: &str = "Registry changed during setup. Concurrent edits were kept. Review Servers before retrying. Credentials for retained servers were kept.";
+const ROLLBACK_KEPT_CREDENTIALS: &str = "Imported credential values were kept.";
+
+/// Connect all's keyring rule, the one #1378 set for Disconnect: a step the user confirms
+/// may ask to unlock the keyring, but a run of steps must not ask again and again. Once a
+/// step has failed with the keyring still locked, the run's later steps are `quiet`: no
+/// keyring call in them can ask, and one that needed the keyring fails at once and says to
+/// unlock it and choose Retry. A Retry the user chooses is not quiet, so it may ask once.
+/// Bulk paths nobody confirms step by step (Remove from all clients, purge) never ask.
+pub fn connect_step<T>(quiet: bool, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    if !quiet {
+        return f();
+    }
+    clients::backup_vault::noninteractive(f).map_err(|error| {
+        // Only a failure the locked keyring caused: a locked error, or a vault write that
+        // failed while the store is locked. Any other error is shown as it is.
+        let locked_now =
+            || clients::backup_vault::store_locked() || crate::secrets::write_would_ask();
+        if clients::backup_vault::is_locked_error(&error)
+            || (crate::import_credentials::is_vault_failure(&error) && locked_now())
+        {
+            let unlock = crate::i18n::tr("Unlock your keyring, then choose Retry.");
+            // A rollback that kept something says so; that stays with the instruction.
+            if [ROLLBACK_KEPT_EDITS, ROLLBACK_KEPT_CREDENTIALS]
+                .iter()
+                .any(|note| error.contains(note))
+            {
+                format!("{unlock}\n\n{error}")
+            } else {
+                unlock
+            }
+        } else {
+            error
+        }
+    })
+}
+
+/// Whether a failed connect step left the keyring locked, so the rest of its run is quiet.
+/// Never asks to unlock.
+pub fn keyring_locked_after(error: &str) -> bool {
+    clients::backup_vault::is_locked_error(error)
+        || clients::backup_vault::store_locked()
+        || crate::secrets::write_would_ask()
+}
+
 pub fn migrate_client_reviewed_inputs(
     client_id: &str,
     profile: Option<&str>,
@@ -2357,8 +2411,8 @@ fn migrate_client_reviewed_inputs_with(
             "Client config changed. Review it again before connecting. Config unchanged.".into(),
         );
     }
-    let (mut result, imported, moved, verification) = crate::import_credentials::transaction(
-        |writes| {
+    let (mut result, imported, moved, verification) =
+        crate::import_credentials::transaction(|writes| {
             let mut prepared = current.clone();
             let (imported, moved) = prepare_client_servers_for_migration(
                 &mut prepared,
@@ -2401,18 +2455,15 @@ fn migrate_client_reviewed_inputs_with(
                     Ok((true, _)) => Err(error),
                     Ok((false, retained)) => {
                         writes.keep_servers(&retained);
-                        Err(format!("{error} Registry changed during setup. Concurrent edits were kept. Review Servers before retrying. Credentials for retained servers were kept."))
+                        Err(format!("{error} {ROLLBACK_KEPT_EDITS}"))
                     }
                     Err(rollback) => {
                         writes.keep();
-                        Err(format!(
-                            "{error} {rollback} Imported credential values were kept."
-                        ))
+                        Err(format!("{error} {rollback} {ROLLBACK_KEPT_CREDENTIALS}"))
                     }
                 },
             }
-        },
-    )?;
+        })?;
     if !unsupported.is_empty() {
         result.outcome.warnings.push(format!(
             "Unsupported servers stayed in the client: {}",
@@ -2477,6 +2528,18 @@ fn verify_setup_gateway(
         }
         let probe = crate::server_runtime::probe_one_bounded(server);
         if !probe.ok {
+            // A quiet step's probe may not read a locked store, so a server that keeps
+            // values there can't be checked yet: said as the lock, not as a broken server.
+            if crate::secrets::prompts_blocked()
+                && crate::server_runtime::keeps_values_in_store(server)
+                && crate::secrets::store_would_prompt()
+            {
+                return Err(format!(
+                    "{} can't be checked while the keyring is locked. Client config unchanged. ({})",
+                    server.name,
+                    clients::backup_vault::locked_error()
+                ));
+            }
             return Err(if probe.auth_required {
                 format!(
                     "{} needs credentials. Enter the missing values in review or fix the native config, then retry. Client config unchanged.",
@@ -4698,6 +4761,230 @@ API_KEY = "synthetic-first-origin"
         assert!(read_registry_exact().unwrap().servers.is_empty());
         assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
         assert!(!fixture.move_record("claude-code").exists());
+    }
+
+    /// Connect all, one client failing part way: the client connected before it stays
+    /// connected with its own backup, and the failing client's config is left byte for
+    /// byte as it was, with no move record and nothing of it in the registry.
+    #[test]
+    fn a_connect_all_step_that_fails_leaves_earlier_clients_and_its_own_config_whole() {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"first":{"command":"first"}}}"#,
+        )
+        .unwrap();
+        let codex = "[mcp_servers.second]\ncommand = \"second\"\n";
+        std::fs::write(fixture.codex(), codex).unwrap();
+        let first = preview_client_setup("claude-code").unwrap();
+        let second = preview_client_setup("codex").unwrap();
+        let connected = connect_step(false, || {
+            migrate_client_reviewed_with(
+                "claude-code",
+                None,
+                false,
+                &["first".into()],
+                &first.revision,
+                |_, _, _, _| Ok(Vec::new().into()),
+            )
+        })
+        .unwrap();
+        let after_first = std::fs::read_to_string(fixture.claude()).unwrap();
+        let error = connect_step(false, || {
+            migrate_client_reviewed_with(
+                "codex",
+                None,
+                false,
+                &["second".into()],
+                &second.revision,
+                |_, _, _, _| Err("Launch failed".into()),
+            )
+        })
+        .unwrap_err();
+        assert_eq!(error, "Launch failed");
+        // The failing client: untouched, with nothing recorded for it.
+        assert_eq!(std::fs::read_to_string(fixture.codex()).unwrap(), codex);
+        assert!(!fixture.move_record("codex").exists());
+        let registry = read_registry_exact().unwrap();
+        assert!(registry
+            .servers
+            .iter()
+            .all(|server| server.name != "second"));
+        // The client before it: still connected, with its own backup.
+        assert_eq!(
+            std::fs::read_to_string(fixture.claude()).unwrap(),
+            after_first
+        );
+        assert!(json_file(&fixture.claude())["mcpServers"]
+            .get("first")
+            .is_none());
+        assert!(registry.servers.iter().any(|server| server.name == "first"));
+        let backup = connected.result.outcome.backup.expect("its own backup");
+        assert!(std::path::Path::new(&backup)
+            .starts_with(fixture.root.join("data/backups/claude-code")));
+        assert!(fixture.move_record("claude-code").exists());
+    }
+
+    /// Connect all with the keyring locked asks at most once: the step that may ask
+    /// raises one prompt and, refused, fails; the steps after it are quiet, raise none,
+    /// change nothing, and say to unlock the keyring and choose Retry.
+    #[test]
+    fn a_locked_keyring_is_asked_about_once_in_a_connect_all_run() {
+        let fixture = MoveFixture::new(&Registry::default());
+        // Each server has a value Toolport moves into the keyring when it connects.
+        let claude =
+            r#"{"mcpServers":{"first":{"command":"first","env":{"PAT":"synthetic-first"}}}}"#;
+        let codex = "[mcp_servers.second]\ncommand = \"second\"\n\n[mcp_servers.second.env]\nPAT = \"synthetic-second\"\n";
+        std::fs::write(fixture.claude(), claude).unwrap();
+        std::fs::write(fixture.codex(), codex).unwrap();
+        let first = preview_client_setup("claude-code").unwrap();
+        let second = preview_client_setup("codex").unwrap();
+        let attempt = |quiet: bool, client: &str, name: &str, revision: &str| {
+            connect_step(quiet, || {
+                migrate_client_reviewed_with(
+                    client,
+                    None,
+                    false,
+                    &[name.into()],
+                    revision,
+                    |_, _, _, _| Ok(Vec::new().into()),
+                )
+            })
+            .err()
+        };
+        let mut errors = Vec::new();
+        let prompts = crate::secrets::locked_store::write_prompts_during(|| {
+            // The first step is the user's own and may ask; the prompt is dismissed.
+            let asked = attempt(false, "claude-code", "first", &first.revision).unwrap();
+            assert!(keyring_locked_after(&asked), "{asked}");
+            // The rest of the run is quiet, including another try of the first step.
+            errors.push(attempt(true, "codex", "second", &second.revision));
+            errors.push(attempt(true, "claude-code", "first", &first.revision));
+        });
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        for error in errors {
+            assert_eq!(
+                error.as_deref(),
+                Some("Unlock your keyring, then choose Retry.")
+            );
+        }
+        assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), claude);
+        assert_eq!(std::fs::read_to_string(fixture.codex()).unwrap(), codex);
+        assert!(!fixture.move_record("claude-code").exists());
+        assert!(!fixture.move_record("codex").exists());
+    }
+
+    /// A quiet step says to unlock the keyring only when the lock caused its failure; any
+    /// other error, with the store locked or not, is shown as it is.
+    #[test]
+    fn a_quiet_step_names_the_keyring_only_when_it_caused_the_failure() {
+        let unlock = Some("Unlock your keyring, then choose Retry.".to_string());
+        let changed = "Client config changed. Review it again.";
+        let vault = "Keychain unavailable. Unlock it and retry importing. Client config unchanged.";
+        let _fixture = MoveFixture::new(&Registry::default());
+        let fail = |error: &str| connect_step(true, || Err::<(), _>(error.to_string())).err();
+        crate::secrets::locked_store::write_prompts_during(|| {
+            assert_eq!(fail(changed).as_deref(), Some(changed));
+            assert_eq!(fail(vault), unlock);
+            assert_eq!(
+                fail("the keyring is locked; this background write waits for it"),
+                unlock
+            );
+        });
+        // A rollback that kept something keeps saying so after the instruction.
+        crate::secrets::locked_store::write_prompts_during(|| {
+            let kept = format!("{vault} {ROLLBACK_KEPT_EDITS}");
+            assert_eq!(
+                fail(&kept),
+                Some(format!("Unlock your keyring, then choose Retry.\n\n{kept}"))
+            );
+        });
+        // Unlocked, a vault failure is not blamed on the keyring.
+        assert_eq!(fail(vault).as_deref(), Some(vault));
+        assert_eq!(fail(changed).as_deref(), Some(changed));
+    }
+
+    /// A quiet step with the real gateway check: the check probes the server on a thread
+    /// of its own, which keeps the step's quiet gate, so a remote server with nothing to
+    /// store raises no unlock prompt from there either. A step that may ask still asks.
+    #[test]
+    fn a_quiet_step_keeps_the_gateway_check_from_asking() {
+        let fixture = MoveFixture::new(&Registry::default());
+        let codex = "[mcp_servers.second]\nurl = \"http://127.0.0.1:9/mcp\"\n";
+        std::fs::write(fixture.codex(), codex).unwrap();
+        let review = preview_client_setup("codex").unwrap();
+        let attempt = |quiet: bool| {
+            connect_step(quiet, || {
+                migrate_client_reviewed_inputs(
+                    "codex",
+                    None,
+                    false,
+                    &["second".into()],
+                    &review.revision,
+                    &Default::default(),
+                    &Default::default(),
+                )
+            })
+            .err()
+        };
+        let mut quiet = None;
+        let prompts = crate::secrets::locked_store::prompts_during(|| quiet = Some(attempt(true)));
+        assert!(
+            prompts.is_empty(),
+            "a quiet step asked to unlock the keyring: {prompts:?}"
+        );
+        assert_eq!(
+            quiet.flatten().as_deref(),
+            Some("Unlock your keyring, then choose Retry.")
+        );
+        assert_eq!(std::fs::read_to_string(fixture.codex()).unwrap(), codex);
+        // The gate is only inherited: a step that may ask still reaches the keyring.
+        let prompts = crate::secrets::locked_store::prompts_during(|| {
+            attempt(false);
+        });
+        assert!(!prompts.is_empty(), "a step that may ask was made quiet");
+    }
+
+    /// A connect that took effect stays connected when the old HTTP token can't be
+    /// removed from the keychain; the leftover token is reported as a warning, as
+    /// Disconnect reports it. The token's registry row is gone, so it is unusable.
+    #[test]
+    fn a_token_left_in_the_keychain_is_a_warning_not_a_failed_connect() {
+        let mut registry = Registry::default();
+        registry.http_clients.push(crate::registry::HttpClient {
+            id: "client:claude-code".into(),
+            label: "Claude Code".into(),
+            token_sha256: "old-hash".into(),
+            profile: String::new(),
+            unknown_fields: Default::default(),
+        });
+        let fixture = MoveFixture::new(&registry);
+        let gateway = serde_json::json!({"url": "http://127.0.0.1:8765/mcp",
+            "headers": {"Authorization": "Bearer old-token"}});
+        std::fs::write(
+            fixture.claude(),
+            serde_json::to_string(&serde_json::json!({"mcpServers": {"toolport": gateway}}))
+                .unwrap(),
+        )
+        .unwrap();
+        let mut result = None;
+        crate::secrets::locked_store::prompts_during(|| {
+            result = Some(connect_client_stdio("claude-code", Some("default"), true));
+        });
+        let result = result.unwrap().expect("the connect took effect");
+        assert!(
+            result
+                .outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("could not remove the old keychain token")),
+            "{:?}",
+            result.outcome.warnings
+        );
+        assert!(read_registry_exact().unwrap().http_clients.is_empty());
+        let config = json_file(&fixture.claude());
+        assert!(config["mcpServers"]["toolport"]["command"].is_string());
+        assert!(config["mcpServers"]["toolport"].get("url").is_none());
     }
 
     #[test]

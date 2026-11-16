@@ -240,8 +240,21 @@ fn probe_timeout(server: &ServerEntry) -> Duration {
 pub fn probe_one_bounded(server: &ServerEntry) -> ProbeResult {
     let (sender, receiver) = std::sync::mpsc::channel();
     let server_for_probe = server.clone();
+    // The keyring gates are per thread: a caller that may not ask to unlock (a quiet
+    // Connect all step, background work) keeps that on the probe's thread. A caller
+    // that may ask is never made quiet.
+    let noninteractive = crate::clients::backup_vault::is_noninteractive();
+    let quiet = crate::secrets::prompts_blocked();
     std::thread::spawn(move || {
-        let _ = sender.send(probe_one(&server_for_probe));
+        let probe = || probe_one(&server_for_probe);
+        let result = if noninteractive {
+            crate::clients::backup_vault::noninteractive(probe)
+        } else if quiet {
+            crate::secrets::without_prompts(probe)
+        } else {
+            probe()
+        };
+        let _ = sender.send(result);
     });
     let timeout = probe_timeout(server);
     receiver
@@ -320,7 +333,7 @@ pub fn probe_health_checked(server: &ServerEntry, check: &KeyringCheck) -> Probe
 /// inline value and no outside source, or a remote server (its sign-in and
 /// token state live there). Generous on purpose: it only decides what is
 /// skipped while the store is locked.
-fn keeps_values_in_store(server: &ServerEntry) -> bool {
+pub(crate) fn keeps_values_in_store(server: &ServerEntry) -> bool {
     let stored = |secret: bool,
                   value: &Option<String>,
                   fields: &serde_json::Map<String, serde_json::Value>| {

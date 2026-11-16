@@ -1292,6 +1292,17 @@ button.toolport-catalog-action {{
 .toolport-state-card.error .toolport-state-icon {{ color: @toolport_error; }}
 
 .toolport-manual-code {{ background: @toolport_card; border: 1px solid @toolport_border; border-radius: 12px; padding: 16px; }}
+/* Spec §10 status card, as React's StatusCard: a 3px start bar for success and warning,
+   none for info, and a tile tinted to match. */
+.toolport-status-card {{ background: @toolport_card; border: 1px solid @toolport_border; border-radius: 12px; padding: 16px; }}
+.toolport-status-card.status-success {{ border-left: 3px solid @toolport_success; }}
+.toolport-status-card.status-warning {{ border-left: 3px solid @toolport_warning; }}
+.toolport-status-card .toolport-status-tile {{ border-radius: 8px; }}
+.toolport-status-card.status-info .toolport-status-tile {{ background: alpha(@toolport_fg, 0.06); color: @toolport_text_secondary; }}
+.toolport-status-card.status-success .toolport-status-tile {{ background: alpha(@toolport_success, 0.12); color: @toolport_success; }}
+.toolport-status-card.status-warning .toolport-status-tile {{ background: alpha(@toolport_warning, 0.12); color: @toolport_warning; }}
+.toolport-status-title {{ font-size: 14px; font-weight: 600; }}
+.toolport-status-detail {{ font-size: 13px; }}
 .toolport-error-callout {{ background: @toolport_card; border: 1px solid @toolport_border; border-left: 3px solid @toolport_error; border-radius: 12px; padding: 16px; }}
 .toolport-error-tile {{ background: alpha(@toolport_error, 0.12); color: @toolport_error; border-radius: 8px; }}
 .toolport-inline-error {{ font-size: 13px; color: @toolport_error; }}
@@ -1562,6 +1573,11 @@ button.toolport-skill-chip:hover {{ background-color: alpha(@toolport_fg, 0.13);
 .toolport-recovery-values textview text {{ background-color: transparent; color: @toolport_fg; }}
 .toolport-feedback + .toolport-feedback {{
   border-top: 1px solid @toolport_border;
+}}
+/* After Connect all, focus returns to the T3 Code card when it has no button left. */
+.toolport-t3-card-group:focus:focus-visible {{
+  outline: 2px solid @toolport_accent;
+  outline-offset: 2px;
 }}
 
 .toolport-native .toolport-badge {{

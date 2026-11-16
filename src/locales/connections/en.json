@@ -2,7 +2,6 @@
   "Used by T3 Code: {names}": "Used by T3 Code: {names}",
   "{name} (off)": "{name} (off)",
   "{name} is on in T3 Code": "{name} is on in T3 Code",
-  "{name} is off in T3 Code": "{name} is off in T3 Code",
   "T3 Code runs these clients as providers. Each reads its own MCP config, so Toolport connects to them, not to T3 Code.": "T3 Code runs these clients as providers. Each reads its own MCP config, so Toolport connects to them, not to T3 Code.",
   "Every enabled T3 Code instance is connected.": "Every enabled T3 Code instance is connected.",
   "{count} enabled T3 Code instance is not connected.": "{count} enabled T3 Code instance is not connected.",
@@ -1124,5 +1123,13 @@
   "Latest {count} entries available.": "Latest {count} entries available.",
   "Showing 1 matching entry from the latest {total}.": "Showing 1 matching entry from the latest {total}.",
   "No errors in the latest entry.": "No errors in the latest entry.",
-  "No errors in the latest {count} entries.": "No errors in the latest {count} entries."
+  "No errors in the latest {count} entries.": "No errors in the latest {count} entries.",
+  "{name} is off in T3 Code. Connect all skips it; you can still connect it here.": "{name} is off in T3 Code. Connect all skips it; you can still connect it here.",
+  "Connect all": "Connect all",
+  "Step {index} of {total}: {names}": "Step {index} of {total}: {names}",
+  "Connect all stopped.": "Connect all stopped.",
+  "Connected {connected} of {total} T3 Code instance.": "Connected {connected} of {total} T3 Code instance.",
+  "Connected {connected} of {total} T3 Code instances.": "Connected {connected} of {total} T3 Code instances.",
+  "Not connected: {names}.": "Not connected: {names}.",
+  "Skip": "Skip"
 }

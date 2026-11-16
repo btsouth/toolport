@@ -8,6 +8,11 @@ use serde::{Serialize, Serializer};
 const VAULT_FAILURE: &str =
     "Keychain unavailable. Unlock it and retry importing. Client config unchanged.";
 
+/// Whether `error` is a reviewed import's vault write failing (it names no cause).
+pub(crate) fn is_vault_failure(error: &str) -> bool {
+    error.contains(VAULT_FAILURE)
+}
+
 pub(crate) fn provided(value: &str) -> bool {
     let value = value.trim();
     static PLACEHOLDER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {

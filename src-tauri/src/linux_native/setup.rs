@@ -9,6 +9,9 @@ pub(super) struct Completion {
     pub servers: Vec<crate::registry_controller::SetupServerResult>,
     pub tools: Vec<serde_json::Value>,
     pub backup: Option<String>,
+    /// What the connect could not finish tidying up (an old token left in the keychain),
+    /// shown under the servers as React shows them.
+    pub warnings: Vec<String>,
 }
 impl From<String> for Completion {
     fn from(message: String) -> Self {
@@ -48,6 +51,87 @@ fn details_expander(title: &str) -> (gtk::Expander, gtk::Box) {
     (expander, content)
 }
 
+/// How one step of a batch ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StepEnd {
+    /// The action completed and the user went on with Next or Done.
+    Completed,
+    /// The action completed, then Escape or closing the window stopped the batch.
+    CompletedAndStopped,
+    /// The step failed and the user chose Skip: the batch goes on without it.
+    Skipped,
+    /// Cancel, close or Escape before the action completed: the batch stops.
+    Stopped,
+}
+
+/// Extra parts of a review run as one step of a batch, such as T3 Code's Connect all.
+#[derive(Clone, Default)]
+pub(super) struct Step {
+    /// A line under the title, such as "Step 1 of 2: Claude Work", in the current language.
+    pub line: Option<std::rc::Rc<dyn Fn() -> String>>,
+    /// More steps follow this one: its success button says Next instead of Done.
+    pub more: bool,
+    /// Called once when the window closes, with how the step ended and whether the
+    /// keyboard closed it (so the control that gets focus next shows its ring). A step
+    /// with this callback is part of a batch, so a failure also offers Skip.
+    pub closed: Option<std::rc::Rc<dyn Fn(StepEnd, bool)>>,
+    /// Set by [`connect_step`] when the review could not be read: the window offers
+    /// Retry, which closes it without ending the step and reads the review again.
+    pub retry: Option<std::rc::Rc<dyn Fn()>>,
+    /// The batch's keyring flag: set once a step fails with the keyring still locked, so
+    /// later steps don't ask to unlock it (`registry_controller::connect_step`). React's
+    /// batch keeps the same flag.
+    pub keyring_quiet: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// This try is a Retry the user chose: it may ask to unlock the keyring.
+    pub retried: bool,
+}
+
+/// Whether this try of a batch step must not ask to unlock the keyring.
+fn quiet_try(flag: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, retried: bool) -> bool {
+    !retried
+        && flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// After a failed try: a keyring left locked makes the rest of the batch quiet.
+fn note_keyring(flag: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, error: &str) {
+    if let Some(flag) = flag {
+        if crate::registry_controller::keyring_locked_after(error) {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// How a batch step ended from what happened in its window.
+pub(super) fn step_end(completed: bool, advanced: bool, skipped: bool) -> StepEnd {
+    match (completed, advanced, skipped) {
+        (true, true, _) => StepEnd::Completed,
+        (true, false, _) => StepEnd::CompletedAndStopped,
+        (false, _, true) => StepEnd::Skipped,
+        (false, _, false) => StepEnd::Stopped,
+    }
+}
+
+/// Focus `button` in `window`, with the focus ring when the keyboard got here.
+fn focus_with_ring(window: &impl IsA<gtk::Window>, button: &gtk::Button, keyboard: bool) {
+    button.grab_focus();
+    if keyboard {
+        window.as_ref().set_focus_visible(true);
+    }
+}
+
+/// The connect review's title names the client, as React's dialog does.
+pub(super) fn review_title(client_name: &str) -> String {
+    crate::i18n::trf("Review and connect {value0}", &[("value0", client_name)])
+}
+
+/// The title of the window shown when a client's review can't be read: "Connect NAME",
+/// as React's dialog titles it.
+pub(super) fn unreadable_review_title(client_name: &str) -> String {
+    crate::i18n::trf("Connect {value0}", &[("value0", client_name)])
+}
+
 // Keep all reviewed dialog fields and its confirmation callback together.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn review(
@@ -79,6 +163,7 @@ pub(super) fn review(
         action,
         finished,
         credential_page,
+        Step::default(),
     );
 }
 
@@ -148,6 +233,7 @@ pub(super) fn review_with_notice(
         + 'static,
     finished: impl Fn() + 'static,
     _credential_page: Option<super::ServerPage>,
+    step: Step,
 ) {
     let dialog = adw::Window::builder()
         .transient_for(parent)
@@ -166,13 +252,85 @@ pub(super) fn review_with_notice(
     confirm.set_widget_name("toolport-setup-confirm");
     confirm.add_css_class("suggested-action");
     cancel.add_css_class("flat");
+    // Only a batch step offers Skip, and only once the step has failed.
+    let in_batch = step.closed.is_some();
+    let skip = l10n::button("Skip");
+    skip.set_widget_name("toolport-setup-skip");
+    skip.set_visible(false);
+    let skipped = std::rc::Rc::new(std::cell::Cell::new(false));
     root.append(&header);
     let body = gtk::Box::new(gtk::Orientation::Vertical, 16);
     body.set_margin_top(24);
     body.set_margin_bottom(24);
     body.set_margin_start(24);
     body.set_margin_end(24);
-    let lede = {
+    let step_line = step.line.clone().map(|line| {
+        let widget = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["toolport-muted", "caption"])
+            .build();
+        l10n::bind_label_with(&widget, move || line());
+        body.append(&widget);
+        widget
+    });
+    let completed = std::rc::Rc::new(std::cell::Cell::new(false));
+    // Set when Next or Done closes a completed step; Escape there stops the batch.
+    let advanced = std::rc::Rc::new(std::cell::Cell::new(false));
+    // Set when Retry reopens a review that could not be read; the step goes on.
+    let retrying = std::rc::Rc::new(std::cell::Cell::new(false));
+    let keyboard = super::keyboard_tracker(&dialog, parent.gets_focus_visible());
+    // Set while the action runs. The window stays open until it finishes, as Cancel and
+    // Escape do and React's dialog does: closing it would end a batch step as stopped
+    // while the config is still being written. Connected first, so a batch step's handler
+    // below never sees this close.
+    let busy = std::rc::Rc::new(std::cell::Cell::new(false));
+    {
+        let busy = busy.clone();
+        dialog.connect_close_request(move |_| {
+            if busy.get() {
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            }
+        });
+    }
+    if let Some(closed) = step.closed.clone() {
+        let (completed, advanced, skipped, retrying, keyboard) = (
+            completed.clone(),
+            advanced.clone(),
+            skipped.clone(),
+            retrying.clone(),
+            keyboard.clone(),
+        );
+        let closed = std::cell::Cell::new(Some(closed));
+        dialog.connect_close_request(move |_| {
+            if retrying.get() {
+                return gtk::glib::Propagation::Proceed;
+            }
+            if let Some(closed) = closed.take() {
+                let end = step_end(completed.get(), advanced.get(), skipped.get());
+                let keyboard = keyboard.get();
+                // Let this window finish closing before the next one opens.
+                gtk::glib::idle_add_local_once(move || closed(end, keyboard));
+            }
+            gtk::glib::Propagation::Proceed
+        });
+    }
+    // A review that could not be read shows its error as the body, as React's dialog
+    // does, with no lede, server list or Details.
+    let unreadable = step.retry.is_some();
+    let lede = if unreadable {
+        let widget = gtk::Label::builder()
+            .label(disclosure)
+            .xalign(0.0)
+            .wrap(true)
+            .selectable(true)
+            .focusable(false)
+            .build();
+        widget.add_css_class("warning");
+        widget
+    } else {
         let widget = gtk::Label::builder()
             .label(crate::i18n::tr(
                 "Review the selected servers before continuing.",
@@ -198,7 +356,6 @@ pub(super) fn review_with_notice(
             String,
             std::collections::BTreeMap<String, String>,
         >::new()));
-    let busy = std::rc::Rc::new(std::cell::Cell::new(false));
     let required_fields = std::rc::Rc::new(std::cell::RefCell::new(Vec::<(
         gtk::glib::WeakRef<gtk::CheckButton>,
         String,
@@ -506,6 +663,8 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
         .margin_end(12)
         .build();
     content.append(&path);
+    details.set_visible(!unreadable);
+    rows.set_visible(!unreadable);
     body.append(&details);
     let feedback = gtk::Label::builder()
         .xalign(0.0)
@@ -520,8 +679,15 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
     root.append(&scroller);
-    root.append(&super::dialog_footer(&[&cancel, &confirm]));
+    root.append(&super::dialog_footer(&[&cancel, &skip, &confirm]));
     dialog.set_content(Some(&root));
+    {
+        let (closing, skipped) = (dialog.clone(), skipped.clone());
+        skip.connect_clicked(move |_| {
+            skipped.set(true);
+            closing.close();
+        });
+    }
     let closing = dialog.clone();
     let busy_cancel = busy.clone();
     cancel.connect_clicked(move |_| {
@@ -547,14 +713,30 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
         dialog.present();
         return;
     }
+    if let Some(retry) = step.retry.clone() {
+        // The review itself could not be read: Retry reads it again, and a batch can go
+        // on to the next step.
+        let (closing, retrying) = (dialog.clone(), retrying.clone());
+        confirm.connect_clicked(move |_| {
+            retrying.set(true);
+            closing.close();
+            retry();
+        });
+        skip.set_visible(in_batch);
+        dialog.present();
+        focus_with_ring(&dialog, &confirm, keyboard.get());
+        return;
+    }
     let selected = std::rc::Rc::new(selected);
     let credential_choices = std::rc::Rc::new(credential_choices);
     let action = std::sync::Arc::new(action);
     let finished = std::rc::Rc::new(finished);
-    let completed = std::rc::Rc::new(std::cell::Cell::new(false));
     let closing = dialog.clone();
+    let shown = dialog.clone();
+    let more = step.more;
     confirm.connect_clicked(move |button| {
         if completed.get() {
+            advanced.set(true);
             closing.close();
             return;
         }
@@ -576,6 +758,7 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
         busy.set(true);
         button.set_sensitive(false);
         cancel.set_sensitive(false);
+        skip.set_sensitive(false);
         for (check, _row, spinner, _, _, row_error, error_chip) in selected.iter() {
             row_error.set_visible(false);
             error_chip.set_visible(false);
@@ -594,16 +777,18 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
         );
         let credential_choices = credential_choices.clone();
         let refresh_confirm = refresh_confirm.clone();
-        let (feedback, button, cancel, body, rows, details, lede, notice) = (
+        let (feedback, button, cancel, skip, body, rows, details, lede, notice) = (
             feedback.clone(),
             button.clone(),
             cancel.clone(),
+            skip.clone(),
             body.clone(),
             rows.clone(),
             details.clone(),
             lede.clone(),
             notice.clone(),
         );
+        let (shown, keyboard, step_line) = (shown.clone(), keyboard.clone(), step_line.clone());
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || action(chosen, choices, inputs)).await;
             busy.set(false);
@@ -619,6 +804,7 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                 );
             }
             cancel.set_sensitive(true);
+            skip.set_sensitive(true);
             button.set_sensitive(true);
             for (check, row, spinner, _, _, row_error, _) in selected.iter() {
                 row_error.set_visible(false);
@@ -633,7 +819,9 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                 Ok(Ok(outcome)) => {
                     completed.set(true);
                     cancel.set_visible(false);
-                    l10n::bind_text(&button, "Done");
+                    skip.set_visible(false);
+                    // Next while more steps follow, Done on the last.
+                    l10n::bind_text(&button, if more { "Next" } else { "Done" });
                     rows.set_visible(false);
                     details.set_visible(false);
                     lede.set_visible(false);
@@ -657,7 +845,10 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                     status.add_css_class("compact");
                     status.add_css_class("toolport-success");
                     status.set_vexpand(false);
-                    body.prepend(&status);
+                    match &step_line {
+                        Some(line) => body.insert_child_after(&status, Some(line)),
+                        None => body.prepend(&status),
+                    }
                     if let Some((_, description)) = outcome.message.split_once(". ") {
                         let next_step = gtk::Label::builder().label(description).wrap(true).build();
                         body.insert_child_after(&next_step, Some(&status));
@@ -684,6 +875,17 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                         results.append(&row);
                     }
                     body.append(&results);
+                    for warning in &outcome.warnings {
+                        let label = gtk::Label::builder()
+                            .label(warning)
+                            .wrap(true)
+                            .wrap_mode(gtk::pango::WrapMode::WordChar)
+                            .selectable(true)
+                            .xalign(0.0)
+                            .build();
+                        label.add_css_class("dim-label");
+                        body.append(&label);
+                    }
                     if !outcome.tools.is_empty() {
                         let (agent, content) =
                             details_expander(&crate::i18n::tr("What your agent sees"));
@@ -726,8 +928,10 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                         content.append(&label);
                         body.append(&detail);
                     }
-                    // Return activates Done without first tabbing through the results.
-                    button.grab_focus();
+                    // Return activates Next or Done without first tabbing through the
+                    // results; the button was disabled while the step ran, which dropped
+                    // focus and its ring.
+                    focus_with_ring(&shown, &button, keyboard.get());
                     finished();
                 }
                 result => {
@@ -738,6 +942,7 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                     feedback.set_label(&error);
                     feedback.add_css_class("error");
                     l10n::bind_text(&button, "Retry");
+                    skip.set_visible(in_batch);
                     refresh_confirm();
                     let mut has_row_error = false;
                     for (_, _, _, _, name, row_error, error_chip) in selected.iter() {
@@ -749,7 +954,8 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                         }
                     }
                     feedback.set_visible(!has_row_error);
-                    button.grab_focus();
+                    // Retry takes focus; Skip and Cancel are next to it in the footer.
+                    focus_with_ring(&shown, &button, keyboard.get());
                 }
             }
         });
@@ -774,19 +980,45 @@ pub(super) fn connect(
     finished: impl Fn() + 'static,
     credential_page: Option<super::ServerPage>,
 ) {
+    connect_step(
+        parent,
+        client_id,
+        profile,
+        force,
+        std::rc::Rc::new(finished),
+        credential_page,
+        Step::default(),
+    );
+}
+
+/// [`connect`] as one step of a batch. When the review can't be read, its window offers
+/// Retry, which reads it again, and Skip in a batch.
+pub(super) fn connect_step(
+    parent: &gtk::Window,
+    client_id: String,
+    profile: Option<String>,
+    force: bool,
+    finished: std::rc::Rc<dyn Fn()>,
+    credential_page: Option<super::ServerPage>,
+    step: Step,
+) {
     let parent = parent.clone();
     gtk::glib::spawn_future_local(async move {
         let id = client_id.clone();
+        let flag = step.keyring_quiet.clone();
+        let quiet = quiet_try(&flag, step.retried);
         let preview = gtk::gio::spawn_blocking(move || {
-            (
-                crate::registry_controller::preview_client_setup(&id),
-                review_client_name(&id),
-            )
+            let review = crate::registry_controller::connect_step(quiet, || {
+                crate::registry_controller::preview_client_setup(&id)
+            });
+            if let Err(error) = &review {
+                note_keyring(&flag, error);
+            }
+            (review, review_client_name(&id))
         })
-        .await
-        .map(|(preview, name)| preview.map(|preview| (preview, name)));
+        .await;
         match preview {
-            Ok(Ok((preview, client_name))) => {
+            Ok((Ok(preview), client_name)) => {
                 let disclosure = crate::i18n::trf(
                     if force {
                         crate::i18n::msg("Config: {value0}\nBackup directory: {value1}\nSelected entries move after gateway verification. Unchecked entries and plugin servers stay in place. This replaces the customized Toolport entry.")
@@ -799,24 +1031,35 @@ pub(super) fn connect(
                     ],
                 );
                 let notice = gateway_settings_notice(&client_name, &preview.gateway_settings);
+                // The step's first connect follows the batch's keyring flag; a Retry the
+                // user chooses may ask.
+                let flag = step.keyring_quiet.clone();
+                let first = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(!step.retried));
                 review_with_notice(
                     &parent,
-                    &crate::i18n::tr("Review and connect"),
+                    &review_title(&client_name),
                     preview.items,
                     &disclosure,
                     notice,
                     crate::i18n::msg("Connect to Toolport"),
                     true,
                     move |selected, choices, inputs| {
-                        let outcome = crate::registry_controller::migrate_client_reviewed_inputs(
-                            &client_id,
-                            profile.as_deref(),
-                            force,
-                            &selected,
-                            &preview.revision,
-                            &choices,
-                            &inputs,
-                        )?;
+                        let retried = !first.swap(false, std::sync::atomic::Ordering::SeqCst);
+                        let outcome = crate::registry_controller::connect_step(
+                            quiet_try(&flag, retried),
+                            || {
+                                crate::registry_controller::migrate_client_reviewed_inputs(
+                                    &client_id,
+                                    profile.as_deref(),
+                                    force,
+                                    &selected,
+                                    &preview.revision,
+                                    &choices,
+                                    &inputs,
+                                )
+                            },
+                        )
+                        .inspect_err(|error| note_keyring(&flag, error))?;
                         Ok(Completion {
                             message: crate::i18n::trf(
                                 "{value0} connected. Restart it to load Toolport.",
@@ -825,34 +1068,56 @@ pub(super) fn connect(
                             servers: outcome.servers,
                             tools: outcome.tools,
                             backup: outcome.result.outcome.backup,
+                            warnings: outcome.result.outcome.warnings,
                         })
                     },
-                    finished,
+                    move || finished(),
                     credential_page,
+                    step,
                 );
             }
-            Ok(Err(error)) => review(
-                &parent,
-                &crate::i18n::tr("Could not review setup"),
-                Vec::new(),
-                &error,
-                crate::i18n::msg("Close"),
-                false,
-                |_, _, _| Err(crate::i18n::tr("Fix the client config and retry.")),
-                || {},
-                None,
-            ),
-            Err(_) => review(
-                &parent,
-                &crate::i18n::tr("Could not review setup"),
-                Vec::new(),
-                &crate::i18n::tr("Client review stopped."),
-                crate::i18n::msg("Close"),
-                false,
-                |_, _, _| Err(crate::i18n::tr("Retry from Clients.")),
-                || {},
-                None,
-            ),
+            failed => {
+                let (error, client_name) = match failed {
+                    Ok((Err(error), name)) => (error, name),
+                    _ => (
+                        crate::i18n::tr("Client review stopped."),
+                        crate::i18n::tr("Client"),
+                    ),
+                };
+                // Cancel, Skip in a batch, and Retry, which reads the review again, as
+                // React's dialog offers when the config can't be read.
+                let again = (parent.clone(), step.clone());
+                let retry = std::rc::Rc::new(move || {
+                    connect_step(
+                        &again.0,
+                        client_id.clone(),
+                        profile.clone(),
+                        force,
+                        finished.clone(),
+                        credential_page.clone(),
+                        Step {
+                            retried: true,
+                            ..again.1.clone()
+                        },
+                    )
+                });
+                review_with_notice(
+                    &parent,
+                    &unreadable_review_title(&client_name),
+                    Vec::new(),
+                    &error,
+                    None,
+                    crate::i18n::msg("Retry"),
+                    false,
+                    |_, _, _| Err(String::new()),
+                    || {},
+                    None,
+                    Step {
+                        retry: Some(retry),
+                        ..step
+                    },
+                );
+            }
         }
     });
 }
@@ -860,6 +1125,24 @@ pub(super) fn connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Connect all asks about a locked keyring at most once: a step that fails with the
+    /// keyring still locked makes the rest of the batch quiet, while a Retry the user
+    /// chooses may still ask. Outside a batch nothing is quiet. React's batch matches.
+    #[test]
+    fn a_batch_goes_quiet_once_the_keyring_stays_locked() {
+        assert!(!quiet_try(&None, false));
+        let flag = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
+        assert!(!quiet_try(&flag, false), "the first step may ask");
+        crate::clients::backup_vault::fake::locked_store(
+            crate::clients::backup_vault::Unlock::StillLocked,
+            || note_keyring(&flag, "Launch failed"),
+        );
+        assert!(quiet_try(&flag, false), "later steps don't ask");
+        assert!(!quiet_try(&flag, true), "a Retry may ask");
+    }
 
     /// A T3 Code home the page lists before it is saved is named in the connect review as
     /// it is on the page, not "Client".
@@ -908,6 +1191,302 @@ mod tests {
             .find(|w| w.title().as_deref() == Some("Could not review setup"))
             .unwrap()
     }
+    #[test]
+    fn review_title_names_the_client() {
+        assert_eq!(
+            review_title("Claude Code (claude_personal)"),
+            "Review and connect Claude Code (claude_personal)"
+        );
+    }
+
+    #[test]
+    fn a_completed_step_closed_without_next_or_done_stops_the_batch() {
+        assert_eq!(step_end(true, true, false), StepEnd::Completed);
+        assert_eq!(step_end(true, false, false), StepEnd::CompletedAndStopped);
+        assert_eq!(step_end(false, false, true), StepEnd::Skipped);
+        assert_eq!(step_end(false, false, false), StepEnd::Stopped);
+    }
+
+    fn wait_for(done: &dyn Fn() -> bool) {
+        let context = gtk::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() && std::time::Instant::now() < deadline {
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+    }
+    fn window_titled(title: &str) -> Option<gtk::Window> {
+        gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .find(|w| w.title().as_deref() == Some(title) && w.is_visible())
+    }
+    fn button_named(window: &gtk::Window, name: &str) -> gtk::Button {
+        descendants(window.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .find(|b| b.widget_name() == name)
+            .unwrap()
+    }
+    fn label_shown(window: &gtk::Window, text: &str) -> bool {
+        descendants(window.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .any(|l| l.text() == text && l.is_visible())
+    }
+    /// A batch step whose end is recorded in the returned cell.
+    fn recorded_step(
+        line: Option<&'static str>,
+        more: bool,
+    ) -> (Step, std::rc::Rc<std::cell::Cell<Option<StepEnd>>>) {
+        let ended = std::rc::Rc::new(std::cell::Cell::new(None));
+        let record = ended.clone();
+        let step = Step {
+            line: line.map(|line| std::rc::Rc::new(move || line.to_string()) as _),
+            more,
+            closed: Some(std::rc::Rc::new(move |end, _| record.set(Some(end)))),
+            ..Step::default()
+        };
+        (step, ended)
+    }
+    fn review_fixture(title: &str, ok: bool, step: Step) -> gtk::Window {
+        review_with_notice(
+            &gtk::Window::new(),
+            title,
+            Vec::new(),
+            "Fixture",
+            None,
+            "Connect",
+            true,
+            move |_, _, _| {
+                if ok {
+                    Ok("Cursor connected. Restart it to load Toolport.".into())
+                } else {
+                    Err("Permission denied".into())
+                }
+            },
+            || {},
+            None,
+            step,
+        );
+        window_titled(title).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn batch_step_offers_skip_after_a_failure_and_next_after_success() {
+        adw::init().unwrap();
+        // A failing step: its line shows, then Retry and Skip; Skip ends it as skipped.
+        let (step, ended) = recorded_step(Some("Step 1 of 2: Cursor"), true);
+        let window = review_fixture("Failing step", false, step);
+        assert!(label_shown(&window, "Step 1 of 2: Cursor"));
+        let confirm = button_named(&window, "toolport-setup-confirm");
+        let skip = button_named(&window, "toolport-setup-skip");
+        assert!(!skip.is_visible(), "Skip waits for a failure");
+        confirm.emit_clicked();
+        wait_for(&|| confirm.label().as_deref() == Some("Retry"));
+        assert!(skip.is_visible());
+        assert_eq!(skip.label().as_deref(), Some("Skip"));
+        assert!(
+            gtk::prelude::GtkWindowExt::focus(&window).as_ref() == Some(confirm.upcast_ref()),
+            "Retry takes focus when the step fails"
+        );
+        // Retry runs the step again and fails again; Skip still ends it.
+        confirm.emit_clicked();
+        wait_for(&|| confirm.is_sensitive());
+        assert_eq!(confirm.label().as_deref(), Some("Retry"));
+        assert!(ended.get().is_none());
+        skip.emit_clicked();
+        wait_for(&|| ended.get().is_some());
+        assert_eq!(ended.get(), Some(StepEnd::Skipped));
+
+        // A succeeding step with more to come says Next and focuses it; Next ends it.
+        let (step, ended) = recorded_step(None, true);
+        let window = review_fixture("Passing step", true, step);
+        let confirm = button_named(&window, "toolport-setup-confirm");
+        confirm.emit_clicked();
+        wait_for(&|| confirm.label().as_deref() == Some("Next"));
+        assert!(!button_named(&window, "toolport-setup-skip").is_visible());
+        assert!(
+            gtk::prelude::GtkWindowExt::focus(&window).as_ref() == Some(confirm.upcast_ref()),
+            "Next takes focus when the step succeeds"
+        );
+        confirm.emit_clicked();
+        wait_for(&|| ended.get().is_some());
+        assert_eq!(ended.get(), Some(StepEnd::Completed));
+
+        // The last step says Done.
+        let (step, _) = recorded_step(None, false);
+        let window = review_fixture("Last step", true, step);
+        let confirm = button_named(&window, "toolport-setup-confirm");
+        confirm.emit_clicked();
+        wait_for(&|| confirm.label().as_deref() == Some("Done"));
+        assert_eq!(confirm.label().as_deref(), Some("Done"));
+        window.close();
+
+        // Outside a batch a failure never offers Skip.
+        let window = review_fixture("Single failing review", false, Step::default());
+        let confirm = button_named(&window, "toolport-setup-confirm");
+        confirm.emit_clicked();
+        wait_for(&|| confirm.label().as_deref() == Some("Retry"));
+        assert!(!button_named(&window, "toolport-setup-skip").is_visible());
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn escape_stops_a_batch_step_before_or_after_it_connects() {
+        adw::init().unwrap();
+        // Escape on the review: the batch stops.
+        let (step, ended) = recorded_step(None, true);
+        let window = review_fixture("Cancelled step", false, step);
+        window.close();
+        wait_for(&|| ended.get().is_some());
+        assert_eq!(ended.get(), Some(StepEnd::Stopped));
+        // Escape on the success screen: this step connected, the batch stops.
+        let (step, ended) = recorded_step(None, true);
+        let window = review_fixture("Escaped step", true, step);
+        let confirm = button_named(&window, "toolport-setup-confirm");
+        confirm.emit_clicked();
+        wait_for(&|| confirm.label().as_deref() == Some("Next"));
+        window.close();
+        wait_for(&|| ended.get().is_some());
+        assert_eq!(ended.get(), Some(StepEnd::CompletedAndStopped));
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn closing_a_step_window_while_it_connects_keeps_it_open() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        adw::init().unwrap();
+        let release = std::sync::Arc::new(AtomicBool::new(false));
+        let wrote = std::sync::Arc::new(AtomicBool::new(false));
+        let (step, ended) = recorded_step(None, true);
+        let (hold, done) = (release.clone(), wrote.clone());
+        review_with_notice(
+            &gtk::Window::new(),
+            "Slow step",
+            Vec::new(),
+            "Fixture",
+            None,
+            "Connect",
+            true,
+            move |_, _, _| {
+                while !hold.load(SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                done.store(true, SeqCst);
+                Ok("Cursor connected. Restart it to load Toolport.".into())
+            },
+            || {},
+            None,
+            step,
+        );
+        let window = window_titled("Slow step").unwrap();
+        let confirm = button_named(&window, "toolport-setup-confirm");
+        confirm.emit_clicked();
+        wait_for(&|| !confirm.is_sensitive());
+        // The window manager asks the window to close while the config is being written.
+        window.close();
+        let context = gtk::glib::MainContext::default();
+        for _ in 0..20 {
+            while context.iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let still_open = window.is_visible();
+        let not_ended = ended.get().is_none();
+        release.store(true, SeqCst);
+        assert!(still_open, "the window stays open while it connects");
+        assert!(not_ended, "the step has not ended");
+        wait_for(&|| confirm.label().as_deref() == Some("Next"));
+        assert!(wrote.load(SeqCst));
+        // Once it has connected, closing it stops the batch with this row connected.
+        window.close();
+        wait_for(&|| ended.get().is_some());
+        assert_eq!(ended.get(), Some(StepEnd::CompletedAndStopped));
+    }
+
+    #[test]
+    fn a_review_that_cannot_be_read_is_titled_as_react_titles_it() {
+        assert_eq!(unreadable_review_title("Cursor"), "Connect Cursor");
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn a_step_whose_review_cannot_be_read_offers_retry_and_skip() {
+        adw::init().unwrap();
+        let _lock = crate::registry::data_dir_test_lock();
+        let root = std::env::temp_dir().join(format!(
+            "toolport-gtk-step-preview-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        let _data = crate::registry::DataDirOverride::set(root.join("data"));
+        let _home = crate::clients::TestHome::set(&root.join("home"));
+        let parent = gtk::Window::new();
+        let (step, ended) = recorded_step(Some("Step 2 of 2: Gone"), false);
+        connect_step(
+            &parent,
+            "no-such-client".into(),
+            None,
+            false,
+            std::rc::Rc::new(|| {}),
+            None,
+            step,
+        );
+        wait_for(&|| window_titled("Connect Client").is_some());
+        let window = window_titled("Connect Client").unwrap();
+        assert!(label_shown(&window, "Step 2 of 2: Gone"));
+        // The error is the body, as in React's dialog: not a review lede over an empty
+        // list with the reason folded under Details.
+        assert!(!label_shown(
+            &window,
+            "Review the selected servers before continuing."
+        ));
+        let shown = descendants(window.upcast_ref());
+        assert!(
+            !shown
+                .iter()
+                .any(|w| w.is::<gtk::Expander>() && w.is_visible()),
+            "no Details expander"
+        );
+        assert!(
+            !shown
+                .iter()
+                .any(|w| w.is::<gtk::ListBox>() && w.is_visible()),
+            "no empty server list"
+        );
+        assert!(
+            shown.iter().any(|w| w
+                .downcast_ref::<gtk::Label>()
+                .is_some_and(|l| l.has_css_class("warning")
+                    && l.is_visible()
+                    && !l.text().is_empty())),
+            "the error is shown"
+        );
+        let confirm = button_named(&window, "toolport-setup-confirm");
+        assert_eq!(confirm.label().as_deref(), Some("Retry"));
+        assert!(button_named(&window, "toolport-setup-skip").is_visible());
+        assert!(
+            gtk::prelude::GtkWindowExt::focus(&window).as_ref() == Some(confirm.upcast_ref()),
+            "Retry takes focus"
+        );
+        // Retry reads the review again: a new window, and the step has not ended.
+        confirm.emit_clicked();
+        wait_for(&|| window_titled("Connect Client").is_some_and(|again| again != window));
+        assert!(ended.get().is_none(), "Retry does not end the step");
+        let again = window_titled("Connect Client").unwrap();
+        assert_ne!(again, window);
+        button_named(&again, "toolport-setup-skip").emit_clicked();
+        wait_for(&|| ended.get().is_some());
+        assert_eq!(ended.get(), Some(StepEnd::Skipped));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn connect_review_names_the_codex_settings_it_adds() {
         let (sentence, lines) = gateway_settings_notice(
@@ -971,6 +1550,7 @@ mod tests {
             |_, _, _| Ok("Codex connected. Restart it to load Toolport.".into()),
             || {},
             None,
+            Step::default(),
         );
         let window = gtk::Window::list_toplevels()
             .into_iter()
@@ -1274,7 +1854,16 @@ mod tests {
             "Fixture",
             "Connect",
             true,
-            |_, _, _| Ok("Claude Code connected. Restart it to load Toolport.".into()),
+            |_, _, _| {
+                Ok(Completion {
+                    message: "Claude Code connected. Restart it to load Toolport.".into(),
+                    // A connect's cleanup warning is shown, as React shows it.
+                    warnings: vec![
+                        "connected; could not remove the old keychain token: locked".into()
+                    ],
+                    ..Completion::default()
+                })
+            },
             || {},
             None,
         );
@@ -1302,6 +1891,12 @@ mod tests {
             .iter()
             .filter_map(|w| w.downcast_ref::<gtk::Label>())
             .any(|label| label.text() == "Restart it to load Toolport." && label.is_visible()));
+        assert!(widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .any(|label| label.text()
+                == "connected; could not remove the old keychain token: locked"
+                && label.is_visible()));
         assert!(!widgets
             .iter()
             .filter_map(|w| w.downcast_ref::<gtk::Button>())
@@ -1402,6 +1997,7 @@ mod tests {
                         serde_json::json!({"name":"toolport_call_tool"}),
                     ],
                     backup: None,
+                    warnings: Vec::new(),
                 })
             },
             || {},

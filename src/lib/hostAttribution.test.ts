@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { DetectedClient, T3CodeOther } from "./types";
 import {
+  compareClientNames,
+  connectAllOutcome,
+  connectAllSummary,
   hostName,
   hostThreadChip,
   hostedClientName,
@@ -184,7 +187,8 @@ describe("t3CodeBadge", () => {
     expect(t3CodeBadge([])).toBeNull();
     expect(t3CodeBadge([use("Work"), use("Home", false)])).toEqual({
       text: "Used by T3 Code: Work, Home (off)",
-      title: "Work is on in T3 Code\nHome is off in T3 Code",
+      title:
+        "Work is on in T3 Code\nHome is off in T3 Code. Connect all skips it; you can still connect it here.",
     });
     expect(t3CodeBadge([use("Claude")])?.text).toBe("Used by T3 Code: Claude");
   });
@@ -314,5 +318,197 @@ describe("t3CodeGapLines for homes Toolport won't use", () => {
         ],
       ),
     ).toBe(2);
+  });
+});
+
+describe("connectAllSummary", () => {
+  it("says only the count when every instance connected", () => {
+    expect(
+      connectAllSummary({ connected: 3, total: 3, stopped: false, notConnected: [] }),
+    ).toEqual({
+      text: "Connected 3 of 3 T3 Code instances.",
+      title: "Connected 3 of 3 T3 Code instances.",
+      detail: "",
+      success: true,
+      tone: "success",
+    });
+    expect(
+      connectAllSummary({ connected: 1, total: 1, stopped: false, notConnected: [] }),
+    ).toEqual({
+      text: "Connected 1 of 1 T3 Code instance.",
+      title: "Connected 1 of 1 T3 Code instance.",
+      detail: "",
+      success: true,
+      tone: "success",
+    });
+  });
+
+  it("names the rows it left out last, and is not a full success then", () => {
+    expect(
+      connectAllSummary({
+        connected: 1,
+        total: 1,
+        stopped: false,
+        notConnected: [],
+        leftOut: ["F uses Kiro, which isn't installed. Install Kiro, then connect it."],
+      }),
+    ).toEqual({
+      text: "Connected 1 of 1 T3 Code instance. F uses Kiro, which isn't installed. Install Kiro, then connect it.",
+      title: "Connected 1 of 1 T3 Code instance.",
+      detail: "F uses Kiro, which isn't installed. Install Kiro, then connect it.",
+      success: false,
+      tone: "warning",
+    });
+  });
+
+  it("names skipped rows in step order without the stopped prefix", () => {
+    expect(
+      connectAllSummary({
+        connected: 2,
+        total: 4,
+        stopped: false,
+        notConnected: ["Cursor", "Claude Code (claude_personal)"],
+      }),
+    ).toEqual({
+      text: "Connected 2 of 4 T3 Code instances. Not connected: Cursor, Claude Code (claude_personal).",
+      title: "Connected 2 of 4 T3 Code instances.",
+      detail: "Not connected: Cursor, Claude Code (claude_personal).",
+      success: false,
+      tone: "warning",
+    });
+  });
+
+  it("says when the user stopped it", () => {
+    expect(
+      connectAllSummary({
+        connected: 0,
+        total: 5,
+        stopped: true,
+        notConnected: ["Aider", "Codex"],
+      }),
+    ).toEqual({
+      text: "Connect all stopped. Connected 0 of 5 T3 Code instances. Not connected: Aider, Codex.",
+      title: "Connect all stopped.",
+      detail: "Connected 0 of 5 T3 Code instances. Not connected: Aider, Codex.",
+      success: false,
+      tone: "warning",
+    });
+  });
+
+  it("is neutral, not a success, when nothing was left to count", () => {
+    expect(
+      connectAllSummary({ connected: 0, total: 0, stopped: false, notConnected: [] }),
+    ).toEqual({
+      text: "Connected 0 of 0 T3 Code instances.",
+      title: "Connected 0 of 0 T3 Code instances.",
+      detail: "",
+      success: true,
+      tone: "info",
+    });
+  });
+});
+
+describe("connectAllOutcome", () => {
+  it("names instances, not rows, and counts only what is still on when the batch ends", () => {
+    const clients = [
+      client({
+        id: "claude",
+        name: "Claude Code (claude_personal)",
+        gatewayInstalled: true,
+        t3Code: [use("Claude Personal")],
+      }),
+      client({
+        id: "opencode",
+        name: "OpenCode",
+        t3Code: [use("OpenCode Go"), use("OpenCode Zen", false)],
+      }),
+      // Turned off in T3 Code while the batch ran.
+      client({ id: "cursor", name: "Cursor", t3Code: [use("Cursor Work", false)] }),
+      client({ id: "kiro", name: "Kiro", appPresent: false, t3Code: [use("F")] }),
+    ];
+    // Removed from T3 Code while the batch ran: "gone" no longer exists.
+    expect(
+      connectAllOutcome(clients, ["claude"], ["opencode", "cursor", "gone"]),
+    ).toEqual({
+      connected: 1,
+      total: 2,
+      notConnected: ["OpenCode Go"],
+      leftOut: ["F uses Kiro, which isn't installed. Install Kiro, then connect it."],
+    });
+  });
+
+  it("does not count a customized row as connected, as its row does not", () => {
+    const clients = [
+      client({
+        id: "codex",
+        name: "Codex",
+        gatewayInstalled: true,
+        entryState: "customized",
+        t3Code: [use("Codex Home")],
+      }),
+    ];
+    expect(connectAllOutcome(clients, [], ["codex"])).toEqual({
+      connected: 0,
+      total: 1,
+      notConnected: ["Codex Home"],
+      leftOut: [],
+    });
+  });
+
+  it("counts a row the rescan shows connected, even when its step reported a failure", () => {
+    const clients = [
+      client({
+        id: "codex",
+        name: "Codex",
+        gatewayInstalled: true,
+        t3Code: [use("Codex Home")],
+      }),
+      client({ id: "aider", name: "Aider", t3Code: [use("Aider Work")] }),
+    ];
+    expect(connectAllOutcome(clients, [], ["codex", "aider"])).toEqual({
+      connected: 1,
+      total: 2,
+      notConnected: ["Aider Work"],
+      leftOut: [],
+    });
+  });
+
+  it("leaves a batch row out of the left-out lines even when it can no longer be read", () => {
+    const clients = [
+      client({
+        id: "codex",
+        name: "Codex",
+        error: "denied",
+        t3Code: [use("Codex Home")],
+      }),
+    ];
+    expect(connectAllOutcome(clients, [], ["codex"])).toEqual({
+      connected: 0,
+      total: 1,
+      notConnected: ["Codex Home"],
+      leftOut: [],
+    });
+  });
+});
+
+describe("compareClientNames", () => {
+  it("orders by Unicode lowercase name, then id, as GTK's client_order does", () => {
+    const rows = [
+      { id: "zed", name: "Zed" },
+      { id: "ecran", name: "Écran" },
+      { id: "codex@b", name: "codex" },
+      { id: "codex@a", name: "Codex" },
+      { id: "emoji", name: "\u{1F600} Smile" },
+      { id: "private", name: "\uFF21 Wide" },
+    ];
+    // Code point order: the astral emoji sorts after U+FF21, unlike UTF-16 order.
+    expect([...rows].sort(compareClientNames).map((row) => row.id)).toEqual([
+      "codex@a",
+      "codex@b",
+      "zed",
+      "ecran",
+      "private",
+      "emoji",
+    ]);
   });
 });

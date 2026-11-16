@@ -7,15 +7,19 @@ import type { ClientActivity, T3CodeOther } from "@/lib/types";
 import { fmtAgo } from "@/lib/utils";
 import { type RefObject, useEffect, useId, useRef, useState } from "react";
 import {
+  Check,
   ChevronDown,
   ChevronRight,
   Download,
+  Info,
   Layers,
   MonitorCog,
   Puzzle,
   RefreshCw,
+  TriangleAlert,
 } from "lucide-react";
 import { ClientRecoveryBanners } from "@/components/ClientRecoveryBanners";
+import { ConnectReviewDialog } from "@/components/ConnectReviewDialog";
 import { requestClientRecoveryScan } from "@/lib/clientRecoveryEvents";
 import { ClientLogo } from "@/components/ClientLogo";
 import {
@@ -32,12 +36,17 @@ import { SkeletonRows } from "@/components/ui/skeleton";
 import { clientDiscovery } from "@/lib/clientDiscovery";
 import {
   T3_CODE_NAME,
+  compareClientNames,
+  connectAllOutcome,
+  connectAllSummary,
   t3CodeActivitySegment,
   t3CodeBadge,
   t3CodeGapLines,
   t3CodeLeftOut,
   t3CodeLeftOutLines,
   t3CodeAnyEnabled,
+  t3CodeEnabledNames,
+  t3CodeInstanceCount,
   t3CodeStatus,
   t3CodeTargets,
   t3CodeUnconnectedCount,
@@ -79,7 +88,7 @@ function sortClients(clients: DetectedClient[]): DetectedClient[] {
         return 4;
     }
   };
-  return [...clients].sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
+  return [...clients].sort((a, b) => rank(a) - rank(b) || compareClientNames(a, b));
 }
 
 function StatusBadge({ status }: { status: ClientStatus }) {
@@ -361,10 +370,12 @@ function ProfileGroup({
     .sort((a, b) => {
       const left = a.claudeProfile;
       const right = b.claudeProfile;
+      // By the same rule as the rows, which GTK's `profile_order` also uses.
       return (
         Number(!left?.command) - Number(!right?.command) ||
-        (left?.command ?? left?.folder ?? "").localeCompare(
-          right?.command ?? right?.folder ?? "",
+        compareClientNames(
+          { name: left?.command ?? left?.folder ?? "", id: a.id },
+          { name: right?.command ?? right?.folder ?? "", id: b.id },
         )
       );
     });
@@ -472,6 +483,12 @@ function ProfileGroup({
 /** The last T3 Code settings revision the Clients page saw, `null` before the first check.
  * The page rescans whenever it sees a new one, so this matches the scanned clients. */
 export type T3CodeSeen = { value: string | null } | null;
+/** Connect all's summary card, kept until dismissed. */
+export type ConnectAllCard = {
+  title: string;
+  detail: string;
+  tone: "success" | "warning" | "info";
+};
 
 export function ClientsView({
   clients,
@@ -481,6 +498,8 @@ export function ClientsView({
   onSelectClient,
   onChanged,
   t3Seen: keptT3Seen,
+  connectAllCard: keptCard,
+  onConnectAllCard,
 }: {
   clients: DetectedClient[];
   registry: Registry | null;
@@ -491,6 +510,10 @@ export function ClientsView({
   /** Kept with the scanned clients, so a change made while the page is unmounted (a
    * client's details or another view open) rescans on return. */
   t3Seen?: RefObject<T3CodeSeen>;
+  /** Connect all's summary, kept with the page data so opening a client's details and
+   * coming back does not drop it; only Dismiss clears it. */
+  connectAllCard?: ConnectAllCard | null;
+  onConnectAllCard?: (card: ConnectAllCard | null) => void;
 }) {
   const { t, locale } = useI18n();
   const [showMissing, setShowMissing] = useState(false);
@@ -620,11 +643,84 @@ export function ClientsView({
   const t3Gaps = t3CodeGapLines(t3Others);
   const t3LeftOut = t3CodeLeftOut(clients);
   const t3Lines = [...t3CodeLeftOutLines(t3LeftOut), ...t3Gaps];
-  const t3Unconnected = t3CodeUnconnectedCount(
-    t3CodeTargets(sorted),
-    t3LeftOut,
-    t3Others,
-  );
+  // Connect all connects these rows, the ones the count includes that can be connected
+  // as they are; instances Toolport can't use at all have no row to connect.
+  const t3Targets = t3CodeTargets(sorted);
+  const t3Count = t3CodeInstanceCount(t3Targets);
+  const t3Unconnected = t3CodeUnconnectedCount(t3Targets, t3LeftOut, t3Others);
+  const t3Card = useRef<HTMLDivElement>(null);
+  // Connect all went away (everything it could connect is connected, say after a batch)
+  // and took focus with it: the card takes focus instead of the page start.
+  const lastT3Count = useRef(t3Count);
+  useEffect(() => {
+    const was = lastT3Count.current;
+    lastT3Count.current = t3Count;
+    if (was === 0 || t3Count > 0) return;
+    if (!document.activeElement || document.activeElement === document.body)
+      t3Card.current?.focus();
+  }, [t3Count]);
+  const [batch, setBatch] = useState<{
+    targets: DetectedClient[];
+    index: number;
+    /** Ids of the rows connected so far. */
+    connectedIds: string[];
+    /** Ids of the rows skipped so far, in step order. */
+    notConnectedIds: string[];
+    /** A step failed with the keyring still locked: later steps don't ask to unlock it
+     * (the backend's `connect_step`; GTK keeps the same flag). */
+    keyringQuiet: boolean;
+  } | null>(null);
+  // A batch that just ended, waiting for the rescan after it: the summary is worked out
+  // from the rows that rescan finds, so an instance turned off or removed meanwhile is
+  // neither counted nor named. GTK builds it from its rescan the same way.
+  const [summaryDue, setSummaryDue] = useState<{
+    connectedIds: string[];
+    notConnectedIds: string[];
+    stopped: boolean;
+  } | null>(null);
+  const summaryShown = useRef<typeof summaryDue>(null);
+  const [ownSummary, setOwnSummary] = useState<ConnectAllCard | null>(null);
+  const allSummary = onConnectAllCard ? (keptCard ?? null) : ownSummary;
+  const setAllSummary = onConnectAllCard ?? setOwnSummary;
+  useEffect(() => {
+    if (!summaryDue || summaryShown.current === summaryDue) return;
+    summaryShown.current = summaryDue;
+    const { title, detail, tone } = connectAllSummary({
+      ...connectAllOutcome(clients, summaryDue.connectedIds, summaryDue.notConnectedIds),
+      stopped: summaryDue.stopped,
+    });
+    // On the page until dismissed, as GTK shows it and as Clients keeps its restart
+    // reminder: a toast fades before a long list of what was not connected is read.
+    setAllSummary({ title, detail, tone });
+  }, [summaryDue, clients, setAllSummary]);
+  // When the batch closes, focus goes back to Connect all, or to the T3 Code card once
+  // the button is gone, never to the page start.
+  const connectAllButton = useRef<HTMLButtonElement>(null);
+  const focusAfterBatch = useRef(false);
+  const finishBatch = (
+    connectedIds: string[],
+    notConnectedIds: string[],
+    stopped: boolean,
+  ) => {
+    setBatch(null);
+    focusAfterBatch.current = true;
+    // The rescan sets the new rows before it resolves; a failed one keeps the old rows.
+    void (onChangedRef.current?.() ?? Promise.resolve())
+      .catch(() => {})
+      .then(() => setSummaryDue({ connectedIds, notConnectedIds, stopped }));
+  };
+  const onBatchDialogClosed = (event: Event) => {
+    if (!focusAfterBatch.current) return;
+    focusAfterBatch.current = false;
+    event.preventDefault();
+    const button = connectAllButton.current;
+    if (button && !button.disabled) button.focus();
+    else t3Card.current?.focus();
+  };
+  const batchTarget = batch ? batch.targets[batch.index] : undefined;
+  // The step names the instances on its row as they were when Connect all started, the
+  // batch the user agreed to; GTK fixes them the same way.
+  const batchNames = t3CodeEnabledNames(batchTarget);
   const present = sorted.filter((client) => statusOf(client) !== "missing");
   const missing = sorted.filter((client) => statusOf(client) === "missing");
   const connected = present.filter((client) => statusOf(client) === "connected");
@@ -694,6 +790,48 @@ export function ClientsView({
         refreshKey={clients}
         onRecovered={() => void onChanged?.()}
       />
+      {allSummary && (
+        // Connect all's summary, above the card as GTK places it: a spec §10 card that
+        // stays until dismissed. A long name breaks anywhere instead of running off a
+        // narrow window.
+        <StatusCard
+          role="status"
+          testId="connect-all-summary"
+          variant={allSummary.tone}
+          icon={
+            allSummary.tone === "warning" ? (
+              <TriangleAlert />
+            ) : allSummary.tone === "success" ? (
+              <Check />
+            ) : (
+              <Info />
+            )
+          }
+          title={allSummary.title}
+          detail={
+            allSummary.detail && (
+              <span className="select-text [overflow-wrap:anywhere]">
+                {allSummary.detail}
+              </span>
+            )
+          }
+          actions={
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setAllSummary(null);
+                // Focus stays on the page, on Connect all or the card, as in GTK.
+                const button = connectAllButton.current;
+                if (button && !button.disabled) button.focus();
+                else t3Card.current?.focus();
+              }}
+            >
+              {t("Dismiss")}
+            </Button>
+          }
+        />
+      )}
       {sessionError && (
         <ErrorCallout
           title={translate("Client session history could not be read.")}
@@ -711,7 +849,14 @@ export function ClientsView({
         />
       )}
       {(hasT3Rows || t3Gaps.length > 0) && (
-        <div data-t3-code-card="" role="group" aria-label={T3_CODE_NAME}>
+        <div
+          data-t3-code-card=""
+          ref={t3Card}
+          tabIndex={-1}
+          role="group"
+          aria-label={T3_CODE_NAME}
+          className="rounded-xl outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+        >
           <StatusCard
             icon={<Layers />}
             title={T3_CODE_NAME}
@@ -732,8 +877,76 @@ export function ClientsView({
                 ))}
               </>
             }
+            actions={
+              t3Count > 0 && (
+                <Button
+                  ref={connectAllButton}
+                  size="sm"
+                  disabled={batch !== null}
+                  onClick={() =>
+                    setBatch({
+                      targets: t3Targets,
+                      index: 0,
+                      connectedIds: [],
+                      notConnectedIds: [],
+                      keyringQuiet: false,
+                    })
+                  }
+                >
+                  {t("Connect all")}
+                </Button>
+              )
+            }
           />
         </div>
+      )}
+      {batch && batchTarget && (
+        <ConnectReviewDialog
+          key={`${batch.index}:${batchTarget.id}`}
+          clientId={batchTarget.id}
+          clientName={batchTarget.name}
+          // The access saved for the row, as its own Connect keeps it.
+          profile={registry?.clientScopes?.[batchTarget.id] || undefined}
+          step={t("Step {index} of {total}: {names}", {
+            index: batch.index + 1,
+            total: batch.targets.length,
+            names: batchNames.join(", "),
+          })}
+          hasNext={batch.index + 1 < batch.targets.length}
+          onCloseAutoFocus={onBatchDialogClosed}
+          keyringQuiet={batch.keyringQuiet}
+          onKeyringLocked={() =>
+            setBatch((current) => current && { ...current, keyringQuiet: true })
+          }
+          onSkip={() => {
+            const notConnectedIds = [...batch.notConnectedIds, batchTarget.id];
+            const next = batch.index + 1;
+            if (next >= batch.targets.length)
+              finishBatch(batch.connectedIds, notConnectedIds, false);
+            else setBatch({ ...batch, index: next, notConnectedIds });
+          }}
+          onClose={(done, advance) => {
+            const next = batch.index + 1;
+            const connectedIds = done
+              ? [...batch.connectedIds, batchTarget.id]
+              : batch.connectedIds;
+            const rest = batch.targets.slice(done ? next : batch.index);
+            if (!advance && rest.length > 0) {
+              // Cancel, close or Escape, on a review or a completion screen, stops the
+              // batch; the rows not connected yet stay unconnected.
+              finishBatch(
+                connectedIds,
+                [...batch.notConnectedIds, ...rest.map((target) => target.id)],
+                true,
+              );
+              return;
+            }
+            if (next >= batch.targets.length)
+              finishBatch(connectedIds, batch.notConnectedIds, false);
+            else setBatch({ ...batch, index: next, connectedIds });
+          }}
+          onConnected={() => {}}
+        />
       )}
 
       {connected.length > 0 && (

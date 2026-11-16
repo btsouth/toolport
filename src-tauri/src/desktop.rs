@@ -793,12 +793,27 @@ struct MigrateResult {
 #[tauri::command]
 async fn preview_client_setup(
     client_id: String,
+    quiet: Option<bool>,
 ) -> Result<crate::registry_controller::ClientSetupReview, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        crate::registry_controller::preview_client_setup(&client_id)
+        // `quiet`: a Connect all step after the keyring stayed locked (see `connect_step`).
+        crate::registry_controller::connect_step(quiet.unwrap_or(false), || {
+            crate::registry_controller::preview_client_setup(&client_id)
+        })
     })
     .await
     .map_err(|_| "Client review stopped".to_string())?
+}
+
+/// Whether a failed Connect all step left the keyring locked, so the rest of the run is
+/// quiet. Never asks to unlock.
+#[tauri::command]
+async fn keyring_locked_after(error: String) -> bool {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::registry_controller::keyring_locked_after(&error)
+    })
+    .await
+    .unwrap_or(true)
 }
 
 /// The client settings a connect or reset adds to Toolport's entry, as the TOML
@@ -834,17 +849,20 @@ async fn migrate_client(
     credential_inputs: Option<
         std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     >,
+    quiet: Option<bool>,
 ) -> Result<MigrateResult, String> {
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        crate::registry_controller::migrate_client_reviewed_inputs(
-            &client_id,
-            profile.as_deref(),
-            force.unwrap_or(false),
-            &selected,
-            &revision,
-            &secret_choices.unwrap_or_default(),
-            &credential_inputs.unwrap_or_default(),
-        )
+        crate::registry_controller::connect_step(quiet.unwrap_or(false), || {
+            crate::registry_controller::migrate_client_reviewed_inputs(
+                &client_id,
+                profile.as_deref(),
+                force.unwrap_or(false),
+                &selected,
+                &revision,
+                &secret_choices.unwrap_or_default(),
+                &credential_inputs.unwrap_or_default(),
+            )
+        })
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -4755,6 +4773,7 @@ pub fn run() {
             remove_toolport_data,
             migrate_client,
             preview_client_setup,
+            keyring_locked_after,
             preview_gateway_settings,
             set_secret,
             set_secret_reference,
