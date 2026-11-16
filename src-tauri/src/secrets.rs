@@ -338,7 +338,13 @@ mod platform {
     }
 
     pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
-        dpk::get(&account(server_id, key))
+        read_secret(server_id, key).map_err(super::ReadFailure::into_message)
+    }
+
+    /// [`get_secret_result`] with the kind of failure: an item whose data is
+    /// not text is damaged; every keychain status is the store's.
+    pub fn read_secret(server_id: &str, key: &str) -> Result<Option<String>, super::ReadFailure> {
+        dpk::get_kinded(&account(server_id, key))
     }
 
     pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
@@ -484,6 +490,16 @@ mod platform {
         /// to `Ok(None)`; the returned CFData is decoded to a `String`.
         pub fn get(account_str: &str) -> Result<Option<String>, String> {
             get_inner(account_str, false).map_err(|e| e.to_string())
+        }
+        pub fn get_kinded(
+            account_str: &str,
+        ) -> Result<Option<String>, crate::secrets::ReadFailure> {
+            get_inner(account_str, false).map_err(|e| match e {
+                crate::secrets::BackupSecretError::Corrupt => {
+                    crate::secrets::ReadFailure::Damaged(e.to_string())
+                }
+                _ => crate::secrets::ReadFailure::Unavailable(e.to_string()),
+            })
         }
         pub fn get_backup(
             account_str: &str,
@@ -1030,10 +1046,28 @@ mod platform {
     }
 
     pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
-        match with_service(|| Entry::new(SERVICE, &account(server_id, key))?.get_password()) {
+        read_secret(server_id, key).map_err(super::ReadFailure::into_message)
+    }
+
+    /// [`get_secret_result`] with the kind of failure.
+    pub fn read_secret(server_id: &str, key: &str) -> Result<Option<String>, super::ReadFailure> {
+        read_kinded(with_service(|| {
+            Entry::new(SERVICE, &account(server_id, key))?.get_password()
+        }))
+    }
+
+    /// An item whose secret is not text is damaged; a locked, missing or
+    /// failing service, or more than one match, is the store's state.
+    pub(super) fn read_kinded(
+        read: Result<String, keyring::Error>,
+    ) -> Result<Option<String>, super::ReadFailure> {
+        match read {
             Ok(v) => Ok(Some(v)),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(e.to_string()),
+            Err(e @ keyring::Error::BadEncoding(_)) => {
+                Err(super::ReadFailure::Damaged(e.to_string()))
+            }
+            Err(e) => Err(super::ReadFailure::Unavailable(e.to_string())),
         }
     }
 
@@ -1370,6 +1404,26 @@ mod platform {
         }
 
         use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// A secret that is not text can never be read back, so it is
+        /// damaged; a locked or failing service may give it up later.
+        #[test]
+        fn a_read_that_cannot_decode_is_damaged_and_a_failing_store_is_not() {
+            assert!(matches!(
+                read_kinded(Err(keyring::Error::BadEncoding(vec![0xff, 0xfe]))),
+                Err(crate::secrets::ReadFailure::Damaged(_))
+            ));
+            for error in [
+                keyring::Error::NoStorageAccess("the collection is locked".into()),
+                keyring::Error::PlatformFailure("org.freedesktop.secrets vanished".into()),
+            ] {
+                assert!(matches!(
+                    read_kinded(Err(error)),
+                    Err(crate::secrets::ReadFailure::Unavailable(_))
+                ));
+            }
+            assert_eq!(read_kinded(Err(keyring::Error::NoEntry)), Ok(None));
+        }
 
         fn dead_daemon() -> keyring::Error {
             keyring::Error::PlatformFailure("org.freedesktop.secrets vanished".into())
@@ -1878,6 +1932,25 @@ pub fn get_vault_secret_result(server_id: &str, key: &str) -> Result<Option<Stri
     registered(server_id, key, value)
 }
 
+/// Why a stored value could not be read. [`scrub_previous`] needs the kind:
+/// a damaged value can never be read back, so there is nothing to scrub or
+/// keep, while a locked or unavailable store may give it up later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReadFailure {
+    /// The stored data is damaged or incomplete.
+    Damaged(String),
+    /// The store is locked or unavailable right now.
+    Unavailable(String),
+}
+
+impl ReadFailure {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::Damaged(message) | Self::Unavailable(message) => message,
+        }
+    }
+}
+
 /// Stable recovery categories. No backend error text or secret bytes cross this boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2037,26 +2110,42 @@ fn scrub_previous(server_id: &str, key: &str, replacement: Option<&str>) -> Resu
     if server_id == INTERNAL_SERVER_ID {
         return Ok(());
     }
+    // The whole file vault is loaded for any write too, so its read errors
+    // always stop the change.
     let stored = if file::active() {
-        file::get_secret_result(server_id, key)
+        file::get_secret_result(server_id, key).map_err(ReadFailure::Unavailable)
     } else {
-        platform::get_secret_result(server_id, key)
+        platform::read_secret(server_id, key)
     };
     #[cfg(test)]
     let stored = if tests::read_is_injected_failure(key) {
-        Err("injected secret read failure".to_string())
+        Err(ReadFailure::Unavailable(
+            "injected secret read failure".to_string(),
+        ))
     } else if tests::read_is_injected_damage(key) {
-        Err("injected damaged secret".to_string())
+        Err(ReadFailure::Damaged("injected damaged secret".to_string()))
     } else {
         stored
     };
-    // An unread value could be neither scrubbed nor kept: change nothing.
-    let stored = stored.map_err(|error| {
-        eprintln!("toolport: the stored value could not be read for its log cleanup ({error})");
-        crate::i18n::tr(
-            "The old value could not be kept for its log cleanup, so nothing was changed. Try again.",
-        )
-    })?;
+    let stored = match stored {
+        Ok(stored) => stored,
+        // Damaged data can never be read back: there is no old value to
+        // scrub or keep, and refusing would leave it unfixable.
+        Err(ReadFailure::Damaged(error)) => {
+            eprintln!(
+                "toolport: the old value could not be read ({error}), so its log cleanup was skipped"
+            );
+            None
+        }
+        // A locked or unavailable store may give the value up later: change
+        // nothing, so the chance to scrub it is not lost.
+        Err(ReadFailure::Unavailable(error)) => {
+            eprintln!("toolport: the stored value could not be read for its log cleanup ({error})");
+            return Err(crate::i18n::tr(
+                "The old value could not be kept for its log cleanup, so nothing was changed. Try again.",
+            ));
+        }
+    };
     if let Some(old) = stored {
         if Some(old.as_str()) != replacement {
             if let Err(error) = crate::secret_redact::scrub_value_now(server_id, key, &old) {
