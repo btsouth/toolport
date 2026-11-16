@@ -3,7 +3,7 @@
   "name": "io.github.btsouth/toolport",
   "title": "Toolport",
   "description": "Local MCP gateway: set up servers once and share them with every AI client",
-  "version": "2.3.6",
+  "version": "2.3.7",
   "websiteUrl": "https://toolport.app",
   "repository": {
     "url": "https://github.com/btsouth/toolport",
@@ -20,7 +20,7 @@
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/btsouth/toolport-gateway:v2.3.6",
+      "identifier": "ghcr.io/btsouth/toolport-gateway:v2.3.7",
       "transport": {
         "type": "stdio"
       },

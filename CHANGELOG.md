@@ -6,10 +6,13 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
-## [2.3.6] - 2026-11-16
+## [2.3.7] - 2026-11-16
 
-Toolport 2.3.6 keeps your stored secrets out of logs and messages, protects the
-credentials in client config backups, and fixes uninstall and client setup on macOS.
+Toolport 2.3.7 keeps your stored secrets out of logs and messages, protects the
+credentials in client config backups, fixes uninstall and client setup on macOS,
+and helps you connect the agents T3 Code runs.
+
+2.3.6 was not released; everything planned for it is in 2.3.7.
 
 If you are on Toolport 1.24.x, this is also your update to Toolport 2. Read the
 [upgrade guide](https://github.com/btsouth/toolport/blob/main/docs/migration.md)
@@ -59,6 +62,14 @@ before updating.
 - Toolport finds the Claude Code and Codex instances T3 Code runs, labels their
   rows on Clients, and connects them like any other client. Activity and approval
   prompts show when a call came through T3 Code. (#1341, #1347)
+- With T3 Code installed, Clients has a T3 Code card. It counts the enabled
+  instances that are not connected yet and lists each one Toolport can't use as
+  it is, with why and what to do. (#1365)
+- The T3 Code card offers **Connect all**, which opens the usual connect review
+  for each row its instances use, one step at a time, with Next, Retry and Skip.
+  Each step keeps the access saved for its row, and stopping keeps the rows
+  already connected. With a locked keyring it asks to unlock once, not on every
+  step. A summary card says what was connected. (#1390)
 - The GTK server editor has a Startup timeout field, shows the Test connection
   result next to the buttons, and points out each field that needs fixing. (#1357)
 - Run on the Tools tab now starts a server that is not running yet. Activity
@@ -97,6 +108,8 @@ before updating.
   was. (#1349, #1366)
 - Activity durations now include the time a call waited for its server to
   start. (#1366)
+- Activity counts the rows it shows as entries, since they include approvals and
+  searches as well as tool calls. (#1367)
 - Server names and status stay readable in narrow windows, connection errors
   read plainly (for example "Connection failed: Connection refused"), and the
   Default access menu marks the current choice. (#1369, #1380)
