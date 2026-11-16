@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SecretsDialog } from "./SecretsDialog";
 import type { ServerEntry } from "@/lib/types";
 import { hasAuthToken, setAuthToken, clearAuthToken } from "@/lib/api";
+import { setLanguage } from "@/lib/i18n";
 
 const api = vi.hoisted(() => ({
   start: vi.fn(),
@@ -200,9 +201,9 @@ describe("access token in the dialog (simulated IPC)", () => {
     vi.mocked(clearAuthToken).mockResolvedValue(undefined);
   });
 
-  it("keeps focus in the token field after Save", async () => {
+  it("names the token field and keeps focus in it after Save", async () => {
     const { user } = await open();
-    const field = screen.getByPlaceholderText("paste access token");
+    const field = screen.getByLabelText("Access token");
     await user.type(field, "synthetic-token");
     await user.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() =>
@@ -219,8 +220,26 @@ describe("access token in the dialog (simulated IPC)", () => {
     expect(clearAuthToken).not.toHaveBeenCalled();
     await user.click(screen.getByRole("button", { name: "Remove" }));
     await waitFor(() => expect(clearAuthToken).toHaveBeenCalledWith(server.id));
-    await waitFor(() =>
-      expect(screen.getByPlaceholderText("paste access token")).toHaveFocus(),
+    await waitFor(() => expect(screen.getByLabelText("Access token")).toHaveFocus());
+  });
+
+  it("says in plain words, in the user's language, that the server refused sign-in", async () => {
+    api.start.mockResolvedValue("refused");
+    api.cancel.mockResolvedValue(true);
+    api.authenticate.mockRejectedValue(
+      "This server does not allow browser sign-in from Toolport. Paste a token from your provider instead.",
     );
+    const { user } = await open();
+    await act(() => setLanguage("de"));
+    try {
+      await user.click(
+        screen.getByRole("button", { name: "Melden Sie sich mit dem Browser an" }),
+      );
+      expect(await screen.findByRole("status")).toHaveTextContent(
+        "Dieser Server erlaubt keine Browser-Anmeldung über Toolport.",
+      );
+    } finally {
+      await act(() => setLanguage("en"));
+    }
   });
 });

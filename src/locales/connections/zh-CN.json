@@ -936,6 +936,7 @@
   "This server didn't declare an API key. If it needs one, add it as an environment variable below. ": "该服务器未声明 API 密钥。如果需要，请将其添加为下面的环境变量。 ",
   "This server needs a pasted token. OAuth sign-in isn't available here. ": "此服务器需要手动粘贴令牌，不支持 OAuth 登录。 ",
   "This server supports browser sign-in. A pasted access token is optional if your provider supplies one. ": "此服务器支持浏览器登录。如果提供商提供访问令牌，也可选择粘贴该令牌。 ",
+  "This server does not allow browser sign-in from Toolport. Paste a token from your provider instead.": "此服务器不允许从 Toolport 进行浏览器登录。请改为粘贴提供商提供的令牌。",
   "This tool takes no arguments.": "该工具不需要任何参数。",
   "This tool's baseline predates first-seen tracking, so it has no dates yet. Toolport fills them in automatically the next time a client lists tools through the gateway.": "此工具的基线早于首次发现时间追踪功能，因此尚无时间记录。下次客户端通过网关列出工具时，Toolport 会自动补全这些时间。",
   "This value is used only for the selected server. It is saved only if connection succeeds.": "该值仅用于选定的服务器。仅当连接成功时才会保存。",

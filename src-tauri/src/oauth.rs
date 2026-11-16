@@ -1209,6 +1209,11 @@ struct DcrResponse {
     client_id: String,
 }
 
+/// Shown when a server refuses to register Toolport for browser sign-in. Both
+/// shells translate this exact text, so keep it in step with their catalogs.
+pub const REGISTRATION_REFUSED: &str =
+    "This server does not allow browser sign-in from Toolport. Paste a token from your provider instead.";
+
 fn register_client(
     registration_endpoint: &str,
     redirect_uri: &str,
@@ -1219,7 +1224,10 @@ fn register_client(
         .post(registration_endpoint)
         .send_json(body)
         .retain_status_body()
-        .map_err(|e| e.to_string())?
+        .map_err(|e| match e {
+            crate::http_client::Error::Status(401 | 403, _) => REGISTRATION_REFUSED.to_string(),
+            e => e.to_string(),
+        })?
         .into_body()
         .with_config()
         .limit(u64::MAX)
@@ -2302,6 +2310,47 @@ mod tests {
                 validate_authorization_response_issuer(Some(different), expected, false).is_err(),
                 "must compare the issuer exactly: {different}"
             );
+        }
+    }
+
+    #[test]
+    fn refused_client_registration_says_so_in_plain_words() {
+        for status in ["401 Unauthorized", "403 Forbidden"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                use std::io::BufRead;
+                let (mut stream, _) = listener.accept().unwrap();
+                // Read the whole request first, or the client may see a reset
+                // instead of the status.
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                let mut body = vec![0u8; length];
+                reader.read_exact(&mut body).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                )
+                .unwrap();
+            });
+            let error = register_client(
+                &format!("http://{address}/register"),
+                "http://127.0.0.1:1/callback",
+                false,
+            )
+            .unwrap_err();
+            server.join().unwrap();
+            assert_eq!(error, REGISTRATION_REFUSED);
         }
     }
 

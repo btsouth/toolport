@@ -936,6 +936,7 @@
   "This server didn't declare an API key. If it needs one, add it as an environment variable below. ": "This server didn't declare an API key. If it needs one, add it as an environment variable below. ",
   "This server needs a pasted token. OAuth sign-in isn't available here. ": "This server needs a pasted token. OAuth sign-in isn't available here. ",
   "This server supports browser sign-in. A pasted access token is optional if your provider supplies one. ": "This server supports browser sign-in. A pasted access token is optional if your provider supplies one. ",
+  "This server does not allow browser sign-in from Toolport. Paste a token from your provider instead.": "This server does not allow browser sign-in from Toolport. Paste a token from your provider instead.",
   "This tool takes no arguments.": "This tool takes no arguments.",
   "This tool's baseline predates first-seen tracking, so it has no dates yet. Toolport fills them in automatically the next time a client lists tools through the gateway.": "This tool's baseline predates first-seen tracking, so it has no dates yet. Toolport fills them in automatically the next time a client lists tools through the gateway.",
   "This value is used only for the selected server. It is saved only if connection succeeds.": "This value is used only for the selected server. It is saved only if connection succeeds.",

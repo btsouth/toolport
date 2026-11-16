@@ -10778,6 +10778,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
             .css_classes(["toolport-input"])
             .build();
         l10n::bind_placeholder(&widget, "Paste a new token");
+        l10n::bind_accessible_label(&widget, "Bearer token");
         widget
     };
     token.set_widget_name("auth-token");
@@ -11376,7 +11377,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
                         page.reprobe_after_auth_change(&reprobe_id);
                     }
                     Ok(Err(error)) => {
-                        feedback.set_label(&error);
+                        feedback.set_label(&sign_in_failure(&error));
                         feedback.remove_css_class("success");
                         feedback.add_css_class("error");
                     }
@@ -11599,6 +11600,16 @@ fn credential_feedback(label: &gtk::Label, error: bool) {
     } else {
         label.remove_css_class("error");
         label.add_css_class("success");
+    }
+}
+
+/// Browser sign-in errors are shown as they come, except a refused client
+/// registration, which gets plain words in the user's language.
+fn sign_in_failure(error: &str) -> String {
+    if error == crate::oauth::REGISTRATION_REFUSED {
+        crate::i18n::lookup(crate::oauth::REGISTRATION_REFUSED)
+    } else {
+        error.to_string()
     }
 }
 
@@ -12713,6 +12724,22 @@ mod credential_dialog_tests {
             Ok(false)
         );
         editor.close();
+
+        // A refused sign-in reads in the user's language, never as a raw 401.
+        crate::i18n::set_language("de").unwrap();
+        assert_eq!(
+            sign_in_failure(crate::oauth::REGISTRATION_REFUSED),
+            "Dieser Server erlaubt keine Browser-Anmeldung über Toolport. Fügen Sie stattdessen ein Token Ihres Anbieters ein."
+        );
+        crate::i18n::set_language("en").unwrap();
+    }
+
+    #[test]
+    fn other_sign_in_failures_show_as_they_come() {
+        assert_eq!(
+            sign_in_failure("the browser callback timed out"),
+            "the browser callback timed out"
+        );
     }
 }
 

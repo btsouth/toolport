@@ -936,6 +936,7 @@
   "This server didn't declare an API key. If it needs one, add it as an environment variable below. ": "Ce serveur n'a pas déclaré de clé API. S'il en a besoin, ajoutez-la comme variable d'environnement ci-dessous. ",
   "This server needs a pasted token. OAuth sign-in isn't available here. ": "Ce serveur nécessite un jeton à coller. La connexion OAuth n'est pas disponible ici. ",
   "This server supports browser sign-in. A pasted access token is optional if your provider supplies one. ": "Ce serveur prend en charge la connexion par navigateur. Coller un jeton d'accès est facultatif si votre fournisseur en fournit un. ",
+  "This server does not allow browser sign-in from Toolport. Paste a token from your provider instead.": "Ce serveur n’autorise pas la connexion par navigateur depuis Toolport. Collez plutôt un jeton fourni par votre fournisseur.",
   "This tool takes no arguments.": "Cet outil ne prend aucun argument.",
   "This tool's baseline predates first-seen tracking, so it has no dates yet. Toolport fills them in automatically the next time a client lists tools through the gateway.": "La référence de cet outil précède le suivi des premières détections et ne contient donc pas encore de dates. Toolport les renseignera automatiquement la prochaine fois qu'un client listera les outils via la passerelle.",
   "This value is used only for the selected server. It is saved only if connection succeeds.": "Cette valeur est utilisée uniquement pour le serveur sélectionné. Il n'est enregistré que si la connexion réussit.",

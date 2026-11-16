@@ -936,6 +936,7 @@
   "This server didn't declare an API key. If it needs one, add it as an environment variable below. ": "이 서버는 API 키를 선언하지 않았습니다. 필요한 경우 아래 환경 변수로 추가하세요. ",
   "This server needs a pasted token. OAuth sign-in isn't available here. ": "이 서버에는 토큰을 붙여넣어야 합니다. 여기서는 OAuth 로그인을 사용할 수 없습니다. ",
   "This server supports browser sign-in. A pasted access token is optional if your provider supplies one. ": "이 서버는 브라우저 로그인을 지원합니다. 공급자가 제공하는 경우 붙여넣은 액세스 토큰은 선택 사항입니다. ",
+  "This server does not allow browser sign-in from Toolport. Paste a token from your provider instead.": "이 서버는 Toolport의 브라우저 로그인을 허용하지 않습니다. 대신 공급자의 토큰을 붙여넣으세요.",
   "This tool takes no arguments.": "이 도구는 인수를 사용하지 않습니다.",
   "This tool's baseline predates first-seen tracking, so it has no dates yet. Toolport fills them in automatically the next time a client lists tools through the gateway.": "이 도구의 기준은 최초 발견 추적 이전에 생성되어 날짜가 없습니다. 다음에 클라이언트가 게이트웨이로 도구를 나열하면 자동 기록됩니다.",
   "This value is used only for the selected server. It is saved only if connection succeeds.": "이 값은 선택한 서버에만 사용됩니다. 연결이 성공한 경우에만 저장됩니다.",

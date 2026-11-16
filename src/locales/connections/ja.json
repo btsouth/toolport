@@ -936,6 +936,7 @@
   "This server didn't declare an API key. If it needs one, add it as an environment variable below. ": "このサーバーは API キーを宣言していません。必要な場合は、以下の環境変数として追加します。 ",
   "This server needs a pasted token. OAuth sign-in isn't available here. ": "このサーバーにはトークンの貼り付けが必要です。ここではOAuthによるサインインは利用できません。 ",
   "This server supports browser sign-in. A pasted access token is optional if your provider supplies one. ": "このサーバーはブラウザーのサインインをサポートしています。プロバイダーが提供する場合、貼り付けたアクセス トークンはオプションです。 ",
+  "This server does not allow browser sign-in from Toolport. Paste a token from your provider instead.": "このサーバーは Toolport からのブラウザー サインインを許可していません。代わりにプロバイダーのトークンを貼り付けてください。",
   "This tool takes no arguments.": "このツールは引数を取りません。",
   "This tool's baseline predates first-seen tracking, so it has no dates yet. Toolport fills them in automatically the next time a client lists tools through the gateway.": "このツールの基準は初回検出の記録開始前に作られたため、日付がありません。次回クライアントがゲートウェイ経由で一覧を取得すると自動記録します。",
   "This value is used only for the selected server. It is saved only if connection succeeds.": "この値は、選択したサーバーに対してのみ使用されます。接続が成功した場合にのみ保存されます。",

@@ -50,6 +50,19 @@ function secretErrorMessage(e: unknown): string {
   return msg;
 }
 
+// The backend's exact words for a server that refuses to register Toolport for
+// browser sign-in (oauth::REGISTRATION_REFUSED), shown in the user's language.
+const REGISTRATION_REFUSED =
+  "This server does not allow browser sign-in from Toolport. Paste a token from your provider instead.";
+function signInFailureMessage(e: unknown): string {
+  const msg = `${e}`;
+  return msg === REGISTRATION_REFUSED
+    ? translate(
+        "This server does not allow browser sign-in from Toolport. Paste a token from your provider instead.",
+      )
+    : msg;
+}
+
 /** Put focus on `target` after an action unless the user already moved it. */
 function refocusIfLost(target: () => HTMLElement | null) {
   // Run after Radix has restored focus from a closing confirmation.
@@ -543,7 +556,7 @@ export function SecretsDialog({
         }
       }
       if (!fresh()) return;
-      const msg = `${e}`;
+      const msg = signInFailureMessage(e);
       setOauthMessage(msg);
       toastError(msg);
     } finally {
@@ -722,6 +735,7 @@ export function SecretsDialog({
                       <Input
                         ref={tokenInputRef}
                         type="password"
+                        aria-label={t("Access token")}
                         placeholder={
                           authSet ? t("•••••••• (set)") : t("paste access token")
                         }
