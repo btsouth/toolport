@@ -206,6 +206,12 @@ fn settings_path() -> Option<PathBuf> {
     Some(data_dir()?.join("userdata").join("settings.json"))
 }
 
+/// Absolute, or rooted on the current drive (`\net\x` on Windows): a fixed folder, never
+/// one below T3 Code's working directory. A rooted one is never inside home by its text.
+fn rooted(path: &Path) -> bool {
+    path.is_absolute() || path.has_root()
+}
+
 /// `~`, `~/x` and `~\x` as T3 Code's `expandHomePath` reads them; anything else as is.
 fn expand(raw: &str, home: &Path) -> Option<PathBuf> {
     let raw = raw.trim();
@@ -977,7 +983,7 @@ fn instance_of(
                 Ok(Some(expand_text(value, home)))
             }
             Some(value) => match expand(value, home) {
-                Some(path) if path.is_absolute() => Ok(Some(path)),
+                Some(path) if rooted(&path) => Ok(Some(path)),
                 // Relative to T3 Code's working directory, which Toolport cannot know.
                 _ => Err(gap(T3CodeGap::RelativeHome, enabled)),
             },
@@ -998,7 +1004,7 @@ fn instance_of(
                 not_plain.set(true);
                 Ok(Some(PathBuf::from(value)))
             }
-            Some(value) if Path::new(value).is_absolute() => Ok(Some(PathBuf::from(value))),
+            Some(value) if rooted(Path::new(value)) => Ok(Some(PathBuf::from(value))),
             Some(_) => Err(gap(T3CodeGap::RelativeHome, enabled)),
         }
     };
@@ -1107,9 +1113,13 @@ pub fn other_instances() -> Vec<T3CodeOther> {
             let path = settings_path().unwrap_or_default();
             let shown = home()
                 .and_then(|home| {
-                    path.strip_prefix(&home)
-                        .ok()
-                        .map(|rest| format!("~/{}", rest.display()))
+                    path.strip_prefix(&home).ok().map(|rest| {
+                        let parts: Vec<_> = rest
+                            .components()
+                            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                            .collect();
+                        format!("~/{}", parts.join("/"))
+                    })
                 })
                 .unwrap_or_else(|| path.display().to_string());
             vec![T3CodeOther {
