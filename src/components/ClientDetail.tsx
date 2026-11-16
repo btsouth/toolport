@@ -139,6 +139,11 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     text: string;
   } | null>(null);
   const showRestartNotice = restartNotice?.clientId === client.id ? restartNotice : null;
+  const [actionError, setActionError] = useState<{
+    clientId: string;
+    text: string;
+  } | null>(null);
+  const shownActionError = actionError?.clientId === client.id ? actionError.text : null;
 
   /** `applied` = Toolport was written into the config; `removed` = taken out of it.
    *
@@ -353,9 +358,20 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
 
   async function toggleInstall() {
     setBusy(true);
+    setActionError(null);
     try {
       if (installed) {
-        const outcome = await uninstallGateway(client.id);
+        let outcome: Awaited<ReturnType<typeof uninstallGateway>>;
+        try {
+          outcome = await uninstallGateway(client.id);
+        } catch (refused) {
+          // Same inline error line and wording as the GTK shell.
+          setActionError({
+            clientId: client.id,
+            text: `${client.name}: ${String(refused)}`,
+          });
+          return;
+        }
         // The disconnect already committed, even if loading notices later fails.
         onChanged();
         const restored = outcome.restored?.length ?? 0;
@@ -395,7 +411,11 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       <ClientRecoveryBanners
         clientId={client.id}
         refreshKey={client}
-        onRecovered={onChanged}
+        onRecovered={() => {
+          // The recovery that blocked Disconnect changed: its error is stale.
+          setActionError(null);
+          onChanged();
+        }}
       />
       {/* Connection: the one thing that actually matters in a client. */}
       {/* The title keeps at least 240px; when the actions don't fit beside it they wrap below. */}
@@ -630,6 +650,15 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           cause={client.error}
           onRetry={onChanged}
         />
+      )}
+
+      {shownActionError && (
+        <p
+          role="alert"
+          className="select-text break-words toolport-alert border-destructive bg-destructive/8 px-3 py-2 text-sm text-destructive"
+        >
+          {shownActionError}
+        </p>
       )}
 
       {showRestartNotice && (

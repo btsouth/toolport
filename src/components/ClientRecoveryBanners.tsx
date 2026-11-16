@@ -206,16 +206,20 @@ export function ClientRecoveryBanners({
   }
   async function prepareDiscard(row: ClientRecovery) {
     begin(row);
+    // The row stays busy ("Working on this recovery…", actions disabled) while
+    // its confirmation is open, as in the GTK shell. Closing it releases the row.
+    let opened = false;
     try {
       await awaitLanguagePersistence();
       const prepared = await prepareClientRecoveryDiscard(row.id);
       confirmationSubmitted.current = false;
       setConfirmation({ kind: "discard", row, prepared });
+      opened = true;
     } catch (cause) {
       fail(row, cause, [`discard-${row.id}`, `retry-${row.id}`]);
       await relist();
     } finally {
-      setBusy(null);
+      if (!opened) setBusy(null);
     }
   }
   async function discard(row: ClientRecovery, prepared: DiscardConfirmation) {
@@ -251,7 +255,9 @@ export function ClientRecoveryBanners({
   const visible = rows.filter((row) => !clientId || row.clientId === clientId);
   const shownResult =
     result && (!clientId || result.clientId === clientId) ? result : null;
-  if (!visible.length && !error && !shownResult) return null;
+  // An open confirmation must render even when a reload emptied the list, or
+  // its row would stay busy with no dialog left to release it.
+  if (!visible.length && !error && !shownResult && !confirmation) return null;
   // Keyboard focus is required to scroll this bounded list without a pointer.
   /* eslint-disable jsx-a11y/no-noninteractive-tabindex */
   const values = (lines: string[], label: string) => (
@@ -432,8 +438,10 @@ export function ClientRecoveryBanners({
           onCloseAutoFocus={(event) => event.preventDefault()}
           onOpenChange={(open) => {
             if (!open) {
-              if (!confirmationSubmitted.current)
+              if (!confirmationSubmitted.current) {
                 focusTargets.current = [`${confirmation.kind}-${confirmation.row.id}`];
+                if (confirmation.kind === "discard") setBusy(null);
+              }
               setConfirmation(null);
             }
           }}

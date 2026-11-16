@@ -2,7 +2,12 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ClientDetail } from "./ClientDetail";
-import { importServers, previewImportServers, listClientRecoveries } from "@/lib/api";
+import {
+  importServers,
+  previewImportServers,
+  listClientRecoveries,
+  retryClientRecovery,
+} from "@/lib/api";
 import type { DetectedClient, Registry } from "@/lib/types";
 
 const installGateway = vi.fn();
@@ -802,4 +807,83 @@ it("refreshes the committed disconnect even when recovery notices cannot be read
     await screen.findByText("Error: Recovery receipt is unreadable"),
   ).toBeInTheDocument();
   expect(toastError).not.toHaveBeenCalled();
+});
+
+it("shows a refused disconnect inline with the client name, as GTK does", async () => {
+  uninstallGateway.mockRejectedValue(
+    "could not read /fixture/moved-servers.json: This recovery file is malformed.",
+  );
+  render(
+    <ClientDetail
+      client={client({ gatewayInstalled: true, entryState: "managed" })}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  await userEvent.click(screen.getByRole("button", { name: "Disconnect" }));
+  await userEvent.click(
+    within(screen.getByRole("dialog")).getByRole("button", { name: "Disconnect" }),
+  );
+  const alert = await screen.findByRole("alert");
+  expect(alert).toHaveTextContent(
+    /^.+: could not read \/fixture\/moved-servers\.json: This recovery file is malformed\.$/,
+  );
+  expect(screen.queryByText("Still connected until restart")).not.toBeInTheDocument();
+  expect(toastError).not.toHaveBeenCalled();
+});
+
+it("clears a refused disconnect once that client's recovery succeeds, as GTK does", async () => {
+  uninstallGateway.mockRejectedValue("could not read its move record");
+  vi.mocked(listClientRecoveries).mockResolvedValue([
+    {
+      id: "receipt-claude-desktop",
+      clientId: "claude-desktop",
+      clientName: "Claude Desktop",
+      path: "/fixture/config.json",
+      backupPath: "/fixture/backups/claude-desktop/original.json",
+      dismissed: false,
+      missing: [{ server: "keyring-echo", key: "API_KEY" }],
+      message: "Claude Desktop is disconnected.",
+      description: "Its original config is back.",
+      valueLines: ["API_KEY for keyring-echo: keyring locked"],
+      discardValues: ["API_KEY for keyring-echo"],
+      error: null,
+      canDiscard: true,
+      canRetry: true,
+      discardStarted: false,
+      discardAction: "Discard these saved values",
+      cleanup: false,
+      instructions: "Unlock your keyring, then choose Retry.",
+      retention: "Kept until recovery succeeds.",
+      details: "",
+    },
+  ]);
+  vi.mocked(retryClientRecovery).mockResolvedValue({
+    id: "receipt-claude-desktop",
+    clientId: "claude-desktop",
+    clientName: "Claude Desktop",
+    restored: 1,
+    accounted: 0,
+    remaining: 0,
+    message: "Claude Desktop: saved values restored: 1.",
+    pending: null,
+  });
+  render(
+    <ClientDetail
+      client={client({ gatewayInstalled: true, entryState: "managed" })}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  await userEvent.click(screen.getByRole("button", { name: "Disconnect" }));
+  await userEvent.click(
+    within(screen.getByRole("dialog")).getByRole("button", { name: "Disconnect" }),
+  );
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Claude Desktop: could not read its move record",
+  );
+  await userEvent.click(await screen.findByRole("button", { name: "Retry" }));
+  await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
 });

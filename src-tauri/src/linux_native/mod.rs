@@ -2647,6 +2647,8 @@ struct ClientPage {
     details: details::DetailHost,
     detail_clients: std::rc::Rc<std::cell::RefCell<Vec<state::ClientView>>>,
     detail_notice: std::rc::Rc<std::cell::RefCell<Option<(String, String)>>>,
+    /// The client whose refused Connect or Disconnect the error line shows.
+    error_client: std::rc::Rc<std::cell::RefCell<Option<String>>>,
     recoveries: std::rc::Rc<std::cell::RefCell<Vec<crate::clients::recovery::ClientRecovery>>>,
     recovery_feedback: std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>,
     recovery_busy: std::rc::Rc<std::cell::Cell<bool>>,
@@ -2737,6 +2739,7 @@ impl ClientPage {
             details,
             detail_clients: Default::default(),
             detail_notice: Default::default(),
+            error_client: Default::default(),
             recoveries: Default::default(),
             recovery_feedback: Default::default(),
             recovery_busy: Default::default(),
@@ -3311,12 +3314,52 @@ impl ClientPage {
         self.feedback.set_visible(false);
     }
 
+    /// A refused client action. It stays until that client's recovery state
+    /// changes ([`Self::clear_client_error`]) or another message replaces it.
+    fn show_client_error(&self, client_id: &str, error: &str) {
+        self.show_error_line(error);
+        // Keyed by the client the action was for, not whichever client is
+        // open now: the user may have selected another one meanwhile.
+        *self.detail_notice.borrow_mut() = Some((client_id.to_string(), error.into()));
+        *self.error_client.borrow_mut() = Some(client_id.to_string());
+        if self.details.selected.borrow().as_deref() == Some(client_id) {
+            self.refresh_open_detail();
+        }
+    }
+
+    /// A recovery action for this client succeeded, so its refused-action
+    /// error no longer describes the current state.
+    pub(super) fn clear_client_error(&self, client_id: &str) {
+        if self.error_client.borrow().as_deref() == Some(client_id) {
+            self.error_client.borrow_mut().take();
+            self.cancel_feedback_timer();
+            self.feedback.set_visible(false);
+        }
+        let stale = self
+            .detail_notice
+            .borrow()
+            .as_ref()
+            .is_some_and(|(id, _)| id == client_id);
+        if stale {
+            self.detail_notice.borrow_mut().take();
+            if self.details.selected.borrow().as_deref() == Some(client_id) {
+                self.refresh_open_detail();
+            }
+        }
+    }
+
     fn show_error(&self, error: &str) {
         let selected = self.details.selected.borrow().clone();
         if let Some(id) = selected {
             *self.detail_notice.borrow_mut() = Some((id, error.into()));
             self.refresh_open_detail();
         }
+        self.show_error_line(error);
+    }
+
+    /// The page's error line only; callers decide which detail it belongs to.
+    fn show_error_line(&self, error: &str) {
+        self.error_client.borrow_mut().take();
         self.pending_confirmation.borrow_mut().take();
         self.cancel_feedback_timer();
         self.feedback.set_label(error);
@@ -3951,14 +3994,24 @@ fn confirm_client_disconnect(client: &state::ClientView, button: gtk::Button, pa
     let Some(parent) = page.app.active_window() else {
         return;
     };
+    // The same strings as the React confirmation, including its wording for a
+    // hand-edited entry.
+    let body = if matches!(client.gateway_state, state::ClientGatewayState::Customized) {
+        crate::i18n::msg("This removes the custom toolport entry from the client's MCP config. You can reconnect anytime.")
+    } else {
+        crate::i18n::msg("This rewrites the client's MCP config to remove the gateway and puts back any servers Toolport moved out of it. You can reconnect anytime.")
+    };
+    let heading = "Disconnect Toolport from {value1}?";
+    let values = [("value1", client.name.to_string())];
+    let values: Vec<(&str, &str)> = values.iter().map(|(k, v)| (*k, v.as_str())).collect();
     #[allow(deprecated)]
-    let dialog = adw::MessageDialog::new(Some(&parent), Some(&crate::i18n::trf("Disconnect {value0}?", &[("value0", &client.name.to_string())])), Some(&crate::i18n::tr("Toolport removes only its managed gateway entry. The client's other settings and MCP servers are preserved.")));
-    l10n::bind_formatted_dialog_heading(
-        &dialog,
-        "Disconnect {value0}?",
-        &[("value0", &client.name.to_string())],
+    let dialog = adw::MessageDialog::new(
+        Some(&parent),
+        Some(&crate::i18n::trf(heading, &values)),
+        Some(&crate::i18n::tr(body)),
     );
-    l10n::bind_dialog_body(&dialog, "Toolport removes only its managed gateway entry. The client's other settings and MCP servers are preserved.");
+    l10n::bind_formatted_dialog_heading(&dialog, heading, &values);
+    l10n::bind_dialog_body(&dialog, body);
     dialog.add_response("cancel", &crate::i18n::tr("Cancel"));
     l10n::bind_dialog_response(&dialog, "cancel", "Cancel");
     dialog.add_response("disconnect", &crate::i18n::tr("Disconnect"));
@@ -3991,6 +4044,7 @@ fn run_client_mutation(
         crate::i18n::msg("Disconnecting client…")
     }));
     let client_id = client.id.clone();
+    let client_id_for_error = client.id.clone();
     let client_name = client.name.clone();
     let button = button.clone();
     gtk::glib::spawn_future_local(async move {
@@ -4062,7 +4116,9 @@ fn run_client_mutation(
                     );
                 }
             }
-            Ok(Err(error)) => page.show_error(&format!("{client_name}: {error}")),
+            Ok(Err(error)) => {
+                page.show_client_error(&client_id_for_error, &format!("{client_name}: {error}"))
+            }
             Err(_) => page.show_error(&crate::i18n::trf(
                 "{value0}: the operation stopped",
                 &[("value0", &client_name.to_string())],

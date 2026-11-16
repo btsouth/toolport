@@ -57,8 +57,10 @@ const NO_CONFIG_PATH: &str = crate::i18n::msg(
     "This recovery file has no valid config path. Its saved values have been kept.",
 );
 const NEWER_RECEIPT: &str = crate::i18n::msg(
-    "A newer Toolport wrote this recovery file. Open it with that version; this version will not change or discard it.",
+    "A newer Toolport wrote this recovery file. This version will not change or discard it.",
 );
+const NEWER_STEP: &str =
+    crate::i18n::msg("Update Toolport to use this recovery file. Other recoveries are unaffected.");
 const MALFORMED_MOVED: &str =
     crate::i18n::msg("Toolport's record of the servers it moved from this client is damaged.");
 pub(super) const DISCARD_FILE_ACTION: &str = crate::i18n::msg("Discard recovery file");
@@ -76,6 +78,15 @@ fn unreadable_receipt(
         .file_name()
         .is_some_and(|name| name == moved::RECORD_NAME);
     let mut receipt = error_receipt(client_id, name, file, format, reason);
+    if reason == NEWER_RECEIPT {
+        // Only the version that wrote it can act on it: no Retry, no Discard.
+        let next = crate::i18n::format_message(NEWER_STEP, &[]);
+        let notice = &mut receipt.notice;
+        notice.details = notice.details.replace(&notice.instructions, &next);
+        notice.instructions = next;
+        notice.can_retry = false;
+        return receipt;
+    }
     if [MALFORMED_RECEIPT, NO_CONFIG_PATH, MALFORMED_MOVED].contains(&reason) {
         let next = if moved_record {
             crate::i18n::tr("Toolport cannot read its record of the servers it moved from this client, so Disconnect cannot put them back in the client config. Choose Discard recovery file to delete the record; the servers stay in Toolport.")
@@ -913,6 +924,9 @@ mod tests {
                 assert_eq!(row.can_discard_file, index >= newer.len(), "{text}");
                 if index < newer.len() {
                     assert!(row.description.contains("newer Toolport"), "{text}");
+                    assert!(!row.can_retry, "{text}");
+                    assert!(row.instructions.contains("Update Toolport"), "{text}");
+                    assert!(!row.details.contains("Retry"), "{text}");
                     assert!(prepare_discard(&row.id).is_err(), "{text}");
                 }
             }
