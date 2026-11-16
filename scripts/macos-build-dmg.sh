@@ -20,6 +20,33 @@ detach() {
   hdiutil detach "$target" -force
 }
 
+# Run `hdiutil create` or `hdiutil convert`, retrying only "Resource busy".
+# CI runners sometimes still hold a fresh image file for a moment, and hdiutil
+# then refuses with that error even though nothing is wrong with the content.
+# Every other failure stops at once with hdiutil's own message, so a size or
+# content problem is never retried away. The partial output is removed before
+# each new try. Usage: hdiutil_retry <output path> <hdiutil args...>
+hdiutil_retry() {
+  local output="$1" try err
+  shift
+  for try in 1 2 3 4; do
+    if err="$(hdiutil "$@" 2>&1)"; then
+      [ -z "$err" ] || printf '%s\n' "$err"
+      return 0
+    fi
+    printf '%s\n' "$err" >&2
+    case "$err" in
+      *"Resource busy"*) ;;
+      *) die "hdiutil $1 failed: $err" ;;
+    esac
+    [ "$try" -lt 4 ] || break
+    log "hdiutil $1: Resource busy on try $try of 4, retrying in $((try * 5))s"
+    rm -rf "$output"
+    sleep $((try * 5))
+  done
+  die "hdiutil $1 still failed after 4 tries: $err"
+}
+
 # Build a drag-to-install dmg: Toolport.app, an Applications shortcut, and a
 # background with an arrow between them. Finder layout is cosmetic: if Finder
 # scripting is unavailable the dmg still has the shortcut. The check at the end
@@ -44,7 +71,7 @@ build_dmg() {
   # hdiutil's own size estimate can come up short for the larger 2.0 app
   # ("No space left on device"), so size the image from the app plus headroom.
   size=$(( $(du -sm "$stage" | cut -f1) * 5 / 4 + 64 ))
-  hdiutil create -volname "Toolport" -srcfolder "$stage" -size "${size}m" -ov -format UDRW "$rw"
+  hdiutil_retry "$rw" create -volname "Toolport" -srcfolder "$stage" -size "${size}m" -ov -format UDRW "$rw"
   attach_out="$(hdiutil attach -readwrite -noverify -noautoopen "$rw")"
   device="$(printf '%s\n' "$attach_out" | awk '/^\/dev\// {print $1; exit}')"
   volume="$(printf '%s\n' "$attach_out" | awk -F '\t' '/\/Volumes\// {sub(/^[ \t]+/, "", $NF); print $NF; exit}')"
@@ -80,7 +107,7 @@ OSA
   sync
   detach "$device"
   rm -f "$out"
-  hdiutil convert "$rw" -format UDZO -imagekey zlib-level=9 -o "$out"
+  hdiutil_retry "$out" convert "$rw" -format UDZO -imagekey zlib-level=9 -o "$out"
   rm -rf "$stage" "$rw"
   check="$(mktemp -d)"
   hdiutil attach -readonly -nobrowse -noautoopen -mountpoint "$check" "$out" >/dev/null
