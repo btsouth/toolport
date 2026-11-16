@@ -653,6 +653,9 @@ export function ClientsView({
     connectedIds: string[];
     /** Ids of the rows skipped so far, in step order. */
     notConnectedIds: string[];
+    /** A step failed with the keyring still locked: later steps don't ask to unlock it
+     * (the backend's `connect_step`; GTK keeps the same flag). */
+    keyringQuiet: boolean;
   } | null>(null);
   // A batch that just ended, waiting for the rescan after it: the summary is worked out
   // from the rows that rescan finds, so an instance turned off or removed meanwhile is
@@ -867,6 +870,7 @@ export function ClientsView({
                       index: 0,
                       connectedIds: [],
                       notConnectedIds: [],
+                      keyringQuiet: false,
                     })
                   }
                 >
@@ -889,6 +893,10 @@ export function ClientsView({
           })}
           hasNext={batch.index + 1 < batch.targets.length}
           onCloseAutoFocus={onBatchDialogClosed}
+          keyringQuiet={batch.keyringQuiet}
+          onKeyringLocked={() =>
+            setBatch((current) => current && { ...current, keyringQuiet: true })
+          }
           onSkip={() => {
             const notConnectedIds = [...batch.notConnectedIds, batchTarget.id];
             const next = batch.index + 1;

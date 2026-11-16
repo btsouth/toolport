@@ -1,7 +1,7 @@
 import { translate, useI18n } from "@/lib/i18n";
 import { useEffect, useRef, useState } from "react";
 import { Check, Loader2 } from "lucide-react";
-import { migrateClient, previewClientSetup } from "@/lib/api";
+import { keyringLockedAfter, migrateClient, previewClientSetup } from "@/lib/api";
 import type { ClientSetupReview, MigrateResult, Registry } from "@/lib/types";
 import { GatewaySettingsNotice } from "./GatewaySettingsNotice";
 import { disclosureSummary, ImportReviewDialog } from "./ImportReviewDialog";
@@ -25,6 +25,8 @@ export function ConnectReviewDialog({
   onClose,
   onConnected,
   onCloseAutoFocus,
+  keyringQuiet = false,
+  onKeyringLocked,
 }: {
   clientId: string;
   clientName: string;
@@ -44,6 +46,12 @@ export function ConnectReviewDialog({
   onConnected: (registry: Registry) => void;
   /** Where focus goes once the dialog has closed, in place of the opener. */
   onCloseAutoFocus?: (event: Event) => void;
+  /** Inside a batch whose keyring stayed locked: this step's first try can't ask to
+   * unlock it. A Retry the user chooses may (the backend's `connect_step`). */
+  keyringQuiet?: boolean;
+  /** Inside a batch: a try failed with the keyring still locked, so later steps are
+   * quiet. */
+  onKeyringLocked?: () => void;
 }) {
   const { t, locale } = useI18n();
   // The dialog renders without a Radix trigger and swaps between its loading,
@@ -76,18 +84,31 @@ export function ConnectReviewDialog({
   useEffect(() => {
     if (result || (error && !review)) primary.current?.focus();
   }, [result, error, review]);
+  // A step's first try follows the batch; Retry is the user's own and may ask.
+  const quietFirst = useRef(keyringQuiet);
+  const noteFailure = (message: string) => {
+    if (!onKeyringLocked) return;
+    void keyringLockedAfter(message).then((locked) => {
+      if (locked) onKeyringLocked();
+    });
+  };
   useEffect(() => {
     let active = true;
-    previewClientSetup(clientId)
+    const quiet = quietFirst.current && attempt === 0;
+    (quiet ? previewClientSetup(clientId, true) : previewClientSetup(clientId))
       .then((r) => {
         if (active) setReview(r);
       })
       .catch((e) => {
-        if (active) setError(String(e));
+        if (!active) return;
+        setError(String(e));
+        noteFailure(String(e));
       });
     return () => {
       active = false;
     };
+    // `noteFailure` only reads props that stay the same for this step.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [clientId, attempt]);
   async function connect(
     selected: string[],
@@ -97,17 +118,23 @@ export function ConnectReviewDialog({
     if (!review) return;
     setBusy(true);
     setError("");
+    // Only the step's first connect follows a quiet batch; Retry may ask.
+    const quiet = quietFirst.current;
+    quietFirst.current = false;
     try {
       const args = [clientId, profile, force, selected, review.revision] as const;
-      const next = credentialInputs
-        ? await migrateClient(...args, secretChoices, credentialInputs)
-        : secretChoices
-          ? await migrateClient(...args, secretChoices)
-          : await migrateClient(...args);
+      const next = quiet
+        ? await migrateClient(...args, secretChoices, credentialInputs, true)
+        : credentialInputs
+          ? await migrateClient(...args, secretChoices, credentialInputs)
+          : secretChoices
+            ? await migrateClient(...args, secretChoices)
+            : await migrateClient(...args);
       setResult(next);
       onConnected(next.registry);
     } catch (e) {
       setError(String(e));
+      noteFailure(String(e));
     } finally {
       setBusy(false);
     }

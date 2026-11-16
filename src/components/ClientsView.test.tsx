@@ -7,6 +7,7 @@ import { ClientsView, type T3CodeSeen } from "./ClientsView";
 import {
   getClientSessions,
   listClientRecoveries,
+  keyringLockedAfter,
   migrateClient,
   previewClientSetup,
   refreshClientRecoveryStatus,
@@ -17,6 +18,7 @@ vi.mock("@/lib/api", () => ({
   getClientSessions: vi.fn(),
   previewClientSetup: vi.fn(),
   migrateClient: vi.fn(),
+  keyringLockedAfter: vi.fn().mockResolvedValue(false),
   listClientRecoveries: vi.fn().mockResolvedValue([]),
   retryClientRecovery: vi.fn(),
   dismissClientRecovery: vi.fn(),
@@ -1360,6 +1362,87 @@ describe("ClientsView", () => {
       await waitFor(() =>
         expect(screen.getByRole("button", { name: "Connect all" })).toHaveFocus(),
       );
+    });
+
+    it("keeps an earlier step connected when a later one fails part way", async () => {
+      mockConnect();
+      vi.mocked(migrateClient)
+        .mockResolvedValueOnce({
+          registry: { servers: [] } as never,
+          imported: 0,
+          moved: [],
+          outcome: { path: "/fixture/aider", backup: "/fixture/backups/aider" },
+          tools: [],
+          servers: [],
+        } as never)
+        .mockRejectedValueOnce("Launch failed");
+      render(
+        <ClientsView
+          clients={[
+            client({ id: "aider", name: "Aider", t3Code: [on("One")] }),
+            client({ id: "codex", name: "Codex", t3Code: [on("Two")] }),
+          ]}
+          registry={null}
+          onSelectClient={vi.fn()}
+          onChanged={vi.fn(async () => {})}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Connect to Toolport" }),
+      );
+      await userEvent.click(await screen.findByRole("button", { name: "Next" }));
+      expect(await screen.findByText("Review and connect Codex")).toBeVisible();
+      await userEvent.click(screen.getByRole("button", { name: "Connect to Toolport" }));
+      expect(await screen.findByText("Launch failed")).toBeVisible();
+      await userEvent.click(screen.getByRole("button", { name: "Skip" }));
+      // Aider stays connected; only Codex's instance is named as not connected.
+      expect(await connectAllSummary("warning")).toContain(
+        "Connected 1 of 2 T3 Code instances. Not connected: Two.",
+      );
+      expect(migrateClient).toHaveBeenCalledTimes(2);
+    });
+
+    it("asks about a locked keyring at most once in a run", async () => {
+      mockConnect();
+      vi.mocked(migrateClient)
+        .mockRejectedValueOnce("Saved credential recovery: Locked")
+        .mockRejectedValueOnce("Unlock your keyring, then choose Retry.");
+      vi.mocked(keyringLockedAfter).mockResolvedValue(true);
+      render(
+        <ClientsView
+          clients={[
+            client({ id: "aider", name: "Aider", t3Code: [on("One")] }),
+            client({ id: "codex", name: "Codex", t3Code: [on("Two")] }),
+          ]}
+          registry={null}
+          onSelectClient={vi.fn()}
+          onChanged={vi.fn(async () => {})}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+      // The first step is the user's own and may ask.
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Connect to Toolport" }),
+      );
+      expect(previewClientSetup).toHaveBeenLastCalledWith("aider");
+      expect(vi.mocked(migrateClient).mock.calls[0]).toHaveLength(5);
+      expect(await screen.findByText("Saved credential recovery: Locked")).toBeVisible();
+      await waitFor(() => expect(keyringLockedAfter).toHaveBeenCalled());
+      await userEvent.click(screen.getByRole("button", { name: "Skip" }));
+      // The keyring stayed locked: the next step reads and connects without asking.
+      expect(await screen.findByText("Review and connect Codex")).toBeVisible();
+      expect(previewClientSetup).toHaveBeenLastCalledWith("codex", true);
+      await userEvent.click(screen.getByRole("button", { name: "Connect to Toolport" }));
+      expect(
+        await screen.findByText("Unlock your keyring, then choose Retry."),
+      ).toBeVisible();
+      expect(vi.mocked(migrateClient).mock.calls[1].at(-1)).toBe(true);
+      // Retry is the user's own choice and may ask once.
+      await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await userEvent.click(await screen.findByRole("button", { name: "Done" }));
+      expect(vi.mocked(migrateClient).mock.calls[2]).toHaveLength(5);
+      vi.mocked(keyringLockedAfter).mockResolvedValue(false);
     });
 
     it("finishes when the last step is skipped after its config could not be read", async () => {

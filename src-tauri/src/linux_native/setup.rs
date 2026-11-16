@@ -75,6 +75,29 @@ pub(super) struct Step {
     /// Set by [`connect_step`] when the review could not be read: the window offers
     /// Retry, which closes it without ending the step and reads the review again.
     pub retry: Option<std::rc::Rc<dyn Fn()>>,
+    /// The batch's keyring flag: set once a step fails with the keyring still locked, so
+    /// later steps don't ask to unlock it (`registry_controller::connect_step`). React's
+    /// batch keeps the same flag.
+    pub keyring_quiet: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// This try is a Retry the user chose: it may ask to unlock the keyring.
+    pub retried: bool,
+}
+
+/// Whether this try of a batch step must not ask to unlock the keyring.
+fn quiet_try(flag: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, retried: bool) -> bool {
+    !retried
+        && flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// After a failed try: a keyring left locked makes the rest of the batch quiet.
+fn note_keyring(flag: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, error: &str) {
+    if let Some(flag) = flag {
+        if crate::registry_controller::keyring_locked_after(error) {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 /// How a batch step ended from what happened in its window.
@@ -968,11 +991,16 @@ pub(super) fn connect_step(
     let parent = parent.clone();
     gtk::glib::spawn_future_local(async move {
         let id = client_id.clone();
+        let flag = step.keyring_quiet.clone();
+        let quiet = quiet_try(&flag, step.retried);
         let preview = gtk::gio::spawn_blocking(move || {
-            (
-                crate::registry_controller::preview_client_setup(&id),
-                review_client_name(&id),
-            )
+            let review = crate::registry_controller::connect_step(quiet, || {
+                crate::registry_controller::preview_client_setup(&id)
+            });
+            if let Err(error) = &review {
+                note_keyring(&flag, error);
+            }
+            (review, review_client_name(&id))
         })
         .await;
         match preview {
@@ -989,6 +1017,10 @@ pub(super) fn connect_step(
                     ],
                 );
                 let notice = gateway_settings_notice(&client_name, &preview.gateway_settings);
+                // The step's first connect follows the batch's keyring flag; a Retry the
+                // user chooses may ask.
+                let flag = step.keyring_quiet.clone();
+                let first = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(!step.retried));
                 review_with_notice(
                     &parent,
                     &review_title(&client_name),
@@ -998,15 +1030,22 @@ pub(super) fn connect_step(
                     crate::i18n::msg("Connect to Toolport"),
                     true,
                     move |selected, choices, inputs| {
-                        let outcome = crate::registry_controller::migrate_client_reviewed_inputs(
-                            &client_id,
-                            profile.as_deref(),
-                            force,
-                            &selected,
-                            &preview.revision,
-                            &choices,
-                            &inputs,
-                        )?;
+                        let retried = !first.swap(false, std::sync::atomic::Ordering::SeqCst);
+                        let outcome = crate::registry_controller::connect_step(
+                            quiet_try(&flag, retried),
+                            || {
+                                crate::registry_controller::migrate_client_reviewed_inputs(
+                                    &client_id,
+                                    profile.as_deref(),
+                                    force,
+                                    &selected,
+                                    &preview.revision,
+                                    &choices,
+                                    &inputs,
+                                )
+                            },
+                        )
+                        .inspect_err(|error| note_keyring(&flag, error))?;
                         Ok(Completion {
                             message: crate::i18n::trf(
                                 "{value0} connected. Restart it to load Toolport.",
@@ -1041,7 +1080,10 @@ pub(super) fn connect_step(
                         force,
                         finished.clone(),
                         credential_page.clone(),
-                        again.1.clone(),
+                        Step {
+                            retried: true,
+                            ..again.1.clone()
+                        },
                     )
                 });
                 review_with_notice(
@@ -1068,6 +1110,24 @@ pub(super) fn connect_step(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Connect all asks about a locked keyring at most once: a step that fails with the
+    /// keyring still locked makes the rest of the batch quiet, while a Retry the user
+    /// chooses may still ask. Outside a batch nothing is quiet. React's batch matches.
+    #[test]
+    fn a_batch_goes_quiet_once_the_keyring_stays_locked() {
+        assert!(!quiet_try(&None, false));
+        let flag = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
+        assert!(!quiet_try(&flag, false), "the first step may ask");
+        crate::clients::backup_vault::fake::locked_store(
+            crate::clients::backup_vault::Unlock::StillLocked,
+            || note_keyring(&flag, "Launch failed"),
+        );
+        assert!(quiet_try(&flag, false), "later steps don't ask");
+        assert!(!quiet_try(&flag, true), "a Retry may ask");
+    }
 
     /// A T3 Code home the page lists before it is saved is named in the connect review as
     /// it is on the page, not "Client".

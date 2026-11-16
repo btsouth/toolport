@@ -96,6 +96,15 @@ off are skipped; you can still connect one yourself.
 - **Escape**, **Cancel** or closing a review stops the batch. Rows already connected
   stay connected.
 
+Each row is connected on its own, as its own **Connect** would: Toolport backs up that
+client's config first, then writes the new one in a single step. A row that fails part
+way leaves its config exactly as it was, with nothing of it added to Toolport, and the
+rows connected before it stay connected, each with its own backup.
+
+If your keyring is locked, the first row that needs it asks you to unlock it once. If
+you don't, that row fails, and the rows after it don't ask again: one that needs the
+keyring says to unlock it and choose **Retry**, and **Retry** may ask once more.
+
 When the batch ends, a summary says how many instances it connected. If any were
 skipped, failed or not reached, or a row needs attention first, it names them and
 stays until you dismiss it. Focus returns to **Connect all**, or to the card once

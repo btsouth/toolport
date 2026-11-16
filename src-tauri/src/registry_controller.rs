@@ -1380,8 +1380,13 @@ fn finish_client_stdio_mutation(
         revoked = removed_http_row;
         Ok(registry)
     })?;
+    // The config and the registry are both written by now, so this cleanup can't fail the
+    // change: an error here would report a connect as failed after it took effect. The
+    // token's row is gone, so a token left behind (say, with the keyring locked) is unused.
     if revoked {
-        crate::secrets::delete_secret(CLIENT_HTTP_VAULT_SERVER, client_id)?;
+        if let Err(error) = crate::secrets::delete_secret(CLIENT_HTTP_VAULT_SERVER, client_id) {
+            eprintln!("toolport: {client_id} connected, but its old HTTP token stays: {error}");
+        }
     }
     Ok(result)
 }
@@ -2253,6 +2258,33 @@ pub fn migrate_client_reviewed_choices(
         choices,
         verify_setup_gateway,
     )
+}
+
+/// Connect all's keyring rule, the one #1378 set for Disconnect: a step the user confirms
+/// may ask to unlock the keyring, but a run of steps must not ask again and again. Once a
+/// step has failed with the keyring still locked, the run's later steps are `quiet`: no
+/// keyring call in them can ask, and one that needed the keyring fails at once and says to
+/// unlock it and choose Retry. A Retry the user chooses is not quiet, so it may ask once.
+/// Bulk paths nobody confirms step by step (Remove from all clients, purge) never ask.
+pub fn connect_step<T>(quiet: bool, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    if !quiet {
+        return f();
+    }
+    clients::backup_vault::noninteractive(f).map_err(|error| {
+        if keyring_locked_after(&error) {
+            crate::i18n::tr("Unlock your keyring, then choose Retry.")
+        } else {
+            error
+        }
+    })
+}
+
+/// Whether a failed connect step left the keyring locked, so the rest of its run is quiet.
+/// Never asks to unlock.
+pub fn keyring_locked_after(error: &str) -> bool {
+    clients::backup_vault::is_locked_error(error)
+        || clients::backup_vault::store_locked()
+        || crate::secrets::write_would_ask()
 }
 
 pub fn migrate_client_reviewed_inputs(
@@ -4698,6 +4730,117 @@ API_KEY = "synthetic-first-origin"
         assert!(read_registry_exact().unwrap().servers.is_empty());
         assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
         assert!(!fixture.move_record("claude-code").exists());
+    }
+
+    /// Connect all, one client failing part way: the client connected before it stays
+    /// connected with its own backup, and the failing client's config is left byte for
+    /// byte as it was, with no move record and nothing of it in the registry.
+    #[test]
+    fn a_connect_all_step_that_fails_leaves_earlier_clients_and_its_own_config_whole() {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"first":{"command":"first"}}}"#,
+        )
+        .unwrap();
+        let codex = "[mcp_servers.second]\ncommand = \"second\"\n";
+        std::fs::write(fixture.codex(), codex).unwrap();
+        let first = preview_client_setup("claude-code").unwrap();
+        let second = preview_client_setup("codex").unwrap();
+        let connected = connect_step(false, || {
+            migrate_client_reviewed_with(
+                "claude-code",
+                None,
+                false,
+                &["first".into()],
+                &first.revision,
+                |_, _, _, _| Ok(Vec::new().into()),
+            )
+        })
+        .unwrap();
+        let after_first = std::fs::read_to_string(fixture.claude()).unwrap();
+        let error = connect_step(false, || {
+            migrate_client_reviewed_with(
+                "codex",
+                None,
+                false,
+                &["second".into()],
+                &second.revision,
+                |_, _, _, _| Err("Launch failed".into()),
+            )
+        })
+        .unwrap_err();
+        assert_eq!(error, "Launch failed");
+        // The failing client: untouched, with nothing recorded for it.
+        assert_eq!(std::fs::read_to_string(fixture.codex()).unwrap(), codex);
+        assert!(!fixture.move_record("codex").exists());
+        let registry = read_registry_exact().unwrap();
+        assert!(registry
+            .servers
+            .iter()
+            .all(|server| server.name != "second"));
+        // The client before it: still connected, with its own backup.
+        assert_eq!(
+            std::fs::read_to_string(fixture.claude()).unwrap(),
+            after_first
+        );
+        assert!(json_file(&fixture.claude())["mcpServers"]
+            .get("first")
+            .is_none());
+        assert!(registry.servers.iter().any(|server| server.name == "first"));
+        let backup = connected.result.outcome.backup.expect("its own backup");
+        assert!(std::path::Path::new(&backup)
+            .starts_with(fixture.root.join("data/backups/claude-code")));
+        assert!(fixture.move_record("claude-code").exists());
+    }
+
+    /// Connect all with the keyring locked asks at most once: the step that may ask
+    /// raises one prompt and, refused, fails; the steps after it are quiet, raise none,
+    /// change nothing, and say to unlock the keyring and choose Retry.
+    #[test]
+    fn a_locked_keyring_is_asked_about_once_in_a_connect_all_run() {
+        let fixture = MoveFixture::new(&Registry::default());
+        // Each server has a value Toolport moves into the keyring when it connects.
+        let claude =
+            r#"{"mcpServers":{"first":{"command":"first","env":{"PAT":"synthetic-first"}}}}"#;
+        let codex = "[mcp_servers.second]\ncommand = \"second\"\n\n[mcp_servers.second.env]\nPAT = \"synthetic-second\"\n";
+        std::fs::write(fixture.claude(), claude).unwrap();
+        std::fs::write(fixture.codex(), codex).unwrap();
+        let first = preview_client_setup("claude-code").unwrap();
+        let second = preview_client_setup("codex").unwrap();
+        let attempt = |quiet: bool, client: &str, name: &str, revision: &str| {
+            connect_step(quiet, || {
+                migrate_client_reviewed_with(
+                    client,
+                    None,
+                    false,
+                    &[name.into()],
+                    revision,
+                    |_, _, _, _| Ok(Vec::new().into()),
+                )
+            })
+            .err()
+        };
+        let mut errors = Vec::new();
+        let prompts = crate::secrets::locked_store::write_prompts_during(|| {
+            // The first step is the user's own and may ask; the prompt is dismissed.
+            let asked = attempt(false, "claude-code", "first", &first.revision).unwrap();
+            assert!(keyring_locked_after(&asked), "{asked}");
+            // The rest of the run is quiet, including another try of the first step.
+            errors.push(attempt(true, "codex", "second", &second.revision));
+            errors.push(attempt(true, "claude-code", "first", &first.revision));
+        });
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        for error in errors {
+            assert_eq!(
+                error.as_deref(),
+                Some("Unlock your keyring, then choose Retry.")
+            );
+        }
+        assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), claude);
+        assert_eq!(std::fs::read_to_string(fixture.codex()).unwrap(), codex);
+        assert!(!fixture.move_record("claude-code").exists());
+        assert!(!fixture.move_record("codex").exists());
     }
 
     #[test]

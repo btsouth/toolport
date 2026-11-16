@@ -1071,6 +1071,8 @@ fn connect_t3_code_targets(page: ClientPage, targets: Vec<state::ClientView>) {
         targets: Vec<state::ClientView>,
         /// Ids of the rows connected so far.
         connected: std::cell::RefCell<Vec<String>>,
+        /// Set once a step fails with the keyring still locked: later steps don't ask.
+        keyring_quiet: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
     fn finish(batch: &Batch, stopped: bool, keyboard: bool) {
         batch.page.t3_code_batch.set(false);
@@ -1125,6 +1127,7 @@ fn connect_t3_code_targets(page: ClientPage, targets: Vec<state::ClientView>) {
                     super::setup::StepEnd::Skipped => run(next.clone(), index + 1, keyboard),
                     super::setup::StepEnd::Stopped => finish(&next, true, keyboard),
                 })),
+                keyring_quiet: Some(batch.keyring_quiet.clone()),
                 ..Default::default()
             },
         );
@@ -1134,6 +1137,7 @@ fn connect_t3_code_targets(page: ClientPage, targets: Vec<state::ClientView>) {
             page,
             targets,
             connected: Default::default(),
+            keyring_quiet: Default::default(),
         }),
         0,
         true,

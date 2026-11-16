@@ -706,6 +706,8 @@ mockIPC(
       }
     }
     switch (command) {
+      case "keyring_locked_after":
+        return false;
       case "preview_client_setup":
         return {
           configPath: "/fixture/codex.toml",

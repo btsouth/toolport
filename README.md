@@ -59,7 +59,7 @@ configuration and policies while each member keeps their own credentials.
 
 - [Upgrade from 1.24.x to 2.0](docs/migration.md)
 - [Supported clients and setup](docs/clients.md)
-- [Toolport with T3 Code](docs/t3-code.md): the rows it uses, the T3 Code card on Clients, and "via T3 Code" in Activity
+- [Toolport with T3 Code](docs/t3-code.md): the rows it uses, the T3 Code card and Connect all on Clients, and "via T3 Code" in Activity
 - [Skills and rules each agent loads](docs/skills-and-rules.md)
 - [Access sets, environment variables, and configuration](docs/configuration.md)
 - [Headless gateway and Docker](docs/headless.md)
