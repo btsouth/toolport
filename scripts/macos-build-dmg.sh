@@ -9,6 +9,17 @@ ASSETS="$(cd "$(dirname "${BASH_SOURCE[0]}")/../packaging/macos/dmg" && pwd)"
 log()  { printf '\033[1m%s\033[0m\n' "== $* ==" >&2; }
 die()  { printf '\033[31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
+# Detach a mounted image. Spotlight or Finder can hold a fresh volume for a
+# moment ("Resource busy"), so try a few times and force the last one.
+detach() {
+  local target="$1"
+  for _ in 1 2 3 4 5; do
+    hdiutil detach "$target" -quiet && return 0
+    sleep 2
+  done
+  hdiutil detach "$target" -force
+}
+
 # Build a drag-to-install dmg: Toolport.app, an Applications shortcut, and a
 # background with an arrow between them. Finder layout is cosmetic: if Finder
 # scripting is unavailable the dmg still has the shortcut. The check at the end
@@ -57,17 +68,17 @@ OSA
   fi
   chmod -Rf go-w /Volumes/Toolport || true
   sync
-  hdiutil detach "$device" -quiet || hdiutil detach "$device" -force
+  detach "$device"
   rm -f "$out"
   hdiutil convert "$rw" -format UDZO -imagekey zlib-level=9 -o "$out"
   rm -rf "$stage" "$rw"
   check="$(mktemp -d)"
   hdiutil attach -readonly -nobrowse -noautoopen -mountpoint "$check" "$out" >/dev/null
   if [ ! -d "$check/Toolport.app" ] || [ "$(readlink "$check/Applications")" != /Applications ]; then
-    hdiutil detach "$check" -quiet || true
+    detach "$check" || true
     die "dmg is missing Toolport.app or its Applications shortcut"
   fi
-  hdiutil detach "$check" -quiet
+  detach "$check"
 }
 
 [ $# -eq 2 ] || die "usage: $0 <Toolport.app> <out.dmg>"
