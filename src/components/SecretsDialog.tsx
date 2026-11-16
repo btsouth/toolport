@@ -1128,63 +1128,67 @@ export function SecretsDialog({
           )}
 
           {/* Extra env secrets are an advanced case; collapse them unless they're
-              the only option (a stdio server that declared no keys). */}
-          <details
-            className="mt-1 border-t pt-3"
-            open={secretKeys.length === 0 && !isRemote}
-          >
-            <summary className="cursor-pointer text-meta text-muted-foreground select-none">
-              {t("Add another environment secret ")}
-            </summary>
-            <div className="mt-2 flex flex-col gap-2">
-              <Input
-                placeholder={t("ENV_NAME")}
-                className="font-mono"
-                value={newKey}
-                onChange={(e) => setNewKey(e.target.value)}
-              />
-              <select
-                aria-label={t("Key source for new variable")}
-                className="self-start rounded border bg-background p-1 text-xs"
-                value={newReference === undefined ? "paste" : "reference"}
-                onChange={(e) =>
-                  setNewReference(e.target.value === "reference" ? "op://" : undefined)
-                }
-              >
-                <option value="paste">{t("Paste a key")}</option>
-                <option value="reference">{t("From a password manager")}</option>
-              </select>
-              {newReference !== undefined ? (
-                <SecretReferenceField
-                  serverId={server.id}
-                  value={newReference}
-                  onChange={setNewReference}
-                />
-              ) : (
+              the only option (a stdio server that declared no keys). A remote
+              server has no environment: Toolport would send a new one as its
+              bearer token, so it takes its token above instead. */}
+          {!isRemote && (
+            <details
+              className="mt-1 border-t pt-3"
+              open={secretKeys.length === 0 && !isRemote}
+            >
+              <summary className="cursor-pointer text-meta text-muted-foreground select-none">
+                {t("Add another environment secret ")}
+              </summary>
+              <div className="mt-2 flex flex-col gap-2">
                 <Input
-                  type="password"
-                  placeholder={t("value")}
-                  value={newValue}
-                  onChange={(e) => setNewValue(e.target.value)}
+                  placeholder={t("ENV_NAME")}
+                  className="font-mono"
+                  value={newKey}
+                  onChange={(e) => setNewKey(e.target.value)}
                 />
-              )}
-              <Button
-                size="icon"
-                className="size-8 shrink-0"
-                aria-label={t("Add secret")}
-                disabled={
-                  busyKey !== null || !newKey.trim() || !(newReference ?? newValue)
-                }
-                onClick={addNew}
-              >
-                {busyKey === "add" ? (
-                  <Loader2 className="size-4 animate-spin" />
+                <select
+                  aria-label={t("Key source for new variable")}
+                  className="self-start rounded border bg-background p-1 text-xs"
+                  value={newReference === undefined ? "paste" : "reference"}
+                  onChange={(e) =>
+                    setNewReference(e.target.value === "reference" ? "op://" : undefined)
+                  }
+                >
+                  <option value="paste">{t("Paste a key")}</option>
+                  <option value="reference">{t("From a password manager")}</option>
+                </select>
+                {newReference !== undefined ? (
+                  <SecretReferenceField
+                    serverId={server.id}
+                    value={newReference}
+                    onChange={setNewReference}
+                  />
                 ) : (
-                  <Plus className="size-4" />
+                  <Input
+                    type="password"
+                    placeholder={t("value")}
+                    value={newValue}
+                    onChange={(e) => setNewValue(e.target.value)}
+                  />
                 )}
-              </Button>
-            </div>
-          </details>
+                <Button
+                  size="icon"
+                  className="size-8 shrink-0"
+                  aria-label={t("Add secret")}
+                  disabled={
+                    busyKey !== null || !newKey.trim() || !(newReference ?? newValue)
+                  }
+                  onClick={addNew}
+                >
+                  {busyKey === "add" ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <Plus className="size-4" />
+                  )}
+                </Button>
+              </div>
+            </details>
+          )}
         </div>
       </DialogContent>
     </Dialog>

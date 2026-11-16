@@ -785,6 +785,62 @@ pub fn refuse_new_remote_env(
     }
 }
 
+/// The refusal a save would give for an editor's current state, so GTK can
+/// disable Save and Test up front, as React does. `previous` is the saved
+/// server when editing. An edit sends its plain rows (`plain`) and keeps the
+/// saved secrets; an add sends its pasted rows (`rows`).
+pub fn editor_remote_env_refusal(
+    previous: Option<&ServerEntry>,
+    transport: &str,
+    command: Option<&str>,
+    url: Option<&str>,
+    plain: Option<&[String]>,
+    rows: &[ValueRow],
+) -> Option<String> {
+    let mut next = match previous {
+        Some(previous) => previous.clone(),
+        None => serde_json::from_value(serde_json::json!({
+            "id": "", "name": "", "transport": transport, "args": [], "env": [],
+        }))
+        .ok()?,
+    };
+    next.transport = transport.to_string();
+    next.command = command
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(String::from);
+    next.url = url
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(String::from);
+    if let Some(plain) = plain {
+        next.env
+            .retain(|env| env.secret || env.unknown_fields.contains_key("source"));
+        next.env
+            .extend(plain.iter().map(|key| crate::registry::EnvVar {
+                key: key.trim().to_string(),
+                value: Some(String::new()),
+                secret: false,
+                unknown_fields: Default::default(),
+            }));
+    }
+    next.env.extend(rows.iter().map(|row| {
+        let mut env = crate::registry::EnvVar {
+            key: row.key.trim().to_string(),
+            value: None,
+            secret: row.secret || row.reference.is_some(),
+            unknown_fields: Default::default(),
+        };
+        if let Some(reference) = &row.reference {
+            env.unknown_fields
+                .insert("source".into(), serde_json::json!({ "ref": reference }));
+        }
+        env
+    }));
+    next.env.retain(|env| !env.key.is_empty());
+    refuse_new_remote_env(previous, &next).err()
+}
+
 /// `server` with `key` as a stored secret, or a reference: the row a declaration
 /// would leave, for [`refuse_new_remote_env`].
 fn with_sent_row(server: &ServerEntry, key: &str, reference: Option<&str>) -> ServerEntry {
@@ -5758,6 +5814,66 @@ API_KEY = "synthetic-first-origin"
                 "nothing else was declared"
             );
         });
+    }
+
+    /// GTK checks its editor as a save would, so Save and Test are off with the
+    /// same sentence before either is clicked.
+    #[test]
+    fn the_editor_check_matches_the_save() {
+        let typed = ValueRow {
+            key: "RESEND_API_KEY".into(),
+            secret: true,
+            ..Default::default()
+        };
+        let url = Some("https://example.com/mcp");
+        let refusal = editor_remote_env_refusal(None, "http", None, url, None, &[typed.clone()]);
+        assert!(refusal.unwrap().contains("RESEND_API_KEY"));
+        assert!(
+            editor_remote_env_refusal(None, "stdio", Some("npx"), None, None, &[typed]).is_none()
+        );
+        let token = ValueRow {
+            key: "Authorization".into(),
+            secret: true,
+            ..Default::default()
+        };
+        assert!(editor_remote_env_refusal(None, "http", None, url, None, &[token]).is_none());
+
+        let mut local = entry_from_fields(fields("local", "stdio")).unwrap();
+        local.env = vec![
+            registry::EnvVar {
+                key: "API_KEY".into(),
+                value: None,
+                secret: true,
+                unknown_fields: Default::default(),
+            },
+            registry::EnvVar {
+                key: "REGION".into(),
+                value: Some("eu".into()),
+                secret: false,
+                unknown_fields: Default::default(),
+            },
+        ];
+        // The stored secret stays after a switch, so it is refused even with
+        // the plain rows removed.
+        let switched = editor_remote_env_refusal(Some(&local), "http", None, url, Some(&[]), &[]);
+        assert!(switched.unwrap().contains("API_KEY"));
+        let mut remote = local.clone();
+        remote.transport = "http".into();
+        remote.command = None;
+        remote.url = url.map(String::from);
+        remote.env.retain(|env| env.secret);
+        assert!(
+            editor_remote_env_refusal(Some(&remote), "http", None, url, Some(&[]), &[]).is_none()
+        );
+        let plain = editor_remote_env_refusal(
+            Some(&remote),
+            "http",
+            None,
+            url,
+            Some(&["REGION".into()]),
+            &[],
+        );
+        assert!(plain.unwrap().contains("REGION"));
     }
 
     /// A stdio server's variables don't carry over to a switch to http: the

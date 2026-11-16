@@ -110,3 +110,32 @@ describe("SecretsDialog vault probe (SBS-841)", () => {
     ).toBeInTheDocument();
   });
 });
+
+/// A remote server has no environment: Toolport would send a new variable to it
+/// as its bearer token, so the dialog offers only its token. GTK's Credentials
+/// page does the same.
+describe("SecretsDialog on a remote server", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    secretStatus.mockResolvedValue([["MY_MCP_TOKEN", true]]);
+  });
+
+  it("offers no new environment secret, and keeps the one it has", async () => {
+    await openDialog(
+      server({
+        transport: "http",
+        command: null,
+        url: "https://mcp.example.com/mcp",
+        env: [{ key: "MY_MCP_TOKEN", value: null, secret: true }],
+      }),
+    );
+    await waitFor(() => expect(screen.getByText("MY_MCP_TOKEN")).toBeInTheDocument());
+    expect(screen.queryByText(/Add another environment secret/)).not.toBeInTheDocument();
+    expect(screen.getByText("Access token")).toBeInTheDocument();
+  });
+
+  it("still offers one on a stdio server", async () => {
+    await openDialog(server());
+    expect(screen.getByText(/Add another environment secret/)).toBeInTheDocument();
+  });
+});

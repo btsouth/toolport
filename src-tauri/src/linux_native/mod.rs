@@ -11724,6 +11724,11 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
     add_actions.append(&add);
     add_row.append(&add_actions);
     add_section.append(&add_row);
+    // A remote server has no environment: Toolport would send a new variable
+    // as its bearer token, so it takes its token from its sign-in settings
+    // instead, as in React.
+    let remote = server.command.is_none() || matches!(server.transport_id.as_str(), "http" | "sse");
+    add_section.set_visible(!remote);
     content.append(&add_section);
 
     let server_id = server.id.clone();
@@ -12360,21 +12365,25 @@ fn open_server_editor_prefilled(
 
     // Plain values can only be edited once the server exists; a new server
     // takes them from a pasted config.
+    // Set once the field checks exist: a variable row's name changed, so the
+    // check for variables on a remote server runs again.
+    let rows_changed: LateAction = Default::default();
     let plain_env = editing.then(|| {
         let personal = page
             .last_snapshot
             .borrow()
             .as_ref()
             .is_some_and(|snapshot| snapshot.personal_sync);
-        let (section, rows) = plain_env_section(
+        let (section, rows, add) = plain_env_section(
             server
                 .as_ref()
                 .map(|server| server.plain_env.as_slice())
                 .unwrap_or_default(),
             personal,
+            &rows_changed,
         );
         form.append(&section);
-        (section, rows)
+        (section, rows, add)
     });
 
     let credentials = gtk::Label::builder()
@@ -12542,14 +12551,18 @@ fn open_server_editor_prefilled(
     let args_row_for_transport = args_row.clone();
     let cwd_row_for_transport = cwd_row.clone();
     let url_row_for_transport = url_row.clone();
-    let env_section = plain_env.as_ref().map(|(section, _)| section.clone());
+    let env_section = plain_env
+        .as_ref()
+        .map(|(section, _, add)| (section.clone(), add.clone()));
     // A remote server has no environment, but variables a stdio server had
     // stay in view after a switch, so they can be removed before saving.
     let had_plain = server
         .as_ref()
         .is_some_and(|server| !server.plain_env.is_empty());
-    if let Some(section) = &env_section {
+    // A remote server takes no new variables.
+    if let Some((section, add)) = &env_section {
         section.set_visible(transport.selected() == 0 || had_plain);
+        add.set_visible(transport.selected() == 0);
     }
     transport.connect_selected_notify(move |transport| {
         update_editor_transport(
@@ -12559,11 +12572,12 @@ fn open_server_editor_prefilled(
             &cwd_row_for_transport,
             &url_row_for_transport,
         );
-        if let Some(section) = &env_section {
+        if let Some((section, add)) = &env_section {
             section.set_visible(transport.selected() == 0 || had_plain);
+            add.set_visible(transport.selected() == 0);
         }
     });
-    let plain_env = plain_env.map(|(_, rows)| rows);
+    let plain_env = plain_env.map(|(_, rows, _)| rows);
 
     let clamp = adw::Clamp::builder()
         .maximum_size(680)
@@ -12583,6 +12597,25 @@ fn open_server_editor_prefilled(
     // Start typing the name, not on the footer's first button.
     gtk::prelude::GtkWindowExt::set_focus(&editor, Some(&name));
 
+    // The saved server, for the check of variables on a remote server.
+    let saved_entry = server_id.as_ref().and_then(|id| {
+        crate::registry::load()
+            .ok()?
+            .servers
+            .into_iter()
+            .find(|saved| &saved.id == id)
+    });
+    let remote_error = gtk::Label::builder()
+        .halign(gtk::Align::Fill)
+        .xalign(0.0)
+        .wrap(true)
+        .visible(false)
+        .margin_start(30)
+        .margin_end(30)
+        .margin_bottom(8)
+        .css_classes(["error"])
+        .build();
+    root.insert_child_after(&remote_error, Some(&scroller));
     let validation_errors = [
         (&name, crate::i18n::msg("Give the server a name.")),
         (
@@ -12628,8 +12661,40 @@ fn open_server_editor_prefilled(
             test.clone(),
         );
         let validation_errors = validation_errors.clone();
+        let (remote_error, saved_entry, plain_rows) = (
+            remote_error.clone(),
+            saved_entry.clone(),
+            plain_env.as_ref().map(std::rc::Rc::downgrade),
+        );
+        let pasted = pasted_env.as_ref().map(PastedEnvSection::downgrade);
         std::rc::Rc::new(move || {
             let remote = transport.selected() != 0;
+            // A variable a remote server would receive as its bearer token:
+            // refused with the same sentence as a save, before Save or Test.
+            let plain_keys: Option<Vec<String>> = plain_rows.as_ref().map(|rows| {
+                rows.upgrade()
+                    .and_then(|rows| {
+                        rows.try_borrow()
+                            .ok()
+                            .map(|rows| rows.iter().map(|row| row.key.text().to_string()).collect())
+                    })
+                    .unwrap_or_default()
+            });
+            let pasted_rows = pasted
+                .as_ref()
+                .and_then(WeakPastedEnvSection::upgrade)
+                .map(|section| section.try_collect())
+                .unwrap_or_default();
+            let refusal = crate::registry_controller::editor_remote_env_refusal(
+                saved_entry.as_ref(),
+                ["stdio", "http", "sse"][(transport.selected() as usize).min(2)],
+                Some(&command.text()),
+                Some(&url.text()),
+                plain_keys.as_deref(),
+                &pasted_rows,
+            );
+            remote_error.set_label(refusal.as_deref().unwrap_or(""));
+            remote_error.set_visible(refusal.is_some());
             let lower_url = url.text().trim().to_ascii_lowercase();
             let valid_url = lower_url.starts_with("https://") || lower_url.starts_with("http://");
             let checks = [
@@ -12638,7 +12703,7 @@ fn open_server_editor_prefilled(
                 (&url, !remote || valid_url),
                 (&timeout, editor_timeout_ms(&timeout.text()).is_ok()),
             ];
-            let valid = checks.iter().all(|(_, valid)| *valid);
+            let valid = checks.iter().all(|(_, valid)| *valid) && refusal.is_none();
             for ((field, ok), (_, error, touched)) in checks.into_iter().zip(&validation_errors) {
                 error.set_visible(!ok && touched.get());
                 if ok || !touched.get() {
@@ -12662,6 +12727,12 @@ fn open_server_editor_prefilled(
     };
     {
         let (validation_errors, validate) = (validation_errors.clone(), validate.clone());
+        // Variable rows run the checks when they change; the hooks hold the
+        // checks, which hold the rows only weakly.
+        *rows_changed.borrow_mut() = Some(validate.clone());
+        if let Some(section) = &pasted_env {
+            *section.changed.borrow_mut() = Some(validate.clone());
+        }
         *quiet_empty_fields.borrow_mut() = Some(std::rc::Rc::new(move || {
             for (entry, _, touched) in &validation_errors {
                 if entry.text().trim().is_empty() {
@@ -13574,6 +13645,8 @@ struct PastedEnvSection {
     caption: gtk::Label,
     list: gtk::Box,
     notice: gtk::Label,
+    /// The editor's field checks, run when a row changes.
+    changed: LateAction,
     rows: std::rc::Rc<std::cell::RefCell<Vec<PastedEnvRow>>>,
     /// Names the paste gave no value. The notice names a row while its name is
     /// one of these and its value is empty, the same rule as the React dialog.
@@ -13586,6 +13659,7 @@ struct PastedEnvSection {
 struct WeakPastedEnvSection {
     section: gtk::glib::WeakRef<gtk::Box>,
     caption: gtk::glib::WeakRef<gtk::Label>,
+    changed: std::rc::Weak<std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>>,
     list: gtk::glib::WeakRef<gtk::Box>,
     notice: gtk::glib::WeakRef<gtk::Label>,
     rows: std::rc::Weak<std::cell::RefCell<Vec<PastedEnvRow>>>,
@@ -13597,6 +13671,7 @@ impl WeakPastedEnvSection {
         Some(PastedEnvSection {
             section: self.section.upgrade()?,
             caption: self.caption.upgrade()?,
+            changed: self.changed.upgrade()?,
             list: self.list.upgrade()?,
             notice: self.notice.upgrade()?,
             rows: self.rows.upgrade()?,
@@ -13700,6 +13775,7 @@ fn pasted_env_section() -> PastedEnvSection {
     let section = PastedEnvSection {
         section,
         caption,
+        changed: Default::default(),
         list,
         notice,
         rows: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
@@ -13714,6 +13790,7 @@ impl PastedEnvSection {
         WeakPastedEnvSection {
             section: self.section.downgrade(),
             caption: self.caption.downgrade(),
+            changed: std::rc::Rc::downgrade(&self.changed),
             list: self.list.downgrade(),
             notice: self.notice.downgrade(),
             rows: std::rc::Rc::downgrade(&self.rows),
@@ -13988,6 +14065,16 @@ impl PastedEnvSection {
                 &[("value0", &missing.join(", "))],
             );
         }
+        drop(names);
+        run_late(&self.changed);
+    }
+
+    /// [`Self::collect`], or nothing while the rows are being changed.
+    fn try_collect(&self) -> Vec<crate::registry_controller::ValueRow> {
+        if self.rows.try_borrow_mut().is_err() {
+            return Vec::new();
+        }
+        self.collect()
     }
 
     /// The rows to save, as the React dialog collects them.
@@ -14046,7 +14133,11 @@ struct PlainEnvRow {
 
 type PlainEnvRows = std::rc::Rc<std::cell::RefCell<Vec<PlainEnvRow>>>;
 
-fn plain_env_section(values: &[state::PlainEnvView], personal: bool) -> (gtk::Box, PlainEnvRows) {
+fn plain_env_section(
+    values: &[state::PlainEnvView],
+    personal: bool,
+    changed: &LateAction,
+) -> (gtk::Box, PlainEnvRows, gtk::Button) {
     let section = gtk::Box::new(gtk::Orientation::Vertical, 8);
     section.add_css_class("toolport-form-section");
     section.append(&section_heading(crate::i18n::msg("Environment"), crate::i18n::msg("Plain settings the command reads, such as a region or a feature flag. Keys and tokens belong in Credentials.")));
@@ -14054,19 +14145,34 @@ fn plain_env_section(values: &[state::PlainEnvView], personal: bool) -> (gtk::Bo
     section.append(&list);
     let rows: PlainEnvRows = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     for saved in values {
-        add_plain_env_row(&list, &rows, Some(saved.clone()), personal);
+        add_plain_env_row(&list, &rows, Some(saved.clone()), personal, changed);
     }
     let add = l10n::button("Add value");
     add.add_css_class("toolport-secondary-action");
     add.set_halign(gtk::Align::Start);
     let list_for_add = list.clone();
     let rows_for_add = rows.clone();
+    let changed_for_add = changed.clone();
     add.connect_clicked(move |_| {
-        let key = add_plain_env_row(&list_for_add, &rows_for_add, None, personal);
+        let key = add_plain_env_row(
+            &list_for_add,
+            &rows_for_add,
+            None,
+            personal,
+            &changed_for_add,
+        );
         key.grab_focus();
     });
     section.append(&add);
-    (section, rows)
+    (section, rows, add)
+}
+
+/// Run a hook set once its target exists, such as the editor's field checks.
+fn run_late(action: &LateAction) {
+    let action = action.borrow().clone();
+    if let Some(action) = action {
+        action();
+    }
 }
 
 fn add_plain_env_row(
@@ -14074,6 +14180,7 @@ fn add_plain_env_row(
     rows: &PlainEnvRows,
     saved: Option<state::PlainEnvView>,
     personal: bool,
+    changed: &LateAction,
 ) -> gtk::Entry {
     let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
     let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -14162,11 +14269,17 @@ fn add_plain_env_row(
         local,
         touched,
     });
+    {
+        let changed = changed.clone();
+        key.connect_changed(move |_| run_late(&changed));
+    }
     let list = list.clone();
     let rows_for_remove = rows.clone();
+    let changed = changed.clone();
     remove.connect_clicked(move |_| {
         list.remove(&row);
         rows_for_remove.borrow_mut().retain(|r| r.row != row);
+        run_late(&changed);
     });
     key
 }
@@ -17430,6 +17543,177 @@ mod tests {
     /// A refused paste leaves Add server as it was before that paste and shows
     /// only the refusal: no "Give the server a name." for the name the user
     /// only left to use the paste box, and the fields of an earlier paste stay.
+    /// The Credentials page offers no new variable for a remote server, which
+    /// would receive it as its bearer token, as in React. A stdio server keeps it.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn credentials_offer_no_new_variable_for_a_remote_server() {
+        use super::*;
+        adw::init().unwrap();
+        let _data = crate::registry::DataDirTestEnv::new("gtk-remote-credentials");
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.RemoteCredentials")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gtk::gio::Cancellable::NONE).unwrap();
+        let parent = adw::ApplicationWindow::builder().application(&app).build();
+        let (content, page, _) = build_content(&app, crate::approval_broker::start_native());
+        parent.set_content(Some(&content));
+        parent.present();
+        let view = |id: &str, command: Option<&str>, transport: &str| state::ServerView {
+            id: id.into(),
+            name: id.into(),
+            origin_label: "Personal".into(),
+            transport: transport.into(),
+            transport_id: transport.into(),
+            command: command.map(String::from),
+            args: vec![],
+            launch: None,
+            url: command
+                .is_none()
+                .then(|| "https://mcp.example.com/mcp".into()),
+            cwd: None,
+            inherit_env: false,
+            hide_prompts: false,
+            secret_keys: vec!["MY_MCP_TOKEN".into()],
+            plain_env: vec![],
+            secret_references: Default::default(),
+            client_credentials: None,
+            enabled: false,
+            requires_review: false,
+            team_route_removed: false,
+            probe_fingerprint: 1,
+        };
+        fn widgets(widget: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+            out.push(widget.clone());
+            let mut child = widget.first_child();
+            while let Some(node) = child {
+                child = node.next_sibling();
+                widgets(&node, out);
+            }
+        }
+        let offers_add = |server: state::ServerView| {
+            let title = format!("Credentials for {}", server.name);
+            open_credentials_editor(server, page.clone());
+            let window = app
+                .windows()
+                .into_iter()
+                .find(|w| w.title().as_deref() == Some(title.as_str()))
+                .unwrap();
+            let mut all = Vec::new();
+            widgets(window.upcast_ref(), &mut all);
+            let heading = all
+                .iter()
+                .filter_map(|w| w.downcast_ref::<gtk::Label>())
+                .find(|l| l.label() == "Add credential")
+                .unwrap()
+                .clone();
+            // Shown only if it and every container up to the window are.
+            let mut shown = true;
+            let mut node = Some(heading.upcast::<gtk::Widget>());
+            while let Some(widget) = node {
+                shown &= widget.is_visible();
+                node = widget.parent();
+            }
+            let stored = all
+                .iter()
+                .filter_map(|w| w.downcast_ref::<gtk::Label>())
+                .any(|l| l.label().contains("MY_MCP_TOKEN"));
+            window.close();
+            (shown, stored)
+        };
+        assert_eq!(offers_add(view("remote", None, "http")), (false, true));
+        assert_eq!(
+            offers_add(view("local", Some("npx"), "stdio")),
+            (true, true)
+        );
+        parent.close();
+    }
+
+    /// A variable a remote server would receive as its token turns Save and
+    /// Test off before either is clicked, with the sentence React shows.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn a_remote_variable_turns_save_and_test_off_up_front() {
+        use super::*;
+        adw::init().unwrap();
+        let _data = crate::registry::DataDirTestEnv::new("gtk-remote-variable");
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.RemoteVariable")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gtk::gio::Cancellable::NONE).unwrap();
+        let parent = adw::ApplicationWindow::builder().application(&app).build();
+        let (content, page, _) = build_content(&app, crate::approval_broker::start_native());
+        parent.set_content(Some(&content));
+        parent.present();
+        let editor = open_server_editor_prefilled(None, None, page, None).unwrap();
+        fn widgets(widget: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+            out.push(widget.clone());
+            let mut child = widget.first_child();
+            while let Some(node) = child {
+                child = node.next_sibling();
+                widgets(&node, out);
+            }
+        }
+        let all = || {
+            let mut all = Vec::new();
+            widgets(editor.upcast_ref(), &mut all);
+            all
+        };
+        all()
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::Expander>().ok())
+            .unwrap()
+            .set_expanded(true);
+        let button = |label: &str| {
+            all()
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Button>().ok())
+                .find(|b| b.label().as_deref() == Some(label))
+                .unwrap()
+        };
+        let (save, test, fill) = (
+            button("Add"),
+            button("Test connection"),
+            button("Fill from snippet"),
+        );
+        let snippet = all()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::TextView>().ok())
+            .find(|t| t.ancestor(gtk::Expander::static_type()).is_some())
+            .unwrap();
+        snippet.buffer().set_text(
+            r#"{"mcpServers":{"authed":{"url":"https://mcp.example.com/mcp","bearerTokenEnvVar":"MY_MCP_TOKEN"}}}"#,
+        );
+        fill.emit_clicked();
+        let refusal = "Remote servers don't read environment variables, so Toolport would send RESEND_API_KEY to this server as its bearer token. Remove it, or name it Authorization if it is this server's token.";
+        let error = || {
+            all()
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Label>().ok())
+                .find(|l| l.has_css_class("error") && l.label().starts_with("Remote servers don't"))
+        };
+        // The pasted token is named Authorization, which a remote server takes.
+        let key = all()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Entry>().ok())
+            .find(|e| e.text() == "Authorization")
+            .expect("the pasted token row is named Authorization");
+        assert!(error().is_some_and(|l| !l.is_visible()));
+        assert!(save.is_sensitive() && test.is_sensitive());
+        key.set_text("RESEND_API_KEY");
+        let shown = error().unwrap();
+        assert!(shown.is_visible());
+        assert_eq!(shown.label(), refusal);
+        assert!(!save.is_sensitive() && !test.is_sensitive());
+        key.set_text("Authorization");
+        assert!(!shown.is_visible());
+        assert!(save.is_sensitive() && test.is_sensitive());
+        editor.close();
+        parent.close();
+    }
+
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn a_refused_paste_leaves_the_form_and_shows_only_the_refusal() {
