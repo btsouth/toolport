@@ -1230,6 +1230,8 @@ mockIPC(
       case "list_server_resources":
       case "list_server_prompts":
         return [];
+      case "cancel_tool_call":
+        return null;
       case "call_tool":
         return {
           content: [{ type: "text", text: `Fixture result: ${JSON.stringify(payload)}` }],

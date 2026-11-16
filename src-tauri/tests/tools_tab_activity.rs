@@ -26,6 +26,8 @@ fn a_tools_tab_run_names_toolport_and_counts_the_start() {
         "slow",
         "echo",
         json!({"text": "hello"}),
+        &conduit_lib::playground::ToolRun::new(),
+        |_| {},
     )
     .expect("the Run succeeds");
     assert!(result.to_string().contains("hello"), "{result}");

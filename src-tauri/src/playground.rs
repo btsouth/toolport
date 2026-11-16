@@ -1,6 +1,7 @@
 //! Shell-neutral server capability and tool runner operations.
 
 use crate::registry::ServerEntry;
+use std::path::Path;
 
 fn server(server_id: &str) -> Result<ServerEntry, String> {
     let registry = crate::registry::load()?;
@@ -107,26 +108,113 @@ pub fn capabilities(server_id: &str) -> Result<Capabilities, String> {
     })
 }
 
+/// The progress token a Tools tab Run sends, so the gateway can say when it is
+/// waiting for the server to start.
+const RUN_PROGRESS_TOKEN: &str = "tools-tab-run";
+
+/// How long one Tools tab Run may take: the gateway's wait for a cold server's
+/// first catalog, a pending approval, and the server's own call limit, plus a
+/// margin for the gateway itself. A Run is cancelled, never cut short.
+pub fn run_time_limit(request_timeout_ms: Option<u64>) -> std::time::Duration {
+    let call = request_timeout_ms
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(crate::downstream::STDIO_READ_TIMEOUT);
+    crate::downstream::SETUP_CATALOG_WAIT_BUDGET
+        + std::time::Duration::from_secs(crate::approval::DEFAULT_TIMEOUT_SECS)
+        + call
+        + std::time::Duration::from_secs(5)
+}
+
+/// One Run on the Tools tab. Clone it to cancel from another thread; while the
+/// gateway is starting the server, [`ToolRun::is_starting`] is true.
+#[derive(Clone)]
+pub struct ToolRun {
+    _registry: crate::downstream::CancelRegistry,
+    cancel: crate::downstream::CancelContext,
+    starting: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Default for ToolRun {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ToolRun {
+    pub fn new() -> Self {
+        let registry = crate::downstream::CancelRegistry::new();
+        let cancel = registry
+            .begin_client_request("tools-tab".into())
+            .expect("a new registry is open");
+        Self {
+            _registry: registry,
+            cancel,
+            starting: Default::default(),
+        }
+    }
+
+    /// Stop the Run: the gateway is told to cancel the call, including a wait
+    /// for the server to start, and the caller gets a cancelled error at once.
+    pub fn cancel(&self) {
+        self.cancel.cancel(Some("Cancelled from the Tools tab"));
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    pub fn is_starting(&self) -> bool {
+        self.starting.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// What the gateway reported about a Run while it is in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunPhase {
+    Starting,
+    Started,
+}
+
 pub fn call_tool(
     server_id: &str,
     tool: &str,
     arguments: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    call_tool_run(server_id, tool, arguments, &ToolRun::new(), |_| {})
+}
+
+/// [`call_tool`] for a Run its caller can cancel and watch.
+pub fn call_tool_run(
+    server_id: &str,
+    tool: &str,
+    arguments: serde_json::Value,
+    run: &ToolRun,
+    on_phase: impl Fn(RunPhase) + Send + Sync + 'static,
+) -> Result<serde_json::Value, String> {
     // Use the same gateway dispatch as clients, including profile scope, quarantine,
     // human approval and result inspection. Never call the downstream directly.
     let gateway = crate::clients::resolve_gateway_path_readonly()
         .ok_or("Could not locate the toolport-gateway binary")?;
-    call_tool_with_gateway(&gateway, server_id, tool, arguments)
+    call_tool_with_gateway(&gateway, server_id, tool, arguments, run, on_phase)
 }
 
-/// [`call_tool`] through a given gateway binary.
+/// [`call_tool_run`] through a given gateway binary.
 pub fn call_tool_with_gateway(
-    gateway: &std::path::Path,
+    gateway: &Path,
     server_id: &str,
     tool: &str,
     arguments: serde_json::Value,
+    run: &ToolRun,
+    on_phase: impl Fn(RunPhase) + Send + Sync + 'static,
 ) -> Result<serde_json::Value, String> {
     let registry = crate::registry::load()?;
+    let limit = run_time_limit(
+        registry
+            .servers
+            .iter()
+            .find(|server| server.id == server_id)
+            .and_then(|server| server.request_timeout_ms),
+    );
     let env = vec![
         (
             "TOOLPORT_DATA_DIR".to_string(),
@@ -142,24 +230,135 @@ pub fn call_tool_with_gateway(
             crate::clients::TOOLS_TAB_CLIENT_ID.to_string(),
         ),
     ];
-    let transport = crate::downstream::StdioTransport::spawn(
+    let mut transport = crate::downstream::StdioTransport::spawn(
         &gateway.to_string_lossy(),
         &[],
         &env,
         None,
         false,
     )?;
-    let mut gateway =
-        crate::downstream::DownstreamServer::connect("tools-tab".to_string(), Box::new(transport))?;
-    gateway
-        .call(
-            "toolport_call_tool",
-            serde_json::json!({
-                "_toolportTarget": {"serverId": server_id, "tool": tool},
-                "arguments": arguments
-            }),
-        )
-        .map_err(|error| error.to_string())
+    // Report each change once, whether the gateway or the wait below noticed it.
+    let on_phase: std::sync::Arc<dyn Fn(RunPhase) + Send + Sync> = std::sync::Arc::new(on_phase);
+    let report = {
+        let starting = std::sync::Arc::clone(&run.starting);
+        move |phase: RunPhase| {
+            let now = phase == RunPhase::Starting;
+            if starting.swap(now, std::sync::atomic::Ordering::SeqCst) != now {
+                on_phase(phase);
+            }
+        }
+    };
+    let report = std::sync::Arc::new(report);
+    let from_gateway = std::sync::Arc::clone(&report);
+    transport.set_progress_sink(Some(std::sync::Arc::new(move |note: serde_json::Value| {
+        let params = &note["params"];
+        if params["progressToken"] != RUN_PROGRESS_TOKEN {
+            return;
+        }
+        match params["_meta"]["toolport/phase"].as_str() {
+            Some("starting") => from_gateway(RunPhase::Starting),
+            Some("started") => from_gateway(RunPhase::Started),
+            _ => {}
+        }
+    })));
+    if run.is_cancelled() {
+        return Err(cancelled());
+    }
+    // Connect and call on a worker, so Cancel returns at once even while the
+    // gateway is still waiting for servers to start before it answers the
+    // handshake. A worker whose Run was cancelled makes no call, and dropping
+    // its connection stops that gateway.
+    // Whether the handshake is done, held while reporting so a late "starting"
+    // from the wait below can never follow the handshake's "started".
+    let connected = std::sync::Arc::new(std::sync::Mutex::new(false));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    {
+        let run = run.clone();
+        let connected = std::sync::Arc::clone(&connected);
+        let report = std::sync::Arc::clone(&report);
+        let server_id = server_id.to_string();
+        let tool = tool.to_string();
+        std::thread::spawn(move || {
+            let gateway = crate::downstream::DownstreamServer::connect(
+                "tools-tab".to_string(),
+                Box::new(transport),
+            );
+            {
+                let mut done = connected
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *done = true;
+                report(RunPhase::Started);
+            }
+            let mut gateway = match gateway {
+                Ok(gateway) => gateway,
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    return;
+                }
+            };
+            if run.is_cancelled() {
+                return;
+            }
+            gateway.set_call_timeout(limit);
+            let result = gateway.call_with_cancel(
+                "toolport_call_tool",
+                serde_json::json!({
+                    "_toolportTarget": {"serverId": server_id, "tool": tool},
+                    "arguments": arguments
+                }),
+                Some(run.cancel.clone()),
+                Some(&serde_json::json!({
+                    "progressToken": RUN_PROGRESS_TOKEN,
+                    crate::downstream::START_NOTICES_META_KEY: true,
+                })),
+            );
+            let _ = sender.send(result.map_err(|error| match error {
+                crate::downstream::TransportError::Classified(
+                    crate::call_failure::CallFailureKind::Timeout { .. },
+                    _,
+                ) => crate::i18n::trf(
+                    "No response after {value0}s. The server may be slow or unreachable; check its status under Servers, then retry.",
+                    &[("value0", &limit.as_secs().to_string())],
+                ),
+                error => error.to_string(),
+            }));
+        });
+    }
+    // The gateway answers the Tools tab's handshake without waiting for
+    // servers, so a slow handshake means the shared gateway itself is starting,
+    // which it does to start this server.
+    let began = std::time::Instant::now();
+    let result = loop {
+        match receiver.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(result) => break result,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(crate::i18n::tr("the tool call stopped unexpectedly"))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if run.is_cancelled() {
+            break Err(cancelled());
+        }
+        if began.elapsed() >= std::time::Duration::from_millis(500) {
+            let done = connected
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !*done {
+                report(RunPhase::Starting);
+            }
+        }
+    };
+    run.starting
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    match result {
+        Err(_) if run.is_cancelled() => Err(cancelled()),
+        result => result,
+    }
+}
+
+fn cancelled() -> String {
+    crate::i18n::tr("Stopped. The server was told to cancel the call.")
 }
 
 pub fn list_resources(server_id: &str) -> Result<Vec<serde_json::Value>, String> {

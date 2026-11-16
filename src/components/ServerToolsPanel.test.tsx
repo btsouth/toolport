@@ -6,6 +6,8 @@ import { ServerToolsPanel } from "./ServerToolsPanel";
 const api = vi.hoisted(() => ({
   listServerTools: vi.fn(),
   callTool: vi.fn(),
+  cancelToolCall: vi.fn(),
+  onToolRunProgress: vi.fn(),
   setToolEnabled: vi.fn(),
   listServerResources: vi.fn(),
   listServerPrompts: vi.fn(),
@@ -55,6 +57,8 @@ describe("server Tools panel", () => {
     vi.clearAllMocks();
     api.listServerTools.mockResolvedValue(tools);
     api.callTool.mockResolvedValue({ content: [{ type: "text", text: "Record found" }] });
+    api.cancelToolCall.mockResolvedValue(undefined);
+    api.onToolRunProgress.mockResolvedValue(() => {});
     api.listServerResources.mockResolvedValue([]);
     api.listServerPrompts.mockResolvedValue([]);
   });
@@ -91,9 +95,51 @@ describe("server Tools panel", () => {
     fireEvent.change(screen.getByLabelText(/id/), { target: { value: "42" } });
     fireEvent.click(screen.getByRole("button", { name: "Call tool" }));
     await waitFor(() =>
-      expect(api.callTool).toHaveBeenCalledWith("alpha", "read", { id: 42 }),
+      expect(api.callTool).toHaveBeenCalledWith(
+        "alpha",
+        "read",
+        { id: 42 },
+        expect.any(String),
+      ),
     );
     expect(await screen.findByText("Record found")).toBeVisible();
+  });
+
+  it("says the server is starting and cancels that Run in the gateway", async () => {
+    const call = deferred<unknown>();
+    api.callTool.mockReturnValue(call.promise);
+    let progress!: (p: { runId: string; phase: string }) => void;
+    api.onToolRunProgress.mockImplementation(async (handler) => {
+      progress = handler;
+      return () => {};
+    });
+    render(
+      <ServerToolsPanel
+        serverId="alpha"
+        registry={registry}
+        onRegistryChange={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /Read a record/ }));
+    fireEvent.change(screen.getByLabelText(/id/), { target: { value: "42" } });
+    fireEvent.click(screen.getByRole("button", { name: "Call tool" }));
+    await waitFor(() => expect(api.callTool).toHaveBeenCalled());
+    const runId = api.callTool.mock.calls[0][3] as string;
+    // Another Run's progress is not this one's.
+    act(() => progress({ runId: "someone-else", phase: "starting" }));
+    expect(screen.getByRole("button", { name: /Calling/ })).toBeVisible();
+    act(() => progress({ runId, phase: "starting" }));
+    expect(screen.getByRole("button", { name: /Starting Alpha/ })).toBeVisible();
+    act(() => progress({ runId, phase: "started" }));
+    expect(screen.getByRole("button", { name: /Calling/ })).toBeVisible();
+    act(() => progress({ runId, phase: "starting" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(api.cancelToolCall).toHaveBeenCalledWith(runId);
+    expect(screen.getByText(/The server was told to cancel the call/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Call tool" })).toBeEnabled();
+    // A late result after the cancel is dropped.
+    await act(async () => call.resolve({ content: [{ type: "text", text: "Late" }] }));
+    expect(screen.queryByText("Late")).not.toBeInTheDocument();
   });
 
   it("shows a result without Toolport's provenance, keeping the server's own _meta", async () => {
