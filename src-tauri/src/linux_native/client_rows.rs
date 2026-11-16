@@ -980,7 +980,8 @@ pub(super) fn t3_code_card(
     let connect = l10n::button("Connect all");
     // React's card uses its default (primary) button.
     connect.add_css_class("suggested-action");
-    connect.set_valign(gtk::Align::Center);
+    // Beside the title, at the top of the card, as React's status card puts its action.
+    connect.set_valign(gtk::Align::Start);
     connect.set_sensitive(!page.t3_code_batch.get());
     connect.connect_clicked(move |_| connect_t3_code_targets(page.clone(), targets.clone()));
     card.append(&connect);

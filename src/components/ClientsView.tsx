@@ -17,7 +17,6 @@ import {
 } from "lucide-react";
 import { ClientRecoveryBanners } from "@/components/ClientRecoveryBanners";
 import { ConnectReviewDialog } from "@/components/ConnectReviewDialog";
-import { toast } from "sonner";
 import { requestClientRecoveryScan } from "@/lib/clientRecoveryEvents";
 import { ClientLogo } from "@/components/ClientLogo";
 import {
@@ -57,17 +56,6 @@ import {
 } from "@/lib/types";
 
 type ClientStatus = "connected" | "ready" | "customized" | "error" | "missing";
-
-/** Toast options for a summary that lists what was not connected: it stays until it is
- * dismissed, and a long name breaks anywhere instead of running off a narrow window. */
-const LASTING_TOAST = {
-  duration: Infinity,
-  closeButton: true,
-  classNames: {
-    title: "[overflow-wrap:anywhere]",
-    description: "[overflow-wrap:anywhere]",
-  },
-};
 
 /** A chip whose text wraps onto more lines instead of hiding names behind an ellipsis;
  * a smaller radius keeps the corners of a tall chip from cutting into its text. */
@@ -673,6 +661,9 @@ export function ClientsView({
     stopped: boolean;
   } | null>(null);
   const summaryShown = useRef<typeof summaryDue>(null);
+  const [allSummary, setAllSummary] = useState<{ text: string; success: boolean } | null>(
+    null,
+  );
   useEffect(() => {
     if (!summaryDue || summaryShown.current === summaryDue) return;
     summaryShown.current = summaryDue;
@@ -680,8 +671,9 @@ export function ClientsView({
       ...connectAllOutcome(clients, summaryDue.connectedIds, summaryDue.notConnectedIds),
       stopped: summaryDue.stopped,
     });
-    if (success) toast.success(text);
-    else toast(text, LASTING_TOAST);
+    // On the page until dismissed, as GTK shows it and as Clients keeps its restart
+    // reminder: a toast fades before a long list of what was not connected is read.
+    setAllSummary({ text, success });
   }, [summaryDue, clients]);
   // When the batch closes, focus goes back to Connect all, or to the T3 Code card once
   // the button is gone, never to the page start.
@@ -780,6 +772,37 @@ export function ClientsView({
         refreshKey={clients}
         onRecovered={() => void onChanged?.()}
       />
+      {allSummary && (
+        // Connect all's summary, above the card as GTK places it. A long name breaks
+        // anywhere instead of running off a narrow window.
+        <div
+          role="status"
+          data-testid="connect-all-summary"
+          data-tone={allSummary.success ? "success" : "warning"}
+          className={`flex select-text items-start gap-2 toolport-alert px-3 py-2 text-sm ${
+            allSummary.success
+              ? "border-success bg-success/8"
+              : "border-warning bg-warning/8"
+          }`}
+        >
+          <p className="min-w-0 flex-1 self-center text-foreground [overflow-wrap:anywhere]">
+            {allSummary.text}
+          </p>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              setAllSummary(null);
+              // Focus stays on the page, on Connect all or the card, as in GTK.
+              const button = connectAllButton.current;
+              if (button && !button.disabled) button.focus();
+              else t3Card.current?.focus();
+            }}
+          >
+            {t("Dismiss")}
+          </Button>
+        </div>
+      )}
       {sessionError && (
         <ErrorCallout
           title={translate("Client session history could not be read.")}

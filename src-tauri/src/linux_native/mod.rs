@@ -3288,16 +3288,16 @@ impl ClientPage {
         if let Some(outcome) = &batch {
             // Built from this scan, so it counts what exists and is on now.
             let (summary, success) = client_rows::t3_code_batch_result(&clients, outcome);
-            if success {
-                // A full success needs no keeping; an older summary would contradict it.
-                self.lasting.set_visible(false);
-                self.show_confirmation(&summary);
-            } else {
-                self.cancel_feedback_timer();
-                self.feedback.set_visible(false);
-                self.lasting_label.set_label(&summary);
-                self.lasting.set_visible(true);
-            }
+            // Kept until dismissed either way, as React keeps it: green for a full
+            // success, amber when something was not connected.
+            self.cancel_feedback_timer();
+            self.feedback.set_visible(false);
+            self.lasting_label.set_label(&summary);
+            self.lasting
+                .remove_css_class(if success { "warning" } else { "success" });
+            self.lasting
+                .add_css_class(if success { "success" } else { "warning" });
+            self.lasting.set_visible(true);
         } else if let Some(confirmation) = self.pending_confirmation.borrow_mut().take() {
             self.show_confirmation(&confirmation);
         } else {
@@ -16435,7 +16435,9 @@ mod tests {
             row("aider", "Aider", Disconnected),
             row("codex", "Codex", Disconnected),
         ]));
-        assert!(connect_all(&page).is_some(), "the card offers Connect all");
+        let offered = connect_all(&page).expect("the card offers Connect all");
+        // Beside the title at the top of the card, as React's status card puts it.
+        assert_eq!(offered.valign(), gtk::Align::Start);
         // Escape on the second step: Aider connected, Codex not.
         *page.pending_batch.borrow_mut() = Some(client_rows::T3BatchOutcome {
             stopped: true,
@@ -16452,6 +16454,7 @@ mod tests {
             "Connect all stopped. Connected 1 of 2 T3 Code instances. Not connected: Codex.";
         assert!(page.lasting.is_visible(), "the summary shows");
         assert_eq!(page.lasting_label.text(), summary);
+        assert!(page.lasting.has_css_class("warning"), "amber, as React's");
         let button = connect_all(&page).unwrap();
         assert!(button.has_focus(), "focus returns to Connect all");
         assert!(
@@ -16474,8 +16477,8 @@ mod tests {
             .unwrap();
         dismiss.emit_clicked();
         assert!(!page.lasting.is_visible());
-        // A batch that connects everything: no lasting summary, and with Connect all gone
-        // focus goes to the T3 Code card.
+        // A batch that connects everything: its summary is kept too, green, as React's
+        // is, and with Connect all gone focus goes to the T3 Code card.
         *page.pending_batch.borrow_mut() = Some(client_rows::T3BatchOutcome {
             stopped: false,
             rows: vec!["codex".into()],
@@ -16488,7 +16491,16 @@ mod tests {
         ]));
         settle();
         assert!(connect_all(&page).is_none());
-        assert!(!page.lasting.is_visible(), "a full success is not kept");
+        assert!(
+            page.lasting.is_visible(),
+            "a full success is kept until dismissed"
+        );
+        assert_eq!(
+            page.lasting_label.text(),
+            "Connected 1 of 1 T3 Code instance."
+        );
+        assert!(page.lasting.has_css_class("success"));
+        assert!(!page.lasting.has_css_class("warning"));
         let card = fixture_descendants(page.list.upcast_ref())
             .into_iter()
             .find(|w| w.has_css_class("toolport-t3-card-group"))
