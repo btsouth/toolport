@@ -3160,9 +3160,15 @@ pub fn set_server_secret_with(
     write_registry: impl FnOnce(&str, &str) -> Result<Registry, String>,
 ) -> Result<Registry, String> {
     // Both shells store through here, so both get the same rules.
-    let (key, value) = credential_slot(server_id, key, value)?;
+    let (key, value, bearer) = credential_slot(server_id, key, value)?;
     let key = normalize_secret_key(key)?;
     let _lock = acquire_auth_lock(server_id)?;
+    if bearer {
+        // Same as a token set from the server's sign-in settings: a stale
+        // sign-in must not outlive the token typed over it.
+        crate::remote::clear_oauth_state(server_id)
+            .map_err(|error| could_not_clear_sign_in_state(&error))?;
+    }
     set_server_secret_using(
         server_id,
         &key,
@@ -3205,29 +3211,36 @@ fn credential_slot<'a>(
     server_id: &str,
     key: &'a str,
     value: &'a str,
-) -> Result<(&'a str, &'a str), String> {
+) -> Result<(&'a str, &'a str, bool), String> {
     if !crate::import_credentials::provided(value) {
         return Err("Enter a credential value. Placeholder values cannot be saved.".into());
     }
-    let registry = read_registry_exact()?;
-    let remote = registry
-        .servers
-        .iter()
-        .find(|s| s.id == server_id)
-        .is_some_and(|s| s.transport != "stdio");
-    if remote && key.trim().eq_ignore_ascii_case("authorization") {
-        let (scheme, token) = value
-            .split_once(' ')
-            .ok_or("Enter a Bearer token for Authorization")?;
-        if !scheme.eq_ignore_ascii_case("bearer") {
-            return Err(
-                "Only Bearer authentication is supported for imported Authorization headers".into(),
-            );
-        }
-        Ok((crate::secrets::HTTP_AUTH_KEY, token))
-    } else {
-        Ok((key, value))
+    if !key.trim().eq_ignore_ascii_case("authorization") {
+        return Ok((key, value, false));
     }
+    let registry = read_registry_exact()?;
+    let Some(server) = registry.servers.iter().find(|s| s.id == server_id) else {
+        return Ok((key, value, false));
+    };
+    // A shared Authorization header keeps its own row, so a member's value
+    // replaces the team's source there. Only the bearer slot is mapped here.
+    let header_row = server
+        .unknown_fields
+        .get("headerKeys")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|headers| headers.iter().any(|h| h["key"] == key));
+    if server.transport == "stdio" || header_row {
+        return Ok((key, value, false));
+    }
+    // A bare token is what the bearer slot holds; a Bearer value is unwrapped.
+    let token = match value.trim().split_once(char::is_whitespace) {
+        None => value.trim(),
+        Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => token.trim(),
+        Some(_) => {
+            return Err("Only Bearer authentication is supported for Authorization headers".into());
+        }
+    };
+    Ok((crate::secrets::HTTP_AUTH_KEY, token, true))
 }
 
 /// Vault a launch argument input without declaring an environment variable.
@@ -5601,6 +5614,64 @@ API_KEY = "synthetic-first-origin"
             !gtk.2,
             "a reference row has no typed value, so neither shell switches it on"
         );
+    }
+
+    /// Authorization typed onto a remote server: a bare or Bearer token goes to
+    /// the bearer slot, another scheme is refused, and a shared Authorization
+    /// header keeps its own row so the member's value replaces the team's.
+    #[test]
+    fn authorization_values_go_where_they_are_sent() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let (_, id) =
+                add_reviewed_entry(entry_from_fields(fields("demo", "http")).unwrap()).unwrap();
+            let store = |value: &str| {
+                set_server_secret_with(&id, "Authorization", value, |id, key| {
+                    Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0)
+                })
+            };
+            let bearer = || crate::secrets::get_secret_result(&id, crate::secrets::HTTP_AUTH_KEY);
+            store("bare-token").unwrap();
+            assert_eq!(bearer().unwrap().as_deref(), Some("bare-token"));
+            store("Bearer typed-token").unwrap();
+            assert_eq!(bearer().unwrap().as_deref(), Some("typed-token"));
+            assert!(store("Basic dXNlcjpwYXNz").is_err());
+            assert_eq!(bearer().unwrap().as_deref(), Some("typed-token"));
+
+            registry::update(|r| {
+                let server = r.servers.iter_mut().find(|s| s.id == id).unwrap();
+                server.unknown_fields.insert(
+                    "headerKeys".into(),
+                    serde_json::json!([{"key": "Authorization", "source": {"ref": "op://Team/api/token"}}]),
+                );
+                server.unknown_fields.insert(
+                    "memberSecretRefs".into(),
+                    serde_json::json!({"header:Authorization": {"ref": "op://Team/api/token"}}),
+                );
+                Ok(())
+            })
+            .unwrap();
+            store("Bearer member-token").unwrap();
+            let server = registry::load()
+                .unwrap()
+                .servers
+                .into_iter()
+                .find(|s| s.id == id)
+                .unwrap();
+            assert_eq!(
+                server.unknown_fields["headerKeys"],
+                serde_json::json!([{"key": "Authorization"}]),
+                "the member's value replaces the team source"
+            );
+            assert!(server.unknown_fields["memberSecretRefs"]
+                .get("header:Authorization")
+                .is_none());
+            assert_eq!(
+                crate::secrets::get_secret_result(&id, "Authorization")
+                    .unwrap()
+                    .as_deref(),
+                Some("Bearer member-token")
+            );
+        });
     }
 
     fn test_path(label: &str) -> std::path::PathBuf {
