@@ -133,11 +133,6 @@ impl VaultWrites {
         crate::clients::backup_storage::register(id, key, value);
         Ok(())
     }
-    pub(crate) fn remove(&mut self, id: &str, key: &str) -> Result<(), String> {
-        let previous = secrets::get_vault_secret_result(id, key).map_err(|_| VAULT_FAILURE)?;
-        self.receipts.push((id.into(), key.into(), previous, None));
-        secrets::delete_secret(id, key).map_err(|_| VAULT_FAILURE.into())
-    }
     pub(crate) fn keep(&mut self) {
         self.receipts.clear();
     }

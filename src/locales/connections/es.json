@@ -141,6 +141,8 @@
   "{value1}vaulted": "{value1}guardado en la bóveda",
   "•••• (saved)": "•••• (guardado)",
   "Enter a value, or leave it in the keychain.": "Introduce un valor o déjalo en el llavero.",
+  "Give this variable a name, or remove it.": "Ponle un nombre a esta variable o elimínala.",
+  "This name is already used by a secret argument. Choose another name.": "Este nombre ya lo usa un argumento secreto. Elige otro nombre.",
   "•••••••• (saved)": "•••••••• (guardado)",
   "•••••••• (set)": "•••••••• (configurado)",
   "+{value1} more": "+{value1} más",

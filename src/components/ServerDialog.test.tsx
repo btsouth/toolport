@@ -380,6 +380,90 @@ describe("ServerDialog", () => {
     expect(api.updateServer.mock.calls[0][1]).toEqual(["TOKEN"]);
   });
 
+  it("keeps a keychain variable added elsewhere while the dialog is open", async () => {
+    const initial = {
+      id: "local",
+      name: "Local",
+      transport: "stdio",
+      command: "local-server",
+      args: [],
+      env: [{ key: "TOKEN", value: null, secret: true }],
+      url: null,
+      source: "manual",
+    } as ServerEntry;
+    api.updateServer.mockResolvedValue(savedRegistry("local"));
+    const user = userEvent.setup();
+    const { rerender } = render(
+      <ServerDialog autoOpen editId="local" initial={initial} onSaved={vi.fn()} />,
+    );
+    // Another Toolport process adds a keychain variable while the dialog is open.
+    rerender(
+      <ServerDialog
+        autoOpen
+        editId="local"
+        initial={{
+          ...initial,
+          env: [...initial.env, { key: "ADDED_ELSEWHERE", value: null, secret: true }],
+        }}
+        onSaved={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(api.updateServer).toHaveBeenCalledTimes(1));
+    expect(api.updateServer.mock.calls[0][1]).toEqual([]);
+  });
+
+  it("moves a renamed value onto the name of a removed variable", async () => {
+    const initial = {
+      id: "local",
+      name: "Local",
+      transport: "stdio",
+      command: "local-server",
+      args: [],
+      env: [
+        { key: "GH_TOKEN", value: null, secret: true },
+        { key: "GITHUB_TOKEN", value: null, secret: true },
+      ],
+      url: null,
+      source: "manual",
+    } as ServerEntry;
+    api.updateServer.mockResolvedValue(savedRegistry("local"));
+    const user = userEvent.setup();
+
+    render(<ServerDialog autoOpen editId="local" initial={initial} onSaved={vi.fn()} />);
+    await user.click(screen.getAllByRole("button", { name: "Remove variable" })[1]);
+    const name = screen.getByDisplayValue("GH_TOKEN");
+    await user.clear(name);
+    await user.type(name, "GITHUB_TOKEN");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(api.updateServer).toHaveBeenCalledTimes(1));
+    expect(api.updateServer.mock.calls[0][1]).toEqual(["GITHUB_TOKEN"]);
+    expect(api.updateServer.mock.calls[0][2]).toEqual([["GH_TOKEN", "GITHUB_TOKEN"]]);
+  });
+
+  it("refuses a stored variable whose name was cleared", async () => {
+    const initial = {
+      id: "local",
+      name: "Local",
+      transport: "stdio",
+      command: "local-server",
+      args: [],
+      env: [{ key: "TOKEN", value: null, secret: true }],
+      url: null,
+      source: "manual",
+    } as ServerEntry;
+    const user = userEvent.setup();
+
+    render(<ServerDialog autoOpen editId="local" initial={initial} onSaved={vi.fn()} />);
+    await user.clear(screen.getByDisplayValue("TOKEN"));
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Give this variable a name, or remove it.",
+    );
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    expect(api.updateServer).not.toHaveBeenCalled();
+  });
+
   it("turns the shell environment off for a server", async () => {
     const initial: ServerEntry = {
       id: "local",

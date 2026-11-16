@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { needsValue, secretKeyChanges } from "./secretKeyChanges";
+import {
+  KEEP_IN_KEYCHAIN,
+  NAME_THIS_VARIABLE,
+  NAME_USED_BY_ARGUMENT,
+  rowProblem,
+  secretKeyChanges,
+} from "./secretKeyChanges";
 
 const stored = { storedAs: "GITHUB_TOKN", key: "GITHUB_TOKN", value: "", secret: true };
 
@@ -28,17 +34,17 @@ describe("secretKeyChanges", () => {
 
   it("blocks a keychain variable made plain with no value", () => {
     const row = { ...stored, secret: false };
-    expect(needsValue(row)).toBe(true);
+    expect(rowProblem(row)).toBe(KEEP_IN_KEYCHAIN);
     expect(secretKeyChanges(["GITHUB_TOKN"], [row])).toEqual({
       removed: [],
       renamed: [],
-      blocked: ["GITHUB_TOKN"],
+      blocked: [["GITHUB_TOKN", KEEP_IN_KEYCHAIN]],
     });
   });
 
   it("deletes the stored value once a plain value or a reference replaces it", () => {
     const plain = { ...stored, secret: false, value: "visible" };
-    expect(needsValue(plain)).toBe(false);
+    expect(rowProblem(plain)).toBeNull();
     expect(secretKeyChanges(["GITHUB_TOKN"], [plain]).removed).toEqual(["GITHUB_TOKN"]);
     const reference = { ...stored, source: { ref: "op://Vault/Item/field" } };
     expect(secretKeyChanges(["GITHUB_TOKN"], [reference]).removed).toEqual([
@@ -53,5 +59,19 @@ describe("secretKeyChanges", () => {
       renamed: [],
       blocked: [],
     });
+  });
+
+  it("blocks a stored variable whose name was cleared", () => {
+    const row = { ...stored, key: " " };
+    expect(secretKeyChanges(["GITHUB_TOKN"], [row]).blocked).toEqual([
+      ["GITHUB_TOKN", NAME_THIS_VARIABLE],
+    ]);
+  });
+
+  it("blocks a rename onto a secret argument's name", () => {
+    const row = { ...stored, key: "IMPORTED_ARG_0" };
+    expect(secretKeyChanges(["GITHUB_TOKN"], [row], ["IMPORTED_ARG_0"]).blocked).toEqual([
+      ["GITHUB_TOKN", NAME_USED_BY_ARGUMENT],
+    ]);
   });
 });

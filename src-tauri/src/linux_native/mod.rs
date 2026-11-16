@@ -13122,26 +13122,30 @@ fn open_server_editor_prefilled(
                     },
                 )
                 .collect::<Vec<_>>(),
+            &launch_secret_keys(original_launch_for_save.as_ref()),
         );
-        if !blocked.is_empty() {
-            // The row says what to do; a stored value is never dropped.
+        if let Some((_, first_message)) = blocked.first() {
+            // Each row says what to do; a stored value is never dropped.
+            let mut focused = false;
             for row in editor_env.borrow().iter() {
-                if row
-                    .stored_as
-                    .as_deref()
-                    .is_some_and(|key| blocked.iter().any(|b| b == key))
-                {
-                    row.keep_hint.set_visible(true);
+                let Some((_, message)) = blocked
+                    .iter()
+                    .find(|(key, _)| row.stored_as.as_deref() == Some(key.as_str()))
+                else {
+                    continue;
+                };
+                l10n::bind_text(&row.keep_hint, message);
+                row.keep_hint.set_visible(true);
+                if !focused {
+                    focused = true;
+                    if *message == crate::registry_controller::KEEP_IN_KEYCHAIN {
+                        row.value.grab_focus();
+                    } else {
+                        row.key.grab_focus();
+                    }
                 }
             }
-            if let Some(row) = editor_env
-                .borrow()
-                .iter()
-                .find(|row| row.stored_as.as_deref() == blocked.first().map(String::as_str))
-            {
-                row.value.grab_focus();
-            }
-            l10n::bind_text(&feedback, crate::registry_controller::KEEP_IN_KEYCHAIN);
+            l10n::bind_text(&feedback, first_message);
             feedback.set_visible(true);
             return;
         }
@@ -13978,7 +13982,17 @@ fn editor_env_row(
                     },
                 );
             }
-            keep_hint.set_visible(stored && !vaulted && value.text().trim().is_empty());
+            let hint = if stored && key.text().trim().is_empty() {
+                Some(crate::registry_controller::NAME_THIS_VARIABLE)
+            } else if stored && !vaulted && value.text().trim().is_empty() {
+                Some(crate::registry_controller::KEEP_IN_KEYCHAIN)
+            } else {
+                None
+            };
+            if let Some(hint) = hint {
+                l10n::bind_text(&keep_hint, hint);
+            }
+            keep_hint.set_visible(hint.is_some());
             source.set_visible(vaulted);
             value.set_visibility(!vaulted);
             value.set_visible(!vaulted || source.selected() == 0);
@@ -14058,6 +14072,20 @@ fn editor_env_row(
         }
     });
 }
+/// The keychain names of a server's secret arguments.
+fn launch_secret_keys(launch: Option<&crate::registry::LaunchConfig>) -> Vec<String> {
+    launch
+        .map(|launch| {
+            launch
+                .inputs
+                .iter()
+                .filter(|input| input.secret)
+                .map(|input| input.key.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Each row as saved, with the name its keychain value was stored under.
 fn collect_editor_rows(rows: &EditorEnvRows) -> Vec<(Option<String>, crate::registry::EnvVar)> {
     rows.borrow()
@@ -14084,7 +14112,10 @@ fn collect_editor_rows(rows: &EditorEnvRows) -> Vec<(Option<String>, crate::regi
             };
             (row.stored_as.clone(), env)
         })
-        .filter(|(_, row)| !row.key.is_empty() || row.value.is_some())
+        // A stored row with its name cleared stays, so the save can say so.
+        .filter(|(stored_as, row)| {
+            stored_as.is_some() || !row.key.is_empty() || row.value.is_some()
+        })
         .collect()
 }
 
@@ -17415,6 +17446,7 @@ mod tests {
                         },
                     )
                     .collect::<Vec<_>>(),
+                &[],
             )
         };
         let (key, value, secret, hint) = {
@@ -17446,7 +17478,13 @@ mod tests {
         secret.set_active(false);
         assert_eq!(placeholder().as_deref(), Some("value"));
         assert!(hint.is_visible());
-        assert_eq!(changes().1, ["GITHUB_TOKN"]);
+        assert_eq!(
+            changes().1,
+            [(
+                "GITHUB_TOKN".to_string(),
+                crate::registry_controller::KEEP_IN_KEYCHAIN
+            )]
+        );
 
         // A typed value replaces it, so the stored one may go.
         value.set_text("visible");
@@ -17455,9 +17493,27 @@ mod tests {
         assert!(blocked.is_empty());
         assert_eq!(typed.removed, ["GITHUB_TOKN"]);
 
-        // A removed row deletes only its own stored value.
+        // A stored row with its name cleared is kept and named in the hint.
         secret.set_active(true);
         value.set_text("");
+        key.set_text("");
+        assert!(hint.is_visible());
+        assert_eq!(
+            hint.label().as_str(),
+            crate::registry_controller::NAME_THIS_VARIABLE
+        );
+        assert_eq!(collect_editor_rows(&rows).len(), 2);
+        assert_eq!(
+            changes().1,
+            [(
+                "GITHUB_TOKN".to_string(),
+                crate::registry_controller::NAME_THIS_VARIABLE
+            )]
+        );
+        key.set_text("GITHUB_TOKEN");
+        assert!(!hint.is_visible());
+
+        // A removed row deletes only its own stored value.
         rows.borrow_mut().remove(0);
         let (gone, blocked) = changes();
         assert!(blocked.is_empty());

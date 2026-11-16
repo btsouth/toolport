@@ -628,6 +628,11 @@ fn registry_matches(left: &Registry, right: &Registry) -> Result<bool, String> {
 /// meets this race.
 /// A keychain variable made plain with no value typed would lose its only copy.
 pub const KEEP_IN_KEYCHAIN: &str = "Enter a value, or leave it in the keychain.";
+/// A stored keychain variable whose name was cleared.
+pub const NAME_THIS_VARIABLE: &str = "Give this variable a name, or remove it.";
+/// A keychain variable renamed onto a secret argument's keychain name.
+pub const NAME_USED_BY_ARGUMENT: &str =
+    "This name is already used by a secret argument. Choose another name.";
 pub const EDITOR_SAVE_RACE: &str = "Servers changed while this editor was open. Nothing was saved. Select Save again to apply your changes.";
 
 fn commit_imports(previous: &Registry, prepared: Registry) -> Result<Registry, String> {
@@ -1233,30 +1238,36 @@ pub struct EditorSecretRow<'a> {
     pub row: &'a registry::EnvVar,
 }
 
-/// The keychain changes an editor's rows ask for, and the rows that would
-/// lose a stored value with nothing to replace it (`blocked`). Both shells
-/// compute this the same way; the backend checks it again.
+/// The keychain changes an editor's rows ask for, and the rows that cannot be
+/// saved as they are, each with the message to show on it (`blocked`, keyed
+/// by the name the row was stored under). Both shells compute this the same
+/// way; the backend checks it again. `launch_secret_keys` are the keychain
+/// names of the server's secret arguments, which variables cannot take.
 pub fn editor_secret_changes(
     vaulted_at_open: &[String],
     rows: &[EditorSecretRow<'_>],
-) -> (SecretKeyChanges, Vec<String>) {
+    launch_secret_keys: &[String],
+) -> (SecretKeyChanges, Vec<(String, &'static str)>) {
     let mut changes = SecretKeyChanges::default();
     let mut blocked = Vec::new();
     for EditorSecretRow { stored_as, row } in rows {
         let Some(old) = stored_as.map(str::trim) else {
             continue;
         };
+        let new = row.key.trim();
         let blank = row.value.as_deref().is_none_or(|v| v.trim().is_empty());
         let keychain = row.secret && !row.unknown_fields.contains_key("source");
-        if !row.secret && blank {
-            blocked.push(old.to_string());
+        if new.is_empty() {
+            blocked.push((old.to_string(), NAME_THIS_VARIABLE));
+        } else if !row.secret && blank {
+            blocked.push((old.to_string(), KEEP_IN_KEYCHAIN));
         } else if !keychain {
             changes.removed.push(old.to_string());
-        } else if row.key.trim() != old {
-            if blank {
-                changes
-                    .renamed
-                    .push((old.to_string(), row.key.trim().to_string()));
+        } else if new != old {
+            if launch_secret_keys.iter().any(|key| key.trim() == new) {
+                blocked.push((old.to_string(), NAME_USED_BY_ARGUMENT));
+            } else if blank {
+                changes.renamed.push((old.to_string(), new.to_string()));
             } else {
                 changes.removed.push(old.to_string());
             }
@@ -1273,8 +1284,9 @@ pub fn editor_secret_changes(
     (changes, blocked)
 }
 
-/// Keychain changes one save makes: values moved to a renamed variable, then
-/// values deleted.
+/// Keychain changes one save makes. Moves are written inside the save's
+/// transaction; deletes run only after the registry commit, so a crash or a
+/// failed commit never leaves a declared variable without its value.
 #[derive(Debug, Default)]
 struct VaultPlan {
     moves: Vec<(String, String)>,
@@ -1282,22 +1294,34 @@ struct VaultPlan {
 }
 
 impl VaultPlan {
-    fn apply(
-        &self,
+    /// Reads every move source before writing any destination, so a swap or
+    /// a rename onto a name that is being freed moves the right values. A
+    /// destination whose source holds nothing is cleared after the commit.
+    fn write_moves(
+        &mut self,
         id: &str,
         writes: &mut crate::import_credentials::VaultWrites,
     ) -> Result<(), String> {
+        let mut values = Vec::new();
         for (from, to) in &self.moves {
             let stored = crate::secrets::get_vault_secret_result(id, from)
                 .map_err(|_| "Could not read the keychain. Nothing was saved.".to_string())?;
-            if let Some(value) = stored {
-                writes.write(id, to, &value)?;
+            values.push((to.clone(), stored));
+        }
+        for (to, stored) in values {
+            match stored {
+                Some(value) => writes.write(id, &to, &value)?,
+                None => self.deletes.push(to),
             }
         }
-        for key in &self.deletes {
-            writes.remove(id, key)?;
-        }
         Ok(())
+    }
+
+    /// After the commit. A delete that fails only leaves an unused value.
+    fn delete_after_commit(&self, id: &str) {
+        for key in &self.deletes {
+            let _ = crate::secrets::delete_secret(id, key);
+        }
     }
 }
 
@@ -1343,31 +1367,55 @@ fn plan_vault_changes(
             return Err(format!("{}: {KEEP_IN_KEYCHAIN}", row.key.trim()));
         }
     }
-    let moves: Vec<(String, String)> = changes
-        .renamed
-        .iter()
-        .filter(|(from, to)| {
-            from.trim() != to.trim()
-                && stored(from)
-                && !stored(to)
-                && listed(from).is_none()
-                && listed(to).is_some_and(|row| {
-                    row.secret && !row.unknown_fields.contains_key("source") && blank(row)
-                })
-        })
-        .map(|(from, to)| (from.trim().to_string(), to.trim().to_string()))
-        .collect();
-    let deletes = dropped_vault_keys(old, env, launch)
-        .into_iter()
-        .filter(|key| {
-            changes
-                .removed
+    // A name may be taken over when its own row is removed or renamed away
+    // in the same save.
+    let leaving = |key: &str| {
+        changes.removed.iter().any(|k| k.trim() == key)
+            || changes
+                .renamed
                 .iter()
-                .chain(moves.iter().map(|(from, _)| from))
-                .any(|gone| gone.trim() == key.trim())
+                .any(|(from, to)| from.trim() == key && to.trim() != key)
+    };
+    let launch_secret = |key: &str| {
+        launch.is_some_and(|launch| {
+            launch
+                .inputs
+                .iter()
+                .any(|input| input.secret && input.key.trim() == key)
         })
+    };
+    let mut moves: Vec<(String, String)> = Vec::new();
+    for (from, to) in &changes.renamed {
+        let (from, to) = (from.trim(), to.trim());
+        if from == to || !stored(from) {
+            continue;
+        }
+        let Some(row) = listed(to) else {
+            continue;
+        };
+        if !row.secret || row.unknown_fields.contains_key("source") || !blank(row) {
+            continue;
+        }
+        if launch_secret(to) {
+            return Err(format!("{to}: {NAME_USED_BY_ARGUMENT}"));
+        }
+        if stored(to) && !leaving(to) {
+            return Err(format!(
+                "{to} already has a stored value. Remove that variable first."
+            ));
+        }
+        moves.push((from.to_string(), to.to_string()));
+    }
+    let destination = |key: &str| moves.iter().any(|(_, to)| to == key);
+    let sources = moves.iter().map(|(from, _)| from.clone());
+    let mut deletes: Vec<String> = dropped_vault_keys(old, env, launch)
+        .into_iter()
+        .filter(|key| changes.removed.iter().any(|gone| gone.trim() == key.trim()))
+        .chain(sources)
+        .filter(|key| !destination(key.trim()))
         .filter(|key| !shared_owner_declares(previous, &old.id, key))
         .collect();
+    deletes.dedup();
     Ok(VaultPlan { moves, deletes })
 }
 
@@ -1382,17 +1430,42 @@ pub fn update_server_entry_with<T>(
 ) -> Result<T, String> {
     let _auth = acquire_auth_lock(&entry.id)?;
     let previous = read_registry_exact_or_default()?;
-    let plan = match previous.servers.iter().find(|server| server.id == entry.id) {
+    let mut plan = match previous.servers.iter().find(|server| server.id == entry.id) {
         Some(old) => {
             plan_vault_changes(&previous, old, &entry.env, entry.launch.as_ref(), changes)?
         }
         None => VaultPlan::default(),
     };
+    let mut entry = entry;
+    rename_required_env(entry.launch.as_mut(), changes);
     let id = entry.id.clone();
-    crate::import_credentials::transaction(|writes| {
-        plan.apply(&id, writes)?;
+    let saved = crate::import_credentials::transaction(|writes| {
+        plan.write_moves(&id, writes)?;
         write(entry)
-    })
+    })?;
+    plan.delete_after_commit(&id);
+    Ok(saved)
+}
+
+/// A renamed variable keeps its place in the launch requirements, or the
+/// server would refuse to start asking for the old name.
+fn rename_required_env(launch: Option<&mut registry::LaunchConfig>, changes: &SecretKeyChanges) {
+    let Some(launch) = launch else {
+        return;
+    };
+    for (from, to) in &changes.renamed {
+        let (from, to) = (from.trim(), to.trim());
+        if launch.required_env.iter().any(|key| key == to) {
+            continue;
+        }
+        for key in launch
+            .required_env
+            .iter_mut()
+            .filter(|key| key.trim() == from)
+        {
+            *key = to.to_string();
+        }
+    }
 }
 
 /// Variables the editor lists without a value or a password manager
@@ -1463,9 +1536,15 @@ fn save_server_editor_fields_with(
         }
         entry.launch = launch.clone();
         entry.enabled = false;
-        Some(crate::import_credentials::Import::prepare_with_choices(
-            entry, None, None,
-        )?)
+        Some(
+            crate::import_credentials::Import::prepare_with_choices(entry, None, None)
+                // No client config is involved in the editor.
+                .map_err(|error| {
+                    error
+                        .trim_end_matches(" Client config unchanged.")
+                        .to_string()
+                })?,
+        )
     } else {
         None
     };
@@ -1560,10 +1639,11 @@ fn save_server_editor_fields_with(
         }
         env.push(value);
     }
-    let plan = match previous.servers.iter().find(|s| s.id == id) {
+    let mut plan = match previous.servers.iter().find(|s| s.id == id) {
         Some(old) => plan_vault_changes(&previous, old, &env, server.launch.as_ref(), changes)?,
         None => VaultPlan::default(),
     };
+    rename_required_env(server.launch.as_mut(), changes);
     // A variable added elsewhere while the dialog was open (the other shell, a
     // sync pull, a team update) keeps its declaration.
     if let Some(opened_with) = &changes.opened_with {
@@ -1621,13 +1701,24 @@ fn save_server_editor_fields_with(
         apply_secret_reference(&mut prepared, &id, key, reference)?;
     }
     prepared.secrets_generation = prepared.secrets_generation.wrapping_add(1);
+    // A value typed here for a moved-from name is the new value, not stale.
+    plan.deletes
+        .retain(|key| !pending.iter().any(|(typed, _)| typed == key));
     let saved = crate::import_credentials::transaction(|writes| {
-        plan.apply(&id, writes)?;
-        let missing = match &import {
+        plan.write_moves(&id, writes)?;
+        let missing: Vec<String> = match &import {
             // The caller already holds this server's credential lock.
             Some(import) => import.transfer_locked(&id, writes, false)?,
             None => Vec::new(),
-        };
+        }
+        .into_iter()
+        // Values typed in this dialog and password manager references are
+        // written below, so they are not missing.
+        .filter(|key| {
+            !pending.iter().any(|(typed, _)| typed == key)
+                && !references.iter().any(|(referenced, _)| referenced == key)
+        })
+        .collect();
         for (key, value) in &pending {
             writes.write(&id, key, value)?;
         }
@@ -1649,6 +1740,7 @@ fn save_server_editor_fields_with(
         }
         commit_unless_changed(&previous, prepared, EDITOR_SAVE_RACE)
     })?;
+    plan.delete_after_commit(&id);
     if !is_new && !references.is_empty() {
         approve_own_reference(&saved, &id)?;
     }
@@ -5382,8 +5474,9 @@ API_KEY = "synthetic-first-origin"
                 stored_as: Some("TOKEN"),
                 row: &plain,
             }],
+            &[],
         );
-        assert_eq!(blocked, ["TOKEN"]);
+        assert_eq!(blocked, [("TOKEN".to_string(), KEEP_IN_KEYCHAIN)]);
         assert!(changes.removed.is_empty());
 
         // The backend refuses it too, whatever the dialog sent, in both shells.
@@ -5418,6 +5511,7 @@ API_KEY = "synthetic-first-origin"
                 stored_as: Some("TOKEN"),
                 row: &typed,
             }],
+            &[],
         );
         assert!(blocked.is_empty());
         save_server_editor_fields(
@@ -5444,6 +5538,7 @@ API_KEY = "synthetic-first-origin"
                 stored_as: Some("GITHUB_TOKN"),
                 row: &renamed,
             }],
+            &[],
         );
         assert!(blocked.is_empty());
         assert!(changes.removed.is_empty());
@@ -5541,19 +5636,27 @@ API_KEY = "synthetic-first-origin"
 
     #[test]
     fn a_failed_restore_is_reported_with_the_original_error() {
-        let (initial, entry) = stored_server(&[("REMOVED", "r")]);
+        let (initial, entry) = stored_server(&[("OLD_NAME", "m")]);
         let _fixture = MoveFixture::new(&initial);
-        crate::secrets::set_secret("srv", "REMOVED", "r").unwrap();
+        crate::secrets::set_secret("srv", "OLD_NAME", "m").unwrap();
         let mut edited = entry;
-        edited.env.clear();
-        let error = crate::secrets::tests::with_failed_write("REMOVED", || {
-            update_server_entry_with(
-                edited,
-                &SecretKeyChanges::removing(&["REMOVED"]),
-                |_| -> Result<(), String> { Err("disk full".into()) },
-            )
-        })
+        edited.env = vec![keychain_env("NEW_NAME", None, true)];
+        let error = update_server_entry_with(
+            edited,
+            &SecretKeyChanges {
+                renamed: vec![("OLD_NAME".into(), "NEW_NAME".into())],
+                ..SecretKeyChanges::default()
+            },
+            |_| -> Result<(), String> {
+                // Another process changes the moved value before the failure,
+                // so the rollback cannot restore it.
+                crate::secrets::set_secret("srv", "NEW_NAME", "concurrent").unwrap();
+                Err("disk full".into())
+            },
+        )
         .unwrap_err();
+        assert_eq!(stored("NEW_NAME").as_deref(), Some("concurrent"));
+        assert_eq!(stored("OLD_NAME").as_deref(), Some("m"));
         assert!(error.contains("disk full"), "{error}");
         assert!(
             error.contains("Could not undo every keychain change"),
@@ -5639,6 +5742,351 @@ API_KEY = "synthetic-first-origin"
         std::fs::remove_dir_all(&approvals).unwrap();
         save().unwrap();
         assert_eq!(read_registry_exact().unwrap().servers.len(), 1);
+    }
+
+    #[test]
+    fn a_new_server_with_a_typed_secret_argument_turns_on() {
+        let _fixture = MoveFixture::new(&Registry::default());
+        let mut form = fields("dup", "stdio");
+        form.args.push("<launch-input>".into());
+        let input = registry::LaunchInput {
+            key: "LAUNCH_TOKEN".into(),
+            label: "Token".into(),
+            secret: true,
+            required: true,
+            value: None,
+            unknown_fields: Default::default(),
+        };
+        let launch = registry::LaunchConfig {
+            inputs: vec![input.clone()],
+            bindings: vec![registry::ArgBinding {
+                index: 2,
+                parts: vec![registry::ArgPart::Input {
+                    key: "LAUNCH_TOKEN".into(),
+                    unknown_fields: Default::default(),
+                }],
+                unknown_fields: Default::default(),
+            }],
+            ..Default::default()
+        };
+        let saved = save_server_editor_fields(
+            None,
+            form,
+            Vec::new(),
+            &SecretKeyChanges::default(),
+            Some(launch),
+            &[(input, "typed-launch".into())],
+        )
+        .unwrap();
+        let server = saved.servers.iter().find(|s| s.name == "dup").unwrap();
+        assert_eq!(
+            crate::secrets::get_vault_secret_result(&server.id, "LAUNCH_TOKEN")
+                .unwrap()
+                .as_deref(),
+            Some("typed-launch")
+        );
+        assert!(crate::import_credentials::ready(server).unwrap());
+        assert!(server.enabled, "a complete new server is turned on");
+    }
+
+    /// Saves the editor's rows the way both shells do: changes computed from
+    /// the rows, every opened variable listed.
+    fn save_rows(
+        opened: &[&str],
+        rows: &[(Option<&str>, registry::EnvVar)],
+    ) -> Result<Registry, String> {
+        let opened: Vec<String> = opened.iter().map(|k| k.to_string()).collect();
+        let (mut changes, blocked) = editor_secret_changes(
+            &opened,
+            &rows
+                .iter()
+                .map(|(stored_as, row)| EditorSecretRow {
+                    stored_as: *stored_as,
+                    row,
+                })
+                .collect::<Vec<_>>(),
+            &[],
+        );
+        assert!(blocked.is_empty(), "{blocked:?}");
+        changes.opened_with = Some(opened);
+        save_server_editor_fields(
+            Some("srv"),
+            fields("srv", "stdio"),
+            rows.iter().map(|(_, row)| row.clone()).collect(),
+            &changes,
+            None,
+            &[],
+        )
+    }
+
+    #[test]
+    fn renaming_onto_a_removed_keychain_name_moves_the_value() {
+        let (initial, _) = stored_server(&[("GH_TOKEN", "new"), ("GITHUB_TOKEN", "stale")]);
+        let _fixture = MoveFixture::new(&initial);
+        crate::secrets::set_secret("srv", "GH_TOKEN", "new").unwrap();
+        crate::secrets::set_secret("srv", "GITHUB_TOKEN", "stale").unwrap();
+        // The GITHUB_TOKEN row is deleted and GH_TOKEN renamed to it.
+        save_rows(
+            &["GH_TOKEN", "GITHUB_TOKEN"],
+            &[(Some("GH_TOKEN"), keychain_env("GITHUB_TOKEN", None, true))],
+        )
+        .unwrap();
+        assert_eq!(stored("GITHUB_TOKEN").as_deref(), Some("new"));
+        assert!(stored("GH_TOKEN").is_none());
+    }
+
+    #[test]
+    fn swapping_two_keychain_names_swaps_their_values() {
+        let (initial, _) = stored_server(&[("A_TOKEN", "a"), ("B_TOKEN", "b")]);
+        let _fixture = MoveFixture::new(&initial);
+        crate::secrets::set_secret("srv", "A_TOKEN", "a").unwrap();
+        crate::secrets::set_secret("srv", "B_TOKEN", "b").unwrap();
+        save_rows(
+            &["A_TOKEN", "B_TOKEN"],
+            &[
+                (Some("A_TOKEN"), keychain_env("B_TOKEN", None, true)),
+                (Some("B_TOKEN"), keychain_env("A_TOKEN", None, true)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(stored("B_TOKEN").as_deref(), Some("a"));
+        assert_eq!(stored("A_TOKEN").as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn a_new_row_with_a_renamed_variables_old_name_does_not_inherit_its_value() {
+        let (initial, _) = stored_server(&[("A_TOKEN", "a")]);
+        let _fixture = MoveFixture::new(&initial);
+        crate::secrets::set_secret("srv", "A_TOKEN", "a").unwrap();
+        save_rows(
+            &["A_TOKEN"],
+            &[
+                (Some("A_TOKEN"), keychain_env("B_TOKEN", None, true)),
+                (None, keychain_env("A_TOKEN", None, true)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(stored("B_TOKEN").as_deref(), Some("a"));
+        assert!(stored("A_TOKEN").is_none());
+    }
+
+    #[test]
+    fn a_rename_onto_a_secret_arguments_name_is_refused() {
+        let (mut initial, _) = stored_server(&[("A_TOKEN", "a")]);
+        initial.servers[0].args[1] = "<launch-input>".into();
+        initial.servers[0].launch = Some(registry::LaunchConfig {
+            inputs: vec![registry::LaunchInput {
+                key: "IMPORTED_ARG_0".into(),
+                label: "Key".into(),
+                secret: true,
+                required: true,
+                value: None,
+                unknown_fields: Default::default(),
+            }],
+            bindings: vec![registry::ArgBinding {
+                index: 1,
+                parts: vec![registry::ArgPart::Input {
+                    key: "IMPORTED_ARG_0".into(),
+                    unknown_fields: Default::default(),
+                }],
+                unknown_fields: Default::default(),
+            }],
+            ..Default::default()
+        });
+        let _fixture = MoveFixture::new(&initial);
+        crate::secrets::set_secret("srv", "A_TOKEN", "a").unwrap();
+        crate::secrets::set_secret("srv", "IMPORTED_ARG_0", "arg").unwrap();
+        let renamed = keychain_env("IMPORTED_ARG_0", None, true);
+        let (_, blocked) = editor_secret_changes(
+            &["A_TOKEN".into()],
+            &[EditorSecretRow {
+                stored_as: Some("A_TOKEN"),
+                row: &renamed,
+            }],
+            &["IMPORTED_ARG_0".into()],
+        );
+        assert_eq!(blocked, [("A_TOKEN".to_string(), NAME_USED_BY_ARGUMENT)]);
+        let mut form = fields("srv", "stdio");
+        form.args[1] = "<launch-input>".into();
+        let error = save_server_editor_fields(
+            Some("srv"),
+            form,
+            vec![renamed],
+            &SecretKeyChanges {
+                renamed: vec![("A_TOKEN".into(), "IMPORTED_ARG_0".into())],
+                opened_with: Some(vec!["A_TOKEN".into()]),
+                ..SecretKeyChanges::default()
+            },
+            None,
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.contains(NAME_USED_BY_ARGUMENT), "{error}");
+        assert_eq!(stored("A_TOKEN").as_deref(), Some("a"));
+        assert_eq!(stored("IMPORTED_ARG_0").as_deref(), Some("arg"));
+    }
+
+    #[test]
+    fn a_renamed_required_variable_still_starts() {
+        let _fixture = MoveFixture::new(&Registry::default());
+        // Added the way React's Add dialog and a pasted config add a server.
+        let mut entry = entry_from_fields(fields("gh", "stdio")).unwrap();
+        entry.env = vec![keychain_env("GITHUB_TOKN", Some("abc"), true)];
+        let (added, id) = add_reviewed_entry(entry).unwrap();
+        let server = added.servers.iter().find(|s| s.id == id).unwrap();
+        assert!(crate::launch_inputs::resolve_args(server).is_ok());
+        let renamed = keychain_env("GITHUB_TOKEN", None, true);
+        let opened = vec!["GITHUB_TOKN".to_string()];
+        let (mut changes, _) = editor_secret_changes(
+            &opened,
+            &[EditorSecretRow {
+                stored_as: Some("GITHUB_TOKN"),
+                row: &renamed,
+            }],
+            &[],
+        );
+        changes.opened_with = Some(opened);
+        let mut form = fields("gh", "stdio");
+        form.cwd = server.cwd.clone();
+        let saved =
+            save_server_editor_fields(Some(&id), form, vec![renamed], &changes, None, &[]).unwrap();
+        let server = saved.servers.iter().find(|s| s.id == id).unwrap();
+        assert!(crate::launch_inputs::resolve_args(server).is_ok());
+        // React's whole-entry save renames it the same way.
+        let mut back = server.clone();
+        back.env = vec![keychain_env("GITHUB_TOKN", None, true)];
+        let saved = update_server_entry_with(
+            back,
+            &SecretKeyChanges {
+                renamed: vec![("GITHUB_TOKEN".into(), "GITHUB_TOKN".into())],
+                ..SecretKeyChanges::default()
+            },
+            save_registry,
+        )
+        .unwrap();
+        let server = saved.servers.iter().find(|s| s.id == id).unwrap();
+        assert!(crate::launch_inputs::resolve_args(server).is_ok());
+    }
+
+    #[test]
+    fn stored_values_are_deleted_only_after_the_registry_commit() {
+        let (initial, _) = stored_server(&[("REMOVED", "r")]);
+        let _fixture = MoveFixture::new(&initial);
+        crate::secrets::set_secret("srv", "REMOVED", "r").unwrap();
+        BEFORE_EDITOR_COMMIT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                assert_eq!(
+                    stored("REMOVED").as_deref(),
+                    Some("r"),
+                    "deleted before commit"
+                );
+            }));
+        });
+        save_rows(&["REMOVED"], &[]).unwrap();
+        assert!(stored("REMOVED").is_none());
+    }
+
+    #[test]
+    fn a_react_save_deletes_stored_values_only_after_the_registry_write() {
+        let (initial, entry) = stored_server(&[("REMOVED", "r")]);
+        let _fixture = MoveFixture::new(&initial);
+        crate::secrets::set_secret("srv", "REMOVED", "r").unwrap();
+        let mut edited = entry;
+        edited.env.clear();
+        update_server_entry_with(edited, &SecretKeyChanges::removing(&["REMOVED"]), |entry| {
+            assert_eq!(
+                stored("REMOVED").as_deref(),
+                Some("r"),
+                "deleted before commit"
+            );
+            save_registry(entry)
+        })
+        .unwrap();
+        assert!(stored("REMOVED").is_none());
+    }
+
+    #[test]
+    fn a_stored_variable_with_its_name_cleared_is_refused() {
+        let cleared = keychain_env("", None, true);
+        let (changes, blocked) = editor_secret_changes(
+            &["TOKEN".into()],
+            &[EditorSecretRow {
+                stored_as: Some("TOKEN"),
+                row: &cleared,
+            }],
+            &[],
+        );
+        assert_eq!(blocked, [("TOKEN".to_string(), NAME_THIS_VARIABLE)]);
+        assert!(changes.removed.is_empty());
+    }
+
+    #[test]
+    fn the_editor_refuses_a_credential_in_the_command_without_client_config_words() {
+        let _fixture = MoveFixture::new(&Registry::default());
+        let mut form = fields("leaky", "stdio");
+        form.command = Some("API_KEY=synthetic-secret-value npx".into());
+        let error = save_server_editor_fields(
+            None,
+            form,
+            Vec::new(),
+            &SecretKeyChanges::default(),
+            None,
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("The command contains a credential"),
+            "{error}"
+        );
+        assert!(!error.contains("Client config"), "{error}");
+    }
+
+    #[test]
+    fn a_gtk_edit_of_a_personal_original_keeps_the_value_its_team_copy_declares() {
+        let mut initial = Registry {
+            team: Some(
+                serde_json::from_value(serde_json::json!({"serverUrl":"https://example.com","teamId":"solo","role":"admin","reportingDeviceId":"fixture","accountStatus":{"personalSync":true}}))
+                    .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let mut personal = entry_from_fields(fields("docs", "stdio")).unwrap();
+        personal.id = "docs".into();
+        personal.env = vec![keychain_env("TOKEN", None, true)];
+        let mut managed = personal.clone();
+        managed.id = "team_solo_docs".into();
+        managed.source = Some("team:solo".into());
+        managed
+            .unknown_fields
+            .insert("teamOriginalId".into(), serde_json::json!("docs"));
+        initial
+            .team
+            .as_mut()
+            .unwrap()
+            .managed_server_ids
+            .insert(managed.id.clone(), personal.id.clone());
+        initial.servers = vec![personal.clone(), managed.clone()];
+        crate::local_auth::bind(&mut initial, &managed, &personal).unwrap();
+        let _fixture = MoveFixture::new(&initial);
+        crate::secrets::set_secret("docs", "TOKEN", "shared").unwrap();
+        save_server_editor_fields(
+            Some("docs"),
+            fields("docs", "stdio"),
+            Vec::new(),
+            &SecretKeyChanges {
+                opened_with: Some(vec!["TOKEN".into()]),
+                ..SecretKeyChanges::removing(&["TOKEN"])
+            },
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            crate::secrets::get_vault_secret_result("docs", "TOKEN")
+                .unwrap()
+                .as_deref(),
+            Some("shared")
+        );
     }
 
     #[test]

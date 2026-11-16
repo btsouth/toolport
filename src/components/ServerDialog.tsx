@@ -1,7 +1,12 @@
 import { translate, useI18n, Trans } from "@/lib/i18n";
 import { envRowSyncs } from "@/lib/envRowSyncs";
 import { errorHeadline } from "@/lib/errors";
-import { needsValue, secretKeyChanges } from "@/lib/secretKeyChanges";
+import {
+  KEEP_IN_KEYCHAIN,
+  NAME_THIS_VARIABLE,
+  rowProblem,
+  secretKeyChanges,
+} from "@/lib/secretKeyChanges";
 import { secretReferenceReview } from "@/lib/secretRefs";
 import { SecretReferenceField } from "@/components/SecretReferenceField";
 import { useEffect, useRef, useState, type ReactNode } from "react";
@@ -149,6 +154,14 @@ export function ServerDialog({
       storedAs?: string;
     }[]
   >(() => rowsFromInitial());
+  // The keychain variables the dialog opened with. Captured with the rows, so
+  // one added elsewhere while the dialog is open is never counted as removed.
+  const [vaultedAtOpen, setVaultedAtOpen] = useState<string[]>(() => storedNames());
+  function storedNames() {
+    return editId === undefined
+      ? []
+      : (initial?.env ?? []).filter((e) => e.secret && !e.source).map((e) => e.key);
+  }
   // Rows for the server as saved. A keychain variable remembers the name its
   // value is stored under, so renaming it keeps the value.
   function rowsFromInitial() {
@@ -242,6 +255,7 @@ export function ServerDialog({
             : String(initial.initializeTimeoutMs / 1000),
       });
       setEnvRows(rowsFromInitial());
+      setVaultedAtOpen(storedNames());
       setLaunch(initial?.launch ?? null);
       setLaunchValues(
         Object.fromEntries(
@@ -452,8 +466,21 @@ export function ServerDialog({
     visibleErrors.push(message);
   }
   // A stored keychain value is never dropped without its replacement.
-  if (envRows.some(needsValue))
-    errors.push(t("Enter a value, or leave it in the keychain."));
+  const launchSecretKeys = (launch?.inputs ?? [])
+    .filter((input) => input.secret)
+    .map((input) => input.key);
+  const problemText = (problem: string | null) =>
+    problem === null
+      ? null
+      : problem === KEEP_IN_KEYCHAIN
+        ? t("Enter a value, or leave it in the keychain.")
+        : problem === NAME_THIS_VARIABLE
+          ? t("Give this variable a name, or remove it.")
+          : t("This name is already used by a secret argument. Choose another name.");
+  for (const row of envRows) {
+    const problem = problemText(rowProblem(row, launchSecretKeys));
+    if (problem && !errors.includes(problem)) errors.push(problem);
+  }
   const ownName = editing
     ? (initial?.name ?? partialEdit?.name)?.trim().toLowerCase()
     : undefined;
@@ -512,14 +539,12 @@ export function ServerDialog({
       // Keychain values the user removed in this dialog, or replaced with a
       // plain value or a password manager reference, are deleted with the
       // update; a renamed variable keeps its value under the new name.
-      const vaultedAtOpen = wasEditing
-        ? (initial?.env ?? [])
-            .filter((old) => old.secret && !old.source)
-            .map((old) => old.key)
-        : [];
       const changes = secretKeyChanges(
-        vaultedAtOpen,
-        envRows.filter((row) => row.key.trim() || row.value),
+        wasEditing ? vaultedAtOpen : [],
+        envRows.filter(
+          (row) => row.storedAs !== undefined || row.key.trim() || row.value,
+        ),
+        launchSecretKeys,
       );
       let result = wasEditing
         ? await updateServer(entry, changes.removed, changes.renamed)
@@ -1108,9 +1133,9 @@ export function ServerDialog({
                 >
                   <X className="size-4" />
                 </Button>
-                {needsValue(row) && (
+                {rowProblem(row, launchSecretKeys) && (
                   <p role="alert" className="w-full text-meta text-destructive">
-                    {t("Enter a value, or leave it in the keychain.")}
+                    {problemText(rowProblem(row, launchSecretKeys))}
                   </p>
                 )}
               </div>

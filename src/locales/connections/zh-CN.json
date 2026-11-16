@@ -141,6 +141,8 @@
   "{value1}vaulted": "{value1} 已安全保存",
   "•••• (saved)": "••••（已保存）",
   "Enter a value, or leave it in the keychain.": "请输入一个值，或将其保留在钥匙串中。",
+  "Give this variable a name, or remove it.": "请为此变量命名，或将其删除。",
+  "This name is already used by a secret argument. Choose another name.": "此名称已被一个机密参数使用。请选择其他名称。",
   "•••••••• (saved)": "••••••••（已保存）",
   "•••••••• (set)": "••••••••（已设置）",
   "+{value1} more": "另有 {value1} 项",

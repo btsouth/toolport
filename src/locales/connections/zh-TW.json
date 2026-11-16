@@ -141,6 +141,8 @@
   "{value1}vaulted": "{value1} 已安全儲存",
   "•••• (saved)": "••••（儲存）",
   "Enter a value, or leave it in the keychain.": "請輸入一個值，或將其保留在鑰匙圈中。",
+  "Give this variable a name, or remove it.": "請為此變數命名，或將其移除。",
+  "This name is already used by a secret argument. Choose another name.": "此名稱已被一個機密引數使用。請選擇其他名稱。",
   "•••••••• (saved)": "••••••••（儲存）",
   "•••••••• (set)": "••••••••（已設定）",
   "+{value1} more": "另有 {value1} 項",

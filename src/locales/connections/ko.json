@@ -141,6 +141,8 @@
   "{value1}vaulted": "{value1}보관됨",
   "•••• (saved)": "•••• (저장됨)",
   "Enter a value, or leave it in the keychain.": "값을 입력하거나 키체인에 그대로 두세요.",
+  "Give this variable a name, or remove it.": "이 변수에 이름을 지정하거나 삭제하세요.",
+  "This name is already used by a secret argument. Choose another name.": "이 이름은 이미 비밀 인수에서 사용 중입니다. 다른 이름을 선택하세요.",
   "•••••••• (saved)": "••••••••(저장됨)",
   "•••••••• (set)": "••••••••(설정됨)",
   "+{value1} more": "+{value1} 더보기",
