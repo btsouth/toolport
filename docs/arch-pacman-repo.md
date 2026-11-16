@@ -47,6 +47,14 @@ There is no Toolport-specific update command, and the app never self-updates.
 Whatever `pacman -Syu` installs is what you run; `pacman -Q toolport` prints the
 installed version.
 
+## Moving from toolport-bin
+
+`toolport-bin` was never published, so a copy you built yourself gets no
+updates. Run the four manual commands under Install, and answer yes when
+`pacman -Syu toolport` asks to remove `toolport-bin`. Your settings in
+`~/.config/Toolport` stay. The one-line installer cannot answer that prompt
+for you, so use the manual commands here.
+
 ## Remove
 
 ```sh

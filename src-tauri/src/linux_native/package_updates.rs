@@ -10,7 +10,7 @@ enum PackageType {
     Deb,
     Rpm,
     Pacman,
-    Aur,
+    ToolportBin,
 }
 
 fn advice(package: Option<PackageType>) -> &'static str {
@@ -22,9 +22,10 @@ fn advice(package: Option<PackageType>) -> &'static str {
             "Download the new .rpm from the release page, then run sudo dnf install ./<file>.rpm.",
         ),
         Some(PackageType::Pacman) => msg("Update Toolport with sudo pacman -Syu."),
-        Some(PackageType::Aur) => {
-            msg("Update toolport-bin with your AUR helper, or rebuild it from the AUR.")
-        }
+        // toolport-bin was never published; a locally built one moves to the repo.
+        Some(PackageType::ToolportBin) => msg(
+            "toolport-bin is no longer updated. Add the Toolport pacman repository as shown in docs/arch-pacman-repo.md on GitHub, then run sudo pacman -Syu toolport and let pacman replace toolport-bin.",
+        ),
         None => msg(
             "Open the release page for the latest Toolport package and installation instructions.",
         ),
@@ -49,10 +50,10 @@ fn installed_type(
                 owner.split(':').next() == Some("toolport") && Path::new(path) == executable
             }),
             PackageType::Rpm | PackageType::Pacman => output.trim() == "toolport",
-            PackageType::Aur => unreachable!(),
+            PackageType::ToolportBin => unreachable!(),
         };
         if package == PackageType::Pacman && output.trim() == "toolport-bin" {
-            return Some(PackageType::Aur);
+            return Some(PackageType::ToolportBin);
         }
         if owned {
             return Some(package);
@@ -85,7 +86,7 @@ fn detect_advice() -> &'static str {
                 PackageType::Deb => ("dpkg-query", &["--search"]),
                 PackageType::Rpm => ("rpm", &["-qf", "--qf", "%{NAME}"]),
                 PackageType::Pacman => ("pacman", &["-Qqo"]),
-                PackageType::Aur => unreachable!(),
+                PackageType::ToolportBin => unreachable!(),
             };
             let output = Command::new(command)
                 .args(args)
@@ -116,14 +117,15 @@ mod tests {
     }
 
     #[test]
-    fn aur_ownership_uses_an_aur_upgrade_path() {
+    fn toolport_bin_ownership_points_at_the_pacman_repo() {
         let executable = Path::new("/usr/bin/toolport-gtk");
         let package = installed_type(executable, |package, _| {
             (package == PackageType::Pacman).then(|| "toolport-bin\n".into())
         });
-        assert_eq!(package, Some(PackageType::Aur));
-        assert!(advice(package).contains("AUR helper"));
-        assert!(!advice(package).contains("pacman -Syu"));
+        assert_eq!(package, Some(PackageType::ToolportBin));
+        assert!(advice(package).contains("Toolport pacman repository"));
+        assert!(advice(package).contains("sudo pacman -Syu toolport"));
+        assert!(!advice(package).contains("AUR"));
     }
 
     #[test]

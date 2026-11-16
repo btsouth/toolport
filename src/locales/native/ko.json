@@ -870,7 +870,7 @@
   "Unsupported": "지원되지 않음",
   "Unsupported: {value0}": "지원되지 않음: {value0}",
   "Update Toolport": "Toolport 업데이트",
-  "Update toolport-bin with your AUR helper, or rebuild it from the AUR.": "AUR 도우미로 toolport-bin을 업데이트하거나 AUR에서 다시 빌드하세요.",
+  "toolport-bin is no longer updated. Add the Toolport pacman repository as shown in docs/arch-pacman-repo.md on GitHub, then run sudo pacman -Syu toolport and let pacman replace toolport-bin.": "toolport-bin은 더 이상 업데이트되지 않습니다. GitHub의 docs/arch-pacman-repo.md에 나온 대로 Toolport pacman 저장소를 추가한 다음 sudo pacman -Syu toolport를 실행하고 pacman이 toolport-bin을 교체하도록 하세요.",
   "Updated authentication for {value0}": "{value0}에 대한 인증 업데이트됨",
   "Updated discovery for {value0}.": "{value0}의 도구 탐색 설정을 업데이트했습니다.",
   "Updating": "업데이트 중",

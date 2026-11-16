@@ -870,7 +870,7 @@
   "Unsupported": "Não compatível",
   "Unsupported: {value0}": "Não suportado: {value0}",
   "Update Toolport": "Atualizar Toolport",
-  "Update toolport-bin with your AUR helper, or rebuild it from the AUR.": "Atualize o toolport-bin com seu auxiliar AUR ou reconstrua-o a partir do AUR.",
+  "toolport-bin is no longer updated. Add the Toolport pacman repository as shown in docs/arch-pacman-repo.md on GitHub, then run sudo pacman -Syu toolport and let pacman replace toolport-bin.": "O toolport-bin não é mais atualizado. Adicione o repositório pacman do Toolport conforme descrito em docs/arch-pacman-repo.md no GitHub, depois execute sudo pacman -Syu toolport e deixe o pacman substituir o toolport-bin.",
   "Updated authentication for {value0}": "Autenticação atualizada para {value0}",
   "Updated discovery for {value0}.": "Descoberta atualizada para {value0}.",
   "Updating": "Atualizando",
