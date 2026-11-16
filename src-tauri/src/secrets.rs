@@ -2553,8 +2553,9 @@ pub(crate) mod tests {
         test()
     }
 
+    /// `"*"` fails every key.
     pub(crate) fn read_is_injected_failure(key: &str) -> bool {
-        FAILED_READ.with(|failed| failed.get() == Some(key))
+        FAILED_READ.with(|failed| matches!(failed.get(), Some(k) if k == key || k == "*"))
     }
 
     pub(crate) fn with_failed_read<T>(key: &'static str, test: impl FnOnce() -> T) -> T {
