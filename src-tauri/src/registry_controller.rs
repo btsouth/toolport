@@ -2659,11 +2659,60 @@ fn update_registry_on_disk(apply: &dyn Fn(&mut Registry)) -> Result<Registry, St
 /// config back. `revoke` deletes the vaulted Shared HTTP bearer after its
 /// registry row is gone; a failure there is reported as a warning because the
 /// bearer no longer authenticates.
+///
+/// Disconnect reads saved credentials without asking for the keyring. Only
+/// when it is refused for a locked keyring before anything changed (a recovery file would have to be sealed with a secret it
+/// cannot read or prove already unsealed) does it ask to unlock once and try
+/// again. If the user cancels, it refuses and leaves everything as it was.
 pub(crate) fn disconnect_client_with(
     client_id: &str,
     update_registry: impl FnOnce(&dyn Fn(&mut Registry)) -> Result<Registry, String>,
     revoke: impl FnOnce() -> Result<(), String>,
 ) -> Result<ClientMutationResult, String> {
+    let mut update_registry = Some(update_registry);
+    let mut revoke = Some(revoke);
+    match disconnect_client_once(client_id, &mut update_registry, &mut revoke) {
+        Err(error)
+            if clients::backup_vault::is_locked_error(&error)
+                && update_registry.is_some()
+                && revoke.is_some() =>
+        {
+            match clients::backup_vault::request_unlock() {
+                clients::backup_vault::Unlock::Open => {
+                    disconnect_client_once(client_id, &mut update_registry, &mut revoke)
+                }
+                clients::backup_vault::Unlock::StillLocked => Err(unlock_to_disconnect(client_id)),
+            }
+        }
+        other => other,
+    }
+}
+
+/// Disconnect's answer when the unlock it asked for was cancelled.
+pub(crate) fn unlock_to_disconnect(client_id: &str) -> String {
+    crate::i18n::trf(
+        "Unlock your keyring to disconnect {client}.",
+        &[("client", &clients::client_display_name(client_id))],
+    )
+}
+
+/// One Disconnect attempt. The callbacks are taken only when used, so a try
+/// refused before the registry write can run again with them.
+fn disconnect_client_once<U, R>(
+    client_id: &str,
+    update_registry: &mut Option<U>,
+    revoke: &mut Option<R>,
+) -> Result<ClientMutationResult, String>
+where
+    U: FnOnce(&dyn Fn(&mut Registry)) -> Result<Registry, String>,
+    R: FnOnce() -> Result<(), String>,
+{
+    let mut update_registry = |apply: &dyn Fn(&mut Registry)| {
+        update_registry
+            .take()
+            .ok_or_else(|| "Disconnect already wrote the registry".to_string())
+            .and_then(|update| update(apply))
+    };
     let current = read_registry_exact_or_default()?;
     let http_id = format!("client:{client_id}");
     let has_shared_http_token = current
@@ -2690,6 +2739,9 @@ pub(crate) fn disconnect_client_with(
             registry.http_clients.retain(|row| row.id != http_id);
         })
     })?;
+    let revoke = revoke
+        .take()
+        .ok_or_else(|| "Disconnect already revoked the token".to_string())?;
     finish_http_disconnect(client_id, &mut result, revoke)?;
     Ok(result)
 }
@@ -6427,6 +6479,125 @@ API_KEY = "synthetic-first-origin"
         assert_eq!(snapshot["exactEligible"], false);
         disconnect_client("claude-code").unwrap();
         assert_eq!(json_file(&fixture.claude())["session"], 2);
+    }
+
+    /// Every file under the data dir and the client config, byte for byte.
+    fn locked_disconnect_snapshot(fixture: &MoveFixture) -> Vec<(PathBuf, Vec<u8>)> {
+        fn walk(dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if !path.extension().is_some_and(|ext| ext == "lock") {
+                    out.push((path.clone(), std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        let mut out = vec![(fixture.claude(), std::fs::read(fixture.claude()).unwrap())];
+        walk(&fixture.root.join("data"), &mut out);
+        out.sort();
+        out
+    }
+
+    /// A 2.3.5 Connect left Claude Code's recovery files unsealed; since then
+    /// the user flagged PLANET secret in Toolport and changed its value in the
+    /// client. That value is new, so it can never be written in plain text.
+    fn locked_disconnect_with_a_new_flagged_secret() -> MoveFixture {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"orbit":{"command":"echo","env":{"PLANET":"mercury-old-fixture"}}}}"#,
+        )
+        .unwrap();
+        // Nothing is known secret yet, so nothing is sealed, as in 2.3.5.
+        clients::install_gateway("claude-code", None).unwrap();
+        let backups = fixture.root.join("data/backups/claude-code");
+        assert!(std::fs::read_dir(&backups).unwrap().flatten().any(|entry| {
+            std::fs::read_to_string(entry.path())
+                .is_ok_and(|raw| raw.contains("mercury-old-fixture"))
+        }));
+        registry::update(|registry| {
+            registry.servers.push(
+                serde_json::from_value(serde_json::json!({
+                    "id":"orbit","name":"Orbit","transport":"stdio",
+                    "env":[{"key":"PLANET","secret":true}]
+                }))
+                .unwrap(),
+            );
+            Ok(())
+        })
+        .unwrap();
+        crate::secrets::set_secret("orbit", "PLANET", "mercury-new-fixture").unwrap();
+        let mut config = json_file(&fixture.claude());
+        config["mcpServers"]["orbit"] = serde_json::json!({
+            "command":"echo","env":{"PLANET":"mercury-new-fixture"}
+        });
+        std::fs::write(fixture.claude(), config.to_string()).unwrap();
+        fixture
+    }
+
+    fn plain_anywhere(fixture: &MoveFixture, value: &str) -> Vec<PathBuf> {
+        locked_disconnect_snapshot(fixture)
+            .into_iter()
+            .filter(|(path, raw)| {
+                *path != fixture.claude() && String::from_utf8_lossy(raw).contains(value)
+            })
+            .map(|(path, _)| path)
+            .collect()
+    }
+
+    /// Greptile P1 and the strict rule: a locked Disconnect that cannot prove
+    /// it exposes nothing new asks to unlock once; cancel refuses in plain
+    /// words and leaves the config, registry and every backup unchanged.
+    #[test]
+    fn locked_disconnect_asks_once_and_cancel_changes_nothing() {
+        let fixture = locked_disconnect_with_a_new_flagged_secret();
+        let before = locked_disconnect_snapshot(&fixture);
+        let mut result = None;
+        let calls = clients::backup_vault::fake::locked_store(
+            clients::backup_vault::Unlock::StillLocked,
+            || result = Some(disconnect_client("claude-code")),
+        );
+        let error = result.unwrap().unwrap_err();
+        assert_eq!(error, "Unlock your keyring to disconnect Claude Code.");
+        assert_eq!(
+            calls.iter().filter(|call| *call == "unlock prompt").count(),
+            1,
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|call| call.starts_with("prompting")),
+            "{calls:?}"
+        );
+        assert_eq!(locked_disconnect_snapshot(&fixture), before);
+        assert!(plain_anywhere(&fixture, "mercury-new-fixture").is_empty());
+    }
+
+    /// The same Disconnect with the unlock accepted finishes, and the new value
+    /// is sealed, never written in plain text.
+    #[test]
+    fn locked_disconnect_unlocked_once_seals_the_new_secret() {
+        let fixture = locked_disconnect_with_a_new_flagged_secret();
+        let mut result = None;
+        let calls =
+            clients::backup_vault::fake::locked_store(clients::backup_vault::Unlock::Open, || {
+                result = Some(disconnect_client("claude-code"))
+            });
+        result.unwrap().unwrap();
+        assert_eq!(
+            calls.iter().filter(|call| *call == "unlock prompt").count(),
+            1,
+            "{calls:?}"
+        );
+        assert!(
+            plain_anywhere(&fixture, "mercury-new-fixture").is_empty(),
+            "{:?}",
+            plain_anywhere(&fixture, "mercury-new-fixture")
+        );
+        assert!(!json_file(&fixture.claude())["mcpServers"]
+            .as_object()
+            .unwrap()
+            .contains_key(clients::GATEWAY_ENTRY_NAME));
     }
 
     #[test]

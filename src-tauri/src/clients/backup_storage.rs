@@ -1107,26 +1107,205 @@ fn vaulted_credentials(text: &str) -> Result<Vec<(Reference, String)>, String> {
     Ok(values)
 }
 
-/// Whether every plain credential in `text` already sits unsealed in this
-/// client's recovery folder, waiting for [`upgrade_legacy`]: writing `text`
-/// unsealed then adds nothing new in plain text.
+/// Whether writing `text` unsealed provably exposes nothing new: it parses,
+/// this client's recovery folder already holds unsealed 2.3.5 files, and every
+/// credential-bearing value in `text` appears, decoded, in one of them.
+/// Credential-bearing: every value Toolport knows is secret (a server's secret
+/// env or launch input name), any name or flag the import heuristics call
+/// secret, every header value, any `Bearer` value, and every value the legacy
+/// seal would find. Anything unparseable or unmatched is not proven.
 fn awaiting_seal(path: &Path, text: &str) -> bool {
     let Some(dir) = path.parent() else {
         return false;
     };
     let client = dir.file_name().and_then(|s| s.to_str()).unwrap_or("client");
-    let wanted = discovered_credentials(text, client);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
-    let unsealed: Vec<String> = entries
-        .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
-        .filter(|raw| envelope(raw).is_none())
-        .collect();
-    !unsealed.is_empty()
-        && wanted
+    let mut unsealed = std::collections::HashSet::new();
+    let mut legacy = false;
+    for entry in entries.flatten() {
+        let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if envelope(&raw).is_some() {
+            continue;
+        }
+        let decoded = match plain_backup(&raw) {
+            Ok(Some(_)) => match decode(&raw) {
+                Ok(text) => text,
+                Err(_) => continue,
+            },
+            Ok(None) => raw,
+            Err(_) => continue,
+        };
+        let mut leaves = Vec::new();
+        if string_leaves(&decoded, 0, &mut leaves) {
+            legacy = true;
+            unsealed.extend(leaves.into_iter().map(|leaf| leaf.value));
+        }
+    }
+    if !legacy {
+        return false;
+    }
+    let mut leaves = Vec::new();
+    if !string_leaves(text, 0, &mut leaves) {
+        return false;
+    }
+    let secret_names = registry_secret_names();
+    leaves
+        .iter()
+        .filter(|leaf| leaf.credential_bearing(&secret_names))
+        .all(|leaf| unsealed.contains(&leaf.value))
+        && discovered_credentials(text, client)
             .iter()
-            .all(|(_, value)| unsealed.iter().any(|raw| raw.contains(value.as_str())))
+            .all(|(_, value)| unsealed.contains(value))
+}
+
+/// A string in a config or recovery file, with what names it.
+struct Leaf {
+    /// The object key it sits under, a `name`/`key` beside a `value`, or the
+    /// flag before it in an argument list.
+    key: Option<String>,
+    /// Somewhere under a `headers` object.
+    header: bool,
+    value: String,
+}
+
+impl Leaf {
+    fn credential_bearing(&self, secret_names: &std::collections::HashSet<String>) -> bool {
+        let value = self.value.trim();
+        if value.is_empty() || value.starts_with("TOOLPORT_MISSING_CREDENTIAL_") {
+            return false;
+        }
+        let lower = value.to_ascii_lowercase();
+        if self.header || lower.starts_with("bearer ") || lower.contains("authorization:") {
+            return true;
+        }
+        let secret_name = |name: &str| {
+            secret_names.contains(&secret_name_key(name))
+                || crate::import_credentials::secret_env(name, None)
+        };
+        if self.key.as_deref().is_some_and(secret_name)
+            || url::Url::parse(value).is_ok_and(|url| url.password().is_some())
+        {
+            return true;
+        }
+        // Free text names its own secrets: `API_KEY sk-...` in a note,
+        // `--api-key=...` in an argument. A known token shape anywhere, or a
+        // secret name beside other words, makes the whole string
+        // credential-bearing. A string that is only a name is a name.
+        let words: Vec<&str> = value
+            .split(|c: char| c.is_whitespace() || matches!(c, '=' | ':' | ',' | ';' | '"' | '\''))
+            .map(|word| word.trim_start_matches('-'))
+            .filter(|word| !word.is_empty())
+            .collect();
+        words.iter().any(|word| {
+            ["sk-", "ghp_", "github_pat_", "xox", "AKIA", "-----BEGIN"]
+                .iter()
+                .any(|prefix| word.starts_with(prefix))
+        }) || words.len() > 1
+            && words.iter().any(|word| {
+                secret_names.contains(&secret_name_key(word))
+                    || crate::import_credentials::secret_env(word, None)
+            })
+    }
+}
+
+/// A secret's name as compared: `--api-key`, `api_key` and `API_KEY` match.
+fn secret_name_key(name: &str) -> String {
+    name.trim_start_matches('-')
+        .to_ascii_uppercase()
+        .replace('-', "_")
+}
+
+/// Every string in `text`, decoded with its own format (JSON, TOML or YAML).
+/// Config texts held as strings inside a recovery record are opened too.
+/// False when `text` does not parse as a document.
+fn string_leaves(text: &str, depth: usize, out: &mut Vec<Leaf>) -> bool {
+    fn walk(
+        value: &serde_json::Value,
+        key: Option<&str>,
+        header: bool,
+        depth: usize,
+        out: &mut Vec<Leaf>,
+    ) {
+        match value {
+            serde_json::Value::String(text) => {
+                out.push(Leaf {
+                    key: key.map(str::to_string),
+                    header,
+                    value: text.clone(),
+                });
+                let nested = text.trim_start();
+                if depth < 4 && (nested.starts_with('{') || nested.contains('\n')) {
+                    let mut inner = Vec::new();
+                    if string_leaves(text, depth + 1, &mut inner) {
+                        out.extend(inner);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                let mut flag: Option<&str> = None;
+                for item in items {
+                    walk(item, flag.or(key), header, depth, out);
+                    flag = item
+                        .as_str()
+                        .filter(|arg| arg.starts_with('-') && !arg.contains('='))
+                        .map(|arg| arg.trim_start_matches('-'));
+                }
+            }
+            serde_json::Value::Object(map) => {
+                let pair = map
+                    .get("value")
+                    .and(map.get("key").or_else(|| map.get("name")))
+                    .and_then(serde_json::Value::as_str);
+                for (name, item) in map {
+                    let name_key = if name == "value" {
+                        pair.unwrap_or(name)
+                    } else {
+                        name.as_str()
+                    };
+                    let in_headers = header || name.eq_ignore_ascii_case("headers");
+                    walk(item, Some(name_key), in_headers, depth, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    match native_value(text) {
+        Some(value @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) => {
+            walk(&value, None, false, depth, out);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Names of every value Toolport stores as secret, for any server.
+fn registry_secret_names() -> std::collections::HashSet<String> {
+    crate::registry::resolved_path()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|raw| serde_json::from_slice::<crate::registry::Registry>(&raw).ok())
+        .into_iter()
+        .flat_map(|registry| registry.servers)
+        .flat_map(|server| {
+            let env = server
+                .env
+                .into_iter()
+                .filter(|env| env.secret)
+                .map(|env| env.key);
+            let inputs = server
+                .launch
+                .into_iter()
+                .flat_map(|launch| launch.inputs)
+                .filter(|input| input.secret)
+                .map(|input| input.key);
+            env.chain(inputs)
+                .map(|name| secret_name_key(&name))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn discovered_credentials(text: &str, client: &str) -> Vec<(Reference, String)> {
@@ -1796,6 +1975,72 @@ mod tests {
                 !awaiting_seal(&path, other),
                 "a new value is never written plain"
             );
+        });
+    }
+
+    /// Greptile P1 (escaped values): the proof compares decoded values, so a
+    /// value with quotes, backslashes or unicode escapes is found in an
+    /// unsealed JSON, TOML or YAML file however each file spells it.
+    #[test]
+    fn unsealed_proof_decodes_escaped_values_in_every_format() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let root = crate::registry::conduit_dir().unwrap().join("backups");
+            let json =
+                r#"{"mcpServers":{"w":{"env":{"WEATHER_API_KEY":"p\"w\\d\u00e9-fixture"}}}}"#;
+            let toml = "[mcp_servers.w.env]\nWEATHER_API_KEY = \"p\\\"w\\\\d\\u00e9-fixture\"\n";
+            let yaml = "mcpServers:\n  w:\n    env:\n      WEATHER_API_KEY: \"p\\\"w\\\\d\\u00e9-fixture\"\n";
+            let literal =
+                "{\"mcpServers\":{\"w\":{\"env\":{\"WEATHER_API_KEY\":\"p\\\"w\\\\dé-fixture\"}}}}";
+            for (client, legacy) in [("cursor", json), ("codex", toml), ("goose", yaml)] {
+                let dir = root.join(client);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("1700000000000-config"), legacy).unwrap();
+                let path = dir.join("original-x.json");
+                for text in [json, toml, yaml, literal] {
+                    assert!(awaiting_seal(&path, text), "{client}: {text}");
+                }
+                let changed = literal.replace("-fixture", "-new");
+                assert!(!awaiting_seal(&path, &changed), "{client}");
+            }
+        });
+    }
+
+    /// Greptile P1 and CodeRabbit (new secrets): every value Toolport knows is
+    /// secret counts, not only what the heuristics find: a registry secret
+    /// whose name looks harmless, a launch input, a header, a secret named in
+    /// free text. Unparseable text is never proven.
+    #[test]
+    fn unsealed_proof_covers_every_value_toolport_knows_is_secret() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let registry = serde_json::from_value(serde_json::json!({"version":3,"profiles":[],"servers":[
+                {"id":"orbit","name":"Orbit","transport":"stdio","command":"echo","args":["<launch-input>"],
+                 "env":[{"key":"PLANET","secret":true}],
+                 "launch":{"inputs":[{"key":"MOON","label":"Moon","secret":true}],
+                           "bindings":[{"index":0,"parts":[{"kind":"input","key":"MOON"}]}]}}
+            ]}))
+            .unwrap();
+            crate::registry::save(&registry).unwrap();
+            let dir = crate::registry::conduit_dir()
+                .unwrap()
+                .join("backups/cursor");
+            std::fs::create_dir_all(&dir).unwrap();
+            let legacy = r#"{"mcpServers":{"orbit":{"env":{"PLANET":"mercury-old","MOON":"io-old"},"headers":{"X-Custom":"hdr-old"}}}}"#;
+            std::fs::write(dir.join("1700000000000-mcp.json"), legacy).unwrap();
+            let path = dir.join("original-x.json");
+            assert!(awaiting_seal(&path, legacy), "nothing new");
+            for text in [
+                r#"{"mcpServers":{"orbit":{"env":{"PLANET":"mercury-new"}}}}"#,
+                r#"{"mcpServers":{"orbit":{"env":{"MOON":"io-new"}}}}"#,
+                r#"{"mcpServers":{"orbit":{"headers":{"X-Custom":"hdr-new"}}}}"#,
+                r#"{"mcpServers":{"orbit":{"args":["--planet","mercury-arg"]}}}"#,
+                r#"{"mcpServers":{"orbit":{"args":["--planet=mercury-arg"]}}}"#,
+                r#"{"mcpServers":{"orbit":{"env":[{"name":"PLANET","value":"mercury-pair"}]}}}"#,
+                r#"{"mcpServers":{},"note":"API_KEY sk-new-fixture-value"}"#,
+                r#"{"mcpServers":{},"note":"PLANET mercury-note"}"#,
+                "not a config PLANET=mercury-raw",
+            ] {
+                assert!(!awaiting_seal(&path, text), "{text}");
+            }
         });
     }
 

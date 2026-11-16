@@ -5684,6 +5684,17 @@ pub struct RepointOutcome {
     pub extra_claude_failed: Vec<(PathBuf, String)>,
 }
 
+/// The name a client is shown with, or its id when it is unknown.
+pub(crate) fn client_display_name(client_id: &str) -> String {
+    find_def(client_id).map_or_else(
+        || client_id.to_string(),
+        |def| {
+            def.location
+                .map_or_else(|| def.name.to_string(), |location| location.name)
+        },
+    )
+}
+
 fn find_def(client_id: &str) -> Option<ClientDef> {
     if let Some(def) = defs().into_iter().find(|d| d.id == client_id) {
         return Some(def);
