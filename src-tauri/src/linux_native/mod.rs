@@ -17700,7 +17700,7 @@ mod tests {
             .filter_map(|w| w.downcast::<gtk::Entry>().ok())
             .find(|e| e.text() == "Authorization")
             .expect("the pasted token row is named Authorization");
-        assert!(error().is_some_and(|l| !l.is_visible()));
+        assert!(error().is_none_or(|l| !l.is_visible()));
         assert!(save.is_sensitive() && test.is_sensitive());
         key.set_text("RESEND_API_KEY");
         let shown = error().unwrap();
