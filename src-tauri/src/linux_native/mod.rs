@@ -4100,14 +4100,14 @@ fn confirm_client_disconnect(client: &state::ClientView, button: gtk::Button, pa
     } else {
         crate::i18n::msg("This rewrites the client's MCP config to remove the gateway and puts back any servers Toolport moved out of it. You can reconnect anytime.")
     };
-    let heading = "Disconnect Toolport from {value1}?";
+    let heading = crate::i18n::msg("Disconnect Toolport from {value1}?");
     let values = [("value1", client.name.to_string())];
     let values: Vec<(&str, &str)> = values.iter().map(|(k, v)| (*k, v.as_str())).collect();
     #[allow(deprecated)]
     let dialog = adw::MessageDialog::new(
         Some(&parent),
-        Some(&crate::i18n::trf(heading, &values)),
-        Some(&crate::i18n::tr(body)),
+        Some(&crate::i18n::format_message(heading, &values)),
+        Some(&crate::i18n::lookup(body)),
     );
     l10n::bind_formatted_dialog_heading(&dialog, heading, &values);
     l10n::bind_dialog_body(&dialog, body);

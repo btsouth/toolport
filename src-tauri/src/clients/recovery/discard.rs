@@ -373,7 +373,10 @@ fn discard_file(receipt: &Receipt, manifest: &str) -> Result<String, String> {
             "{client}'s unreadable recovery file was deleted. The client config was not changed.",
         )
     };
-    Ok(issue(crate::i18n::trf(done, &[("client", name)])))
+    Ok(issue(crate::i18n::format_message(
+        done,
+        &[("client", name)],
+    )))
 }
 
 /// Only typed Discard results pass unchanged. Anything else becomes a
