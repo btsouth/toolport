@@ -397,14 +397,16 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               ? translate(
                   restored === 1
                     ? msg(
-                        "Disconnected Toolport from {client} and put back {count} server",
+                        "Disconnected Toolport from {client} and put back {count} server.",
                       )
                     : msg(
-                        "Disconnected Toolport from {client} and put back {count} servers",
+                        "Disconnected Toolport from {client} and put back {count} servers.",
                       ),
                   { client: client.name, count: restored },
                 )
-              : translate("Disconnected Toolport from {value0}", { value0: client.name }),
+              : translate("Disconnected Toolport from {value0}.", {
+                  value0: client.name,
+                }),
             ...warnings,
           ]);
         }

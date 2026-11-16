@@ -832,6 +832,32 @@ it("shows disconnect and restart feedback once inline without a duplicate toast"
   expect(toastError).not.toHaveBeenCalled();
 });
 
+it("ends the disconnect line before a kept-entry warning, as GTK does", async () => {
+  const kept =
+    "Toolport kept the toolport entry you edited. Remove it by hand if you uninstall Toolport.";
+  uninstallGateway.mockResolvedValue({
+    path: "/fixture/config",
+    restored: [],
+    warnings: [kept],
+  });
+  render(
+    <ClientDetail
+      client={client({ gatewayInstalled: true, entryState: "customized" })}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  await userEvent.click(screen.getByRole("button", { name: "Disconnect" }));
+  await userEvent.click(
+    within(screen.getByRole("dialog")).getByRole("button", { name: "Disconnect" }),
+  );
+  const notice = await screen.findByRole("status");
+  expect(notice).toHaveTextContent(
+    `Restart ${client().name} so it stops loading Toolport. Disconnected Toolport from ${client().name}. ${kept}`,
+  );
+});
+
 it("keeps a keychain warning next to the recovery notice after disconnect", async () => {
   const recovery = "Cursor needs a missing value restored.";
   uninstallGateway.mockResolvedValue({
