@@ -396,11 +396,36 @@ fn prewarm_launcher(server: &ServerEntry) {
 }
 
 #[tauri::command]
-fn update_server(state: State<RegistryState>, entry: ServerEntry) -> Result<Registry, String> {
-    let (reg, _) = write_registry(state.inner(), |reg| {
-        crate::registry_controller::apply_update_entry(reg, entry)
-    })?;
-    Ok(reg)
+fn update_server(
+    state: State<RegistryState>,
+    entry: ServerEntry,
+    removed_secret_keys: Option<Vec<String>>,
+    renamed_secret_keys: Option<Vec<(String, String)>>,
+) -> Result<Registry, String> {
+    update_server_in(
+        state.inner(),
+        entry,
+        &crate::registry_controller::SecretKeyChanges {
+            removed: removed_secret_keys.unwrap_or_default(),
+            renamed: renamed_secret_keys.unwrap_or_default(),
+            opened_with: None,
+        },
+    )
+}
+
+/// A variable removed from the keychain in the editor is deleted from it too,
+/// and a renamed one keeps its value under the new name.
+fn update_server_in(
+    state: &RegistryState,
+    entry: ServerEntry,
+    changes: &crate::registry_controller::SecretKeyChanges,
+) -> Result<Registry, String> {
+    crate::registry_controller::update_server_entry_with(entry, changes, |entry| {
+        let (reg, _) = write_registry(state, |reg| {
+            crate::registry_controller::apply_update_entry(reg, entry)
+        })?;
+        Ok(reg)
+    })
 }
 
 #[tauri::command]
@@ -7170,6 +7195,58 @@ mod tests {
         assert_eq!(supplied_secret(Some("   ".into())), None);
         assert_eq!(supplied_secret(Some("\t\n".into())), None);
         assert_eq!(supplied_secret(None), None);
+    }
+
+    /// The Tauri command React's editor saves through: a renamed keychain
+    /// variable keeps its value, and a failed registry write puts a deleted
+    /// value back.
+    #[test]
+    fn update_server_command_moves_renamed_values_and_restores_on_failure() {
+        let _generation = GEN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _hooks = REVOKE_HOOK_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_revoke_hooks();
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut entry: ServerEntry = serde_json::from_value(serde_json::json!({
+                "id":"srv","name":"srv","transport":"stdio","command":"npx","args":[],
+                "env":[{"key":"OLD_NAME","secret":true}]
+            }))
+            .unwrap();
+            let reg = Registry {
+                servers: vec![entry.clone()],
+                ..Default::default()
+            };
+            registry::save(&reg).unwrap();
+            let state = Mutex::new(reg);
+            crate::secrets::set_secret("srv", "OLD_NAME", "kept").unwrap();
+            let stored = |key: &str| crate::secrets::get_vault_secret_result("srv", key).unwrap();
+            entry.env[0].key = "NEW_NAME".into();
+            update_server_in(
+                &state,
+                entry.clone(),
+                &crate::registry_controller::SecretKeyChanges {
+                    renamed: vec![("OLD_NAME".into(), "NEW_NAME".into())],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(stored("NEW_NAME").as_deref(), Some("kept"));
+            assert!(stored("OLD_NAME").is_none());
+
+            entry.env.clear();
+            fail_next_registry_write();
+            let failed = update_server_in(
+                &state,
+                entry,
+                &crate::registry_controller::SecretKeyChanges::removing(&["NEW_NAME"]),
+            );
+            clear_revoke_hooks();
+            assert!(failed.is_err());
+            assert_eq!(stored("NEW_NAME").as_deref(), Some("kept"));
+        });
     }
 
     fn fail_next_registry_write() {

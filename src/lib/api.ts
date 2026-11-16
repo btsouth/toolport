@@ -1060,8 +1060,18 @@ export function addCatalogServer(entry: CatalogEntry): Promise<Registry> {
   return addServer(server);
 }
 
-export function updateServer(entry: ServerEntry): Promise<Registry> {
-  return invoke<Registry>("update_server", { entry });
+/// `removedSecretKeys` lists the keychain variables the user deleted in the
+/// editor; their stored values are deleted with the update.
+export function updateServer(
+  entry: ServerEntry,
+  removedSecretKeys: string[] = [],
+  renamedSecretKeys: [string, string][] = [],
+): Promise<Registry> {
+  return invoke<Registry>("update_server", {
+    entry,
+    removedSecretKeys,
+    renamedSecretKeys,
+  });
 }
 
 export function removeServer(id: string): Promise<Registry> {

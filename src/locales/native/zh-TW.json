@@ -1214,5 +1214,12 @@
   "Use an http:// or https:// URL for a remote server.": "遠端伺服器請使用 http:// 或 https:// URL。",
   "Use stdio, http or sse after -t.": "請在 -t 之後使用 stdio、http 或 sse。",
   "Add a value for {value0} before saving. The pasted config did not include it.": "儲存前請為 {value0} 新增值。貼上的設定中沒有包含它。",
-  "Use each variable name once. Rename or remove the second {value0}.": "每個變數名稱只能使用一次。請重新命名或刪除第二個 {value0}。"
+  "Use each variable name once. Rename or remove the second {value0}.": "每個變數名稱只能使用一次。請重新命名或刪除第二個 {value0}。",
+  "API keys and other secrets are stored in your OS keychain, never in the config.": "API 金鑰與其他機密會儲存在作業系統的鑰匙圈中，絕不寫入設定。",
+  "Add variable": "新增變數",
+  "Environment variable name": "環境變數名稱",
+  "Environment variable value": "環境變數值",
+  "Credential source": "憑證來源",
+  "Credential reference": "憑證參照",
+  "Servers changed while this editor was open. Nothing was saved. Select Save again to apply your changes.": "此編輯器開啟期間伺服器已變更。未儲存任何內容。請再次選取「儲存」以套用你的變更。"
 }

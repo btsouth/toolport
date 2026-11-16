@@ -188,6 +188,8 @@ describe("ServerDialog", () => {
     await waitFor(() => expect(api.updateServer).toHaveBeenCalledTimes(1));
     expect(api.updateServer).toHaveBeenCalledWith(
       expect.objectContaining({ launch: null, source: "manual" }),
+      expect.any(Array),
+      expect.any(Array),
     );
   });
 
@@ -246,6 +248,8 @@ describe("ServerDialog", () => {
         transport: "http",
         requestTimeoutMs: null,
       }),
+      expect.any(Array),
+      expect.any(Array),
     );
   });
 
@@ -280,7 +284,100 @@ describe("ServerDialog", () => {
         inheritEnv: true,
         futureField: "kept",
       }),
+      expect.any(Array),
+      expect.any(Array),
     );
+  });
+
+  it("deletes the stored value of a keychain variable removed in the dialog", async () => {
+    const initial = {
+      id: "local",
+      name: "Local",
+      transport: "stdio",
+      command: "local-server",
+      args: [],
+      env: [
+        { key: "OLD_TOKEN", value: null, secret: true },
+        { key: "KEPT_TOKEN", value: null, secret: true },
+        { key: "REGION", value: "east", secret: false },
+      ],
+      url: null,
+      source: "manual",
+    } as ServerEntry;
+    api.updateServer.mockResolvedValue(savedRegistry("local"));
+    const user = userEvent.setup();
+
+    render(<ServerDialog autoOpen editId="local" initial={initial} onSaved={vi.fn()} />);
+    const removeButtons = screen.getAllByRole("button", { name: "Remove variable" });
+    await user.click(removeButtons[0]);
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(api.updateServer).toHaveBeenCalledTimes(1));
+    expect(api.updateServer.mock.calls[0][1]).toEqual(["OLD_TOKEN"]);
+  });
+
+  it("moves the stored value of a renamed keychain variable", async () => {
+    const initial = {
+      id: "local",
+      name: "Local",
+      transport: "stdio",
+      command: "local-server",
+      args: [],
+      env: [{ key: "GITHUB_TOKN", value: null, secret: true }],
+      url: null,
+      source: "manual",
+    } as ServerEntry;
+    api.updateServer.mockResolvedValue(savedRegistry("local"));
+    const user = userEvent.setup();
+
+    // Opened from its Edit button, as on the server page.
+    render(
+      <ServerDialog
+        editId="local"
+        initial={initial}
+        onSaved={vi.fn()}
+        trigger={<button>Edit</button>}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    const name = screen.getByDisplayValue("GITHUB_TOKN");
+    await user.type(name, "{End}{Backspace}{Backspace}KEN");
+    expect(screen.getByPlaceholderText("•••• (saved)")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(api.updateServer).toHaveBeenCalledTimes(1));
+    expect(api.updateServer.mock.calls[0][1]).toEqual([]);
+    expect(api.updateServer.mock.calls[0][2]).toEqual([["GITHUB_TOKN", "GITHUB_TOKEN"]]);
+    expect(api.setSecret).not.toHaveBeenCalled();
+  });
+
+  it("keeps a stored value made plain until a new value is typed", async () => {
+    const initial = {
+      id: "local",
+      name: "Local",
+      transport: "stdio",
+      command: "local-server",
+      args: [],
+      env: [{ key: "TOKEN", value: null, secret: true }],
+      url: null,
+      source: "manual",
+    } as ServerEntry;
+    api.updateServer.mockResolvedValue(savedRegistry("local"));
+    const user = userEvent.setup();
+
+    render(<ServerDialog autoOpen editId="local" initial={initial} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("checkbox", { name: "Keep TOKEN in keychain" }));
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Enter a value, or leave it in the keychain.",
+    );
+    expect(screen.getByPlaceholderText("value")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+
+    await user.type(screen.getByPlaceholderText("value"), "visible");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(api.updateServer).toHaveBeenCalledTimes(1));
+    expect(api.updateServer.mock.calls[0][1]).toEqual(["TOKEN"]);
   });
 
   it("turns the shell environment off for a server", async () => {
@@ -305,6 +402,8 @@ describe("ServerDialog", () => {
     await waitFor(() => expect(api.updateServer).toHaveBeenCalledTimes(1));
     expect(api.updateServer).toHaveBeenCalledWith(
       expect.objectContaining({ inheritEnv: false }),
+      expect.any(Array),
+      expect.any(Array),
     );
   });
 
@@ -335,6 +434,8 @@ describe("ServerDialog", () => {
         hidePrompts: true,
         disabledTools: ["delete_everything"],
       }),
+      expect.any(Array),
+      expect.any(Array),
     );
   });
 
@@ -368,6 +469,8 @@ describe("ServerDialog", () => {
         id: "remote",
         initializeTimeoutMs: 300_500,
       }),
+      expect.any(Array),
+      expect.any(Array),
     );
   });
 
@@ -449,6 +552,8 @@ describe("ServerDialog", () => {
     expect(api.updateServer).toHaveBeenCalledTimes(1);
     expect(api.updateServer).toHaveBeenCalledWith(
       expect.objectContaining({ id: "demo", name: "demo" }),
+      expect.any(Array),
+      expect.any(Array),
     );
     expect(onSaved).toHaveBeenLastCalledWith(afterRetryC);
     expect(toast.success).toHaveBeenCalledWith("Saved demo");

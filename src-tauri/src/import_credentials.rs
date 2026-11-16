@@ -120,16 +120,23 @@ pub(crate) fn secret_env(key: &str, value: Option<&str>) -> bool {
 /// Vault changes are prepared before registry/config locks and undone on every error.
 #[derive(Default)]
 pub(crate) struct VaultWrites {
-    receipts: Vec<(String, String, Option<String>, String)>,
+    receipts: Vec<(String, String, Option<String>, Option<String>)>,
+    auth_locks: std::collections::BTreeMap<String, crate::registry_controller::AuthMutationLock>,
+    owner_pins: std::collections::BTreeMap<String, Option<crate::local_auth::OwnerPin>>,
 }
 impl VaultWrites {
-    fn write(&mut self, id: &str, key: &str, value: &str) -> Result<(), String> {
+    pub(crate) fn write(&mut self, id: &str, key: &str, value: &str) -> Result<(), String> {
         let previous = secrets::get_vault_secret_result(id, key).map_err(|_| VAULT_FAILURE)?;
         self.receipts
-            .push((id.into(), key.into(), previous, value.into()));
+            .push((id.into(), key.into(), previous, Some(value.into())));
         secrets::set_secret(id, key, value).map_err(|_| VAULT_FAILURE.to_string())?;
         crate::clients::backup_storage::register(id, key, value);
         Ok(())
+    }
+    pub(crate) fn remove(&mut self, id: &str, key: &str) -> Result<(), String> {
+        let previous = secrets::get_vault_secret_result(id, key).map_err(|_| VAULT_FAILURE)?;
+        self.receipts.push((id.into(), key.into(), previous, None));
+        secrets::delete_secret(id, key).map_err(|_| VAULT_FAILURE.into())
     }
     pub(crate) fn keep(&mut self) {
         self.receipts.clear();
@@ -141,7 +148,7 @@ impl VaultWrites {
         let mut failed = false;
         for (id, key, previous, written) in self.receipts.drain(..).rev() {
             match secrets::get_vault_secret_result(&id, &key) {
-                Ok(current) if current.as_deref() == Some(&written) => {
+                Ok(current) if current == written => {
                     let result = match previous {
                         Some(value) => secrets::set_secret(&id, &key, &value),
                         None => secrets::delete_secret(&id, &key),
@@ -617,6 +624,34 @@ impl Import {
     }
 
     pub(crate) fn transfer_into(
+        &self,
+        id: &str,
+        writes: &mut VaultWrites,
+        existing: bool,
+    ) -> Result<Vec<String>, String> {
+        // Share the editor/credential mutation lock through registry commit and
+        // rollback. A concurrently allocated ID must not overwrite another save.
+        if let std::collections::btree_map::Entry::Vacant(slot) = writes.owner_pins.entry(id.into())
+        {
+            slot.insert(crate::local_auth::pin_personal_owner(id)?);
+        }
+        let owner = crate::local_auth::owner(id)?;
+        if let std::collections::btree_map::Entry::Vacant(slot) =
+            writes.auth_locks.entry(owner.clone())
+        {
+            slot.insert(crate::registry_controller::acquire_auth_owner_lock(&owner)?);
+        }
+        self.transfer_with(
+            id,
+            existing,
+            secrets::get_vault_secret_result,
+            |id, key, value| writes.write(id, key, value),
+        )
+    }
+
+    /// [`Self::transfer_into`] for a caller that already holds the credential
+    /// lock for `id`, which the lock file cannot take a second time.
+    pub(crate) fn transfer_locked(
         &self,
         id: &str,
         writes: &mut VaultWrites,

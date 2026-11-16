@@ -1214,5 +1214,12 @@
   "Use an http:// or https:// URL for a remote server.": "원격 서버에는 http:// 또는 https:// URL을 사용하세요.",
   "Use stdio, http or sse after -t.": "-t 뒤에는 stdio, http, sse 중 하나를 쓰세요.",
   "Add a value for {value0} before saving. The pasted config did not include it.": "저장하기 전에 {value0} 값을 추가하세요. 붙여 넣은 구성에 포함되어 있지 않았습니다.",
-  "Use each variable name once. Rename or remove the second {value0}.": "변수 이름은 한 번만 사용하세요. 두 번째 {value0}의 이름을 바꾸거나 지우세요."
+  "Use each variable name once. Rename or remove the second {value0}.": "변수 이름은 한 번만 사용하세요. 두 번째 {value0}의 이름을 바꾸거나 지우세요.",
+  "API keys and other secrets are stored in your OS keychain, never in the config.": "API 키와 기타 비밀 값은 운영 체제의 키체인에 저장되며 설정에는 저장되지 않습니다.",
+  "Add variable": "변수 추가",
+  "Environment variable name": "환경 변수 이름",
+  "Environment variable value": "환경 변수 값",
+  "Credential source": "인증 정보 출처",
+  "Credential reference": "인증 정보 참조",
+  "Servers changed while this editor was open. Nothing was saved. Select Save again to apply your changes.": "이 편집기가 열려 있는 동안 서버가 변경되었습니다. 아무것도 저장되지 않았습니다. 변경 사항을 적용하려면 저장을 다시 선택하세요."
 }

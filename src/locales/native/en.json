@@ -1214,5 +1214,12 @@
   "Use an http:// or https:// URL for a remote server.": "Use an http:// or https:// URL for a remote server.",
   "Use stdio, http or sse after -t.": "Use stdio, http or sse after -t.",
   "Add a value for {value0} before saving. The pasted config did not include it.": "Add a value for {value0} before saving. The pasted config did not include it.",
-  "Use each variable name once. Rename or remove the second {value0}.": "Use each variable name once. Rename or remove the second {value0}."
+  "Use each variable name once. Rename or remove the second {value0}.": "Use each variable name once. Rename or remove the second {value0}.",
+  "API keys and other secrets are stored in your OS keychain, never in the config.": "API keys and other secrets are stored in your OS keychain, never in the config.",
+  "Add variable": "Add variable",
+  "Environment variable name": "Environment variable name",
+  "Environment variable value": "Environment variable value",
+  "Credential source": "Credential source",
+  "Credential reference": "Credential reference",
+  "Servers changed while this editor was open. Nothing was saved. Select Save again to apply your changes.": "Servers changed while this editor was open. Nothing was saved. Select Save again to apply your changes."
 }

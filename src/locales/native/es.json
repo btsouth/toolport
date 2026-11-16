@@ -1214,5 +1214,12 @@
   "Use an http:// or https:// URL for a remote server.": "Use una URL http:// o https:// para un servidor remoto.",
   "Use stdio, http or sse after -t.": "Use stdio, http o sse después de -t.",
   "Add a value for {value0} before saving. The pasted config did not include it.": "Añada un valor para {value0} antes de guardar. La configuración pegada no lo incluía.",
-  "Use each variable name once. Rename or remove the second {value0}.": "Use cada nombre de variable una sola vez. Cambie el nombre del segundo {value0} o quítelo."
+  "Use each variable name once. Rename or remove the second {value0}.": "Use cada nombre de variable una sola vez. Cambie el nombre del segundo {value0} o quítelo.",
+  "API keys and other secrets are stored in your OS keychain, never in the config.": "Las claves de API y otros secretos se guardan en el llavero del sistema operativo, nunca en la configuración.",
+  "Add variable": "Añadir variable",
+  "Environment variable name": "Nombre de la variable de entorno",
+  "Environment variable value": "Valor de la variable de entorno",
+  "Credential source": "Origen de las credenciales",
+  "Credential reference": "Referencia de credenciales",
+  "Servers changed while this editor was open. Nothing was saved. Select Save again to apply your changes.": "Los servidores cambiaron mientras este editor estaba abierto. No se guardó nada. Selecciona Guardar de nuevo para aplicar tus cambios."
 }

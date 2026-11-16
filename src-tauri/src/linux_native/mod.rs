@@ -12087,6 +12087,38 @@ fn open_server_editor_prefilled(
 ) -> Option<adw::Window> {
     let parent = page.app.active_window()?;
     let editing = server_id.is_some();
+    // What the dialog lists decides which keychain values a save may delete,
+    // so an edit never opens with a list it could not read.
+    let saved_env = match server.as_ref() {
+        Some(view) => match crate::registry::load() {
+            Ok(registry) => registry
+                .servers
+                .into_iter()
+                .find(|s| s.id == view.id)
+                .map(|s| s.env)
+                .unwrap_or_default(),
+            Err(error) if editing => {
+                page.show_feedback(
+                    &crate::i18n::trf("Could not continue: {value0}", &[("value0", &error)]),
+                    true,
+                );
+                return None;
+            }
+            Err(_) => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    // Keychain variables the dialog opened with. Saving deletes the stored
+    // value only of those the user removes here.
+    let vaulted_at_open: Vec<String> = if editing {
+        saved_env
+            .iter()
+            .filter(|env| env.secret && !env.unknown_fields.contains_key("source"))
+            .map(|env| env.key.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let editor = adw::Window::builder()
         .application(&page.app)
         .transient_for(&parent)
@@ -12162,13 +12194,6 @@ fn open_server_editor_prefilled(
         "Keep this new server on this machine from the start.",
     );
     form.append(&local_only);
-
-    // Pasted env rows wait in their own section until the add commits; the entry
-    // itself never carries secret values, they go straight to the keychain on save.
-    let pasted_env = (!editing).then(pasted_env_section);
-    if let Some(section) = &pasted_env {
-        section.release_on_close(&editor);
-    }
 
     let name = {
         let widget = gtk::Entry::builder()
@@ -12490,43 +12515,65 @@ fn open_server_editor_prefilled(
     test.set_halign(gtk::Align::End);
     form.append(&connection);
 
-    // Plain values can only be edited once the server exists; a new server
-    // takes them from a pasted config.
-    let plain_env = editing.then(|| {
-        let personal = page
-            .last_snapshot
-            .borrow()
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.personal_sync);
-        let (section, rows) = plain_env_section(
-            server
-                .as_ref()
-                .map(|server| server.plain_env.as_slice())
-                .unwrap_or_default(),
-            personal,
+    let env_section = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    env_section.add_css_class("toolport-form-section");
+    env_section.append(&section_heading(
+        crate::i18n::msg("Environment variables"),
+        crate::i18n::msg(
+            "API keys and other secrets are stored in your OS keychain, never in the config.",
+        ),
+    ));
+    let env_list = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let editor_env: EditorEnvRows = Default::default();
+    // Every variable the dialog opened with. One added elsewhere while it is
+    // open is not in this list, so saving keeps it.
+    let opened_with: Option<Vec<String>> =
+        editing.then(|| saved_env.iter().map(|env| env.key.clone()).collect());
+    for env in saved_env {
+        editor_env_row(
+            &env_list,
+            &editor_env,
+            env,
+            &feedback,
+            server_id.as_deref().unwrap_or(""),
         );
-        form.append(&section);
-        (section, rows)
-    });
-
-    let credentials = gtk::Label::builder()
-        .halign(gtk::Align::Start)
-        .xalign(0.0)
-        .wrap(true)
-        .css_classes(["toolport-editor-note", "caption"])
-        .build();
-    l10n::bind_label(
-        &credentials,
-        if editing {
-            crate::i18n::msg("Existing credentials, tool settings, and newer configuration fields are preserved. Use the server card's Credentials action to add or replace secret values.")
-        } else {
-            crate::i18n::msg("Save the server first, then use its Credentials action to store secret values in the system keychain.")
-        },
-    );
-    if let Some(pasted) = &pasted_env {
-        form.append(&pasted.section);
     }
-    form.append(&credentials);
+    // Add only: names a paste gave no value, as React's dialog shows them.
+    let pasted_notice = (!editing).then(|| PastedNotice::new(&editor_env));
+    if let Some(notice) = &pasted_notice {
+        env_section.append(&notice.label);
+    }
+    env_section.append(&env_list);
+    // Typed secret values leave memory with the dialog.
+    release_editor_env_on_close(&editor, &env_list, &editor_env);
+    let add_env = l10n::button("Add variable");
+    add_env.set_halign(gtk::Align::Start);
+    let (list_for_add, rows_for_add, feedback_for_env, id_for_env) = (
+        env_list.clone(),
+        editor_env.clone(),
+        feedback.clone(),
+        server_id.clone().unwrap_or_default(),
+    );
+    let notice_for_add = pasted_notice.clone();
+    add_env.connect_clicked(move |_| {
+        editor_env_row(
+            &list_for_add,
+            &rows_for_add,
+            crate::registry::EnvVar {
+                key: String::new(),
+                value: None,
+                secret: true,
+                unknown_fields: Default::default(),
+            },
+            &feedback_for_env,
+            &id_for_env,
+        );
+        if let Some(notice) = &notice_for_add {
+            notice.watch_rows();
+        }
+    });
+    env_section.append(&add_env);
+    form.append(&env_section);
 
     // Set once the field checks exist: after a refused paste, an empty field
     // shows no error, so the refusal is the only message (as in React).
@@ -12579,10 +12626,9 @@ fn open_server_editor_prefilled(
         let exact_args_for_fill = exact_args.clone();
         let url_for_fill = url.clone();
         let cwd_for_fill = cwd.clone();
-        let env_for_fill = pasted_env
-            .clone()
-            .expect("Add server has a pasted env section");
-        let credentials_for_fill = credentials.clone();
+        let editor_env_for_fill = editor_env.clone();
+        let env_list_for_fill = env_list.clone();
+        let notice_for_fill = pasted_notice.clone();
         let page_for_fill = page.clone();
         let quiet_for_fill = quiet_empty_fields.clone();
         fill.connect_clicked(move |fill| {
@@ -12621,9 +12667,14 @@ fn open_server_editor_prefilled(
                     set_exact_args(&args_for_fill, &exact_args_for_fill, &first.args);
                     url_for_fill.set_text(first.url.as_deref().unwrap_or(""));
                     cwd_for_fill.set_text("");
-                    env_for_fill.fill(&first.env);
-                    // The rows take the values now, so the save-first note does not apply.
-                    credentials_for_fill.set_visible(first.env.is_empty());
+                    while let Some(child) = env_list_for_fill.first_child() { env_list_for_fill.remove(&child); }
+                    editor_env_for_fill.borrow_mut().clear();
+                    for env in &first.env {
+                        editor_env_row(&env_list_for_fill,&editor_env_for_fill,crate::registry::EnvVar{key:env.key.clone(),value:env.value.clone(),secret:crate::import_credentials::secret_env(&env.key,env.value.as_deref()),unknown_fields:Default::default()},&feedback_for_fill,"");
+                    }
+                    if let Some(notice) = &notice_for_fill {
+                        notice.show_missing(&first.env);
+                    }
                     // Re-rendered on a language change, like the error below.
                     let name = first.name.clone();
                     let count = servers.len();
@@ -12674,10 +12725,6 @@ fn open_server_editor_prefilled(
     let args_row_for_transport = args_row.clone();
     let cwd_row_for_transport = cwd_row.clone();
     let url_row_for_transport = url_row.clone();
-    let env_section = plain_env.as_ref().map(|(section, _)| section.clone());
-    if let Some(section) = &env_section {
-        section.set_visible(transport.selected() == 0);
-    }
     transport.connect_selected_notify(move |transport| {
         update_editor_transport(
             transport.selected(),
@@ -12686,11 +12733,7 @@ fn open_server_editor_prefilled(
             &cwd_row_for_transport,
             &url_row_for_transport,
         );
-        if let Some(section) = &env_section {
-            section.set_visible(transport.selected() == 0);
-        }
     });
-    let plain_env = plain_env.map(|(_, rows)| rows);
 
     let clamp = adw::Clamp::builder()
         .maximum_size(680)
@@ -12912,8 +12955,8 @@ fn open_server_editor_prefilled(
     let launch_definition_for_test = original_launch.clone();
     let original_command_for_test = original_command.clone();
     let original_args_for_test = original_args.clone();
-    let plain_env_for_test = plain_env.clone();
     let exact_args_for_test = exact_args.clone();
+    let editor_env_for_test = editor_env.clone();
     let busy_for_test = busy.clone();
     let generation_for_test = generation.clone();
     let validate_for_test = validate.clone();
@@ -12955,12 +12998,12 @@ fn open_server_editor_prefilled(
             })
             .collect::<Vec<_>>();
         let launch_definition = launch_definition_for_test.clone();
-        let env_edits = plain_env_for_test.as_ref().map(collect_plain_env);
-        // Plain environment rows come and go, so they are compared instead.
-        let (started, env_at_start, plain_env) = (
+        let env_edits = collect_editor_env(&editor_env_for_test);
+        // Variable rows come and go, so they are compared instead.
+        let (started, env_at_start, editor_env) = (
             generation_for_test.get(),
             env_edits.clone(),
-            plain_env_for_test.clone(),
+            editor_env_for_test.clone(),
         );
         let generation = generation_for_test.clone();
         let server_id = server_id_for_test.clone();
@@ -12977,9 +13020,7 @@ fn open_server_editor_prefilled(
                     server_id.as_deref(),
                     fields,
                 )?;
-                if let Some(edits) = env_edits {
-                    crate::registry_controller::apply_plain_env(&mut entry, edits)?;
-                }
+                entry.env = env_edits;
                 if !binding_changed {
                     if entry.launch.is_none() {
                         entry.launch = launch_definition;
@@ -13002,9 +13043,7 @@ fn open_server_editor_prefilled(
             busy.set(false);
             validate();
             // Like React, a result for settings edited since is discarded.
-            if generation.get() != started
-                || plain_env.as_ref().map(collect_plain_env) != env_at_start
-            {
+            if generation.get() != started || collect_editor_env(&editor_env) != env_at_start {
                 feedback.set_visible(false);
                 return;
             }
@@ -13071,6 +13110,42 @@ fn open_server_editor_prefilled(
             validate_for_save();
             return;
         };
+        let env_rows = collect_editor_rows(&editor_env);
+        let (mut secret_changes, blocked) = crate::registry_controller::editor_secret_changes(
+            &vaulted_at_open,
+            &env_rows
+                .iter()
+                .map(
+                    |(stored_as, row)| crate::registry_controller::EditorSecretRow {
+                        stored_as: stored_as.as_deref(),
+                        row,
+                    },
+                )
+                .collect::<Vec<_>>(),
+        );
+        if !blocked.is_empty() {
+            // The row says what to do; a stored value is never dropped.
+            for row in editor_env.borrow().iter() {
+                if row
+                    .stored_as
+                    .as_deref()
+                    .is_some_and(|key| blocked.iter().any(|b| b == key))
+                {
+                    row.keep_hint.set_visible(true);
+                }
+            }
+            if let Some(row) = editor_env
+                .borrow()
+                .iter()
+                .find(|row| row.stored_as.as_deref() == blocked.first().map(String::as_str))
+            {
+                row.value.grab_focus();
+            }
+            l10n::bind_text(&feedback, crate::registry_controller::KEEP_IN_KEYCHAIN);
+            feedback.set_visible(true);
+            return;
+        }
+        secret_changes.opened_with = opened_with.clone();
         feedback.set_visible(false);
         busy_for_save.set(true);
         validate_for_save();
@@ -13105,11 +13180,12 @@ fn open_server_editor_prefilled(
             .collect::<Vec<_>>();
         let launch_definition = original_launch_for_save.clone();
         let display_name = fields.name.trim().to_string();
-        let (env, keychain) = pasted_env
-            .as_ref()
-            .map(PastedEnvSection::collect)
-            .unwrap_or_default();
-        let env_edits = plain_env.as_ref().map(collect_plain_env);
+        let env_edits: Vec<_> = env_rows.into_iter().map(|(_, row)| row).collect();
+        let missing = if editing {
+            Vec::new()
+        } else {
+            crate::registry_controller::editor_missing_values(&env_edits)
+        };
         let page = page.clone();
         let busy = busy_for_save.clone();
         let validate = validate_for_save.clone();
@@ -13129,48 +13205,16 @@ fn open_server_editor_prefilled(
                         "Replace <launch-input> with a literal argument before saving",
                     ));
                 }
-                match server_id {
-                    Some(server_id) => {
-                        let mut registry =
-                            crate::registry_controller::update_server_fields_and_env(
-                                &server_id, fields, env_edits,
-                            )?;
-                        if !binding_changed {
-                            registry = save_launch_entries(&server_id, &launch_values, registry)?;
-                        }
-                        Ok((registry, Vec::new(), Vec::new()))
-                    }
-                    None if env.is_empty() => {
-                        let mut registry = if !binding_changed {
-                            match launch_definition {
-                                Some(launch) => crate::registry_controller::add_server_with_launch(
-                                    fields, launch,
-                                )?,
-                                None => crate::registry_controller::add_server(fields)?,
-                            }
-                        } else {
-                            crate::registry_controller::add_server(fields)?
-                        };
-                        if !binding_changed {
-                            if let Some(id) =
-                                registry.servers.last().map(|server| server.id.clone())
-                            {
-                                registry = save_launch_entries(&id, &launch_values, registry)?;
-                            }
-                        }
-                        Ok((registry, Vec::new(), Vec::new()))
-                    }
-                    None => {
-                        let outcome = crate::registry_controller::add_snippet_server_choices(
-                            fields, env, &keychain,
-                        )?;
-                        Ok::<_, String>((
-                            outcome.registry,
-                            outcome.declared_without_value,
-                            outcome.failed,
-                        ))
-                    }
-                }
+                let launch = (!binding_changed).then_some(launch_definition).flatten();
+                let registry = crate::registry_controller::save_server_editor_fields(
+                    server_id.as_deref(),
+                    fields,
+                    env_edits,
+                    &secret_changes,
+                    launch,
+                    if binding_changed { &[] } else { &launch_values },
+                )?;
+                Ok::<_, String>((registry, missing, Vec::<String>::new()))
             })
             .await;
             match update {
@@ -13192,11 +13236,15 @@ fn open_server_editor_prefilled(
                     editor.close();
                 }
                 Ok(Err(error)) => {
-                    l10n::bind_formatted_label(
-                        &feedback,
-                        "Could not save: {value0}",
-                        &[("value0", &error.to_string())],
-                    );
+                    if error == crate::registry_controller::EDITOR_SAVE_RACE {
+                        l10n::bind_text(&feedback, crate::registry_controller::EDITOR_SAVE_RACE);
+                    } else {
+                        l10n::bind_formatted_label(
+                            &feedback,
+                            "Could not save: {value0}",
+                            &[("value0", &error.to_string())],
+                        );
+                    }
                     busy.set(false);
                     validate();
                     feedback.set_visible(true);
@@ -13328,40 +13376,6 @@ fn open_sync_settings(server_id: &str, page: &ServerPage) {
         });
     });
     dialog.present();
-}
-
-fn save_launch_entries(
-    server_id: &str,
-    values: &[(crate::registry::LaunchInput, String)],
-    mut registry: crate::registry::Registry,
-) -> Result<crate::registry::Registry, String> {
-    for (input, value) in values {
-        if let Some(reference) =
-            crate::secret_refs::source(&input.unknown_fields).map_err(|e| e.to_string())?
-        {
-            registry =
-                crate::registry_controller::set_secret_reference(server_id, &input.key, reference)?;
-        } else if input.secret {
-            if value.is_empty() {
-                registry = crate::registry::update(|reg| {
-                    crate::registry_controller::apply_launch_secret_generation(
-                        reg, server_id, &input.key,
-                    )
-                })?
-                .0;
-            } else {
-                registry =
-                    crate::registry_controller::set_launch_secret(server_id, &input.key, value)?;
-            }
-        } else if input.value.as_deref().unwrap_or("") != value {
-            registry = crate::registry_controller::set_launch_input_value(
-                server_id,
-                &input.key,
-                (!value.is_empty()).then_some(value.clone()),
-            )?;
-        }
-    }
-    Ok(registry)
 }
 
 fn editor_field_data(label: &str, child: &impl IsA<gtk::Widget>) -> gtk::Box {
@@ -13674,463 +13688,410 @@ fn section_heading(title: &'static str, subtitle: &'static str) -> gtk::Box {
     heading
 }
 
-/// The environment values a paste brought into Add server, laid out like the
-/// React dialog's rows: name, value and Keychain, plus the same notice for values
-/// the paste left out (a `$TOKEN` it could not read, or a key with no value).
-/// Pasted values to save: each key, and its value when one was given.
-type PastedEnv = Vec<(String, Option<String>)>;
-
 #[derive(Clone)]
-struct PastedEnvSection {
-    section: gtk::Box,
-    list: gtk::Box,
-    notice: gtk::Label,
-    rows: std::rc::Rc<std::cell::RefCell<Vec<PastedEnvRow>>>,
-    /// Names the paste gave no value. The notice names a row while its name is
-    /// one of these and its value is empty, the same rule as the React dialog.
-    missing: std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<String>>>,
-}
-
-/// What a row's own signal handlers hold. Strong references there would form
-/// cycles (a row's widgets own handlers that own the rows), so closing the
-/// dialog would leave the widgets and the pasted values alive.
-struct WeakPastedEnvSection {
-    section: gtk::glib::WeakRef<gtk::Box>,
-    list: gtk::glib::WeakRef<gtk::Box>,
-    notice: gtk::glib::WeakRef<gtk::Label>,
-    rows: std::rc::Weak<std::cell::RefCell<Vec<PastedEnvRow>>>,
-    missing: std::rc::Weak<std::cell::RefCell<std::collections::BTreeSet<String>>>,
-}
-
-impl WeakPastedEnvSection {
-    fn upgrade(&self) -> Option<PastedEnvSection> {
-        Some(PastedEnvSection {
-            section: self.section.upgrade()?,
-            list: self.list.upgrade()?,
-            notice: self.notice.upgrade()?,
-            rows: self.rows.upgrade()?,
-            missing: self.missing.upgrade()?,
-        })
-    }
-}
-
-#[derive(Clone)]
-struct PastedEnvRow {
+struct EditorEnvRow {
     row: gtk::Box,
+    /// The name this variable had when the dialog opened, if its value is in
+    /// the keychain. Renaming the row moves that value to the new name.
+    stored_as: Option<String>,
+    /// "Enter a value, or leave it in the keychain." under the value field.
+    keep_hint: gtk::Label,
+    /// Whether "Same on every machine" is the user's choice (saved before or
+    /// changed here) rather than the default sync decides.
+    portable_chosen: std::rc::Rc<dyn Fn() -> bool>,
     key: gtk::Entry,
     value: gtk::Entry,
-    keychain: gtk::CheckButton,
+    secret: gtk::CheckButton,
+    source: gtk::DropDown,
+    reference: gtk::Entry,
+    portable: gtk::CheckButton,
+}
+type EditorEnvRows = std::rc::Rc<std::cell::RefCell<Vec<EditorEnvRow>>>;
+
+/// Add server: the names a paste brought in without a value (a `$TOKEN` it
+/// could not read, or a key the config left empty). The notice names a row
+/// while its name is one of these and its value is empty, the same rule and
+/// sentence as the React dialog.
+#[derive(Clone)]
+struct PastedNotice {
+    label: gtk::Label,
+    missing: std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<String>>>,
+    /// Weak: the rows' own handlers hold this notice.
+    rows: std::rc::Weak<std::cell::RefCell<Vec<EditorEnvRow>>>,
+    /// Name fields already followed, so a row is watched once.
+    watched: std::rc::Rc<std::cell::RefCell<Vec<gtk::glib::WeakRef<gtk::Entry>>>>,
 }
 
-fn pasted_env_section() -> PastedEnvSection {
-    let section = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    section.add_css_class("toolport-form-section");
-    section.set_visible(false);
-    let heading = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    heading.append(&{
-        let widget = gtk::Label::builder()
-            .halign(gtk::Align::Start)
-            .css_classes(["toolport-section-label"])
-            .build();
-        l10n::bind_label(&widget, "Environment variables");
-        widget
-    });
-    heading.append(&{
-        let widget = gtk::Label::builder()
-            .halign(gtk::Align::Fill)
-            .xalign(0.0)
-            .wrap(true)
-            .css_classes(["toolport-muted", "caption"])
-            .build();
-        l10n::bind_formatted_label(
-            &widget,
-            "API keys and other secrets the server needs (e.g.{value1}{value2}). Values are stored in your OS keychain, never in the config.",
-            &[("value1", " "), ("value2", "RESEND_API_KEY")],
-        );
-        widget
-    });
-    section.append(&heading);
-    let notice = gtk::Label::builder()
-        .halign(gtk::Align::Fill)
-        .xalign(0.0)
-        .wrap(true)
-        .visible(false)
-        .css_classes(["toolport-feedback", "warning"])
-        .build();
-    section.append(&notice);
-    let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    section.append(&list);
-    PastedEnvSection {
-        section,
-        list,
-        notice,
-        rows: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
-        missing: std::rc::Rc::new(std::cell::RefCell::new(Default::default())),
-    }
-}
-
-impl PastedEnvSection {
-    fn downgrade(&self) -> WeakPastedEnvSection {
-        WeakPastedEnvSection {
-            section: self.section.downgrade(),
-            list: self.list.downgrade(),
-            notice: self.notice.downgrade(),
-            rows: std::rc::Rc::downgrade(&self.rows),
-            missing: std::rc::Rc::downgrade(&self.missing),
+impl PastedNotice {
+    fn new(rows: &EditorEnvRows) -> Self {
+        Self {
+            label: gtk::Label::builder()
+                .halign(gtk::Align::Fill)
+                .xalign(0.0)
+                .wrap(true)
+                .visible(false)
+                .css_classes(["toolport-feedback", "warning"])
+                .build(),
+            missing: Default::default(),
+            rows: std::rc::Rc::downgrade(rows),
+            watched: Default::default(),
         }
     }
 
-    /// Drop every row and the values in them when `window` closes. The editor's
-    /// own handlers can keep the window alive after it closes, so this does not
-    /// wait for it to be freed.
-    fn release_on_close(&self, window: &impl IsA<gtk::Window>) {
-        let section = self.downgrade();
-        window.connect_close_request(move |window| {
-            if let Some(section) = section.upgrade() {
-                // A window holds its focused widget, which may be in a row.
-                window.set_focus(gtk::Widget::NONE);
-                section.clear();
-            }
-            gtk::glib::Propagation::Proceed
-        });
-    }
-
-    fn clear(&self) {
-        // Taken first: clearing a value runs its handler, which reads the rows.
-        let rows = std::mem::take(&mut *self.rows.borrow_mut());
-        self.missing.borrow_mut().clear();
-        for row in rows {
-            row.value.set_text("");
-            self.list.remove(&row.row);
-        }
-    }
-
-    /// Replace the rows with a new paste's values.
-    fn fill(&self, env: &[crate::clients::SnippetEnvVar]) {
-        self.clear();
+    /// After a paste filled the rows: remember which names came without a value.
+    fn show_missing(&self, env: &[crate::clients::SnippetEnvVar]) {
         *self.missing.borrow_mut() = env
             .iter()
-            .filter(|var| var.value.as_deref().is_none_or(str::is_empty))
-            .map(|var| var.key.clone())
+            .filter(|env| env.value.as_deref().is_none_or(str::is_empty))
+            .map(|env| env.key.clone())
             .collect();
-        for var in env {
-            let secret = crate::import_credentials::secret_env(&var.key, var.value.as_deref());
-            self.add_row(&var.key, var.value.as_deref(), secret);
-        }
-        self.section.set_visible(!env.is_empty());
-        self.refresh_notice();
+        self.watch_rows();
     }
 
-    fn add_row(&self, key_text: &str, value_text: Option<&str>, secret: bool) {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let key = {
-            let widget = gtk::Entry::builder()
-                .text(key_text)
-                .width_chars(16)
-                .css_classes(["toolport-input", "monospace"])
-                .build();
-            l10n::bind_placeholder(&widget, "ENV_NAME");
-            widget
+    /// Follow every row's name and value. Each row is watched once.
+    fn watch_rows(&self) {
+        let Some(rows) = self.rows.upgrade() else {
+            return;
         };
-        let value = {
-            let widget = gtk::Entry::builder()
-                .text(value_text.unwrap_or(""))
-                .hexpand(true)
-                .visibility(!secret)
-                .input_purpose(if secret {
-                    gtk::InputPurpose::Password
-                } else {
-                    gtk::InputPurpose::FreeForm
-                })
-                .css_classes(["toolport-input"])
-                .build();
-            l10n::bind_placeholder(&widget, "value");
-            widget
-        };
-        let keychain = l10n::check_button("Keychain");
-        keychain.set_active(secret);
-        keychain.set_valign(gtk::Align::Center);
-        let remove = gtk::Button::builder()
-            .icon_name("user-trash-symbolic")
-            .valign(gtk::Align::Center)
-            .css_classes(["flat", "toolport-destructive-icon"])
-            .build();
-        l10n::bind_tooltip(&remove, "Remove this value");
-        let name_accessible = {
-            let (key, value, keychain, remove) = (
-                key.downgrade(),
-                value.downgrade(),
-                keychain.downgrade(),
-                remove.downgrade(),
-            );
-            move || {
-                let (Some(key), Some(value), Some(keychain), Some(remove)) = (
-                    key.upgrade(),
-                    value.upgrade(),
-                    keychain.upgrade(),
-                    remove.upgrade(),
-                ) else {
-                    return;
-                };
-                let name = key.text();
-                let name = if name.trim().is_empty() {
-                    "variable".to_string()
-                } else {
-                    name.trim().to_string()
-                };
-                value.update_property(&[gtk::accessible::Property::Label(&name)]);
-                keychain.update_property(&[gtk::accessible::Property::Label(&crate::i18n::trf(
-                    "Keep {value1} in keychain",
-                    &[("value1", &name)],
-                ))]);
-                remove.update_property(&[gtk::accessible::Property::Label(&crate::i18n::tr(
-                    "Remove this value",
-                ))]);
+        for row in rows.borrow().iter() {
+            let mut watched = self.watched.borrow_mut();
+            watched.retain(|entry| entry.upgrade().is_some());
+            if watched
+                .iter()
+                .any(|entry| entry.upgrade().as_ref() == Some(&row.key))
+            {
+                continue;
             }
-        };
-        name_accessible();
-        {
-            let section = self.downgrade();
-            key.connect_changed(move |_| {
-                name_accessible();
-                if let Some(section) = section.upgrade() {
-                    section.refresh_notice();
-                }
-            });
+            watched.push(row.key.downgrade());
+            for entry in [&row.key, &row.value] {
+                let label = self.label.downgrade();
+                let missing = std::rc::Rc::downgrade(&self.missing);
+                let watched = std::rc::Rc::downgrade(&self.watched);
+                let rows = self.rows.clone();
+                entry.connect_changed(move |_| {
+                    if let (Some(label), Some(missing), Some(watched)) =
+                        (label.upgrade(), missing.upgrade(), watched.upgrade())
+                    {
+                        let rows = rows.clone();
+                        PastedNotice {
+                            label,
+                            missing,
+                            rows,
+                            watched,
+                        }
+                        .refresh();
+                    }
+                });
+            }
         }
-        {
-            let value = value.downgrade();
-            keychain.connect_toggled(move |check| {
-                if let Some(value) = value.upgrade() {
-                    value.set_visibility(!check.is_active());
-                }
-            });
-        }
-        row.append(&key);
-        row.append(&value);
-        row.append(&keychain);
-        row.append(&remove);
-        self.list.append(&row);
-        self.rows.borrow_mut().push(PastedEnvRow {
-            row: row.clone(),
-            key,
-            value: value.clone(),
-            keychain,
-        });
-        {
-            let section = self.downgrade();
-            value.connect_changed(move |_| {
-                if let Some(section) = section.upgrade() {
-                    section.refresh_notice();
-                }
-            });
-        }
-        let (section, row) = (self.downgrade(), row.downgrade());
-        remove.connect_clicked(move |_| {
-            let (Some(section), Some(row)) = (section.upgrade(), row.upgrade()) else {
-                return;
-            };
-            section.list.remove(&row);
-            section.rows.borrow_mut().retain(|r| r.row != row);
-            section.refresh_notice();
-            section
-                .section
-                .set_visible(!section.rows.borrow().is_empty());
-        });
+        self.refresh();
     }
 
-    /// The same notice the React dialog shows above its rows.
-    fn refresh_notice(&self) {
+    fn refresh(&self) {
         let names = self.missing.borrow();
         let missing: Vec<String> = self
             .rows
-            .borrow()
-            .iter()
-            .map(|r| (r.key.text().trim().to_string(), r.value.text().is_empty()))
-            .filter(|(key, empty)| *empty && names.contains(key))
-            .map(|(key, _)| key)
-            .collect();
-        self.notice.set_visible(!missing.is_empty());
+            .upgrade()
+            .map(|rows| {
+                rows.borrow()
+                    .iter()
+                    .map(|r| (r.key.text().trim().to_string(), r.value.text().is_empty()))
+                    .filter(|(key, empty)| *empty && names.contains(key))
+                    .map(|(key, _)| key)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.label.set_visible(!missing.is_empty());
         if missing.is_empty() {
-            l10n::unbind(&self.notice, "label");
-            self.notice.set_label("");
+            l10n::unbind(&self.label, "label");
+            self.label.set_label("");
         } else {
             l10n::bind_formatted_label(
-                &self.notice,
+                &self.label,
                 "Add a value for {value0} before saving. The pasted config did not include it.",
                 &[("value0", &missing.join(", "))],
             );
         }
     }
-
-    /// The values to save and each key's Keychain choice.
-    fn collect(&self) -> (PastedEnv, std::collections::BTreeMap<String, bool>) {
-        let mut env = Vec::new();
-        let mut keychain = std::collections::BTreeMap::new();
-        for row in self.rows.borrow().iter() {
-            let key = row.key.text().trim().to_string();
-            if key.is_empty() {
-                continue;
-            }
-            let value = row.value.text().to_string();
-            keychain.insert(key.clone(), row.keychain.is_active());
-            env.push((key, (!value.is_empty()).then_some(value)));
-        }
-        (env, keychain)
-    }
 }
 
-/// One editable plain environment value in Edit server.
-#[derive(Clone)]
-struct PlainEnvRow {
-    row: gtk::Box,
-    key: gtk::Entry,
-    value: gtk::Entry,
-    local: Option<gtk::CheckButton>,
-    /// Set once the user flips "This machine only"; until then the box follows
-    /// the saved choice, or sync's default for a new name.
-    touched: std::rc::Rc<std::cell::Cell<bool>>,
-}
-
-type PlainEnvRows = std::rc::Rc<std::cell::RefCell<Vec<PlainEnvRow>>>;
-
-fn plain_env_section(values: &[state::PlainEnvView], personal: bool) -> (gtk::Box, PlainEnvRows) {
-    let section = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    section.add_css_class("toolport-form-section");
-    section.append(&section_heading(crate::i18n::msg("Environment"), crate::i18n::msg("Plain settings the command reads, such as a region or a feature flag. Keys and tokens belong in Credentials.")));
-    let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    section.append(&list);
-    let rows: PlainEnvRows = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    for saved in values {
-        add_plain_env_row(&list, &rows, Some(saved.clone()), personal);
-    }
-    let add = l10n::button("Add value");
-    add.add_css_class("toolport-secondary-action");
-    add.set_halign(gtk::Align::Start);
-    let list_for_add = list.clone();
-    let rows_for_add = rows.clone();
-    add.connect_clicked(move |_| {
-        let key = add_plain_env_row(&list_for_add, &rows_for_add, None, personal);
-        key.grab_focus();
-    });
-    section.append(&add);
-    (section, rows)
-}
-
-fn add_plain_env_row(
+/// A row's handlers hold its row, so the rows (and any value typed into them)
+/// would outlive the dialog. Closing it drops them.
+fn release_editor_env_on_close(
+    window: &impl IsA<gtk::Window>,
     list: &gtk::Box,
-    rows: &PlainEnvRows,
-    saved: Option<state::PlainEnvView>,
-    personal: bool,
-) -> gtk::Entry {
-    let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let key = gtk::Entry::builder()
-        .text(saved.as_ref().map(|s| s.key.as_str()).unwrap_or(""))
-        .placeholder_text("NAME")
-        .width_chars(16)
-        .css_classes(["toolport-input", "monospace"])
-        .build();
-    let value = {
-        let widget = gtk::Entry::builder()
-            .text(saved.as_ref().map(|s| s.value.as_str()).unwrap_or(""))
-            .placeholder_text(crate::i18n::tr("Value"))
-            .hexpand(true)
-            .css_classes(["toolport-input"])
-            .build();
-        l10n::bind_placeholder(&widget, "Value");
-        widget
-    };
+    rows: &EditorEnvRows,
+) {
+    let list = list.downgrade();
+    let rows = std::rc::Rc::downgrade(rows);
+    window.connect_close_request(move |window| {
+        // A window holds its focused widget, which may be in a row.
+        window.set_focus(gtk::Widget::NONE);
+        if let Some(rows) = rows.upgrade() {
+            rows.borrow_mut().clear();
+        }
+        if let Some(list) = list.upgrade() {
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+        }
+        gtk::glib::Propagation::Proceed
+    });
+}
+
+fn editor_env_row(
+    list: &gtk::Box,
+    rows: &EditorEnvRows,
+    saved: crate::registry::EnvVar,
+    feedback: &gtk::Label,
+    server_id: &str,
+) {
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let key = gtk::Entry::builder().text(&saved.key).hexpand(true).build();
+    // Same placeholders as React's editor, translated with it.
+    l10n::bind_placeholder(&key, "ENV_NAME");
+    key.update_property(&[gtk::accessible::Property::Label(&crate::i18n::tr(
+        "Environment variable name",
+    ))]);
     let remove = gtk::Button::builder()
         .icon_name("user-trash-symbolic")
-        .tooltip_text(crate::i18n::tr("Remove this value"))
-        .valign(gtk::Align::Center)
-        .css_classes(["flat", "toolport-destructive-icon"])
+        .tooltip_text(crate::i18n::tr("Remove variable"))
+        .css_classes(["flat"])
         .build();
-    line.append(&key);
-    line.append(&value);
-    line.append(&remove);
-    row.append(&line);
+    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    heading.append(&key);
+    heading.append(&remove);
+    row.append(&heading);
+    let secret = l10n::check_button("Keychain");
+    secret.set_active(saved.secret);
+    let value = gtk::Entry::builder()
+        .text(saved.value.as_deref().unwrap_or(""))
+        .visibility(!saved.secret)
+        .hexpand(true)
+        .build();
+    let stored_as = (saved.secret
+        && !saved.key.is_empty()
+        && !saved.unknown_fields.contains_key("source")
+        && !server_id.is_empty())
+    .then(|| saved.key.clone());
+    value.update_property(&[gtk::accessible::Property::Label(&crate::i18n::tr(
+        "Environment variable value",
+    ))]);
+    let reference_value = saved
+        .unknown_fields
+        .get("source")
+        .and_then(|s| s.get("ref"))
+        .and_then(serde_json::Value::as_str);
+    let (source, reference_box, reference) =
+        secret_reference_fields(server_id, reference_value, feedback);
+    row.append(&source);
+    row.append(&value);
+    // Making a stored variable plain without typing a value would lose it.
+    let keep_hint = l10n::label(crate::registry_controller::KEEP_IN_KEYCHAIN);
+    keep_hint.set_xalign(0.0);
+    keep_hint.set_wrap(true);
+    keep_hint.add_css_class("caption");
+    keep_hint.add_css_class("error");
+    row.append(&keep_hint);
+    let keep_hint_for_row = keep_hint.clone();
+    row.append(&reference_box);
+    let portable = l10n::check_button("Same on every machine");
+    portable.set_active(
+        saved
+            .unknown_fields
+            .get("portable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| {
+                !crate::personal_sync::looks_machine_local(
+                    &saved.key,
+                    saved.value.as_deref().unwrap_or(""),
+                )
+            }),
+    );
+    let options = page_header::ActionFlow::new();
+    options.append(&secret);
+    options.append(&portable);
+    row.append(&options);
+    let portability_reason = gtk::Label::builder()
+        .label(crate::i18n::tr(
+            "This variable changes how programs run, so it always stays on this machine.",
+        ))
+        .wrap(true)
+        .xalign(0.0)
+        .css_classes(["caption", "toolport-muted"])
+        .build();
+    row.append(&portability_reason);
+    let saved_choice = saved.unknown_fields.contains_key("portable");
     let touched = std::rc::Rc::new(std::cell::Cell::new(false));
-    let local = personal.then(|| {
-        let check = l10n::check_button("This machine only");
-        row.append(&check);
-        let setting = std::rc::Rc::new(std::cell::Cell::new(false));
-        let refresh = {
-            let (key, value, check, touched, setting) = (
-                key.clone(),
-                value.clone(),
-                check.clone(),
-                touched.clone(),
-                setting.clone(),
-            );
-            move || {
-                let name = key.text();
-                let name = name.trim();
-                let risky = crate::personal_sync::risky_sync_env(name);
-                let active = if risky {
-                    true
-                } else if touched.get() {
-                    check.is_active()
-                } else {
-                    match &saved {
-                        Some(saved) if saved.key == name => saved.portable != Some(true),
-                        _ => crate::personal_sync::looks_machine_local(name, &value.text()),
-                    }
-                };
-                setting.set(true);
-                check.set_active(active);
-                setting.set(false);
-                check.set_sensitive(!risky);
-                check.set_tooltip_text(Some(&if risky {
-                    crate::i18n::tr("This variable changes how programs run, so it always stays on this machine.")
-                } else {
-                    crate::i18n::tr("Keep this value off your other machines.")
-                }));
+    let setting = std::rc::Rc::new(std::cell::Cell::new(false));
+    // The row's own handlers run this, so it holds the row's widgets weakly:
+    // strong references would keep the row, and any value typed into it,
+    // alive after the dialog closes.
+    let update: std::rc::Rc<dyn Fn()> = {
+        let (secret, source, value, reference_box, portable, key) = (
+            secret.downgrade(),
+            source.downgrade(),
+            value.downgrade(),
+            reference_box.downgrade(),
+            portable.downgrade(),
+            key.downgrade(),
+        );
+        let (keep_hint, portability_reason) =
+            (keep_hint.downgrade(), portability_reason.downgrade());
+        let (touched, setting) = (touched.clone(), setting.clone());
+        let stored = stored_as.is_some();
+        let shows_saved = std::cell::Cell::new(None);
+        std::rc::Rc::new(move || {
+            let (
+                Some(secret),
+                Some(source),
+                Some(value),
+                Some(reference_box),
+                Some(portable),
+                Some(key),
+                Some(keep_hint),
+                Some(portability_reason),
+            ) = (
+                secret.upgrade(),
+                source.upgrade(),
+                value.upgrade(),
+                reference_box.upgrade(),
+                portable.upgrade(),
+                key.upgrade(),
+                keep_hint.upgrade(),
+                portability_reason.upgrade(),
+            )
+            else {
+                return;
+            };
+            let vaulted = secret.is_active();
+            // The stored value follows the row, renamed or not, while it stays
+            // in the keychain.
+            let saved_now = stored && vaulted && source.selected() == 0;
+            if shows_saved.replace(Some(saved_now)) != Some(saved_now) {
+                l10n::bind_placeholder(
+                    &value,
+                    if saved_now {
+                        "•••• (saved)"
+                    } else {
+                        "value"
+                    },
+                );
             }
-        };
-        refresh();
-        let refresh = std::rc::Rc::new(refresh);
-        let on_key = refresh.clone();
-        key.connect_changed(move |_| on_key());
-        value.connect_changed(move |_| refresh());
-        let touched = touched.clone();
-        check.connect_toggled(move |_| {
-            if !setting.get() {
-                touched.set(true);
-            }
-        });
-        check
+            keep_hint.set_visible(stored && !vaulted && value.text().trim().is_empty());
+            source.set_visible(vaulted);
+            value.set_visibility(!vaulted);
+            value.set_visible(!vaulted || source.selected() == 0);
+            reference_box.set_visible(vaulted && source.selected() == 1);
+            portable.set_visible(!vaulted);
+            let risky = crate::personal_sync::risky_sync_env(key.text().trim());
+            let active = if risky {
+                false
+            } else if touched.get() {
+                portable.is_active()
+            } else if saved.key == key.text().trim() {
+                saved
+                    .unknown_fields
+                    .get("portable")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or_else(|| {
+                        !crate::personal_sync::looks_machine_local(key.text().trim(), &value.text())
+                    })
+            } else {
+                !crate::personal_sync::looks_machine_local(key.text().trim(), &value.text())
+            };
+            setting.set(true);
+            portable.set_active(active);
+            setting.set(false);
+            portable.set_sensitive(!risky);
+            portability_reason.set_visible(!vaulted && risky);
+        })
+    };
+    let chosen = touched.clone();
+    portable.connect_toggled(move |_| {
+        if !setting.get() {
+            touched.set(true);
+        }
     });
-    list.append(&row);
-    rows.borrow_mut().push(PlainEnvRow {
+    let on_secret = update.clone();
+    secret.connect_toggled(move |_| on_secret());
+    let on_source = update.clone();
+    source.connect_selected_notify(move |_| on_source());
+    let on_key = update.clone();
+    key.connect_changed(move |_| on_key());
+    let on_value = update.clone();
+    value.connect_changed(move |_| on_value());
+    update();
+    for field in [&key, &value, &reference] {
+        let feedback = feedback.clone();
+        field.connect_changed(move |_| feedback.set_visible(false));
+    }
+    let record = EditorEnvRow {
+        stored_as,
+        keep_hint: keep_hint_for_row,
+        portable_chosen: std::rc::Rc::new(move || saved_choice || chosen.get()),
         row: row.clone(),
-        key: key.clone(),
+        key,
         value,
-        local,
-        touched,
-    });
-    let list = list.clone();
-    let rows_for_remove = rows.clone();
+        secret,
+        source,
+        reference,
+        portable,
+    };
+    rows.borrow_mut().push(record);
+    list.append(&row);
+    // Weak for the same reason: the button is inside the row.
+    let (list, rows, row) = (
+        list.downgrade(),
+        std::rc::Rc::downgrade(rows),
+        row.downgrade(),
+    );
     remove.connect_clicked(move |_| {
-        list.remove(&row);
-        rows_for_remove.borrow_mut().retain(|r| r.row != row);
+        let Some(row) = row.upgrade() else {
+            return;
+        };
+        if let Some(list) = list.upgrade() {
+            list.remove(&row);
+        }
+        if let Some(rows) = rows.upgrade() {
+            rows.borrow_mut().retain(|r| r.row != row);
+        }
     });
-    key
 }
-
-fn collect_plain_env(rows: &PlainEnvRows) -> Vec<crate::registry_controller::PlainEnvEdit> {
+/// Each row as saved, with the name its keychain value was stored under.
+fn collect_editor_rows(rows: &EditorEnvRows) -> Vec<(Option<String>, crate::registry::EnvVar)> {
     rows.borrow()
         .iter()
-        .map(|row| crate::registry_controller::PlainEnvEdit {
-            key: row.key.text().to_string(),
-            value: row.value.text().to_string(),
-            local_only: row
-                .local
-                .as_ref()
-                .filter(|_| row.touched.get())
-                .map(gtk::CheckButton::is_active),
+        .map(|row| {
+            let mut unknown_fields = serde_json::Map::new();
+            if row.secret.is_active() && row.source.selected() == 1 {
+                unknown_fields.insert(
+                    "source".into(),
+                    serde_json::json!({"ref":row.reference.text().trim()}),
+                );
+            }
+            if !row.secret.is_active() && (row.portable_chosen)() {
+                unknown_fields.insert(
+                    "portable".into(),
+                    serde_json::json!(row.portable.is_active()),
+                );
+            }
+            let env = crate::registry::EnvVar {
+                key: row.key.text().trim().into(),
+                value: (!row.value.text().is_empty()).then(|| row.value.text().to_string()),
+                secret: row.secret.is_active(),
+                unknown_fields,
+            };
+            (row.stored_as.clone(), env)
         })
+        .filter(|(_, row)| !row.key.is_empty() || row.value.is_some())
+        .collect()
+}
+
+fn collect_editor_env(rows: &EditorEnvRows) -> Vec<crate::registry::EnvVar> {
+    collect_editor_rows(rows)
+        .into_iter()
+        .map(|(_, row)| row)
         .collect()
 }
 
@@ -14539,10 +14500,13 @@ mod tests {
                 inherit_env: None,
                 hide_prompts: None,
             };
-            crate::registry_controller::add_snippet_server_choices(
+            crate::registry_controller::save_server_editor_fields(
+                None,
                 fields,
                 Vec::new(),
                 &Default::default(),
+                None,
+                &[],
             )
             .unwrap();
             let saved = crate::registry::load().unwrap();
@@ -14556,16 +14520,21 @@ mod tests {
     }
 
     /// Closing Add server frees the pasted rows and the values typed into them:
-    /// no row handler may keep its own row, or the section, alive.
+    /// no row handler may keep its own row, or the notice, alive.
     #[test]
     #[ignore = "requires GTK; explicitly run in the isolated omabox session"]
     fn pasted_rows_are_freed_when_the_dialog_closes() {
         use super::*;
         gtk::init().expect("this regression runs inside omabox");
         let window = gtk::Window::new();
-        let section = pasted_env_section();
+        let feedback = gtk::Label::new(None);
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let rows: EditorEnvRows = Default::default();
+        let notice = PastedNotice::new(&rows);
         let shell = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        shell.append(&section.section);
+        shell.append(&notice.label);
+        shell.append(&list);
+        shell.append(&feedback);
         // Like the editor's Cancel button, a handler that keeps its window alive.
         let cancel = gtk::Button::new();
         {
@@ -14574,8 +14543,8 @@ mod tests {
         }
         shell.append(&cancel);
         window.set_child(Some(&shell));
-        section.release_on_close(&window);
-        section.fill(&[
+        release_editor_env_on_close(&window, &list, &rows);
+        let pasted = [
             crate::clients::SnippetEnvVar {
                 key: "API_KEY".into(),
                 value: Some("sk-live-SECRET42".into()),
@@ -14588,39 +14557,67 @@ mod tests {
                 key: "REGION".into(),
                 value: Some("eu".into()),
             },
-        ]);
+        ];
+        for env in &pasted {
+            editor_env_row(
+                &list,
+                &rows,
+                crate::registry::EnvVar {
+                    key: env.key.clone(),
+                    value: env.value.clone(),
+                    secret: env.key != "REGION",
+                    unknown_fields: Default::default(),
+                },
+                &feedback,
+                "",
+            );
+        }
+        notice.show_missing(&pasted);
         window.present();
+        assert!(notice.label.is_visible());
+        assert!(
+            notice.label.text().contains("TOKEN"),
+            "{}",
+            notice.label.text()
+        );
         // Use every handler once: rename, type, toggle and remove.
-        let (rows, value, key, removed) = {
-            let rows = section.rows.borrow();
+        let weak_rows = std::rc::Rc::downgrade(&rows);
+        let (value, key, removed) = {
+            let rows = rows.borrow();
             rows[1].key.set_text("TOKEN2");
             rows[1].value.set_text("typed-secret");
-            rows[0].keychain.set_active(false);
+            rows[0].secret.set_active(false);
             (
-                std::rc::Rc::downgrade(&section.rows),
                 rows[0].value.downgrade(),
                 rows[1].key.downgrade(),
                 rows[2].row.downgrade(),
             )
         };
+        // The renamed row no longer has a missing name.
+        assert!(!notice.label.is_visible());
         let remove = removed
             .upgrade()
+            .unwrap()
+            .first_child()
             .unwrap()
             .last_child()
             .and_downcast::<gtk::Button>()
             .unwrap();
         remove.emit_clicked();
         drop(remove);
-        assert_eq!(section.rows.borrow().len(), 2);
-        let missing = std::rc::Rc::downgrade(&section.missing);
-        // The editor's own handlers hold the section until it closes.
+        assert_eq!(rows.borrow().len(), 2);
+        let missing = std::rc::Rc::downgrade(&notice.missing);
+        // The editor's own handlers hold the rows until it closes.
         cancel.emit_clicked();
-        drop((section, cancel, shell, window));
+        drop((rows, notice, cancel, shell, list, feedback, window));
         let context = gtk::glib::MainContext::default();
         while context.pending() {
             context.iteration(false);
         }
-        assert!(rows.upgrade().is_none(), "the rows outlived the dialog");
+        assert!(
+            weak_rows.upgrade().is_none(),
+            "the rows outlived the dialog"
+        );
         assert!(
             missing.upgrade().is_none(),
             "the gap list outlived the dialog"
@@ -17378,6 +17375,98 @@ mod tests {
 
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn editor_rows_carry_their_stored_value_through_rename_and_untick() {
+        use super::*;
+        adw::init().unwrap();
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let rows: EditorEnvRows = Default::default();
+        let feedback = gtk::Label::new(None);
+        let env = |key: &str, value: Option<&str>, secret: bool| crate::registry::EnvVar {
+            key: key.into(),
+            value: value.map(str::to_string),
+            secret,
+            unknown_fields: Default::default(),
+        };
+        editor_env_row(
+            &list,
+            &rows,
+            env("GITHUB_TOKN", None, true),
+            &feedback,
+            "srv",
+        );
+        editor_env_row(
+            &list,
+            &rows,
+            env("REGION", Some("east"), false),
+            &feedback,
+            "srv",
+        );
+        let vaulted_at_open = ["GITHUB_TOKN".to_string()];
+        let changes = || {
+            let collected = collect_editor_rows(&rows);
+            crate::registry_controller::editor_secret_changes(
+                &vaulted_at_open,
+                &collected
+                    .iter()
+                    .map(
+                        |(stored_as, row)| crate::registry_controller::EditorSecretRow {
+                            stored_as: stored_as.as_deref(),
+                            row,
+                        },
+                    )
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let (key, value, secret, hint) = {
+            let rows = rows.borrow();
+            (
+                rows[0].key.clone(),
+                rows[0].value.clone(),
+                rows[0].secret.clone(),
+                rows[0].keep_hint.clone(),
+            )
+        };
+        let placeholder = || value.placeholder_text().map(|t| t.to_string());
+        assert_eq!(placeholder().as_deref(), Some("•••• (saved)"));
+        assert!(rows.borrow()[1].stored_as.is_none());
+        assert!(!hint.is_visible());
+
+        // Renamed with no new value: the stored value moves with it.
+        key.set_text("GITHUB_TOKEN");
+        assert_eq!(placeholder().as_deref(), Some("•••• (saved)"));
+        let (moved, blocked) = changes();
+        assert!(blocked.is_empty());
+        assert!(moved.removed.is_empty());
+        assert_eq!(
+            moved.renamed,
+            [("GITHUB_TOKN".to_string(), "GITHUB_TOKEN".to_string())]
+        );
+
+        // Unticked with nothing typed: the row says so and the save is blocked.
+        secret.set_active(false);
+        assert_eq!(placeholder().as_deref(), Some("value"));
+        assert!(hint.is_visible());
+        assert_eq!(changes().1, ["GITHUB_TOKN"]);
+
+        // A typed value replaces it, so the stored one may go.
+        value.set_text("visible");
+        assert!(!hint.is_visible());
+        let (typed, blocked) = changes();
+        assert!(blocked.is_empty());
+        assert_eq!(typed.removed, ["GITHUB_TOKN"]);
+
+        // A removed row deletes only its own stored value.
+        secret.set_active(true);
+        value.set_text("");
+        rows.borrow_mut().remove(0);
+        let (gone, blocked) = changes();
+        assert!(blocked.is_empty());
+        assert_eq!(gone.removed, ["GITHUB_TOKN"]);
+        assert!(gone.renamed.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn editor_validation_clears_feedback_and_keeps_test_result_outside_scroll() {
         use super::*;
         adw::init().unwrap();
@@ -17502,6 +17591,24 @@ mod tests {
             .clone();
         transport.set_selected(1);
         assert_eq!(timeout.placeholder_text().as_deref(), Some("30"));
+
+        // Credentials can be entered before the first save, as in React.
+        let env_names = |widgets: &[gtk::Widget]| {
+            widgets
+                .iter()
+                .filter_map(|w| w.downcast_ref::<gtk::Entry>())
+                .filter(|e| e.placeholder_text().as_deref() == Some("ENV_NAME"))
+                .count()
+        };
+        let rows_before = env_names(&all);
+        button("Add variable").emit_clicked();
+        let mut after = Vec::new();
+        widgets(editor.upcast_ref(), &mut after);
+        assert_eq!(
+            env_names(&after),
+            rows_before + 1,
+            "a new server takes environment variables and keys before its first save"
+        );
 
         // The URL error says what is wrong, as in React.
         let url = entry("https://example.com/mcp");
@@ -19229,6 +19336,9 @@ fn secret_reference_fields(
     ]);
     quiet_tooltips::guard_dropdown(&choice);
     l10n::bind_dropdown_choices(&choice, &["Paste a key", "From a password manager"]);
+    choice.update_property(&[gtk::accessible::Property::Label(&crate::i18n::tr(
+        "Credential source",
+    ))]);
     choice.set_selected(u32::from(existing.is_some()));
     let container = gtk::Box::new(gtk::Orientation::Vertical, 8);
     container.set_visible(existing.is_some());
@@ -19236,6 +19346,9 @@ fn secret_reference_fields(
     let names: Vec<_> = providers.iter().map(|p| p.name).collect();
     let provider = gtk::DropDown::from_strings(&names);
     quiet_tooltips::guard_dropdown(&provider);
+    provider.update_property(&[gtk::accessible::Property::Label(&crate::i18n::tr(
+        "Password manager",
+    ))]);
     provider.set_selected(
         existing
             .and_then(|r| providers.iter().position(|p| r.starts_with(p.scheme)))
@@ -19250,6 +19363,9 @@ fn secret_reference_fields(
         .placeholder_text(start.example)
         .build();
 
+    reference.update_property(&[gtk::accessible::Property::Label(&crate::i18n::tr(
+        "Credential reference",
+    ))]);
     let reference_for_provider = reference.clone();
     provider.connect_selected_notify(move |provider| {
         reference_for_provider.set_text("");

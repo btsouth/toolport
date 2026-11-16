@@ -140,6 +140,7 @@
   "{value1}Team": "{value1}團隊",
   "{value1}vaulted": "{value1} 已安全儲存",
   "•••• (saved)": "••••（儲存）",
+  "Enter a value, or leave it in the keychain.": "請輸入一個值，或將其保留在鑰匙圈中。",
   "•••••••• (saved)": "••••••••（儲存）",
   "•••••••• (set)": "••••••••（已設定）",
   "+{value1} more": "另有 {value1} 項",

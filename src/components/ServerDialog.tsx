@@ -1,6 +1,7 @@
 import { translate, useI18n, Trans } from "@/lib/i18n";
 import { envRowSyncs } from "@/lib/envRowSyncs";
 import { errorHeadline } from "@/lib/errors";
+import { needsValue, secretKeyChanges } from "@/lib/secretKeyChanges";
 import { secretReferenceReview } from "@/lib/secretRefs";
 import { SecretReferenceField } from "@/components/SecretReferenceField";
 import { useEffect, useRef, useState, type ReactNode } from "react";
@@ -143,16 +144,25 @@ export function ServerDialog({
       secret?: boolean;
       portable?: boolean;
       source?: { ref: string };
+      /** The name its value was stored under in the keychain when the
+       * dialog opened. A renamed row keeps that value. */
+      storedAs?: string;
     }[]
-  >(
-    initial?.env.map((e) => ({
-      key: e.key,
-      value: e.secret ? "" : (e.value ?? ""),
-      secret: e.secret,
-      source: e.source,
-      portable: e.portable,
-    })) ?? [],
-  );
+  >(() => rowsFromInitial());
+  // Rows for the server as saved. A keychain variable remembers the name its
+  // value is stored under, so renaming it keeps the value.
+  function rowsFromInitial() {
+    return (
+      initial?.env.map((e) => ({
+        storedAs: editId !== undefined && e.secret && !e.source ? e.key : undefined,
+        key: e.key,
+        value: e.secret ? "" : (e.value ?? ""),
+        secret: e.secret,
+        source: e.source,
+        portable: e.portable,
+      })) ?? []
+    );
+  }
   // Keys a paste brought in without a value (a `$TOKEN` it could not read, or a
   // key the config left empty). The notice above the rows names them until filled.
   const [pastedMissing, setPastedMissing] = useState<ReadonlySet<string>>(new Set());
@@ -231,15 +241,7 @@ export function ServerDialog({
             ? ""
             : String(initial.initializeTimeoutMs / 1000),
       });
-      setEnvRows(
-        initial?.env.map((e) => ({
-          key: e.key,
-          value: e.secret ? "" : (e.value ?? ""),
-          secret: e.secret,
-          source: e.source,
-          portable: e.portable,
-        })) ?? [],
-      );
+      setEnvRows(rowsFromInitial());
       setLaunch(initial?.launch ?? null);
       setLaunchValues(
         Object.fromEntries(
@@ -449,6 +451,9 @@ export function ServerDialog({
     errors.push(message);
     visibleErrors.push(message);
   }
+  // A stored keychain value is never dropped without its replacement.
+  if (envRows.some(needsValue))
+    errors.push(t("Enter a value, or leave it in the keychain."));
   const ownName = editing
     ? (initial?.name ?? partialEdit?.name)?.trim().toLowerCase()
     : undefined;
@@ -504,7 +509,21 @@ export function ServerDialog({
     const wasEditing = editing;
     setBusy(true);
     try {
-      let result = wasEditing ? await updateServer(entry) : await addServer(entry);
+      // Keychain values the user removed in this dialog, or replaced with a
+      // plain value or a password manager reference, are deleted with the
+      // update; a renamed variable keeps its value under the new name.
+      const vaultedAtOpen = wasEditing
+        ? (initial?.env ?? [])
+            .filter((old) => old.secret && !old.source)
+            .map((old) => old.key)
+        : [];
+      const changes = secretKeyChanges(
+        vaultedAtOpen,
+        envRows.filter((row) => row.key.trim() || row.value),
+      );
+      let result = wasEditing
+        ? await updateServer(entry, changes.removed, changes.renamed)
+        : await addServer(entry);
       // Vault any values the user entered now. setSecret keys by server id. For a
       // new server, add_server appends it, so it's the last entry - resolving by
       // name would pick the wrong one if two servers share a name.
@@ -1023,7 +1042,7 @@ export function ServerDialog({
                   <Input
                     type={row.secret === false ? "text" : "password"}
                     placeholder={
-                      initial?.env.some((e) => e.key === row.key)
+                      row.storedAs !== undefined && row.secret !== false
                         ? t("•••• (saved)")
                         : t("value")
                     }
@@ -1089,6 +1108,11 @@ export function ServerDialog({
                 >
                   <X className="size-4" />
                 </Button>
+                {needsValue(row) && (
+                  <p role="alert" className="w-full text-meta text-destructive">
+                    {t("Enter a value, or leave it in the keychain.")}
+                  </p>
+                )}
               </div>
             ))}
             <Button

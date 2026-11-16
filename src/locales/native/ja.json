@@ -1214,5 +1214,12 @@
   "Use an http:// or https:// URL for a remote server.": "リモートサーバーには http:// または https:// の URL を使ってください。",
   "Use stdio, http or sse after -t.": "-t の後ろには stdio、http、sse のいずれかを指定してください。",
   "Add a value for {value0} before saving. The pasted config did not include it.": "保存する前に {value0} の値を追加してください。貼り付けた設定には含まれていませんでした。",
-  "Use each variable name once. Rename or remove the second {value0}.": "変数名はそれぞれ 1 回だけ使ってください。2 つ目の {value0} の名前を変えるか、削除してください。"
+  "Use each variable name once. Rename or remove the second {value0}.": "変数名はそれぞれ 1 回だけ使ってください。2 つ目の {value0} の名前を変えるか、削除してください。",
+  "API keys and other secrets are stored in your OS keychain, never in the config.": "API キーなどのシークレットは OS のキーチェーンに保存され、設定には保存されません。",
+  "Add variable": "変数を追加",
+  "Environment variable name": "環境変数名",
+  "Environment variable value": "環境変数の値",
+  "Credential source": "認証情報の取得元",
+  "Credential reference": "認証情報の参照",
+  "Servers changed while this editor was open. Nothing was saved. Select Save again to apply your changes.": "このエディターを開いている間にサーバーが変更されました。何も保存されていません。変更を反映するには、もう一度［保存］を選択してください。"
 }
