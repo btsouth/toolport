@@ -2469,6 +2469,14 @@ fn owned(text: Cow<'_, str>) -> Option<String> {
 type Scope = Option<PathBuf>;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many distinct values this process has learned. It moves when a value is
+/// registered that the redactor did not know, so text screened before it moved
+/// (a downstream's cached lists, a built `tools/list`) may need screening again.
+pub fn generation() -> u64 {
+    GENERATION.load(Ordering::Acquire)
+}
 type Registries = std::collections::HashMap<Scope, Registry>;
 static REGISTRY: RwLock<Option<Registries>> = RwLock::new(None);
 
@@ -2818,6 +2826,9 @@ fn add(scope: &Scope, id: &str, name: &str, value: &str) -> bool {
     match index {
         Ok(index) => {
             cover(scope, index);
+            // After the cover, so a reader that sees the new generation also
+            // redacts the new value.
+            GENERATION.fetch_add(1, Ordering::AcqRel);
             wake_builder();
             true
         }

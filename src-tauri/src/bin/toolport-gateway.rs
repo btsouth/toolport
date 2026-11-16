@@ -7934,6 +7934,9 @@ struct ToolSurfaceKey {
     apps: bool,
     relays_apps: bool,
     app_servers: Vec<String>,
+    /// [`conduit_lib::secret_redact::generation`] when built: a value learned
+    /// since must not be served from a surface screened before it.
+    redaction: u64,
 }
 
 struct ToolSurfaceEntry {
@@ -8058,6 +8061,7 @@ fn cached_tool_surfaces(
         apps,
         relays_apps,
         app_servers,
+        redaction: conduit_lib::secret_redact::generation(),
     };
     // Request-local snapshots have no future hit. Empty snapshots read a live
     // router, so its identity alone cannot describe their changing contents.
@@ -8169,10 +8173,14 @@ fn build_tool_surfaces(
         .collect();
     let relays_apps = key.relays_apps;
     let hints = ResultSizeHints::new(reg, allowed);
+    // Lists are screened when fetched; a value learned since is redacted here
+    // (whole forms, so a name hit is a plain marker) until the refresh that
+    // re-screens the server's own list, and rebuilds its aliases, lands.
     let neutralized = |tool: &Value| {
         let mut tool = tool.clone();
         neutralize_listed_tool(&mut tool);
         hints.apply(&mut tool, router);
+        conduit_lib::secret_redact::redact_definition(&mut tool);
         tool
     };
     let mut floor = full_tool_floor(key.code_mode, key.full_fallback);
@@ -8208,6 +8216,9 @@ fn build_tool_surfaces(
             .filter(|_| mode == DiscoveryMode::Grouped),
     );
     hints.apply_all(&mut floor, router);
+    for tool in &mut floor {
+        conduit_lib::secret_redact::redact_definition(tool);
+    }
     let apps = scoped
         .iter()
         .copied()
@@ -12827,6 +12838,20 @@ fn adopt_reconnected_servers(
     glog(&msg);
 }
 
+/// Whether any cached downstream list still holds a value the redactor knows
+/// (it was screened before that value was learned).
+fn lists_hold_unscreened_values(router: &Router) -> bool {
+    let unscreened = |items: Vec<Value>| {
+        items
+            .into_iter()
+            .any(|mut item| conduit_lib::secret_redact::redact_definition(&mut item))
+    };
+    unscreened(router.aggregated_tools())
+        || unscreened(router.aggregated_resources())
+        || unscreened(router.aggregated_resource_templates())
+        || unscreened(router.aggregated_prompts())
+}
+
 /// One iteration of the registry watcher (no sleep).
 ///
 /// Quarantine reconciliation runs **before** the early-continue on
@@ -12892,10 +12917,28 @@ fn watch_tick(
         host.invalidate_root_views();
         host.invalidate_tool_scope_views();
     }
+    // A value learned since the last tick may sit in lists screened before it.
+    // Then every connected server's lists are fetched again, as if each had
+    // announced a change: only that re-screens the raw definitions and keeps
+    // their aliases routable. One refresh per tick, however many values came.
+    let redaction = conduit_lib::secret_redact::generation();
+    let rescreen = if host.redaction_seen.swap(redaction, Ordering::SeqCst) != redaction {
+        let live = router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if lists_hold_unscreened_values(&live) {
+            downstream::change::TOOLS | downstream::change::RESOURCES | downstream::change::PROMPTS
+        } else {
+            0
+        }
+    } else {
+        0
+    };
     // A live downstream server that changed its own tool set (sent
     // tools/list_changed) sets this. Swap before acting so a notification
     // arriving mid-refresh is caught on the next tick rather than lost.
-    let downstream_notified = downstream_dirty.swap(0, Ordering::SeqCst);
+    let downstream_notified = downstream_dirty.swap(0, Ordering::SeqCst) | rescreen;
     let cache_expired = {
         let live = router
             .lock()
@@ -13446,6 +13489,8 @@ struct HostState {
     /// that profile's allowlist changes.
     tool_scope_views: Mutex<ToolScopeViews>,
     tool_surfaces: Mutex<ToolSurfaceCache>,
+    /// The redaction generation the last watch tick acted on.
+    redaction_seen: AtomicU64,
     /// Root-dependent downstreams are keyed by their resolved launch parameters.
     /// Every view shares the host router's ordinary slots and any rooted slot
     /// whose LaunchKey is equal, even when another root view is composed later.
@@ -23225,6 +23270,7 @@ fn gateway_main(cli_args: Vec<String>) {
         router: Arc::clone(&router),
         tool_scope_views: Mutex::new(ToolScopeViews::default()),
         tool_surfaces: Mutex::new(ToolSurfaceCache::default()),
+        redaction_seen: AtomicU64::new(0),
         root_launch_pool: Mutex::new(RootLaunchPool::default()),
         cached_tools: Arc::clone(&cached_tools),
         ready: Arc::clone(&ready),
@@ -31234,6 +31280,7 @@ mod tests {
             router,
             tool_scope_views: Mutex::new(ToolScopeViews::default()),
             tool_surfaces: Mutex::new(ToolSurfaceCache::default()),
+            redaction_seen: AtomicU64::new(0),
             root_launch_pool: Mutex::new(RootLaunchPool::default()),
             cached_tools,
             ready: Arc::new(AtomicBool::new(true)),
@@ -31286,6 +31333,7 @@ mod tests {
                 router: Arc::new(Mutex::new(Arc::new(Router::new()))),
                 tool_scope_views: Mutex::new(ToolScopeViews::default()),
                 tool_surfaces: Mutex::new(ToolSurfaceCache::default()),
+                redaction_seen: AtomicU64::new(0),
                 root_launch_pool: Mutex::new(RootLaunchPool::default()),
                 cached_tools: Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default()))),
                 ready: Arc::new(AtomicBool::new(true)),
