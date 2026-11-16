@@ -139,8 +139,12 @@ impl HealthCache {
                     reason == ProbeReason::Refresh
                         || cached.fingerprint != fingerprint
                         || (reason == ProbeReason::Stale
-                            && now.saturating_duration_since(cached.checked_at)
-                                >= HEALTH_STALE_AFTER)
+                            && (now.saturating_duration_since(cached.checked_at)
+                                >= HEALTH_STALE_AFTER
+                                // "Keyring locked" says nothing about the
+                                // server, and may only mean the keyring was
+                                // busy: check again whenever the page opens.
+                                || cached.result.keyring_locked))
                 }
             };
             if let Some(flight) = self.in_flight.get_mut(id) {
@@ -411,6 +415,36 @@ mod tests {
                 ProbeOutcome::Discard => panic!("nothing was removed"),
             }
         }
+    }
+
+    /// Failure mode: a check that found the keyring locked (or only busy)
+    /// stayed "Keyring locked" for five minutes of page opens, after the
+    /// keyring was unlocked, unless the user chose Retry.
+    #[test]
+    fn a_keyring_locked_result_is_checked_again_when_the_page_opens() {
+        let mut cache = HealthCache::default();
+        let now = Instant::now();
+        let first = cache.plan(&[("a", 1), ("b", 1)], ProbeReason::ConfigChanged, now);
+        for ticket in first {
+            let mut result = ok(&ticket.server_id);
+            if ticket.server_id == "a" {
+                result.ok = false;
+                result.keyring_locked = true;
+            }
+            assert_eq!(cache.complete(&ticket, result, now), ProbeOutcome::Apply);
+        }
+        let soon = now + Duration::from_secs(1);
+        let again = cache.plan(&[("a", 1), ("b", 1)], ProbeReason::Stale, soon);
+        assert_eq!(
+            ids(&again),
+            ["a"],
+            "only the locked result is checked again"
+        );
+        assert!(!again[0].interactive, "the page's own check never asks");
+        // Re-renders and config reloads still never probe it on their own.
+        assert!(cache
+            .plan(&[("a", 1), ("b", 1)], ProbeReason::ConfigChanged, soon)
+            .is_empty());
     }
 
     #[test]
