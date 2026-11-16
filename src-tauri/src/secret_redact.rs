@@ -4344,6 +4344,10 @@ pub fn scrub_data_dir(dir: &Path) -> std::io::Result<usize> {
 /// counted by [`crate::secrets`].
 pub static RETIRED_PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// What the Windows stderr relay covers. Windows has no `dup2` for handles, so
+/// two writers cannot be moved onto the relay once they hold the original.
+pub const WINDOWS_RELAY_COVERAGE: &str = "stderr is redacted for this process's standard error handle, its C runtime and the servers it starts. Two cases are not covered: a native library with its own C runtime writes through its own stderr, and code that saved the standard error handle before redaction started keeps writing to the original. Windows cannot redirect either one afterwards.";
+
 /// Lines for `toolport_status` about redaction. A secret under
 /// [`SHORT_SECRET_CHARS`] characters is only matched as a whole token, so a
 /// copy of it inside a longer word would still be written; it is named (never
@@ -4357,6 +4361,9 @@ pub fn status_notes() -> Vec<String> {
         crate::daemon_log::StderrRedaction::Unprotected { reason } => notes.push(format!(
             "stderr is not redacted: {reason}. Restart Toolport; until then a secret a server prints to stderr may reach the terminal or the client's log."
         )),
+        crate::daemon_log::StderrRedaction::Relayed if cfg!(windows) => {
+            notes.push(WINDOWS_RELAY_COVERAGE.to_string())
+        }
         _ => {}
     }
     if current().is_some_and(|layers| layers.0.iter().any(|m| m.is_broken())) {
