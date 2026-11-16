@@ -1209,5 +1209,7 @@
   "Showing {value0} of the latest {value1} entries.": "显示最新 {value1} 条记录中的 {value0} 条。",
   "Showing 1 matching entry from the latest {value1}.": "显示最新 {value1} 条记录中匹配的 1 条。",
   "Show all {value0} entries": "显示全部 {value0} 条记录",
-  "Import as {value0}": "导入为 {value0}"
+  "Import as {value0}": "导入为 {value0}",
+  "Open the review to check whether this is already in Toolport.": "打开审核，检查它是否已在 Toolport 中。",
+  "{value0} is already in Toolport.": "{value0} 已在 Toolport 中。"
 }

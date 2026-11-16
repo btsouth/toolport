@@ -5276,15 +5276,38 @@ API_KEY = "synthetic-first-origin"
         ));
         // Detection never reads the vault: what only the vault could confirm is neither
         // offered nor claimed as in Toolport.
-        let ((importable, managed), reads) = crate::secrets::tests::vault_reads_during(|| {
-            (
-                names(clients::importable_servers(&client, &registry)),
-                clients::managed_server_names(&client, &registry),
-            )
-        });
+        let ((importable, managed, unconfirmed), reads) =
+            crate::secrets::tests::vault_reads_during(|| {
+                (
+                    names(clients::importable_servers(&client, &registry)),
+                    clients::managed_server_names(&client, &registry),
+                    clients::unconfirmed_server_slots(&client, &registry),
+                )
+            });
         assert_eq!(reads, Vec::<String>::new());
         assert_eq!(importable, ["new-one"]);
         assert!(managed.is_empty());
+        // They are listed for review under their own names, not dropped.
+        let mut listed = unconfirmed
+            .iter()
+            .map(|(_, server, _)| server.name.as_str())
+            .collect::<Vec<_>>();
+        listed.sort_unstable();
+        assert_eq!(
+            listed,
+            ["arg-same", "url-changed", "url-same", "url-unknown"]
+        );
+        let review = preview_client_imports_for("claude-code").unwrap();
+        for (_, server, connection) in &unconfirmed {
+            let item = review.iter().find(|item| &item.connection == connection);
+            // Review lists what still differs and leaves out what is already there.
+            assert_eq!(
+                item.is_some(),
+                server.name == "url-changed" || server.name == "url-unknown",
+                "{}",
+                server.name
+            );
+        }
         for name in ["url-same", "arg-same", "url-changed"] {
             let server = client.servers.iter().find(|s| s.name == name).unwrap();
             assert!(matches!(

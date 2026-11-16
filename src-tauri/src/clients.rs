@@ -4215,15 +4215,33 @@ pub fn importable_server_slots(
     client: &DetectedClient,
     registry: &crate::registry::Registry,
 ) -> Vec<(usize, McpServer, String)> {
+    server_slots(client, registry, false)
+}
+
+/// The client's servers that only the keychain could match to one in Toolport, under
+/// their own names, with the same index and connection id fields as
+/// [`importable_server_slots`]. Detection does not read the keychain; review does.
+pub fn unconfirmed_server_slots(
+    client: &DetectedClient,
+    registry: &crate::registry::Registry,
+) -> Vec<(usize, McpServer, String)> {
+    server_slots(client, registry, true)
+}
+
+fn server_slots(
+    client: &DetectedClient,
+    registry: &crate::registry::Registry,
+    unconfirmed: bool,
+) -> Vec<(usize, McpServer, String)> {
     use crate::registry_controller::{import_connection_key, server_from_detected};
-    // Detection never reads the vault: a server only it could confirm is left out.
+    // Detection never reads the vault: a server only it could confirm is unconfirmed.
     let names = crate::registry_controller::import_candidates(
         std::slice::from_ref(client),
         registry,
         crate::registry_controller::Confirm::VaultFree,
     )
     .into_iter()
-    .filter(|c| c.unknown.is_none())
+    .filter(|c| c.unknown.is_some() == unconfirmed)
     .map(|c| (import_connection_key(&c.entry), c.name))
     .collect::<std::collections::HashMap<_, _>>();
     let mut seen = std::collections::HashSet::new();

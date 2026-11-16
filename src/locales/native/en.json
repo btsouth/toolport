@@ -1209,5 +1209,7 @@
   "Showing {value0} of the latest {value1} entries.": "Showing {value0} of the latest {value1} entries.",
   "Showing 1 matching entry from the latest {value1}.": "Showing 1 matching entry from the latest {value1}.",
   "Show all {value0} entries": "Show all {value0} entries",
-  "Import as {value0}": "Import as {value0}"
+  "Import as {value0}": "Import as {value0}",
+  "Open the review to check whether this is already in Toolport.": "Open the review to check whether this is already in Toolport.",
+  "{value0} is already in Toolport.": "{value0} is already in Toolport."
 }

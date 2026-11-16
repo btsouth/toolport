@@ -1209,5 +1209,7 @@
   "Showing {value0} of the latest {value1} entries.": "Affichage de {value0} des {value1} entrées les plus récentes.",
   "Showing 1 matching entry from the latest {value1}.": "Affichage de 1 entrée correspondante parmi les {value1} plus récentes.",
   "Show all {value0} entries": "Afficher les {value0} entrées",
-  "Import as {value0}": "Importer sous le nom {value0}"
+  "Import as {value0}": "Importer sous le nom {value0}",
+  "Open the review to check whether this is already in Toolport.": "Ouvrez l'examen pour vérifier si ce serveur est déjà dans Toolport.",
+  "{value0} is already in Toolport.": "{value0} est déjà dans Toolport."
 }
