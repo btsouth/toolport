@@ -2352,6 +2352,12 @@ fn prompts_allowed() -> bool {
     WITHOUT_PROMPTS.with(|depth| depth.get() == 0)
 }
 
+/// Inside [`without_prompts`] on this thread, so work it hands to another thread can
+/// carry it there.
+pub(crate) fn prompts_blocked() -> bool {
+    !prompts_allowed()
+}
+
 /// Inside [`without_prompts`], on a store whose ordinary reads can ask to
 /// unlock (Secret Service). macOS, Windows and the file vault never ask, so
 /// their reads keep their usual path.

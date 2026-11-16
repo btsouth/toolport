@@ -418,11 +418,17 @@ export function connectAllOutcome(
   notConnectedIds: string[],
 ): { connected: number; total: number; notConnected: string[]; leftOut: string[] } {
   const byId = (id: string) => clients.find((client) => client.id === id);
-  const connected = connectedIds.reduce(
+  // A row the rescan shows connected counts as connected, even when its step reported a
+  // failure after the connect took effect.
+  const connectedNow = (id: string) => byId(id)?.gatewayInstalled === true;
+  const connectedRows = [...connectedIds, ...notConnectedIds.filter(connectedNow)];
+  const connected = connectedRows.reduce(
     (sum, id) => sum + t3CodeEnabledNames(byId(id)).length,
     0,
   );
-  const notConnected = notConnectedIds.flatMap((id) => t3CodeEnabledNames(byId(id)));
+  const notConnected = notConnectedIds
+    .filter((id) => !connectedNow(id))
+    .flatMap((id) => t3CodeEnabledNames(byId(id)));
   const batchIds = new Set([...connectedIds, ...notConnectedIds]);
   return {
     connected,
@@ -450,7 +456,13 @@ export function connectAllSummary({
   stopped: boolean;
   notConnected: string[];
   leftOut?: string[];
-}): { text: string; title: string; detail: string; success: boolean } {
+}): {
+  text: string;
+  title: string;
+  detail: string;
+  success: boolean;
+  tone: "success" | "warning" | "info";
+} {
   const parts = [
     stopped && translate("Connect all stopped."),
     translate(
@@ -465,10 +477,14 @@ export function connectAllSummary({
   ].filter(Boolean) as string[];
   // The card's title is the first sentence; the rest is its detail. GTK splits the same.
   const [title, ...rest] = parts;
+  const success = !stopped && notConnected.length === 0 && leftOut.length === 0;
   return {
     text: parts.join(" "),
     title,
     detail: rest.join(" "),
-    success: !stopped && notConnected.length === 0 && leftOut.length === 0,
+    success,
+    // Neutral when nothing was left to count (every row gone or off by the end), not a
+    // green "0 of 0". GTK picks the same tone.
+    tone: success ? (total === 0 ? "info" : "success") : "warning",
   };
 }

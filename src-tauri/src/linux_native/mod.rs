@@ -3276,20 +3276,13 @@ impl ClientPage {
         let batch = self.pending_batch.borrow_mut().take();
         if let Some(outcome) = &batch {
             // Built from this scan, so it counts what exists and is on now.
-            let (title, detail, success) = client_rows::t3_code_batch_result(&clients, outcome);
+            let (title, detail, tone) = client_rows::t3_code_batch_result(&clients, outcome);
             // Kept until dismissed either way, as React keeps it: a success card for a
-            // full success, a warning card when something was not connected.
+            // full success, a warning card when something was not connected, a neutral
+            // one when nothing was left to count.
             self.cancel_feedback_timer();
             self.feedback.set_visible(false);
-            self.lasting_card.show(
-                if success {
-                    StatusTone::Success
-                } else {
-                    StatusTone::Warning
-                },
-                &title,
-                &detail,
-            );
+            self.lasting_card.show(tone, &title, &detail);
             self.lasting.set_visible(true);
         } else if let Some(confirmation) = self.pending_confirmation.borrow_mut().take() {
             self.show_confirmation(&confirmation);

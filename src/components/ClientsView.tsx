@@ -11,6 +11,7 @@ import {
   ChevronDown,
   ChevronRight,
   Download,
+  Info,
   Layers,
   MonitorCog,
   Puzzle,
@@ -669,18 +670,18 @@ export function ClientsView({
   const [allSummary, setAllSummary] = useState<{
     title: string;
     detail: string;
-    success: boolean;
+    tone: "success" | "warning" | "info";
   } | null>(null);
   useEffect(() => {
     if (!summaryDue || summaryShown.current === summaryDue) return;
     summaryShown.current = summaryDue;
-    const { title, detail, success } = connectAllSummary({
+    const { title, detail, tone } = connectAllSummary({
       ...connectAllOutcome(clients, summaryDue.connectedIds, summaryDue.notConnectedIds),
       stopped: summaryDue.stopped,
     });
     // On the page until dismissed, as GTK shows it and as Clients keeps its restart
     // reminder: a toast fades before a long list of what was not connected is read.
-    setAllSummary({ title, detail, success });
+    setAllSummary({ title, detail, tone });
   }, [summaryDue, clients]);
   // When the batch closes, focus goes back to Connect all, or to the T3 Code card once
   // the button is gone, never to the page start.
@@ -786,8 +787,16 @@ export function ClientsView({
         <StatusCard
           role="status"
           testId="connect-all-summary"
-          variant={allSummary.success ? "success" : "warning"}
-          icon={allSummary.success ? <Check /> : <TriangleAlert />}
+          variant={allSummary.tone}
+          icon={
+            allSummary.tone === "warning" ? (
+              <TriangleAlert />
+            ) : allSummary.tone === "success" ? (
+              <Check />
+            ) : (
+              <Info />
+            )
+          }
           title={allSummary.title}
           detail={
             allSummary.detail && (
@@ -886,6 +895,8 @@ export function ClientsView({
           key={`${batch.index}:${batchTarget.id}`}
           clientId={batchTarget.id}
           clientName={batchTarget.name}
+          // The access saved for the row, as its own Connect keeps it.
+          profile={registry?.clientScopes?.[batchTarget.id] || undefined}
           step={t("Step {index} of {total}: {names}", {
             index: batch.index + 1,
             total: batch.targets.length,

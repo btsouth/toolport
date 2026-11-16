@@ -27,7 +27,7 @@ pub(crate) fn noninteractive<T>(f: impl FnOnce() -> T) -> T {
     crate::secrets::without_prompts(f)
 }
 
-fn is_noninteractive() -> bool {
+pub(crate) fn is_noninteractive() -> bool {
     NONINTERACTIVE.with(|depth| depth.get() > 0)
 }
 

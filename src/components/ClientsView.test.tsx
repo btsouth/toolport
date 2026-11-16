@@ -51,7 +51,7 @@ vi.mock("sonner", () => ({
 }));
 // A summary that lists what was not connected stays until it is dismissed.
 /** Connect all's summary on the page, which stays until dismissed as GTK's does. */
-async function connectAllSummary(tone: "success" | "warning") {
+async function connectAllSummary(tone: "success" | "warning" | "info") {
   const summary = await screen.findByTestId("connect-all-summary");
   // Spec §10: a status card in the outcome's tone, its first sentence as the title.
   expect(summary).toHaveAttribute("data-slot", "status-card");
@@ -1443,6 +1443,141 @@ describe("ClientsView", () => {
       await userEvent.click(await screen.findByRole("button", { name: "Done" }));
       expect(vi.mocked(migrateClient).mock.calls[2]).toHaveLength(5);
       vi.mocked(keyringLockedAfter).mockResolvedValue(false);
+    });
+
+    it("connects each step with the access saved for its row", async () => {
+      mockConnect();
+      render(
+        <ClientsView
+          clients={[client({ id: "aider", name: "Aider", t3Code: [on("One")] })]}
+          registry={
+            {
+              servers: [],
+              profiles: [{ id: "work", name: "Work" }],
+              clientScopes: { aider: "work" },
+            } as never
+          }
+          onSelectClient={vi.fn()}
+          onChanged={vi.fn(async () => {})}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Connect to Toolport" }),
+      );
+      await screen.findByRole("button", { name: "Done" });
+      expect(vi.mocked(migrateClient).mock.calls[0][1]).toBe("work");
+    });
+
+    it("decides the keyring question before Skip can move on", async () => {
+      mockConnect();
+      vi.mocked(migrateClient).mockRejectedValueOnce("Saved credential recovery: Locked");
+      let answer: (locked: boolean) => void = () => {};
+      vi.mocked(keyringLockedAfter).mockImplementation(
+        () =>
+          new Promise<boolean>((resolve) => {
+            answer = resolve;
+          }),
+      );
+      render(
+        <ClientsView
+          clients={[
+            client({ id: "aider", name: "Aider", t3Code: [on("One")] }),
+            client({ id: "codex", name: "Codex", t3Code: [on("Two")] }),
+          ]}
+          registry={null}
+          onSelectClient={vi.fn()}
+          onChanged={vi.fn(async () => {})}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Connect to Toolport" }),
+      );
+      await waitFor(() => expect(keyringLockedAfter).toHaveBeenCalled());
+      // No error, so no Skip, while the check is still out.
+      expect(screen.queryByRole("button", { name: "Skip" })).not.toBeInTheDocument();
+      await act(async () => {
+        answer(true);
+      });
+      expect(await screen.findByText("Saved credential recovery: Locked")).toBeVisible();
+      await userEvent.click(screen.getByRole("button", { name: "Skip" }));
+      expect(await screen.findByText("Review and connect Codex")).toBeVisible();
+      expect(vi.mocked(previewClientSetup).mock.calls.at(-1)).toEqual(["codex", true]);
+      vi.mocked(keyringLockedAfter).mockReset();
+      vi.mocked(keyringLockedAfter).mockResolvedValue(false);
+    });
+
+    it("lets the connect after a Retry of an unreadable quiet step ask, as GTK does", async () => {
+      mockConnect();
+      vi.mocked(migrateClient).mockRejectedValueOnce("Saved credential recovery: Locked");
+      vi.mocked(keyringLockedAfter).mockResolvedValue(true);
+      render(
+        <ClientsView
+          clients={[
+            client({ id: "aider", name: "Aider", t3Code: [on("One")] }),
+            client({ id: "codex", name: "Codex", t3Code: [on("Two")] }),
+          ]}
+          registry={null}
+          onSelectClient={vi.fn()}
+          onChanged={vi.fn(async () => {})}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Connect to Toolport" }),
+      );
+      expect(await screen.findByText("Saved credential recovery: Locked")).toBeVisible();
+      vi.mocked(previewClientSetup).mockRejectedValueOnce("unreadable");
+      await userEvent.click(screen.getByRole("button", { name: "Skip" }));
+      expect(await screen.findByText("unreadable")).toBeVisible();
+      expect(vi.mocked(previewClientSetup).mock.calls.at(-1)).toEqual(["codex", true]);
+      await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Connect to Toolport" }),
+      );
+      await screen.findByRole("button", { name: "Done" });
+      expect(vi.mocked(previewClientSetup).mock.calls.at(-1)).toEqual(["codex"]);
+      expect(vi.mocked(migrateClient).mock.calls.at(-1)).toHaveLength(5);
+      vi.mocked(keyringLockedAfter).mockResolvedValue(false);
+    });
+
+    it("counts a row the rescan shows connected, and is neutral when nothing is left", async () => {
+      for (const [after, tone, text] of [
+        [{ gatewayInstalled: true }, "success", "Connected 1 of 1 T3 Code instance."],
+        [{ t3Code: [] }, "info", "Connected 0 of 0 T3 Code instances."],
+      ] as [Partial<DetectedClient>, "success" | "info", string][]) {
+        mockConnect();
+        vi.mocked(migrateClient).mockRejectedValueOnce("Reload failed");
+        const props = {
+          registry: null,
+          onSelectClient: vi.fn(),
+          onChanged: vi.fn(async () => {}),
+        };
+        const { rerender, unmount } = render(
+          <ClientsView
+            clients={[client({ id: "aider", name: "Aider", t3Code: [on("One")] })]}
+            {...props}
+          />,
+        );
+        await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+        await userEvent.click(
+          await screen.findByRole("button", { name: "Connect to Toolport" }),
+        );
+        expect(await screen.findByText("Reload failed")).toBeVisible();
+        // The rescan the step's failure leaves behind.
+        rerender(
+          <ClientsView
+            clients={[
+              client({ id: "aider", name: "Aider", t3Code: [on("One")], ...after }),
+            ]}
+            {...props}
+          />,
+        );
+        await userEvent.click(screen.getByRole("button", { name: "Skip" }));
+        expect(await connectAllSummary(tone)).toBe(text);
+        unmount();
+      }
     });
 
     it("finishes when the last step is skipped after its config could not be read", async () => {

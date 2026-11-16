@@ -86,11 +86,15 @@ export function ConnectReviewDialog({
   }, [result, error, review]);
   // A step's first try follows the batch; Retry is the user's own and may ask.
   const quietFirst = useRef(keyringQuiet);
-  const noteFailure = (message: string) => {
+  // Answered before the error (and its Skip) shows, so the next step is already quiet
+  // when Skip moves on, as GTK records it before showing the error.
+  const noteFailure = async (message: string) => {
     if (!onKeyringLocked) return;
-    void keyringLockedAfter(message).then((locked) => {
-      if (locked) onKeyringLocked();
-    });
+    try {
+      if (await keyringLockedAfter(message)) onKeyringLocked();
+    } catch {
+      // Unknown: the next step keeps the batch's current mode.
+    }
   };
   useEffect(() => {
     let active = true;
@@ -99,10 +103,10 @@ export function ConnectReviewDialog({
       .then((r) => {
         if (active) setReview(r);
       })
-      .catch((e) => {
+      .catch(async (e) => {
         if (!active) return;
-        setError(String(e));
-        noteFailure(String(e));
+        await noteFailure(String(e));
+        if (active) setError(String(e));
       });
     return () => {
       active = false;
@@ -133,8 +137,8 @@ export function ConnectReviewDialog({
       setResult(next);
       onConnected(next.registry);
     } catch (e) {
+      await noteFailure(String(e));
       setError(String(e));
-      noteFailure(String(e));
     } finally {
       setBusy(false);
     }
@@ -259,6 +263,9 @@ export function ConnectReviewDialog({
                   ref={primary}
                   onClick={() => {
                     setError("");
+                    // The user's own Retry may ask, here and in the connect after it,
+                    // as GTK's.
+                    quietFirst.current = false;
                     setAttempt(attempt + 1);
                   }}
                 >

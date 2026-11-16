@@ -330,6 +330,7 @@ describe("connectAllSummary", () => {
       title: "Connected 3 of 3 T3 Code instances.",
       detail: "",
       success: true,
+      tone: "success",
     });
     expect(
       connectAllSummary({ connected: 1, total: 1, stopped: false, notConnected: [] }),
@@ -338,6 +339,7 @@ describe("connectAllSummary", () => {
       title: "Connected 1 of 1 T3 Code instance.",
       detail: "",
       success: true,
+      tone: "success",
     });
   });
 
@@ -355,6 +357,7 @@ describe("connectAllSummary", () => {
       title: "Connected 1 of 1 T3 Code instance.",
       detail: "F uses Kiro, which isn't installed. Install Kiro, then connect it.",
       success: false,
+      tone: "warning",
     });
   });
 
@@ -371,6 +374,7 @@ describe("connectAllSummary", () => {
       title: "Connected 2 of 4 T3 Code instances.",
       detail: "Not connected: Cursor, Claude Code (claude_personal).",
       success: false,
+      tone: "warning",
     });
   });
 
@@ -387,6 +391,19 @@ describe("connectAllSummary", () => {
       title: "Connect all stopped.",
       detail: "Connected 0 of 5 T3 Code instances. Not connected: Aider, Codex.",
       success: false,
+      tone: "warning",
+    });
+  });
+
+  it("is neutral, not a success, when nothing was left to count", () => {
+    expect(
+      connectAllSummary({ connected: 0, total: 0, stopped: false, notConnected: [] }),
+    ).toEqual({
+      text: "Connected 0 of 0 T3 Code instances.",
+      title: "Connected 0 of 0 T3 Code instances.",
+      detail: "",
+      success: true,
+      tone: "info",
     });
   });
 });
@@ -416,6 +433,24 @@ describe("connectAllOutcome", () => {
       total: 2,
       notConnected: ["OpenCode Go"],
       leftOut: ["F uses Kiro, which isn't installed. Install Kiro, then connect it."],
+    });
+  });
+
+  it("counts a row the rescan shows connected, even when its step reported a failure", () => {
+    const clients = [
+      client({
+        id: "codex",
+        name: "Codex",
+        gatewayInstalled: true,
+        t3Code: [use("Codex Home")],
+      }),
+      client({ id: "aider", name: "Aider", t3Code: [use("Aider Work")] }),
+    ];
+    expect(connectAllOutcome(clients, [], ["codex", "aider"])).toEqual({
+      connected: 1,
+      total: 2,
+      notConnected: ["Aider Work"],
+      leftOut: [],
     });
   });
 

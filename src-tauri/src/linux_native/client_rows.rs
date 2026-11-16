@@ -1105,7 +1105,8 @@ fn connect_t3_code_targets(page: ClientPage, targets: Vec<state::ClientView>) {
         super::setup::connect_step(
             &parent,
             client.id.clone(),
-            None,
+            // The access saved for the row, as its own Connect keeps it.
+            client.scope_id.clone(),
             false,
             std::rc::Rc::new(|| {}),
             Some(batch.page.credential_page.clone()),
@@ -1234,11 +1235,13 @@ pub(super) fn t3_code_batch_summary(
 }
 
 /// The Connect all summary for `outcome` against the current rows, as a card title and
-/// detail, and whether it is a full success. React's `connectAllOutcome` and `connectAllSummary` work out the same.
+/// detail, and its tone: success for a full success, info when nothing was left to count
+/// (every row gone or off by the end), warning otherwise. React's `connectAllOutcome` and
+/// `connectAllSummary` work out the same.
 pub(super) fn t3_code_batch_result(
     clients: &[state::ClientView],
     outcome: &T3BatchOutcome,
-) -> (String, String, bool) {
+) -> (String, String, super::StatusTone) {
     // The enabled instances on a row as it is now, named as the steps name them.
     let enabled = |id: &String| {
         clients
@@ -1249,15 +1252,24 @@ pub(super) fn t3_code_batch_result(
             .map(|instance| instance.display_name.clone())
             .collect::<Vec<_>>()
     };
+    // A row the scan shows connected counts as connected, even when its step reported a
+    // failure after the connect took effect.
+    let connected_now = |id: &String| {
+        outcome.connected.contains(id)
+            || clients.iter().any(|client| {
+                &client.id == id && client.gateway_state == state::ClientGatewayState::Connected
+            })
+    };
     let connected = outcome
-        .connected
+        .rows
         .iter()
+        .filter(|id| connected_now(id))
         .map(|id| enabled(id).len())
         .sum::<usize>();
     let not_connected = outcome
         .rows
         .iter()
-        .filter(|id| !outcome.connected.contains(id))
+        .filter(|id| !connected_now(id))
         .flat_map(enabled)
         .collect::<Vec<_>>();
     // Left-out rows are found again, without the batch's own rows.
@@ -1268,14 +1280,15 @@ pub(super) fn t3_code_batch_result(
         .collect::<Vec<_>>();
     let left_out = t3_code_left_out_lines(&t3_code_left_out(&others));
     let success = !outcome.stopped && not_connected.is_empty() && left_out.is_empty();
-    let (title, detail) = t3_code_batch_summary(
-        outcome.stopped,
-        connected,
-        connected + not_connected.len(),
-        &not_connected,
-        &left_out,
-    );
-    (title, detail, success)
+    let total = connected + not_connected.len();
+    let (title, detail) =
+        t3_code_batch_summary(outcome.stopped, connected, total, &not_connected, &left_out);
+    let tone = match (success, total) {
+        (true, 0) => super::StatusTone::Info,
+        (true, _) => super::StatusTone::Success,
+        (false, _) => super::StatusTone::Warning,
+    };
+    (title, detail, tone)
 }
 
 /// A client's profiles under one entry: Claude Code profiles or Codex homes. Copies of the
@@ -1985,6 +1998,7 @@ mod tests {
 
     #[test]
     fn t3_code_batch_result_counts_what_is_on_when_the_batch_ends() {
+        use super::super::StatusTone;
         use state::ClientGatewayState::*;
         let mut claude = client("claude", Connected);
         claude.name = "Claude Code (claude_personal)".into();
@@ -2016,7 +2030,7 @@ mod tests {
             (
                 "Connected 1 of 2 T3 Code instances.".into(),
                 "Not connected: OpenCode Go. F uses Kiro, which isn't installed. Install Kiro, then connect it.".into(),
-                false
+                StatusTone::Warning
             )
         );
         let all = T3BatchOutcome {
@@ -2029,7 +2043,7 @@ mod tests {
             (
                 "Connected 1 of 1 T3 Code instance.".into(),
                 String::new(),
-                true
+                StatusTone::Success
             )
         );
         // A batch row that can no longer be read is named once, not again as left out.
@@ -2046,7 +2060,34 @@ mod tests {
             (
                 "Connect all stopped.".into(),
                 "Connected 0 of 1 T3 Code instance. Not connected: Codex Home.".into(),
-                false
+                StatusTone::Warning
+            )
+        );
+        // A step reported as failed after its connect took effect: the scan shows the
+        // row connected, so it counts as connected.
+        let failed_late = T3BatchOutcome {
+            rows: vec!["claude".into()],
+            ..T3BatchOutcome::default()
+        };
+        assert_eq!(
+            t3_code_batch_result(&clients[..1], &failed_late),
+            (
+                "Connected 1 of 1 T3 Code instance.".into(),
+                String::new(),
+                StatusTone::Success
+            )
+        );
+        // Every batch row gone or off by the end: a neutral card, not a green 0 of 0.
+        let nothing_left = T3BatchOutcome {
+            rows: vec!["cursor".into(), "gone".into()],
+            ..T3BatchOutcome::default()
+        };
+        assert_eq!(
+            t3_code_batch_result(&clients[2..3], &nothing_left),
+            (
+                "Connected 0 of 0 T3 Code instances.".into(),
+                String::new(),
+                StatusTone::Info
             )
         );
     }
