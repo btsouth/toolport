@@ -1957,8 +1957,16 @@ mod tests {
     #[test]
     #[ignore = "manual isolated setup screenshot fixture"]
     fn setup_screenshot_fixture() {
+        // A manual fixture: it keeps the window open for a screenshot. Run it only
+        // when asked (TOOLPORT_SETUP_FIXTURE_STATE set, for example to "ready"),
+        // so a run of every ignored test under xvfb does not wait on it forever.
+        let Ok(state) = std::env::var("TOOLPORT_SETUP_FIXTURE_STATE") else {
+            eprintln!(
+                "setup_screenshot_fixture skipped: set TOOLPORT_SETUP_FIXTURE_STATE to run it"
+            );
+            return;
+        };
         adw::init().unwrap();
-        let state = std::env::var("TOOLPORT_SETUP_FIXTURE_STATE").unwrap_or_default();
         let scratch =
             std::env::temp_dir().join(format!("toolport-gtk-setup-fixture-{}", std::process::id()));
         let _data = crate::registry::DataDirOverride::set(&scratch);
@@ -2053,6 +2061,15 @@ mod tests {
             || {},
             Some(credential_page),
         );
-        gtk::glib::MainLoop::new(None, false).run();
+        // Even when asked for, close after a while (TOOLPORT_SETUP_FIXTURE_SECONDS,
+        // 300 by default) so a forgotten run ends.
+        let seconds = std::env::var("TOOLPORT_SETUP_FIXTURE_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(300);
+        let main_loop = gtk::glib::MainLoop::new(None, false);
+        let quit = main_loop.clone();
+        gtk::glib::timeout_add_seconds_local_once(seconds, move || quit.quit());
+        main_loop.run();
     }
 }
