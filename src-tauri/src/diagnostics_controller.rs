@@ -23,7 +23,9 @@ pub fn gather() -> String {
     }
     let _ = writeln!(output, "\ngateway log (last {DIAG_LOG_LINES} lines):");
     output.push_str(&gateway_log_tail(DIAG_LOG_LINES));
-    output
+    // Copied to the clipboard and pasted into issues: every registered secret
+    // goes, wherever in the text it appears.
+    crate::secret_redact::redact_log_text(&output).into_owned()
 }
 
 pub(crate) fn registry_summary(registry: &Registry) -> String {
@@ -85,7 +87,7 @@ pub(crate) fn registry_summary(registry: &Registry) -> String {
         };
         let target = match (&server.command, &server.url) {
             (Some(command), _) => safe_command_target(command, &server.args),
-            (None, Some(url)) => registry::redact_url_userinfo(url),
+            (None, Some(url)) => crate::secret_redact::redact_config_url(url),
             _ => String::new(),
         };
         let _ = writeln!(
@@ -251,6 +253,25 @@ fn open_directory(directory: std::path::PathBuf, what: &str) -> Result<(), Strin
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostics_carry_no_key_from_a_server_url() {
+        let mut server: crate::registry::ServerEntry = serde_json::from_value(serde_json::json!({
+            "id": "remote", "name": "Remote", "transport": "http",
+            "url": "https://mcp.example.com/sse/sk-DiagPathKey0123456789?apiKey=diag-QueryKey987654"
+        }))
+        .unwrap();
+        server.env.clear();
+        let reg = crate::registry::Registry {
+            servers: vec![server],
+            ..Default::default()
+        };
+        let text = super::registry_summary(&reg);
+        for value in ["sk-DiagPathKey0123456789", "diag-QueryKey987654"] {
+            assert!(!text.contains(value), "{value} in {text}");
+        }
+        assert!(text.contains("https://mcp.example.com/sse/"), "{text}");
+    }
+
     #[test]
     fn access_review_diagnostics_labels_default_access() {
         let reg = crate::registry::Registry {

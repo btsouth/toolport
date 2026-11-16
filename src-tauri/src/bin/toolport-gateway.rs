@@ -3752,6 +3752,7 @@ fn with_status_notes(summary: String) -> String {
     if let Some(notice) = conduit_lib::telemetry::health().notice() {
         notes.push(notice);
     }
+    notes.extend(conduit_lib::secret_redact::status_notes());
     if notes.is_empty() {
         return summary;
     }
@@ -5582,6 +5583,7 @@ fn execute_call(
                         active_client_label().as_deref(),
                         None,
                         None,
+                        None,
                     );
                     return json!({
                         "content": [{ "type": "text", "text": msg }],
@@ -5920,6 +5922,9 @@ fn execute_call(
     };
     // Hash args for the audit line (and SOU-171 org export) without storing them.
     let call_args_hash = audit::args_hash(&arguments);
+    // The client's own arguments, for the outgoing redaction's exemption: a
+    // secret the client sent may be echoed back to it.
+    let client_arguments = arguments.clone();
     if let Some(profiler) = &mut call_profiler {
         profiler.mark_preflight();
     }
@@ -5932,7 +5937,11 @@ fn execute_call(
     //
     // Identity already comes from `exec_router` via the SOU-478 rebind above
     // (SOU-474 originally fixed only this progress path).
-    let (_progress_route, relay_owned) = prepare_progress(client_meta, server_id);
+    let (_progress_route, relay_owned) = prepare_progress(
+        client_meta,
+        Some(&json!({ "arguments": client_arguments })),
+        server_id,
+    );
     let client_meta = relay_owned.as_ref().or(client_meta);
 
     // Resolve pseudonyms LAST, immediately before the call leaves the machine, so
@@ -6019,8 +6028,16 @@ fn execute_call(
             // hostile server can't bypass the injection scanner by answering with an
             // error instead of a result (issue #421). A server's own result, failed or
             // not, gets no Toolport text appended: clients parse these blocks.
-            let Defended { result: out, pii } =
-                defend_and_shape(reg, srv, tool, client, result, "", shape);
+            let request = json!({ "arguments": client_arguments });
+            let Defended {
+                result: mut out,
+                pii,
+                secrets: shaped,
+            } = defend_and_shape_for(reg, srv, tool, client, result, "", shape, Some(&request));
+            let secrets = with_shaped(
+                shaped,
+                secrets_replaced_in(&mut out, &client_arguments, opts.direct),
+            );
             if let Some(profiler) = &mut call_profiler {
                 profiler.mark_postprocess();
             }
@@ -6043,6 +6060,7 @@ fn execute_call(
                 active_client_label().as_deref(),
                 Some(&call_args_hash),
                 pii,
+                Some(&secrets),
             );
             if let Some(profiler) = call_profiler {
                 profiler.finish();
@@ -6072,8 +6090,25 @@ fn execute_call(
             // Defend first, then audit: the error text runs through the same PII pass as
             // a successful result, and the audit row has to carry that pass's count like
             // the success path does (SBS-607).
-            let Defended { result: out, pii } =
-                defend_and_shape(reg, srv, tool, client, result, &trailer, shape);
+            let request = json!({ "arguments": client_arguments });
+            let Defended {
+                result: mut out,
+                pii,
+                secrets: shaped,
+            } = defend_and_shape_for(
+                reg,
+                srv,
+                tool,
+                client,
+                result,
+                &trailer,
+                shape,
+                Some(&request),
+            );
+            let secrets = with_shaped(
+                shaped,
+                secrets_replaced_in(&mut out, &client_arguments, opts.direct),
+            );
             let defended_err = audited_error_text(&e, &out);
             audit::record_routed_call(
                 reg,
@@ -6087,10 +6122,41 @@ fn execute_call(
                 active_client_label().as_deref(),
                 Some(&call_args_hash),
                 pii,
+                Some(&secrets),
             );
             out
         }
     }
+}
+
+/// The configured secrets a call's result carries, by name and count, for its
+/// audit row. A direct call's result is redacted here, as the final pass to the
+/// client would redact it; a code-mode step's result goes to the script as it
+/// is (the script may pass a value on), so a copy is counted instead.
+fn secrets_replaced_in(
+    out: &mut Value,
+    client_arguments: &Value,
+    direct: bool,
+) -> std::collections::BTreeMap<String, usize> {
+    let request = json!({ "arguments": client_arguments });
+    if direct {
+        conduit_lib::secret_redact::redact_outgoing_counted(out, Some(&request))
+    } else {
+        let mut copy = out.clone();
+        conduit_lib::secret_redact::redact_outgoing_counted(&mut copy, Some(&request))
+    }
+}
+
+/// The audit counts of a call: those replaced before shaping plus any the
+/// final pass found after it (a trailer, say).
+fn with_shaped(
+    shaped: Option<std::collections::BTreeMap<String, usize>>,
+    mut after: std::collections::BTreeMap<String, usize>,
+) -> std::collections::BTreeMap<String, usize> {
+    for (name, count) in shaped.into_iter().flatten() {
+        *after.entry(name).or_default() += count;
+    }
+    after
 }
 
 /// Flags for [`execute_call`] that would otherwise be adjacent bools (easy to swap).
@@ -6710,9 +6776,25 @@ fn defend_and_shape(
     srv: &str,
     tool: &str,
     client: Option<&str>,
+    result: Value,
+    trailer: &str,
+    shape: bool,
+) -> Defended {
+    defend_and_shape_for(reg, srv, tool, client, result, trailer, shape, None)
+}
+
+/// [`defend_and_shape`] for a call whose `request` exempts the client's own
+/// values from the redaction that runs before shaping.
+#[allow(clippy::too_many_arguments)]
+fn defend_and_shape_for(
+    reg: &Registry,
+    srv: &str,
+    tool: &str,
+    client: Option<&str>,
     mut result: Value,
     trailer: &str,
     shape: bool,
+    request: Option<&Value>,
 ) -> Defended {
     // Scan untrusted output for injection; record findings, optionally fail closed.
     // Block mode alone must still run the scanner: an org forceBlockOnInjection (or a
@@ -6741,6 +6823,7 @@ fn defend_and_shape(
     if !blocked {
         integrity::label_untrusted_result(srv, &mut result);
     }
+    let mut secrets = None;
     // Cap an oversized result, cache the full body, hand back a head + fetch cursor.
     // A per-server resultBudget overrides the global default (Some(0) = never shape).
     // Code-mode intermediate calls pass `shape = false`: full bodies stay in the
@@ -6759,6 +6842,13 @@ fn defend_and_shape(
 
                 budget
             });
+        // Before the cut: the head and the cached body are both redacted, so
+        // neither a head that ends inside a secret nor a fetch page that
+        // starts inside one returns part of it.
+        secrets = Some(conduit_lib::secret_redact::redact_outgoing_counted(
+            &mut result,
+            request,
+        ));
         shaping::shape_result(&mut result, budget, client);
     }
     if !blocked && shape {
@@ -6771,7 +6861,11 @@ fn defend_and_shape(
             arr.push(json!({ "type": "text", "text": trailer }));
         }
     }
-    Defended { result, pii }
+    Defended {
+        result,
+        pii,
+        secrets,
+    }
 }
 
 /// [`defend_and_shape`]'s output: the agent-facing result, plus what the PII pass did on
@@ -6784,6 +6878,8 @@ struct Defended {
     result: Value,
     /// `None` when PII redaction was off for this call -- see [`pseudonymize_if_enabled`].
     pii: Option<audit::PiiPass>,
+    /// Secrets replaced before shaping, by name; `None` when not shaped.
+    secrets: Option<std::collections::BTreeMap<String, usize>>,
 }
 
 /// Exposed tool names for code-mode `servers.*` stubs: full catalog minus gateway
@@ -9050,7 +9146,7 @@ fn handle_request_with_cancel(
             let client_meta = params.and_then(|p| p.get("_meta")).cloned();
             let mrtr = MrtrRequest::from_params(params);
             let (_progress_route, relay_owned) = match router.resource_server(uri) {
-                Some(owner) => prepare_progress(client_meta.as_ref(), owner),
+                Some(owner) => prepare_progress(client_meta.as_ref(), params, owner),
                 None => (None, None),
             };
             let client_meta = relay_owned.or(client_meta);
@@ -9206,7 +9302,7 @@ fn handle_request_with_cancel(
             let client_meta = params.and_then(|p| p.get("_meta")).cloned();
             let mrtr = MrtrRequest::from_params(params);
             let (_progress_route, relay_owned) = match router.prompt_server(name) {
-                Some(owner) => prepare_progress(client_meta.as_ref(), owner),
+                Some(owner) => prepare_progress(client_meta.as_ref(), params, owner),
                 None => (None, None),
             };
             let client_meta = relay_owned.or(client_meta);
@@ -9996,6 +10092,10 @@ fn connect_one_result(
     } else {
         server
     };
+    // Every inline or URL-borne secret this server carries is registered before
+    // anything is launched or sent (stdio entries were registered as they
+    // resolved; this also covers the HTTP branch).
+    conduit_lib::secret_refs::register_inline_secrets(server);
     let initialize_timeout = server.initialize_timeout();
     let result = if let Err(error) = &initialize_timeout {
         Err(error.clone())
@@ -10714,11 +10814,12 @@ fn deliver_resource_updated(
     if targets.is_empty() {
         return;
     }
-    let msg = json!({
+    let mut msg = json!({
         "jsonrpc": "2.0",
         "method": "notifications/resources/updated",
         "params": { "uri": uri }
     });
+    conduit_lib::secret_redact::redact_outgoing(&mut msg, None);
     let mut need_stdio = false;
     let mut session_ids: Vec<String> = Vec::new();
     for sid in targets {
@@ -10779,6 +10880,11 @@ struct ProgressRoute {
     /// own unique token downstream and translates back here, the same way it
     /// namespaces tool names.
     client_token: Value,
+    /// The registered values the client sent in the request (any spelling):
+    /// echoed in its progress, they are its own and are left as they are. Each
+    /// progress message is redacted whole and on its own, never held or joined
+    /// with another, so its text is delivered as it came, in order.
+    exempt: Option<Arc<std::collections::HashSet<String>>>,
     /// The request instance that asked for it. Its progress is delivered only while
     /// that instance is live, so a cancelled call's late progress never reaches the
     /// client, which may already have reused the token for its next request.
@@ -10833,6 +10939,25 @@ impl Drop for ProgressRegistration {
     }
 }
 
+/// The last pass on a progress notification of `route`: every secret not in
+/// the client's own request is replaced, and the client's token restored.
+fn finish_progress_note(note: &mut Value, route: &ProgressRoute) {
+    conduit_lib::secret_redact::redact_outgoing_exempt(note, route.exempt.as_deref());
+    if let Some(params) = note.get_mut("params").and_then(Value::as_object_mut) {
+        params.insert("progressToken".to_string(), route.client_token.clone());
+        if let Some(tag) = route
+            .owner
+            .as_ref()
+            .and_then(downstream::CancelContext::adapter_tag)
+        {
+            let meta = params.entry("_meta").or_insert_with(|| json!({}));
+            if let Some(meta) = meta.as_object_mut() {
+                meta.insert(ADAPTER_REQUEST_META.to_string(), json!(tag));
+            }
+        }
+    }
+}
+
 /// Register the `progressToken` in `client_meta` (if any) for the duration of one
 /// downstream call. Returns `None` when the client asked for no progress, which
 /// is the common case.
@@ -10841,10 +10966,12 @@ impl Drop for ProgressRegistration {
 fn register_progress(
     table: &Arc<Mutex<ProgressRoutes>>,
     client_meta: Option<&Value>,
+    request: Option<&Value>,
     producer: &str,
     session: &str,
 ) -> Option<(ProgressRegistration, String)> {
     let client_token = client_meta?.get("progressToken")?.clone();
+    let exempt = conduit_lib::secret_redact::exempt_values(request);
     // Mint our own token rather than reusing the client's. Two clients picking
     // the same value (integers are common) would otherwise share a table entry,
     // so the counter lives on the table itself rather than in a global.
@@ -10859,6 +10986,7 @@ fn register_progress(
             session: session.to_string(),
             producer: producer.to_string(),
             client_token,
+            exempt,
             owner: APPROVAL_CANCEL.with(|current| current.borrow().clone()),
         },
     );
@@ -10879,6 +11007,7 @@ fn register_progress(
 /// rather than being repeated.
 fn prepare_progress(
     client_meta: Option<&Value>,
+    request: Option<&Value>,
     producer: &str,
 ) -> (Option<ProgressRegistration>, Option<Value>) {
     let Some(meta) = client_meta else {
@@ -10889,7 +11018,7 @@ fn prepare_progress(
     }
     match progress_target() {
         Some(session) => {
-            match register_progress(progress_routes(), client_meta, producer, &session) {
+            match register_progress(progress_routes(), client_meta, request, producer, &session) {
                 Some((registration, token)) => {
                     let mut relayed = meta.clone();
                     if let Some(obj) = relayed.as_object_mut() {
@@ -10921,16 +11050,16 @@ fn deliver_progress(
     let Some(key) = token.as_str().map(str::to_string) else {
         return;
     };
-    let (session, client_token, owner) = {
+    let mut note = note.clone();
+    let (session, owner) = {
         let table = routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match table.active.get(&key) {
-            Some(route) if route.producer == producer => (
-                route.session.clone(),
-                route.client_token.clone(),
-                route.owner.clone(),
-            ),
+            Some(route) if route.producer == producer => {
+                finish_progress_note(&mut note, route);
+                (route.session.clone(), route.owner.clone())
+            }
             Some(route) => {
                 eprintln!(
                     "toolport: progress for token from '{producer}' dropped \
@@ -10944,21 +11073,17 @@ fn deliver_progress(
             None => return,
         }
     };
-    // Hand the client back ITS token; ours is an internal correlator.
-    let mut note = note.clone();
-    if let Some(params) = note.get_mut("params").and_then(Value::as_object_mut) {
-        params.insert("progressToken".to_string(), client_token);
-        if let Some(tag) = owner
-            .as_ref()
-            .and_then(downstream::CancelContext::adapter_tag)
-        {
-            let meta = params.entry("_meta").or_insert_with(|| json!({}));
-            if let Some(meta) = meta.as_object_mut() {
-                meta.insert(ADAPTER_REQUEST_META.to_string(), json!(tag));
-            }
-        }
-    }
-    let note = &note;
+    deliver_progress_to(stdio, mcp_sessions, &session, &note, owner.as_ref());
+}
+
+/// Hand one finished progress notification to the client session `session`.
+fn deliver_progress_to(
+    stdio: &Arc<SessionState>,
+    mcp_sessions: &McpSessions,
+    session: &str,
+    note: &Value,
+    owner: Option<&downstream::CancelContext>,
+) {
     if session == RESOURCE_SUB_STDIO {
         // Hand off rather than write here. This runs on the downstream drain
         // thread, BEFORE that thread forwards response lines to the request loop.
@@ -10974,7 +11099,7 @@ fn deliver_progress(
             eprintln!("toolport: stdio progress for a session with no stdio face; dropped");
             return;
         };
-        if sender.try_send((note.clone(), owner)).is_err() {
+        if sender.try_send((note.clone(), owner.cloned())).is_err() {
             eprintln!("toolport: stdio progress queue full or closed; progress dropped");
         }
         return;
@@ -10985,19 +11110,19 @@ fn deliver_progress(
     let sessions = mcp_sessions
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(target) = sessions.get(&session) else {
+    let Some(target) = sessions.get(session) else {
         return;
     };
     if target.is_expired() || target.closed.load(Ordering::SeqCst) {
         return;
     }
     let push = || {
-        if !target.push_message(json, None) {
+        if !target.push_redacted(json, None) {
             eprintln!("toolport: MCP session outbound queue full; progress dropped");
         }
     };
     // Queued only while its request is live, as one step against its cancellation.
-    match &owner {
+    match owner {
         Some(owner) => {
             owner.speak_with(push);
         }
@@ -12276,6 +12401,9 @@ fn load_tool_cache(profile: Option<&str>) -> Vec<Value> {
         if let Some(schema) = tool.get_mut("inputSchema") {
             conduit_lib::router::normalize_tool_schema(schema);
         }
+        // A cache an older build wrote may still hold a secret a server echoed
+        // into a definition; serve it the way the live catalog now is.
+        conduit_lib::secret_redact::redact_definition(tool);
     }
     tools
 }
@@ -12359,8 +12487,22 @@ fn save_server_catalogs_for_launches(router: &Router, profile: Option<&str>, key
         })
     };
     if let Ok(raw) = raw {
-        let _ = registry::atomic_write(&path, &raw);
+        write_catalog_cache(&path, &raw);
     }
+}
+
+/// Replace a cached tool catalog under the lock the secret scrub rewrites it
+/// with, redacting inside it so a secret learned while a scrub runs is caught
+/// and the scrub cannot put back the catalog it read. A cache that cannot take
+/// the lock is not written: the next build saves it again, and the previous
+/// cache stays usable meanwhile.
+fn write_catalog_cache(path: &Path, raw: &str) {
+    let Ok(_lock) = registry::lock_at(path) else {
+        glog("tool cache not saved: its lock stayed busy past the store deadline");
+        return;
+    };
+    let raw = conduit_lib::secret_redact::redact_definition_line(raw);
+    let _ = registry::atomic_write(path, &raw);
 }
 
 fn save_tool_cache(tools: &dyn ToolCatalog, profile: Option<&str>) {
@@ -12377,7 +12519,7 @@ fn save_tool_cache(tools: &dyn ToolCatalog, profile: Option<&str>) {
         if let Ok(s) = serde_json::to_string(&wrapped) {
             // Atomic + unique temp: several gateways share this cache file, so a
             // torn or interleaved write would leave an inconsistent catalog.
-            let _ = registry::atomic_write(&path, &s);
+            write_catalog_cache(&path, &s);
         }
     }
 }
@@ -15592,6 +15734,16 @@ impl SessionState {
     /// stream; stdio writes it straight to the client. Returns false when the
     /// message could not be delivered (queue full, or a write failure).
     fn push_message(&self, json: String, request_id: Option<String>) -> bool {
+        // Notifications and server requests carry upstream text with no client
+        // request behind them.
+        let json = conduit_lib::secret_redact::redact_outgoing_json(json);
+        self.push_redacted(json, request_id)
+    }
+
+    /// [`Self::push_message`] for a message already given its last redaction
+    /// pass with the request it answers (a call's progress, which keeps the
+    /// client's own values), so that pass is not undone by one without it.
+    fn push_redacted(&self, json: String, request_id: Option<String>) -> bool {
         match &self.transport {
             SessionTransportFace::Stdio(stdout) => {
                 let Ok(value) = serde_json::from_str::<Value>(&json) else {
@@ -17301,6 +17453,30 @@ fn process_request_wire(
         observed.close(observation::CloseReason::RequestComplete);
     }
     if let Some(response) = &mut response {
+        // Every server's secrets, after any per-server pass: a value one server
+        // returns is never handed to a client unless the client sent it.
+        match conduit_lib::secret_redact::unavailable_reason() {
+            // Fail closed, but keep the protocol: a status call still says what
+            // is wrong, with fixed text that holds no upstream content.
+            Some(reason)
+                if method == "tools/call"
+                    && req.pointer("/params/name").and_then(Value::as_str)
+                        == Some("toolport_status")
+                    && response.envelope.get("id").is_some() =>
+            {
+                let id = response.envelope["id"].clone();
+                response.envelope = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "content": [{ "type": "text", "text": reason }], "isError": true },
+                });
+            }
+            _ => {
+                // Its result or error only: the id is the client's own, and
+                // it matches the reply by it.
+                conduit_lib::secret_redact::redact_reply(&mut response.envelope, req.get("params"));
+            }
+        }
         response.observation = Some(observed.clone());
         response.tools_list = method == "tools/list";
         response.listed_tools = holder
@@ -20719,6 +20895,11 @@ fn insecure_loopback_requested(args: &[String]) -> bool {
 /// Whether the operator asked this process to be the host daemon (`--daemon`).
 /// Phase 2: the daemon role currently serves the internal identity handshake and
 /// exits after an idle grace; it does not own a router yet.
+/// The secrets a gateway learns at start, in every role: inline values only.
+fn learn_startup_secrets() {
+    conduit_lib::secret_refs::preload_inline_secrets();
+}
+
 fn daemon_requested(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "--daemon")
 }
@@ -22523,11 +22704,17 @@ fn detach_from_client_session() {}
 
 /// Entry point: classify the command line, then run the requested role.
 fn main() {
+    gateway_main(std::env::args().skip(1).collect());
+    // A role that returns (the stdio loop, the HTTP servers) lands its last
+    // stderr lines; every other exit goes through `telemetry::exit_with`.
+    conduit_lib::daemon_log::flush_stderr_relay(Duration::from_millis(500));
+}
+
+fn gateway_main(cli_args: Vec<String>) {
     conduit_lib::secret_refs::enable_gateway_cache();
     // `--help`/`--version`/an unrecognized flag are decided before anything
     // else touches disk, the keychain, or stdin - see #605. Positional args
     // and the existing four flags fall through to `Run` unchanged.
-    let cli_args: Vec<String> = std::env::args().skip(1).collect();
     if cli_args.first().map(String::as_str) == Some(worker::WORKER_ARG) {
         worker::worker_main();
     }
@@ -22699,6 +22886,11 @@ fn main() {
         }
         ArgAction::Run => {}
     }
+    // Every serving role (adapter, private gateway, daemon, HTTP bridge and
+    // proxy, direct stdio) redacts its stderr from here on: an adapter's goes
+    // to the client's log, the daemon's to daemon.log. A relay that cannot
+    // start leaves stderr on the null device, never unredacted.
+    conduit_lib::daemon_log::install_stderr_redaction();
     if daemon_requested(&cli_args) {
         gateway_memory::configure_daemon();
     }
@@ -22711,7 +22903,9 @@ fn main() {
             Some(value) => match value.parse::<u16>() {
                 Ok(port) if port > 0 => port,
                 _ => {
-                    eprintln!("toolport-gateway: invalid HTTP proxy port: {value}");
+                    // Not the value: this runs before the configured
+                    // secrets are known, and it may be one.
+                    eprintln!("toolport-gateway: invalid HTTP proxy port");
                     conduit_lib::telemetry::exit_with(1);
                 }
             },
@@ -22770,6 +22964,24 @@ fn main() {
     // at this run's first spill.
     std::thread::spawn(conduit_lib::shaping::remove_stale_spills);
     if let Some(dir) = registry::conduit_dir() {
+        // Inline secrets are known to the redactor before this process replays
+        // or writes diagnostic text. Stored ones are learned by the read that
+        // first uses them (a server's launch registers its values before the
+        // child starts), so no role reads the vault, or waits on a keyring
+        // prompt, before it serves.
+        learn_startup_secrets();
+        // Values retired while a log could still hold them live in the vault
+        // too: only the daemon retries their cleanup, off the startup path.
+        if daemon_requested(&cli_args) {
+            std::thread::spawn(|| {
+                let retired = conduit_lib::secrets::retry_retired_scrubs();
+                if retired > 0 {
+                    glog(&format!(
+                        "{retired} replaced or deleted secret(s) still wait for their log cleanup; kept in the vault until it succeeds"
+                    ));
+                }
+            });
+        }
         conduit_lib::rate_limits::bind_data_dir(&dir);
         // Share downstream 429 backoff windows across gateway processes
         // (issue #874) until the host daemon lands. Missing state = no backoff.
@@ -22777,6 +22989,9 @@ fn main() {
         // Record the servers this gateway starts, and stop the ones a killed or
         // crashed gateway left behind.
         conduit_lib::child_ledger::bind_data_dir(&dir);
+        // Once this process resolves a server's secrets, rewrite any copy an older
+        // build left in the logs (once per secret name, off the call path).
+        conduit_lib::secret_redact::enable_background_scrub();
         let reaped = conduit_lib::child_ledger::reap_orphans(&dir);
         if reaped > 0 {
             glog(&format!(
@@ -23375,6 +23590,94 @@ mod tests {
 
     mod search_scale {
         include!("../gateway/search_eval_scale.rs");
+    }
+
+    /// Child half of `every_gateway_role_redacts_its_stderr`: runs the real
+    /// entry point in its own process, because it replaces the process's stderr.
+    #[test]
+    fn gateway_stderr_child() {
+        let Some(secret) = std::env::var_os("TOOLPORT_GATEWAY_STDERR_CHILD") else {
+            return;
+        };
+        let secret = secret.to_string_lossy().to_string();
+        // An invalid port is reported before the configured secrets are
+        // preloaded, so the value may be a secret the redactor does not know.
+        super::gateway_main(vec!["--http-proxy".into(), secret]);
+    }
+
+    /// Failure mode: no role learns a stored value at start any more, so the
+    /// read that launches a server must register it before the server can echo
+    /// it: here the server's first (and only) output line quotes its token.
+    #[cfg(unix)]
+    #[test]
+    fn a_value_read_at_launch_is_redacted_from_the_servers_first_output() {
+        let _data = DataDirTestEnv::new("a_value_read_at_launch_is_redacted");
+        let secret = "launch-only-secret-4Wd8Qm";
+        std::env::set_var("TOOLPORT_SECRET_LAUNCH_ONLY_TOKEN", secret);
+        let server: ServerEntry = serde_json::from_value(json!({
+            "id": "launch-srv", "name": "Launch", "enabled": true, "source": "fixture",
+            "transport": "stdio", "command": "/bin/sh",
+            "args": ["-c", "echo \"server says $LAUNCH_ONLY_TOKEN\" >&2; exit 3"],
+            "inheritEnv": false,
+            "env": [{"key": "LAUNCH_ONLY_TOKEN", "secret": true}]
+        }))
+        .unwrap();
+        let mut reg = Registry::default();
+        reg.servers.push(server.clone());
+        registry::save(&reg).unwrap();
+        // What every role runs at start reads no stored value.
+        super::learn_startup_secrets();
+        let at_start = conduit_lib::secret_redact::redact_text(secret).into_owned();
+        let dirty = Arc::new(AtomicU8::new(0));
+        let handler: ServerRequestHandler = Arc::new(|_| None);
+        let failure = match connect_one_result(&server, &dirty, handler, None, None) {
+            Err(failure) => failure.message,
+            Ok(_) => panic!("the server exits at once"),
+        };
+        // The launch read registers the value before the child is spawned, so
+        // the line the server writes first is already covered.
+        let first_line =
+            conduit_lib::secret_redact::redact_text(&format!("server says {secret}")).into_owned();
+        std::env::remove_var("TOOLPORT_SECRET_LAUNCH_ONLY_TOKEN");
+        assert_eq!(at_start, secret, "a stored value was learned at start");
+        assert!(!failure.contains(secret), "{failure}");
+        assert_eq!(first_line, "server says [secret:LAUNCH_ONLY_TOKEN]");
+    }
+
+    /// Before the relay was installed for every role, only the daemon's stderr
+    /// was redacted; an adapter's or proxy's went straight to the client's log.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn every_gateway_role_redacts_its_stderr() {
+        let dir = std::env::temp_dir().join(format!(
+            "tp-gateway-stderr-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("client-stderr.log");
+        let secret = "proxy-canary-5Rt9-SECRET";
+        let file = std::fs::File::create(&log).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::gateway_stderr_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TOOLPORT_GATEWAY_STDERR_CHILD", secret)
+            .stdout(std::process::Stdio::null())
+            .stderr(file)
+            .status()
+            .unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!status.success(), "an invalid port exits 1: {text}");
+        assert!(!text.contains(secret), "{text}");
+        assert!(text.contains("invalid HTTP proxy port"), "{text}");
     }
 
     #[test]
@@ -24274,6 +24577,59 @@ mod tests {
             out["to"], "ada@example.com",
             "resource-minted PII must resolve for a tool on the same server"
         );
+    }
+
+    /// Failure mode: the result was cut and its full body cached before it
+    /// was redacted, so a secret crossing the head boundary left its first
+    /// characters in the reply, and a fetch page starting inside it the rest.
+    #[test]
+    fn a_shaped_result_never_returns_part_of_a_secret() {
+        let _data = DataDirTestEnv::new("a_shaped_result_never_returns_part_of_a_secret");
+        let secret = "shape-secret-7Wq2Kd9Lm4Xp";
+        conduit_lib::secret_redact::register("shape-srv", "SHAPE_KEY", secret);
+        let mut reg = Registry::default();
+        reg.result_budgets.insert("shape-srv".to_string(), 4096);
+        // Copies at every alignment, so the head and any page cut one.
+        let text: String = (0..4000)
+            .map(|i| format!("{}{secret}", "x".repeat(i % 11)))
+            .collect();
+        let result = json!({ "content": [{ "type": "text", "text": text }] });
+        let shaped =
+            defend_and_shape(&reg, "shape-srv", "shape-srv__read", None, result, "", true).result;
+        let head = shaped["content"][0]["text"].as_str().unwrap().to_string();
+        let cursor = head
+            .split("\"cursor\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("a shaped result")
+            .to_string();
+        let mut pages = vec![head];
+        for offset in [0, 3, 1000, 1007, 4096, 4101] {
+            let page = shaping::fetch_result(&cursor, offset, 997, None, None);
+            pages.push(
+                page["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
+        let whole = shaping::fetch_result(&cursor, 0, usize::MAX, None, None);
+        pages.push(
+            whole["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+        for page in pages {
+            for piece in secret.as_bytes().windows(8) {
+                let piece = std::str::from_utf8(piece).unwrap();
+                assert!(
+                    !page.contains(piece),
+                    "{piece} in {}",
+                    &page[..page.len().min(300)]
+                );
+            }
+        }
     }
 
     #[test]
@@ -26071,6 +26427,52 @@ mod tests {
             &json!({"command":"changed"})
         )
         .is_empty());
+    }
+
+    /// Failure mode: a tool catalog is replaced without the scrub's lock, so a
+    /// catalog saved while a scrub runs keeps a secret the scrub just learned,
+    /// or the scrub's replace puts back the older catalog.
+    #[test]
+    fn tool_caches_wait_for_the_scrub_lock_and_redact_inside_it() {
+        let _env = DataDirTestEnv::new("tool-cache-scrub-lock");
+        let text = conduit_lib::secret_redact::append_during_scrub_for_test(
+            &tool_cache_path(None).unwrap(),
+            ("tool-cache-lock", "TOKEN", "cache-late-token-P3vN8kQd"),
+            || {
+                let tools = vec![
+                    json!({"name":"cache__t", "description":"uses cache-late-token-P3vN8kQd"}),
+                ];
+                save_tool_cache(&tools, None);
+            },
+        );
+        assert!(text.contains("cache__t"), "{text}");
+        assert!(!text.contains("cache-late-token-P3vN8kQd"), "{text}");
+
+        let text = conduit_lib::secret_redact::append_during_scrub_for_test(
+            &server_catalog_path(None).unwrap(),
+            ("tool-cache-lock", "SERVERS", "servers-late-token-T6jR4mWx"),
+            || {
+                let mut router = Router::new();
+                router.add_supervised(
+                    "cache".into(),
+                    vec![
+                        json!({"name":"cached", "description":"uses servers-late-token-T6jR4mWx"}),
+                    ],
+                    Arc::new(|| {
+                        let mut server =
+                            DownstreamServer::connect("cache".into(), Box::new(CacheRoute))
+                                .unwrap();
+                        server.load_resources_prompts();
+                        Ok(server)
+                    }),
+                    ReconnectBackoff::default(),
+                    json!({"revision":1}),
+                );
+                save_server_catalogs(&router, None);
+            },
+        );
+        assert!(text.contains("\"cached\""), "{text}");
+        assert!(!text.contains("servers-late-token-T6jR4mWx"), "{text}");
     }
 
     #[test]
@@ -38754,7 +39156,7 @@ mod tests {
         );
 
         let meta = json!({ "progressToken": "must-not-route" });
-        let (registration, relayed) = prepare_progress(Some(&meta), "alpha");
+        let (registration, relayed) = prepare_progress(Some(&meta), None, "alpha");
         assert!(registration.is_none());
         assert!(relayed
             .expect("metadata is relayed without progress")
@@ -38782,7 +39184,7 @@ mod tests {
             "no session and no stdio: nowhere to deliver"
         );
 
-        let (registration, relayed) = prepare_progress(Some(&meta), "alpha");
+        let (registration, relayed) = prepare_progress(Some(&meta), None, "alpha");
         assert!(registration.is_none(), "nothing to register against");
         let relayed = relayed.expect("_meta is still relayed, minus the token");
         assert!(
@@ -38811,7 +39213,7 @@ mod tests {
         );
 
         let meta = json!({ "progressToken": 7 });
-        let (registration, relayed) = prepare_progress(Some(&meta), "alpha");
+        let (registration, relayed) = prepare_progress(Some(&meta), None, "alpha");
         assert!(
             registration.is_some(),
             "a deliverable token gets a live route"
@@ -38842,6 +39244,7 @@ mod tests {
         let (_registration, wire_token) = register_progress(
             &routes,
             Some(&json!({ "progressToken": "tok-1" })),
+            None,
             "alpha",
             &s1,
         )
@@ -38875,6 +39278,145 @@ mod tests {
     }
 
     #[test]
+    fn each_progress_message_is_redacted_on_its_own_and_delivered_as_it_came() {
+        let _data = DataDirTestEnv::new("progress-per-message");
+        conduit_lib::secret_redact::register("alpha", "TOKEN", "sk-SECRETVALUE1234");
+        conduit_lib::secret_redact::register("alpha", "OWN", "sk-OwnProgress789");
+        let state = http_state(false);
+        let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
+        let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+        let (stdio, _stdio_rx) = stdio_session_with_progress();
+        let request = json!({ "arguments": { "key": "sk-OwnProgress789" } });
+        let (registration, wire) = register_progress(
+            &routes,
+            Some(&json!({ "progressToken": "tok-each" })),
+            Some(&request),
+            "alpha",
+            &s1,
+        )
+        .unwrap();
+        let messages = [
+            "Fetching items",
+            "Processing items",
+            "Step 3 of 7",
+            "using sk-SECRETVALUE1234 now",
+            "echo sk-OwnProgress789 ok",
+            "Done: 12 files",
+        ];
+        for (i, message) in messages.iter().enumerate() {
+            deliver_progress(
+                &stdio,
+                &state.mcp_sessions,
+                &routes,
+                "alpha",
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": {"progressToken": wire, "progress": i, "message": message}
+                }),
+            );
+        }
+        let got: Vec<Value> = drain_session(&state, &s1)
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let texts: Vec<&str> = got
+            .iter()
+            .map(|n| n["params"]["message"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "Fetching items",
+                "Processing items",
+                "Step 3 of 7",
+                "using [secret:TOKEN] now",
+                // The client sent this value: its echo is its own.
+                "echo sk-OwnProgress789 ok",
+                "Done: 12 files",
+            ]
+        );
+        for (i, note) in got.iter().enumerate() {
+            assert_eq!(note["params"]["progress"], i, "{note}");
+            assert_eq!(note["params"]["progressToken"], "tok-each", "{note}");
+        }
+        // Nothing waits for the end of the call.
+        drop(registration);
+        assert!(drain_session(&state, &s1).is_empty());
+    }
+
+    #[test]
+    fn a_reply_keeps_its_request_id_when_the_id_equals_a_secret() {
+        let _data = DataDirTestEnv::new("reply-id-secret");
+        conduit_lib::secret_redact::register("alpha", "PIN", "482193");
+        conduit_lib::secret_redact::register("alpha", "KEY", "sk-ReplyIdSecret77");
+        let state = http_state(false);
+        for id in [json!(482193), json!("sk-ReplyIdSecret77")] {
+            for req in [
+                json!({"jsonrpc":"2.0","id":id,"method":"ping"}),
+                json!({"jsonrpc":"2.0","id":id,"method":"ping","params":{}}),
+            ] {
+                let reply = process_request_wire(
+                    &state,
+                    &req,
+                    &SearchGuard::default(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    DiscoveryMode::Full,
+                )
+                .expect("a reply")
+                .into_value();
+                assert_eq!(reply["id"], id, "{reply}");
+                assert_eq!(reply["jsonrpc"], "2.0", "{reply}");
+            }
+        }
+    }
+
+    #[test]
+    fn without_secret_redaction_clients_get_valid_replies_and_status_says_why() {
+        let _data = DataDirTestEnv::new("redaction-unavailable");
+        conduit_lib::secret_redact::register("alpha", "KEY", "sk-UnavailableSecret12");
+        conduit_lib::secret_redact::force_unavailable_for_test(true);
+        let state = http_state(false);
+        let call = |req: Value| {
+            process_request_wire(
+                &state,
+                &req,
+                &SearchGuard::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                DiscoveryMode::Full,
+            )
+            .expect("a reply")
+            .into_value()
+        };
+        let status = call(
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"toolport_status","arguments":{}}}),
+        );
+        let list = call(json!({"jsonrpc":"2.0","id":4,"method":"tools/list"}));
+        conduit_lib::secret_redact::force_unavailable_for_test(false);
+        assert_eq!(status["jsonrpc"], "2.0");
+        assert_eq!(status["id"], 3);
+        let text = status["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("Secret redaction is unavailable"),
+            "{text}"
+        );
+        assert_eq!(
+            list,
+            json!({"jsonrpc":"2.0","id":4,"error":{"code":-32603,"message":conduit_lib::secret_redact::WITHHELD_RESPONSE}})
+        );
+    }
+
+    #[test]
     fn identical_client_tokens_from_two_clients_do_not_collide() {
         let _data =
             DataDirTestEnv::new("f3-identical-client-tokens-from-two-clients-do-not-collide");
@@ -38890,10 +39432,22 @@ mod tests {
         let (stdio, _stdio_rx) = stdio_session_with_progress();
 
         // Same client token, same downstream server, two different clients.
-        let (_r1, wire1) =
-            register_progress(&routes, Some(&json!({ "progressToken": 1 })), "alpha", &s1).unwrap();
-        let (_r2, wire2) =
-            register_progress(&routes, Some(&json!({ "progressToken": 1 })), "alpha", &s2).unwrap();
+        let (_r1, wire1) = register_progress(
+            &routes,
+            Some(&json!({ "progressToken": 1 })),
+            None,
+            "alpha",
+            &s1,
+        )
+        .unwrap();
+        let (_r2, wire2) = register_progress(
+            &routes,
+            Some(&json!({ "progressToken": 1 })),
+            None,
+            "alpha",
+            &s2,
+        )
+        .unwrap();
         assert_ne!(wire1, wire2, "each call gets its own downstream token");
         assert_eq!(
             routes.lock().unwrap().active.len(),
@@ -38927,6 +39481,7 @@ mod tests {
         let (registration, wire_token) = register_progress(
             &routes,
             Some(&json!({ "progressToken": "tok-1" })),
+            None,
             "alpha",
             &s1,
         )
@@ -39004,6 +39559,7 @@ mod tests {
         let (_reg, wire) = register_progress(
             &routes,
             Some(&json!({ "progressToken": "tok-1" })),
+            None,
             "alpha",
             RESOURCE_SUB_STDIO,
         )
@@ -39106,10 +39662,11 @@ mod tests {
         // leave no state behind.
         let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
         let (_stdio, _stdio_rx) = stdio_session_with_progress();
-        assert!(register_progress(&routes, None, "alpha", "stdio").is_none());
+        assert!(register_progress(&routes, None, None, "alpha", "stdio").is_none());
         assert!(register_progress(
             &routes,
             Some(&json!({ "traceparent": "x" })),
+            None,
             "alpha",
             "stdio"
         )
@@ -50068,9 +50625,12 @@ mod tests {
         let second = Arc::new(Mutex::new(ProgressRoutes::default()));
         let meta = json!({ "progressToken": 7 });
 
-        let (first_a, token_a) = register_progress(&first, Some(&meta), "alpha", "s1").unwrap();
-        let (first_b, token_b) = register_progress(&first, Some(&meta), "alpha", "s2").unwrap();
-        let (_second_a, token_c) = register_progress(&second, Some(&meta), "alpha", "s3").unwrap();
+        let (first_a, token_a) =
+            register_progress(&first, Some(&meta), None, "alpha", "s1").unwrap();
+        let (first_b, token_b) =
+            register_progress(&first, Some(&meta), None, "alpha", "s2").unwrap();
+        let (_second_a, token_c) =
+            register_progress(&second, Some(&meta), None, "alpha", "s3").unwrap();
 
         assert_ne!(token_a, token_b, "one table must never mint a token twice");
         assert_eq!(token_a, "tp-1");

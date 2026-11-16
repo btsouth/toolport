@@ -45,8 +45,7 @@ pub fn set_role(role: Role) {
 
 fn format_line(msg: &str, millis: u64, pid: u32, role: &str) -> String {
     let seconds = millis / 1000 % 86_400;
-    let msg = crate::registry::redact_secret_text(&crate::redact_url_userinfo(msg))
-        .replace(['\n', '\r'], " ");
+    let msg = crate::secret_redact::redact_log_text(msg).replace(['\n', '\r'], " ");
     format!(
         "{}T{:02}:{:02}:{:02}.{:03}Z pid={pid} role={role} {msg}",
         crate::usage_report::utc_day(millis),
@@ -90,43 +89,25 @@ pub(crate) fn line(msg: &str) -> String {
     format_line(msg, millis, std::process::id(), role)
 }
 
-/// How long an append waits for the shared log lock before writing without it.
-///
-/// Deliberately far shorter than the registry's own deadline. This lock exists
-/// only to serialize the *trim*; the append underneath it is a single `O_APPEND`
-/// write that is already safe unserialized. Waiting the registry's five seconds
-/// therefore buys nothing and costs everything: [`append`] is called four times
-/// on the gateway's startup path BEFORE it reads its first line of stdin, so
-/// under contention a client waited up to twenty seconds for its `initialize`
-/// reply and gave up long before that (SBS-1019). Trimming is best effort by
-/// design - see the `Err` arm below - so conceding the lock quickly is the
-/// cheapest thing this function can do.
-const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
-
-/// [`LOCK_WAIT`], but never shorter than an explicitly configured store deadline.
-///
-/// `TOOLPORT_LOCK_TIMEOUT_MS` may only RAISE this, never lower it: the tests that
-/// set it are asserting that a contended append genuinely waits its turn, and
-/// they cannot do that against a deadline shorter than the hold they stage. A
-/// caller that wants less contention tolerance than 250ms is asking for torn
-/// diagnostics, so the floor stands.
-fn lock_wait() -> std::time::Duration {
-    crate::brand::env_var("TOOLPORT_LOCK_TIMEOUT_MS", "CONDUIT_LOCK_TIMEOUT_MS")
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|ms| *ms > 0)
-        .map(std::time::Duration::from_millis)
-        .map_or(LOCK_WAIT, |configured| configured.max(LOCK_WAIT))
-}
-
-/// Append `msg` to `path` and trim if needed, holding the sibling lock across
-/// both so a concurrent writer cannot land a line that this process's stale
-/// trim snapshot then overwrites (SBS-869). A lock we cannot take degrades to
-/// an unlocked append rather than to a lost line.
 #[cfg(test)]
 pub(crate) fn append_to(path: &Path, msg: &str) {
     let _ = append_batch_to(path, &[msg.to_string()]);
 }
 
+/// Append `lines` to `path` and trim if needed, holding the sibling lock across
+/// both so a concurrent writer cannot land a line that this process's stale
+/// trim snapshot then overwrites (SBS-869), and so no line lands inside the
+/// secret scrub's read-and-replace of this file.
+///
+/// Every line is written under the lock or not at all. An unlocked append can
+/// be lost to the scrub's replace, or carry a secret the scrub learned after
+/// this line was formatted, so it is never a fallback. The wait is the store
+/// deadline (`TOOLPORT_LOCK_TIMEOUT_MS`, five seconds by default), not a short
+/// one: this runs only on the telemetry writer thread, which no connection
+/// waits on ([`append`] only queues, and the startup path that once waited here
+/// (SBS-1019) queues too), and every holder of this lock (another appender's
+/// write and trim, or a scrub) keeps it for one bounded read and rewrite. Past
+/// the deadline the batch is reported as failed records in telemetry health.
 pub(crate) fn append_batch_to(
     path: &Path,
     lines: &[String],
@@ -134,33 +115,20 @@ pub(crate) fn append_batch_to(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    match crate::registry::lock_at_for(path, lock_wait()) {
-        Ok(_lock) => {
-            for (index, line) in lines.iter().enumerate() {
-                append_line(path, line).map_err(|message| crate::telemetry::AppendError {
-                    message,
-                    unconfirmed: Some(lines.len() - index),
-                })?;
-            }
-            try_trim_log_if_large(path).map_err(crate::telemetry::AppendError::after_append)
-        }
-        // A contended diagnostic lock defers only rotation. No caller waits here:
-        // this runs on the telemetry writer, with each whole line in one append.
-        Err(_) => {
-            for (index, line) in lines.iter().enumerate() {
-                append_line(path, line).map_err(|message| crate::telemetry::AppendError {
-                    message,
-                    unconfirmed: Some(lines.len() - index),
-                })?;
-            }
-            Ok(())
-        }
+    let _lock = crate::registry::lock_at(path)?;
+    for (index, line) in lines.iter().enumerate() {
+        append_line(path, line).map_err(|message| crate::telemetry::AppendError {
+            message,
+            unconfirmed: Some(lines.len() - index),
+        })?;
     }
+    try_trim_log_if_large(path).map_err(crate::telemetry::AppendError::after_append)
 }
 
-/// One `O_APPEND` write of the whole record, so even the unlocked fallback
-/// cannot interleave half a line with another writer's.
+/// One `O_APPEND` write of the whole record, redacted under the caller's lock
+/// with every secret known by then.
 fn append_line(path: &Path, msg: &str) -> Result<(), String> {
+    let msg = crate::secret_redact::redact_line_for(path, msg);
     let mut file = crate::registry::open_append_private(path).map_err(|error| error.to_string())?;
     file.write_all(format!("{msg}\n").as_bytes())
         .map_err(|error| error.to_string())
@@ -431,8 +399,8 @@ mod tests {
         let attempting = root.join("attempting");
         let done = root.join("done");
         std::fs::write(&path, "SEED\n").unwrap();
-        // The child has to wait out the hold below, not time out into the
-        // unlocked fallback append. Children inherit the raised deadline.
+        // The child has to wait out the hold below, not time out and drop its
+        // line. Children inherit the raised deadline.
         let _lock_budget = crate::registry::LockTimeoutOverride::generous();
         let held = crate::registry::lock_at(&path).expect("hold the gateway log lock");
 
@@ -471,5 +439,34 @@ mod tests {
             "SEED\nUNIQUE_CHILD\n"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Failure mode: a contended append gives up on the lock after a short wait
+    /// and writes anyway, so it lands in the middle of a scrub with a secret the
+    /// scrub just learned (or is lost to the scrub's replace).
+    #[test]
+    fn a_contended_append_never_writes_without_the_lock() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let root = std::env::temp_dir().join(format!(
+            "toolport-gatewaylog-scrub-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&root);
+        let path = root.join("gateway.log");
+        std::fs::write(&path, "SEED\n").unwrap();
+        let target = path.clone();
+        let text = crate::secret_redact::append_during_scrub_for_test(
+            &path,
+            ("gatewaylog-lock", "TOKEN", "gw-late-token-H3kV9pLm"),
+            move || {
+                append_batch_to(&target, &["connect with gw-late-token-H3kV9pLm".into()]).unwrap()
+            },
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(text.starts_with("SEED\nconnect with "), "{text}");
+        assert!(!text.contains("gw-late-token-H3kV9pLm"), "{text}");
     }
 }

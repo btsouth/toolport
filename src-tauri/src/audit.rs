@@ -38,6 +38,9 @@ pub fn try_clear() -> std::io::Result<()> {
     let Some(path) = audit_path() else {
         return Ok(());
     };
+    // Under the appenders' and the scrub's lock, so neither can put cleared
+    // lines back.
+    let _lock = crate::registry::lock_at(&path).map_err(std::io::Error::other)?;
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -155,6 +158,7 @@ pub fn record_routed_call(
     client_label: Option<&str>,
     args_hash: Option<&str>,
     pii: Option<PiiPass>,
+    secrets_replaced: Option<&std::collections::BTreeMap<String, usize>>,
 ) {
     let mut entry = timed_entry(
         &crate::router::sanitize_segment(server_id),
@@ -169,6 +173,12 @@ pub fn record_routed_call(
     );
     if let Some(label) = client_label.and_then(crate::approval::sanitize_client_label) {
         entry["clientLabel"] = json!(label);
+    }
+    // Which configured secrets the result carried, by name and count: the values
+    // themselves never reach the log. Named for what it counts: replacements in
+    // the result sent to the client, not in logs or other output.
+    if let Some(replaced) = secrets_replaced.filter(|m| !m.is_empty()) {
+        entry["secretsReplacedInResult"] = json!(replaced);
     }
     if let Err(error) = crate::team_activity::record(reg, server_id, ok) {
         eprintln!("Toolport: Teams activity could not be persisted: {error}");
@@ -253,7 +263,8 @@ fn timed_entry(
     }
     if !ok {
         if let Some(err) = error {
-            let trimmed: String = err.trim().chars().take(MAX_AUDIT_ERR_CHARS).collect();
+            // Redact before cutting: a cut first could keep part of a secret.
+            let trimmed = crate::secret_redact::truncate_chars(err.trim(), MAX_AUDIT_ERR_CHARS);
             if !trimmed.is_empty() {
                 entry["error"] = json!(trimmed);
             }
@@ -1205,6 +1216,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             );
         }
         let rows = read_all().unwrap();
@@ -1230,6 +1242,50 @@ mod tests {
     }
 
     #[test]
+    fn a_call_row_names_the_secrets_its_result_carried() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("toolport-secrets-row-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let replaced: std::collections::BTreeMap<String, usize> =
+            [("API_KEY".to_string(), 2)].into_iter().collect();
+        record_routed_call(
+            &crate::registry::Registry::default(),
+            "srv",
+            "read",
+            true,
+            Some(5),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&replaced),
+        );
+        record_routed_call(
+            &crate::registry::Registry::default(),
+            "srv",
+            "plain",
+            true,
+            Some(5),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&Default::default()),
+        );
+        let rows = read_recent(10).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let read = rows.iter().find(|r| r["tool"] == "read").unwrap();
+        assert_eq!(read["secretsReplacedInResult"], json!({"API_KEY": 2}));
+        let plain = rows.iter().find(|r| r["tool"] == "plain").unwrap();
+        assert!(plain.get("secretsReplacedInResult").is_none(), "{plain}");
+    }
+
+    #[test]
     fn p08b_r1_hyphenated_call_and_approval_share_activity_server() {
         let _lock = crate::registry::data_dir_test_lock();
         let dir = std::env::temp_dir().join(format!("toolport-p08b-r1-{}", std::process::id()));
@@ -1243,6 +1299,7 @@ mod tests {
             Some(850),
             None,
             Some("adapter:claude-code"),
+            None,
             None,
             None,
             None,

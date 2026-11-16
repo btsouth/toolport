@@ -337,12 +337,25 @@ fn remember_backup_error(error: &keyring::Error) {
     BACKUP_ERROR.with(|s| s.set(Some(state)));
 }
 fn read_entry(account: &str) -> Result<Option<String>, String> {
-    match entry(account)?.get_password() {
+    read_entry_kinded(account).map_err(super::ReadFailure::into_message)
+}
+
+/// [`read_entry`] with the kind of failure: a credential blob that is not
+/// text is damaged; any other failure is Credential Manager's.
+fn read_entry_kinded(account: &str) -> Result<Option<String>, super::ReadFailure> {
+    match entry(account)
+        .map_err(super::ReadFailure::Unavailable)?
+        .get_password()
+    {
         Ok(value) => Ok(Some(value)),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(error) => {
             remember_backup_error(&error);
-            Err("Credential Manager read failed".into())
+            let message = "Credential Manager read failed".to_string();
+            Err(match error {
+                keyring::Error::BadEncoding(_) => super::ReadFailure::Damaged(message),
+                _ => super::ReadFailure::Unavailable(message),
+            })
         }
     }
 }
@@ -406,7 +419,7 @@ fn read_backoff(attempt: usize) {
 /// Read the base credential. Identical to [`read_entry`] outside tests; under
 /// `cfg(test)` it honours [`script_base_reads`] so the retry below can be driven
 /// deterministically instead of by racing a writer thread.
-fn read_base(account: &str) -> Result<Option<String>, String> {
+fn read_base(account: &str) -> Result<Option<String>, super::ReadFailure> {
     #[cfg(test)]
     {
         let scripted = BASE_READ_SCRIPT.with(|queue| queue.borrow_mut().pop_front());
@@ -414,7 +427,7 @@ fn read_base(account: &str) -> Result<Option<String>, String> {
             return Ok(None);
         }
     }
-    read_entry(account)
+    read_entry_kinded(account)
 }
 
 fn delete_entry(account: &str) -> Result<(), String> {
@@ -1001,6 +1014,14 @@ pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String>
 }
 
 pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
+    read_secret(server_id, key).map_err(super::ReadFailure::into_message)
+}
+
+/// [`get_secret_result`] with the kind of failure: a manifest that does not
+/// parse, a missing chunk or a failed checksum is damaged data; a Credential
+/// Manager read that fails is the store's.
+pub fn read_secret(server_id: &str, key: &str) -> Result<Option<String>, super::ReadFailure> {
+    use super::ReadFailure::Damaged;
     let _lock = credential_lock();
     let base = account(server_id, key);
     // Keep the most recent integrity error. A later transient absence must not
@@ -1013,13 +1034,13 @@ pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, S
                 if let Some(direct) = parse_direct_value(&value) {
                     return Ok(Some(direct));
                 }
-                let Some(manifest) = parse_manifest(&value)? else {
+                let Some(manifest) = parse_manifest(&value).map_err(Damaged)? else {
                     return Ok(Some(value));
                 };
                 let mut combined = String::new();
                 let mut failed = None;
                 for index in 0..manifest.count {
-                    match read_entry(&chunk_account(&base, &manifest.generation, index))? {
+                    match read_entry_kinded(&chunk_account(&base, &manifest.generation, index))? {
                         Some(chunk) => combined.push_str(&chunk),
                         None => {
                             failed = Some(format!("Windows credential chunk {index} is missing"));
@@ -1051,7 +1072,7 @@ pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, S
         }
     }
     match last_error {
-        Some(error) => Err(error),
+        Some(error) => Err(Damaged(error)),
         // Absent on every attempt: the credential really is gone.
         None => Ok(None),
     }

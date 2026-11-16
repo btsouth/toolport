@@ -14,6 +14,7 @@
 // Needs a debug build first:
 //   npm run build:gateway
 
+import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -177,6 +178,17 @@ for (const [signal, code] of [
   });
 }
 
+// TOOLPORT_BENCH_SECRETS=N gives the mock N inline token values, so the run
+// measures the gateway with that many secrets registered for redaction.
+function benchSecrets() {
+  const count = Number(process.env.TOOLPORT_BENCH_SECRETS || 0);
+  return Array.from({ length: count }, (_, i) => ({
+    key: `BENCH_API_TOKEN_${i}`,
+    value: `bench-${i}-${randomBytes(12).toString("hex")}`,
+    secret: false,
+  }));
+}
+
 async function main() {
   const dir = mkdtempSync(join(tmpdir(), "conduit-lat-"));
   scratch = dir;
@@ -203,7 +215,7 @@ async function main() {
           transport: "stdio",
           command: MOCK,
           args: [],
-          env: [],
+          env: benchSecrets(),
         },
       ],
       profiles: [{ id: "bench", name: "Bench", enabledServerIds: ["mock"] }],

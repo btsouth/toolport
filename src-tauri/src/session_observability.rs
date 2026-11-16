@@ -433,6 +433,34 @@ impl Drop for Session {
 mod tests {
     use super::*;
     #[test]
+    fn a_secret_used_as_a_host_thread_never_reaches_the_audit_log() {
+        let data = crate::registry::DataDirTestEnv::new("host-thread-secret");
+        let secret = "sk-HostThreadSecret77";
+        crate::secret_redact::register("srv", "KEY", secret);
+        let host = crate::host_attribution::Host {
+            host: crate::host_attribution::T3_CODE.into(),
+            thread: Some(secret.into()),
+        };
+        let session = Session::start_hosted(
+            Some("adapter:claude-code"),
+            None,
+            None,
+            None,
+            Some(&host),
+            "stdio",
+            "initialize",
+        );
+        session.close(CloseReason::Reinitialize);
+        assert!(crate::telemetry::flush_for_test(
+            std::time::Duration::from_secs(5)
+        ));
+        let text = std::fs::read_to_string(data.dir.join("audit.jsonl")).unwrap();
+        assert!(!text.contains(secret), "{text}");
+        assert!(text.contains("\"hostThread\":\"[secret:KEY]\""), "{text}");
+        assert!(text.contains("\"host\":\"t3-code\""), "{text}");
+    }
+
+    #[test]
     fn private_principals_never_reach_new_telemetry_rows() {
         let data = crate::registry::DataDirTestEnv::new("f3-private-principals");
         for id in [

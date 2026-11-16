@@ -95,6 +95,15 @@ fn write_line(entry: &Value) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    // Shared with the secret scrub's rewrite, so a capture cannot land between its
+    // read and replace and be lost. A capture that cannot take it is dropped, never
+    // written unlocked: it could carry a secret the scrub learned meanwhile.
+    let Ok(_lock) = crate::registry::lock_at(&path) else {
+        return;
+    };
+    // Redacted under the lock, with every secret known by now.
+    let mut entry = entry.clone();
+    crate::secret_redact::redact_value(&mut entry);
     // Owner-only from creation: these are raw request and response bodies, so
     // arguments that may carry secrets and PII (SBS-868).
     if let Ok(mut file) = crate::registry::open_append_private(&path) {
@@ -150,6 +159,9 @@ pub fn try_clear() -> std::io::Result<()> {
     let Some(path) = inspect_path() else {
         return Ok(());
     };
+    // Under the scrub's lock, so a scrub that read the file first cannot put the
+    // cleared captures back.
+    let _lock = crate::registry::lock_at(&path).map_err(std::io::Error::other)?;
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -166,6 +178,33 @@ pub fn clear() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Failure mode: the capture is redacted before the lock is taken (and
+    /// written anyway when the lock is not), so a capture queued behind a scrub
+    /// keeps a secret the scrub just learned.
+    #[test]
+    fn capture_waits_for_the_scrub_lock_and_redacts_inside_it() {
+        let _data_dir = crate::registry::data_dir_test_lock();
+        let (_override, root) = isolated_data_dir("scrub-lock");
+        let text = crate::secret_redact::append_during_scrub_for_test(
+            &root.join("inspect.jsonl"),
+            ("inspect-lock", "TOKEN", "inspect-late-token-W5nB3qYe"),
+            || {
+                record(
+                    None,
+                    "github",
+                    "search",
+                    &json!({ "q": "inspect-late-token-W5nB3qYe" }),
+                    &json!({ "ok": true }),
+                    true,
+                    1,
+                )
+            },
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(text.contains("\"server\":\"github\""), "{text}");
+        assert!(!text.contains("inspect-late-token-W5nB3qYe"), "{text}");
+    }
 
     #[test]
     fn record_then_read_recent_returns_it() {

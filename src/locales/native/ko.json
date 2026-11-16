@@ -1189,5 +1189,6 @@
   "Imported {value0} server. Needs input: {value1}": "서버 {value0}개를 가져왔습니다. 입력 필요: {value1}",
   "\n{value0} baseline tokens − {value1} catalog response tokens − {value2} search response tokens = {value3} net token change. A negative change means responses used more tokens than the baseline.\n{value4} client sessions; {value5} catalog responses; {value6} search responses.\n{value7} baseline catalog text; {value8} catalog text sent; {value9} search text sent.": "\n기준 Token {value0} − 카탈로그 응답 Token {value1} − 검색 응답 Token {value2} = 순 Token 변화 {value3}. 음수이면 응답에 기준보다 많은 Token이 사용되었다는 뜻입니다.\n클라이언트 세션 {value4}개; 카탈로그 응답 {value5}개; 검색 응답 {value6}개.\n기준 카탈로그 텍스트 {value7}; 전송된 카탈로그 텍스트 {value8}; 전송된 검색 텍스트 {value9}.",
   "{value0} extra tokens": "{value0} Token 추가",
-  "Toolport recorded a net token change of -{value1}. Full catalog baselines minus all catalog and search responses; counted locally with cl100k_base, not a billing figure. toolport.app": "Toolport가 기록한 순 Token 변화: -{value1}. 전체 카탈로그 기준에서 모든 카탈로그 및 검색 응답을 뺀 값이며 cl100k_base로 로컬에서 계산합니다. 청구 수치가 아닙니다. toolport.app"
+  "Toolport recorded a net token change of -{value1}. Full catalog baselines minus all catalog and search responses; counted locally with cl100k_base, not a billing figure. toolport.app": "Toolport가 기록한 순 Token 변화: -{value1}. 전체 카탈로그 기준에서 모든 카탈로그 및 검색 응답을 뺀 값이며 cl100k_base로 로컬에서 계산합니다. 청구 수치가 아닙니다. toolport.app",
+  "The old value could not be kept for its log cleanup, so nothing was changed. Try again.": "로그 정리를 위해 이전 값을 보관할 수 없어 아무것도 변경하지 않았습니다. 다시 시도하세요."
 }

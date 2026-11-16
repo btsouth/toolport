@@ -1189,5 +1189,6 @@
   "Imported {value0} server. Needs input: {value1}": "{value0} 件のサーバーをインポートしました。入力が必要です: {value1}",
   "\n{value0} baseline tokens − {value1} catalog response tokens − {value2} search response tokens = {value3} net token change. A negative change means responses used more tokens than the baseline.\n{value4} client sessions; {value5} catalog responses; {value6} search responses.\n{value7} baseline catalog text; {value8} catalog text sent; {value9} search text sent.": "\n基準のToken数 {value0} − カタログ応答のToken数 {value1} − 検索応答のToken数 {value2} = 正味のToken変化量 {value3}。マイナスの場合、応答で使われたToken数が基準を上回ったことを示します。\nクライアントセッション{value4}件、カタログ応答{value5}件、検索応答{value6}件。\n基準カタログのテキスト量：{value7}、送信したカタログのテキスト量：{value8}、送信した検索テキスト量：{value9}。",
   "{value0} extra tokens": "{value0} Token 追加",
-  "Toolport recorded a net token change of -{value1}. Full catalog baselines minus all catalog and search responses; counted locally with cl100k_base, not a billing figure. toolport.app": "Toolportが記録した正味のToken変化量：-{value1}。全カタログの基準値から、すべてのカタログ応答と検索応答を差し引き、cl100k_baseでローカルに計算しています。請求額を示す数値ではありません。toolport.app"
+  "Toolport recorded a net token change of -{value1}. Full catalog baselines minus all catalog and search responses; counted locally with cl100k_base, not a billing figure. toolport.app": "Toolportが記録した正味のToken変化量：-{value1}。全カタログの基準値から、すべてのカタログ応答と検索応答を差し引き、cl100k_baseでローカルに計算しています。請求額を示す数値ではありません。toolport.app",
+  "The old value could not be kept for its log cleanup, so nothing was changed. Try again.": "ログの消去のために古い値を保持できなかったため、何も変更していません。もう一度お試しください。"
 }

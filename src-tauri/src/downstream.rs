@@ -220,6 +220,42 @@ pub(crate) fn header_param_specs(tool: &Value) -> Result<Vec<HeaderParamSpec>, S
     Ok(specs)
 }
 
+/// A definition (tool, prompt, resource or template) that carries a configured
+/// secret's value is advertised with the value replaced, before anything
+/// (clients, search, the tool cache, integrity pins) sees it, and the server and
+/// item are reported as a security event. Calls still reach the item by the
+/// name the server advertised ([`crate::secret_redact::upstream_identifier`]).
+///
+/// The identifier mapping is returned uncommitted: the caller commits it when
+/// the screened catalog replaces the advertised one, so a refresh that keeps the
+/// previous catalog keeps the mapping that goes with it.
+fn screen_definitions_for_secrets(
+    server_id: &str,
+    catalog: crate::secret_redact::Catalog,
+    items: &mut Vec<Value>,
+) -> crate::secret_redact::Screened {
+    let screened = crate::secret_redact::screen_definitions(server_id, catalog, items);
+    for item in &screened.refused {
+        let message = format!(
+            "toolport: server '{server_id}' put a configured secret in the {} identifier '{item}', and its alias collided with another; the item is not advertised",
+            catalog.as_str()
+        );
+        eprintln!("{message}");
+        crate::gatewaylog::append(&message);
+    }
+    for (tool, secrets) in &screened.flagged {
+        let message = format!(
+            "toolport: server '{server_id}' put a configured secret ({}) in the definition of {} '{tool}'; it is advertised with the value replaced",
+            secrets.join(", "),
+            catalog.as_str()
+        );
+        eprintln!("{message}");
+        crate::gatewaylog::append(&message);
+        crate::integrity::record_secret_in_definition(server_id, tool, secrets);
+    }
+    screened
+}
+
 fn filter_modern_http_tools(server_id: &str, tools: Vec<Value>) -> Vec<Value> {
     tools
         .into_iter()
@@ -4098,10 +4134,13 @@ impl StdioCore {
             .try_wait()
             .ok()
             .flatten();
+        // Redacted here, where it is still the whole kept tail: its first line
+        // may begin inside a secret the ring cut, and a secret may be wrapped
+        // across lines; every sink after this sees only one message.
         let tail = self
             .stderr
             .lock()
-            .map(|b| b.trim().to_string())
+            .map(|b| crate::secret_redact::redact_excerpt(&b).trim().to_string())
             .unwrap_or_default();
         let mut msg = String::from("downstream server exited");
         if let Some(code) = status.and_then(|s| s.code()) {
@@ -8867,11 +8906,13 @@ impl DownstreamServer {
             .into());
         }
         let modern_http = matches!(era, Era::Modern { .. }) && transport.supports_request_headers();
-        let tools = if modern_http {
+        let mut tools = if modern_http {
             filter_modern_http_tools(&id, listed.items)
         } else {
             listed.items
         };
+        screen_definitions_for_secrets(&id, crate::secret_redact::Catalog::Tool, &mut tools)
+            .commit();
 
         // MCP Apps is advertised only for capability-aware catalog fetches.
         // Restore Toolport's ordinary per-request metadata before any live call
@@ -9065,12 +9106,17 @@ impl DownstreamServer {
         }
         let refreshed = match listed {
             Ok(listed) if listed.warning.is_none() => {
-                let new_tools = if self.modern_http {
+                let mut new_tools = if self.modern_http {
                     filter_modern_http_tools(&self.id, listed.items)
                 } else {
                     listed.items
                 };
-                apply_catalog_refresh(
+                let screened = screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Tool,
+                    &mut new_tools,
+                );
+                let applied = apply_catalog_refresh(
                     &mut self.tools,
                     new_tools,
                     &mut self.shrink_tools_streak,
@@ -9078,7 +9124,11 @@ impl DownstreamServer {
                     listed.cache_hint,
                     &self.id,
                     "tool",
-                )
+                );
+                if applied {
+                    screened.commit();
+                }
+                applied
             }
             Ok(listed) => {
                 self.tool_cache_hint.mark_stale_and_defer();
@@ -9132,15 +9182,24 @@ impl DownstreamServer {
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
         match fetch_paginated_list(&mut *self.transport, "resources/list", "resources") {
             Ok(listed) if listed.warning.is_none() => {
-                apply_catalog_refresh(
+                let mut items = listed.items;
+                let screened = screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Resource,
+                    &mut items,
+                );
+                let applied = apply_catalog_refresh(
                     &mut self.resources,
-                    listed.items,
+                    items,
                     &mut self.shrink_resources_streak,
                     &mut self.resource_cache_hint,
                     listed.cache_hint,
                     &self.id,
                     "resource",
                 );
+                if applied {
+                    screened.commit();
+                }
             }
             Ok(listed) => {
                 self.resource_cache_hint.mark_stale_and_defer();
@@ -9166,15 +9225,24 @@ impl DownstreamServer {
             "resourceTemplates",
         ) {
             Ok(listed) if listed.warning.is_none() => {
-                apply_catalog_refresh(
+                let mut items = listed.items;
+                let screened = screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Template,
+                    &mut items,
+                );
+                let applied = apply_catalog_refresh(
                     &mut self.resource_templates,
-                    listed.items,
+                    items,
                     &mut self.shrink_templates_streak,
                     &mut self.resource_template_cache_hint,
                     listed.cache_hint,
                     &self.id,
                     "resource-template",
                 );
+                if applied {
+                    screened.commit();
+                }
             }
             Ok(listed) => {
                 self.resource_template_cache_hint.mark_stale_and_defer();
@@ -9215,15 +9283,24 @@ impl DownstreamServer {
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
         match fetch_paginated_list(&mut *self.transport, "prompts/list", "prompts") {
             Ok(listed) if listed.warning.is_none() => {
-                apply_catalog_refresh(
+                let mut items = listed.items;
+                let screened = screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Prompt,
+                    &mut items,
+                );
+                let applied = apply_catalog_refresh(
                     &mut self.prompts,
-                    listed.items,
+                    items,
                     &mut self.shrink_prompts_streak,
                     &mut self.prompt_cache_hint,
                     listed.cache_hint,
                     &self.id,
                     "prompt",
                 );
+                if applied {
+                    screened.commit();
+                }
             }
             Ok(listed) => {
                 self.prompt_cache_hint.mark_stale_and_defer();
@@ -9262,7 +9339,14 @@ impl DownstreamServer {
                     );
                 }
                 self.resource_cache_hint = listed.cache_hint;
-                self.resources = listed.items;
+                let mut items = listed.items;
+                screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Resource,
+                    &mut items,
+                )
+                .commit();
+                self.resources = items;
             }
             if let Ok(listed) = fetch_paginated_list(
                 &mut *self.transport,
@@ -9276,7 +9360,14 @@ impl DownstreamServer {
                     );
                 }
                 self.resource_template_cache_hint = listed.cache_hint;
-                self.resource_templates = listed.items;
+                let mut items = listed.items;
+                screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Template,
+                    &mut items,
+                )
+                .commit();
+                self.resource_templates = items;
             }
         }
         if self.caps_prompts {
@@ -9290,7 +9381,14 @@ impl DownstreamServer {
                     );
                 }
                 self.prompt_cache_hint = listed.cache_hint;
-                self.prompts = listed.items;
+                let mut items = listed.items;
+                screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Prompt,
+                    &mut items,
+                )
+                .commit();
+                self.prompts = items;
             }
         }
     }
@@ -9351,6 +9449,15 @@ impl DownstreamServer {
     /// this downstream (SOU-394). The gateway only calls this when at least one
     /// upstream client is subscribed to the same URI.
     pub fn subscribe_resource(&mut self, uri: &str) -> Result<Value, TransportError> {
+        // The server's own URI, before either path: an advertised alias means
+        // nothing to it.
+        let uri = crate::secret_redact::upstream_identifier(
+            self.server_id(),
+            crate::secret_redact::Catalog::Resource,
+            uri,
+        )
+        .into_owned();
+        let uri = uri.as_str();
         if matches!(self.era, Era::Modern { .. }) {
             if self.modern_resource_subscriptions.insert(uri.to_string()) {
                 let mut resource_subscriptions: Vec<String> =
@@ -9377,6 +9484,15 @@ impl DownstreamServer {
 
     /// Drop a previously established downstream resource subscription.
     pub fn unsubscribe_resource(&mut self, uri: &str) -> Result<Value, TransportError> {
+        // The server's own URI, before either path: an advertised alias means
+        // nothing to it.
+        let uri = crate::secret_redact::upstream_identifier(
+            self.server_id(),
+            crate::secret_redact::Catalog::Resource,
+            uri,
+        )
+        .into_owned();
+        let uri = uri.as_str();
         if matches!(self.era, Era::Modern { .. }) {
             if self.modern_resource_subscriptions.remove(uri) {
                 let mut resource_subscriptions: Vec<String> =
@@ -9694,6 +9810,18 @@ pub trait ServerDispatch {
         } else {
             Vec::new()
         };
+        // A name or argument key the server advertised with a secret in it was
+        // shown to clients with the marker; send the server its own text.
+        let tool = crate::secret_redact::upstream_identifier(
+            self.server_id(),
+            crate::secret_redact::Catalog::Tool,
+            tool,
+        );
+        let arguments = crate::secret_redact::upstream_arguments(
+            self.server_id(),
+            crate::secret_redact::Catalog::Tool,
+            arguments,
+        );
         self.request_with_mrtr(
             "tools/call",
             json!({ "name": tool, "arguments": arguments }),
@@ -9711,6 +9839,11 @@ pub trait ServerDispatch {
         meta: Option<&Value>,
         mrtr: Option<&MrtrRequest>,
     ) -> Result<Value, TransportError> {
+        let uri = crate::secret_redact::upstream_identifier(
+            self.server_id(),
+            crate::secret_redact::Catalog::Resource,
+            uri,
+        );
         self.request_with_mrtr(
             "resources/read",
             json!({ "uri": uri }),
@@ -9729,6 +9862,16 @@ pub trait ServerDispatch {
         meta: Option<&Value>,
         mrtr: Option<&MrtrRequest>,
     ) -> Result<Value, TransportError> {
+        let name = crate::secret_redact::upstream_identifier(
+            self.server_id(),
+            crate::secret_redact::Catalog::Prompt,
+            name,
+        );
+        let arguments = crate::secret_redact::upstream_arguments(
+            self.server_id(),
+            crate::secret_redact::Catalog::Prompt,
+            arguments,
+        );
         self.request_with_mrtr(
             "prompts/get",
             json!({ "name": name, "arguments": arguments }),
@@ -14129,6 +14272,34 @@ for line in sys.stdin:
         fixture.finish();
     }
 
+    #[test]
+    fn a_stderr_tail_never_reports_a_piece_of_a_secret() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-tail-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        crate::secret_redact::register("tail-server", "TAIL_KEY", "sk-TailSecret789xyz");
+        // The kept tail starts inside one secret (the ring trimmed the rest) and
+        // a tool wrapped another across a line break.
+        let mut fixture = CoreFixture::new(
+            "tail",
+            "Secret789xyz was rejected\nretrying with sk-Tail\nSecret789xyz\n",
+        );
+        let waiter = fixture.request("a", json!({ "name": "one" }), None);
+        fixture.wait_for_pending(1);
+        fixture.close_stdout();
+        match waiter.join().unwrap() {
+            Err(TransportError::Unavailable(message)) => {
+                assert!(message.contains("was rejected"), "{message}");
+                for piece in ["Secret789", "sk-Tail", "789xyz"] {
+                    assert!(!message.contains(piece), "{piece} in {message}");
+                }
+            }
+            other => panic!("expected the exit to fail the call, got {other:?}"),
+        }
+        fixture.finish();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn server_request(id: &str, method: &str) -> Value {
         json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": {} })
     }
@@ -16385,6 +16556,46 @@ for line in sys.stdin:
                 .resource_subscriptions,
             vec!["fixture://a".to_string()]
         );
+        // A resource whose URI holds a secret is advertised under an alias;
+        // the server is subscribed to its own URI, and unsubscribed from it.
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-sub-alias-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        crate::secret_redact::register("modern", "RES_KEY", "res-secret-4Kp9Wz");
+        let mut resources = vec![json!({"uri": "mem://res-secret-4Kp9Wz/doc", "name": "r"})];
+        crate::secret_redact::screen_definitions(
+            "modern",
+            crate::secret_redact::Catalog::Resource,
+            &mut resources,
+        )
+        .commit();
+        let alias = resources[0]["uri"].as_str().unwrap().to_string();
+        assert!(alias.contains("[secret:"), "{alias}");
+        server.subscribe_resource(&alias).unwrap();
+        let listened = filters
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .resource_subscriptions
+            .clone();
+        server.unsubscribe_resource(&alias).unwrap();
+        let after = filters
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .resource_subscriptions
+            .clone();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            listened,
+            vec![
+                "fixture://a".to_string(),
+                "mem://res-secret-4Kp9Wz/doc".to_string()
+            ]
+        );
+        assert_eq!(after, vec!["fixture://a".to_string()]);
         assert!(
             requests
                 .lock()

@@ -832,6 +832,22 @@ fn read_cli(
     Ok(value)
 }
 pub fn resolve(reference: &str) -> Result<String, ResolveError> {
+    let value = resolve_uncached(reference)?;
+    crate::secret_redact::register("reference", reference_name(reference), &value);
+    Ok(value)
+}
+
+/// The last path segment of a reference (`op://vault/item/field` -> `field`), used
+/// only as the redaction marker's name.
+fn reference_name(reference: &str) -> &str {
+    reference
+        .trim_end_matches('/')
+        .rsplit(['/', ':'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or("reference")
+}
+
+fn resolve_uncached(reference: &str) -> Result<String, ResolveError> {
     let p = parse(reference)?;
     if p.scheme == "env:" {
         return std::env::var(&reference[4..])
@@ -1063,8 +1079,187 @@ fn resolved_server_with_values(
             i.value = Some(values[r].clone());
         }
     }
+    register_inline_secrets(&resolved);
     Ok(resolved)
 }
+
+/// The startup preload of the desktop shells and of every gateway role:
+/// inline values only, for every server. It reads no vault value, so a start
+/// can never raise or wait on an unlock prompt, and no process reads a
+/// credential it does not need. A vault value is registered when it is first
+/// read for real use (editing, a test, the launch of its server).
+pub fn preload_inline_secrets() {
+    let Ok(reg) = crate::registry::load_resolved() else {
+        return;
+    };
+    for server in &reg.servers {
+        register_inline_secrets(server);
+    }
+}
+
+/// Register every secret value a server entry carries itself (inline `secret`
+/// env values and launch inputs, and references once resolved) with the
+/// redactor, before anything is launched or sent with them. Vault reads register
+/// on their own ([`crate::secrets`]); this covers the values that never pass
+/// through the vault. Every stdio launch resolves through [`resolve_server`],
+/// and remote connects call this directly.
+pub fn register_inline_secrets(server: &ServerEntry) {
+    for e in &server.env {
+        let Some(value) = &e.value else { continue };
+        // An unflagged inline value is protected too when its name says it is a
+        // credential or it has a known token prefix: a hand-edited registry need
+        // not set the flag. The value-shape guesses used at import (a long
+        // random-looking string) are not used here: a path or id they flag would
+        // then be redacted from every log line and every result that carries it.
+        let token_prefix = [
+            "sk-",
+            "ghp_",
+            "gho_",
+            "github_pat_",
+            "xox",
+            "AKIA",
+            "-----BEGIN",
+        ]
+        .iter()
+        .any(|prefix| value.trim_start().starts_with(prefix));
+        let by_name = crate::import_credentials::secret_env(&e.key, None)
+            && credential_shaped(value)
+            && (crate::import_credentials::secret_word_is_last(&e.key) || looks_random(value));
+        if e.secret || token_prefix || by_name {
+            crate::secret_redact::register(&server.id, &e.key, value);
+        }
+    }
+    // The mask also marks the value after a split flag (`--token` `value`).
+    let mask = crate::registry::secret_arg_mask(&server.args);
+    for (arg, _) in server.args.iter().zip(mask).filter(|(_, masked)| *masked) {
+        if let Some(credential) = arg_credential(arg) {
+            crate::secret_redact::register(&server.id, "arg", credential);
+        }
+    }
+    // Credential parts of a configured URL, never the bare URL or the username.
+    if let Some(url) = server.url.as_deref().and_then(|u| url::Url::parse(u).ok()) {
+        if let Some(password) = url.password() {
+            crate::secret_redact::register(&server.id, "url_password", password);
+        }
+        for (name, value) in url.query_pairs() {
+            if crate::import_credentials::secret_url_name(&name)
+                || crate::registry::arg_looks_secret(&value)
+            {
+                crate::secret_redact::register(&server.id, &name, &value);
+            }
+        }
+        let mut after_secret_name = false;
+        for segment in url.path_segments().into_iter().flatten() {
+            let decoded = urlencoding::decode(segment)
+                .map(|d| d.into_owned())
+                .unwrap_or_else(|_| segment.to_string());
+            if after_secret_name || crate::registry::arg_looks_secret(&decoded) {
+                crate::secret_redact::register(&server.id, "url_path", &decoded);
+            }
+            after_secret_name = crate::import_credentials::secret_url_name(&decoded);
+        }
+    }
+    for i in server
+        .launch
+        .iter()
+        .flat_map(|l| &l.inputs)
+        .filter(|i| i.secret)
+    {
+        if let Some(value) = &i.value {
+            crate::secret_redact::register(&server.id, &i.key, value);
+        }
+    }
+}
+
+/// Whether a value registered by its name alone looks like a credential.
+///
+/// A name such as `AUTH_ENABLED` or `TOKEN_TTL` matches a credential word but
+/// holds a setting, and a registered `true` or `3600` would be replaced in
+/// every result and log line. So a value registered for its name alone must
+/// be at least 8 characters and must not be a switch word, a plain number,
+/// duration or size (digits with an optional unit), or a path or URL with no
+/// credentials in it (no password, no query, no path segment of 16 or more
+/// characters). Where the credential word sits matters too: when it ends the
+/// name (`API_KEY`, `GITHUB_TOKEN`, `BASIC_AUTH`) that shape is enough, but when
+/// another word follows it (`AUTH_METHOD`, `TOKEN_TYPE`, `KEY_FILE`) the name
+/// describes a setting, and the value is registered only if it also looks
+/// random: 16 or more characters with both a letter and a digit. A value
+/// flagged `secret`, one with a known token prefix, and one read from the
+/// vault are always registered.
+fn credential_shaped(value: &str) -> bool {
+    let value = value.trim();
+    if value.chars().count() < 8 {
+        return false;
+    }
+    const SWITCHES: [&str; 10] = [
+        "true", "false", "yes", "no", "on", "off", "null", "none", "enabled", "disabled",
+    ];
+    if SWITCHES.iter().any(|w| value.eq_ignore_ascii_case(w)) {
+        return false;
+    }
+    let digits = value.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let unit = value.len() - digits.len();
+    if unit <= 3
+        && digits.starts_with(|c: char| c.is_ascii_digit())
+        && digits
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == '_')
+    {
+        return false;
+    }
+    if value.starts_with(['/', '~', '.']) || value.get(1..3) == Some(":\\") {
+        return false;
+    }
+    if let Ok(url) = url::Url::parse(value) {
+        // A webhook carries its token in the path: a long segment counts.
+        let plain_path = url
+            .path_segments()
+            .into_iter()
+            .flatten()
+            .all(|segment| segment.len() < 16);
+        if url.has_host() && url.password().is_none() && url.query().is_none() && plain_path {
+            return false;
+        }
+    }
+    true
+}
+
+/// At least 16 characters with both a letter and a digit, for a value whose
+/// name only qualifies a credential word ([`credential_shaped`]).
+fn looks_random(value: &str) -> bool {
+    let value = value.trim();
+    value.chars().count() >= 16
+        && value.chars().any(|c| c.is_ascii_alphabetic())
+        && value.chars().any(|c| c.is_ascii_digit())
+}
+
+/// The credential in a masked argument: the value of `--flag=value`, nothing
+/// for `--flag=` (its value is the next entry), else the whole entry. A header
+/// (`Authorization: Bearer tok`) gives its value without its name, so the
+/// bearer form and its bare token are registered and the name is not.
+fn arg_credential(arg: &str) -> Option<&str> {
+    let value = match arg.split_once('=') {
+        Some((name, value)) if name.starts_with('-') && !name.contains(char::is_whitespace) => {
+            value
+        }
+        _ => arg,
+    };
+    let value = match value.split_once(':') {
+        Some((name, rest))
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                && rest.starts_with(' ') =>
+        {
+            rest
+        }
+        _ => value,
+    };
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
+}
+
 pub fn has_references(server: &ServerEntry) -> bool {
     server
         .env
@@ -1169,6 +1364,112 @@ mod tests {
 
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Failure mode: a credential passed as `--token` `value` was not
+    /// registered (the value entry looks like nothing on its own), and one
+    /// passed as `--token=value` was registered only with its flag, so the
+    /// value echoed alone was written in clear.
+    #[test]
+    fn inline_credential_flags_register_the_value_split_or_joined() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-inline-args-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        let server: crate::registry::ServerEntry = serde_json::from_str(
+            r#"{"id":"inline-args","name":"Inline","source":"fixture","transport":"stdio","command":"node","args":["server.js","--token","abcDEF9split","--api-key=abcDEF9joined","--token=","abcDEF9empty","--verbose","--header","Authorization: Bearer hdrSplit7Qx2Lm","--header=X-Api-Key: hdrJoined4Rt8Wn"],"inheritEnv":false,"env":[]}"#,
+        )
+        .unwrap();
+        super::register_inline_secrets(&server);
+        let out = crate::secret_redact::redact_text(
+            "split abcDEF9split joined abcDEF9joined empty abcDEF9empty --token= --verbose server.js",
+        );
+        // A header argument registers its credential, never its header name:
+        // a window of the name would replace that ordinary word everywhere.
+        let headers = crate::secret_redact::redact_text(
+            "bare hdrSplit7Qx2Lm and hdrJoined4Rt8Wn; Authorization required, X-Api-Key missing",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            out,
+            "split [secret:arg] joined [secret:arg] empty [secret:arg] --token= --verbose server.js"
+        );
+        assert_eq!(
+            headers,
+            "bare [secret:arg] and [secret:arg]; Authorization required, X-Api-Key missing"
+        );
+    }
+
+    /// Failure mode: the startup preload (the shells' and every gateway
+    /// role's) read the vault of every server, so a locked keyring could raise
+    /// an unlock prompt at start, or hold a gateway start on an unanswered one,
+    /// for credentials the process did not need.
+    #[test]
+    fn no_startup_preload_reads_a_vault_value() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let registry = crate::registry::Registry {
+                servers: serde_json::from_value(serde_json::json!([
+                    {"id":"pre-on","name":"On","enabled":true,"source":"fixture","transport":"stdio","command":"node","args":[],"inheritEnv":false,"env":[{"key":"ON_TOKEN","secret":true}]},
+                    {"id":"pre-off","name":"Off","enabled":false,"source":"fixture","transport":"stdio","command":"node","args":[],"inheritEnv":false,"env":[{"key":"OFF_TOKEN","secret":true}]},
+                    {"id":"pre-inline","name":"Inline","enabled":true,"source":"fixture","transport":"stdio","command":"node","args":[],"inheritEnv":false,"env":[{"key":"INLINE_TOKEN","value":"pre-inline-value-6Tz1","secret":true}]}
+                ]))
+                .unwrap(),
+                ..Default::default()
+            };
+            crate::registry::save(&registry).unwrap();
+            let reads = crate::secrets::tests::reads_during(super::preload_inline_secrets);
+            assert!(reads.is_empty(), "{reads:?}");
+            assert_eq!(
+                crate::secret_redact::redact_text("got pre-inline-value-6Tz1"),
+                "got [secret:INLINE_TOKEN]"
+            );
+        });
+    }
+
+    /// Failure mode: an unflagged env value was registered by its name alone,
+    /// and a name such as `AUTH_ENABLED` carries ordinary settings: `true`,
+    /// `3600` or `8` was then replaced wherever it appeared in a result.
+    #[test]
+    fn ordinary_settings_with_credential_names_are_not_registered() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-inline-env-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        let server: crate::registry::ServerEntry = serde_json::from_str(
+            r#"{"id":"inline-env","name":"Inline","source":"fixture","transport":"stdio","command":"node","args":[],"inheritEnv":false,"env":[
+                {"key":"AUTH_ENABLED","value":"true"},
+                {"key":"TOKEN_TTL","value":"3600"},
+                {"key":"PASSWORD_MIN","value":"8"},
+                {"key":"USE_API_KEY","value":"1"},
+                {"key":"TOKEN_CACHE_DIR","value":"/var/cache/tokens"},
+                {"key":"AUTH_URL","value":"https://auth.example.invalid/login"},
+                {"key":"TOKEN_TIMEOUT","value":"1500ms"},
+                {"key":"API_KEY","value":"abcd1234efgh"},
+                {"key":"DB_PASSWORD","value":"postgres://app:pw-Zx81kq@db.example.invalid/app"},
+                {"key":"HOOK_TOKEN","value":"https://hooks.example.invalid/services/abcdEFGHijklMNOPqrst"},
+                {"key":"AUTH_METHOD","value":"password"},
+                {"key":"OAUTH_FLOW","value":"authorization_code"},
+                {"key":"AUTH_PROVIDER","value":"github-oauth"},
+                {"key":"TOKEN_TYPE","value":"bearer_token"},
+                {"key":"KEY_FILE","value":"keys.json"},
+                {"key":"GITHUB_TOKEN","value":"correcthorsebatterystaple"},
+                {"key":"API_KEY_OVERRIDE","value":"zyxw9876vuts5432rqpo"},
+                {"key":"PIN","value":"4821","secret":true}
+            ]}"#,
+        )
+        .unwrap();
+        super::register_inline_secrets(&server);
+        let ordinary = r#"{"enabled": true, "ttl": 3600, "min": 8, "use": 1} /var/cache/tokens https://auth.example.invalid/login 1500ms password authorization_code github-oauth bearer_token keys.json"#;
+        let kept = crate::secret_redact::redact_text(ordinary).into_owned();
+        let secrets = crate::secret_redact::redact_text(
+            "key abcd1234efgh pass postgres://app:pw-Zx81kq@db.example.invalid/app hook https://hooks.example.invalid/services/abcdEFGHijklMNOPqrst pin 4821 gh correcthorsebatterystaple override zyxw9876vuts5432rqpo",
+        )
+        .into_owned();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(kept, ordinary);
+        assert_eq!(
+            secrets,
+            "key [secret:API_KEY] pass [secret:DB_PASSWORD] hook [secret:HOOK_TOKEN] pin [secret:PIN] gh [secret:GITHUB_TOKEN] override [secret:API_KEY_OVERRIDE]"
+        );
+    }
+
     struct Scratch(PathBuf);
     impl Scratch {
         fn new() -> Self {

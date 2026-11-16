@@ -338,7 +338,13 @@ mod platform {
     }
 
     pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
-        dpk::get(&account(server_id, key))
+        read_secret(server_id, key).map_err(super::ReadFailure::into_message)
+    }
+
+    /// [`get_secret_result`] with the kind of failure: an item whose data is
+    /// not text is damaged; every keychain status is the store's.
+    pub fn read_secret(server_id: &str, key: &str) -> Result<Option<String>, super::ReadFailure> {
+        dpk::get_kinded(&account(server_id, key))
     }
 
     pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
@@ -484,6 +490,16 @@ mod platform {
         /// to `Ok(None)`; the returned CFData is decoded to a `String`.
         pub fn get(account_str: &str) -> Result<Option<String>, String> {
             get_inner(account_str, false).map_err(|e| e.to_string())
+        }
+        pub fn get_kinded(
+            account_str: &str,
+        ) -> Result<Option<String>, crate::secrets::ReadFailure> {
+            get_inner(account_str, false).map_err(|e| match e {
+                crate::secrets::BackupSecretError::Corrupt => {
+                    crate::secrets::ReadFailure::Damaged(e.to_string())
+                }
+                _ => crate::secrets::ReadFailure::Unavailable(e.to_string()),
+            })
         }
         pub fn get_backup(
             account_str: &str,
@@ -1030,10 +1046,28 @@ mod platform {
     }
 
     pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
-        match with_service(|| Entry::new(SERVICE, &account(server_id, key))?.get_password()) {
+        read_secret(server_id, key).map_err(super::ReadFailure::into_message)
+    }
+
+    /// [`get_secret_result`] with the kind of failure.
+    pub fn read_secret(server_id: &str, key: &str) -> Result<Option<String>, super::ReadFailure> {
+        read_kinded(with_service(|| {
+            Entry::new(SERVICE, &account(server_id, key))?.get_password()
+        }))
+    }
+
+    /// An item whose secret is not text is damaged; a locked, missing or
+    /// failing service, or more than one match, is the store's state.
+    pub(super) fn read_kinded(
+        read: Result<String, keyring::Error>,
+    ) -> Result<Option<String>, super::ReadFailure> {
+        match read {
             Ok(v) => Ok(Some(v)),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(e.to_string()),
+            Err(e @ keyring::Error::BadEncoding(_)) => {
+                Err(super::ReadFailure::Damaged(e.to_string()))
+            }
+            Err(e) => Err(super::ReadFailure::Unavailable(e.to_string())),
         }
     }
 
@@ -1371,6 +1405,26 @@ mod platform {
 
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        /// A secret that is not text can never be read back, so it is
+        /// damaged; a locked or failing service may give it up later.
+        #[test]
+        fn a_read_that_cannot_decode_is_damaged_and_a_failing_store_is_not() {
+            assert!(matches!(
+                read_kinded(Err(keyring::Error::BadEncoding(vec![0xff, 0xfe]))),
+                Err(crate::secrets::ReadFailure::Damaged(_))
+            ));
+            for error in [
+                keyring::Error::NoStorageAccess("the collection is locked".into()),
+                keyring::Error::PlatformFailure("org.freedesktop.secrets vanished".into()),
+            ] {
+                assert!(matches!(
+                    read_kinded(Err(error)),
+                    Err(crate::secrets::ReadFailure::Unavailable(_))
+                ));
+            }
+            assert_eq!(read_kinded(Err(keyring::Error::NoEntry)), Ok(None));
+        }
+
         fn dead_daemon() -> keyring::Error {
             keyring::Error::PlatformFailure("org.freedesktop.secrets vanished".into())
         }
@@ -1692,6 +1746,18 @@ mod file {
 }
 
 fn set_secret_raw(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if tests::write_is_injected_failure(key) {
+        return Err("injected secret persistence failure".into());
+    }
+    // Before the write, so a refreshed OAuth token is covered even if the store fails.
+    crate::secret_redact::register(server_id, key, value);
+    write_stored(server_id, key, value)
+}
+
+/// A write with no registration, for Toolport's own internal keys.
+fn write_stored(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+    scrub_previous(server_id, key, Some(value))?;
     if file::active() {
         return file::set_secret(server_id, key, value);
     }
@@ -1707,6 +1773,26 @@ pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String>
         return Err("reserved Toolport secret namespace".to_string());
     }
     set_secret_raw(&crate::local_auth::owner(server_id)?, key, value)
+}
+
+/// A client-config backup's vault write. Its key is new for each backup
+/// (it holds the content hash), so there is no old value whose log cleanup
+/// could be lost, and it is never registered: the text is a whole client
+/// config, never sent to a server, and its ordinary lines would otherwise be
+/// redacted from every log.
+pub(crate) fn set_backup_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if tests::write_is_injected_failure(key) {
+        return Err("injected secret persistence failure".into());
+    }
+    if server_id == INTERNAL_SERVER_ID {
+        return Err("reserved Toolport secret namespace".to_string());
+    }
+    let owner = crate::local_auth::owner(server_id)?;
+    if file::active() {
+        return file::set_secret(&owner, key, value);
+    }
+    platform::set_secret(&owner, key, value)
 }
 
 pub fn get_secret(server_id: &str, key: &str) -> Option<String> {
@@ -1776,13 +1862,31 @@ pub(crate) fn task_handle_key() -> Result<[u8; 32], String> {
 ///    `CONDUIT_SECRET_KEY`) is set
 /// 4. OS keychain / platform backend
 fn get_secret_result_raw(server_id: &str, key: &str) -> Result<Option<String>, String> {
+    registered(server_id, key, read_stored(server_id, key))
+}
+
+/// A read with no registration, for Toolport's own internal keys.
+fn read_stored(server_id: &str, key: &str) -> Result<Option<String>, String> {
     if let Some(v) = env_secret_override(key) {
-        return Ok(Some(v));
+        Ok(Some(v))
+    } else if file::active() {
+        file::get_secret_result(server_id, key)
+    } else {
+        platform::get_secret_result(server_id, key)
     }
-    if file::active() {
-        return file::get_secret_result(server_id, key);
+}
+
+/// Every value this process reads or stores is registered for redaction at the log
+/// writers ([`crate::secret_redact`]), so no echo of it reaches disk.
+fn registered(
+    server_id: &str,
+    key: &str,
+    value: Result<Option<String>, String>,
+) -> Result<Option<String>, String> {
+    if let Ok(Some(v)) = &value {
+        crate::secret_redact::register(server_id, key, v);
     }
-    platform::get_secret_result(server_id, key)
+    value
 }
 
 /// Inspect only the managed identity's vault, never environment overrides or aliases.
@@ -1821,6 +1925,8 @@ pub(crate) fn has_own_credentials(server: &crate::registry::ServerEntry) -> Resu
 
 pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
     #[cfg(test)]
+    tests::record_read(server_id, key);
+    #[cfg(test)]
     if tests::read_is_injected_failure(key) {
         return Err("injected secret read failure".into());
     }
@@ -1838,10 +1944,31 @@ pub fn get_vault_secret_result(server_id: &str, key: &str) -> Result<Option<Stri
     }
     let owner = crate::local_auth::owner(server_id)?;
     let server_id = owner.as_str();
-    if file::active() {
-        return file::get_secret_result(server_id, key);
+    let value = if file::active() {
+        file::get_secret_result(server_id, key)
+    } else {
+        platform::get_secret_result(server_id, key)
+    };
+    registered(server_id, key, value)
+}
+
+/// Why a stored value could not be read. [`scrub_previous`] needs the kind:
+/// a damaged value can never be read back, so there is nothing to scrub or
+/// keep, while a locked or unavailable store may give it up later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReadFailure {
+    /// The stored data is damaged or incomplete.
+    Damaged(String),
+    /// The store is locked or unavailable right now.
+    Unavailable(String),
+}
+
+impl ReadFailure {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::Damaged(message) | Self::Unavailable(message) => message,
+        }
     }
-    platform::get_secret_result(server_id, key)
 }
 
 /// Stable recovery categories. No backend error text or secret bytes cross this boundary.
@@ -1993,7 +2120,181 @@ fn env_var_nonblank(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
+/// Before a stored value is replaced or deleted, scrub the logs for it: once it
+/// is gone from the vault nothing could find a copy an older build (or another
+/// tool) left on disk. Reads the stored value directly, never an environment
+/// override, and skips Toolport's own internal keys. An error when a log may
+/// still hold the old value and it could not be kept for a later cleanup: the
+/// caller then changes nothing, so the stored value is not lost.
+fn scrub_previous(server_id: &str, key: &str, replacement: Option<&str>) -> Result<(), String> {
+    if server_id == INTERNAL_SERVER_ID {
+        return Ok(());
+    }
+    // The whole file vault is loaded for any write too, so its read errors
+    // always stop the change.
+    let stored = if file::active() {
+        file::get_secret_result(server_id, key).map_err(ReadFailure::Unavailable)
+    } else {
+        platform::read_secret(server_id, key)
+    };
+    #[cfg(test)]
+    let stored = if tests::read_is_injected_failure(key) {
+        Err(ReadFailure::Unavailable(
+            "injected secret read failure".to_string(),
+        ))
+    } else if tests::read_is_injected_damage(key) {
+        Err(ReadFailure::Damaged("injected damaged secret".to_string()))
+    } else {
+        stored
+    };
+    let stored = match stored {
+        Ok(stored) => stored,
+        // Damaged data can never be read back: there is no old value to
+        // scrub or keep, and refusing would leave it unfixable.
+        Err(ReadFailure::Damaged(error)) => {
+            eprintln!(
+                "toolport: the old value could not be read ({error}), so its log cleanup was skipped"
+            );
+            None
+        }
+        // A locked or unavailable store may give the value up later: change
+        // nothing, so the chance to scrub it is not lost.
+        Err(ReadFailure::Unavailable(error)) => {
+            eprintln!("toolport: the stored value could not be read for its log cleanup ({error})");
+            return Err(crate::i18n::tr(
+                "The old value could not be kept for its log cleanup, so nothing was changed. Try again.",
+            ));
+        }
+    };
+    if let Some(old) = stored {
+        if Some(old.as_str()) != replacement {
+            if let Err(error) = crate::secret_redact::scrub_value_now(server_id, key, &old) {
+                // A log may still hold it: keep the value in the vault, under
+                // Toolport's own namespace, until a later scrub succeeds.
+                eprintln!("toolport: {error}; keeping the old value for a later cleanup");
+                retire(server_id, key, &old)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Values replaced or deleted while a log may still hold them, as a JSON list of
+/// `{server, key, value}` in the vault (never on disk in the clear).
+const RETIRED_KEY: &str = "retired-secret-values";
+
+fn retired_load() -> Vec<(String, String, String)> {
+    // Unregistered: the values in it are registered on their own, and the
+    // list changes on every save.
+    let Ok(Some(raw)) = read_stored(INTERNAL_SERVER_ID, RETIRED_KEY) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<serde_json::Value>>(&raw)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| {
+            Some((
+                v.get("server")?.as_str()?.to_string(),
+                v.get("key")?.as_str()?.to_string(),
+                v.get("value")?.as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn retired_save(entries: &[(String, String, String)]) -> Result<(), String> {
+    crate::secret_redact::RETIRED_PENDING
+        .store(entries.len(), std::sync::atomic::Ordering::Relaxed);
+    if entries.is_empty() {
+        return match read_stored(INTERNAL_SERVER_ID, RETIRED_KEY) {
+            Ok(Some(_)) => delete_secret_raw(INTERNAL_SERVER_ID, RETIRED_KEY),
+            _ => Ok(()),
+        };
+    }
+    let list: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(server, key, value)| serde_json::json!({"server": server, "key": key, "value": value}))
+        .collect();
+    #[cfg(test)]
+    if tests::write_is_injected_failure(RETIRED_KEY) {
+        return Err("injected secret persistence failure".into());
+    }
+    write_stored(
+        INTERNAL_SERVER_ID,
+        RETIRED_KEY,
+        &serde_json::Value::Array(list).to_string(),
+    )
+}
+
+/// The cross-process lock every read-modify-write of the retired list holds,
+/// so two processes never save over each other's entries.
+fn retired_lock() -> Result<crate::registry::FileLock, String> {
+    let dir = crate::registry::conduit_dir().ok_or("no data directory")?;
+    crate::registry::lock_at(&dir.join(RETIRED_KEY))
+}
+
+fn retire(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+    let saved = retired_lock().and_then(|_lock| {
+        let mut entries = retired_load();
+        let entry = (server_id.to_string(), key.to_string(), value.to_string());
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+        retired_save(&entries)
+    });
+    saved.map_err(|error| {
+        eprintln!("toolport: could not keep a retired secret for cleanup: {error}");
+        crate::i18n::tr(
+            "The old value could not be kept for its log cleanup, so nothing was changed. Try again.",
+        )
+    })
+}
+
+/// Register every retired value and retry its cleanup; entries whose scrub now
+/// succeeds are dropped from the vault. Returns how many still wait. Called at
+/// gateway start, so a value is redacted again before anything is written.
+pub fn retry_retired_scrubs() -> usize {
+    let entries = retired_load();
+    if entries.is_empty() {
+        crate::secret_redact::RETIRED_PENDING.store(0, std::sync::atomic::Ordering::Relaxed);
+        return 0;
+    }
+    // The scrubs run unlocked (each may wait for a busy scrub); then, under
+    // the lock, only the entries they cleaned are removed from the list as it
+    // is now, so a value another process retired meanwhile is kept.
+    let cleaned: Vec<(String, String, String)> = entries
+        .into_iter()
+        .filter(|(server, key, value)| {
+            crate::secret_redact::scrub_value_now(server, key, value).is_ok()
+        })
+        .collect();
+    #[cfg(test)]
+    tests::run_retry_hook();
+    let _lock = match retired_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("toolport: could not update retired secrets: {error}");
+            return retired_load().len();
+        }
+    };
+    let remaining: Vec<(String, String, String)> = retired_load()
+        .into_iter()
+        .filter(|entry| !cleaned.contains(entry))
+        .collect();
+    let left = remaining.len();
+    if let Err(error) = retired_save(&remaining) {
+        eprintln!("toolport: could not update retired secrets: {error}");
+    }
+    left
+}
+
+/// How many retired values still wait for their log cleanup (for status).
+pub fn retired_scrubs_pending() -> usize {
+    retired_load().len()
+}
+
 fn delete_secret_raw(server_id: &str, key: &str) -> Result<(), String> {
+    scrub_previous(server_id, key, None)?;
     if file::active() {
         return file::delete_secret(server_id, key);
     }
@@ -2235,8 +2536,46 @@ pub(crate) mod tests {
         static FAILED_WRITE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
     }
 
+    thread_local! {
+        static READS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn record_read(server_id: &str, key: &str) {
+        READS.with(|reads| reads.borrow_mut().push(format!("{server_id}/{key}")));
+    }
+
+    /// The `server/key` reads of [`super::get_secret_result`] on this thread
+    /// while `test` runs.
+    pub(crate) fn reads_during(test: impl FnOnce()) -> Vec<String> {
+        READS.with(|reads| reads.borrow_mut().clear());
+        test();
+        READS.with(|reads| std::mem::take(&mut *reads.borrow_mut()))
+    }
+
+    thread_local! {
+        static DAMAGED_READ: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(crate) fn read_is_injected_damage(key: &str) -> bool {
+        DAMAGED_READ.with(|damaged| damaged.get() == Some(key))
+    }
+
+    /// Reads of `key`'s stored value find it damaged (a broken chunk manifest,
+    /// an undecodable item) while `test` runs: nothing can ever read it back.
+    pub(crate) fn with_damaged_read<T>(key: &'static str, test: impl FnOnce() -> T) -> T {
+        struct Restore(Option<&'static str>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                DAMAGED_READ.with(|damaged| damaged.set(self.0));
+            }
+        }
+        let _restore = Restore(DAMAGED_READ.with(|damaged| damaged.replace(Some(key))));
+        test()
+    }
+
+    /// `"*"` fails every key.
     pub(crate) fn read_is_injected_failure(key: &str) -> bool {
-        FAILED_READ.with(|failed| failed.get() == Some(key))
+        FAILED_READ.with(|failed| matches!(failed.get(), Some(k) if k == key || k == "*"))
     }
 
     pub(crate) fn with_failed_read<T>(key: &'static str, test: impl FnOnce() -> T) -> T {
@@ -2248,6 +2587,26 @@ pub(crate) mod tests {
         }
         let _restore = Restore(FAILED_READ.with(|failed| failed.replace(Some(key))));
         test()
+    }
+
+    thread_local! {
+        static RETRY_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Run `hook` inside the next [`super::retry_retired_scrubs`] on this
+    /// thread, after its scrubs and before it updates the retired list.
+    pub(crate) fn with_retry_hook<T>(hook: impl FnOnce() + 'static, test: impl FnOnce() -> T) -> T {
+        RETRY_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        let out = test();
+        RETRY_HOOK.with(|h| h.borrow_mut().take());
+        out
+    }
+
+    pub(crate) fn run_retry_hook() {
+        if let Some(hook) = RETRY_HOOK.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
     }
 
     pub(crate) fn write_is_injected_failure(key: &str) -> bool {

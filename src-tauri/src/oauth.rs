@@ -237,13 +237,25 @@ fn debug_log(msg: &str) {
         return;
     }
     if let Some(path) = crate::registry::conduit_dir().map(|d| d.join("oauth-debug.log")) {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        // Owner-only from creation (SBS-868).
-        if let Ok(mut f) = crate::registry::open_append_private(&path) {
-            let _ = writeln!(f, "{msg}");
-        }
+        debug_log_to(&path, msg);
+    }
+}
+
+fn debug_log_to(path: &std::path::Path, msg: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // The secret scrub rewrites this file under the same lock. Redact inside
+    // it, so a secret learned while a scrub runs is still caught, and drop the
+    // line rather than write it unlocked.
+    let Ok(_lock) = crate::registry::lock_at(path) else {
+        return;
+    };
+    // Owner-only from creation (SBS-868). URLs here come from the user's
+    // config and upstream metadata, so they get the gateway.log treatment.
+    let msg = crate::secret_redact::redact_log_text(msg);
+    if let Ok(mut f) = crate::registry::open_append_private(path) {
+        let _ = f.write_all(format!("{msg}\n").as_bytes());
     }
 }
 
@@ -1520,10 +1532,15 @@ fn client_secret_basic_header(client_id: &str, client_secret: &str) -> String {
         urlencoding::encode(client_id),
         urlencoding::encode(client_secret)
     );
-    format!(
+    let header = format!(
         "Basic {}",
         base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes())
-    )
+    );
+    // The client secret is registered from the vault already; this registers the
+    // exact credential string too, so the whole header value redacts as one.
+    crate::secret_redact::register(client_id, "client_secret_basic", &header);
+    crate::secret_redact::register_whole(client_id, "client_secret_basic", &credentials);
+    header
 }
 
 /// Strip a credential out of text that is about to be surfaced or logged.
@@ -1904,6 +1921,45 @@ pub(crate) fn authenticate_cancellable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_log_redacts_secrets_and_url_credentials() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-oauth-debug-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        crate::secret_redact::register("oauth-srv", "API_KEY", "oauth-query-key-77Zq");
+        let path = dir.join("oauth-debug.log");
+        debug_log_to(
+            &path,
+            "discovering https://svc:typed-pass-9x@mcp.example.invalid/mcp?api_key=oauth-query-key-77Zq",
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!text.contains("oauth-query-key-77Zq"), "{text}");
+        assert!(!text.contains("typed-pass-9x"), "{text}");
+        assert!(text.starts_with("discovering "), "{text}");
+    }
+
+    /// Failure mode: the debug log appends without the scrub's lock, so a line
+    /// written while a scrub runs keeps a secret learned during it.
+    #[test]
+    fn debug_log_waits_for_the_scrub_lock_and_redacts_inside_it() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-oauth-debug-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        let path = dir.join("oauth-debug.log");
+        let target = path.clone();
+        let text = crate::secret_redact::append_during_scrub_for_test(
+            &path,
+            ("oauth-lock", "API_KEY", "oauth-late-key-Q8rT2wXz"),
+            move || debug_log_to(&target, "token request with oauth-late-key-Q8rT2wXz"),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(text.starts_with("token request with "), "{text}");
+        assert!(!text.contains("oauth-late-key-Q8rT2wXz"), "{text}");
+    }
 
     /// The vectors are lifted from `src/lib/openUrl.test.ts`. Keeping them
     /// identical is the point: this guard exists so a compromised renderer

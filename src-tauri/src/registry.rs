@@ -264,7 +264,10 @@ pub(crate) fn append_lines_with_outcome(
     };
     let mut bytes = String::new();
     for line in lines {
-        bytes.push_str(line);
+        // The persistence boundary for every locked append-only log: no resolved
+        // secret value is written, whatever field carried it.
+        let line = crate::secret_redact::redact_line_for(path, line);
+        bytes.push_str(&line);
         if !line.ends_with('\n') {
             bytes.push('\n');
         }
@@ -3241,6 +3244,18 @@ impl Drop for DataDirOverride {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
+}
+
+/// The installed [`DataDirOverride`], if any. Never resolves the real directory.
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
+pub(crate) fn data_dir_override() -> Option<PathBuf> {
+    if !DATA_DIR_OVERRIDE_ACTIVE.load(Ordering::SeqCst) {
+        return None;
+    }
+    DATA_DIR_OVERRIDE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 /// Resolve the data dir and cache it: the container check and the UNC

@@ -421,9 +421,9 @@ fn encode_internal(
     // The complete byte spelling lives only in the vault. Publish the fallback
     // only after a verified vault write, before modifying the client's file.
     for (index, value) in retained_values.iter().enumerate() {
-        crate::secrets::set_secret(&account, &format!("{key}-credential-{index}"), value)?;
+        crate::secrets::set_backup_secret(&account, &format!("{key}-credential-{index}"), value)?;
     }
-    crate::secrets::set_secret(&account, &key, text)?;
+    crate::secrets::set_backup_secret(&account, &key, text)?;
     if crate::secrets::get_backup_secret_result(&account, &key)?.as_deref() != Some(text) {
         return Err("Could not verify vaulted client backup. Client config unchanged.".into());
     }
@@ -1660,6 +1660,42 @@ mod tests {
                     "unsigned refusal must not publish plaintext recovery"
                 );
             }
+        });
+    }
+
+    /// Failure mode: a backup write went through the log-cleanup step for
+    /// server secrets. Its key is new, so there is nothing to clean, but a read
+    /// the store refused (an unsigned macOS process gets -34018) blocked the
+    /// backup, and the whole config text was registered as a secret, so its
+    /// ordinary lines were redacted from every log.
+    #[test]
+    fn a_backup_write_skips_the_log_cleanup_for_server_secrets() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            clear();
+            reset_missing();
+            let dir = crate::registry::conduit_dir().unwrap();
+            let path = dir.join("backups/cursor/1-mcp.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let line = "\"command\": \"npx-backup-ordinary-line\"";
+            let original = format!(
+                "{{\n {line},\n \"env\":{{\"API_KEY\":\"sk-backup-unread-fixture\"}}\n}}\n"
+            );
+            register(
+                "backup-unread-fixture",
+                "API_KEY",
+                "sk-backup-unread-fixture",
+            );
+            let encoded = crate::secrets::tests::with_failed_read("*", || encode(&path, &original));
+            clear();
+            let encoded = encoded.expect("a backup write has no old value to clean");
+            assert!(!encoded.contains("sk-backup-unread-fixture"));
+            assert_eq!(crate::secret_redact::redact_text(line), line);
+            // A server secret still refuses while its old value cannot be read.
+            crate::secrets::set_secret("backup-srv", "SERVER_KEY", "server-old-4Rt7").unwrap();
+            let refused = crate::secrets::tests::with_failed_read("*", || {
+                crate::secrets::set_secret("backup-srv", "SERVER_KEY", "server-new-8Yp2")
+            });
+            assert!(refused.is_err());
         });
     }
 

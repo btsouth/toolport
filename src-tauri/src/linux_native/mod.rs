@@ -16113,6 +16113,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         crate::audit::record_decision(
             "team-slack",

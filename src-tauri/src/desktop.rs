@@ -352,6 +352,8 @@ fn prewarm_launcher(server: &ServerEntry) {
     }
     let server = server.clone();
     std::thread::spawn(move || {
+        // Same registration as every other launch, before the child starts.
+        crate::secret_refs::register_inline_secrets(&server);
         let Ok(resolved) = crate::launch_inputs::resolve_args_for_prewarm(&server) else {
             return;
         };
@@ -4367,6 +4369,15 @@ fn open_external(url: String) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Before anything can resolve a secret: the shell's stderr (a terminal, the
+    // journal, or a console) and its children's are redacted from here on.
+    crate::daemon_log::install_stderr_redaction();
+    // The relay can only remove values it knows: learn the inline ones now,
+    // off the startup path. Vault values are learned when first read for use,
+    // so a hidden start never raises a keyring prompt.
+    let _ = std::thread::Builder::new()
+        .name("toolport-secret-preload".into())
+        .spawn(crate::secret_refs::preload_inline_secrets);
     let _ = crate::i18n::initialize();
     // `generate_context!()` must expand exactly once in this crate: on macOS dev
     // builds each expansion embeds a `_EMBED_INFO_PLIST` byte section, and two
@@ -4962,6 +4973,9 @@ pub fn run() {
                 if let Some(broker) = app_handle.try_state::<approval_broker::ApprovalBroker>() {
                     broker.clear_endpoint();
                 }
+                // Tauri exits the process after this event; land the last
+                // redacted stderr lines first.
+                crate::daemon_log::flush_stderr_relay(std::time::Duration::from_millis(500));
             }
         });
 }

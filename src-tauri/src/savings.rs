@@ -541,7 +541,8 @@ fn append_lines_at_with_hook(
     let mut file = crate::registry::open_append_private(path).map_err(|e| e.to_string())?;
     let mut bytes = String::new();
     for line in lines {
-        bytes.push_str(line);
+        let line = crate::secret_redact::redact_line_for(path, line);
+        bytes.push_str(&line);
         if !line.ends_with('\n') {
             bytes.push('\n');
         }

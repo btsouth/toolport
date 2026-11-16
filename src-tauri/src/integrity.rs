@@ -1930,6 +1930,8 @@ fn save_quarantine_with(
     })?;
     let serialized = serde_json::to_string(q)
         .map_err(|e| format!("Could not serialize the quarantine store at {path:?}: {e}"))?;
+    // Held definitions are upstream text; screen them like the live catalog.
+    let serialized = crate::secret_redact::redact_definition_line(&serialized);
     write(&path, &serialized)
         .map_err(|e| format!("Could not persist the quarantine store at {path:?}: {e}"))?;
     // Invalidate the mtime cache only after the new contents are durable (SOU-303).
@@ -3430,7 +3432,10 @@ fn rules() -> &'static [Rule] {
 /// Best-effort: returns None for hits with no direct phrase position (e.g. an encoded
 /// payload), where the labels alone remain the evidence.
 fn evidence_snippet(text: &str) -> Option<String> {
-    let text = truncate_on_char_boundary(text, MAX_SCAN_BYTES);
+    // Redact before normalizing (which lowercases) and before cutting the excerpt
+    // window, either of which would hide a secret from the exact match at the log.
+    let redacted = crate::secret_redact::redact_text(text);
+    let text = truncate_on_char_boundary(&redacted, MAX_SCAN_BYTES);
     let hay = normalize(text);
     let mut best: Option<usize> = None;
     let mut consider = |pos: Option<usize>| {
@@ -4405,6 +4410,27 @@ fn is_zero_width(c: char) -> bool {
     matches!(c, '\u{200B}'..='\u{200F}' | '\u{2060}' | '\u{FEFF}')
 }
 
+/// A server put the value of a configured secret (its own or another server's)
+/// into a tool definition, model-visible text. The definition is advertised with
+/// the value replaced; this records that it happened, naming the server, the
+/// tool and which secrets (by name), so the user can review that server.
+pub fn record_secret_in_definition(server: &str, tool: &str, secrets: &[String]) -> bool {
+    record_event(&json!({
+        "ts": epoch_millis(),
+        "type": "tool_poison_flag",
+        "server": server,
+        "tool": tool,
+        "change": "secret_echo",
+        "signatures": ["configured-secret-in-definition"],
+        "score": 1.0,
+        "severity": SEV_HIGH,
+        "evidence": format!(
+            "The definition contained the value of {}; it is shown to clients with the value replaced.",
+            secrets.join(", ")
+        ),
+    }))
+}
+
 fn poison_event(
     server: &str,
     tool: &str,
@@ -4625,8 +4651,18 @@ pub fn record_sync_refusal(server: &str, detail: &str) {
     }));
 }
 
+/// `event` with every secret known now redacted: the persistence boundary for
+/// security.jsonl. Called under the file's lock, which the secret scrub also
+/// rewrites it under, so a secret learned while a scrub runs is still caught.
+fn redacted_event(event: &Value) -> Value {
+    let mut redacted = event.clone();
+    crate::secret_redact::redact_value(&mut redacted);
+    redacted
+}
+
 fn record_definition_change(event: &Value, path: &Path) -> Result<(), String> {
     let _lock = crate::registry::lock_at(path)?;
+    let event = &redacted_event(event);
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -4700,6 +4736,7 @@ fn record_event(event: &Value) -> bool {
         let Ok(_lock) = crate::registry::lock_at(&path) else {
             return false;
         };
+        let event = &redacted_event(event);
         // Collapse the concurrent multi-gateway burst before it hits disk (see
         // `recently_recorded`), so the shared log carries one line per real change.
         if recently_recorded(event, &path) {
@@ -5473,6 +5510,30 @@ mod tests {
     impl Drop for TestDataDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Failure mode: a security event is redacted before the log's lock is
+    /// taken, so an event queued behind a scrub keeps a secret the scrub just
+    /// learned. Both the plain append and the drift-merge path are covered.
+    #[test]
+    fn security_events_are_redacted_inside_the_scrub_lock() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let data = TestDataDir::new("security-scrub-lock");
+        let path = data.path.join("security.jsonl");
+        for (kind, secret) in [
+            ("tool_poison_flag", "sec-late-token-F4hZ7cUw"),
+            ("tool_drift", "sec-drift-token-K9mE2rTb"),
+        ] {
+            let event =
+                json!({"type": kind, "server": "srv", "tool": "srv__t", "detail": secret, "ts": 1});
+            let text = crate::secret_redact::append_during_scrub_for_test(
+                &path,
+                ("security-lock", kind, secret),
+                move || assert!(record_event(&event)),
+            );
+            assert!(text.contains(kind), "{text}");
+            assert!(!text.contains(secret), "{kind}: {text}");
         }
     }
 

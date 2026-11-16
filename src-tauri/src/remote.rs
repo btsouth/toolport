@@ -85,6 +85,13 @@ fn now_epoch_seconds() -> u64 {
         .as_secs()
 }
 
+/// A diagnostic line on stderr with every registered secret removed. A server's
+/// rejection or a vault error can quote the credential it was given; the relay
+/// also redacts, but this holds where it could not start.
+fn warn(text: &str) {
+    eprintln!("{}", crate::secret_redact::redact_log_text(text));
+}
+
 fn refresh_decision(state: &OAuthState, now: u64) -> RefreshDecision {
     let Some(expires_at) = state.expires_at else {
         // Backward-compatible and provider-compatible: without a known expiry,
@@ -193,7 +200,7 @@ pub fn clear_oauth_state(server_id: &str) -> Result<(), String> {
 
 // ── Client-credentials flow (SBS-524) ──────────────────────────────────────
 
-const CC_STATE_KEY: &str = "__oauth_cc_state__";
+pub(crate) const CC_STATE_KEY: &str = "__oauth_cc_state__";
 
 /// What a later reacquisition needs, resolved once at connect time.
 ///
@@ -521,7 +528,7 @@ impl CredentialState {
         if secrets::set_secret(server_id, secrets::HTTP_AUTH_KEY, token).is_ok() {
             self.vaulted_access = Some(token.to_string());
         } else {
-            eprintln!("OAuth refreshed access token could not be saved; using it in memory.");
+            warn("OAuth refreshed access token could not be saved; using it in memory.");
         }
     }
 }
@@ -728,7 +735,7 @@ fn refresh_token_under_lock(
     // Even on timeout, a peer may have saved a usable winner just before our
     // reread. Otherwise no exchange is allowed without a held lock.
     let _refresh_lock = refresh_lock.map_err(|cause| {
-        eprintln!("OAuth refresh lock unavailable: {cause}");
+        warn(&format!("OAuth refresh lock unavailable: {cause}"));
         OAUTH_REFRESH_LOCK_ERROR.to_string()
     })?;
     // Client-credentials servers have no refresh token by construction, so they
@@ -873,7 +880,7 @@ fn refresh_token_under_lock(
             credentials.save_access(server_id, &token.access_token);
         }
         Err(_) => {
-            eprintln!("OAuth refresh metadata could not be saved; will retry.");
+            warn("OAuth refresh metadata could not be saved; will retry.");
             // An unchanged refresh token remains safe to retry from the vault.
             // Preserve a previously pending rotation even if this response omits it.
             if rotated || credentials.pending.is_some() {
@@ -1429,13 +1436,34 @@ struct ImportedConcurrent(
     Redaction,
     bool,
 );
+/// The configured private values of one server, compiled for replacement, plus
+/// its secret references (for re-reading them after an auth rejection).
+///
+/// Replacement uses the same `[secret:NAME]` marker and matcher as the log
+/// writers ([`crate::secret_redact`]), so the caller and the audit see the same
+/// text: the upstream's real message with only the private values removed, in
+/// their raw and encoded forms. Each line is matched as a possible fragment, so a
+/// bounded stderr tail that starts or ends inside a value loses that part too.
 #[derive(Clone)]
-struct Redaction(Vec<String>, Vec<String>);
+struct Redaction(Arc<crate::secret_redact::Matcher>, Vec<String>);
 impl Redaction {
+    fn new<N: AsRef<str>, V: AsRef<str>>(values: &[(N, V)], references: Vec<String>) -> Self {
+        // A username is not secret, so it is replaced whole but never by fragment
+        // (an eight-letter piece of it would otherwise vanish from every message).
+        let whole_only = values
+            .iter()
+            .filter(|(name, _)| name.as_ref() == "url_user")
+            .map(|(_, value)| value.as_ref().to_string())
+            .collect();
+        Self(
+            Arc::new(crate::secret_redact::Matcher::new_with(values, &whole_only)),
+            references,
+        )
+    }
     fn for_server(server: &ServerEntry) -> Self {
-        let mut values = Vec::new();
+        let mut values: Vec<(String, String)> = Vec::new();
         if let Some(url) = &server.url {
-            values.push(url.clone());
+            values.push(("url".into(), url.clone()));
             if let Ok(parsed) = url::Url::parse(url) {
                 let decoded = |value: &str| {
                     url::form_urlencoded::parse(format!("v={value}").as_bytes())
@@ -1443,20 +1471,20 @@ impl Redaction {
                         .map(|(_, v)| v.into_owned())
                         .unwrap_or_default()
                 };
-                let mut add = |value: &str| {
-                    values.push(value.into());
-                    values.push(decoded(value));
+                let mut add = |name: &str, value: &str| {
+                    values.push((name.into(), value.into()));
+                    values.push((name.into(), decoded(value)));
                 };
-                add(parsed.username());
+                add("url_user", parsed.username());
                 if let Some(password) = parsed.password() {
-                    add(password);
+                    add("url_password", password);
                 }
                 for pair in parsed.query().unwrap_or("").split('&') {
                     if let Some((key, value)) = pair.split_once('=') {
                         if crate::import_credentials::secret_url_name(key)
                             || decoded(value).len() >= 4
                         {
-                            add(value);
+                            add(&decoded(key), value);
                         }
                     }
                 }
@@ -1467,7 +1495,7 @@ impl Redaction {
                         || crate::registry::arg_looks_secret(&value)
                         || crate::import_credentials::secret_env("", Some(&value))
                     {
-                        add(segment);
+                        add("url_path", segment);
                     }
                     after_secret_name = crate::import_credentials::secret_url_name(&value);
                 }
@@ -1479,7 +1507,7 @@ impl Redaction {
                     .ok()
                     .flatten()
             }) {
-                values.push(value);
+                values.push((env.key.clone(), value));
             }
         }
         for input in server
@@ -1493,31 +1521,30 @@ impl Redaction {
                     .ok()
                     .flatten()
             }) {
-                values.push(value);
+                values.push((input.key.clone(), value));
             }
         }
         if crate::import_credentials::has_imported_url(server) {
             if let Ok(Some(value)) =
                 secrets::get_vault_secret_result(&server.id, secrets::IMPORTED_URL_KEY)
             {
-                values.push(value);
+                values.push((secrets::IMPORTED_URL_KEY.into(), value));
             }
         }
-        values.retain(|value| !value.is_empty());
-        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-        values.dedup();
-        Self(values, crate::secret_refs::review_references(server))
+        values.retain(|(_, value)| !value.is_empty());
+        Self::new(&values, crate::secret_refs::review_references(server))
     }
-    fn text(&self, mut message: String) -> String {
-        for value in &self.0 {
-            if value.len() < 4 {
-                let token = regex::Regex::new(&format!(r"\b{}\b", regex::escape(value))).unwrap();
-                message = token.replace_all(&message, "<redacted>").into_owned();
-            } else {
-                message = message.replace(value, "<redacted>");
-            }
+    fn text(&self, message: String) -> String {
+        let mut out = String::with_capacity(message.len());
+        for line in message.split_inclusive('\n') {
+            let (body, end) = match line.strip_suffix('\n') {
+                Some(body) => (body, "\n"),
+                None => (line, ""),
+            };
+            out.push_str(&self.0.redact_fragment(body));
+            out.push_str(end);
         }
-        message
+        out
     }
     fn value(&self, value: serde_json::Value) -> serde_json::Value {
         match value {
@@ -1551,38 +1578,24 @@ impl Redaction {
             for reference in &self.1 {
                 crate::secret_refs::invalidate(reference);
             }
+            let upstream = self.error(error).to_string();
             return E::Classified(
                 K::Unavailable { after_send: true },
-                "Password manager credential rejected. Reconnecting will read the key again."
-                    .into(),
+                format!(
+                    "Password manager credential rejected ({upstream}). Reconnecting will read the key again."
+                ),
             );
         }
-        // Child tails can contain a fragment or an escaped credential. Use fixed
-        // text for reference-backed errors while retaining their retry classification.
-        let message = match error {
-            E::Retry { retry_after, .. } => {
-                return E::Retry {
-                    retry_after,
-                    message: "Reference-backed server asked to retry.".into(),
-                }
-            }
-            E::RateLimited { retry_after, .. } => {
-                return E::RateLimited {
-                    retry_after,
-                    message: "Reference-backed server rate limited the request.".into(),
-                }
-            }
-            E::Fatal(_) => {
-                return E::Unavailable("Reference-backed server connection closed.".into())
-            }
-            E::Rpc(ref value) => {
-                return E::Rpc(
-                    serde_json::json!({"code": value.get("code").and_then(serde_json::Value::as_i64).unwrap_or(-32603), "message": "Reference-backed server rejected the request."}),
-                )
-            }
-            _ => "Reference-backed server request failed.",
-        };
-        E::Classified(kind, message.into())
+        // Every other error keeps the classification it always had and now carries
+        // the upstream's own text, with the server's private values (and any
+        // fragment of one at a line edge) replaced by markers, so the caller can
+        // tell what went wrong. A closed connection still reports as unavailable
+        // so its supervisor reconnects and reads the reference again.
+        match self.error(error) {
+            retry @ (E::Retry { .. } | E::RateLimited { .. } | E::Rpc(_)) => retry,
+            E::Fatal(message) => E::Unavailable(message),
+            other => E::Classified(kind, other.to_string()),
+        }
     }
     fn error(&self, error: crate::downstream::TransportError) -> crate::downstream::TransportError {
         use crate::downstream::TransportError as E;
@@ -1637,10 +1650,11 @@ impl Transport for ImportedTransport {
     }
     fn connection_reset_reason(&self) -> Option<String> {
         self.0.connection_reset_reason().map(|error| {
+            let reason = self.1.text(error);
             if self.2 {
-                "Reference-backed connection closed. Restart to read its key again.".into()
+                format!("{reason} (reference-backed: restart to read its key again)")
             } else {
-                self.1.text(error)
+                reason
             }
         })
     }
@@ -1799,6 +1813,8 @@ fn connect_remote_inner(
         });
     }
     let server = &server_with_headers;
+    // Inline secret values and resolved headers, before anything is sent.
+    crate::secret_refs::register_inline_secrets(server);
     let url = server.url.as_deref().unwrap_or("");
     let server_id = &server.id;
     // Untrusted-provenance servers also get private/loopback refused at the resolver,
@@ -1938,11 +1954,11 @@ fn connect_remote_inner(
                     Err(vault_error) => {
                         // Keep the downstream rejection out of the returned string but
                         // not out of the record of what happened.
-                        eprintln!(
+                        warn(&format!(
                             "toolport: could not tell whether the transport refreshed during the \
                              failed connect to {server_id:?}; the server rejected the credential \
                              with: {e}"
-                        );
+                        ));
                         return Err(format!(
                             "{vault_error} (the server rejected the credential Toolport sent, and \
                              without the vault there is no way to tell whether it had already been \
@@ -2133,7 +2149,7 @@ mod tests {
             secrets::set_secret(&server.id, "PAT", "synthetic-codex-token").unwrap();
             assert_eq!(
                 safe_imported_error(&server, "HTTP 500: synthetic-codex-token rejected".into()),
-                "HTTP 500: <redacted> rejected"
+                "HTTP 500: [secret:PAT] rejected"
             );
         });
     }
@@ -2145,7 +2161,7 @@ mod tests {
         let result = redaction.text("HTTP 401: private-user private-password sk-private-path private%2Fquery private/query; attempt 1".into());
         assert_eq!(
             result,
-            "HTTP 401: <redacted> <redacted> <redacted> <redacted> <redacted>; attempt 1"
+            "HTTP 401: [secret:url_user] [secret:url_password] [secret:url_path] [secret:token] [secret:token]; attempt 1"
         );
     }
 
@@ -2182,10 +2198,10 @@ mod tests {
 
     #[test]
     fn reviewed_transport_preserves_rpc_errors_and_redacts_only_private_values() {
-        let redact = Redaction(
-            vec![
-                "synthetic-pat".into(),
-                "https://example.invalid/mcp?token=secret".into(),
+        let redact = Redaction::new(
+            &[
+                ("PAT", "synthetic-pat"),
+                ("url", "https://example.invalid/mcp?token=secret"),
             ],
             vec![],
         );
@@ -2194,14 +2210,14 @@ mod tests {
         ));
         assert!(
             matches!(frame, crate::downstream::TransportError::FrameRejected(ref message)
-            if message == "oversized frame near <redacted>")
+            if message == "oversized frame near [secret:PAT]")
         );
         let error = redact.error(crate::downstream::TransportError::Rpc(serde_json::json!({"code":-32602,"message":"Invalid argument near synthetic-pat","data":{"endpoint":"https://example.invalid/mcp?token=secret","field":"limit"}})));
         if let crate::downstream::TransportError::Rpc(value) = error {
             assert_eq!(value["code"], -32602);
-            assert_eq!(value["message"], "Invalid argument near <redacted>");
+            assert_eq!(value["message"], "Invalid argument near [secret:PAT]");
             assert_eq!(value["data"]["field"], "limit");
-            assert_eq!(value["data"]["endpoint"], "<redacted>");
+            assert_eq!(value["data"]["endpoint"], "[secret:url]");
         } else {
             panic!("RPC error category must survive");
         }
@@ -4336,19 +4352,31 @@ mod reference_redaction_tests {
     }
 
     #[test]
-    fn reference_errors_are_opaque_and_auth_triggers_reconnection() {
+    fn reference_errors_keep_their_message_minus_the_value_and_auth_triggers_reconnection() {
         let reference = "op://auth-test/item/key";
         assert_eq!(
             crate::secret_refs::test_cached_value(reference, "old"),
             "old"
         );
-        let redaction = Redaction(vec!["synthetic-ref-value".into()], vec![reference.into()]);
+        let redaction = Redaction::new(&[("REF", "synthetic-ref-value")], vec![reference.into()]);
+        // A tail that holds only a piece of the value: the piece goes, the message stays.
         let e = redaction.connection_error(
             crate::downstream::TransportError::Fatal("tail ends in ref-value".into()),
             true,
         );
-        assert!(!e.to_string().contains("ref-value"));
+        assert_eq!(e.to_string(), "tail ends in [secret:REF]");
         assert!(e.is_health_failure());
+        // A JSON-RPC error keeps its code, message and data, minus the value.
+        let e = redaction.connection_error(
+            crate::downstream::TransportError::Rpc(serde_json::json!({"code":-32602,"message":"limit too high for key synthetic-ref-value","data":{"max":50}})),
+            true,
+        );
+        let crate::downstream::TransportError::Rpc(value) = e else {
+            panic!("RPC errors stay RPC errors");
+        };
+        assert_eq!(value["code"], -32602);
+        assert_eq!(value["message"], "limit too high for key [secret:REF]");
+        assert_eq!(value["data"]["max"], 50);
         let e = redaction.connection_error(
             crate::downstream::TransportError::Classified(
                 crate::call_failure::CallFailureKind::Auth {
