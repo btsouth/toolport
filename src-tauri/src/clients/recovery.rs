@@ -766,11 +766,13 @@ pub fn retry_with_report(id: &str) -> Result<RecoveryAttempt, String> {
             backup_vault::Unlock::Open => unlocked = true,
         }
     }
-    let pending = retry(id)?;
+    let retried = retry(id);
     if unlocked {
-        // Client refreshes start-up deferred for the locked keyring can run now.
+        // Client refreshes start-up deferred for the locked keyring can run
+        // now, whether or not this restore itself succeeded.
         backup_vault::after_unlock();
     }
+    let pending = retried?;
     let remaining = pending.as_ref().map_or(0, |r| r.missing.len());
     let (restored, accounted) = recovery_values::progress();
     let message = if restored + accounted == 0 && remaining > 0 && backup_vault::store_locked() {

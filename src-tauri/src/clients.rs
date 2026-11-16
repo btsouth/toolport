@@ -10023,6 +10023,14 @@ pub fn refresh_stale_client_configs() -> RepointOutcome {
             eprintln!("toolport: {error}");
         }
     }
+    // Always say the pass ran: a Clients rescan may already have refreshed
+    // these clients, and then the pass itself has nothing else to log.
+    crate::gatewaylog::append(&format!(
+        "toolport: client config refresh after keyring unlock: {} updated, {} failed, {} still waiting for the keyring",
+        outcome.repointed.len(),
+        outcome.failed.len(),
+        outcome.deferred.len(),
+    ));
     outcome
 }
 
