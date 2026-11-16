@@ -12280,9 +12280,14 @@ fn open_server_editor_prefilled(
     };
     // An edit makes an earlier result or error stale. Only edits clear it:
     // moving focus in and out of a field keeps a finished Test result.
+    // Counts edits, so a Test that finishes after one knows its result is for
+    // the earlier settings.
+    let generation = std::rc::Rc::new(std::cell::Cell::new(0u64));
     let edited: std::rc::Rc<dyn Fn()> = {
         let (busy, feedback, validate) = (busy.clone(), feedback.clone(), validate.clone());
+        let generation = generation.clone();
         std::rc::Rc::new(move || {
+            generation.set(generation.get().wrapping_add(1));
             if !busy.get() {
                 feedback.set_visible(false);
             }
@@ -12319,6 +12324,18 @@ fn open_server_editor_prefilled(
     args.buffer().connect_changed(move |_| edited_args());
     let edited_cwd = edited.clone();
     cwd.connect_changed(move |_| edited_cwd());
+    let edited_inherit = edited.clone();
+    inherit_env.connect_active_notify(move |_| edited_inherit());
+    for (_, field, source) in &launch_entries {
+        let edited_field = edited.clone();
+        field.connect_changed(move |_| edited_field());
+        if let Some((choice, reference)) = source {
+            let edited_choice = edited.clone();
+            choice.connect_selected_notify(move |_| edited_choice());
+            let edited_reference = edited.clone();
+            reference.connect_changed(move |_| edited_reference());
+        }
+    }
     let edited_transport = edited;
     transport.connect_selected_notify(move |_| edited_transport());
     validate();
@@ -12367,6 +12384,7 @@ fn open_server_editor_prefilled(
     let original_args_for_test = original_args.clone();
     let plain_env_for_test = plain_env.clone();
     let busy_for_test = busy.clone();
+    let generation_for_test = generation.clone();
     let validate_for_test = validate.clone();
     test.connect_clicked(move |_| {
         let Some(timeout_ms) = timeout_value(&timeout_for_test.text()) else {
@@ -12407,6 +12425,13 @@ fn open_server_editor_prefilled(
             .collect::<Vec<_>>();
         let launch_definition = launch_definition_for_test.clone();
         let env_edits = plain_env_for_test.as_ref().map(collect_plain_env);
+        // Plain environment rows come and go, so they are compared instead.
+        let (started, env_at_start, plain_env) = (
+            generation_for_test.get(),
+            env_edits.clone(),
+            plain_env_for_test.clone(),
+        );
+        let generation = generation_for_test.clone();
         let server_id = server_id_for_test.clone();
         let feedback = feedback_for_test.clone();
         let busy = busy_for_test.clone();
@@ -12445,6 +12470,13 @@ fn open_server_editor_prefilled(
             .await;
             busy.set(false);
             validate();
+            // Like React, a result for settings edited since is discarded.
+            if generation.get() != started
+                || plain_env.as_ref().map(collect_plain_env) != env_at_start
+            {
+                feedback.set_visible(false);
+                return;
+            }
             feedback.set_visible(true);
             match result {
                 Ok(Ok(probe)) if probe.ok => {
@@ -16267,29 +16299,48 @@ mod tests {
         name.set_text("fixture edited");
         assert!(!feedback.is_visible());
 
-        // While a Test or Save runs, edits never turn its buttons back on, so
-        // a second click cannot start a second test or add the server twice.
-        // Each held operation then fails and the buttons come back.
-        for (start, failed) in [
-            (&test, "Could not test: synthetic test failure"),
-            (&save, "Could not save: synthetic save failure"),
-        ] {
+        let inherit_env = all
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Switch>())
+            .next()
+            .unwrap()
+            .clone();
+        let held = |start: &gtk::Button, edit: &dyn Fn(), failure: &str| {
             let (release, gate) = std::sync::mpsc::channel::<String>();
             *editor_gate::GATE.lock().unwrap() = Some(gate);
             start.emit_clicked();
             assert!(!save.is_sensitive() && !test.is_sensitive());
-            name.set_text("edited while busy");
-            url.set_text("https://example.com/other");
+            edit();
             assert!(!save.is_sensitive() && !test.is_sensitive());
-            release
-                .send(failed.split(": ").nth(1).unwrap().to_string())
-                .unwrap();
+            release.send(failure.to_string()).unwrap();
             settle(&|| save.is_sensitive());
             assert!(test.is_sensitive());
-            assert!(feedback.is_visible());
-            assert_eq!(feedback.label(), failed);
-            assert!(editor.is_visible(), "a failed save keeps the editor open");
-        }
+        };
+        // A Test result for unchanged settings shows, and switching the shell
+        // environment, which the probe reads, makes it stale.
+        held(&test, &|| {}, "synthetic test failure");
+        assert!(feedback.is_visible());
+        assert_eq!(feedback.label(), "Could not test: synthetic test failure");
+        inherit_env.set_active(!inherit_env.is_active());
+        assert!(!feedback.is_visible(), "a probe setting changed");
+
+        // While a Test or Save runs, edits never turn its buttons back on, so
+        // a second click cannot start a second test or add the server twice.
+        // A Test that finishes after an edit is for the earlier settings and
+        // is dropped, as in React; a held Save fails and says so.
+        let edit = || {
+            name.set_text("edited while busy");
+            url.set_text("https://example.com/other");
+        };
+        held(&test, &edit, "synthetic test failure");
+        assert!(
+            !feedback.is_visible(),
+            "a result for earlier settings showed"
+        );
+        held(&save, &edit, "synthetic save failure");
+        assert!(feedback.is_visible());
+        assert_eq!(feedback.label(), "Could not save: synthetic save failure");
+        assert!(editor.is_visible(), "a failed save keeps the editor open");
         assert!(crate::registry::load().unwrap().servers.is_empty());
         editor.close();
         parent.close();
