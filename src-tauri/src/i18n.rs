@@ -259,7 +259,7 @@ pub fn group_digits(value: usize) -> String {
     group_digits_for(locale(), value)
 }
 
-fn group_digits_for(locale: &str, value: usize) -> String {
+pub(crate) fn group_digits_for(locale: &str, value: usize) -> String {
     let digits = value.to_string();
     let (separator, min_digits) = match locale {
         "de" | "pt-BR" => (".", 4),

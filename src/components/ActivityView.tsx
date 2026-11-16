@@ -2372,16 +2372,24 @@ export function ActivityView({
           : ""}
         {logOpen
           ? visible.length === entries.length
-            ? tr("Showing the latest {count}.", {
-                count: visible.length.toLocaleString(locale),
-              })
-            : tr("Showing {matching} matching rows from the latest {total}.", {
-                matching: visible.length.toLocaleString(locale),
-                total: entries.length.toLocaleString(locale),
-              })
-          : tr("Latest {count} available.", {
-              count: entries.length.toLocaleString(locale),
-            })}
+            ? entries.length === 1
+              ? tr("Showing the latest entry.")
+              : tr("Showing the latest {count} entries.", {
+                  count: visible.length.toLocaleString(locale),
+                })
+            : visible.length === 1
+              ? tr("Showing 1 matching entry from the latest {total}.", {
+                  total: entries.length.toLocaleString(locale),
+                })
+              : tr("Showing {matching} matching entries from the latest {total}.", {
+                  matching: visible.length.toLocaleString(locale),
+                  total: entries.length.toLocaleString(locale),
+                })
+          : entries.length === 1
+            ? tr("Latest entry available.")
+            : tr("Latest {count} entries available.", {
+                count: entries.length.toLocaleString(locale),
+              })}
       </p>
 
       {logOpen && (
@@ -2425,9 +2433,11 @@ export function ActivityView({
                 icon={<Search />}
                 title={
                   errorsOnly && !serverFilter
-                    ? tr("No errors in the last {value1} calls.", {
-                        value1: entries.length,
-                      })
+                    ? entries.length === 1
+                      ? tr("No errors in the latest entry.")
+                      : tr("No errors in the latest {count} entries.", {
+                          count: entries.length.toLocaleString(locale),
+                        })
                     : tr("No calls match this filter.")
                 }
                 action={

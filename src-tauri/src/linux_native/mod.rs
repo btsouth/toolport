@@ -5775,8 +5775,12 @@ impl ActivityPage {
         let filtered = filter_calls(&snapshot.recent, server.as_deref(), errors_only);
         if filtered.is_empty() {
             self.clear_recent_rows();
-            self.filter_count
-                .set_label(&crate::i18n::tr("0 matching rows"));
+            self.filter_count.set_label(&activity_count_summary(
+                snapshot.call_count,
+                0,
+                snapshot.recent.len(),
+                true,
+            ));
             self.show_more_calls.set_visible(false);
             let card = state_card(
                 "edit-find-symbolic",
@@ -5811,7 +5815,7 @@ impl ActivityPage {
             crate::i18n::tr("Show fewer").to_string()
         } else {
             crate::i18n::trf(
-                "Show all {value0} rows",
+                "Show all {value0} entries",
                 &[("value0", &format!("{}", match_count))],
             )
         };
@@ -6966,26 +6970,44 @@ fn savings_title(loads: u64) -> &'static str {
 }
 
 fn activity_count_summary(total: usize, visible: usize, recent: usize, filtered: bool) -> String {
-    let shown = if filtered {
+    activity_count_summary_in(crate::i18n::group_digits, total, visible, recent, filtered)
+}
+
+/// [`activity_count_summary`] with the counts grouped by `group`: the current language's
+/// grouping (1.000 in German), as React's `toLocaleString` writes them.
+fn activity_count_summary_in(
+    group: impl Fn(usize) -> String,
+    total: usize,
+    visible: usize,
+    recent: usize,
+    filtered: bool,
+) -> String {
+    // The total counts tool calls; the list also holds approvals and Toolport's own
+    // searches, so the shown rows are "entries", never "calls". React's Activity view
+    // uses the same sentences.
+    let visible_text = group(visible);
+    let recent_text = group(recent);
+    let shown = if filtered && visible == 1 {
         crate::i18n::trf(
-            "Showing {value0} matching rows from the latest {value1}.",
-            &[
-                ("value0", &format!("{}", visible)),
-                ("value1", &format!("{}", recent)),
-            ],
+            "Showing 1 matching entry from the latest {value1}.",
+            &[("value1", &recent_text)],
         )
+    } else if filtered {
+        crate::i18n::trf(
+            "Showing {value0} matching entries from the latest {value1}.",
+            &[("value0", &visible_text), ("value1", &recent_text)],
+        )
+    } else if visible == recent && visible == 1 {
+        crate::i18n::tr("Showing the latest entry.")
     } else if visible == recent {
         crate::i18n::trf(
-            "Showing the latest {value0}.",
-            &[("value0", &format!("{}", visible))],
+            "Showing the latest {value0} entries.",
+            &[("value0", &visible_text)],
         )
     } else {
         crate::i18n::trf(
-            "Showing {value0} of the latest {value1}.",
-            &[
-                ("value0", &format!("{}", visible)),
-                ("value1", &format!("{}", recent)),
-            ],
+            "Showing {value0} of the latest {value1} entries.",
+            &[("value0", &visible_text), ("value1", &recent_text)],
         )
     };
     crate::i18n::trf(
@@ -6994,10 +7016,7 @@ fn activity_count_summary(total: usize, visible: usize, recent: usize, filtered:
         } else {
             crate::i18n::msg("{value0} calls recorded on this computer. {value2}")
         },
-        &[
-            ("value0", &grouped_number(total as u64).to_string()),
-            ("value2", &shown.to_string()),
-        ],
+        &[("value0", &group(total)), ("value2", &shown.to_string())],
     )
 }
 
@@ -17799,21 +17818,48 @@ mod tests {
 
     #[test]
     fn recorded_call_summary_uses_plain_counts() {
+        // Approvals and searches are rows but not calls: 4 calls can show 6 entries.
+        assert_eq!(
+            activity_count_summary(4, 6, 6, false),
+            "4 calls recorded on this computer. Showing the latest 6 entries."
+        );
         assert_eq!(
             activity_count_summary(1, 2, 2, false),
-            "1 call recorded on this computer. Showing the latest 2."
+            "1 call recorded on this computer. Showing the latest 2 entries."
+        );
+        assert_eq!(
+            activity_count_summary(1, 1, 1, false),
+            "1 call recorded on this computer. Showing the latest entry."
         );
         assert_eq!(
             activity_count_summary(5225, 5, 5, false),
-            "5,225 calls recorded on this computer. Showing the latest 5."
+            "5,225 calls recorded on this computer. Showing the latest 5 entries."
         );
         assert_eq!(
             activity_count_summary(5225, 10, 100, false),
-            "5,225 calls recorded on this computer. Showing 10 of the latest 100."
+            "5,225 calls recorded on this computer. Showing 10 of the latest 100 entries."
         );
         assert_eq!(
             activity_count_summary(5225, 2, 5, true),
-            "5,225 calls recorded on this computer. Showing 2 matching rows from the latest 5."
+            "5,225 calls recorded on this computer. Showing 2 matching entries from the latest 5."
+        );
+        assert_eq!(
+            activity_count_summary(5225, 1, 5, true),
+            "5,225 calls recorded on this computer. Showing 1 matching entry from the latest 5."
+        );
+        assert_eq!(
+            activity_count_summary(5225, 0, 5, true),
+            "5,225 calls recorded on this computer. Showing 0 matching entries from the latest 5."
+        );
+        // Grouped as the current language groups digits, as React's toLocaleString does.
+        let german = |value| crate::i18n::group_digits_for("de", value);
+        assert_eq!(
+            activity_count_summary_in(german, 5225, 1500, 2000, false),
+            "5.225 calls recorded on this computer. Showing 1.500 of the latest 2.000 entries."
+        );
+        assert_eq!(
+            activity_count_summary(5225, 1_000, 1_000, false),
+            "5,225 calls recorded on this computer. Showing the latest 1,000 entries."
         );
     }
 

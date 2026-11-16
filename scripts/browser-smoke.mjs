@@ -672,7 +672,7 @@ try {
     /before reaching the model/,
   );
   await expect(page.getByText(/5,225 calls recorded/)).toContainText(
-    "Showing the latest 5.",
+    "Showing the latest 5 entries.",
   );
   await expect(page.getByText("Nothing searched yet.", { exact: true })).toHaveCount(0);
   await expect(
