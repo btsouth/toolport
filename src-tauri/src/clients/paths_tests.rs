@@ -868,6 +868,36 @@ fn startup_keeps_an_old_entry_the_client_may_still_read() {
     assert!(rows[0].gateway_installed);
 }
 
+/// Greptile P1: a relocation whose backed-up write the locked keyring refuses
+/// waits for the keyring (so the start-up waiter retries it), it is not failed.
+#[test]
+fn a_relocation_the_locked_keyring_refuses_waits_for_it() {
+    let fixture = Fixture::new("relocate-locked");
+    let legacy = fixture
+        .home
+        .join(".codeium")
+        .join("windsurf")
+        .join("mcp_config.json");
+    write(
+        &legacy,
+        &json!({"mcpServers": {"toolport": old_entry("windsurf"), "native": {"command": "native", "env": {"API_KEY": "sk-relocate-locked-fixture"}}}}),
+    );
+    // A Toolport server stores that value, so the backup needs the vault.
+    let registry = serde_json::from_value(json!({"version":3,"profiles":[],"servers":[{"id":"native","name":"Native","transport":"stdio","env":[{"key":"API_KEY","secret":true}]}]})).unwrap();
+    crate::registry::save(&registry).unwrap();
+    let before = std::fs::read(&legacy).unwrap();
+    let mut outcome = None;
+    super::backup_vault::fake::locked_store(super::backup_vault::Unlock::StillLocked, || {
+        outcome = Some(super::backup_vault::noninteractive(|| {
+            relocate::relocate_all(fixture.gateway(), &HashMap::new())
+        }));
+    });
+    let outcome = outcome.unwrap();
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    assert_eq!(outcome.deferred, vec!["windsurf".to_string()]);
+    assert_eq!(std::fs::read(&legacy).unwrap(), before, "nothing written");
+}
+
 /// S1: a `~/.cline` folder (from the CLI or shared rules) is not evidence that the
 /// VS Code extension moved. Until Cline's new settings file exists, the extension's
 /// own storage file stays the one Toolport writes, and its entry is never removed.

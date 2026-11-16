@@ -780,41 +780,45 @@ pub fn still_locked_message() -> String {
 /// failed prompt is reported in plain words, never as a tally of zeros.
 pub fn retry_with_report(id: &str) -> Result<RecoveryAttempt, String> {
     let before = find(id)?.notice;
-    if before.can_discard && before.can_retry && backup_vault::store_locked() {
+    // Try with the values the store gives without asking first: a locked
+    // collection that holds none of this card's values, or a card whose values
+    // the user already put back by hand, never needs an unlock.
+    // That first try never asks: a write it needs while the keyring is locked
+    // is refused instead, and asks below only as part of the unlock.
+    let mut retried = backup_vault::noninteractive(|| retry(id));
+    let (mut restored, mut accounted) = recovery_values::progress();
+    let owed = |result: &Result<Option<ClientRecovery>, String>| match result {
+        Ok(Some(row)) => owed_locked(Path::new(&row.backup_path)),
+        Ok(None) => false,
+        Err(error) => backup_vault::is_locked_error(error),
+    };
+    let mut still_locked = false;
+    if before.can_retry && owed(&retried) {
         match backup_vault::request_unlock() {
-            backup_vault::Unlock::StillLocked => {
-                let pending = list()?.into_iter().find(|r| r.id == before.id);
-                return Ok(RecoveryAttempt {
-                    remaining: pending.as_ref().map_or(0, |r| r.missing.len()),
-                    message: still_locked_message(),
-                    restored: 0,
-                    accounted: 0,
-                    id: before.id,
-                    client_id: before.client_id,
-                    client_name: before.client_name,
-                    pending,
-                    refreshed: false,
-                });
+            backup_vault::Unlock::StillLocked => still_locked = true,
+            backup_vault::Unlock::Open => {
+                retried = retry(id);
+                let (more, gone) = recovery_values::progress();
+                restored += more;
+                accounted += gone;
             }
-            backup_vault::Unlock::Open => {}
         }
     }
-    let retried = retry(id);
+    if still_locked && retried.is_err() {
+        // Refused for the lock before anything was written: the card stays.
+        retried = Ok(list()?.into_iter().find(|r| r.id == before.id));
+    }
     // The store is open now (or was never locked): client refreshes this
     // process's start-up put off for the keyring can run, whether or not this
     // restore itself succeeded. Done before returning, so the shell's rescan
     // after Retry shows the refreshed clients.
-    let refreshed = backup_vault::refresh_deferred();
+    let refreshed = !still_locked && backup_vault::refresh_deferred();
+    let locked_now = owed(&retried);
     let pending = retried?;
     let remaining = pending.as_ref().map_or(0, |r| r.missing.len());
-    let (restored, accounted) = recovery_values::progress();
     // Only a value that really failed as Locked earns the locked wording; a
     // slow store check or another reason (value gone, damaged) keeps the tally.
-    let message = if restored + accounted == 0
-        && pending
-            .as_ref()
-            .is_some_and(|row| owed_locked(Path::new(&row.backup_path)))
-    {
+    let message = if restored + accounted == 0 && (locked_now || still_locked) {
         still_locked_message()
     } else {
         progress_message(&before.client_name, restored, accounted, remaining)
@@ -1279,7 +1283,6 @@ mod tests {
                 outcome.unwrap().is_err(),
                 "a config that cannot be parsed fails the restore"
             );
-            assert_eq!(calls.first().map(String::as_str), Some("unlock prompt"));
             assert!(
                 calls.iter().any(|c| c == "refresh deferred client configs"),
                 "{calls:?}"
@@ -1302,7 +1305,7 @@ mod tests {
                 backup_vault::fake::set_startup_deferred(false);
                 done = Some(retry_with_report(&card.id).unwrap());
             });
-            assert_eq!(calls.first().map(String::as_str), Some("unlock prompt"));
+            assert!(calls.iter().any(|c| c == "unlock prompt"), "{calls:?}");
             assert!(
                 !calls.iter().any(|c| c == "refresh deferred client configs"),
                 "{calls:?}"
@@ -1361,6 +1364,26 @@ mod tests {
         });
     }
 
+    /// Greptile P2: a locked store elsewhere (another collection) must not
+    /// make Retry ask, or refuse, when this card's values are readable.
+    #[test]
+    fn retry_restores_readable_values_without_an_unrelated_unlock() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let card = locked_card_fixture("cursor", &data.join("unrelated.json"));
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            let mut done = None;
+            let calls = backup_vault::fake::locked_store(backup_vault::Unlock::StillLocked, || {
+                backup_vault::fake::open_but_store_check_locked();
+                done = Some(retry_with_report(&card.id).unwrap());
+            });
+            assert!(!calls.iter().any(|c| c == "unlock prompt"), "{calls:?}");
+            let done = done.unwrap();
+            assert_eq!((done.restored, done.remaining), (1, 0), "{}", done.message);
+            assert!(done.pending.is_none());
+        });
+    }
+
     /// F6: Retry is the one place an unlock prompt is wanted. It asks, and when
     /// the keyring stays locked it says so in plain words instead of a tally.
     #[test]
@@ -1377,7 +1400,7 @@ mod tests {
             let calls = backup_vault::fake::locked_store(backup_vault::Unlock::StillLocked, || {
                 outcome = Some(retry_with_report(&card.id).unwrap());
             });
-            assert_eq!(calls.first().map(String::as_str), Some("unlock prompt"));
+            assert!(calls.iter().any(|c| c == "unlock prompt"), "{calls:?}");
             let still = outcome.take().unwrap();
             assert_eq!(
                 still.message,
@@ -1397,7 +1420,7 @@ mod tests {
             let calls = backup_vault::fake::locked_store(backup_vault::Unlock::Open, || {
                 outcome = Some(retry_with_report(&card.id).unwrap());
             });
-            assert_eq!(calls.first().map(String::as_str), Some("unlock prompt"));
+            assert!(calls.iter().any(|c| c == "unlock prompt"), "{calls:?}");
             assert!(calls.iter().any(|c| c == "refresh deferred client configs"));
             let done = outcome.unwrap();
             assert!(done.pending.is_none());

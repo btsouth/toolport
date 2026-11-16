@@ -382,6 +382,15 @@ pub(crate) mod fake {
         with(|store| store.check_times_out = true);
     }
 
+    /// Inside [`locked_store`]: reads and writes reach the real vault, while
+    /// the whole-store check still says locked (another collection is).
+    pub(crate) fn open_but_store_check_locked() {
+        with(|store| {
+            store.locked = false;
+            store.check_times_out = true;
+        });
+    }
+
     pub(super) fn locked() -> Option<bool> {
         with(|store| store.locked || store.check_times_out)
     }

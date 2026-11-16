@@ -10107,6 +10107,7 @@ fn repoint_stale_gateways_quietly(managed: &HashMap<String, ManagedEntry>) -> Re
     moved.retain(|(id, _)| !outcome.repointed.iter().any(|(later, _)| later == id));
     outcome.repointed.splice(0..0, moved);
     outcome.failed.extend(relocated.failed);
+    outcome.deferred.extend(relocated.deferred);
     repoint_other_claude_configs(&current, &mut outcome);
     log_repoint_outcome(&current, &outcome);
     #[cfg(target_os = "linux")]
