@@ -18003,6 +18003,118 @@ mod tests {
         assert_eq!(filter_tool_identities(&identities, "nothing").len(), 0);
     }
 
+    /// Cancel and close dispose the Add and Edit windows: their own handlers
+    /// do not keep them, or the widgets they hold, alive.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn closed_server_editors_are_freed() {
+        use super::*;
+        adw::init().unwrap();
+        let _data = crate::registry::DataDirTestEnv::new("gtk-editor-freed");
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.EditorFreed")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gtk::gio::Cancellable::NONE).unwrap();
+        let parent = adw::ApplicationWindow::builder().application(&app).build();
+        let (content, page, _) = build_content(&app, crate::approval_broker::start_native());
+        parent.set_content(Some(&content));
+        parent.present();
+        let server = state::ServerView {
+            id: "local".into(),
+            name: "Local tool".into(),
+            origin_label: "Personal".into(),
+            transport: "stdio".into(),
+            transport_id: "stdio".into(),
+            command: Some("npx".into()),
+            args: vec![],
+            launch: None,
+            url: None,
+            cwd: None,
+            inherit_env: false,
+            hide_prompts: false,
+            secret_keys: vec![],
+            plain_env: vec![state::PlainEnvView {
+                key: "REGION".into(),
+                value: "eu".into(),
+                portable: None,
+            }],
+            secret_references: Default::default(),
+            client_credentials: None,
+            enabled: false,
+            requires_review: false,
+            team_route_removed: false,
+            probe_fingerprint: 1,
+        };
+        let pump = || {
+            let context = gtk::glib::MainContext::default();
+            for _ in 0..50 {
+                while context.pending() {
+                    context.iteration(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        fn widgets(widget: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+            out.push(widget.clone());
+            let mut child = widget.first_child();
+            while let Some(node) = child {
+                child = node.next_sibling();
+                widgets(&node, out);
+            }
+        }
+        for (label, editing, by_cancel) in [
+            ("add, Cancel", false, true),
+            ("add, closed", false, false),
+            ("edit, Cancel", true, true),
+            ("edit, closed", true, false),
+        ] {
+            let editor = if editing {
+                open_server_editor_prefilled(
+                    Some(server.clone()),
+                    Some("local".into()),
+                    page.clone(),
+                    None,
+                )
+            } else {
+                open_server_editor_prefilled(None, None, page.clone(), None)
+            }
+            .unwrap();
+            pump();
+            let weak = editor.downgrade();
+            let form = {
+                let mut all = Vec::new();
+                widgets(editor.upcast_ref(), &mut all);
+                all.iter()
+                    .find(|w| w.is::<gtk::Entry>())
+                    .unwrap()
+                    .downgrade()
+            };
+            if by_cancel {
+                let mut all = Vec::new();
+                widgets(editor.upcast_ref(), &mut all);
+                all.into_iter()
+                    .filter_map(|w| w.downcast::<gtk::Button>().ok())
+                    .find(|b| b.label().as_deref() == Some("Cancel"))
+                    .unwrap()
+                    .emit_clicked();
+            } else {
+                editor.close();
+            }
+            drop(editor);
+            pump();
+            assert!(
+                weak.upgrade().is_none(),
+                "{label}: the editor window is still alive"
+            );
+            assert!(
+                form.upgrade().is_none(),
+                "{label}: its fields are still alive"
+            );
+        }
+        parent.close();
+    }
+
     /// A refused paste leaves Add server as it was before that paste and shows
     /// only the refusal: no "Give the server a name." for the name the user
     /// only left to use the paste box, and the fields of an earlier paste stay.
