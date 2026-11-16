@@ -1775,6 +1775,26 @@ pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String>
     set_secret_raw(&crate::local_auth::owner(server_id)?, key, value)
 }
 
+/// A client-config backup's vault write. Its key is new for each backup
+/// (it holds the content hash), so there is no old value whose log cleanup
+/// could be lost, and it is never registered: the text is a whole client
+/// config, never sent to a server, and its ordinary lines would otherwise be
+/// redacted from every log.
+pub(crate) fn set_backup_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if tests::write_is_injected_failure(key) {
+        return Err("injected secret persistence failure".into());
+    }
+    if server_id == INTERNAL_SERVER_ID {
+        return Err("reserved Toolport secret namespace".to_string());
+    }
+    let owner = crate::local_auth::owner(server_id)?;
+    if file::active() {
+        return file::set_secret(&owner, key, value);
+    }
+    platform::set_secret(&owner, key, value)
+}
+
 pub fn get_secret(server_id: &str, key: &str) -> Option<String> {
     get_secret_result(server_id, key).ok().flatten()
 }

@@ -421,9 +421,9 @@ fn encode_internal(
     // The complete byte spelling lives only in the vault. Publish the fallback
     // only after a verified vault write, before modifying the client's file.
     for (index, value) in retained_values.iter().enumerate() {
-        crate::secrets::set_secret(&account, &format!("{key}-credential-{index}"), value)?;
+        crate::secrets::set_backup_secret(&account, &format!("{key}-credential-{index}"), value)?;
     }
-    crate::secrets::set_secret(&account, &key, text)?;
+    crate::secrets::set_backup_secret(&account, &key, text)?;
     if crate::secrets::get_backup_secret_result(&account, &key)?.as_deref() != Some(text) {
         return Err("Could not verify vaulted client backup. Client config unchanged.".into());
     }
