@@ -3803,7 +3803,26 @@ pub fn redact_outgoing_json(json: String) -> String {
     // forms only, as in [`redact_outgoing`].
     match m.main().redact_definition_line(&json) {
         Cow::Borrowed(_) => json,
-        Cow::Owned(out) => out,
+        Cow::Owned(out) => keep_request_id(&json, out),
+    }
+}
+
+/// `edited` with the `id` of `original` put back: a request's id is the
+/// gateway's own (or the server's), and the client answers by it, so it is
+/// never redacted, as a reply's id is not ([`redact_reply`]).
+fn keep_request_id(original: &str, edited: String) -> String {
+    let Ok(Value::Object(before)) = serde_json::from_str::<Value>(original) else {
+        return edited;
+    };
+    let Some(id) = before.get("id") else {
+        return edited;
+    };
+    match serde_json::from_str::<Value>(&edited) {
+        Ok(Value::Object(mut after)) if after.get("id") != Some(id) => {
+            after.insert("id".to_string(), id.clone());
+            Value::Object(after).to_string()
+        }
+        _ => edited,
     }
 }
 
