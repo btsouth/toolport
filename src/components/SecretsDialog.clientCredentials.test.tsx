@@ -165,6 +165,20 @@ describe("SecretsDialog client credentials (SBS-524)", () => {
     await waitFor(() => expect(clearClientCredentials).toHaveBeenCalledWith("srv-1"));
   });
 
+  it("puts focus on the collapsed section's opener after a confirmed removal", async () => {
+    hasClientSecret.mockResolvedValue(true);
+    const user = await openDialog(
+      server({ clientCredentials: { clientId: "client-abc" } }),
+    );
+    await waitFor(() => expect(hasClientSecret).toHaveBeenCalled());
+    await user.click(screen.getByRole("button", { name: "Remove client credentials" }));
+    await user.click(screen.getByRole("button", { name: "Remove" }));
+    const opener = await screen.findByRole("button", {
+      name: /No browser available\?/,
+    });
+    await waitFor(() => expect(opener).toHaveFocus());
+  });
+
   it("does not treat a failed secret probe as a missing secret", async () => {
     hasClientSecret.mockRejectedValue(new Error("keychain unavailable"));
     const user = await openDialog(

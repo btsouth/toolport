@@ -358,7 +358,9 @@ jobs:
             quiet_tooltips::tests::a_guarded_menu_silences_tooltips_before_it_is_presented \
             quiet_tooltips::tests::dropdowns_split_buttons_and_popovers_silence_tooltips_while_open \
             tests::pasted_rows_are_freed_when_the_dialog_closes \
-            tests::pasted_arguments_survive_the_gtk_box
+            tests::pasted_arguments_survive_the_gtk_box \
+            credential_dialog_tests::credentials_dialog_waits_for_values_and_stays_open_after_each_write \
+            credential_dialog_tests::authentication_dialog_confirms_removals_and_keeps_focus_and_caption
           do
             xvfb-run -a dbus-run-session -- cargo test \
               --manifest-path src-tauri/Cargo.toml --no-default-features \
