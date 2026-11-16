@@ -252,6 +252,7 @@
   "Changed tool definitions are flagged for review, and results that look like prompt injection show up in Activity.": "변경된 도구 정의는 검토를 위해 플래그가 지정되고 프롬프트 삽입처럼 보이는 결과가 활동에 표시됩니다.",
   "Changes: {changes}": "변경 사항: {changes}",
   "Check cancelled": "확인을 취소했습니다",
+  "Keyring locked": "키링 잠김",
   "Check that each server started on the main screen.": "메인 화면에서 각 서버가 시작됐는지 확인하세요.",
   "Checked Toolport status": "Toolport 상태를 확인했습니다.",
   "Checking {name}...": "{name} 확인 중...",

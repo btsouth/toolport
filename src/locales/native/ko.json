@@ -1073,6 +1073,7 @@
   "{value0} credentials and settings": "{value0} 자격 증명 및 설정",
   "{value0} direct + {value1} fallback": "{value0} 직접 + {value1} 대체",
   "{value0} failing": "{value0} 실패",
+  "{value0} waiting for the keyring": "{value0}개 키링 대기 중",
   "{value0} is a boolean and should not reach text coercion": "{value0}는 부울이며 텍스트 강제 변환에 도달해서는 안 됩니다.",
   "{value0} is required": "{value0}는 필수입니다",
   "{value0} ms": "{value0}밀리초",

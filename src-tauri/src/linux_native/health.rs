@@ -21,12 +21,28 @@ pub(super) enum ProbeReason {
     /// The user asked for a fresh check, or credentials outside the registry
     /// changed.
     Refresh,
+    /// The keyring was found open: check again the servers that showed it
+    /// locked, without asking.
+    Unlocked,
+}
+
+/// Enabled servers by health state, for the page's one-line summary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Tally {
+    pub(super) ready: usize,
+    pub(super) auth: usize,
+    pub(super) errors: usize,
+    pub(super) locked: usize,
+    pub(super) pending: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ProbeTicket {
     pub(super) server_id: String,
     token: u64,
+    /// The user asked for this check (Refresh, or Retry on this server), so it
+    /// may ask to unlock the keyring. Checks the page starts never do.
+    pub(super) interactive: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -53,6 +69,11 @@ struct InFlight {
     /// The definition to probe once this probe finishes, when it went stale
     /// while running. Probing again only then keeps one process per server.
     rerun: Option<u64>,
+    /// This probe was the user's.
+    interactive: bool,
+    /// A user's Refresh or Retry is waiting for this probe to finish: the
+    /// rerun is theirs, not this probe's.
+    rerun_interactive: bool,
 }
 
 #[derive(Default)]
@@ -60,11 +81,34 @@ pub(super) struct HealthCache {
     results: HashMap<String, Cached>,
     in_flight: HashMap<String, InFlight>,
     next_token: u64,
+    /// The page polls the keyring while a row shows it locked.
+    polling_keyring: bool,
 }
 
 impl HealthCache {
     pub(super) fn result(&self, server_id: &str) -> Option<&ProbeResult> {
         self.results.get(server_id).map(|cached| &cached.result)
+    }
+
+    /// Some row shows "Keyring locked".
+    pub(super) fn has_locked(&self) -> bool {
+        self.results
+            .values()
+            .any(|cached| cached.result.keyring_locked)
+    }
+
+    /// Whether to start polling the keyring: some row shows it locked and no
+    /// poll runs yet. [`Self::keep_polling`] ends it.
+    pub(super) fn start_keyring_poll(&mut self) -> bool {
+        let start = self.has_locked() && !self.polling_keyring;
+        self.polling_keyring |= start;
+        start
+    }
+
+    /// The poll goes on while a row shows the keyring locked.
+    pub(super) fn keep_polling(&mut self) -> bool {
+        self.polling_keyring = self.has_locked();
+        self.polling_keyring
     }
 
     pub(super) fn is_checking(&self, server_id: &str) -> bool {
@@ -83,11 +127,25 @@ impl HealthCache {
 
     /// Decide which enabled servers need a probe. `enabled` pairs each enabled
     /// server id with its definition fingerprint.
+    #[cfg(test)]
     pub(super) fn plan(
         &mut self,
         enabled: &[(&str, u64)],
         reason: ProbeReason,
         now: Instant,
+    ) -> Vec<ProbeTicket> {
+        self.plan_asked(enabled, reason, now, None)
+    }
+
+    /// [`Self::plan`] for a check the user asked for: a Refresh asks for every
+    /// server, a Retry for `retried`. Their tickets, and a rerun queued behind a
+    /// probe already running, are interactive.
+    pub(super) fn plan_asked(
+        &mut self,
+        enabled: &[(&str, u64)],
+        reason: ProbeReason,
+        now: Instant,
+        retried: Option<&str>,
     ) -> Vec<ProbeTicket> {
         self.results
             .retain(|id, _| enabled.iter().any(|(enabled_id, _)| enabled_id == id));
@@ -100,29 +158,37 @@ impl HealthCache {
 
         let mut tickets = Vec::new();
         for &(id, fingerprint) in enabled {
+            let asked = reason == ProbeReason::Refresh || retried == Some(id);
             let needed = match self.results.get(id) {
                 None => true,
                 Some(cached) => {
                     reason == ProbeReason::Refresh
                         || cached.fingerprint != fingerprint
                         || (reason == ProbeReason::Stale
-                            && now.saturating_duration_since(cached.checked_at)
-                                >= HEALTH_STALE_AFTER)
+                            && (now.saturating_duration_since(cached.checked_at)
+                                >= HEALTH_STALE_AFTER
+                                // "Keyring locked" says nothing about the
+                                // server, and may only mean the keyring was
+                                // busy: check again whenever the page opens.
+                                || cached.result.keyring_locked))
+                        || (reason == ProbeReason::Unlocked && cached.result.keyring_locked)
                 }
             };
             if let Some(flight) = self.in_flight.get_mut(id) {
                 if flight.rerun.is_some() {
                     flight.rerun = Some(fingerprint);
-                } else if flight.fingerprint == fingerprint && reason != ProbeReason::Refresh {
+                    flight.rerun_interactive |= asked;
+                } else if flight.fingerprint == fingerprint && !asked {
                     flight.wanted = true;
-                } else if needed {
+                } else if needed || asked {
                     flight.wanted = false;
                     flight.rerun = Some(fingerprint);
+                    flight.rerun_interactive |= asked;
                 }
                 continue;
             }
             if needed {
-                tickets.push(self.start(id, fingerprint));
+                tickets.push(self.start(id, fingerprint, asked));
             }
         }
         tickets
@@ -145,7 +211,10 @@ impl HealthCache {
             .remove(&ticket.server_id)
             .expect("the in-flight entry was just found");
         if let Some(fingerprint) = flight.rerun {
-            return ProbeOutcome::Rerun(self.start(&ticket.server_id, fingerprint));
+            // A rerun that replaces the user's probe, or that the user queued,
+            // is still theirs.
+            let interactive = flight.interactive || flight.rerun_interactive;
+            return ProbeOutcome::Rerun(self.start(&ticket.server_id, fingerprint, interactive));
         }
         if !flight.wanted {
             return ProbeOutcome::Discard;
@@ -162,24 +231,23 @@ impl HealthCache {
     }
 
     /// Ready, needs sign-in, failing and still checking, over enabled servers.
-    pub(super) fn tally<'a>(
-        &self,
-        enabled: impl IntoIterator<Item = &'a str>,
-    ) -> (usize, usize, usize, usize) {
-        let (mut ready, mut auth, mut errors, mut pending) = (0, 0, 0, 0);
+    pub(super) fn tally<'a>(&self, enabled: impl IntoIterator<Item = &'a str>) -> Tally {
+        let mut tally = Tally::default();
         for id in enabled {
             match self.results.get(id) {
-                _ if self.in_flight.contains_key(id) => pending += 1,
-                None => pending += 1,
-                Some(cached) if cached.result.ok => ready += 1,
-                Some(cached) if cached.result.auth_required => auth += 1,
-                Some(_) => errors += 1,
+                _ if self.in_flight.contains_key(id) => tally.pending += 1,
+                None => tally.pending += 1,
+                Some(cached) if cached.result.ok => tally.ready += 1,
+                Some(cached) if cached.result.auth_required => tally.auth += 1,
+                // Not checked: the keyring is locked. Not a failure.
+                Some(cached) if cached.result.keyring_locked => tally.locked += 1,
+                Some(_) => tally.errors += 1,
             }
         }
-        (ready, auth, errors, pending)
+        tally
     }
 
-    fn start(&mut self, server_id: &str, fingerprint: u64) -> ProbeTicket {
+    fn start(&mut self, server_id: &str, fingerprint: u64, interactive: bool) -> ProbeTicket {
         self.next_token = self.next_token.wrapping_add(1);
         self.in_flight.insert(
             server_id.to_string(),
@@ -188,11 +256,14 @@ impl HealthCache {
                 fingerprint,
                 wanted: true,
                 rerun: None,
+                interactive,
+                rerun_interactive: false,
             },
         );
         ProbeTicket {
             server_id: server_id.to_string(),
             token: self.next_token,
+            interactive,
         }
     }
 }
@@ -210,6 +281,7 @@ mod tests {
             auth_required: false,
             failure: None,
             auth_target: None,
+            keyring_locked: false,
         }
     }
 
@@ -225,6 +297,31 @@ mod tests {
             let id = ticket.server_id.clone();
             assert_eq!(cache.complete(&ticket, ok(&id), now), ProbeOutcome::Apply);
         }
+    }
+
+    /// Failure mode: after a Retry on one locked row, or an unlock by
+    /// anything else, the other rows kept "Keyring locked" until Refresh.
+    #[test]
+    fn an_open_keyring_checks_every_locked_row_again_and_only_those() {
+        let mut cache = HealthCache::default();
+        let now = Instant::now();
+        let enabled = [("a", 1), ("b", 2), ("c", 3)];
+        for ticket in cache.plan(&enabled, ProbeReason::ConfigChanged, now) {
+            let mut result = ok(&ticket.server_id);
+            result.ok = ticket.server_id == "c";
+            result.keyring_locked = !result.ok;
+            assert_eq!(cache.complete(&ticket, result, now), ProbeOutcome::Apply);
+        }
+        assert!(cache.start_keyring_poll());
+        assert!(!cache.start_keyring_poll(), "one poll");
+        let again = cache.plan(&enabled, ProbeReason::Unlocked, now);
+        assert_eq!(ids(&again), ["a", "b"]);
+        assert!(again.iter().all(|ticket| !ticket.interactive));
+        assert!(cache.plan(&enabled, ProbeReason::Unlocked, now).is_empty());
+        assert!(cache.keep_polling(), "still showing locked while checked");
+        settle(&mut cache, again, now);
+        assert!(!cache.has_locked());
+        assert!(!cache.keep_polling());
     }
 
     #[test]
@@ -245,7 +342,13 @@ mod tests {
                 .plan(&enabled, ProbeReason::ConfigChanged, now)
                 .is_empty());
         }
-        assert_eq!(cache.tally(["a", "b"]), (2, 0, 0, 0));
+        assert_eq!(
+            cache.tally(["a", "b"]),
+            Tally {
+                ready: 2,
+                ..Tally::default()
+            }
+        );
     }
 
     #[test]
@@ -317,6 +420,85 @@ mod tests {
         );
     }
 
+    /// Failure mode: a Refresh or Retry during a check the page started only
+    /// queued a rerun, and the rerun took the finished check's
+    /// `interactive = false`, so a locked keyring stayed "Keyring locked".
+    #[test]
+    fn a_refresh_or_retry_queued_behind_an_automatic_probe_stays_the_users() {
+        let mut cache = HealthCache::default();
+        let now = Instant::now();
+        let first = cache.plan(&[("a", 1), ("b", 1)], ProbeReason::ConfigChanged, now);
+        assert!(first.iter().all(|ticket| !ticket.interactive));
+
+        // Refresh while both run: nothing starts now, both reruns are the user's.
+        assert!(cache
+            .plan_asked(&[("a", 1), ("b", 1)], ProbeReason::Refresh, now, None)
+            .is_empty());
+        for ticket in &first {
+            let ProbeOutcome::Rerun(next) = cache.complete(ticket, ok(&ticket.server_id), now)
+            else {
+                panic!("a refresh during a probe must rerun it");
+            };
+            assert!(next.interactive, "{next:?}");
+            assert_eq!(
+                cache.complete(&next, ok(&next.server_id), now),
+                ProbeOutcome::Apply
+            );
+        }
+
+        // A row's Retry on one server while the page checks both again.
+        let again = cache.plan(&[("a", 2), ("b", 2)], ProbeReason::ConfigChanged, now);
+        cache.invalidate("a");
+        assert!(cache
+            .plan_asked(
+                &[("a", 2), ("b", 2)],
+                ProbeReason::ConfigChanged,
+                now,
+                Some("a")
+            )
+            .is_empty());
+        for ticket in &again {
+            match cache.complete(ticket, ok(&ticket.server_id), now) {
+                ProbeOutcome::Rerun(next) => {
+                    assert_eq!(next.server_id, "a");
+                    assert!(next.interactive, "the retried server's rerun is the user's");
+                }
+                ProbeOutcome::Apply => assert_eq!(ticket.server_id, "b"),
+                ProbeOutcome::Discard => panic!("nothing was removed"),
+            }
+        }
+    }
+
+    /// Failure mode: a check that found the keyring locked (or only busy)
+    /// stayed "Keyring locked" for five minutes of page opens, after the
+    /// keyring was unlocked, unless the user chose Retry.
+    #[test]
+    fn a_keyring_locked_result_is_checked_again_when_the_page_opens() {
+        let mut cache = HealthCache::default();
+        let now = Instant::now();
+        let first = cache.plan(&[("a", 1), ("b", 1)], ProbeReason::ConfigChanged, now);
+        for ticket in first {
+            let mut result = ok(&ticket.server_id);
+            if ticket.server_id == "a" {
+                result.ok = false;
+                result.keyring_locked = true;
+            }
+            assert_eq!(cache.complete(&ticket, result, now), ProbeOutcome::Apply);
+        }
+        let soon = now + Duration::from_secs(1);
+        let again = cache.plan(&[("a", 1), ("b", 1)], ProbeReason::Stale, soon);
+        assert_eq!(
+            ids(&again),
+            ["a"],
+            "only the locked result is checked again"
+        );
+        assert!(!again[0].interactive, "the page's own check never asks");
+        // Re-renders and config reloads still never probe it on their own.
+        assert!(cache
+            .plan(&[("a", 1), ("b", 1)], ProbeReason::ConfigChanged, soon)
+            .is_empty());
+    }
+
     #[test]
     fn refresh_and_invalidate_probe_again_without_overlapping() {
         let mut cache = HealthCache::default();
@@ -334,7 +516,13 @@ mod tests {
         let ProbeOutcome::Rerun(next) = cache.complete(&refresh[0], ok("a"), now) else {
             panic!("an invalidated probe must be rerun");
         };
-        assert_eq!(cache.tally(["a"]), (0, 0, 0, 1));
+        assert_eq!(
+            cache.tally(["a"]),
+            Tally {
+                pending: 1,
+                ..Tally::default()
+            }
+        );
         assert_eq!(cache.complete(&next, ok("a"), now), ProbeOutcome::Apply);
         // A ticket from an older round never lands.
         assert_eq!(

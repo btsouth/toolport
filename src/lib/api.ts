@@ -129,9 +129,11 @@ export function gatherDiagnostics(): Promise<string> {
   return invoke<string>("gather_diagnostics");
 }
 
-/** Connect to each enabled server and report health + tool count. */
-export function probeServers(): Promise<ProbeResult[]> {
-  return invoke<ProbeResult[]>("probe_servers");
+/** Connect to each enabled server and report health + tool count. Only an
+ * `interactive` check (a Refresh or Retry the user chose) may ask to unlock the
+ * keyring; otherwise a server that keeps values in a locked one says so. */
+export function probeServers(interactive = false): Promise<ProbeResult[]> {
+  return invoke<ProbeResult[]>("probe_servers", { interactive });
 }
 
 /** Connect to a (possibly unsaved) server entry to verify it works before
@@ -408,6 +410,8 @@ export interface HttpBridgeStatus {
   port: number | null;
   url: string | null;
   token: string | null;
+  /** Left on, and waiting for the keyring to unlock before it starts. */
+  keyringLocked?: boolean;
 }
 
 /** Start the supervised toolport-gateway HTTP/OpenAPI server (Open WebUI etc.). */
@@ -418,6 +422,11 @@ export function startHttpBridge(port?: number): Promise<HttpBridgeStatus> {
 /** Stop the supervised HTTP/OpenAPI server. */
 export function stopHttpBridge(): Promise<HttpBridgeStatus> {
   return invoke<HttpBridgeStatus>("stop_http_bridge");
+}
+
+/** The user's Retry on an endpoint waiting for the keyring; may ask to unlock it. */
+export function retryHttpBridge(): Promise<HttpBridgeStatus> {
+  return invoke<HttpBridgeStatus>("retry_http_bridge");
 }
 
 /** Current HTTP/OpenAPI bridge status (reaps the child if it exited). */

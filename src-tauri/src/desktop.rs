@@ -34,7 +34,7 @@ use crate::remote;
 use crate::savings;
 use crate::searchtrace;
 use crate::secrets;
-use crate::server_runtime::{probe_one, probe_one_bounded, ProbeResult};
+use crate::server_runtime::{probe_one, ProbeResult};
 use crate::teams;
 use crate::vendors;
 
@@ -1299,11 +1299,17 @@ fn last_lines(text: &str, n: usize) -> String {
 /// UI resolves each row independently instead of waiting for the slowest - a cold
 /// `npx` install used to leave the whole grid "checking" for 30-60s. Still returns
 /// the full batch for callers that want it. Issue #252.
+///
+/// The window's own checks (on load, after a change) never ask to unlock the
+/// keyring: a server that keeps values in a locked one reports it locked.
+/// `interactive` is a Refresh or Retry the user chose, which may ask.
 #[tauri::command]
 async fn probe_servers(
     app: tauri::AppHandle,
     state: State<'_, RegistryState>,
+    interactive: Option<bool>,
 ) -> Result<Vec<ProbeResult>, String> {
+    let interactive = interactive.unwrap_or(false);
     // Snapshot which servers to probe, then drop the lock before any I/O.
     let servers = {
         let reg = state
@@ -1314,21 +1320,79 @@ async fn probe_servers(
     // One worker thread per server. Each emits its result as soon as it's ready
     // (the UI listens for `server-probed`), then contributes to the returned batch.
     tauri::async_runtime::spawn_blocking(move || {
+        let check = crate::server_runtime::KeyringCheck::default();
         let handles: Vec<_> = servers
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|s| {
                 let app = app.clone();
+                let check = check.clone();
                 std::thread::spawn(move || {
-                    let result = probe_one_bounded(&s);
+                    let result = if interactive {
+                        crate::server_runtime::probe_one_bounded(&s)
+                    } else {
+                        crate::server_runtime::probe_health_checked(&s, &check)
+                    };
                     let _ = app.emit("server-probed", &result);
                     result
                 })
             })
             .collect();
-        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        let results: Vec<ProbeResult> = handles.into_iter().filter_map(|h| h.join().ok()).collect();
+        recheck_locked_servers(&app, &servers, &results);
+        results
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Servers whose last check found the keyring locked, for
+/// [`crate::server_runtime::recheck_locked_once_open`].
+static LOCKED_SERVERS: Mutex<crate::server_runtime::LockedRecheck> =
+    Mutex::new(crate::server_runtime::LockedRecheck::new());
+
+/// A row shows "Keyring locked" until something checks it again, and the
+/// keyring may only have been busy: check those rows again (never asking) on
+/// the first poll that finds it open.
+fn recheck_locked_servers(
+    app: &tauri::AppHandle,
+    servers: &[crate::registry::ServerEntry],
+    results: &[ProbeResult],
+) {
+    let locked = servers
+        .iter()
+        .filter(|server| {
+            results
+                .iter()
+                .any(|result| result.server_id == server.id && result.keyring_locked)
+        })
+        .cloned()
+        .collect();
+    let start = LOCKED_SERVERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .replace(locked);
+    if !start {
+        return;
+    }
+    let app = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("toolport-locked-recheck".into())
+        .spawn(move || {
+            crate::server_runtime::recheck_locked_once_open(
+                &LOCKED_SERVERS,
+                crate::http_bridge::KEYRING_POLL,
+                |result| {
+                    let _ = app.emit("server-probed", result);
+                },
+            )
+        });
+    if spawned.is_err() {
+        LOCKED_SERVERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stopped();
+    }
 }
 
 /// List the tools one server exposes (raw MCP tool objects: name, description,
@@ -2188,38 +2252,41 @@ fn start_team_lifecycle(app: &tauri::AppHandle) {
                     failures = 0;
                     3
                 }
-                Ok(true) => {
-                    let result = teams::sync_wait(25);
-                    let _ = handle.emit("team-sync-status", crate::team_sync_status::current());
-                    match result {
-                        Ok(result) => {
-                            failures = 0;
-                            if stop.load(std::sync::atomic::Ordering::Acquire) {
-                                break;
+                Ok(true) => match teams::background_sync(25) {
+                    // The keyring is locked: no prompt, no error, the next tick tries again.
+                    None => 5,
+                    Some(result) => {
+                        let _ = handle.emit("team-sync-status", crate::team_sync_status::current());
+                        match result {
+                            Ok(result) => {
+                                failures = 0;
+                                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                                    break;
+                                }
+                                let state = handle.state::<RegistryState>();
+                                match finish_sync(&handle, state.inner(), result) {
+                                    Ok(fresh) => {
+                                        let _ = handle.emit("team-sync-registry", &fresh);
+                                    }
+                                    Err(error) => {
+                                        let _ = handle.emit("team-sync-error", &error);
+                                    }
+                                }
+                                teams::retry_delay_seconds(0)
                             }
-                            let state = handle.state::<RegistryState>();
-                            match finish_sync(&handle, state.inner(), result) {
-                                Ok(fresh) => {
+                            Err(error) => {
+                                failures = failures.saturating_add(1);
+                                let _ = handle.emit("team-sync-error", &error);
+                                if let Ok(fresh) = registry::load() {
                                     let _ = handle.emit("team-sync-registry", &fresh);
                                 }
-                                Err(error) => {
-                                    let _ = handle.emit("team-sync-error", &error);
-                                }
+                                registry::load()
+                                    .map(|r| teams::sync_retry_seconds(&r, failures))
+                                    .unwrap_or_else(|_| teams::retry_delay_seconds(failures))
                             }
-                            teams::retry_delay_seconds(0)
-                        }
-                        Err(error) => {
-                            failures = failures.saturating_add(1);
-                            let _ = handle.emit("team-sync-error", &error);
-                            if let Ok(fresh) = registry::load() {
-                                let _ = handle.emit("team-sync-registry", &fresh);
-                            }
-                            registry::load()
-                                .map(|r| teams::sync_retry_seconds(&r, failures))
-                                .unwrap_or_else(|_| teams::retry_delay_seconds(failures))
                         }
                     }
-                }
+                },
                 Err(error) => {
                     failures = failures.saturating_add(1);
                     eprintln!("Toolport: Teams registry unavailable: {error}");
@@ -3632,10 +3699,40 @@ async fn start_http_bridge(app: AppHandle, port: Option<u16>) -> Result<HttpBrid
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<HttpBridgeState>();
         let registry = app.state::<RegistryState>();
+        if let Some(held) = hold_http_bridge_turned_on(state.inner(), registry.inner(), port)? {
+            // Starts on the first unlock, like one left on; Retry may ask.
+            restore_http_bridge_on_start(app.clone());
+            return Ok(held);
+        }
         start_persisted_http_bridge(state.inner(), registry.inner(), port)
     })
     .await
     .map_err(|error| format!("HTTP endpoint task failed: {error}"))?
+}
+
+/// Turning the endpoint on while the keyring is locked saves the setting and
+/// waits, like an endpoint left on at start: it shows "Keyring locked", and
+/// only Retry may ask to unlock. `None`: the keyring would not ask; start it.
+fn hold_http_bridge_turned_on(
+    state: &HttpBridgeState,
+    registry: &RegistryState,
+    port: Option<u16>,
+) -> Result<Option<HttpBridgeStatus>, String> {
+    let _lifecycle = HTTP_BRIDGE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if crate::http_bridge::status(state).running || !secrets::store_would_prompt() {
+        return Ok(None);
+    }
+    write_registry(registry, |reg| {
+        reg.http_bridge_enabled = true;
+        if port.is_some() {
+            reg.http_bridge_port = port;
+        }
+        Ok(())
+    })?;
+    crate::http_bridge::mark_waiting(state, true);
+    Ok(Some(crate::http_bridge::status(state)))
 }
 
 /// Start the endpoint and durably remember the user's intent. Shared HTTP client
@@ -3696,7 +3793,20 @@ fn start_http_bridge_with_token_at(
     port: Option<u16>,
     token: Option<String>,
 ) -> Result<HttpBridgeStatus, String> {
+    #[cfg(test)]
+    if FAKE_BRIDGE_START.with(std::cell::Cell::get) {
+        return Ok(HttpBridgeStatus::new(
+            port,
+            Some(token.unwrap_or_else(|| "minted-test-token".into())),
+        ));
+    }
     crate::http_bridge::start_with_token_at(state, port, token)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A start that "comes up" with the token it was given, or a new one.
+    static FAKE_BRIDGE_START: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn stop_http_bridge_with(
@@ -3710,37 +3820,135 @@ fn stop_http_bridge_with(
 #[tauri::command]
 async fn stop_http_bridge(app: AppHandle) -> Result<HttpBridgeStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let _lifecycle = HTTP_BRIDGE_LIFECYCLE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let registry = app.state::<RegistryState>();
-        clear_update_http_bridge_intent()?;
-        write_registry(registry.inner(), |reg| {
-            reg.http_bridge_enabled = false;
-            Ok(())
-        })?;
         let state = app.state::<HttpBridgeState>();
-        let mut bridge = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        stop_http_bridge_with(&mut bridge, std::process::Child::kill)
+        stop_persisted_http_bridge(state.inner(), registry.inner())
     })
     .await
     .map_err(|error| format!("HTTP endpoint task failed: {error}"))?
 }
 
+/// Turn the endpoint off and forget the user's intent. One waiting for the
+/// keyring is on too: this clears its saved setting and ends the wait, without
+/// reading the keyring, so an unlock never starts it.
+fn stop_persisted_http_bridge(
+    state: &HttpBridgeState,
+    registry: &RegistryState,
+) -> Result<HttpBridgeStatus, String> {
+    let _lifecycle = HTTP_BRIDGE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    clear_update_http_bridge_intent()?;
+    write_registry(registry, |reg| {
+        reg.http_bridge_enabled = false;
+        Ok(())
+    })?;
+    let mut bridge = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    stop_http_bridge_with(&mut bridge, std::process::Child::kill)
+}
+
+/// At start: bring back an endpoint the user left on. Never asks to unlock
+/// the keyring: while it would, the endpoint shows as locked (`Ok(false)`),
+/// and [`restore_http_bridge_on_start`] starts it on the first unlock.
+#[cfg(test)]
 fn restore_persisted_http_bridge(state: &HttpBridgeState) -> Result<bool, String> {
+    match restore_http_bridge_once(state) {
+        crate::http_bridge::Restore::Running => Ok(true),
+        crate::http_bridge::Restore::Off | crate::http_bridge::Restore::Held => Ok(false),
+        crate::http_bridge::Restore::Failed(error) => Err(error),
+    }
+}
+
+/// One restore attempt at start: no keyring call in it may ask to unlock.
+fn restore_http_bridge_once(state: &HttpBridgeState) -> crate::http_bridge::Restore {
+    use crate::http_bridge::Restore;
+    match secrets::without_prompts(|| restore_saved_http_bridge(state, false)) {
+        Ok(true) => Restore::Running,
+        Ok(false) if crate::http_bridge::waiting_for_keyring(state) => Restore::Held,
+        Ok(false) => Restore::Off,
+        Err(error) => Restore::Failed(error),
+    }
+}
+
+/// `may_prompt` only for the user's Retry.
+fn restore_saved_http_bridge(state: &HttpBridgeState, may_prompt: bool) -> Result<bool, String> {
     let _lifecycle = HTTP_BRIDGE_LIFECYCLE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let registry = registry::load()?;
     if !registry.http_bridge_enabled {
+        // Turned off between an attempt and its wait: no wait left to show.
+        crate::http_bridge::mark_waiting(state, false);
         return Ok(false);
     }
-    let token = secrets::get_secret_result(HTTP_BRIDGE_VAULT_SERVER, HTTP_BRIDGE_VAULT_KEY)?
-        .ok_or("The HTTP endpoint is enabled, but its saved bearer token is missing")?;
-    start_http_bridge_with_token_at(state, registry.http_bridge_port, Some(token))?;
+    if crate::http_bridge::status(state).running {
+        return Ok(true);
+    }
+    if !may_prompt && crate::http_bridge::hold_for_keyring(state) {
+        return Ok(false);
+    }
+    let saved = secrets::get_secret_result(HTTP_BRIDGE_VAULT_SERVER, HTTP_BRIDGE_VAULT_KEY)?;
+    let minted = saved.is_none();
+    let status = start_http_bridge_with_token_at(state, registry.http_bridge_port, saved)?;
+    if minted {
+        // Turned on while locked before any token was saved: save the new
+        // one, as a first start does.
+        let saved = status
+            .token
+            .as_deref()
+            .ok_or("The HTTP endpoint started without a bearer token")
+            .map_err(str::to_string)
+            .and_then(|token| {
+                secrets::set_secret(HTTP_BRIDGE_VAULT_SERVER, HTTP_BRIDGE_VAULT_KEY, token)
+            });
+        if let Err(error) = saved {
+            let mut bridge = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = stop_http_bridge_with(&mut bridge, std::process::Child::kill);
+            return Err(format!("Could not save the HTTP endpoint token: {error}"));
+        }
+    }
     Ok(true)
+}
+
+/// Restore the saved endpoint at start: if the keyring is locked, again as
+/// soon as it is unlocked; if it fails, again a few times while it shows the
+/// wait.
+fn restore_http_bridge_on_start(app: AppHandle) {
+    fn state_of(app: &AppHandle) -> &HttpBridgeState {
+        app.state::<HttpBridgeState>().inner()
+    }
+    fn attempt(app: &AppHandle) -> crate::http_bridge::Restore {
+        restore_http_bridge_once(state_of(app))
+    }
+    match crate::http_bridge::restore_with_retries(app, state_of, attempt, 1) {
+        crate::http_bridge::Restore::Running => {
+            eprintln!("toolport: restored the saved HTTP endpoint")
+        }
+        crate::http_bridge::Restore::Held => {
+            eprintln!("toolport: the saved HTTP endpoint waits for the keyring to unlock")
+        }
+        crate::http_bridge::Restore::Off => {}
+        crate::http_bridge::Restore::Failed(error) => {
+            eprintln!("toolport: could not restore the saved HTTP endpoint yet: {error}")
+        }
+    }
+}
+
+/// The user's Retry on an endpoint that waited for the keyring. It may ask to
+/// unlock it.
+#[tauri::command]
+async fn retry_http_bridge(app: AppHandle) -> Result<HttpBridgeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<HttpBridgeState>();
+        restore_saved_http_bridge(state.inner(), true)?;
+        Ok(crate::http_bridge::status(state.inner()))
+    })
+    .await
+    .map_err(|error| format!("HTTP endpoint task failed: {error}"))?
 }
 
 /// Make an update-restored endpoint durable before its one-shot recovery marker
@@ -3771,6 +3979,14 @@ fn resume_http_bridge_after_update(
         return Ok(false);
     };
     ensure_http_bridge_at(state, intent.port, Some(intent.token.clone()))?;
+    if crate::secrets::write_would_ask() {
+        // Saving the token would ask to unlock the keyring. The endpoint runs
+        // from the update's marker, which stays until a start can save it.
+        eprintln!(
+            "toolport: restored the HTTP endpoint after the update; it is saved once the keyring is unlocked"
+        );
+        return Ok(true);
+    }
     if let Err(error) = persist_restored_http_bridge(registry, intent.port, &intent.token) {
         eprintln!(
             "toolport: restored the HTTP endpoint, but could not save its persistent state: {error}"
@@ -3786,13 +4002,17 @@ fn resume_http_bridge_after_update(
 }
 
 /// Report whether the HTTP bridge is running, reaping it if it has exited.
+/// Off the main thread: a start holds the bridge's state while it waits for
+/// the endpoint to come up.
 #[tauri::command]
-fn http_bridge_status(state: State<HttpBridgeState>) -> Result<HttpBridgeStatus, String> {
-    let mut bridge = state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    http_bridge_alive(&mut bridge);
-    Ok(HttpBridgeStatus::new(bridge.port, bridge.token.clone()))
+async fn http_bridge_status(app: AppHandle) -> Result<HttpBridgeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(crate::http_bridge::status(
+            app.state::<HttpBridgeState>().inner(),
+        ))
+    })
+    .await
+    .map_err(|error| format!("HTTP endpoint task failed: {error}"))?
 }
 
 /// macOS only: show the Dock icon when a window is visible, and drop it (Accessory
@@ -4634,6 +4854,7 @@ pub fn run() {
             start_http_bridge,
             stop_http_bridge,
             http_bridge_status,
+            retry_http_bridge,
             stop_spawned_gateways,
             recover_update_gateways,
             stop_stale_gateways,
@@ -4753,15 +4974,7 @@ pub fn run() {
                         "toolport: could not restore the HTTP endpoint after the in-app update: {error}"
                     ),
                 }
-                match restore_persisted_http_bridge(
-                    migrate_handle.state::<HttpBridgeState>().inner(),
-                ) {
-                    Ok(true) => eprintln!("toolport: restored the saved HTTP endpoint"),
-                    Ok(false) => {}
-                    Err(error) => eprintln!(
-                        "toolport: could not restore the saved HTTP endpoint: {error}"
-                    ),
-                }
+                restore_http_bridge_on_start(migrate_handle.clone());
                 // Ownership map from disk (this launch thread has no RegistryState handle).
                 if !isolated_data_dir {
                     let managed_snapshot = registry::load()
@@ -5035,6 +5248,151 @@ mod tests {
         ))
     }
 
+    /// Failure mode: with the endpoint left on, every start read its saved
+    /// bearer token, and a locked keyring asked to be unlocked.
+    #[test]
+    fn a_start_with_the_endpoint_left_on_never_asks_to_unlock_the_keyring() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            registry::save(&Registry {
+                http_bridge_enabled: true,
+                http_bridge_port: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+            let state = HttpBridgeState::default();
+            let mut restored = None;
+            let prompts = crate::secrets::locked_store::prompts_during(|| {
+                restored = Some(restore_persisted_http_bridge(&state));
+            });
+            assert!(prompts.is_empty(), "{prompts:?}");
+            assert_eq!(restored, Some(Ok(false)));
+            assert!(!crate::http_bridge::status(&state).running);
+        });
+    }
+
+    /// Failure mode: an endpoint waiting for the keyring showed as off, and
+    /// its switch started it instead of turning it off; the saved setting
+    /// stayed on and the first unlock started it.
+    #[test]
+    fn turning_off_an_endpoint_that_waits_for_the_keyring_clears_it_for_good() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            registry::save(&Registry {
+                http_bridge_enabled: true,
+                http_bridge_port: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+            let state = HttpBridgeState::default();
+            let registry_state = Mutex::new(registry::load().unwrap());
+            let prompts = crate::secrets::locked_store::prompts_during(|| {
+                assert_eq!(restore_persisted_http_bridge(&state), Ok(false));
+                assert!(crate::http_bridge::status(&state).keyring_locked);
+                let stopped = stop_persisted_http_bridge(&state, &registry_state).unwrap();
+                assert!(!stopped.running && !stopped.keyring_locked, "{stopped:?}");
+            });
+            assert!(
+                prompts.is_empty(),
+                "turning it off read the keyring: {prompts:?}"
+            );
+            assert!(!registry::load().unwrap().http_bridge_enabled);
+            assert!(!crate::http_bridge::waiting_for_keyring(&state));
+            // A late restore (the waiter after an unlock) keeps it off.
+            assert_eq!(restore_persisted_http_bridge(&state), Ok(false));
+            assert!(!crate::http_bridge::status(&state).running);
+        });
+    }
+
+    /// A token read that fails at start (here: the store refuses it) is a
+    /// failed attempt the caller retries while it shows the wait, never a read
+    /// that asks to unlock.
+    #[test]
+    fn a_restore_whose_token_read_fails_is_a_failed_attempt() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            registry::save(&Registry {
+                http_bridge_enabled: true,
+                http_bridge_port: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+            let state = HttpBridgeState::default();
+            let outcome = crate::secrets::tests::with_failed_read(HTTP_BRIDGE_VAULT_KEY, || {
+                restore_http_bridge_once(&state)
+            });
+            assert!(
+                matches!(outcome, crate::http_bridge::Restore::Failed(_)),
+                "{outcome:?}"
+            );
+            assert!(!crate::http_bridge::status(&state).running);
+        });
+    }
+
+    /// Failure mode: turned on for the first time while locked, the endpoint
+    /// had no saved token, and every Retry failed with "saved bearer token is
+    /// missing". Retry now starts it with a new token and saves it.
+    #[test]
+    fn retry_starts_an_endpoint_turned_on_before_any_token_was_saved() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            registry::save(&Registry::default()).unwrap();
+            let state = HttpBridgeState::default();
+            let registry_state = Mutex::new(registry::load().unwrap());
+            crate::secrets::locked_store::prompts_during(|| {
+                hold_http_bridge_turned_on(&state, &registry_state, Some(1))
+                    .unwrap()
+                    .expect("held while locked");
+            });
+            FAKE_BRIDGE_START.with(|fake| fake.set(true));
+            let retried = restore_saved_http_bridge(&state, true);
+            FAKE_BRIDGE_START.with(|fake| fake.set(false));
+            assert_eq!(retried, Ok(true));
+            assert_eq!(
+                secrets::get_secret(HTTP_BRIDGE_VAULT_SERVER, HTTP_BRIDGE_VAULT_KEY).as_deref(),
+                Some("minted-test-token")
+            );
+            crate::http_bridge::mark_waiting(&state, false);
+        });
+    }
+
+    /// Failure mode: a Stop between a failed attempt and its wait left the
+    /// wait set with the setting off; the desktop restore read that as held,
+    /// so it showed "Keyring locked" and polled for good.
+    #[test]
+    fn a_desktop_restore_that_finds_it_off_clears_the_wait() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            registry::save(&Registry::default()).unwrap();
+            let state = HttpBridgeState::default();
+            crate::http_bridge::mark_waiting(&state, true);
+            assert_eq!(
+                restore_http_bridge_once(&state),
+                crate::http_bridge::Restore::Off
+            );
+            assert!(!crate::http_bridge::status(&state).keyring_locked);
+        });
+    }
+
+    /// Turning it on while the keyring is locked never asks: it saves the
+    /// setting and shows the wait; Retry is the one that may ask.
+    #[test]
+    fn turning_the_endpoint_on_while_the_keyring_is_locked_waits() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            registry::save(&Registry::default()).unwrap();
+            let state = HttpBridgeState::default();
+            let registry_state = Mutex::new(registry::load().unwrap());
+            let mut held = None;
+            let prompts = crate::secrets::locked_store::prompts_during(|| {
+                held = Some(hold_http_bridge_turned_on(&state, &registry_state, None));
+            });
+            assert!(prompts.is_empty(), "{prompts:?}");
+            let held = held.unwrap().unwrap().expect("held while locked");
+            assert!(held.keyring_locked && !held.running, "{held:?}");
+            assert!(registry::load().unwrap().http_bridge_enabled);
+            // Unlocked: nothing to hold, so the switch starts it.
+            assert!(hold_http_bridge_turned_on(&state, &registry_state, None)
+                .unwrap()
+                .is_none());
+            crate::http_bridge::mark_waiting(&state, false);
+        });
+    }
+
     #[test]
     fn close_hides_only_with_a_created_tray_and_registered_host() {
         assert!(close_to_tray(true, true));
@@ -5065,6 +5423,7 @@ mod tests {
             port: Some(9876),
             token: Some("preserved-secret-token".to_string()),
             proxy_mode: false,
+            waiting_for_keyring: false,
         };
 
         let error = stop_http_bridge_with(&mut bridge, |_| {
@@ -5276,7 +5635,7 @@ mod tests {
         let mut server = plain_server("bogus", "Bogus");
         server.command = Some("toolport-no-such-binary-xyz".into());
         let start = std::time::Instant::now();
-        let r = probe_one_bounded(&server);
+        let r = crate::server_runtime::probe_one_bounded(&server);
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "a fast failure must not wait on the timeout"

@@ -252,6 +252,7 @@
   "Changed tool definitions are flagged for review, and results that look like prompt injection show up in Activity.": "Geänderte Tool-Definitionen werden zur Überprüfung markiert. Ergebnisse mit möglicher Prompt-Injection erscheinen unter „Aktivität“.",
   "Changes: {changes}": "Änderungen: {changes}",
   "Check cancelled": "Prüfung abgebrochen",
+  "Keyring locked": "Schlüsselbund gesperrt",
   "Check that each server started on the main screen.": "Prüfe im Hauptbildschirm, ob alle Server gestartet wurden.",
   "Checked Toolport status": "Toolport-Status überprüft",
   "Checking {name}...": "Überprüfen {name}...",

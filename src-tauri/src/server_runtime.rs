@@ -19,11 +19,18 @@ pub struct ProbeResult {
     pub auth_required: bool,
     pub failure: Option<crate::call_failure::CallFailureKind>,
     pub auth_target: Option<crate::call_failure::AuthTarget>,
+    /// Not checked: the server keeps values in a locked keyring, and a check
+    /// nobody asked for does not ask to unlock it.
+    #[serde(default)]
+    pub keyring_locked: bool,
 }
 
 impl ProbeResult {
     pub fn failure_label(&self) -> &str {
         use crate::call_failure::{AuthTarget, CallFailureKind as K};
+        if self.keyring_locked {
+            return "Keyring locked";
+        }
         if self.auth_required {
             return match self.auth_target {
                 Some(AuthTarget::Scope) => "Permission required",
@@ -176,6 +183,7 @@ pub fn probe_one(server: &ServerEntry) -> ProbeResult {
             auth_required: false,
             failure: None,
             auth_target: None,
+            keyring_locked: false,
         },
         Err(error) => failed_probe(server, error),
     }
@@ -207,6 +215,7 @@ fn failed_probe(server: &ServerEntry, error: crate::call_failure::CallFailure) -
         },
         failure: Some(error.kind),
         error: Some(error.detail),
+        keyring_locked: false,
     }
 }
 
@@ -245,21 +254,212 @@ pub fn probe_one_bounded(server: &ServerEntry) -> ProbeResult {
             auth_required: false,
             failure: Some(crate::call_failure::CallFailureKind::Timeout { after_send: false }),
             auth_target: None,
+            keyring_locked: false,
         })
 }
 
+/// Test Connection for a saved server: a user action, so it may ask to unlock
+/// the store.
 pub fn probe_registered(server_id: &str) -> Result<ProbeResult, String> {
+    Ok(probe_one_bounded(&registered_server(server_id)?))
+}
+
+/// The health check a shell runs on its own: at start, after a change, when a
+/// page comes back. Nobody asked for it, so it must not ask to unlock the store.
+pub fn probe_health_bounded(server: &ServerEntry) -> ProbeResult {
+    probe_health_checked(server, &KeyringCheck::default())
+}
+
+/// One keyring check for a round of health checks, made by the first one
+/// that needs it: which servers keep a locked value in the store, read once,
+/// not once per server competing for the store.
+#[derive(Clone, Default)]
+pub struct KeyringCheck(
+    std::sync::Arc<std::sync::OnceLock<Option<std::collections::HashSet<String>>>>,
+);
+
+impl KeyringCheck {
+    /// Whether this server keeps a locked value; unknown counts as locked.
+    fn locked(
+        &self,
+        server: &ServerEntry,
+        check: impl FnOnce() -> Option<std::collections::HashSet<String>>,
+    ) -> bool {
+        match self.0.get_or_init(check) {
+            None => true,
+            Some(owners) => {
+                owners.contains(&server.id)
+                    || crate::local_auth::owner(&server.id)
+                        .is_ok_and(|owner| owners.contains(&owner))
+            }
+        }
+    }
+}
+
+/// [`probe_health_bounded`] sharing its round's keyring check.
+pub fn probe_health_checked(server: &ServerEntry, check: &KeyringCheck) -> ProbeResult {
+    // Property reads that ask nothing: a read of this server's locked value
+    // could raise the unlock prompt. A server with nothing stored is checked
+    // even while the default collection stays locked.
+    if keeps_values_in_store(server) && check.locked(server, secrets::owners_with_locked_values) {
+        return ProbeResult {
+            server_id: server.id.clone(),
+            ok: false,
+            tool_count: 0,
+            error: Some("keyring locked".into()),
+            auth_required: false,
+            failure: None,
+            auth_target: None,
+            keyring_locked: true,
+        };
+    }
+    probe_one_bounded(server)
+}
+
+/// Whether connecting may read a value from the store: a secret with no
+/// inline value and no outside source, or a remote server (its sign-in and
+/// token state live there). Generous on purpose: it only decides what is
+/// skipped while the store is locked.
+fn keeps_values_in_store(server: &ServerEntry) -> bool {
+    let stored = |secret: bool,
+                  value: &Option<String>,
+                  fields: &serde_json::Map<String, serde_json::Value>| {
+        secret && value.is_none() && !fields.contains_key("source")
+    };
+    server.url.is_some()
+        || server
+            .env
+            .iter()
+            .any(|entry| stored(entry.secret, &entry.value, &entry.unknown_fields))
+        || server.launch.as_ref().is_some_and(|launch| {
+            launch
+                .inputs
+                .iter()
+                .any(|input| stored(input.secret, &input.value, &input.unknown_fields))
+        })
+}
+
+/// [`probe_health_checked`] for a saved server.
+pub fn probe_health_registered(
+    server_id: &str,
+    check: &KeyringCheck,
+) -> Result<ProbeResult, String> {
+    Ok(probe_health_checked(&registered_server(server_id)?, check))
+}
+
+/// Servers whose health check found the keyring locked (or busy), for
+/// [`recheck_locked_once_open`]. One thread runs at a time; each round's
+/// list replaces the one before.
+pub struct LockedRecheck {
+    servers: Vec<ServerEntry>,
+    round: u64,
+    running: bool,
+}
+
+impl Default for LockedRecheck {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LockedRecheck {
+    pub const fn new() -> Self {
+        Self {
+            servers: Vec::new(),
+            round: 0,
+            running: false,
+        }
+    }
+
+    /// A finished round's locked servers (a round checks every enabled
+    /// server). True: start the recheck thread, none runs yet.
+    pub fn replace(&mut self, locked: Vec<ServerEntry>) -> bool {
+        self.servers = locked;
+        self.round += 1;
+        let start = !self.running && !self.servers.is_empty();
+        self.running |= start;
+        start
+    }
+
+    /// The thread could not start.
+    pub fn stopped(&mut self) {
+        self.running = false;
+    }
+
+    /// The list to check with its round, or `None`: nothing left, so the
+    /// thread ends.
+    fn next(&mut self) -> Option<(u64, Vec<ServerEntry>)> {
+        if self.servers.is_empty() {
+            self.running = false;
+            return None;
+        }
+        Some((self.round, self.servers.clone()))
+    }
+
+    /// Keep what is still locked. A list a newer round put in place while
+    /// this one was checked stands as it is.
+    fn settle(&mut self, round: u64, results: &[ProbeResult]) {
+        if round != self.round {
+            return;
+        }
+        self.servers.retain(|server| {
+            results
+                .iter()
+                .find(|result| result.server_id == server.id)
+                .is_none_or(|result| result.keyring_locked)
+        });
+    }
+}
+
+/// Servers whose health check found the keyring locked (or busy), checked
+/// again without asking each time a poll finds it open, until none is
+/// locked. Nothing else checks them again while the page stays open. Start
+/// it only when [`LockedRecheck::replace`] says so.
+pub fn recheck_locked_once_open(
+    locked: &std::sync::Mutex<LockedRecheck>,
+    poll: Duration,
+    report: impl Fn(&ProbeResult) + Sync,
+) {
+    let queue = || {
+        locked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    loop {
+        std::thread::sleep(poll);
+        if queue().next().is_none() {
+            return;
+        }
+        if secrets::store_would_prompt() {
+            continue;
+        }
+        let Some((round, servers)) = queue().next() else {
+            return;
+        };
+        let check = KeyringCheck::default();
+        let results: Vec<ProbeResult> = std::thread::scope(|scope| {
+            let handles: Vec<_> = servers
+                .iter()
+                .map(|server| scope.spawn(|| probe_health_checked(server, &check)))
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        results.iter().for_each(&report);
+        queue().settle(round, &results);
+    }
+}
+
+fn registered_server(server_id: &str) -> Result<ServerEntry, String> {
     let path = crate::registry::resolved_path().ok_or("could not resolve the registry path")?;
     let contents = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read the registry: {error}"))?;
     let registry = crate::registry::parse_registry_contents(&contents)
         .map_err(|error| format!("could not parse the registry: {error}"))?;
-    let server = registry
+    registry
         .servers
         .into_iter()
         .find(|server| server.id == server_id)
-        .ok_or_else(|| format!("server '{server_id}' not found"))?;
-    Ok(probe_one_bounded(&server))
+        .ok_or_else(|| format!("server '{server_id}' not found"))
 }
 
 /// The servers the Servers page shows as on. Default access only limits what
@@ -311,6 +511,143 @@ mod tests {
             launch: None,
             unknown_fields: serde_json::Map::new(),
         }
+    }
+
+    /// Failure mode: with the default collection locked all session and no
+    /// Toolport value in it, every remote server showed "Keyring locked";
+    /// 2.3.5 checked them. Only a server with a locked stored value waits.
+    #[test]
+    fn a_locked_default_collection_holds_only_servers_with_stored_values() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut remote = server();
+            remote.id = "no-auth".into();
+            remote.transport = "http".into();
+            remote.url = Some("http://127.0.0.1:1/mcp".into());
+            let mut plain = server();
+            plain.id = "plain".into();
+            plain.command = Some("/bin/false".into());
+            let mut stored = server();
+            stored.id = "stored".into();
+            stored.command = Some("/bin/false".into());
+            stored.env = vec![crate::registry::EnvVar {
+                key: "API_KEY".into(),
+                value: None,
+                secret: true,
+                unknown_fields: Default::default(),
+            }];
+            let mut results = Vec::new();
+            let prompts = crate::secrets::locked_store::locked_values_during(&["stored"], || {
+                assert!(
+                    crate::secrets::store_would_prompt(),
+                    "the default is locked"
+                );
+                let check = KeyringCheck::default();
+                for server in [&remote, &plain, &stored] {
+                    results.push(probe_health_checked(server, &check));
+                }
+            });
+            assert!(prompts.is_empty(), "{prompts:?}");
+            assert!(!results[0].keyring_locked, "{:?}", results[0]);
+            assert!(!results[1].keyring_locked, "{:?}", results[1]);
+            assert!(results[2].keyring_locked, "{:?}", results[2]);
+        });
+    }
+
+    /// A round of health checks makes one keyring check, not one per server.
+    #[test]
+    fn a_round_of_health_checks_checks_the_keyring_once() {
+        let check = KeyringCheck::default();
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let check = check.clone();
+                let calls = &calls;
+                scope.spawn(move || {
+                    check.locked(&server(), || {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        None
+                    })
+                });
+            }
+        });
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Failure mode: a round that marked rows locked while the recheck was
+    /// probing lost them to the recheck's cleanup, and a round soon after
+    /// the list emptied started a second recheck thread.
+    #[test]
+    fn a_newer_round_keeps_its_locked_rows_and_one_recheck_runs() {
+        let named = |id: &str| ServerEntry {
+            id: id.into(),
+            ..server()
+        };
+        let open = |id: &str| ProbeResult {
+            server_id: id.into(),
+            ok: true,
+            tool_count: 1,
+            error: None,
+            auth_required: false,
+            failure: None,
+            auth_target: None,
+            keyring_locked: false,
+        };
+        let mut queue = LockedRecheck::new();
+        assert!(
+            queue.replace(vec![named("a")]),
+            "the first starts the thread"
+        );
+        let (round, _) = queue.next().unwrap();
+        // While it probes "a", a newer round finds "a" and "b" locked.
+        assert!(!queue.replace(vec![named("a"), named("b")]), "one thread");
+        queue.settle(round, &[open("a")]);
+        assert_eq!(queue.servers.len(), 2, "the newer round's rows stay");
+        // A round that empties the list, then one that fills it again
+        // before the thread's next tick: still one thread.
+        assert!(!queue.replace(Vec::new()));
+        assert!(!queue.replace(vec![named("c")]));
+        let (round, _) = queue.next().unwrap();
+        queue.settle(round, &[open("c")]);
+        assert!(queue.next().is_none() && !queue.running);
+        assert!(
+            queue.replace(vec![named("d")]),
+            "ended: the next starts one"
+        );
+    }
+
+    /// Failure mode: a row that showed "Keyring locked" (a locked or busy
+    /// keyring) kept it after the keyring opened, until a Refresh.
+    #[test]
+    fn locked_rows_are_checked_again_once_the_keyring_opens() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut remote = server();
+            remote.transport = "http".into();
+            remote.url = Some("http://127.0.0.1:1/mcp".into());
+            let locked = std::sync::Mutex::new(LockedRecheck::new());
+            assert!(locked.lock().unwrap().replace(vec![remote]));
+            let (sender, results) = std::sync::mpsc::channel();
+            let sender = std::sync::Mutex::new(sender);
+            std::thread::scope(|scope| {
+                let mut early = None;
+                let prompts = crate::secrets::locked_store::prompts_during(|| {
+                    scope.spawn(|| {
+                        recheck_locked_once_open(&locked, Duration::from_millis(10), |result| {
+                            let _ = sender.lock().unwrap().send(result.clone());
+                        })
+                    });
+                    early = Some(results.recv_timeout(Duration::from_millis(300)));
+                });
+                assert!(prompts.is_empty(), "{prompts:?}");
+                assert!(early.unwrap().is_err(), "checked while locked");
+                let result = results
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("checked once open");
+                assert_eq!(result.server_id, "probe");
+                assert!(!result.keyring_locked, "{result:?}");
+            });
+            let queue = locked.lock().unwrap();
+            assert!(queue.servers.is_empty() && !queue.running);
+        });
     }
 
     #[test]

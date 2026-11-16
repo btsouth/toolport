@@ -10030,20 +10030,29 @@ fn server_credential_revision(server: &ServerEntry, generation: u64) -> String {
         return digest.clone();
     }
     let mut material = Vec::new();
+    let mut unreadable = false;
     for (key, vault_only) in keys {
+        // A router build is no use of the value: it must not ask to unlock the
+        // store (every role builds one at start). Locked, the value reads as
+        // unreadable, and the connect that first uses it asks.
         let value = if vault_only {
-            secrets::get_vault_secret_result(&server.id, &key)
+            secrets::get_vault_secret_without_prompt(&server.id, &key)
         } else {
-            secrets::get_secret_result(&server.id, &key)
+            secrets::get_secret_without_prompt(&server.id, &key)
         };
+        unreadable |= value.is_err();
         // Errors are represented without recording their possibly sensitive text.
         material.push(json!({"key":key,"value":value.as_ref().ok(),"unreadable":value.is_err()}));
     }
     let digest = registry::sha256_hex(&Value::Array(material).to_string());
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(cache_key, (generation, digest.clone()));
+    // Only a complete read is kept: one taken while the store was locked is
+    // read again by the next build.
+    if !unreadable {
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(cache_key, (generation, digest.clone()));
+    }
     digest
 }
 
@@ -45081,6 +45090,53 @@ mod tests {
             .aggregated_tools()
             .iter()
             .any(|tool| tool["name"] == "one__greet"));
+    }
+
+    /// Failure mode: a gateway start (any role) read a server's stored values
+    /// the way that asks to unlock the store: the router build digests every
+    /// server's credentials, and the daemon retried retired-value cleanups, so
+    /// a locked keyring raised a prompt nobody asked for.
+    #[test]
+    fn no_gateway_start_makes_a_prompting_read() {
+        let _env = DataDirTestEnv::new("start-no-prompt");
+        let mut stdio = stub_server("start-vaulted", "Vaulted");
+        stdio.enabled = true;
+        stdio.env =
+            vec![serde_json::from_value(json!({"key": "START_TOKEN", "secret": true})).unwrap()];
+        let mut remote = stub_server("start-remote", "Remote");
+        remote.enabled = true;
+        remote.command = None;
+        remote.transport = "http".into();
+        remote.url = Some("https://remote.example.invalid/mcp".into());
+        let mut reg = Registry {
+            servers: vec![stdio, remote],
+            ..Default::default()
+        };
+        for id in ["start-vaulted", "start-remote"] {
+            reg.profiles[0].enabled_server_ids.push(id.into());
+        }
+        registry::save(&reg).unwrap();
+        let dir = registry::conduit_dir().unwrap();
+        std::fs::write(dir.join(conduit_lib::secret_redact::SCRUB_PENDING_FILE), "").unwrap();
+        let prompts = conduit_lib::secrets::locked_store::prompts_during(|| {
+            learn_startup_secrets();
+            let _ = conduit_lib::secrets::retry_retired_scrubs();
+            for daemon in [true, false] {
+                let _router = build_router(
+                    &reg,
+                    None,
+                    daemon,
+                    daemon,
+                    &Arc::new(AtomicU8::new(0)),
+                    Arc::new(|_| None),
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+            }
+        });
+        assert!(prompts.is_empty(), "{prompts:?}");
     }
 
     /// P1.3: the discovery mode belongs to the host, so one host's switch cannot decide what

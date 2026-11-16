@@ -1,6 +1,6 @@
 import { type SettingsSubpage } from "@/lib/settingsPages";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { ThemeProvider } from "@/lib/theme";
@@ -13,7 +13,11 @@ import {
   removeToolportData,
   getRegistry,
   getBaselineNotice,
+  httpBridgeStatus,
   isAutostartEnabled,
+  retryHttpBridge,
+  startHttpBridge,
+  stopHttpBridge,
   listServerTools,
   listQuarantined,
   releaseQuarantine,
@@ -51,6 +55,10 @@ vi.mock("@/lib/api", async (importOriginal) => {
     setSafetyLevel: vi.fn(),
     clientsNeedingRestart: vi.fn().mockResolvedValue([]),
     stopStaleGateways: vi.fn(),
+    httpBridgeStatus: vi.fn(actual.httpBridgeStatus),
+    retryHttpBridge: vi.fn(),
+    startHttpBridge: vi.fn(),
+    stopHttpBridge: vi.fn(),
   };
 });
 
@@ -256,6 +264,117 @@ describe("SettingsView launch at login", () => {
     await waitFor(() => expect(control).toBeEnabled());
     expect(control).toHaveAttribute("aria-checked", "true");
     expect(screen.queryByText(/couldn't read the os setting/i)).not.toBeInTheDocument();
+  });
+});
+
+describe("SettingsView HTTP endpoint", () => {
+  it("shows an endpoint waiting for the keyring as locked, and Retry starts it", async () => {
+    const stopped = { running: false, port: null, url: null, token: null };
+    vi.mocked(httpBridgeStatus).mockResolvedValueOnce({
+      ...stopped,
+      keyringLocked: true,
+    });
+    vi.mocked(retryHttpBridge).mockResolvedValueOnce({
+      running: true,
+      port: 8765,
+      url: "http://localhost:8765",
+      token: "bridge-token",
+      keyringLocked: false,
+    });
+    const user = userEvent.setup();
+    renderSettings("connections");
+
+    expect(await screen.findByText("Keyring locked")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Unlock your keyring, then choose Retry\./),
+    ).toBeInTheDocument();
+    // Still on: the switch shows the saved setting, not whether it runs yet.
+    expect(screen.getByRole("switch", { name: /Open WebUI/ })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(retryHttpBridge).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(await screen.findByText("http://localhost:8765")).toBeInTheDocument();
+    expect(retryHttpBridge).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Keyring locked")).not.toBeInTheDocument();
+  });
+});
+
+describe("SettingsView HTTP endpoint waiting for the keyring", () => {
+  it("turns it off from the switch, without starting it", async () => {
+    vi.mocked(startHttpBridge).mockClear();
+    vi.mocked(stopHttpBridge).mockClear();
+    vi.mocked(retryHttpBridge).mockClear();
+    const stopped = { running: false, port: null, url: null, token: null };
+    vi.mocked(httpBridgeStatus).mockResolvedValueOnce({
+      ...stopped,
+      keyringLocked: true,
+    });
+    vi.mocked(stopHttpBridge).mockResolvedValueOnce({ ...stopped, keyringLocked: false });
+    const user = userEvent.setup();
+    renderSettings("connections");
+
+    const toggle = await screen.findByRole("switch", { name: /Open WebUI/ });
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    await user.click(toggle);
+
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
+    expect(stopHttpBridge).toHaveBeenCalledTimes(1);
+    expect(startHttpBridge).not.toHaveBeenCalled();
+    expect(retryHttpBridge).not.toHaveBeenCalled();
+    expect(screen.queryByText("Keyring locked")).not.toBeInTheDocument();
+  });
+});
+
+describe("SettingsView HTTP endpoint status reads", () => {
+  it("keeps a finished Retry when an older status read answers after it", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const stopped = { running: false, port: null, url: null, token: null };
+      let pollStarted = false;
+      let answerPoll: (
+        status: typeof stopped & { keyringLocked: boolean },
+      ) => void = () => {};
+      vi.mocked(httpBridgeStatus)
+        .mockResolvedValueOnce({ ...stopped, keyringLocked: true })
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              pollStarted = true;
+              answerPoll = resolve;
+            }),
+        );
+      vi.mocked(retryHttpBridge).mockResolvedValueOnce({
+        running: true,
+        port: 8765,
+        url: "http://localhost:8765",
+        token: "bridge-token",
+        keyringLocked: false,
+      });
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+      renderSettings("connections");
+
+      expect(await screen.findByText("Keyring locked")).toBeInTheDocument();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+      await waitFor(() => expect(pollStarted).toBe(true));
+
+      await user.click(screen.getByRole("button", { name: "Retry" }));
+      expect(await screen.findByText("http://localhost:8765")).toBeInTheDocument();
+
+      // The poll that started before Retry answers last, with the old state.
+      await act(async () => {
+        answerPoll({ ...stopped, keyringLocked: true });
+      });
+      expect(screen.getByText("http://localhost:8765")).toBeInTheDocument();
+      expect(screen.queryByText("Keyring locked")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

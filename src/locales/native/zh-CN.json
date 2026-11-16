@@ -1073,6 +1073,7 @@
   "{value0} credentials and settings": "{value0} 凭证和设置",
   "{value0} direct + {value1} fallback": "{value0} 个直接匹配 + {value1} 个回退匹配",
   "{value0} failing": "{value0} 项失败",
+  "{value0} waiting for the keyring": "{value0} 个等待密钥环",
   "{value0} is a boolean and should not reach text coercion": "{value0} 是一个布尔值，不应达到文本强制转换",
   "{value0} is required": "{value0} 为必填项",
   "{value0} ms": "{value0} ms",

@@ -1071,6 +1071,149 @@ mod platform {
         }
     }
 
+    /// How long a check of its own waits for another keyring operation before
+    /// it answers "unknown".
+    const STORE_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// Whether a read could ask to unlock, by one search that never unlocks.
+    /// Only a search that finds no locked Toolport item, or no Secret Service
+    /// to connect to (a read cannot prompt either), says no. Unknown (another
+    /// keyring operation holds the store, a timeout, a failed search) says
+    /// yes: background work waits rather than risk a prompt.
+    pub fn store_would_prompt() -> bool {
+        would_prompt(false)
+    }
+
+    /// [`store_would_prompt`] for a write: a new item goes into the default
+    /// collection, and writing to a locked (or missing) one asks too, even
+    /// with no Toolport item in the store.
+    pub fn write_would_prompt() -> bool {
+        would_prompt(true)
+    }
+
+    fn would_prompt(write: bool) -> bool {
+        let search = || {
+            let found = with_backup_service(|service| {
+                super::would_prompt_by(
+                    write,
+                    || match service.get_default_collection() {
+                        Ok(collection) => collection
+                            .is_locked()
+                            .map(Some)
+                            .map_err(|error| classify(&error)),
+                        Err(dbus_secret_service::Error::NoResult) => Ok(None),
+                        Err(error) => Err(classify(&error)),
+                    },
+                    || {
+                        service
+                            .search_items(std::collections::HashMap::from([("service", SERVICE)]))
+                            .map(|found| !found.locked.is_empty())
+                            .map_err(|error| classify(&error))
+                    },
+                )
+            });
+            let no_service = || {
+                BACKUP_BATCH.with(|slot| {
+                    slot.borrow()
+                        .as_ref()
+                        .is_some_and(|batch| batch.service.is_none() && batch.failure.is_some())
+                })
+            };
+            match found {
+                Ok(locked) => locked,
+                Err(_) if no_service() => false,
+                Err(_) => true,
+            }
+        };
+        if BACKUP_BATCH.with(|slot| slot.borrow().is_some()) {
+            search()
+        } else {
+            with_backup_batch(|| {
+                BACKUP_BATCH.with(|slot| {
+                    if let Some(batch) = slot.borrow_mut().as_mut() {
+                        batch.deadline = batch
+                            .deadline
+                            .min(std::time::Instant::now() + STORE_CHECK_TIMEOUT);
+                    }
+                });
+                search()
+            })
+        }
+    }
+
+    /// Owners with a locked Toolport value in any collection, never asking.
+    /// The default collection open: the one search, as before. Locked (where
+    /// KeePassXC answers a search with its dialog): property reads of the
+    /// locked collections' items only. `None`: unknown (busy, timed out, a
+    /// failed read); the next probe round checks again.
+    pub fn owners_with_locked_values() -> Option<std::collections::HashSet<String>> {
+        let read = || {
+            let found = with_backup_service(|service| {
+                let failed = |error: dbus_secret_service::Error| classify(&error);
+                let owner_of = |item: &dbus_secret_service::Item| {
+                    item.get_attributes().map_err(failed).map(|attributes| {
+                        (attributes.get("service").map(String::as_str) == Some(SERVICE))
+                            .then(|| attributes.get("username").cloned())
+                            .flatten()
+                    })
+                };
+                super::owners_with_locked_by(
+                    || match service.get_default_collection() {
+                        Ok(collection) => collection.is_locked().map(Some).map_err(failed),
+                        Err(dbus_secret_service::Error::NoResult) => Ok(None),
+                        Err(error) => Err(failed(error)),
+                    },
+                    || {
+                        let found = service
+                            .search_items(std::collections::HashMap::from([("service", SERVICE)]))
+                            .map_err(failed)?;
+                        found.locked.iter().map(owner_of).collect()
+                    },
+                    || {
+                        let collections = service.get_all_collections().map_err(failed)?;
+                        super::accounts_in_locked(
+                            &collections,
+                            |collection| collection.is_locked().map_err(failed),
+                            |collection| {
+                                collection
+                                    .get_all_items()
+                                    .map_err(failed)?
+                                    .iter()
+                                    .map(owner_of)
+                                    .collect()
+                            },
+                        )
+                    },
+                )
+            });
+            let no_service = BACKUP_BATCH.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .is_some_and(|batch| batch.service.is_none() && batch.failure.is_some())
+            });
+            match found {
+                Ok(owners) => Some(owners),
+                // Nothing to read from, so nothing to ask for either.
+                Err(_) if no_service => Some(Default::default()),
+                Err(_) => None,
+            }
+        };
+        if BACKUP_BATCH.with(|slot| slot.borrow().is_some()) {
+            read()
+        } else {
+            with_backup_batch(|| {
+                BACKUP_BATCH.with(|slot| {
+                    if let Some(batch) = slot.borrow_mut().as_mut() {
+                        batch.deadline = batch
+                            .deadline
+                            .min(std::time::Instant::now() + STORE_CHECK_TIMEOUT);
+                    }
+                });
+                read()
+            })
+        }
+    }
+
     fn read_backup_item<T>(
         unlocked: usize,
         locked: usize,
@@ -1284,6 +1427,23 @@ mod platform {
                     0
                 );
             });
+        }
+
+        /// Failure mode: while another keyring operation held the store, the
+        /// check could not search and answered "would not prompt", so
+        /// background work went on to a read that asks to unlock.
+        #[test]
+        fn a_busy_store_counts_as_one_that_would_prompt() {
+            let _held = SERVICE_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let started = std::time::Instant::now();
+            assert!(store_would_prompt(), "unknown must wait, not read");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{:?}",
+                started.elapsed()
+            );
         }
 
         #[test]
@@ -1757,6 +1917,13 @@ fn set_secret_raw(server_id: &str, key: &str, value: &str) -> Result<(), String>
 
 /// A write with no registration, for Toolport's own internal keys.
 fn write_stored(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+    if write_would_prompt() {
+        return Err("the keyring is locked; this background write waits for it".into());
+    }
+    // A write to a locked Secret Service collection asks to unlock it too.
+    if locked_store::locked() || locked_store::collection_locked() {
+        return Err(locked_store::prompted(server_id, key));
+    }
     scrub_previous(server_id, key, Some(value))?;
     if file::active() {
         return file::set_secret(server_id, key, value);
@@ -1787,6 +1954,12 @@ pub(crate) fn set_backup_secret(server_id: &str, key: &str, value: &str) -> Resu
     }
     if server_id == INTERNAL_SERVER_ID {
         return Err("reserved Toolport secret namespace".to_string());
+    }
+    if write_would_prompt() {
+        return Err("the keyring is locked; this background write waits for it".into());
+    }
+    if locked_store::locked() || locked_store::collection_locked() {
+        return Err(locked_store::prompted(server_id, key));
     }
     let owner = crate::local_auth::owner(server_id)?;
     if file::active() {
@@ -1869,10 +2042,226 @@ fn get_secret_result_raw(server_id: &str, key: &str) -> Result<Option<String>, S
 fn read_stored(server_id: &str, key: &str) -> Result<Option<String>, String> {
     if let Some(v) = env_secret_override(key) {
         Ok(Some(v))
+    } else if locked_store::locked() {
+        Err(locked_store::prompted(server_id, key))
     } else if file::active() {
         file::get_secret_result(server_id, key)
     } else {
         platform::get_secret_result(server_id, key)
+    }
+}
+
+/// Whether reading a stored value now could ask the user to unlock the store:
+/// some Toolport item in it is locked. Asks nothing itself. Work nobody asked
+/// for (a health check at start, a cleanup) waits while it is true; the first
+/// real use of a value still asks. The encrypted file, the macOS
+/// data-protection keychain and Windows never prompt.
+pub fn store_would_prompt() -> bool {
+    if locked_store::locked() || locked_store::collection_locked() {
+        return true;
+    }
+    if file::active() {
+        return false;
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        platform::store_would_prompt()
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        false
+    }
+}
+
+/// Which servers (vault owners) keep a locked value in the store, without a
+/// search or an unlock: a health check skips only those, so a server with
+/// nothing stored is checked even while the default collection stays
+/// locked. `None`: unknown; treat every server that may read the store as
+/// locked. The encrypted file, macOS and Windows never ask: none.
+pub fn owners_with_locked_values() -> Option<std::collections::HashSet<String>> {
+    if locked_store::locked() {
+        return None;
+    }
+    if locked_store::collection_locked() {
+        return Some(locked_store::locked_owners());
+    }
+    if file::active() {
+        return Some(Default::default());
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        platform::owners_with_locked_values()
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        Some(Default::default())
+    }
+}
+
+/// [`get_secret_result`] for work nobody asked for: never asks to unlock the
+/// store, and a locked one is an error. Registers what it reads, the same way.
+pub fn get_secret_without_prompt(server_id: &str, key: &str) -> Result<Option<String>, String> {
+    if server_id == INTERNAL_SERVER_ID {
+        return Err("reserved Toolport secret namespace".to_string());
+    }
+    let owner = crate::local_auth::owner(server_id)?;
+    if let Some(value) = env_secret_override(key) {
+        return registered(owner.as_str(), key, Ok(Some(value)));
+    }
+    registered(
+        owner.as_str(),
+        key,
+        backup_secret_status(owner.as_str(), key).map_err(|error| error.to_string()),
+    )
+}
+
+/// [`get_vault_secret_result`] for work nobody asked for, like
+/// [`get_secret_without_prompt`].
+pub fn get_vault_secret_without_prompt(
+    server_id: &str,
+    key: &str,
+) -> Result<Option<String>, String> {
+    if server_id == INTERNAL_SERVER_ID {
+        return Err("reserved Toolport secret namespace".to_string());
+    }
+    let owner = crate::local_auth::owner(server_id)?;
+    registered(
+        owner.as_str(),
+        key,
+        backup_secret_status(owner.as_str(), key).map_err(|error| error.to_string()),
+    )
+}
+
+/// Test support: a store that is locked, so every read that would ask the user
+/// to unlock it is recorded (and fails) instead. Reads that never prompt see a
+/// locked store. Process-wide: hold the data-directory test lock around it.
+pub mod locked_store {
+    #[cfg(any(test, feature = "test-support"))]
+    static LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    #[cfg(any(test, feature = "test-support"))]
+    static PROMPTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    #[cfg(any(test, feature = "test-support"))]
+    static COLLECTION_LOCKED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    #[cfg(any(test, feature = "test-support"))]
+    static LOCKED_OWNERS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Run `f` with the store locked; every `server/key` read that would have
+    /// asked to unlock it, in order.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn prompts_during(f: impl FnOnce()) -> Vec<String> {
+        use std::sync::atomic::Ordering;
+        struct Unlock;
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                LOCKED.store(false, Ordering::SeqCst);
+            }
+        }
+        PROMPTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        LOCKED.store(true, Ordering::SeqCst);
+        let unlock = Unlock;
+        f();
+        drop(unlock);
+        std::mem::take(
+            &mut *PROMPTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Run `f` with only the default collection locked and no Toolport item
+    /// in it: reads find nothing to unlock, a new item's write would ask.
+    /// Every write that would have asked, in order.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn write_prompts_during(f: impl FnOnce()) -> Vec<String> {
+        use std::sync::atomic::Ordering;
+        struct Unlock;
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                COLLECTION_LOCKED.store(false, Ordering::SeqCst);
+            }
+        }
+        PROMPTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        COLLECTION_LOCKED.store(true, Ordering::SeqCst);
+        let unlock = Unlock;
+        f();
+        drop(unlock);
+        std::mem::take(
+            &mut *PROMPTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// [`write_prompts_during`] with these owners' values in the store,
+    /// locked.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn locked_values_during(owners: &[&str], f: impl FnOnce()) -> Vec<String> {
+        *LOCKED_OWNERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            owners.iter().map(|owner| owner.to_string()).collect();
+        let prompts = write_prompts_during(f);
+        LOCKED_OWNERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        prompts
+    }
+
+    pub(crate) fn locked_owners() -> std::collections::HashSet<String> {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            LOCKED_OWNERS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .cloned()
+                .collect()
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            Default::default()
+        }
+    }
+
+    pub(crate) fn collection_locked() -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            COLLECTION_LOCKED.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn locked() -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            LOCKED.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            false
+        }
+    }
+
+    /// Record a read that would have prompted; its error.
+    pub(crate) fn prompted(server_id: &str, key: &str) -> String {
+        #[cfg(any(test, feature = "test-support"))]
+        PROMPTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(format!("{server_id}/{key}"));
+        let _ = (server_id, key);
+        "keyring locked".to_string()
     }
 }
 
@@ -1911,7 +2300,9 @@ pub(crate) fn has_own_credentials(server: &crate::registry::ServerEntry) -> Resu
         "__oauth_cc_state__",
     ]);
     for key in keys {
-        let value = if file::active() {
+        let value = if locked_store::locked() {
+            Err(locked_store::prompted(&server.id, key))
+        } else if file::active() {
             file::get_secret_result(&server.id, key)
         } else {
             platform::get_secret_result(&server.id, key)
@@ -1921,6 +2312,124 @@ pub(crate) fn has_own_credentials(server: &crate::registry::ServerEntry) -> Resu
         }
     }
     Ok(false)
+}
+
+thread_local! {
+    static WITHOUT_PROMPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Run work nobody asked for (background sync, a restore at start) so that no
+/// keyring call in it, on this thread, can ask to unlock: reads use the
+/// non-prompting path, and a write or delete fails while the store would
+/// prompt. A check made before the work cannot cover a keyring that locks
+/// during it; this does.
+pub fn without_prompts<T>(f: impl FnOnce() -> T) -> T {
+    struct Leave;
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            WITHOUT_PROMPTS.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+    WITHOUT_PROMPTS.with(|depth| depth.set(depth.get() + 1));
+    let _leave = Leave;
+    f()
+}
+
+fn prompts_allowed() -> bool {
+    WITHOUT_PROMPTS.with(|depth| depth.get() == 0)
+}
+
+/// Inside [`without_prompts`], on a store whose ordinary reads can ask to
+/// unlock (Secret Service). macOS, Windows and the file vault never ask, so
+/// their reads keep their usual path.
+fn read_must_not_prompt() -> bool {
+    !prompts_allowed()
+        && (locked_store::locked()
+            || (cfg!(all(not(target_os = "macos"), not(target_os = "windows"))) && !file::active()))
+}
+
+/// The background check: `default_locked` reads the default collection's
+/// `Locked` property (`None`: there is none), which never asks; `search`
+/// looks for locked Toolport items, which KeePassXC answers with its unlock
+/// dialog while its database is locked. So a locked default collection is
+/// the answer without a search, and the polls that repeat this check every
+/// few seconds never raise that dialog. A write also asks with no default
+/// collection to put a new item in.
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+fn would_prompt_by<E>(
+    write: bool,
+    default_locked: impl FnOnce() -> Result<Option<bool>, E>,
+    search: impl FnOnce() -> Result<bool, E>,
+) -> Result<bool, E> {
+    match default_locked()? {
+        Some(true) => Ok(true),
+        None if write => Ok(true),
+        _ => search(),
+    }
+}
+
+/// [`owners_with_locked_values`]'s plan: `default_locked` is a property read;
+/// open, `search` returns the accounts of the locked Toolport items it finds
+/// (in other collections), one call however large the store; locked or
+/// missing (no search: KeePassXC opens its dialog for one), `walk` reads the
+/// accounts in the locked collections. An account is `owner::key`.
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+fn owners_with_locked_by<E>(
+    default_locked: impl FnOnce() -> Result<Option<bool>, E>,
+    search: impl FnOnce() -> Result<Vec<Option<String>>, E>,
+    walk: impl FnOnce() -> Result<Vec<Option<String>>, E>,
+) -> Result<std::collections::HashSet<String>, E> {
+    let accounts = match default_locked()? {
+        Some(false) => search()?,
+        Some(true) | None => walk()?,
+    };
+    Ok(accounts
+        .into_iter()
+        .flatten()
+        .filter_map(|account| account.split_once("::").map(|(owner, _)| owner.to_string()))
+        .collect())
+}
+
+/// The accounts of the items in the locked `collections`: every item of a
+/// locked collection is locked, and an open one is skipped without listing
+/// its items.
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+fn accounts_in_locked<C, E>(
+    collections: &[C],
+    locked: impl Fn(&C) -> Result<bool, E>,
+    accounts: impl Fn(&C) -> Result<Vec<Option<String>>, E>,
+) -> Result<Vec<Option<String>>, E> {
+    let mut found = Vec::new();
+    for collection in collections {
+        if locked(collection)? {
+            found.extend(accounts(collection)?);
+        }
+    }
+    Ok(found)
+}
+
+/// A write or delete inside [`without_prompts`] while the store would ask.
+fn write_would_prompt() -> bool {
+    !prompts_allowed() && write_would_ask()
+}
+
+/// Whether a write now could ask to unlock the store: [`store_would_prompt`],
+/// or a locked default collection a new item would go into.
+pub(crate) fn write_would_ask() -> bool {
+    if locked_store::locked() || locked_store::collection_locked() {
+        return true;
+    }
+    if file::active() {
+        return false;
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        platform::write_would_prompt()
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        false
+    }
 }
 
 pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
@@ -1933,6 +2442,9 @@ pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, S
     if server_id == INTERNAL_SERVER_ID {
         return Err("reserved Toolport secret namespace".to_string());
     }
+    if read_must_not_prompt() {
+        return get_secret_without_prompt(server_id, key);
+    }
     get_secret_result_raw(&crate::local_auth::owner(server_id)?, key)
 }
 
@@ -1942,9 +2454,14 @@ pub fn get_vault_secret_result(server_id: &str, key: &str) -> Result<Option<Stri
     if server_id == INTERNAL_SERVER_ID {
         return Err("reserved Toolport secret namespace".to_string());
     }
+    if read_must_not_prompt() {
+        return get_vault_secret_without_prompt(server_id, key);
+    }
     let owner = crate::local_auth::owner(server_id)?;
     let server_id = owner.as_str();
-    let value = if file::active() {
+    let value = if locked_store::locked() {
+        Err(locked_store::prompted(server_id, key))
+    } else if file::active() {
         file::get_secret_result(server_id, key)
     } else {
         platform::get_secret_result(server_id, key)
@@ -2036,6 +2553,10 @@ pub(crate) fn backup_secret_status(
         return Err(BackupSecretError::AccessDenied);
     }
     let owner = crate::local_auth::owner(server_id).map_err(|_| BackupSecretError::AccessDenied)?;
+    // These reads never ask to unlock the store: a locked one says so.
+    if locked_store::locked() {
+        return Err(BackupSecretError::Locked);
+    }
     if file::active() {
         return file::get_secret_result(owner.as_str(), key)
             .map_err(|_| BackupSecretError::Unavailable);
@@ -2254,6 +2775,11 @@ fn retire(server_id: &str, key: &str, value: &str) -> Result<(), String> {
 /// succeeds are dropped from the vault. Returns how many still wait. Called at
 /// gateway start, so a value is redacted again before anything is written.
 pub fn retry_retired_scrubs() -> usize {
+    // The list lives in the store: reading it while locked would ask the user
+    // to unlock it at start. It waits for the next start that finds it open.
+    if store_would_prompt() {
+        return crate::secret_redact::RETIRED_PENDING.load(std::sync::atomic::Ordering::Relaxed);
+    }
     let entries = retired_load();
     if entries.is_empty() {
         crate::secret_redact::RETIRED_PENDING.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -2294,6 +2820,12 @@ pub fn retired_scrubs_pending() -> usize {
 }
 
 fn delete_secret_raw(server_id: &str, key: &str) -> Result<(), String> {
+    if write_would_prompt() {
+        return Err("the keyring is locked; this background delete waits for it".into());
+    }
+    if locked_store::locked() {
+        return Err(locked_store::prompted(server_id, key));
+    }
     scrub_previous(server_id, key, None)?;
     if file::active() {
         return file::delete_secret(server_id, key);
@@ -2650,6 +3182,130 @@ pub(crate) mod tests {
         let _cleanup = Cleanup(dir, std::env::var_os("TOOLPORT_SECRET_KEY"));
         std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
         test();
+    }
+
+    /// Failure mode: the owner check listed every item of every collection on
+    /// each probe round, which a large keyring could stretch past its 2 s
+    /// deadline, and then every server showed "Keyring locked" though the
+    /// keyring was open.
+    #[test]
+    fn an_open_default_collection_is_one_search_and_a_locked_one_walks_locked_collections() {
+        let (searches, walks) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+        let owners = owners_with_locked_by(
+            || Ok::<_, ()>(Some(false)),
+            || {
+                searches.set(searches.get() + 1);
+                Ok(vec![Some("other-collection::API_KEY".into())])
+            },
+            || {
+                walks.set(walks.get() + 1);
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+        assert_eq!((searches.get(), walks.get()), (1, 0));
+        assert_eq!(owners, ["other-collection".to_string()].into());
+
+        // Locked: no search; only the locked collections are listed.
+        let listed = std::cell::RefCell::new(Vec::new());
+        let collections = [("login", true), ("open", false), ("second", true)];
+        let owners = owners_with_locked_by(
+            || Ok::<_, ()>(Some(true)),
+            || {
+                searches.set(searches.get() + 1);
+                Ok(Vec::new())
+            },
+            || {
+                accounts_in_locked(
+                    &collections,
+                    |(_, locked)| Ok(*locked),
+                    |(name, _)| {
+                        listed.borrow_mut().push(*name);
+                        Ok(vec![Some(format!("{name}-server::KEY")), None])
+                    },
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(searches.get(), 1, "searched while the default was locked");
+        assert_eq!(*listed.borrow(), ["login", "second"]);
+        assert_eq!(
+            owners,
+            ["login-server".to_string(), "second-server".to_string()].into()
+        );
+    }
+
+    /// Times one owner check against the session's real keyring. Run in a
+    /// box with a filled keyring:
+    /// `cargo test ... -- --ignored --exact secrets::tests::time_owner_check --nocapture`
+    #[test]
+    #[ignore = "times the session keyring; run in omabox"]
+    fn time_owner_check() {
+        let _data = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("toolport-owner-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        std::env::remove_var("TOOLPORT_SECRET_KEY");
+        let started = std::time::Instant::now();
+        let owners = owners_with_locked_values();
+        println!(
+            "owner check: {:?} in {} ms",
+            owners.map(|owners| owners.len()),
+            started.elapsed().as_millis()
+        );
+    }
+
+    /// Failure mode: every check searched the store, and KeePassXC answers a
+    /// search with its unlock dialog while its database is locked, so the 3 s
+    /// polls raised it again after every cancel.
+    #[test]
+    fn polls_never_search_while_the_default_collection_is_locked() {
+        let searches = std::cell::Cell::new(0);
+        let search = || {
+            searches.set(searches.get() + 1);
+            Ok::<_, ()>(false)
+        };
+        for _ in 0..20 {
+            for write in [false, true] {
+                assert_eq!(would_prompt_by(write, || Ok(Some(true)), search), Ok(true));
+            }
+        }
+        assert_eq!(
+            searches.get(),
+            0,
+            "searched while the default collection was locked"
+        );
+        // Open: the search still finds locked items in another collection.
+        assert_eq!(
+            would_prompt_by(false, || Ok(Some(false)), || Ok::<_, ()>(true)),
+            Ok(true)
+        );
+        assert_eq!(
+            would_prompt_by(false, || Ok(Some(false)), search),
+            Ok(false)
+        );
+        // No default collection: a read searches, a write would ask.
+        assert_eq!(would_prompt_by(false, || Ok(None), search), Ok(false));
+        assert_eq!(would_prompt_by(true, || Ok(None), search), Ok(true));
+        assert_eq!(searches.get(), 2);
+    }
+
+    /// Failure mode: the background write gate asked only whether a Toolport
+    /// item was locked, so with none in the store a new item's write to the
+    /// locked default collection asked to unlock it.
+    #[test]
+    fn a_background_write_waits_while_the_default_collection_is_locked() {
+        with_isolated_vault(|| {
+            let mut written = None;
+            let prompts = locked_store::write_prompts_during(|| {
+                written = Some(without_prompts(|| {
+                    set_secret("srv", "API_KEY", "collection-locked-value")
+                }));
+            });
+            assert!(prompts.is_empty(), "the write asked: {prompts:?}");
+            assert!(written.unwrap().is_err());
+            assert_eq!(get_secret("srv", "API_KEY"), None);
+        });
     }
 
     /// Deletes a real keychain credential even when a test assertion unwinds.

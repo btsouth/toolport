@@ -53,6 +53,23 @@ pub(super) struct SettingsPage {
     launch_at_login: gtk::Switch,
     endpoint_status: gtk::Label,
     endpoint_button: gtk::Button,
+    /// Retry for an endpoint left on while the keyring is locked; the main
+    /// button still turns it off.
+    endpoint_retry: gtk::Button,
+    /// A timer is re-reading a keyring-locked endpoint until it starts.
+    endpoint_watch: Rc<Cell<bool>>,
+    /// What the page last showed: on (running, or left on and waiting for
+    /// the keyring), and waiting. The main thread never reads the bridge's
+    /// state itself: a start holds it while the endpoint comes up.
+    endpoint_on: Rc<Cell<bool>>,
+    endpoint_locked: Rc<Cell<bool>>,
+    /// The status the page shows, for Copy URL, Copy token and Show token.
+    endpoint_shown: Rc<RefCell<Option<crate::http_bridge::HttpBridgeStatus>>>,
+    /// Bumped by every Start, Stop or Retry: a status read begun before one
+    /// is older than its result and is dropped.
+    endpoint_generation: Rc<Cell<u64>>,
+    /// One status read at a time.
+    endpoint_reading: Rc<Cell<bool>>,
     copy_endpoint: gtk::Button,
     copy_endpoint_token: gtk::Button,
     reveal_endpoint_token: gtk::ToggleButton,
@@ -541,6 +558,10 @@ impl SettingsPage {
         endpoint_actions.insert(&copy_endpoint, -1);
         endpoint_actions.insert(&copy_endpoint_token, -1);
         endpoint_actions.insert(&reveal_endpoint_token, -1);
+        let endpoint_retry = l10n::button("Retry");
+        endpoint_retry.add_css_class("suggested-action");
+        endpoint_retry.set_visible(false);
+        endpoint_actions.insert(&endpoint_retry, -1);
         endpoint_actions.insert(&endpoint_button, -1);
         endpoint.append(&endpoint_actions);
         let endpoint_token_value = gtk::Label::builder()
@@ -860,6 +881,13 @@ l10n::bind_dialog_heading(&error_dialog, msg("Could not start data removal"));
             launch_at_login,
             endpoint_status,
             endpoint_button,
+            endpoint_retry,
+            endpoint_watch: Rc::new(Cell::new(false)),
+            endpoint_on: Rc::new(Cell::new(false)),
+            endpoint_locked: Rc::new(Cell::new(false)),
+            endpoint_shown: Rc::new(RefCell::new(None)),
+            endpoint_generation: Rc::new(Cell::new(0)),
+            endpoint_reading: Rc::new(Cell::new(false)),
             copy_endpoint: copy_endpoint.clone(),
             copy_endpoint_token: copy_endpoint_token.clone(),
             reveal_endpoint_token: reveal_endpoint_token.clone(),
@@ -924,6 +952,10 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
         settings_page
             .endpoint_button
             .connect_clicked(move |_| page_for_endpoint.toggle_endpoint());
+        let page_for_endpoint_retry = settings_page.clone();
+        settings_page
+            .endpoint_retry
+            .connect_clicked(move |_| page_for_endpoint_retry.retry_endpoint());
         let page_for_http_client = settings_page.clone();
         settings_page
             .add_http_client
@@ -986,7 +1018,7 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
         });
         let page_for_url = settings_page.clone();
         copy_endpoint.connect_clicked(move |_| {
-            let status = page_for_url.bridge.status();
+            let status = page_for_url.shown_endpoint();
             let Some(url) = status.url else {
                 page_for_url.show_error(&tr("start the Shared HTTP endpoint first"));
                 return;
@@ -1002,7 +1034,7 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
         });
         let page_for_token = settings_page.clone();
         copy_endpoint_token.connect_clicked(move |_| {
-            let status = page_for_token.bridge.status();
+            let status = page_for_token.shown_endpoint();
             let Some(token) = status.token else {
                 page_for_token.show_error(&tr("start the Shared HTTP endpoint first"));
                 return;
@@ -1019,7 +1051,7 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
         let page_for_reveal = settings_page.clone();
         reveal_endpoint_token.connect_toggled(move |toggle| {
             if toggle.is_active() {
-                let status = page_for_reveal.bridge.status();
+                let status = page_for_reveal.shown_endpoint();
                 page_for_reveal
                     .endpoint_token_value
                     .set_label(status.token.as_deref().unwrap_or(""));
@@ -1080,15 +1112,51 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
                     }
                     Err(_) => page.show_error(&tr("the gateway cleanup task stopped unexpectedly")),
                 }
-                page.render_endpoint(page.bridge.status());
+                page.refresh_endpoint();
             });
         });
         settings_page
     }
 
+    /// The main button turns the endpoint on or off. One left on that waits for
+    /// the keyring is on: Stop clears the saved setting and ends the wait,
+    /// without reading the keyring.
     fn toggle_endpoint(&self) {
+        self.run_endpoint(self.endpoint_on.get(), false);
+    }
+
+    /// Read the endpoint's state off the main thread and show it, unless a
+    /// Start, Stop or Retry finished meanwhile (its result is newer).
+    fn refresh_endpoint(&self) {
+        if self.endpoint_reading.replace(true) {
+            return;
+        }
+        let generation = self.endpoint_generation.get();
+        let bridge = self.bridge.clone();
+        let page = self.clone();
+        gtk::glib::spawn_future_local(async move {
+            let status = gtk::gio::spawn_blocking(move || bridge.status()).await;
+            page.endpoint_reading.set(false);
+            if page.endpoint_generation.get() != generation {
+                return;
+            }
+            if let Ok(status) = status {
+                page.render_endpoint(status);
+            }
+        });
+    }
+
+    /// Retry on an endpoint left on while the keyring was locked: the user
+    /// asked, so this one may ask to unlock it.
+    fn retry_endpoint(&self) {
+        self.run_endpoint(false, true);
+    }
+
+    fn run_endpoint(&self, running: bool, retry: bool) {
+        self.endpoint_generation
+            .set(self.endpoint_generation.get().wrapping_add(1));
         self.endpoint_button.set_sensitive(false);
-        let running = self.bridge.status().running;
+        self.endpoint_retry.set_sensitive(false);
         l10n::bind_label(
             &self.feedback,
             if running {
@@ -1103,25 +1171,38 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
             let result = gtk::gio::spawn_blocking(move || {
                 if running {
                     bridge.stop()
+                } else if retry {
+                    bridge.retry_restore()
                 } else {
-                    bridge.start(None)
+                    bridge.turn_on(None)
                 }
             })
             .await;
+            // Reads begun while this ran are older than its result.
+            page.endpoint_generation
+                .set(page.endpoint_generation.get().wrapping_add(1));
             page.endpoint_button.set_sensitive(true);
+            page.endpoint_retry.set_sensitive(true);
             match result {
                 Ok(Ok(status)) => {
+                    // Waiting for the keyring: the status line says so; it
+                    // has not started yet.
+                    let waiting = !running && status.keyring_locked;
                     page.render_endpoint(status);
-                    l10n::bind_label(
-                        &page.feedback,
-                        if running {
-                            msg("Shared HTTP endpoint stopped")
-                        } else {
-                            msg("Shared HTTP endpoint started")
-                        },
-                    );
-                    page.feedback.remove_css_class("error");
-                    page.feedback.add_css_class("success");
+                    if waiting {
+                        page.feedback.set_label("");
+                    } else {
+                        l10n::bind_label(
+                            &page.feedback,
+                            if running {
+                                msg("Shared HTTP endpoint stopped")
+                            } else {
+                                msg("Shared HTTP endpoint started")
+                            },
+                        );
+                        page.feedback.remove_css_class("error");
+                        page.feedback.add_css_class("success");
+                    }
                 }
                 Ok(Err(error)) => page.show_error(&error),
                 Err(_) => page.show_error(&tr("the endpoint operation stopped unexpectedly")),
@@ -1653,7 +1734,19 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
         }
     }
 
+    fn shown_endpoint(&self) -> crate::http_bridge::HttpBridgeStatus {
+        self.endpoint_shown
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| crate::http_bridge::HttpBridgeStatus::new(None, None))
+    }
+
     fn render_endpoint(&self, status: crate::http_bridge::HttpBridgeStatus) {
+        *self.endpoint_shown.borrow_mut() = Some(status.clone());
+        self.endpoint_on
+            .set(status.running || status.keyring_locked);
+        self.endpoint_locked
+            .set(!status.running && status.keyring_locked);
         if let Some(url) = status.url {
             l10n::bind_formatted_label(
                 &self.endpoint_status,
@@ -1672,12 +1765,32 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
                 self.endpoint_token_value.set_visible(true);
             }
             self.add_http_client.set_sensitive(true);
+            self.endpoint_retry.set_visible(false);
         } else {
-            self.endpoint_status.set_label(&tr("Stopped"));
-            l10n::bind_button(&self.endpoint_button, msg("Start"));
-            self.endpoint_button
-                .remove_css_class("toolport-destructive");
-            self.endpoint_button.add_css_class("suggested-action");
+            if status.keyring_locked {
+                // Still on (saved), waiting for the keyring: Stop turns it off,
+                // Retry may ask to unlock.
+                l10n::bind_label_with(&self.endpoint_status, || {
+                    format!(
+                        "{} · {}",
+                        tr("Keyring locked"),
+                        tr("Unlock your keyring, then choose Retry.")
+                    )
+                });
+                l10n::bind_button(&self.endpoint_button, msg("Stop"));
+                self.endpoint_button.remove_css_class("suggested-action");
+                self.endpoint_button.add_css_class("toolport-destructive");
+                self.endpoint_retry.set_visible(true);
+                self.watch_locked_endpoint();
+            } else {
+                // Bound, so it replaces the locked text's binding too.
+                l10n::bind_label(&self.endpoint_status, msg("Stopped"));
+                l10n::bind_button(&self.endpoint_button, msg("Start"));
+                self.endpoint_button
+                    .remove_css_class("toolport-destructive");
+                self.endpoint_button.add_css_class("suggested-action");
+                self.endpoint_retry.set_visible(false);
+            }
             self.copy_endpoint.set_sensitive(false);
             self.copy_endpoint_token.set_sensitive(false);
             self.reveal_endpoint_token.set_sensitive(false);
@@ -1686,6 +1799,23 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
             self.endpoint_token_value.set_visible(false);
             self.add_http_client.set_sensitive(false);
         }
+    }
+
+    /// While the endpoint waits for the keyring, re-read it so the page shows
+    /// it running as soon as an unlock brings it back.
+    fn watch_locked_endpoint(&self) {
+        if self.endpoint_watch.replace(true) {
+            return;
+        }
+        let page = self.clone();
+        gtk::glib::timeout_add_local(crate::http_bridge::KEYRING_POLL, move || {
+            if !page.endpoint_locked.get() {
+                page.endpoint_watch.set(false);
+                return gtk::glib::ControlFlow::Break;
+            }
+            page.refresh_endpoint();
+            gtk::glib::ControlFlow::Continue
+        });
     }
 
     fn render_http_clients(&self, settings: crate::registry_controller::HttpClientSettings) {
@@ -2208,7 +2338,7 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
                     set_switch(&page.launch_at_login, launch_at_login);
                     page.launch_at_login.set_sensitive(true);
                     page.updating.set(false);
-                    page.render_endpoint(page.bridge.status());
+                    page.refresh_endpoint();
                     page.render_quarantine(quarantined);
                     if let Ok(notice) = baseline_notice {
                         page.baseline_notice
@@ -3595,8 +3725,24 @@ mod tests {
         assert_action(false, "Start");
         page.render_endpoint(stopped());
         assert_action(false, "Start");
+        assert!(!page.endpoint_retry.is_visible());
+        // Left on, waiting for the keyring: still on, so the main action turns
+        // it off; Retry beside it may ask to unlock.
+        let mut locked = stopped();
+        locked.keyring_locked = true;
+        page.render_endpoint(locked);
+        assert_action(true, "Stop");
+        assert!(page.endpoint_retry.is_visible() && page.endpoint_retry.is_sensitive());
+        assert_eq!(
+            page.endpoint_status.label().as_str(),
+            "Keyring locked · Unlock your keyring, then choose Retry."
+        );
+        page.render_endpoint(stopped());
+        assert_action(false, "Start");
+        assert!(!page.endpoint_retry.is_visible());
         page.render_endpoint(running());
         assert_action(true, "Stop");
+        assert!(!page.endpoint_retry.is_visible());
         crate::i18n::set_language("fr").unwrap();
         l10n::refresh_bindings();
         assert_action(true, "Arrêter");

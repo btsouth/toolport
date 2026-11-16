@@ -2230,8 +2230,10 @@ type RegistryReload = std::rc::Rc<dyn Fn()>;
 
 #[derive(Clone)]
 struct HealthRow {
-    /// The row's status chip.
+    /// The row's status text.
     label: gtk::Label,
+    /// The pill around it, which carries the status class.
+    chip: gtk::Box,
     authenticate: gtk::Button,
     copy_error: gtk::Button,
     retry: gtk::Button,
@@ -2243,6 +2245,13 @@ impl ServerPage {
     fn reprobe_after_auth_change(&self, server_id: &str) {
         self.health.borrow_mut().invalidate(server_id);
         self.probe_servers(health::ProbeReason::ConfigChanged);
+    }
+
+    /// A row's Retry: the user asked, so this check may ask to unlock the
+    /// keyring.
+    fn retry_probe(&self, server_id: &str) {
+        self.health.borrow_mut().invalidate(server_id);
+        self.plan_probes(health::ProbeReason::ConfigChanged, Some(server_id));
     }
 
     /// Retry for an unreadable registry. Without a window controller (tests),
@@ -2562,15 +2571,21 @@ impl ServerPage {
             self.posture.set_visible(false);
             return;
         }
-        let (ready, auth, errors, pending) = self.health.borrow().tally(enabled.iter().copied());
+        let tally = self.health.borrow().tally(enabled.iter().copied());
         self.posture.set_visible(true);
-        self.posture
-            .set_label(&posture_line(ready, auth, errors, pending, enabled.len()));
+        self.posture.set_label(&posture_line(tally, enabled.len()));
     }
 
     /// Probe the enabled servers the health cache says need it, in the
     /// background, and land each result on its live row.
     fn probe_servers(&self, reason: health::ProbeReason) {
+        self.plan_probes(reason, None);
+    }
+
+    /// Checks the page starts on its own never ask to unlock the keyring
+    /// (`probe_health_registered`); a Refresh, or a Retry on `retried`, is the
+    /// user's and may.
+    fn plan_probes(&self, reason: health::ProbeReason, retried: Option<&str>) {
         let Some(snapshot) = self.last_snapshot.borrow().clone() else {
             return;
         };
@@ -2580,10 +2595,13 @@ impl ServerPage {
             .filter(|server| server.enabled)
             .map(|server| (server.id.as_str(), server.probe_fingerprint))
             .collect::<Vec<_>>();
-        let tickets = self
-            .health
-            .borrow_mut()
-            .plan(&enabled, reason, std::time::Instant::now());
+        let tickets = self.health.borrow_mut().plan_asked(
+            &enabled,
+            reason,
+            std::time::Instant::now(),
+            retried,
+        );
+        let check = crate::server_runtime::KeyringCheck::default();
         for ticket in tickets {
             for row in self
                 .health_rows
@@ -2594,25 +2612,31 @@ impl ServerPage {
             {
                 l10n::bind_text(&row.label, "Checking…");
                 for class in ["success", "error", "review"] {
-                    row.label.remove_css_class(class);
+                    row.chip.remove_css_class(class);
                 }
                 row.label.set_tooltip_text(None);
                 row.authenticate.set_visible(false);
                 row.copy_error.set_visible(false);
                 row.retry.set_visible(false);
             }
-            self.spawn_probe(ticket);
+            self.spawn_probe(ticket, check.clone());
         }
         self.update_posture();
     }
 
-    fn spawn_probe(&self, ticket: health::ProbeTicket) {
+    /// `check`: the round's one keyring check.
+    fn spawn_probe(&self, ticket: health::ProbeTicket, check: crate::server_runtime::KeyringCheck) {
+        let interactive = ticket.interactive;
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
             let server_id = ticket.server_id.clone();
             let id_for_probe = server_id.clone();
             let result = gtk::gio::spawn_blocking(move || {
-                crate::server_runtime::probe_registered(&id_for_probe)
+                if interactive {
+                    crate::server_runtime::probe_registered(&id_for_probe)
+                } else {
+                    crate::server_runtime::probe_health_registered(&id_for_probe, &check)
+                }
             })
             .await;
             let probe = match result {
@@ -2625,6 +2649,7 @@ impl ServerPage {
                     auth_required: false,
                     failure: None,
                     auth_target: None,
+                    keyring_locked: false,
                 },
                 Err(_) => crate::server_runtime::ProbeResult {
                     server_id: server_id.clone(),
@@ -2634,6 +2659,7 @@ impl ServerPage {
                     auth_required: false,
                     failure: None,
                     auth_target: None,
+                    keyring_locked: false,
                 },
             };
             let outcome = page.health.borrow_mut().complete(
@@ -2642,11 +2668,50 @@ impl ServerPage {
                 std::time::Instant::now(),
             );
             match outcome {
-                health::ProbeOutcome::Apply => page.apply_probe(&server_id, &probe),
-                health::ProbeOutcome::Rerun(next) => page.spawn_probe(next),
+                health::ProbeOutcome::Apply => {
+                    page.apply_probe(&server_id, &probe);
+                    if probe.keyring_locked {
+                        page.watch_keyring();
+                    } else if interactive {
+                        // The user's check got past the keyring: so can the
+                        // rows that showed it locked.
+                        page.probe_servers(health::ProbeReason::Unlocked);
+                    }
+                }
+                health::ProbeOutcome::Rerun(next) => page.spawn_probe(next, Default::default()),
                 health::ProbeOutcome::Discard => {}
             }
             page.update_posture();
+        });
+    }
+
+    /// "Keyring locked" may only mean the keyring was busy, and nothing else
+    /// checks the row again while the page stays open: while a row shows it,
+    /// check the keyring every few seconds off the main thread, and check
+    /// those rows again (without asking) once it is open.
+    fn watch_keyring(&self) {
+        if !self.health.borrow_mut().start_keyring_poll() {
+            return;
+        }
+        let page = self.clone();
+        let checking = std::rc::Rc::new(std::cell::Cell::new(false));
+        gtk::glib::timeout_add_local(crate::http_bridge::KEYRING_POLL, move || {
+            if !page.health.borrow_mut().keep_polling() {
+                return gtk::glib::ControlFlow::Break;
+            }
+            if !checking.replace(true) {
+                let page = page.clone();
+                let checking = checking.clone();
+                gtk::glib::spawn_future_local(async move {
+                    let open =
+                        gtk::gio::spawn_blocking(|| !crate::secrets::store_would_prompt()).await;
+                    checking.set(false);
+                    if open.unwrap_or(false) {
+                        page.probe_servers(health::ProbeReason::Unlocked);
+                    }
+                });
+            }
+            gtk::glib::ControlFlow::Continue
         });
     }
 
@@ -2661,10 +2726,10 @@ impl ServerPage {
         {
             let (status, class) = probe_status_line(probe);
             row.label.set_label(&status);
-            row.label.remove_css_class("success");
-            row.label.remove_css_class("error");
-            row.label.remove_css_class("review");
-            row.label.add_css_class(class);
+            row.chip.remove_css_class("success");
+            row.chip.remove_css_class("error");
+            row.chip.remove_css_class("review");
+            row.chip.add_css_class(class);
             row.label.set_tooltip_text(probe_tooltip(probe).as_deref());
             row.authenticate
                 .set_label(&crate::i18n::lookup(probe_auth_action(probe)));
@@ -9855,7 +9920,8 @@ fn probe_status_line(probe: &crate::server_runtime::ProbeResult) -> (String, &'s
     } else {
         (
             crate::i18n::lookup(probe.failure_label()),
-            if probe.auth_required {
+            // A locked keyring waits on the user, like a sign-in: not a failure.
+            if probe.auth_required || probe.keyring_locked {
                 "review"
             } else {
                 "error"
@@ -9984,7 +10050,14 @@ fn probe_tooltip(probe: &crate::server_runtime::ProbeResult) -> Option<String> {
 }
 
 /// The one-line posture summary above the server list.
-fn posture_line(ready: usize, auth: usize, errors: usize, pending: usize, total: usize) -> String {
+fn posture_line(tally: health::Tally, total: usize) -> String {
+    let health::Tally {
+        ready,
+        auth,
+        errors,
+        locked,
+        pending,
+    } = tally;
     if pending > 0 {
         return crate::i18n::trf(
             if total == 1 {
@@ -9998,7 +10071,7 @@ fn posture_line(ready: usize, auth: usize, errors: usize, pending: usize, total:
             ],
         );
     }
-    if auth == 0 && errors == 0 {
+    if auth == 0 && errors == 0 && locked == 0 {
         return crate::i18n::trf(
             if total == 1 {
                 crate::i18n::msg("All {value0} enabled server is ready.")
@@ -10026,6 +10099,12 @@ fn posture_line(ready: usize, auth: usize, errors: usize, pending: usize, total:
         parts.push(crate::i18n::trf(
             "{value0} failing",
             &[("value0", &format!("{}", errors))],
+        ));
+    }
+    if locked > 0 {
+        parts.push(crate::i18n::trf(
+            "{value0} waiting for the keyring",
+            &[("value0", &format!("{}", locked))],
         ));
     }
     parts.join(" · ")
@@ -10163,14 +10242,26 @@ fn server_row(
     let health = gtk::Label::builder()
         .valign(gtk::Align::Center)
         .max_width_chars(28)
-        .css_classes(["toolport-badge", "toolport-server-state"])
+        .css_classes(["toolport-server-state"])
         .build();
     client_rows::wrap_row_text(&health);
+    // The pill holds the status color; a dot in it, as in React.
+    let chip = gtk::Box::builder()
+        .spacing(4)
+        .valign(gtk::Align::Center)
+        .css_classes(["toolport-badge", "toolport-badge-wraps"])
+        .build();
+    let dot = gtk::Box::builder()
+        .valign(gtk::Align::Center)
+        .css_classes(["toolport-chip-dot"])
+        .build();
+    chip.append(&dot);
+    chip.append(&health);
     if server.enabled && !server.requires_review {
         l10n::bind_text(&health, "Checking…");
     } else {
         l10n::bind_text(&health, "Off");
-        health.add_css_class("off");
+        chip.add_css_class("off");
     }
     lead.append(&text);
 
@@ -10223,7 +10314,7 @@ fn server_row(
     };
     let page_for_retry = page.clone();
     let retry_id = server.id.clone();
-    retry.connect_clicked(move |_| page_for_retry.reprobe_after_auth_change(&retry_id));
+    retry.connect_clicked(move |_| page_for_retry.retry_probe(&retry_id));
     // Recovery actions sit with the status they recover from, as in React; the
     // name and meta lines ellipsize to make room for them.
     let health_actions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -10238,6 +10329,7 @@ fn server_row(
         rows.retain(|row| row.label.root().is_some());
         rows.push(HealthRow {
             label: health.clone(),
+            chip: chip.clone(),
             authenticate: authenticate.clone(),
             copy_error: copy_error.clone(),
             retry: retry.clone(),
@@ -10251,7 +10343,7 @@ fn server_row(
         {
             let (status, class) = probe_status_line(previous);
             health.set_label(&status);
-            health.add_css_class(class);
+            chip.add_css_class(class);
             authenticate.set_label(&crate::i18n::lookup(probe_auth_action(previous)));
             authenticate.set_visible(previous.auth_required);
             copy_error.set_visible(!previous.ok && previous.error.is_some());
@@ -10389,7 +10481,7 @@ l10n::bind_dialog_response(&dialog, "enable", "Enable");
         // No "Enabled" label beside the switch: the chip says the state, and the
         // switch's accessible name says what it changes (spec 6).
         let status = health.clone();
-        controls.append(&health);
+        controls.append(&chip);
         let toggle = gtk::Switch::builder()
             .active(server.enabled)
             .valign(gtk::Align::Center)
@@ -18253,20 +18345,67 @@ mod tests {
 
     #[test]
     fn posture_lines_cover_checking_healthy_and_mixed_states() {
+        // A locked keyring is not a failure: those servers were not checked.
         assert_eq!(
-            posture_line(0, 0, 0, 3, 3),
+            posture_line(
+                health::Tally {
+                    locked: 9,
+                    ..health::Tally::default()
+                },
+                9
+            ),
+            "0 ready · 9 waiting for the keyring"
+        );
+        assert_eq!(
+            posture_line(
+                health::Tally {
+                    ready: 0,
+                    auth: 0,
+                    errors: 0,
+                    locked: 0,
+                    pending: 3,
+                },
+                3
+            ),
             "Checking 3 of 3 enabled servers…"
         );
         assert_eq!(
-            posture_line(4, 0, 0, 0, 4),
+            posture_line(
+                health::Tally {
+                    ready: 4,
+                    auth: 0,
+                    errors: 0,
+                    locked: 0,
+                    pending: 0,
+                },
+                4
+            ),
             "All 4 enabled servers are ready."
         );
         assert_eq!(
-            posture_line(1, 0, 0, 0, 1),
+            posture_line(
+                health::Tally {
+                    ready: 1,
+                    auth: 0,
+                    errors: 0,
+                    locked: 0,
+                    pending: 0,
+                },
+                1
+            ),
             "All 1 enabled server is ready."
         );
         assert_eq!(
-            posture_line(2, 1, 1, 0, 4),
+            posture_line(
+                health::Tally {
+                    ready: 2,
+                    auth: 1,
+                    errors: 1,
+                    locked: 0,
+                    pending: 0,
+                },
+                4
+            ),
             "2 ready · 1 needs sign-in · 1 failing"
         );
     }
@@ -18281,6 +18420,7 @@ mod tests {
             auth_required: auth,
             failure: None,
             auth_target: None,
+            keyring_locked: false,
         };
         assert_eq!(
             probe_status_line(&probe(true, 1, false)),
@@ -18293,6 +18433,14 @@ mod tests {
         assert_eq!(
             probe_status_line(&probe(false, 0, false)),
             ("Connection failed".to_string(), "error")
+        );
+        let locked = crate::server_runtime::ProbeResult {
+            keyring_locked: true,
+            ..probe(false, 0, false)
+        };
+        assert_eq!(
+            probe_status_line(&locked),
+            ("Keyring locked".to_string(), "review")
         );
     }
 
@@ -18316,6 +18464,7 @@ mod tests {
                 auth_required: true,
                 failure: None,
                 auth_target: Some(target),
+                keyring_locked: false,
             };
             assert_eq!(probe_status_line(&probe), (text.into(), "review"));
             assert_eq!(probe_auth_action(&probe), action);
@@ -18599,6 +18748,7 @@ mod tests {
             auth_required,
             failure: None,
             auth_target: None,
+            keyring_locked: false,
         };
         page.apply_probe(
             "cloudflare",
@@ -18671,6 +18821,12 @@ mod tests {
             ),
         );
         assert_eq!(health.text(), "Needs sign-in");
+        // Like React's chip: the warning pill with a dot in it.
+        let chip = health.parent().unwrap();
+        assert!(chip.has_css_class("toolport-badge") && chip.has_css_class("review"));
+        assert!(chip
+            .first_child()
+            .is_some_and(|dot| dot.has_css_class("toolport-chip-dot")));
         assert!(health.tooltip_text().is_none());
         assert!(!health.layout().is_ellipsized());
         window.set_child(None::<&gtk::Widget>);
@@ -18802,10 +18958,10 @@ mod tests {
         let off_chip = children(&holding_switch(&off_rows[0]).expect("the off row controls"))
             .into_iter()
             .find(|widget| widget.has_css_class("toolport-badge"))
-            .and_downcast::<gtk::Label>()
             .unwrap();
-        assert_eq!(off_chip.text(), "Off");
         assert!(off_chip.has_css_class("off"));
+        let off_text = off_chip.last_child().and_downcast::<gtk::Label>().unwrap();
+        assert_eq!(off_text.text(), "Off");
 
         // Turning Linear on moves the same row into the running group.
         let linear_row = off_rows[0].clone();

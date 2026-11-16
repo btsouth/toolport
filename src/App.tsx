@@ -233,6 +233,16 @@ function App() {
   const [starSurface, setStarSurface] = useState<StarSurface>(null);
   const lastProbeRef = useRef(0);
   const probeFlightRef = useRef(createSingleFlight<ProbeResult[]>());
+  // Set by a Refresh or Retry the user chose: the next probe flight to start may
+  // ask to unlock the keyring. The window's own probes never do. It stays set
+  // until a flight starts, so a request queued behind an automatic probe, or
+  // coalesced with others, keeps the user's choice.
+  const interactiveProbeRef = useRef(false);
+  const takeInteractive = () => {
+    const interactive = interactiveProbeRef.current;
+    interactiveProbeRef.current = false;
+    return interactive;
+  };
   const loadedOnce = useRef(false);
 
   // Probe health quietly (no toast). Used on load and after authenticating, so
@@ -245,7 +255,7 @@ function App() {
       lastProbeRef.current = Date.now();
       setProbing(true);
       try {
-        const results = await probeServers();
+        const results = await probeServers(takeInteractive());
         setHealth(Object.fromEntries(results.map((r) => [r.serverId, r])));
         setBackendReachable(true);
         return results;
@@ -261,12 +271,13 @@ function App() {
   // Registry/auth mutations need a probe that starts after any older snapshot.
   // Multiple mutations during one active probe share a single trailing run.
   const reprobeAfterMutation = useCallback(
-    (): Promise<ProbeResult[]> =>
-      probeFlightRef.current.runAfterCurrent(async () => {
+    (interactive = false): Promise<ProbeResult[]> => {
+      if (interactive) interactiveProbeRef.current = true;
+      return probeFlightRef.current.runAfterCurrent(async () => {
         lastProbeRef.current = Date.now();
         setProbing(true);
         try {
-          const results = await probeServers();
+          const results = await probeServers(takeInteractive());
           setHealth(Object.fromEntries(results.map((r) => [r.serverId, r])));
           setBackendReachable(true);
           return results;
@@ -276,8 +287,15 @@ function App() {
         } finally {
           setProbing(false);
         }
-      }),
+      });
+    },
     [],
+  );
+
+  // A row's Retry: the user asked, so it may ask to unlock the keyring.
+  const retryProbe = useCallback(
+    (): Promise<ProbeResult[]> => reprobeAfterMutation(true),
+    [reprobeAfterMutation],
   );
 
   const applyRegistryChange = useCallback(
@@ -342,9 +360,10 @@ function App() {
 
   // `announce` is set by the manual Refresh button: it waits for the health probe
   // and reports a summary toast. The silent path (initial load, focus refresh)
-  // fires the probe without blocking or toasting.
+  // fires the probe without blocking or toasting. `interactive`: the user asked
+  // (Refresh, Ctrl+R), so its probe may ask to unlock the keyring.
   const load = useCallback(
-    async (announce = false) => {
+    async (announce = false, interactive = announce) => {
       setLoading(true);
       setError(null);
       setDetailError(null);
@@ -388,7 +407,7 @@ function App() {
         setActivityKey((k) => k + 1);
         if (announce) {
           try {
-            const results = await reprobeAfterMutation();
+            const results = await reprobeAfterMutation(interactive);
             if (results.length > 0) {
               const up = results.filter((r) => r.ok).length;
               toast.success(
@@ -403,6 +422,8 @@ function App() {
           } catch {
             toast.warning(translate("Refreshed, but couldn't check server health"));
           }
+        } else if (interactive) {
+          void reprobeAfterMutation(true).catch(() => {});
         } else {
           void reprobe().catch(() => {});
         }
@@ -434,7 +455,7 @@ function App() {
     setCheckingClientRecoveries(true);
     const focused = document.activeElement as HTMLElement | null;
     try {
-      await Promise.all([requestClientRecoveryScan(), load(false)]);
+      await Promise.all([requestClientRecoveryScan(), load(false, true)]);
     } catch (cause: unknown) {
       toastError(
         typeof cause === "string"
@@ -745,7 +766,13 @@ function App() {
   // Keep these counts independent of `visible` so a filter cannot produce a
   // misleading "0 servers" action while hiding an affected row.
   const authAttention = attentionServers.filter((s) => health[s.id]?.authRequired);
-  const errorAttention = attentionServers.filter((s) => !health[s.id]?.authRequired);
+  // Not failing: not checked, because the keyring is locked.
+  const lockedAttention = attentionServers.filter(
+    (s) => !health[s.id]?.authRequired && health[s.id]?.keyringLocked,
+  );
+  const errorAttention = attentionServers.filter(
+    (s) => !health[s.id]?.authRequired && !health[s.id]?.keyringLocked,
+  );
 
   // Count what would actually be imported: drop the gateway entry and anything
   // already in the registry, then dedupe by name across clients (the backend
@@ -997,7 +1024,7 @@ function App() {
       onSwitchRef={registerServerSwitch}
       onRemove={() => handleRemove(server.id, server.name)}
       onRegistryChange={applyRegistryChange}
-      onReprobe={() => void reprobeAfterMutation().catch(() => {})}
+      onReprobe={() => void retryProbe().catch(() => {})}
     />
   );
 
@@ -1228,7 +1255,9 @@ function App() {
                 variant="outline"
                 size="sm"
                 className="shrink-0"
-                onClick={() => void reprobe().catch(() => {})}
+                onClick={() => {
+                  void reprobeAfterMutation(true).catch(() => {});
+                }}
                 disabled={probing}
               >
                 {" "}
@@ -1303,7 +1332,7 @@ function App() {
                         registry={registry}
                         onRegistryChange={applyRegistryChange}
                         health={health}
-                        onReprobe={() => void reprobeAfterMutation().catch(() => {})}
+                        onReprobe={() => void retryProbe().catch(() => {})}
                         onOpenServers={() => selectView("servers")}
                       />
                     ) : view === "settings" ? (
@@ -1338,7 +1367,7 @@ function App() {
                               backFromDetail("servers");
                           }}
                           onRegistryChange={applyRegistryChange}
-                          onReprobe={() => void reprobeAfterMutation().catch(() => {})}
+                          onReprobe={() => void retryProbe().catch(() => {})}
                         />
                       ) : (
                         <SharedEmptyState
@@ -1383,6 +1412,7 @@ function App() {
                             <ServerNextAction
                               authServers={authAttention}
                               errorServers={errorAttention}
+                              lockedServers={lockedAttention}
                             />
                           ) : (
                             <ServerPosture
@@ -1672,13 +1702,30 @@ function ServerPosture({
 function ServerNextAction({
   authServers,
   errorServers,
+  lockedServers = [],
 }: {
   authServers: ServerEntry[];
   errorServers: ServerEntry[];
+  lockedServers?: ServerEntry[];
 }) {
   const { t } = useI18n();
   const authCount = authServers.length;
-  const errorCount = errorServers.length;
+  // Servers the window did not check because the keyring is locked: on their
+  // own they only need an unlock; alongside other problems they count with
+  // those that could not start.
+  const lockedOnly =
+    lockedServers.length > 0 && authCount === 0 && errorServers.length === 0;
+  if (lockedOnly) {
+    return (
+      <StatusCard
+        variant="warning"
+        icon={<KeyRound />}
+        title={t("Keyring locked")}
+        detail={t("Unlock your keyring, then choose Retry.")}
+      />
+    );
+  }
+  const errorCount = errorServers.length + lockedServers.length;
   const title =
     authCount === 1 && errorCount === 0
       ? t("Sign in to {value1}", { value1: authServers[0].name })

@@ -1073,6 +1073,7 @@
   "{value0} credentials and settings": "{value0} credenciales y configuración",
   "{value0} direct + {value1} fallback": "{value0} directo + {value1} alternativo",
   "{value0} failing": "{value0} fallando",
+  "{value0} waiting for the keyring": "{value0} esperando el llavero",
   "{value0} is a boolean and should not reach text coercion": "{value0} es booleano y no debe alcanzar la coerción de texto",
   "{value0} is required": "{value0} es obligatorio",
   "{value0} ms": "{value0} ms",

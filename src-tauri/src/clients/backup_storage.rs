@@ -1160,6 +1160,29 @@ pub(crate) fn upgrade_legacy() -> Result<usize, String> {
     Ok(upgraded)
 }
 
+/// [`upgrade_legacy`] at start, where nothing may ask to unlock the keyring.
+/// `None`: a vault write would ask, so every original is left as it is for
+/// [`upgrade_legacy_once_open`].
+pub(crate) fn upgrade_legacy_at_start() -> Option<Result<usize, String>> {
+    match crate::secrets::without_prompts(upgrade_legacy) {
+        Err(_) if crate::secrets::write_would_ask() => None,
+        result => Some(result),
+    }
+}
+
+/// Waits for the keyring to open (by itself or by a user action), checking
+/// every `poll`, then upgrades; a keyring that locks again keeps it waiting.
+pub(crate) fn upgrade_legacy_once_open(poll: std::time::Duration) -> Result<usize, String> {
+    loop {
+        if !crate::secrets::write_would_ask() {
+            if let Some(result) = upgrade_legacy_at_start() {
+                return result;
+            }
+        }
+        std::thread::sleep(poll);
+    }
+}
+
 pub(crate) fn protect_existing() -> Result<(), String> {
     for path in owned_backup_paths()? {
         let raw = match std::fs::read_to_string(&path) {
@@ -1895,6 +1918,37 @@ mod tests {
             assert_eq!(std::fs::read(&file).unwrap(), bytes);
             assert_eq!(source_path(&file).unwrap(), None);
             release_for_discard(&file).unwrap();
+        });
+    }
+
+    /// Failure mode: the start upgrade of a plaintext backup wrote its vault
+    /// item past the background gate, so a locked keyring asked at start.
+    #[test]
+    fn the_start_upgrade_waits_for_a_locked_keyring_and_never_asks() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let path = crate::registry::conduit_dir()
+                .unwrap()
+                .join("backups/cursor/1-mcp.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let raw = r#"{"mcpServers":{"native":{"env":{"API_KEY":"sk-legacy-fixture"}}}}"#;
+            std::fs::write(&path, raw).unwrap();
+            let mut started = None;
+            let prompts = crate::secrets::locked_store::prompts_during(|| {
+                started = Some(upgrade_legacy_at_start());
+            });
+            assert!(prompts.is_empty(), "{prompts:?}");
+            assert!(started.unwrap().is_none(), "upgraded while locked");
+            let prompts = crate::secrets::locked_store::write_prompts_during(|| {
+                assert!(upgrade_legacy_at_start().is_none());
+            });
+            assert!(prompts.is_empty(), "{prompts:?}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+            // Open: the waiter upgrades it.
+            assert_eq!(
+                upgrade_legacy_once_open(std::time::Duration::ZERO).unwrap(),
+                1
+            );
+            assert!(envelope(&std::fs::read_to_string(&path).unwrap()).is_some());
         });
     }
 

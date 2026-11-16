@@ -252,6 +252,7 @@
   "Changed tool definitions are flagged for review, and results that look like prompt injection show up in Activity.": "変更されたツール定義にはレビュー用のフラグが付けられ、プロンプト インジェクションと思われる結果がアクティビティに表示されます。",
   "Changes: {changes}": "変更点: {changes}",
   "Check cancelled": "確認をキャンセルしました",
+  "Keyring locked": "キーリングがロックされています",
   "Check that each server started on the main screen.": "メイン画面で各サーバーが起動したことを確認してください。",
   "Checked Toolport status": "Toolportステータスを確認しました",
   "Checking {name}...": "{name} を確認中...",

@@ -218,6 +218,108 @@ describe("App health visibility", () => {
     expect(screen.queryByRole("status", { name: /^Ready,/i })).not.toBeInTheDocument();
   });
 
+  it("shows a locked keyring as locked, and only a Retry may ask to unlock it", async () => {
+    localStorage.setItem("toolport.onboarded", "1");
+    getRegistry.mockResolvedValue({
+      version: 3,
+      servers: [
+        {
+          id: "server-1",
+          enabled: true,
+          name: "Vaulted server",
+          transport: "stdio",
+          command: "example",
+          args: [],
+          env: [{ key: "TOKEN", secret: true }],
+          url: null,
+          source: "manual",
+        },
+      ],
+      profiles: [{ id: "default", name: "Default", enabledServerIds: ["server-1"] }],
+      activeProfileId: "default",
+    });
+    probeServers.mockResolvedValue([
+      {
+        serverId: "server-1",
+        ok: false,
+        toolCount: 0,
+        error: "keyring locked",
+        authRequired: false,
+        keyringLocked: true,
+      },
+    ]);
+
+    render(<App />);
+
+    expect(
+      await screen.findByText("Unlock your keyring, then choose Retry."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/couldn't start/i)).not.toBeInTheDocument();
+    // The row's chip: waiting on the user (warning), not failing (destructive).
+    const chip = screen
+      .getAllByText("Keyring locked")
+      .map((node) => node.closest("[data-slot='badge']"))
+      .find(Boolean);
+    expect(chip).toHaveAttribute("data-variant", "warning");
+    expect(probeServers).toHaveBeenCalledWith(false);
+    expect(probeServers).not.toHaveBeenCalledWith(true);
+
+    await userEvent.click(screen.getByRole("button", { name: /Retry/ }));
+    await waitFor(() => expect(probeServers).toHaveBeenCalledWith(true));
+  });
+
+  it("asks to unlock on Refresh and Ctrl+R, even queued behind the window's own probe", async () => {
+    localStorage.setItem("toolport.onboarded", "1");
+    getRegistry.mockResolvedValue({
+      version: 3,
+      servers: [
+        {
+          id: "server-1",
+          enabled: true,
+          name: "Vaulted server",
+          transport: "stdio",
+          command: "example",
+          args: [],
+          env: [{ key: "TOKEN", secret: true }],
+          url: null,
+          source: "manual",
+        },
+      ],
+      profiles: [{ id: "default", name: "Default", enabledServerIds: ["server-1"] }],
+      activeProfileId: "default",
+    });
+    const locked = [
+      {
+        serverId: "server-1",
+        ok: false,
+        toolCount: 0,
+        error: "keyring locked",
+        authRequired: false,
+        keyringLocked: true,
+      },
+    ];
+    // The window's own probe is still running when the user refreshes.
+    let finishAutomatic: (value: ProbeResult[]) => void = () => {};
+    probeServers.mockImplementationOnce(
+      () => new Promise<ProbeResult[]>((resolve) => (finishAutomatic = resolve)),
+    );
+    probeServers.mockResolvedValue(locked);
+    const user = userEvent.setup();
+
+    render(<App />);
+    await waitFor(() => expect(probeServers).toHaveBeenCalledWith(false));
+
+    await user.click(await screen.findByRole("button", { name: "Refresh" }));
+    act(() => finishAutomatic(locked));
+    await waitFor(() => expect(probeServers).toHaveBeenCalledTimes(2));
+    expect(probeServers).toHaveBeenLastCalledWith(true);
+
+    probeServers.mockClear();
+    await user.keyboard("{Control>}r{/Control}");
+    await waitFor(() => expect(probeServers).toHaveBeenCalledWith(true));
+    expect(probeServers).not.toHaveBeenCalledWith(false);
+  });
+
   it("drops stale health when a server is re-enabled", async () => {
     localStorage.setItem("toolport.onboarded", "1");
     const server = {

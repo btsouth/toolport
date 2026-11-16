@@ -2,6 +2,7 @@ import { translate } from "./i18n";
 import type { ProbeResult } from "./types";
 
 export function serverFailureLabel(health: ProbeResult): string {
+  if (health.keyringLocked) return translate("Keyring locked");
   if (health.authRequired)
     return health.authTarget === "scope"
       ? translate("Permission required")

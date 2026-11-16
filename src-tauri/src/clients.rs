@@ -9998,10 +9998,22 @@ fn referenced_gateway_paths_in(clients: &[DetectedClient]) -> Option<Vec<PathBuf
 
 pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> RepointOutcome {
     let mut outcome = RepointOutcome::default();
-    if let Err(error) = backup_storage::upgrade_legacy() {
-        outcome
+    match backup_storage::upgrade_legacy_at_start() {
+        Some(Err(error)) => outcome
             .failed
-            .push(("client recovery backups".into(), error));
+            .push(("client recovery backups".into(), error)),
+        Some(Ok(_)) => {}
+        None => {
+            let _ = std::thread::Builder::new()
+                .name("toolport-backup-upgrade".into())
+                .spawn(|| {
+                    if let Err(error) =
+                        backup_storage::upgrade_legacy_once_open(crate::http_bridge::KEYRING_POLL)
+                    {
+                        eprintln!("toolport: could not secure client recovery backups: {error}");
+                    }
+                });
+        }
     }
     let current = match resolve_gateway_path() {
         Ok(path) => path,

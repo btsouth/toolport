@@ -252,6 +252,7 @@
   "Changed tool definitions are flagged for review, and results that look like prompt injection show up in Activity.": "Changed tool definitions are flagged for review, and results that look like prompt injection show up in Activity.",
   "Changes: {changes}": "Changes: {changes}",
   "Check cancelled": "Check cancelled",
+  "Keyring locked": "Keyring locked",
   "Check that each server started on the main screen.": "Check that each server started on the main screen.",
   "Checked Toolport status": "Checked Toolport status",
   "Checking {name}...": "Checking {name}...",
