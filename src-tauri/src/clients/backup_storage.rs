@@ -325,7 +325,21 @@ fn encode_internal(
 ) -> Result<String, String> {
     let mut values = IMPORTS.with(|v| v.borrow().clone());
     if !missing() || !disconnecting {
-        values.extend(vaulted_credentials(text)?);
+        match vaulted_credentials(text) {
+            Ok(vaulted) => values.extend(vaulted),
+            // A 2.3.5 install upgraded in place keeps this client's recovery
+            // files unsealed until the keyring first opens. A Disconnect while
+            // it is locked writes them the same way, adding no value that is
+            // not already there in plain text; the start-up seal
+            // (`upgrade_legacy_once_open`, under the same mutation lock) seals
+            // them all once it opens.
+            Err(error) if disconnecting && backup_vault::is_locked_error(&error) => {
+                if !awaiting_seal(path, text) {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
     }
     let mut generations = Vec::new();
     // Rewrites of an existing snapshot must retain its protection even outside
@@ -1093,6 +1107,28 @@ fn vaulted_credentials(text: &str) -> Result<Vec<(Reference, String)>, String> {
     Ok(values)
 }
 
+/// Whether every plain credential in `text` already sits unsealed in this
+/// client's recovery folder, waiting for [`upgrade_legacy`]: writing `text`
+/// unsealed then adds nothing new in plain text.
+fn awaiting_seal(path: &Path, text: &str) -> bool {
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    let client = dir.file_name().and_then(|s| s.to_str()).unwrap_or("client");
+    let wanted = discovered_credentials(text, client);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let unsealed: Vec<String> = entries
+        .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
+        .filter(|raw| envelope(raw).is_none())
+        .collect();
+    !unsealed.is_empty()
+        && wanted
+            .iter()
+            .all(|(_, value)| unsealed.iter().any(|raw| raw.contains(value.as_str())))
+}
+
 fn discovered_credentials(text: &str, client: &str) -> Vec<(Reference, String)> {
     let nonsecret_values: std::collections::HashSet<String> = crate::registry::resolved_path()
         .and_then(|path| std::fs::read(path).ok())
@@ -1730,6 +1766,36 @@ mod tests {
                 crate::secrets::set_secret("backup-srv", "SERVER_KEY", "server-new-8Yp2")
             });
             assert!(refused.is_err());
+        });
+    }
+
+    /// A locked Disconnect may write a recovery file unsealed only when every
+    /// plain credential in it already sits unsealed in that client's folder.
+    #[test]
+    fn unsealed_writes_only_repeat_values_already_plain_in_the_folder() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let dir = crate::registry::conduit_dir()
+                .unwrap()
+                .join("backups/cursor");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("original-x.json");
+            let text = r#"{"mcpServers":{"w":{"env":{"WEATHER_API_KEY":"wx-await-seal-value"}}}}"#;
+            assert!(
+                !awaiting_seal(&path, text),
+                "nothing unsealed in the folder"
+            );
+            std::fs::write(dir.join("1700000000000-mcp.json"), "{}").unwrap();
+            assert!(
+                !awaiting_seal(&path, text),
+                "the value is not plain there yet"
+            );
+            std::fs::write(dir.join("1700000000000-mcp.json"), text).unwrap();
+            assert!(awaiting_seal(&path, text));
+            let other = r#"{"mcpServers":{"w":{"env":{"WEATHER_API_KEY":"wx-a-new-value"}}}}"#;
+            assert!(
+                !awaiting_seal(&path, other),
+                "a new value is never written plain"
+            );
         });
     }
 

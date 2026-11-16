@@ -927,6 +927,88 @@ pub(crate) fn locked_card_fixture(client: &str, path: &Path) -> ClientRecovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F23: a 2.3.5 install upgraded in place keeps its receipts and move
+    /// record unsealed until the keyring first opens. A Disconnect while it is
+    /// still locked must not dead-end: it disconnects, asks nothing, and keeps
+    /// the original whole.
+    #[test]
+    fn a_locked_disconnect_of_an_unsealed_2_3_5_receipt_still_disconnects() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let client = "cursor";
+            let data = crate::registry::conduit_dir().unwrap();
+            let path = data.join("legacy.json");
+            let original = "{\n \"mcpServers\":{\"weather-demo\":{\"command\":\"echo\",\"env\":{\"WEATHER_API_KEY\":\"wx-legacy-fixture-value\"}}}\n}\n";
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            std::fs::write(&path, original).unwrap();
+            // 2.3.5 Connect: no vault sealing, so the receipt and move record
+            // hold the value in plain text.
+            mutation::run(client, &path, Format::JsonMcpServers, || {
+                backup_file(client, &path)?;
+                moved::record(client, Format::JsonMcpServers, &path)?;
+                write_format(Format::JsonMcpServers, &path, &[], true)
+            })
+            .unwrap();
+            let dir = backup_dir(client).unwrap();
+            let plain = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| std::fs::read_to_string(e.unwrap().path()).ok())
+                .filter(|raw| raw.contains("wx-legacy-fixture-value"))
+                .count();
+            assert!(plain > 0, "the fixture starts unsealed, as 2.3.5 left it");
+            // "Move into gateway" then stored the value in the vault.
+            let registry = serde_json::from_value(serde_json::json!({"version":3,"profiles":[],"servers":[
+                {"id":"weather-demo","name":"Weather demo","transport":"stdio","env":[{"key":"WEATHER_API_KEY","secret":true}]}
+            ]}))
+            .unwrap();
+            crate::registry::save(&registry).unwrap();
+            crate::secrets::set_secret(
+                "weather-demo",
+                "WEATHER_API_KEY",
+                "wx-legacy-fixture-value",
+            )
+            .unwrap();
+            let connected = std::fs::read(&path).unwrap();
+
+            let mut result = None;
+            let calls = backup_vault::fake::locked_store(backup_vault::Unlock::StillLocked, || {
+                result = Some(disconnect::restore_path(
+                    client,
+                    &path,
+                    Format::JsonMcpServers,
+                    None,
+                ));
+            });
+            assert!(
+                !calls
+                    .iter()
+                    .any(|c| c.starts_with("prompting") || c == "unlock prompt"),
+                "{calls:?}"
+            );
+            let result = result.unwrap();
+            assert!(result.is_ok(), "Disconnect dead-ended: {result:?}");
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert_ne!(
+                after.as_bytes(),
+                connected.as_slice(),
+                "the client was disconnected"
+            );
+            // The plain original was readable, so it is back byte for byte and
+            // nothing is owed: no card.
+            assert_eq!(after, original);
+            assert!(list()
+                .unwrap()
+                .iter()
+                .all(|row| row.path != path.to_string_lossy()));
+            // The finished Disconnect released this client's recovery files:
+            // no plain copy of the value is left behind for the seal to find.
+            assert_eq!(backup_storage::upgrade_legacy().unwrap(), 0);
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let raw = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+                assert!(!raw.contains("wx-legacy-fixture-value"), "{raw}");
+            }
+        });
+    }
     fn pending(path: &Path) -> ClientRecovery {
         pending_for("cursor", path)
     }
