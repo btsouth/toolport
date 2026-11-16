@@ -206,7 +206,9 @@ pub(super) enum RecordProblem {
     Unreadable,
 }
 pub(super) const RECORD_NAME: &str = RECORD_FILE;
-/// Checks a move record exactly as [`load`] reads it.
+/// Checks a move record's shape as [`load`] reads it, from its public text
+/// only: the recovery list calls this while drawing the Clients page, so it
+/// must never wait on the credential store or raise an unlock prompt.
 pub(super) fn check_record(file: &Path) -> Result<(), RecordProblem> {
     let raw = match std::fs::read_to_string(file) {
         Ok(raw) => raw,
@@ -216,7 +218,7 @@ pub(super) fn check_record(file: &Path) -> Result<(), RecordProblem> {
         }
         Err(_) => return Err(RecordProblem::Unreadable),
     };
-    let decoded = backup_storage::decode(&raw);
+    let decoded = backup_storage::public_text(&raw);
     if decoded
         .as_deref()
         .ok()

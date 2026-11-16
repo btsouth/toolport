@@ -555,7 +555,21 @@ fn insert_action(actions: &gtk::FlowBox, button: &gtk::Button) {
     }
 }
 
+/// Rescan client rows after a Retry that refreshed waiting client configs,
+/// and after a failed one, which may have refreshed them before it failed.
+fn rescan_after_retry<E>(
+    result: &Result<Result<crate::clients::recovery::RecoveryAttempt, String>, E>,
+) -> bool {
+    match result {
+        Ok(Ok(attempt)) => attempt.refreshed,
+        Ok(Err(_)) => true,
+        Err(_) => false,
+    }
+}
+
 impl ClientPage {
+    /// Lists from the recovery files only; it never contacts the credential
+    /// store, so it is safe on the UI thread.
     pub(super) fn reload_recoveries(&self) {
         match crate::clients::recovery::list() {
             Ok(records) => *self.recoveries.borrow_mut() = records,
@@ -788,6 +802,7 @@ impl ClientPage {
             page.recovery_feedback
                 .borrow_mut()
                 .retain(|(id, _)| id != &record.id);
+            let rescan = rescan_after_retry(&result);
             match result {
                 Ok(Ok(result)) if result.pending.is_none() => {
                     page.set_recovery_result(&record.client_id, result.message, true);
@@ -807,6 +822,9 @@ impl ClientPage {
             }
             page.reload_recoveries();
             page.refresh_open_detail();
+            if rescan {
+                page.refresh_with(false);
+            }
             focus_first_later(
                 &page.root,
                 vec![
@@ -1070,6 +1088,48 @@ impl ClientPage {
 
 #[cfg(test)]
 mod tests {
+    /// A failed Retry may already have refreshed waiting client configs, so
+    /// the client rows are rescanned then too.
+    #[test]
+    fn a_failed_retry_still_rescans_client_rows() {
+        let attempt = |refreshed| crate::clients::recovery::RecoveryAttempt {
+            id: "r".into(),
+            client_id: "cursor".into(),
+            client_name: "Cursor".into(),
+            restored: 0,
+            accounted: 0,
+            remaining: 1,
+            message: String::new(),
+            pending: None,
+            refreshed,
+        };
+        let ok = |a| -> Result<Result<_, String>, ()> { Ok(Ok(a)) };
+        assert!(rescan_after_retry(&ok(attempt(true))));
+        assert!(!rescan_after_retry(&ok(attempt(false))));
+        assert!(rescan_after_retry::<()>(&Ok(Err("restore failed".into()))));
+        assert!(!rescan_after_retry::<()>(&Err(())));
+    }
+
+    /// F5: the recovery card's labels re-read their text on the GTK main
+    /// thread. With a locked keyring that must make no credential-store call,
+    /// so it can never wait on (or raise) an unlock prompt.
+    #[test]
+    fn card_labels_read_their_text_without_the_credential_store() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let card =
+                crate::clients::recovery::locked_card_fixture("cursor", &data.join("gtk.json"));
+            let mut texts = Vec::new();
+            let (calls, prompts) = crate::clients::backup_vault::fake::locked_everywhere(|| {
+                texts.push(current_text(&card.id, |r| &r.message, "fallback"));
+                texts.push(current_text(&card.id, |r| &r.instructions, "fallback"));
+            });
+            assert_eq!(calls, Vec::<String>::new(), "card text made store calls");
+            assert_eq!(prompts, Vec::<String>::new(), "card text would prompt");
+            assert_eq!(texts, vec![card.message.clone(), card.instructions.clone()]);
+        });
+    }
+
     #[test]
     #[ignore = "requires an isolated GTK desktop"]
     fn nested_recovery_lists_keep_their_bounded_content_height() {

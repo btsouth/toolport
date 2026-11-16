@@ -292,6 +292,149 @@ fn spans(format: Format, text: &str) -> Result<Vec<Span>, String> {
         _ => json_spans(text),
     }
 }
+/// Names on the way to every string in `text` that holds `marker`: object keys
+/// and entry `name` fields, so the config entries a saved value sits under.
+/// Fields that make an object a server entry in any client format.
+const ENTRY_FIELDS: &[&str] = &[
+    "command",
+    "url",
+    "serverUrl",
+    "httpUrl",
+    "type",
+    "transport",
+    "args",
+    "env",
+    "headers",
+];
+
+/// Where `marker` sits in `text`: for each occurrence, the server entries on
+/// the way to it (object keys of server entries and entry `name` fields) and
+/// the field that holds it (an env or header key, or a `name`/`key` beside a
+/// `value`).
+fn marker_owners(
+    format: Format,
+    text: &str,
+    marker: &str,
+) -> Result<Vec<(String, Option<String>)>, String> {
+    fn walk(
+        value: &serde_json::Value,
+        marker: &str,
+        field: Option<&str>,
+        path: &mut Vec<String>,
+        out: &mut Vec<(String, Option<String>)>,
+    ) {
+        match value {
+            serde_json::Value::String(text) if contains_marker(text, marker) => {
+                for name in path.iter() {
+                    let owner = (name.clone(), field.map(str::to_string));
+                    if !out.contains(&owner) {
+                        out.push(owner);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, marker, field, path, out);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                let named = map.get("name").and_then(serde_json::Value::as_str);
+                // `{"name": KEY, "value": ...}` names the field, not a server.
+                let pair = map.contains_key("value");
+                let pair_key = map
+                    .get("key")
+                    .or_else(|| map.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|_| pair);
+                let server = named.filter(|_| !pair);
+                if let Some(name) = server {
+                    path.push(name.to_string());
+                }
+                for (key, item) in map {
+                    // Only a server entry names an owner: structural keys such
+                    // as `env`, `headers` or `mcpServers` never do.
+                    let entry = item.as_object().is_some_and(|fields| {
+                        ENTRY_FIELDS.iter().any(|field| fields.contains_key(*field))
+                    });
+                    if entry {
+                        path.push(key.clone());
+                    }
+                    let field = if key == "value" {
+                        pair_key
+                    } else {
+                        Some(key.as_str())
+                    };
+                    walk(item, marker, field, path, out);
+                    if entry {
+                        path.pop();
+                    }
+                }
+                if server.is_some() {
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(
+        &mutation::value(format, Some(text))?,
+        marker,
+        None,
+        &mut Vec::new(),
+        &mut out,
+    );
+    Ok(out)
+}
+
+/// Which of `refs` (reference and marker pairs from one receipt) belong to
+/// this config. One saved value can equal the stored secret of several
+/// Toolport servers or keys, and the receipt then lists all of them for one
+/// marker. A reference whose server entry holds the marker under its own key
+/// owns it; failing that, one whose server entry holds it under another field
+/// (a header, say); when none does (or the marker is gone), the first listed
+/// keeps it. Returns the indexes to keep, in order.
+pub(super) fn owned(
+    format: Format,
+    text: Option<&str>,
+    refs: &[(&backup_storage::Reference, &str)],
+) -> Vec<usize> {
+    let mut keep = Vec::new();
+    for (index, (_, marker)) in refs.iter().enumerate() {
+        let group: Vec<usize> = (0..refs.len()).filter(|&i| refs[i].1 == *marker).collect();
+        if group[0] != index {
+            continue;
+        }
+        if group.len() == 1 {
+            keep.push(index);
+            continue;
+        }
+        let owners = text
+            .and_then(|text| marker_owners(format, text, marker).ok())
+            .unwrap_or_default();
+        let by = |exact: bool| -> Vec<usize> {
+            group
+                .iter()
+                .copied()
+                .filter(|&i| {
+                    let r = refs[i].0;
+                    owners.iter().any(|(server, field)| {
+                        server == &r.server && (!exact || field.as_deref() == Some(r.key.as_str()))
+                    })
+                })
+                .collect()
+        };
+        let exact = by(true);
+        let matching = if exact.is_empty() { by(false) } else { exact };
+        if matching.is_empty() {
+            keep.push(index);
+        } else {
+            keep.extend(matching);
+        }
+    }
+    keep.sort_unstable();
+    keep
+}
 pub(super) fn present(format: Format, text: &str, marker: &str) -> Result<bool, String> {
     Ok(spans(format, text)?
         .iter()
@@ -382,7 +525,12 @@ pub(super) fn remember_progress(
     resolved: &[String],
 ) -> Result<(), String> {
     let mut refs = std::collections::BTreeMap::<(String, String), (bool, bool)>::new();
-    for v in values {
+    let pairs: Vec<_> = values
+        .iter()
+        .map(|v| (&v.reference, v.marker.as_str()))
+        .collect();
+    let owned = owned(format, before, &pairs);
+    for v in owned.iter().map(|&i| &values[i]) {
         let b = before
             .map(|t| present(format, t, &v.marker))
             .transpose()?
@@ -410,6 +558,62 @@ pub(super) fn remember_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shared_marker_belongs_to_the_entries_that_hold_it() {
+        let reference = |server: &str| backup_storage::Reference {
+            server: server.into(),
+            key: "API_KEY".into(),
+        };
+        let (a, b, c) = (
+            reference("weather"),
+            reference("weather-demo"),
+            reference("other"),
+        );
+        let m = "TOOLPORT_MISSING_CREDENTIAL_0";
+        let one = r#"{"mcpServers":{"weather-demo":{"env":{"API_KEY":"TOOLPORT_MISSING_CREDENTIAL_0"}}}}"#;
+        let both = r#"{"mcpServers":{"weather":{"env":{"API_KEY":"TOOLPORT_MISSING_CREDENTIAL_0"}},"weather-demo":{"env":{"API_KEY":"TOOLPORT_MISSING_CREDENTIAL_0"}}}}"#;
+        let named = "servers:\n  - name: weather-demo\n    env:\n      API_KEY: TOOLPORT_MISSING_CREDENTIAL_0\n";
+        let refs = [(&a, m), (&b, m), (&c, "TOOLPORT_MISSING_CREDENTIAL_1")];
+        assert_eq!(owned(Format::JsonMcpServers, Some(one), &refs), vec![1, 2]);
+        assert_eq!(
+            owned(Format::JsonMcpServers, Some(both), &refs),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            owned(Format::YamlMcpServersList, Some(named), &refs),
+            vec![1, 2]
+        );
+        // A structural key (`env`) is never an owner, even when a server has that id.
+        let env = reference("env");
+        let structural = [(&env, m), (&a, m)];
+        let weather =
+            r#"{"mcpServers":{"weather":{"env":{"API_KEY":"TOOLPORT_MISSING_CREDENTIAL_0"}}}}"#;
+        assert_eq!(
+            owned(Format::JsonMcpServers, Some(weather), &structural),
+            vec![1]
+        );
+        // Same server, another key with the same value: only the key that holds it.
+        let token = backup_storage::Reference {
+            server: "weather".into(),
+            key: "TOKEN".into(),
+        };
+        let keyed = [(&a, m), (&token, m)];
+        let api = r#"{"mcpServers":{"weather":{"command":"w","env":{"API_KEY":"TOOLPORT_MISSING_CREDENTIAL_0"}}}}"#;
+        assert_eq!(owned(Format::JsonMcpServers, Some(api), &keyed), vec![0]);
+        // A header that is no reference's key falls back to the server.
+        let header = r#"{"mcpServers":{"weather":{"url":"u","headers":{"Authorization":"Bearer TOOLPORT_MISSING_CREDENTIAL_0"}}}}"#;
+        assert_eq!(
+            owned(Format::JsonMcpServers, Some(header), &keyed),
+            vec![0, 1]
+        );
+        // No entry holds it (or the config is gone): the first listed keeps it.
+        assert_eq!(owned(Format::JsonMcpServers, None, &refs), vec![0, 2]);
+        assert_eq!(
+            owned(Format::JsonMcpServers, Some("{}"), &refs[..2]),
+            vec![0]
+        );
+    }
     #[test]
     fn complete_marker_ids_do_not_match_prefixes_or_cascade_into_saved_values() {
         let m = |n| format!("TOOLPORT_MISSING_CREDENTIAL_{n}");

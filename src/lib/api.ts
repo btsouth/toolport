@@ -753,6 +753,8 @@ export interface RecoveryAttempt {
   remaining: number;
   message: string;
   pending: ClientRecovery | null;
+  /** Client configs waiting for the keyring were refreshed during this Retry. */
+  refreshed: boolean;
 }
 export function retryClientRecovery(id: string): Promise<RecoveryAttempt> {
   return invoke<RecoveryAttempt>("retry_client_recovery", { id });

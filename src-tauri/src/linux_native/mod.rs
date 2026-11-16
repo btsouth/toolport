@@ -917,6 +917,7 @@ fn run_startup_maintenance() {
         .map(|registry| registry.client_managed_entries)
         .unwrap_or_default();
     let repoint = crate::clients::repoint_stale_gateways(&managed);
+    crate::clients::backup_vault::note_startup_deferred(!repoint.deferred.is_empty());
     if !repoint.repointed.is_empty() {
         let _ = crate::registry::update(|registry| {
             for (client_id, entry) in &repoint.repointed {
@@ -3195,6 +3196,8 @@ impl ClientPage {
 
     fn render(&self, snapshot: state::ClientSnapshot) {
         self.loaded.set(true);
+        // Listing reads only the recovery files, so it is safe here, and a
+        // fresh list can never be overwritten by an older scan's copy.
         self.reload_recoveries();
         *self.profiles.borrow_mut() = snapshot.profiles;
         let sessions = snapshot.sessions;

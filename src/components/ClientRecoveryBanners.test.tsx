@@ -56,6 +56,7 @@ function result(pending: ClientRecovery | null = null) {
     remaining: pending ? 1 : 0,
     message: `Cursor: saved values restored: ${pending ? 0 : 1}; already resolved or removed: 0; still missing: ${pending ? 1 : 0}.`,
     pending,
+    refreshed: false,
   };
 }
 
@@ -137,6 +138,16 @@ it("keeps the recovery visible when retry is still locked", async () => {
   );
   expect(screen.getByRole("region")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+});
+
+it("reloads client rows when a still pending Retry refreshed waiting client configs", async () => {
+  api.retryClientRecovery.mockResolvedValue({ ...result(recovery()), refreshed: true });
+  const onRecovered = vi.fn();
+  render(<ClientRecoveryBanners refreshKey="initial" onRecovered={onRecovered} />);
+  await userEvent.click(await screen.findByRole("button", { name: "Retry" }));
+  expect(await screen.findByRole("status")).toHaveTextContent("still missing: 1.");
+  expect(screen.getByRole("region")).toBeInTheDocument();
+  expect(onRecovered).toHaveBeenCalledOnce();
 });
 
 it("requires an informed dismissal and keeps the receipt discoverable after remount", async () => {
@@ -724,4 +735,30 @@ it("keeps an open Discard confirmation when a reload empties the list", async ()
   await userEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   expect(document.querySelector("[data-recovery-busy]")).toBeNull();
+});
+
+it("says plainly when Retry leaves the keyring locked, with the backend's words", async () => {
+  // The backend writes this line for both shells; GTK shows the same text.
+  const locked =
+    "Keyring locked. Nothing was restored. Unlock your keyring, then choose Retry.";
+  api.retryClientRecovery.mockResolvedValue({ ...result(recovery()), message: locked });
+  render(<ClientRecoveryBanners refreshKey="initial" />);
+  const notice = await screen.findByRole("region", {
+    name: "Client config recovery: Cursor",
+  });
+  // Every line comes verbatim from the shared recovery listing.
+  const row = recovery();
+  expect(within(notice).getByText(/Cursor is disconnected/)).toBeVisible();
+  expect(within(notice).getByText(row.description)).toBeVisible();
+  for (const line of row.valueLines) {
+    expect(within(notice).getByText(line, { exact: false })).toBeVisible();
+  }
+  expect(within(notice).getByText(row.instructions)).toBeVisible();
+  await userEvent.click(within(notice).getByRole("button", { name: "Retry" }));
+  expect(await screen.findByRole("status")).toHaveTextContent(locked);
+  expect(screen.getByRole("status")).not.toHaveTextContent(
+    /values put back|still missing/,
+  );
+  expect(screen.getByRole("region")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
 });

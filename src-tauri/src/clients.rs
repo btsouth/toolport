@@ -18,6 +18,7 @@ use crate::registry::{ManagedEntry, ServerEntry};
 #[cfg(windows)]
 pub(crate) mod backup_permissions;
 pub(crate) mod backup_storage;
+pub(crate) mod backup_vault;
 mod claude_add;
 mod claude_profiles;
 pub use claude_profiles::ClaudeProfile;
@@ -5288,11 +5289,14 @@ fn detect_clients_for_display_in(
     let mut failures = HashMap::new();
     let mut changed = false;
     if let Some(path) = gateway.filter(|path| path.is_file()) {
-        let repoint = repoint_stale_gateways_in(
-            &path.to_string_lossy(),
-            targets,
-            &current.client_managed_entries,
-        );
+        // The Clients page draws from this scan: never ask to unlock here.
+        let repoint = backup_vault::noninteractive(|| {
+            repoint_stale_gateways_in(
+                &path.to_string_lossy(),
+                targets,
+                &current.client_managed_entries,
+            )
+        });
         if !repoint.repointed.is_empty() {
             changed = true;
             if let Err(error) = crate::registry::update(|registry| {
@@ -5669,6 +5673,10 @@ pub struct RepointOutcome {
     /// UI. Six clients on this developer's machine sat on a superseded gateway
     /// for days with nothing anywhere recording why.
     pub failed: Vec<(String, String)>,
+    /// Clients whose refresh needs the keyring, which is locked. Nothing was
+    /// written and nobody was asked to unlock it; the next start or the next
+    /// unlock the user asks for (a recovery Retry) refreshes them.
+    pub deferred: Vec<String>,
     /// Legacy secondary-repair reporting fields, retained for callers. Locations
     /// now report their own IDs in `repointed` and `failed`.
     pub extra_claude_repointed: Vec<PathBuf>,
@@ -9996,23 +10004,83 @@ fn referenced_gateway_paths_in(clients: &[DetectedClient]) -> Option<Vec<PathBuf
     Some(out)
 }
 
+/// Refresh stale client configs (start-up maintenance) without ever asking to
+/// unlock the keyring: a refresh that needs a locked keyring is deferred.
 pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> RepointOutcome {
+    backup_vault::noninteractive(|| repoint_stale_gateways_quietly(managed))
+}
+
+/// The start-up refresh again, after the user unlocked the keyring for a
+/// recovery Retry: clients deferred while it was locked are written now.
+pub fn refresh_stale_client_configs() -> RepointOutcome {
+    // Without the ownership records an entry's edits cannot be told apart from
+    // Toolport's own, so nothing is rewritten: the clients keep waiting.
+    let managed = match crate::registry::load() {
+        Ok(registry) => registry.client_managed_entries,
+        Err(error) => {
+            crate::gatewaylog::append(&format!(
+                "toolport: client config refresh after keyring unlock skipped; the registry could not be read: {error}"
+            ));
+            return RepointOutcome {
+                deferred: vec!["client configs (registry unreadable)".into()],
+                ..RepointOutcome::default()
+            };
+        }
+    };
+    let outcome = repoint_stale_gateways(&managed);
+    if !outcome.repointed.is_empty() {
+        if let Err(error) = crate::gateway_publish::persist_repointed_ownership(&outcome.repointed)
+        {
+            eprintln!("toolport: {error}");
+        }
+    }
+    // Always say the pass ran: a Clients rescan may already have refreshed
+    // these clients, and then the pass itself has nothing else to log.
+    crate::gatewaylog::append(&format!(
+        "toolport: client config refresh after keyring unlock: {} updated, {} failed, {} still waiting for the keyring",
+        outcome.repointed.len(),
+        outcome.failed.len(),
+        outcome.deferred.len(),
+    ));
+    outcome
+}
+
+/// Backup-upgrade waiters this test process started.
+#[cfg(test)]
+pub(crate) static UPGRADE_WAITERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn repoint_stale_gateways_quietly(managed: &HashMap<String, ManagedEntry>) -> RepointOutcome {
     let mut outcome = RepointOutcome::default();
     match backup_storage::upgrade_legacy_at_start() {
+        Some(Ok(_)) => {}
+        // Refused as locked inside the start-up pass: retried on the next start
+        // or after a user's unlock (a recovery Retry runs this pass again).
+        Some(Err(error)) if backup_vault::is_locked_error(&error) => {
+            outcome.deferred.push("client recovery backups".into());
+        }
         Some(Err(error)) => outcome
             .failed
             .push(("client recovery backups".into(), error)),
-        Some(Ok(_)) => {}
         None => {
-            let _ = std::thread::Builder::new()
-                .name("toolport-backup-upgrade".into())
-                .spawn(|| {
-                    if let Err(error) =
-                        backup_storage::upgrade_legacy_once_open(crate::http_bridge::KEYRING_POLL)
-                    {
-                        eprintln!("toolport: could not secure client recovery backups: {error}");
-                    }
-                });
+            outcome.deferred.push("client recovery backups".into());
+            // One waiter per process, however often this pass runs again.
+            static UPGRADE_WAITER: std::sync::Once = std::sync::Once::new();
+            UPGRADE_WAITER.call_once(|| {
+                #[cfg(test)]
+                UPGRADE_WAITERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = std::thread::Builder::new()
+                    .name("toolport-backup-upgrade".into())
+                    .spawn(|| {
+                        if let Err(error) = backup_storage::upgrade_legacy_once_open(
+                            crate::http_bridge::KEYRING_POLL,
+                        ) {
+                            eprintln!(
+                                "toolport: could not secure client recovery backups: {error}"
+                            );
+                        }
+                    });
+            });
         }
     }
     let current = match resolve_gateway_path() {
@@ -10043,12 +10111,14 @@ pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> Repoin
     let mut repoint = repoint_stale_gateways_in(&current, detect_clients(), &managed);
     // Keep the earlier legacy-backup upgrade failure in the result.
     repoint.failed.extend(outcome.failed);
+    repoint.deferred.splice(0..0, outcome.deferred);
     let mut outcome = repoint;
     // A client the pass below rewrote again keeps that later ownership snapshot.
     let mut moved = relocated.repointed;
     moved.retain(|(id, _)| !outcome.repointed.iter().any(|(later, _)| later == id));
     outcome.repointed.splice(0..0, moved);
     outcome.failed.extend(relocated.failed);
+    outcome.deferred.extend(relocated.deferred);
     repoint_other_claude_configs(&current, &mut outcome);
     log_repoint_outcome(&current, &outcome);
     #[cfg(target_os = "linux")]
@@ -10229,6 +10299,9 @@ fn repoint_stale_gateways_in(
             match repair_codex_http_settings(&client, record) {
                 Ok(Some(updated)) => outcome.repointed.push((client.id.clone(), updated)),
                 Ok(None) => {}
+                Err(error) if backup_vault::is_locked_error(&error) => {
+                    outcome.deferred.push(client.id.clone());
+                }
                 Err(error) => {
                     let msg = format!(
                         "toolport: could not add Codex settings to {}'s shared HTTP entry: {error}",
@@ -10270,6 +10343,10 @@ fn repoint_stale_gateways_in(
         // Entries written before a client's format required a field (VS Code's
         // `type`) get just that field added; the rest stays as the user left it.
         if let Err(error) = backfill_client_fields(&client.id, entry_name) {
+            if backup_vault::is_locked_error(&error) {
+                outcome.deferred.push(client.id.clone());
+                continue;
+            }
             let msg = format!(
                 "toolport: could not add required fields to {}'s gateway entry: {error}",
                 client.id
@@ -10442,13 +10519,17 @@ fn repoint_stale_gateways_in(
                     "config was written but returned no ownership record".to_string(),
                 )),
             },
+            // Nothing was written: the backup that must come first needs the
+            // keyring. Not a failure, and not a reason to ask for an unlock.
+            Err(error) if backup_vault::is_locked_error(&error) => {
+                crate::gatewaylog::append(&format!(
+                    "toolport: {}'s gateway entry will be refreshed once the keyring is unlocked",
+                    client.id
+                ));
+                outcome.deferred.push(client.id.clone());
+            }
             Err(error) => {
-                let msg = format!(
-                    "toolport: could not re-point {}'s gateway entry from {} to {}: {error}",
-                    client.id,
-                    if stored.is_empty() { "none" } else { stored },
-                    current,
-                );
+                let msg = repoint_failure_message(&client.id, stored, current, &error);
                 eprintln!("{msg}");
                 crate::gatewaylog::append(&msg);
                 outcome.failed.push((client.id.clone(), error.to_string()));
@@ -10456,6 +10537,19 @@ fn repoint_stale_gateways_in(
         }
     }
     outcome
+}
+
+/// Says what the pass was doing: a new gateway path is a re-point, the same
+/// path is a refresh of the entry's settings.
+fn repoint_failure_message(client_id: &str, stored: &str, current: &str, error: &str) -> String {
+    if stored == current {
+        format!("toolport: could not refresh {client_id}'s gateway entry ({current}): {error}")
+    } else {
+        format!(
+            "toolport: could not re-point {client_id}'s gateway entry from {} to {current}: {error}",
+            if stored.is_empty() { "none" } else { stored },
+        )
+    }
 }
 
 /// [`backfill_required_fields`] for one client's owned entry, under the config lock
@@ -10548,6 +10642,14 @@ fn repoint_other_claude_configs_in(
                 eprintln!("{msg}");
                 crate::gatewaylog::append(&msg);
                 outcome.extra_claude_repointed.push(path);
+            }
+            // The backup the write needs waits for the keyring: retried with
+            // the other clients waiting for it, not reported as failed.
+            Err(error) if backup_vault::is_locked_error(&error) => {
+                outcome.deferred.push(format!(
+                    "secondary Claude Code config at {}",
+                    path.display()
+                ));
             }
             Err(error) => {
                 let msg = format!(
@@ -10684,6 +10786,7 @@ fn log_repoint_outcome(current: &str, outcome: &RepointOutcome) {
     if outcome.repointed.is_empty()
         && outcome.customized.is_empty()
         && outcome.failed.is_empty()
+        && outcome.deferred.is_empty()
         && outcome.extra_claude_repointed.is_empty()
         && outcome.extra_claude_failed.is_empty()
     {
@@ -10704,7 +10807,7 @@ fn log_repoint_outcome(current: &str, outcome: &RepointOutcome) {
             .join(", ")
     };
     crate::gatewaylog::append(&format!(
-        "toolport: re-point pass against {current}: {} re-pointed [{}], {} customized [{}], {} failed [{}], {} secondary Claude configs re-pointed [{}], {} secondary failed [{}]",
+        "toolport: client config refresh against {current}: {} updated [{}], {} customized [{}], {} failed [{}], {} waiting for the keyring [{}], {} secondary Claude configs re-pointed [{}], {} secondary failed [{}]",
         outcome.repointed.len(),
         ids(&outcome.repointed),
         outcome.customized.len(),
@@ -10716,6 +10819,8 @@ fn log_repoint_outcome(current: &str, outcome: &RepointOutcome) {
             .map(|(id, why)| format!("{id}: {why}"))
             .collect::<Vec<_>>()
             .join("; "),
+        outcome.deferred.len(),
+        outcome.deferred.join(", "),
         outcome.extra_claude_repointed.len(),
         paths(&outcome.extra_claude_repointed),
         outcome.extra_claude_failed.len(),

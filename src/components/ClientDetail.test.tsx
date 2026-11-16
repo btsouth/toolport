@@ -1001,6 +1001,7 @@ it("clears a refused disconnect once that client's recovery succeeds, as GTK doe
     remaining: 0,
     message: "Claude Desktop: saved values restored: 1.",
     pending: null,
+    refreshed: false,
   });
   render(
     <ClientDetail
@@ -1019,4 +1020,56 @@ it("clears a refused disconnect once that client's recovery succeeds, as GTK doe
   );
   await userEvent.click(await screen.findByRole("button", { name: "Retry" }));
   await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+});
+
+it("shows the recovery card a Disconnect leaves at once, without a rescan", async () => {
+  uninstallGateway.mockResolvedValue({
+    path: "/fixture/config",
+    restored: [],
+    warnings: [],
+  });
+  render(
+    <ClientDetail
+      client={client({ gatewayInstalled: true, entryState: "managed" })}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  await waitFor(() => expect(listClientRecoveries).toHaveBeenCalled());
+  expect(screen.queryByRole("region", { name: /Client config recovery/ })).toBeNull();
+  const row: ClientRecovery = {
+    id: "disconnect-recovery",
+    clientId: client().id,
+    clientName: client().name,
+    path: "/fixture/config",
+    backupPath: "/fixture/backup",
+    missing: [{ server: "weather-demo", key: "WEATHER_API_KEY" }],
+    dismissed: false,
+    message: `${client().name} is disconnected.`,
+    description:
+      "Its original config is back, with temporary text where these values belong. Latest check of the saved values:",
+    valueLines: ["WEATHER_API_KEY for weather-demo: keyring locked"],
+    discardValues: ["WEATHER_API_KEY for weather-demo"],
+    error: null,
+    canDiscard: true,
+    canRetry: true,
+    discardStarted: false,
+    discardAction: "Discard these saved values",
+    cleanup: false,
+    instructions: "If your keyring is locked, unlock it. Then choose Retry.",
+    retention: "",
+    details: "",
+  };
+  vi.mocked(listClientRecoveries).mockResolvedValue([row]);
+  await userEvent.click(screen.getByRole("button", { name: "Disconnect" }));
+  await userEvent.click(
+    within(screen.getByRole("dialog")).getByRole("button", { name: "Disconnect" }),
+  );
+  const card = await screen.findByRole("region", {
+    name: `Client config recovery: ${client().name}`,
+  });
+  expect(
+    within(card).getByText(/WEATHER_API_KEY for weather-demo: keyring locked/),
+  ).toBeVisible();
 });

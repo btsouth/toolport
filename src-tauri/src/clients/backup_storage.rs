@@ -342,7 +342,7 @@ fn encode_internal(
                 generations.push((previous.key.clone(), previous.references.len()));
             }
             for (index, reference) in previous.references.into_iter().enumerate() {
-                if let Some(value) = crate::secrets::get_backup_secret_result(
+                if let Some(value) = backup_vault::read(
                     &previous.account,
                     &format!("{}-credential-{index}", previous.key),
                 )
@@ -421,10 +421,10 @@ fn encode_internal(
     // The complete byte spelling lives only in the vault. Publish the fallback
     // only after a verified vault write, before modifying the client's file.
     for (index, value) in retained_values.iter().enumerate() {
-        crate::secrets::set_backup_secret(&account, &format!("{key}-credential-{index}"), value)?;
+        backup_vault::write(&account, &format!("{key}-credential-{index}"), value)?;
     }
-    crate::secrets::set_backup_secret(&account, &key, text)?;
-    if crate::secrets::get_backup_secret_result(&account, &key)?.as_deref() != Some(text) {
+    backup_vault::write(&account, &key, text)?;
+    if backup_vault::read(&account, &key)?.as_deref() != Some(text) {
         return Err("Could not verify vaulted client backup. Client config unchanged.".into());
     }
     serde_json::to_string(&Envelope {
@@ -612,6 +612,23 @@ fn complete_wrapper(raw: &str) -> Result<(), String> {
     ))
 }
 
+/// The text a recovery file decodes to with the vault out of reach: the plain
+/// copy, or the fallback with markers where the saved values go. Listing and
+/// page rendering use this, so showing a recovery never contacts a vault.
+pub(super) fn public_text(text: &str) -> Result<String, String> {
+    if plain_backup(text)?.is_some() {
+        // A plain copy holds no vault reference; decode only checks its hash.
+        return decode(text);
+    }
+    match envelope(text) {
+        Some(saved) => Ok(saved.fallback),
+        None if damaged_wrapper(text) => Err(crate::i18n::tr(
+            "This recovery file is malformed. Its saved values have been kept.",
+        )),
+        None => Ok(text.into()),
+    }
+}
+
 pub(super) fn decode(text: &str) -> Result<String, String> {
     if let Some(plain) = plain_backup(text)? {
         // Path ownership is checked by `source_path`, like an Envelope's key;
@@ -630,7 +647,7 @@ pub(super) fn decode(text: &str) -> Result<String, String> {
         }
         return Ok(text.into());
     };
-    match crate::secrets::get_backup_secret_result(&saved.account, &saved.key) {
+    match backup_vault::read(&saved.account, &saved.key) {
         Ok(Some(payload)) if crate::registry::sha256_hex(&payload) == saved.hash => {
             merge_recovery_metadata(
                 payload,
@@ -697,12 +714,10 @@ pub(super) fn decode(text: &str) -> Result<String, String> {
 fn verified_copy_payload(saved: &Envelope) -> Option<String> {
     let mut payload = saved.fallback.clone();
     for (index, reference) in saved.references.iter().enumerate() {
-        let copy = crate::secrets::backup_secret_status(
-            &saved.account,
-            &format!("{}-credential-{index}", saved.key),
-        )
-        .ok()
-        .flatten();
+        let copy =
+            backup_vault::status(&saved.account, &format!("{}-credential-{index}", saved.key))
+                .ok()
+                .flatten();
         let value = copy
             .filter(|value| {
                 saved
@@ -711,7 +726,7 @@ fn verified_copy_payload(saved: &Envelope) -> Option<String> {
                     .is_none_or(|hash| crate::registry::sha256_hex(value) == *hash)
             })
             .or_else(|| {
-                crate::secrets::backup_secret_status(&reference.server, &reference.key)
+                backup_vault::status(&reference.server, &reference.key)
                     .ok()
                     .flatten()
                     .filter(|v| {
@@ -760,7 +775,7 @@ pub(super) fn read_exact(path: &Path, source: &Path) -> Result<String, String> {
     };
     crate::secrets::with_backup_batch(|| {
         use crate::secrets::BackupSecretError;
-        let result = crate::secrets::backup_secret_status(&saved.account, &saved.key);
+        let result = backup_vault::status(&saved.account, &saved.key);
         if let Ok(Some(payload)) = &result {
             if crate::registry::sha256_hex(payload) == saved.hash {
                 return Ok(payload.clone());
@@ -849,14 +864,10 @@ fn release_owned(path: &Path, discard_all: bool) -> Result<(), String> {
                 if !key.starts_with(&prefix) {
                     continue;
                 }
-                crate::secrets::delete_backup_secret_copies_status(
-                    &saved.account,
-                    &key,
-                    discard_all,
-                )
-                .map_err(|e| recovery::next_step(e, discard_all))?;
+                backup_vault::delete(&saved.account, &key, discard_all)
+                    .map_err(|e| recovery::next_step(e, discard_all))?;
                 for index in 0..count {
-                    crate::secrets::delete_backup_secret_copies_status(
+                    backup_vault::delete(
                         &saved.account,
                         &format!("{key}-credential-{index}"),
                         discard_all,
@@ -1068,7 +1079,7 @@ fn vaulted_credentials(text: &str) -> Result<Vec<(Reference, String)>, String> {
             if !text.contains(key) && !credentials_visible {
                 continue;
             }
-            if let Some(value) = crate::secrets::get_backup_secret_result(&server.id, key)? {
+            if let Some(value) = backup_vault::read(&server.id, key)? {
                 values.push((
                     Reference {
                         server: server.id.clone(),
@@ -1194,7 +1205,7 @@ pub(crate) fn protect_existing() -> Result<(), String> {
         // Refuse a future or malformed wrapper before any rewrite.
         let plain = plain_backup(&raw)?;
         let payload = match envelope(&raw) {
-            Some(saved) => crate::secrets::get_backup_secret_result(&saved.account, &saved.key)?
+            Some(saved) => backup_vault::read(&saved.account, &saved.key)?
                 .filter(|payload| crate::registry::sha256_hex(payload) == saved.hash)
                 .ok_or("Unlock the original backup vault before importing more credentials. Client config unchanged.")?,
             None if plain.is_some() => decode(&raw)?,
@@ -2190,7 +2201,8 @@ fn infer_value(fallback: &str, payload: &str, marker: &str) -> Option<String> {
     strings(fallback, payload, marker)
 }
 pub(super) fn recovery_values(path: &Path) -> Result<Vec<RecoveryValue>, String> {
-    use crate::secrets::{backup_secret_status as get, BackupSecretError as State};
+    use crate::secrets::BackupSecretError as State;
+    use backup_vault::status as get;
     let text =
         std::fs::read_to_string(path).map_err(|_| "Could not read the saved recovery file")?;
     let mut saved = Vec::new();

@@ -77,6 +77,10 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     "T3 Code still uses this folder. Remove it from T3 Code's provider settings first.",
   );
   const [busy, setBusy] = useState(false);
+  // Bumped after Disconnect so the recovery card it may leave shows at once,
+  // as in GTK, without waiting for a rescan.
+  const [recoveryEpoch, setRecoveryEpoch] = useState(0);
+  const recoveryKey = useMemo(() => ({ client, recoveryEpoch }), [client, recoveryEpoch]);
   // Snapshotted at dialog-open time so a registry-changed event mid-review can't
   // reshuffle `toImport` out from under the indices the user already confirmed.
   const [bulkImportServers, setBulkImportServers] = useState<ImportItem[] | null>(null);
@@ -380,6 +384,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         }
         // The disconnect already committed, even if loading notices later fails.
         onChanged();
+        setRecoveryEpoch((value) => value + 1);
         const restored = outcome.restored?.length ?? 0;
         // Recovery owns its own persistent notice. Do not also announce it in
         // an ordinary success notice or in a transient toast, but keep any
@@ -424,7 +429,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     <div className="flex min-w-0 flex-col gap-5">
       <ClientRecoveryBanners
         clientId={client.id}
-        refreshKey={client}
+        refreshKey={recoveryKey}
         onRecovered={() => {
           // The recovery that blocked Disconnect changed: its error is stale.
           setActionError(null);

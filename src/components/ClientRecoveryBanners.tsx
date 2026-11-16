@@ -192,6 +192,8 @@ export function ClientRecoveryBanners({
       if (outcome.pending) {
         setMessages((previous) => ({ ...previous, [row.id]: outcome.message }));
         focusTargets.current = [`retry-${row.id}`];
+        // Waiting client configs were rewritten: reload the client rows.
+        if (outcome.refreshed) onRecovered?.();
       } else {
         setResult({ clientId: row.clientId, message: outcome.message, tone: "success" });
         focusTargets.current = ["result"];

@@ -327,6 +327,14 @@ pub(super) fn relocate_all(
                     outcome.repointed.push((id.to_string(), entry));
                 }
             }
+            // A backed-up write the locked keyring refused: not a failure. The
+            // start-up waiter (or a Retry) runs this pass again once it opens.
+            Err(error) if super::backup_vault::is_locked_error(&error) => {
+                crate::gatewaylog::append(&format!(
+                    "toolport: {id}'s old Toolport entry will be moved once the keyring is unlocked"
+                ));
+                outcome.deferred.push(id.to_string());
+            }
             Err(error) => {
                 let msg = format!("toolport: could not move {id}'s old Toolport entry: {error}");
                 eprintln!("{msg}");

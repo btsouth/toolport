@@ -318,6 +318,18 @@ fn read_receipt(id: &str, name: &str, file: &Path) -> Result<Option<Receipt>, &'
             discard_values.push(name);
         }
     }
+    // A value that equals another server's stored secret is listed for both
+    // in the receipt; the card shows only the server whose entry holds it.
+    let markers = {
+        let pairs: Vec<_> = markers.iter().map(|(r, m)| (r, m.as_str())).collect();
+        let keep = recovery_values::owned(format, current.as_deref(), &pairs);
+        markers
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| keep.contains(index))
+            .map(|(_, pair)| pair)
+            .collect::<Vec<_>>()
+    };
     let mut missing = Vec::new();
     let mut value_lines = Vec::new();
     let mut instructions = Vec::new();
@@ -649,6 +661,23 @@ fn receipts() -> Result<Vec<Receipt>, String> {
 pub fn list() -> Result<Vec<ClientRecovery>, String> {
     Ok(receipts()?.into_iter().map(|r| r.notice).collect())
 }
+/// Whether the receipt's latest check left a saved value Locked.
+fn owed_locked(file: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(file) else {
+        return false;
+    };
+    let Ok((record, _)) = backup_storage::raw_metadata(&raw) else {
+        return false;
+    };
+    serde_json::from_value::<Vec<backup_storage::RecoveryIssue>>(
+        record.get("recoveryIssues").cloned().unwrap_or_default(),
+    )
+    .is_ok_and(|issues| {
+        issues
+            .iter()
+            .any(|issue| issue.state == crate::secrets::BackupSecretError::Locked)
+    })
+}
 fn find(id: &str) -> Result<Receipt, String> {
     receipts()?
         .into_iter()
@@ -734,13 +763,65 @@ pub struct RecoveryAttempt {
     pub remaining: usize,
     pub message: String,
     pub pending: Option<ClientRecovery>,
+    /// Client configs start-up put off for the keyring were refreshed during
+    /// this Retry; the shell rescans its client rows.
+    pub refreshed: bool,
 }
+const STILL_LOCKED: &str = crate::i18n::msg(
+    "Keyring locked. Nothing was restored. Unlock your keyring, then choose Retry.",
+);
+/// Shared Retry result when the keyring stayed locked, in every shell.
+pub fn still_locked_message() -> String {
+    crate::i18n::format_message(STILL_LOCKED, &[])
+}
+/// Retry is the one recovery action that asks to unlock the keyring: the user
+/// chose it, and it runs on a worker thread in both shells. A cancelled or
+/// failed prompt is reported in plain words, never as a tally of zeros.
 pub fn retry_with_report(id: &str) -> Result<RecoveryAttempt, String> {
     let before = find(id)?.notice;
-    let pending = retry(id)?;
+    // Try with the values the store gives without asking first: a locked
+    // collection that holds none of this card's values, or a card whose values
+    // the user already put back by hand, never needs an unlock.
+    // That first try never asks: a write it needs while the keyring is locked
+    // is refused instead, and asks below only as part of the unlock.
+    let mut retried = backup_vault::noninteractive(|| retry(id));
+    let (mut restored, mut accounted) = recovery_values::progress();
+    let owed = |result: &Result<Option<ClientRecovery>, String>| match result {
+        Ok(Some(row)) => owed_locked(Path::new(&row.backup_path)),
+        Ok(None) => false,
+        Err(error) => backup_vault::is_locked_error(error),
+    };
+    let mut still_locked = false;
+    if before.can_retry && owed(&retried) {
+        match backup_vault::request_unlock() {
+            backup_vault::Unlock::StillLocked => still_locked = true,
+            backup_vault::Unlock::Open => {
+                retried = retry(id);
+                let (more, gone) = recovery_values::progress();
+                restored += more;
+                accounted += gone;
+            }
+        }
+    }
+    if still_locked && retried.is_err() {
+        // Refused for the lock before anything was written: the card stays.
+        retried = Ok(list()?.into_iter().find(|r| r.id == before.id));
+    }
+    // The store is open now (or was never locked): client refreshes this
+    // process's start-up put off for the keyring can run, whether or not this
+    // restore itself succeeded. Done before returning, so the shell's rescan
+    // after Retry shows the refreshed clients.
+    let refreshed = !still_locked && backup_vault::refresh_deferred();
+    let locked_now = owed(&retried);
+    let pending = retried?;
     let remaining = pending.as_ref().map_or(0, |r| r.missing.len());
-    let (restored, accounted) = recovery_values::progress();
-    let message = progress_message(&before.client_name, restored, accounted, remaining);
+    // Only a value that really failed as Locked earns the locked wording; a
+    // slow store check or another reason (value gone, damaged) keeps the tally.
+    let message = if restored + accounted == 0 && (locked_now || still_locked) {
+        still_locked_message()
+    } else {
+        progress_message(&before.client_name, restored, accounted, remaining)
+    };
     Ok(RecoveryAttempt {
         id: before.id,
         client_id: before.client_id,
@@ -750,6 +831,7 @@ pub fn retry_with_report(id: &str) -> Result<RecoveryAttempt, String> {
         remaining,
         message,
         pending,
+        refreshed,
     })
 }
 /// Trusted Rust/CLI entry to the same confirmed core the UI uses. It reviews
@@ -811,6 +893,37 @@ pub fn safe_action_error(id: &str, error: &str) -> String {
     crate::i18n::tr("Recovery could not finish. Check the client config and credential-store access, then choose Retry. The recovery record is kept.")
 }
 
+/// A disconnected client whose saved value sits in a vault that is now out of
+/// reach, plus the vaulted move record "Move into gateway" leaves beside it:
+/// the Clients page lists both after a Disconnect with a locked keyring.
+#[cfg(test)]
+pub(crate) fn locked_card_fixture(client: &str, path: &Path) -> ClientRecovery {
+    let original = "{\n \"mcpServers\":{\"native\":{\"command\":\"echo\",\"env\":{\"API_KEY\":\"sk-recovery-state-fixture\"}}}\n}\n";
+    std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+    crate::secrets::set_secret("native", "API_KEY", "sk-recovery-state-fixture").unwrap();
+    backup_storage::register("native", "API_KEY", "sk-recovery-state-fixture");
+    std::fs::write(path, original).unwrap();
+    mutation::run(client, path, Format::JsonMcpServers, || {
+        backup_file(client, path)?;
+        moved::record(client, Format::JsonMcpServers, path)?;
+        write_format(Format::JsonMcpServers, path, &[], true)
+    })
+    .unwrap();
+    backup_storage::clear();
+    std::env::set_var("TOOLPORT_SECRET_KEY", "locked-state-fixture");
+    disconnect::restore_path(client, path, Format::JsonMcpServers, None).unwrap();
+    let record = backup_dir(client).unwrap().join(moved::RECORD_NAME);
+    let raw = std::fs::read_to_string(&record).expect("the move record outlives the Disconnect");
+    assert!(
+        raw.contains("toolportBackupVersion") && !raw.contains("sk-recovery-state-fixture"),
+        "the move record is sealed in the vault"
+    );
+    list()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.path == path.to_string_lossy())
+        .unwrap()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1075,6 +1188,267 @@ mod tests {
             assert_eq!(done.restored, 1);
             assert_eq!(done.remaining, 0);
             assert!(done.pending.is_none());
+        });
+    }
+
+    /// F5: drawing the Clients page lists recovery cards. With the keyring
+    /// locked that must make no credential-store call at all (a read waited on
+    /// a prompt another thread held and froze the GTK window), and the card
+    /// still says what is missing and why.
+    #[test]
+    fn listing_recovery_cards_never_touches_the_credential_store() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let card = locked_card_fixture("cursor", &data.join("listed.json"));
+            let mut rows = Vec::new();
+            let (calls, prompts) = backup_vault::fake::locked_everywhere(|| {
+                rows = list().unwrap();
+            });
+            assert_eq!(calls, Vec::<String>::new(), "listing made store calls");
+            assert_eq!(prompts, Vec::<String>::new(), "listing would prompt");
+            let listed = rows.iter().find(|r| r.id == card.id).unwrap();
+            assert_eq!(listed.message, card.message);
+            assert!(listed.message.starts_with("Cursor is disconnected."));
+            assert_eq!(listed.value_lines, card.value_lines);
+            assert_eq!(listed.instructions, card.instructions);
+            assert!(listed.can_retry && listed.error.is_none());
+            // The sealed move record is healthy, not a damaged-file card.
+            assert!(!rows
+                .iter()
+                .any(|r| r.backup_path.ends_with(moved::RECORD_NAME)));
+        });
+    }
+
+    /// A saved value that equals another server's stored secret (same key, same
+    /// value) is listed for both in the receipt. The card and the Retry tally
+    /// name only the server whose entry holds it in this config, in both shells.
+    #[test]
+    fn a_card_lists_only_the_server_whose_entry_holds_the_value() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let path = data.join("shared-value.json");
+            let original = "{\n \"mcpServers\":{\"weather-demo\":{\"command\":\"echo\",\"env\":{\"WEATHER_API_KEY\":\"wx-shared-fixture-value\"}}}\n}\n";
+            let registry = serde_json::from_value(serde_json::json!({"version":3,"profiles":[],"servers":[
+                {"id":"weather","name":"Weather","transport":"stdio","env":[{"key":"WEATHER_API_KEY","secret":true}]},
+                {"id":"weather-demo","name":"Weather demo","transport":"stdio","env":[{"key":"WEATHER_API_KEY","secret":true}]}
+            ]}))
+            .unwrap();
+            crate::registry::save(&registry).unwrap();
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            for server in ["weather", "weather-demo"] {
+                crate::secrets::set_secret(server, "WEATHER_API_KEY", "wx-shared-fixture-value")
+                    .unwrap();
+            }
+            std::fs::write(&path, original).unwrap();
+            mutation::run("cursor", &path, Format::JsonMcpServers, || {
+                backup_file("cursor", &path)?;
+                write_format(Format::JsonMcpServers, &path, &[], true)
+            })
+            .unwrap();
+            std::env::set_var("TOOLPORT_SECRET_KEY", "locked-state-fixture");
+            disconnect::restore_path("cursor", &path, Format::JsonMcpServers, None).unwrap();
+            let card = list()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.path == path.to_string_lossy())
+                .expect("the unreadable saved value leaves a card");
+            let servers: Vec<_> = card.missing.iter().map(|r| r.server.as_str()).collect();
+            assert_eq!(servers, vec!["weather-demo"], "{:?}", card.value_lines);
+            assert_eq!(card.value_lines.len(), 1, "{:?}", card.value_lines);
+            assert!(card.value_lines[0].starts_with("WEATHER_API_KEY for weather-demo:"));
+
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            let done = retry_with_report(&card.id).unwrap();
+            assert_eq!((done.restored, done.remaining), (1, 0), "{}", done.message);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        });
+    }
+
+    /// The user's unlock is what the deferred start-up refreshes wait for, so
+    /// they run even when the restore after it fails.
+    #[test]
+    fn a_failed_restore_after_an_unlock_still_runs_the_deferred_refresh() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let path = data.join("broken.json");
+            let card = locked_card_fixture("cursor", &path);
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            std::fs::write(&path, "{ not json").unwrap();
+            let mut outcome = None;
+            let calls = backup_vault::fake::locked_store(backup_vault::Unlock::Open, || {
+                outcome = Some(retry_with_report(&card.id));
+            });
+            assert!(
+                outcome.unwrap().is_err(),
+                "a config that cannot be parsed fails the restore"
+            );
+            assert!(
+                calls.iter().any(|c| c == "refresh deferred client configs"),
+                "{calls:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+        });
+    }
+
+    /// K1: a process whose start-up pass did not run or put nothing off (a
+    /// data-dir override instance, a debug GTK build) never refreshes the
+    /// user's client configs after an unlock.
+    #[test]
+    fn a_retry_refreshes_nothing_when_start_up_put_nothing_off() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let card = locked_card_fixture("cursor", &data.join("guarded.json"));
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            let mut done = None;
+            let calls = backup_vault::fake::locked_store(backup_vault::Unlock::Open, || {
+                backup_vault::fake::set_startup_deferred(false);
+                done = Some(retry_with_report(&card.id).unwrap());
+            });
+            assert!(calls.iter().any(|c| c == "unlock prompt"), "{calls:?}");
+            assert!(
+                !calls.iter().any(|c| c == "refresh deferred client configs"),
+                "{calls:?}"
+            );
+            let done = done.unwrap();
+            assert_eq!(done.restored, 1);
+            assert!(!done.refreshed);
+        });
+    }
+
+    /// K2: the user unlocked elsewhere, then chose Retry. The clients start-up
+    /// put off are refreshed now, and the shell is told to rescan them.
+    #[test]
+    fn a_retry_with_the_store_already_open_runs_the_deferred_refresh() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let card = locked_card_fixture("cursor", &data.join("open.json"));
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            let mut done = None;
+            let calls = backup_vault::fake::open_store(|| {
+                done = Some(retry_with_report(&card.id).unwrap());
+            });
+            assert!(!calls.iter().any(|c| c == "unlock prompt"), "{calls:?}");
+            assert!(
+                calls.iter().any(|c| c == "refresh deferred client configs"),
+                "{calls:?}"
+            );
+            let done = done.unwrap();
+            assert_eq!((done.restored, done.remaining), (1, 0));
+            assert!(done.refreshed);
+        });
+    }
+
+    /// K4: a store check that times out right after an unlock must not turn a
+    /// real failure (here a saved copy the vault cannot read) into "Keyring
+    /// locked"; only a value the restore found Locked earns that wording.
+    #[test]
+    fn retry_says_locked_only_for_a_value_that_failed_as_locked() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let card = locked_card_fixture("cursor", &data.join("timeout.json"));
+            // The vault key stays wrong: the saved copy is unreadable, not locked.
+            let mut done = None;
+            backup_vault::fake::locked_store(backup_vault::Unlock::Open, || {
+                backup_vault::fake::set_check_times_out();
+                done = Some(retry_with_report(&card.id).unwrap());
+            });
+            let done = done.unwrap();
+            assert_eq!((done.restored, done.remaining), (0, 1), "{}", done.message);
+            assert_ne!(done.message, still_locked_message());
+            assert!(
+                done.message.starts_with("Cursor: values put back: 0;"),
+                "{}",
+                done.message
+            );
+        });
+    }
+
+    /// Greptile P2: a locked store elsewhere (another collection) must not
+    /// make Retry ask, or refuse, when this card's values are readable.
+    #[test]
+    fn retry_restores_readable_values_without_an_unrelated_unlock() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let card = locked_card_fixture("cursor", &data.join("unrelated.json"));
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+            let mut done = None;
+            let calls = backup_vault::fake::locked_store(backup_vault::Unlock::StillLocked, || {
+                backup_vault::fake::open_but_store_check_locked();
+                done = Some(retry_with_report(&card.id).unwrap());
+            });
+            assert!(!calls.iter().any(|c| c == "unlock prompt"), "{calls:?}");
+            let done = done.unwrap();
+            assert_eq!((done.restored, done.remaining), (1, 0), "{}", done.message);
+            assert!(done.pending.is_none());
+        });
+    }
+
+    /// The locked Retry result is translated by the backend in the user's
+    /// language, so both shells show it as is. Headless builds carry no
+    /// catalogs and stay English.
+    #[cfg(any(feature = "desktop", feature = "gtk-desktop"))]
+    #[test]
+    fn the_locked_retry_message_follows_the_language() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            crate::i18n::set_language("zh-CN").unwrap();
+            let chinese = still_locked_message();
+            crate::i18n::set_language("en").unwrap();
+            assert_eq!(
+                chinese,
+                "密钥环已锁定。没有恢复任何内容。请解锁密钥环，然后选择“重试”。"
+            );
+            assert_eq!(
+                still_locked_message(),
+                "Keyring locked. Nothing was restored. Unlock your keyring, then choose Retry."
+            );
+        });
+    }
+
+    /// F6: Retry is the one place an unlock prompt is wanted. It asks, and when
+    /// the keyring stays locked it says so in plain words instead of a tally.
+    #[test]
+    fn retry_asks_to_unlock_and_says_plainly_when_the_keyring_stays_locked() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let path = data.join("retry.json");
+            let card = locked_card_fixture("cursor", &path);
+            let template = std::fs::read(&path).unwrap();
+            // Unlocking makes the saved copies readable again.
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+
+            let mut outcome = None;
+            let calls = backup_vault::fake::locked_store(backup_vault::Unlock::StillLocked, || {
+                outcome = Some(retry_with_report(&card.id).unwrap());
+            });
+            assert!(calls.iter().any(|c| c == "unlock prompt"), "{calls:?}");
+            let still = outcome.take().unwrap();
+            assert_eq!(
+                still.message,
+                "Keyring locked. Nothing was restored. Unlock your keyring, then choose Retry."
+            );
+            assert_eq!(still.message, still_locked_message());
+            assert_eq!(
+                (still.restored, still.accounted, still.remaining),
+                (0, 0, 1)
+            );
+            assert_eq!(
+                still.pending.as_ref().map(|r| r.id.as_str()),
+                Some(card.id.as_str())
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), template, "nothing written");
+
+            let calls = backup_vault::fake::locked_store(backup_vault::Unlock::Open, || {
+                outcome = Some(retry_with_report(&card.id).unwrap());
+            });
+            assert!(calls.iter().any(|c| c == "unlock prompt"), "{calls:?}");
+            assert!(calls.iter().any(|c| c == "refresh deferred client configs"));
+            let done = outcome.unwrap();
+            assert!(done.pending.is_none());
+            assert_eq!((done.restored, done.remaining), (1, 0));
+            assert!(done.message.starts_with("Cursor: values put back: 1;"));
+            assert!(std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("sk-recovery-state-fixture"));
         });
     }
 }

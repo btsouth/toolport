@@ -391,3 +391,191 @@ fn the_connect_preview_lists_the_codex_settings_it_will_add() {
     assert!(codex_gateway_settings_preview("grok", None).is_empty());
     assert!(codex_gateway_settings_preview("claude-code", None).is_empty());
 }
+
+/// F1: with the keyring locked, the start-up refresh of a Codex entry (its
+/// backup must seal another server's inline key) neither asks to unlock nor
+/// reports a failure. It is deferred, and the next pass with the keyring open
+/// writes it.
+#[test]
+fn a_locked_keyring_defers_the_startup_refresh_without_a_prompt() {
+    crate::secrets::tests::with_isolated_vault(|| {
+        let dir = crate::registry::conduit_dir().unwrap();
+        let _env_lock = env_test_lock();
+        let _client_env = isolated_client_env(&dir);
+        let _home = TestHome::set(&dir);
+        let path = resolved_definition_path(&find_def("codex").unwrap()).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let current = dir.join("toolport-gateway");
+        std::fs::write(&current, "fixture").unwrap();
+        let current = current.to_str().unwrap();
+        crate::registry::update(|registry| {
+            registry.servers.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "weather", "name": "Weather", "command": "weather",
+                    "transport": "stdio", "enabled": true,
+                    "env": [{"key": "WEATHER_API_KEY", "secret": true}]
+                }))
+                .unwrap(),
+            );
+            Ok(())
+        })
+        .unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "[mcp_servers.toolport]\ncommand = '{current}'\n\n\
+                 [mcp_servers.toolport.env]\nTOOLPORT_CLIENT_ID = \"codex\"\n\
+                 TOOLPORT_ATTRIBUTION_ID = \"codex\"\n\n\
+                 [mcp_servers.weather]\ncommand = \"weather\"\n\n\
+                 [mcp_servers.weather.env]\nWEATHER_API_KEY = \"sk-weather-locked-fixture\"\n"
+            ),
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let rows = || {
+            let mut rows = vec![read_client(&find_def("codex").unwrap())];
+            apply_entry_states(&mut rows, &HashMap::new());
+            rows
+        };
+        let mut outcome = None;
+        let (calls, prompts) = backup_vault::fake::locked_everywhere(|| {
+            outcome = Some(backup_vault::noninteractive(|| {
+                repoint_stale_gateways_in(current, rows(), &HashMap::new())
+            }));
+        });
+        assert_eq!(prompts, Vec::<String>::new());
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with("prompting") || call == "unlock prompt"),
+            "{calls:?}"
+        );
+        let outcome = outcome.unwrap();
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        assert_eq!(outcome.deferred, vec!["codex".to_string()]);
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
+
+        // Keyring open again (the next start, or a Retry unlock): written.
+        let outcome = repoint_stale_gateways_in(current, rows(), &HashMap::new());
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        assert_eq!(outcome.repointed.len(), 1);
+        assert_eq!(
+            codex_entry(&path)["startup_timeout_sec"].as_integer(),
+            Some(75)
+        );
+    });
+}
+
+/// F1: legacy plaintext backups are sealed at start. With the keyring locked
+/// that write would raise the unlock prompt; the start-up pass defers it.
+#[test]
+fn a_locked_keyring_defers_sealing_legacy_backups_at_start() {
+    crate::secrets::tests::with_isolated_vault(|| {
+        let dir = crate::registry::conduit_dir().unwrap();
+        let _env_lock = env_test_lock();
+        let _client_env = isolated_client_env(&dir);
+        let _home = TestHome::set(&dir);
+        let legacy = backup_dir("cursor").unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        // A 2.3.5 timestamped backup: the client config as it was, key inline.
+        let original = "{\"mcpServers\":{\"native\":{\"command\":\"echo\",\"env\":{\"API_KEY\":\"sk-legacy-locked-fixture\"}}}}\n".to_string();
+        let file = legacy.join("1700000000000-mcp.json");
+        std::fs::write(&file, &original).unwrap();
+        let mut outcome = None;
+        let (calls, prompts) = backup_vault::fake::locked_everywhere(|| {
+            outcome = Some(repoint_stale_gateways(&HashMap::new()));
+        });
+        assert_eq!(prompts, Vec::<String>::new());
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with("prompting") || call == "unlock prompt"),
+            "{calls:?}"
+        );
+        let outcome = outcome.unwrap();
+        assert!(
+            !outcome
+                .failed
+                .iter()
+                .any(|(what, _)| what == "client recovery backups"),
+            "{:?}",
+            outcome.failed
+        );
+        assert!(outcome
+            .deferred
+            .contains(&"client recovery backups".to_string()));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+    });
+}
+
+/// K10: a pass that runs again while the keyring would still ask starts no
+/// second backup-upgrade waiter.
+#[test]
+fn repeated_start_up_passes_start_one_backup_upgrade_waiter() {
+    crate::secrets::tests::with_isolated_vault(|| {
+        let dir = crate::registry::conduit_dir().unwrap();
+        let _env_lock = env_test_lock();
+        let _client_env = isolated_client_env(&dir);
+        let _home = TestHome::set(&dir);
+        let legacy = backup_dir("cursor").unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        let original = "{\"mcpServers\":{\"native\":{\"command\":\"echo\",\"env\":{\"API_KEY\":\"sk-legacy-waiter-fixture\"}}}}\n";
+        std::fs::write(legacy.join("1700000000000-mcp.json"), original).unwrap();
+        crate::secrets::locked_store::prompts_during(|| {
+            for _ in 0..3 {
+                let outcome = repoint_stale_gateways(&HashMap::new());
+                assert!(outcome
+                    .deferred
+                    .contains(&"client recovery backups".to_string()));
+            }
+        });
+        assert_eq!(UPGRADE_WAITERS.load(std::sync::atomic::Ordering::SeqCst), 1);
+    });
+}
+
+/// CodeRabbit (Major): with the registry unreadable, the ownership records are
+/// unknown, so the post-unlock refresh rewrites nothing and keeps waiting.
+#[test]
+fn an_unreadable_registry_stops_the_unlock_refresh() {
+    crate::secrets::tests::with_isolated_vault(|| {
+        let dir = crate::registry::conduit_dir().unwrap();
+        let _env_lock = env_test_lock();
+        let _client_env = isolated_client_env(&dir);
+        let _home = TestHome::set(&dir);
+        let registry = crate::registry::resolved_path().unwrap();
+        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        std::fs::write(&registry, "{ not a registry").unwrap();
+        let outcome = refresh_stale_client_configs();
+        assert!(outcome.repointed.is_empty() && outcome.failed.is_empty());
+        assert!(!outcome.deferred.is_empty(), "{:?}", outcome.deferred);
+        assert_eq!(
+            std::fs::read_to_string(&registry).unwrap(),
+            "{ not a registry"
+        );
+    });
+}
+
+/// F1: the log names what the pass was doing; the same path is a refresh.
+#[test]
+fn refresh_failures_do_not_claim_a_repoint_onto_the_same_path() {
+    let same = repoint_failure_message(
+        "codex",
+        "/usr/bin/toolport-gateway",
+        "/usr/bin/toolport-gateway",
+        "disk full",
+    );
+    assert_eq!(
+        same,
+        "toolport: could not refresh codex's gateway entry (/usr/bin/toolport-gateway): disk full"
+    );
+    let moved = repoint_failure_message(
+        "codex",
+        "/opt/old/toolport-gateway",
+        "/usr/bin/toolport-gateway",
+        "disk full",
+    );
+    assert_eq!(
+        moved,
+        "toolport: could not re-point codex's gateway entry from /opt/old/toolport-gateway to /usr/bin/toolport-gateway: disk full"
+    );
+}

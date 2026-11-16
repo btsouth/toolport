@@ -351,3 +351,54 @@ fn round3_location_disconnect_removes_both_reserved_names_after_adoption() {
         original["mcpServers"]["foreign"]
     );
 }
+
+/// CodeRabbit: a secondary Claude Code config whose repair needs a backup the
+/// locked keyring refuses waits for the keyring instead of failing, so the
+/// start-up waiter retries it.
+#[test]
+fn a_locked_secondary_claude_repair_waits_for_the_keyring() {
+    let data = crate::registry::DataDirTestEnv::new("round3-locked-secondary");
+    let _env_lock = env_test_lock();
+    let _client_env = isolated_client_env(&data.dir);
+    let root = data.dir.join("home");
+    std::fs::create_dir(&root).unwrap();
+    let _home = TestHome::set(&root);
+    let old = data.dir.join("bin/toolport-gateway-1.24.0");
+    let current = data.dir.join("Toolport/bin/toolport-gateway-2.0.0");
+    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+    std::fs::write(&old, "old").unwrap();
+    std::fs::write(&current, "new").unwrap();
+    // A Toolport server stores the inline value, so the backup needs the vault.
+    let registry = serde_json::from_value(serde_json::json!({"version":3,"profiles":[],"servers":[{"id":"native","name":"Native","transport":"stdio","env":[{"key":"API_KEY","secret":true}]}]})).unwrap();
+    crate::registry::save(&registry).unwrap();
+    let path = root.join(".claude-work").join(".claude.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let raw = serde_json::json!({"mcpServers":{
+        "toolport":{"command":old,"env":{"TOOLPORT_PROFILE":"work"}},
+        "native":{"command":"native","env":{"API_KEY":"sk-secondary-locked-fixture"}}
+    }})
+    .to_string();
+    std::fs::write(&path, &raw).unwrap();
+    let mut outcome = RepointOutcome::default();
+    backup_vault::fake::locked_store(backup_vault::Unlock::StillLocked, || {
+        backup_vault::noninteractive(|| {
+            repoint_other_claude_configs_in(
+                current.to_str().unwrap(),
+                std::slice::from_ref(&path),
+                &mut outcome,
+            )
+        });
+    });
+    assert!(
+        outcome.extra_claude_failed.is_empty(),
+        "{:?}",
+        outcome.extra_claude_failed
+    );
+    assert_eq!(outcome.deferred.len(), 1, "{:?}", outcome.deferred);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        raw,
+        "nothing written"
+    );
+}
