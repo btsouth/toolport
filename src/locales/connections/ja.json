@@ -659,7 +659,7 @@
   "Password manager": "パスワードマネージャー",
   "Password manager provider": "パスワードマネージャープロバイダー",
   "Password manager: {reference}": "パスワードマネージャー: {reference}",
-  "Paste a config snippet from any client:\n\n• Claude Code: claude mcp add-json ...\n• Cursor/Devin/Antigravity: {\"mcpServers\": ...}\n• VS Code: {\"servers\": ...}\n• Codex: [mcp_servers.name]\n• Zed: {\"context_servers\": ...}": "クライアントの設定を貼り付けてください：\n\n• Claude Code: claude mcp add-json ...\n• Cursor/Devin/Antigravity: {\"mcpServers\": ...}\n• VS Code: {\"servers\": ...}\n• Codex: [mcp_servers.name]\n• Zed: {\"context_servers\": ...}",
+  "Paste a config snippet from any client:\n\n• Claude Code: claude mcp add ... / claude mcp add-json ...\n• Cursor/Devin/Antigravity: {\"mcpServers\": ...}\n• VS Code: {\"servers\": ...}\n• Codex: [mcp_servers.name]\n• Zed: {\"context_servers\": ...}": "クライアントの設定を貼り付けてください：\n\n• Claude Code: claude mcp add ... / claude mcp add-json ...\n• Cursor/Devin/Antigravity: {\"mcpServers\": ...}\n• VS Code: {\"servers\": ...}\n• Codex: [mcp_servers.name]\n• Zed: {\"context_servers\": ...}",
   "Paste a key": "キーを貼り付けます",
   "paste access token": "アクセストークンを貼り付け",
   "Paste the invite code your team shared. Toolport connects this device and pulls the team's server set.": "チームが共有した招待コードを貼り付けます。 Toolport はこのデバイスを接続し、チームのサーバー セットをプルします。",

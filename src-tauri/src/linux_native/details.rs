@@ -1219,7 +1219,9 @@ mod tests {
         }
         crate::i18n::set_language("fr").unwrap();
         l10n::refresh_bindings();
-        let french = crate::i18n::tr(source);
+        let french = crate::i18n::tr(
+            "T3 Code still uses this folder. Remove it from T3 Code's provider settings first.",
+        );
         assert_ne!(french, source, "the reason has a French translation");
         for button in [&row[0], &detail[0]] {
             assert_eq!(button.tooltip_text().as_deref(), Some(french.as_str()));

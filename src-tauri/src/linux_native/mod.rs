@@ -12027,11 +12027,12 @@ fn open_server_editor_prefilled(
     );
     form.append(&local_only);
 
-    // Pasted env values wait here until the add commits; the entry itself never
-    // carries secret values, they go straight to the keychain on save.
-    type SnippetEnv = Vec<(String, Option<String>)>;
-    let snippet_env: std::rc::Rc<std::cell::RefCell<SnippetEnv>> =
-        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    // Pasted env rows wait in their own section until the add commits; the entry
+    // itself never carries secret values, they go straight to the keychain on save.
+    let pasted_env = (!editing).then(pasted_env_section);
+    if let Some(section) = &pasted_env {
+        section.release_on_close(&editor);
+    }
 
     let name = {
         let widget = gtk::Entry::builder()
@@ -12133,10 +12134,15 @@ fn open_server_editor_prefilled(
     args.set_bottom_margin(8);
     args.set_left_margin(8);
     args.set_right_margin(8);
-    args.buffer().set_text(
-        &server
+    // The box shows one argument per line, which cannot hold an empty or padded
+    // argument. Keep the exact list until the user edits the text.
+    let exact_args = exact_args_for(&args);
+    set_exact_args(
+        &args,
+        &exact_args,
+        server
             .as_ref()
-            .map(|server| server.args.join("\n"))
+            .map(|server| server.args.as_slice())
             .unwrap_or_default(),
     );
     let args_scroller = gtk::ScrolledWindow::builder()
@@ -12225,6 +12231,7 @@ fn open_server_editor_prefilled(
         };
         connection.append(&binding_warning);
         let args_for_warning = args.clone();
+        let exact_for_warning = exact_args.clone();
         let command_for_warning = command.clone();
         let old_args = original_args.clone();
         let old_command = original_command.clone();
@@ -12233,7 +12240,7 @@ fn open_server_editor_prefilled(
             let text = buffer
                 .text(&buffer.start_iter(), &buffer.end_iter(), false)
                 .to_string();
-            let parsed = text.lines().map(str::to_string).collect::<Vec<_>>();
+            let parsed = editor_args(exact_for_warning.borrow().clone(), &text);
             binding_warning.set_visible(
                 parsed != old_args || Some(command_for_warning.text().to_string()) != old_command,
             );
@@ -12380,6 +12387,9 @@ fn open_server_editor_prefilled(
             crate::i18n::msg("Save the server first, then use its Credentials action to store secret values in the system keychain.")
         },
     );
+    if let Some(pasted) = &pasted_env {
+        form.append(&pasted.section);
+    }
     form.append(&credentials);
 
     if !editing {
@@ -12427,21 +12437,20 @@ fn open_server_editor_prefilled(
         let transport_for_fill = transport.clone();
         let command_for_fill = command.clone();
         let args_for_fill = args.clone();
+        let exact_args_for_fill = exact_args.clone();
         let url_for_fill = url.clone();
         let cwd_for_fill = cwd.clone();
-        let env_for_fill = snippet_env.clone();
+        let env_for_fill = pasted_env
+            .clone()
+            .expect("Add server has a pasted env section");
+        let credentials_for_fill = credentials.clone();
         let page_for_fill = page.clone();
         fill.connect_clicked(move |fill| {
             let buffer = snippet.buffer();
             let text = buffer
                 .text(&buffer.start_iter(), &buffer.end_iter(), false)
                 .to_string();
-            const MAX_SNIPPET_BYTES: usize = 256 * 1024;
-            let parsed = if text.len() > MAX_SNIPPET_BYTES {
-                Err(crate::i18n::trf("Snippet is {value0} KB; limit is {value1} KB. Paste a single server config, not an entire file.", &[("value0", &format!("{}", text.len() / 1024)), ("value1", &format!("{}", MAX_SNIPPET_BYTES / 1024))]))
-            } else {
-                crate::clients::parse_snippet(&text).map_err(|_| crate::i18n::tr("Could not read the pasted config. Check its syntax and retry.").to_string())
-            };
+            let parsed = parse_pasted_snippet(&text);
             feedback_for_fill.set_visible(true);
             match parsed {
                 Ok(servers) => {
@@ -12469,35 +12478,39 @@ fn open_server_editor_prefilled(
                         _ => 0,
                     });
                     command_for_fill.set_text(first.command.as_deref().unwrap_or(""));
-                    args_for_fill.buffer().set_text(&first.args.join("\n"));
+                    set_exact_args(&args_for_fill, &exact_args_for_fill, &first.args);
                     url_for_fill.set_text(first.url.as_deref().unwrap_or(""));
                     cwd_for_fill.set_text("");
-                    *env_for_fill.borrow_mut() = first
+                    env_for_fill.fill(&first.env);
+                    // The rows take the values now, so the save-first note does not apply.
+                    credentials_for_fill.set_visible(first.env.is_empty());
+                    // Re-rendered on a language change, like the error below.
+                    let name = first.name.clone();
+                    let count = servers.len();
+                    // Count what the import will vault, not every variable:
+                    // plain settings are saved with the server instead, and a
+                    // key the paste left empty has nothing to vault yet.
+                    let vaulted = first
                         .env
                         .iter()
-                        .map(|env| (env.key.clone(), env.value.clone()))
-                        .collect();
-                    feedback_for_fill.set_label(&snippet_fill_feedback(
-                        &first.name,
-                        servers.len(),
-                        // Count what the import will vault, not every variable:
-                        // plain settings are saved with the server instead.
-                        first
-                            .env
-                            .iter()
-                            .filter(|env| {
-                                crate::import_credentials::secret_env(&env.key, env.value.as_deref())
-                            })
-                            .count(),
-                    ));
+                        .filter(|env| {
+                            env.value.as_deref().is_some_and(|v| !v.is_empty())
+                                && crate::import_credentials::secret_env(&env.key, env.value.as_deref())
+                        })
+                        .count();
+                    l10n::bind_label_with(&feedback_for_fill, move || {
+                        snippet_fill_feedback(&name, count, vaulted)
+                    });
                     feedback_for_fill.remove_css_class("error");
                     feedback_for_fill.add_css_class("success");
                     // Filling the fields re-validated the form, which hides
                     // stale feedback; this message is new.
                     feedback_for_fill.set_visible(true);
                 }
-                Err(error) => {
-                    l10n::bind_formatted_label(&feedback_for_fill, "Could not parse the snippet: {value0}", &[("value0", &error.to_string())]);
+                Err(failure) => {
+                    // The same sentence the React dialog shows, re-read on a
+                    // language change. It never holds pasted text.
+                    l10n::bind_label_with(&feedback_for_fill, move || failure.message());
                     feedback_for_fill.remove_css_class("success");
                     feedback_for_fill.add_css_class("error");
                 }
@@ -12693,15 +12706,19 @@ fn open_server_editor_prefilled(
     // The default shown matches React: 10 seconds for a local command, 120
     // when it downloads its package first, the request timeout for a remote.
     let timeout_hint: std::rc::Rc<dyn Fn()> = {
-        let (transport, command, args, timeout) = (
+        let (transport, command, args, exact_args, timeout) = (
             transport.clone(),
             command.clone(),
             args.clone(),
+            exact_args.clone(),
             timeout.clone(),
         );
         std::rc::Rc::new(move || {
             let milliseconds = if transport.selected() == 0 {
-                suggested_startup_timeout_ms(command.text().trim(), &editor_args(&args))
+                suggested_startup_timeout_ms(
+                    command.text().trim(),
+                    &editor_args_of(&args, &exact_args),
+                )
             } else {
                 match saved_timeouts {
                     Some((_, request, false)) => request.unwrap_or(30_000),
@@ -12734,6 +12751,7 @@ fn open_server_editor_prefilled(
     let original_command_for_test = original_command.clone();
     let original_args_for_test = original_args.clone();
     let plain_env_for_test = plain_env.clone();
+    let exact_args_for_test = exact_args.clone();
     let busy_for_test = busy.clone();
     let generation_for_test = generation.clone();
     let validate_for_test = validate.clone();
@@ -12752,7 +12770,7 @@ fn open_server_editor_prefilled(
             &name_for_test,
             &transport_for_test,
             &command_for_test,
-            &args_for_test,
+            (&args_for_test, &exact_args_for_test),
             &url_for_test,
             &cwd_for_test,
             &inherit_env_for_test,
@@ -12894,8 +12912,15 @@ fn open_server_editor_prefilled(
         busy_for_save.set(true);
         validate_for_save();
         let server_id = server_id.clone();
-        let mut fields =
-            collect_server_fields(&name, &transport, &command, &args, &url, &cwd, &inherit_env);
+        let mut fields = collect_server_fields(
+            &name,
+            &transport,
+            &command,
+            (&args, &exact_args),
+            &url,
+            &cwd,
+            &inherit_env,
+        );
         fields.initialize_timeout_ms = timeout_ms;
         fields.sync_local_only = local_only.is_active();
         fields.hide_prompts = Some(hide_prompts.is_active());
@@ -12917,7 +12942,10 @@ fn open_server_editor_prefilled(
             .collect::<Vec<_>>();
         let launch_definition = original_launch_for_save.clone();
         let display_name = fields.name.trim().to_string();
-        let env = snippet_env.borrow().clone();
+        let (env, keychain) = pasted_env
+            .as_ref()
+            .map(PastedEnvSection::collect)
+            .unwrap_or_default();
         let env_edits = plain_env.as_ref().map(collect_plain_env);
         let page = page.clone();
         let busy = busy_for_save.clone();
@@ -12970,7 +12998,9 @@ fn open_server_editor_prefilled(
                         Ok((registry, Vec::new(), Vec::new()))
                     }
                     None => {
-                        let outcome = crate::registry_controller::add_snippet_server(fields, env)?;
+                        let outcome = crate::registry_controller::add_snippet_server_choices(
+                            fields, env, &keychain,
+                        )?;
                         Ok::<_, String>((
                             outcome.registry,
                             outcome.declared_without_value,
@@ -13200,6 +13230,35 @@ fn editor_field(label: &'static str, child: &impl IsA<gtk::Widget>) -> gtk::Box 
 }
 
 /// What the editor reports after filling the form from a pasted snippet.
+/// Why the GTK paste box could not fill the form. Holds no pasted text.
+#[derive(Clone, Copy)]
+enum PasteFailure {
+    TooLarge(usize),
+    Parse(crate::clients::SnippetError),
+}
+
+const MAX_SNIPPET_BYTES: usize = 256 * 1024;
+
+impl PasteFailure {
+    /// The same sentence the React dialog's `parse_server_snippet` returns.
+    fn message(self) -> String {
+        match self {
+            Self::TooLarge(len) => crate::i18n::trf("Snippet is {value0} KB; limit is {value1} KB. Paste a single server config, not an entire file.", &[("value0", &format!("{}", len / 1024)), ("value1", &format!("{}", MAX_SNIPPET_BYTES / 1024))]),
+            Self::Parse(error) => error.message(),
+        }
+    }
+}
+
+/// The paste box's parse, with the same size limit as the React dialog.
+fn parse_pasted_snippet(
+    text: &str,
+) -> Result<Vec<crate::clients::ParsedSnippetServer>, PasteFailure> {
+    if text.len() > MAX_SNIPPET_BYTES {
+        return Err(PasteFailure::TooLarge(text.len()));
+    }
+    crate::clients::parse_snippet_for_user(text).map_err(PasteFailure::Parse)
+}
+
 fn snippet_fill_feedback(name: &str, server_count: usize, env_count: usize) -> String {
     let mut message = if server_count > 1 {
         crate::i18n::trf(
@@ -13282,23 +13341,54 @@ fn editor_timeout_ms(text: &str) -> Result<Option<u64>, String> {
     Ok(Some(milliseconds as u64))
 }
 
-/// The editor's arguments, one per non-empty line.
-fn editor_args(args: &gtk::TextView) -> Vec<String> {
+/// The exact arguments behind the one-per-line box, until the user edits it.
+type ExactArgs = std::rc::Rc<std::cell::RefCell<Option<Vec<String>>>>;
+
+/// The kept list for an arguments box, dropped as soon as its text changes.
+fn exact_args_for(args: &gtk::TextView) -> ExactArgs {
+    let exact: ExactArgs = Default::default();
+    let weak = std::rc::Rc::downgrade(&exact);
+    args.buffer().connect_changed(move |_| {
+        if let Some(exact) = weak.upgrade() {
+            exact.borrow_mut().take();
+        }
+    });
+    exact
+}
+
+/// Show `values` in the arguments box and keep them exactly.
+fn set_exact_args(args: &gtk::TextView, exact: &ExactArgs, values: &[String]) {
+    // Setting the text clears the kept list, so keep it afterwards.
+    args.buffer().set_text(&values.join("\n"));
+    *exact.borrow_mut() = Some(values.to_vec());
+}
+
+/// The arguments to save: the kept list while the text is as it was shown,
+/// otherwise one per non-empty line of the text.
+fn editor_args(exact: Option<Vec<String>>, text: &str) -> Vec<String> {
+    exact.unwrap_or_else(|| {
+        text.lines()
+            .map(str::trim)
+            .filter(|argument| !argument.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    })
+}
+
+/// The arguments the editor would save right now.
+fn editor_args_of(args: &gtk::TextView, exact: &ExactArgs) -> Vec<String> {
     let buffer = args.buffer();
-    buffer
-        .text(&buffer.start_iter(), &buffer.end_iter(), false)
-        .lines()
-        .map(str::trim)
-        .filter(|argument| !argument.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
+    editor_args(
+        exact.borrow().clone(),
+        &buffer.text(&buffer.start_iter(), &buffer.end_iter(), false),
+    )
 }
 
 fn collect_server_fields(
     name: &gtk::Entry,
     transport: &gtk::DropDown,
     command: &gtk::Entry,
-    args: &gtk::TextView,
+    (args, exact_args): (&gtk::TextView, &ExactArgs),
     url: &gtk::Entry,
     cwd: &gtk::Entry,
     inherit_env: &gtk::Switch,
@@ -13314,7 +13404,7 @@ fn collect_server_fields(
         }
         .into(),
         command: Some(command.text().to_string()),
-        args: editor_args(args),
+        args: editor_args_of(args, exact_args),
         url: Some(url.text().to_string()),
         cwd: Some(cwd.text().to_string()),
         inherit_env: Some(inherit_env.is_active()),
@@ -13416,6 +13506,312 @@ fn section_heading(title: &'static str, subtitle: &'static str) -> gtk::Box {
         widget
     });
     heading
+}
+
+/// The environment values a paste brought into Add server, laid out like the
+/// React dialog's rows: name, value and Keychain, plus the same notice for values
+/// the paste left out (a `$TOKEN` it could not read, or a key with no value).
+/// Pasted values to save: each key, and its value when one was given.
+type PastedEnv = Vec<(String, Option<String>)>;
+
+#[derive(Clone)]
+struct PastedEnvSection {
+    section: gtk::Box,
+    list: gtk::Box,
+    notice: gtk::Label,
+    rows: std::rc::Rc<std::cell::RefCell<Vec<PastedEnvRow>>>,
+    /// Names the paste gave no value. The notice names a row while its name is
+    /// one of these and its value is empty, the same rule as the React dialog.
+    missing: std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<String>>>,
+}
+
+/// What a row's own signal handlers hold. Strong references there would form
+/// cycles (a row's widgets own handlers that own the rows), so closing the
+/// dialog would leave the widgets and the pasted values alive.
+struct WeakPastedEnvSection {
+    section: gtk::glib::WeakRef<gtk::Box>,
+    list: gtk::glib::WeakRef<gtk::Box>,
+    notice: gtk::glib::WeakRef<gtk::Label>,
+    rows: std::rc::Weak<std::cell::RefCell<Vec<PastedEnvRow>>>,
+    missing: std::rc::Weak<std::cell::RefCell<std::collections::BTreeSet<String>>>,
+}
+
+impl WeakPastedEnvSection {
+    fn upgrade(&self) -> Option<PastedEnvSection> {
+        Some(PastedEnvSection {
+            section: self.section.upgrade()?,
+            list: self.list.upgrade()?,
+            notice: self.notice.upgrade()?,
+            rows: self.rows.upgrade()?,
+            missing: self.missing.upgrade()?,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct PastedEnvRow {
+    row: gtk::Box,
+    key: gtk::Entry,
+    value: gtk::Entry,
+    keychain: gtk::CheckButton,
+}
+
+fn pasted_env_section() -> PastedEnvSection {
+    let section = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    section.add_css_class("toolport-form-section");
+    section.set_visible(false);
+    let heading = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    heading.append(&{
+        let widget = gtk::Label::builder()
+            .halign(gtk::Align::Start)
+            .css_classes(["toolport-section-label"])
+            .build();
+        l10n::bind_label(&widget, "Environment variables");
+        widget
+    });
+    heading.append(&{
+        let widget = gtk::Label::builder()
+            .halign(gtk::Align::Fill)
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["toolport-muted", "caption"])
+            .build();
+        l10n::bind_formatted_label(
+            &widget,
+            "API keys and other secrets the server needs (e.g.{value1}{value2}). Values are stored in your OS keychain, never in the config.",
+            &[("value1", " "), ("value2", "RESEND_API_KEY")],
+        );
+        widget
+    });
+    section.append(&heading);
+    let notice = gtk::Label::builder()
+        .halign(gtk::Align::Fill)
+        .xalign(0.0)
+        .wrap(true)
+        .visible(false)
+        .css_classes(["toolport-feedback", "warning"])
+        .build();
+    section.append(&notice);
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    section.append(&list);
+    PastedEnvSection {
+        section,
+        list,
+        notice,
+        rows: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        missing: std::rc::Rc::new(std::cell::RefCell::new(Default::default())),
+    }
+}
+
+impl PastedEnvSection {
+    fn downgrade(&self) -> WeakPastedEnvSection {
+        WeakPastedEnvSection {
+            section: self.section.downgrade(),
+            list: self.list.downgrade(),
+            notice: self.notice.downgrade(),
+            rows: std::rc::Rc::downgrade(&self.rows),
+            missing: std::rc::Rc::downgrade(&self.missing),
+        }
+    }
+
+    /// Drop every row and the values in them when `window` closes. The editor's
+    /// own handlers can keep the window alive after it closes, so this does not
+    /// wait for it to be freed.
+    fn release_on_close(&self, window: &impl IsA<gtk::Window>) {
+        let section = self.downgrade();
+        window.connect_close_request(move |window| {
+            if let Some(section) = section.upgrade() {
+                // A window holds its focused widget, which may be in a row.
+                window.set_focus(gtk::Widget::NONE);
+                section.clear();
+            }
+            gtk::glib::Propagation::Proceed
+        });
+    }
+
+    fn clear(&self) {
+        // Taken first: clearing a value runs its handler, which reads the rows.
+        let rows = std::mem::take(&mut *self.rows.borrow_mut());
+        self.missing.borrow_mut().clear();
+        for row in rows {
+            row.value.set_text("");
+            self.list.remove(&row.row);
+        }
+    }
+
+    /// Replace the rows with a new paste's values.
+    fn fill(&self, env: &[crate::clients::SnippetEnvVar]) {
+        self.clear();
+        *self.missing.borrow_mut() = env
+            .iter()
+            .filter(|var| var.value.as_deref().is_none_or(str::is_empty))
+            .map(|var| var.key.clone())
+            .collect();
+        for var in env {
+            let secret = crate::import_credentials::secret_env(&var.key, var.value.as_deref());
+            self.add_row(&var.key, var.value.as_deref(), secret);
+        }
+        self.section.set_visible(!env.is_empty());
+        self.refresh_notice();
+    }
+
+    fn add_row(&self, key_text: &str, value_text: Option<&str>, secret: bool) {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let key = {
+            let widget = gtk::Entry::builder()
+                .text(key_text)
+                .width_chars(16)
+                .css_classes(["toolport-input", "monospace"])
+                .build();
+            l10n::bind_placeholder(&widget, "ENV_NAME");
+            widget
+        };
+        let value = {
+            let widget = gtk::Entry::builder()
+                .text(value_text.unwrap_or(""))
+                .hexpand(true)
+                .visibility(!secret)
+                .input_purpose(if secret {
+                    gtk::InputPurpose::Password
+                } else {
+                    gtk::InputPurpose::FreeForm
+                })
+                .css_classes(["toolport-input"])
+                .build();
+            l10n::bind_placeholder(&widget, "value");
+            widget
+        };
+        let keychain = l10n::check_button("Keychain");
+        keychain.set_active(secret);
+        keychain.set_valign(gtk::Align::Center);
+        let remove = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat", "toolport-destructive-icon"])
+            .build();
+        l10n::bind_tooltip(&remove, "Remove this value");
+        let name_accessible = {
+            let (key, value, keychain, remove) = (
+                key.downgrade(),
+                value.downgrade(),
+                keychain.downgrade(),
+                remove.downgrade(),
+            );
+            move || {
+                let (Some(key), Some(value), Some(keychain), Some(remove)) = (
+                    key.upgrade(),
+                    value.upgrade(),
+                    keychain.upgrade(),
+                    remove.upgrade(),
+                ) else {
+                    return;
+                };
+                let name = key.text();
+                let name = if name.trim().is_empty() {
+                    "variable".to_string()
+                } else {
+                    name.trim().to_string()
+                };
+                value.update_property(&[gtk::accessible::Property::Label(&name)]);
+                keychain.update_property(&[gtk::accessible::Property::Label(&crate::i18n::trf(
+                    "Keep {value1} in keychain",
+                    &[("value1", &name)],
+                ))]);
+                remove.update_property(&[gtk::accessible::Property::Label(&crate::i18n::tr(
+                    "Remove this value",
+                ))]);
+            }
+        };
+        name_accessible();
+        {
+            let section = self.downgrade();
+            key.connect_changed(move |_| {
+                name_accessible();
+                if let Some(section) = section.upgrade() {
+                    section.refresh_notice();
+                }
+            });
+        }
+        {
+            let value = value.downgrade();
+            keychain.connect_toggled(move |check| {
+                if let Some(value) = value.upgrade() {
+                    value.set_visibility(!check.is_active());
+                }
+            });
+        }
+        row.append(&key);
+        row.append(&value);
+        row.append(&keychain);
+        row.append(&remove);
+        self.list.append(&row);
+        self.rows.borrow_mut().push(PastedEnvRow {
+            row: row.clone(),
+            key,
+            value: value.clone(),
+            keychain,
+        });
+        {
+            let section = self.downgrade();
+            value.connect_changed(move |_| {
+                if let Some(section) = section.upgrade() {
+                    section.refresh_notice();
+                }
+            });
+        }
+        let (section, row) = (self.downgrade(), row.downgrade());
+        remove.connect_clicked(move |_| {
+            let (Some(section), Some(row)) = (section.upgrade(), row.upgrade()) else {
+                return;
+            };
+            section.list.remove(&row);
+            section.rows.borrow_mut().retain(|r| r.row != row);
+            section.refresh_notice();
+            section
+                .section
+                .set_visible(!section.rows.borrow().is_empty());
+        });
+    }
+
+    /// The same notice the React dialog shows above its rows.
+    fn refresh_notice(&self) {
+        let names = self.missing.borrow();
+        let missing: Vec<String> = self
+            .rows
+            .borrow()
+            .iter()
+            .map(|r| (r.key.text().trim().to_string(), r.value.text().is_empty()))
+            .filter(|(key, empty)| *empty && names.contains(key))
+            .map(|(key, _)| key)
+            .collect();
+        self.notice.set_visible(!missing.is_empty());
+        if missing.is_empty() {
+            l10n::unbind(&self.notice, "label");
+            self.notice.set_label("");
+        } else {
+            l10n::bind_formatted_label(
+                &self.notice,
+                "Add a value for {value0} before saving. The pasted config did not include it.",
+                &[("value0", &missing.join(", "))],
+            );
+        }
+    }
+
+    /// The values to save and each key's Keychain choice.
+    fn collect(&self) -> (PastedEnv, std::collections::BTreeMap<String, bool>) {
+        let mut env = Vec::new();
+        let mut keychain = std::collections::BTreeMap::new();
+        for row in self.rows.borrow().iter() {
+            let key = row.key.text().trim().to_string();
+            if key.is_empty() {
+                continue;
+            }
+            let value = row.value.text().to_string();
+            keychain.insert(key.clone(), row.keychain.is_active());
+            env.push((key, (!value.is_empty()).then_some(value)));
+        }
+        (env, keychain)
+    }
 }
 
 /// One editable plain environment value in Edit server.
@@ -13951,6 +14347,157 @@ mod tests {
             kept,
             vec!["config restored; could not remove the revoked keychain token: locked"]
         );
+    }
+
+    /// A pasted command's arguments reach GTK's save path exactly, including an
+    /// empty and a padded one the one-per-line box cannot show.
+    #[test]
+    fn pasted_arguments_round_trip_through_the_gtk_save_path() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let pasted = r#"claude mcp add demo -- node server.js "" " padded ""#;
+            let parsed = crate::clients::parse_snippet(pasted).unwrap().remove(0);
+            let expected = ["server.js", "", " padded "];
+            assert_eq!(parsed.args, expected);
+            // What the box shows, and what Save reads back from it.
+            let shown = parsed.args.join("\n");
+            let args = super::editor_args(Some(parsed.args.clone()), &shown);
+            let fields = crate::registry_controller::ServerFields {
+                sync_local_only: false,
+                initialize_timeout_ms: None,
+                name: parsed.name.clone(),
+                transport: parsed.transport.clone(),
+                command: parsed.command.clone(),
+                args,
+                url: None,
+                cwd: None,
+                inherit_env: None,
+                hide_prompts: None,
+            };
+            crate::registry_controller::add_snippet_server_choices(
+                fields,
+                Vec::new(),
+                &Default::default(),
+            )
+            .unwrap();
+            let saved = crate::registry::load().unwrap();
+            assert_eq!(saved.servers[0].args, expected);
+            // Once the user edits the text, the lines are what they typed.
+            assert_eq!(
+                super::editor_args(None, "server.js\n\n padded \n"),
+                ["server.js", "padded"]
+            );
+        });
+    }
+
+    /// Closing Add server frees the pasted rows and the values typed into them:
+    /// no row handler may keep its own row, or the section, alive.
+    #[test]
+    #[ignore = "requires GTK; explicitly run in the isolated omabox session"]
+    fn pasted_rows_are_freed_when_the_dialog_closes() {
+        use super::*;
+        gtk::init().expect("this regression runs inside omabox");
+        let window = gtk::Window::new();
+        let section = pasted_env_section();
+        let shell = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        shell.append(&section.section);
+        // Like the editor's Cancel button, a handler that keeps its window alive.
+        let cancel = gtk::Button::new();
+        {
+            let window = window.clone();
+            cancel.connect_clicked(move |_| window.close());
+        }
+        shell.append(&cancel);
+        window.set_child(Some(&shell));
+        section.release_on_close(&window);
+        section.fill(&[
+            crate::clients::SnippetEnvVar {
+                key: "API_KEY".into(),
+                value: Some("sk-live-SECRET42".into()),
+            },
+            crate::clients::SnippetEnvVar {
+                key: "TOKEN".into(),
+                value: None,
+            },
+            crate::clients::SnippetEnvVar {
+                key: "REGION".into(),
+                value: Some("eu".into()),
+            },
+        ]);
+        window.present();
+        // Use every handler once: rename, type, toggle and remove.
+        let (rows, value, key, removed) = {
+            let rows = section.rows.borrow();
+            rows[1].key.set_text("TOKEN2");
+            rows[1].value.set_text("typed-secret");
+            rows[0].keychain.set_active(false);
+            (
+                std::rc::Rc::downgrade(&section.rows),
+                rows[0].value.downgrade(),
+                rows[1].key.downgrade(),
+                rows[2].row.downgrade(),
+            )
+        };
+        let remove = removed
+            .upgrade()
+            .unwrap()
+            .last_child()
+            .and_downcast::<gtk::Button>()
+            .unwrap();
+        remove.emit_clicked();
+        drop(remove);
+        assert_eq!(section.rows.borrow().len(), 2);
+        let missing = std::rc::Rc::downgrade(&section.missing);
+        // The editor's own handlers hold the section until it closes.
+        cancel.emit_clicked();
+        drop((section, cancel, shell, window));
+        let context = gtk::glib::MainContext::default();
+        while context.pending() {
+            context.iteration(false);
+        }
+        assert!(rows.upgrade().is_none(), "the rows outlived the dialog");
+        assert!(
+            missing.upgrade().is_none(),
+            "the gap list outlived the dialog"
+        );
+        assert!(
+            value.upgrade().is_none(),
+            "a pasted value outlived the dialog"
+        );
+        assert!(key.upgrade().is_none(), "a renamed key outlived the dialog");
+        assert!(
+            removed.upgrade().is_none(),
+            "a removed row outlived the dialog"
+        );
+    }
+
+    /// The arguments box keeps a pasted list exactly until the user edits it.
+    #[test]
+    #[ignore = "requires GTK; explicitly run in the isolated omabox session"]
+    fn pasted_arguments_survive_the_gtk_box() {
+        use super::*;
+        gtk::init().expect("this regression runs inside omabox");
+        let parsed =
+            crate::clients::parse_snippet(r#"claude mcp add demo -- node server.js "" " padded ""#)
+                .unwrap()
+                .remove(0);
+        let args = gtk::TextView::new();
+        let exact = exact_args_for(&args);
+        set_exact_args(&args, &exact, &parsed.args);
+        let collect = || {
+            collect_server_fields(
+                &gtk::Entry::new(),
+                &gtk::DropDown::from_strings(&["stdio"]),
+                &gtk::Entry::new(),
+                (&args, &exact),
+                &gtk::Entry::new(),
+                &gtk::Entry::new(),
+                &gtk::Switch::new(),
+            )
+            .args
+        };
+        assert_eq!(collect(), ["server.js", "", " padded "]);
+        args.buffer().set_text("server.js\n other ");
+        assert_eq!(collect(), ["server.js", "other"]);
     }
 
     /// Manual synthetic visual fixture. Run only in omabox with a request file;
@@ -16599,7 +17146,9 @@ mod tests {
         let feedback = all
             .iter()
             .filter_map(|w| w.downcast_ref::<gtk::Label>())
-            .find(|l| l.has_css_class("toolport-feedback"))
+            // The pasted values notice is a warning inside the form, not the
+            // editor's own feedback.
+            .find(|l| l.has_css_class("toolport-feedback") && !l.has_css_class("warning"))
             .unwrap();
         assert!(
             feedback

@@ -659,7 +659,7 @@
   "Password manager": "Gestor de contraseñas",
   "Password manager provider": "Proveedor del gestor de contraseñas",
   "Password manager: {reference}": "Gestor de contraseñas: {reference}",
-  "Paste a config snippet from any client:\n\n• Claude Code: claude mcp add-json ...\n• Cursor/Devin/Antigravity: {\"mcpServers\": ...}\n• VS Code: {\"servers\": ...}\n• Codex: [mcp_servers.name]\n• Zed: {\"context_servers\": ...}": "Pega un fragmento de configuración de cualquier cliente:\n\n• Claude Code: claude mcp add-json ...\n• Cursor/Devin/Antigravity: {\"mcpServers\": ...}\n• VS Code: {\"servers\": ...}\n• Codex: [mcp_servers.name]\n• Zed: {\"context_servers\": ...}",
+  "Paste a config snippet from any client:\n\n• Claude Code: claude mcp add ... / claude mcp add-json ...\n• Cursor/Devin/Antigravity: {\"mcpServers\": ...}\n• VS Code: {\"servers\": ...}\n• Codex: [mcp_servers.name]\n• Zed: {\"context_servers\": ...}": "Pega un fragmento de configuración de cualquier cliente:\n\n• Claude Code: claude mcp add ... / claude mcp add-json ...\n• Cursor/Devin/Antigravity: {\"mcpServers\": ...}\n• VS Code: {\"servers\": ...}\n• Codex: [mcp_servers.name]\n• Zed: {\"context_servers\": ...}",
   "Paste a key": "Pegar una clave",
   "paste access token": "pegar token de acceso",
   "Paste the invite code your team shared. Toolport connects this device and pulls the team's server set.": "Pega el código de invitación que compartió tu equipo. Toolport conecta este dispositivo y extrae el conjunto de servidores del equipo.",

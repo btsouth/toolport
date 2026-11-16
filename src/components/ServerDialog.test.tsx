@@ -22,6 +22,7 @@ vi.mock("@/lib/api", () => api);
 vi.mock("sonner", () => ({ toast }));
 vi.mock("@/lib/toast", () => ({ toastError: vi.fn() }));
 
+import { toastError } from "@/lib/toast";
 import { ServerDialog } from "./ServerDialog";
 
 function deferred<T>() {
@@ -564,6 +565,131 @@ describe("ServerDialog", () => {
       expect(screen.getByRole("button", { name: "Test connection" })).toBeEnabled(),
     );
     expect(screen.getByRole("button", { name: "Add" })).toBeEnabled();
+  });
+
+  it("names pasted keys that still need a value until they are filled", async () => {
+    api.parseServerSnippet.mockResolvedValueOnce([
+      {
+        name: "gh",
+        transport: "http",
+        command: null,
+        args: [],
+        url: "https://api.githubcopilot.com/mcp",
+        env: [
+          { key: "Authorization", value: null, secret: true },
+          { key: "REGION", value: "eu", secret: false },
+        ],
+      },
+    ]);
+    const user = userEvent.setup();
+    render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    await user.click(screen.getByRole("button", { name: "Paste from client config" }));
+    await user.type(screen.getByPlaceholderText(/Paste a config snippet/i), "pasted");
+    await user.click(screen.getByRole("button", { name: "Parse & fill" }));
+
+    const notice =
+      "Add a value for Authorization before saving. The pasted config did not include it.";
+    expect(await screen.findByText(notice)).toBeInTheDocument();
+    const values = screen.getAllByPlaceholderText("value");
+    await user.type(values[0], "Bearer abc");
+    expect(screen.queryByText(notice)).not.toBeInTheDocument();
+  });
+
+  it("saves pasted empty and padded arguments exactly", async () => {
+    const args = ["server.js", "", " padded "];
+    api.parseServerSnippet.mockResolvedValueOnce([
+      { name: "demo", transport: "stdio", command: "node", args, url: null, env: [] },
+    ]);
+    api.addServer.mockResolvedValueOnce(savedRegistry("demo"));
+    const user = userEvent.setup();
+    render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    await user.click(screen.getByRole("button", { name: "Paste from client config" }));
+    await user.type(screen.getByPlaceholderText(/Paste a config snippet/i), "pasted");
+    await user.click(screen.getByRole("button", { name: "Parse & fill" }));
+    await waitFor(() =>
+      expect(screen.getByLabelText("Arguments")).toHaveValue('server.js "" " padded "'),
+    );
+    await user.click(screen.getByRole("button", { name: "Add" }));
+
+    await waitFor(() => expect(api.addServer).toHaveBeenCalledTimes(1));
+    expect(api.addServer.mock.calls[0][0].args).toEqual(args);
+  });
+
+  it("refuses two variables with one name, as GTK does", async () => {
+    api.parseServerSnippet.mockResolvedValueOnce([
+      {
+        name: "dup",
+        transport: "stdio",
+        command: "npx",
+        args: [],
+        url: null,
+        env: [
+          { key: "API_KEY", value: "abc", secret: true },
+          { key: "TOKEN", value: null, secret: true },
+        ],
+      },
+    ]);
+    const user = userEvent.setup();
+    render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    await user.click(screen.getByRole("button", { name: "Paste from client config" }));
+    await user.type(screen.getByPlaceholderText(/Paste a config snippet/i), "pasted");
+    await user.click(screen.getByRole("button", { name: "Parse & fill" }));
+    const token = await screen.findByDisplayValue("TOKEN");
+    await user.clear(token);
+    await user.type(token, "API_KEY");
+
+    expect(
+      screen.getByText(
+        "Use each variable name once. Rename or remove the second API_KEY.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add" })).toBeDisabled();
+    // The renamed row is no longer a name the paste left out.
+    expect(
+      screen.queryByText(/The pasted config did not include it/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("forgets pasted gaps when the dialog is opened again", async () => {
+    api.parseServerSnippet.mockResolvedValueOnce([
+      {
+        name: "gh",
+        transport: "stdio",
+        command: "npx",
+        args: [],
+        url: null,
+        env: [{ key: "TOKEN", value: null, secret: true }],
+      },
+    ]);
+    const user = userEvent.setup();
+    render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    await user.click(screen.getByRole("button", { name: "Paste from client config" }));
+    await user.type(screen.getByPlaceholderText(/Paste a config snippet/i), "pasted");
+    await user.click(screen.getByRole("button", { name: "Parse & fill" }));
+    await screen.findByText(/Add a value for TOKEN/);
+
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    await user.click(screen.getByRole("button", { name: /Add variable/i }));
+    await user.type(screen.getAllByPlaceholderText("ENV_NAME").at(-1)!, "TOKEN");
+    expect(screen.queryByText(/Add a value for TOKEN/)).not.toBeInTheDocument();
+  });
+
+  it("shows the parser's own message when a paste is refused", async () => {
+    const message = "Write each -e value as KEY=value.";
+    api.parseServerSnippet.mockRejectedValueOnce(message);
+    const user = userEvent.setup();
+    render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    await user.click(screen.getByRole("button", { name: "Paste from client config" }));
+    await user.type(screen.getByPlaceholderText(/claude mcp add \.\.\. \//), "bad");
+    await user.click(screen.getByRole("button", { name: "Parse & fill" }));
+
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith(message));
   });
 
   it("keeps a newer result when tests resolve out of order after reopening", async () => {
