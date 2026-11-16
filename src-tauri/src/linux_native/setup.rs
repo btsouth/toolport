@@ -23,6 +23,11 @@ pub(super) struct ConnectResult {
     pub warnings: Vec<String>,
 }
 
+/// The connect review's title, naming the client as React's does.
+pub(super) fn connect_review_title(client_name: &str) -> String {
+    crate::i18n::trf("Review and connect {value0}", &[("value0", client_name)])
+}
+
 /// The connect review's lede, React's sentence: what happens to the selected entries,
 /// and that a customized Toolport entry is replaced when it is.
 pub(super) fn connect_review_lede(force: bool) -> &'static str {
@@ -545,7 +550,13 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
         .margin_end(12)
         .build();
     content.append(&path);
-    body.append(&details);
+    details.set_widget_name("toolport-setup-review-details");
+    // Under the lede and any notice, above the entries, where React's review has it.
+    let above = notice
+        .as_ref()
+        .map(|card| card.clone().upcast::<gtk::Widget>())
+        .unwrap_or_else(|| lede.clone().upcast());
+    body.insert_child_after(&details, Some(&above));
     let feedback = gtk::Label::builder()
         .xalign(0.0)
         .wrap(true)
@@ -907,7 +918,7 @@ pub(super) fn connect(
                 let notice = gateway_settings_notice(&client_name, &preview.gateway_settings);
                 review_with_notice(
                     &parent,
-                    &crate::i18n::tr("Review and connect"),
+                    &connect_review_title(&client_name),
                     preview.items,
                     &disclosure,
                     Some(connect_review_lede(force)),
@@ -1119,6 +1130,26 @@ mod tests {
         assert!(!labels(&window)
             .iter()
             .any(|t| t == "Review the selected servers before continuing."));
+        // Details sits right under the lede, above the entries, as in React.
+        let review_details = descendants(window.upcast_ref())
+            .into_iter()
+            .find(|w| w.widget_name() == "toolport-setup-review-details")
+            .unwrap();
+        let before = review_details
+            .prev_sibling()
+            .and_downcast::<gtk::Label>()
+            .unwrap();
+        assert_eq!(
+            before.text(),
+            "Selected entries move into Toolport after verification."
+        );
+        assert!(review_details
+            .next_sibling()
+            .is_some_and(|w| w.is::<gtk::ListBox>()));
+        assert_eq!(
+            connect_review_title("Claude Code"),
+            "Review and connect Claude Code"
+        );
         let connect = descendants(window.upcast_ref())
             .into_iter()
             .filter_map(|w| w.downcast::<gtk::Button>().ok())
