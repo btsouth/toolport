@@ -340,7 +340,11 @@ pub fn recheck_locked_once_open(
     poll: Duration,
     report: impl Fn(&ProbeResult) + Sync,
 ) {
-    let queue = || locked.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let queue = || {
+        locked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
     loop {
         std::thread::sleep(poll);
         if queue().is_empty() {

@@ -55,8 +55,8 @@ impl HttpBridgeStatus {
 /// has been unlocked.
 pub const KEYRING_POLL: Duration = Duration::from_secs(3);
 
-/// At start, before the saved token is read: true when reading it would ask to
-/// unlock the keyring. The state then shows as locked until the endpoint starts
+/// At start, before the saved token is read: true when reading it, or saving
+/// a new one, would ask to unlock the keyring. The state then shows as locked until the endpoint starts
 /// or is turned off. A running endpoint is never held.
 pub fn hold_for_keyring(state: &HttpBridgeState) -> bool {
     let running = {
@@ -65,7 +65,7 @@ pub fn hold_for_keyring(state: &HttpBridgeState) -> bool {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         alive(&mut bridge)
     };
-    let hold = !running && crate::secrets::store_would_prompt();
+    let hold = !running && crate::secrets::write_would_ask();
     state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -165,7 +165,7 @@ pub fn restore_after_unlock(
             if !still_waiting() {
                 return;
             }
-            if !crate::secrets::store_would_prompt() {
+            if !crate::secrets::write_would_ask() {
                 restore();
                 return;
             }
@@ -432,6 +432,22 @@ mod tests {
         let outcome = super::restore_with_retries(fixture.clone(), fixture_state, fixture_off, 2);
         assert_eq!(outcome, super::Restore::Off);
         assert!(!super::status(&fixture.0 .0).keyring_locked);
+    }
+
+    /// Failure mode: with no Toolport item in the store and its collection
+    /// locked, the restore made a token it could not save, failed five times
+    /// and stayed off after the unlock.
+    #[test]
+    fn a_locked_collection_holds_the_endpoint_for_the_unlock() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let state = super::HttpBridgeState::default();
+            let prompts = crate::secrets::locked_store::write_prompts_during(|| {
+                assert!(super::hold_for_keyring(&state));
+            });
+            assert!(prompts.is_empty(), "{prompts:?}");
+            assert!(super::status(&state).keyring_locked);
+            assert!(!super::hold_for_keyring(&state), "open: nothing to hold");
+        });
     }
 
     /// The retries are bounded: it then shows the endpoint stopped.

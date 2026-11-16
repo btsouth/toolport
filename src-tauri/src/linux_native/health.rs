@@ -92,7 +92,9 @@ impl HealthCache {
 
     /// Some row shows "Keyring locked".
     pub(super) fn has_locked(&self) -> bool {
-        self.results.values().any(|cached| cached.result.keyring_locked)
+        self.results
+            .values()
+            .any(|cached| cached.result.keyring_locked)
     }
 
     /// Whether to start polling the keyring: some row shows it locked and no

@@ -18958,10 +18958,10 @@ mod tests {
         let off_chip = children(&holding_switch(&off_rows[0]).expect("the off row controls"))
             .into_iter()
             .find(|widget| widget.has_css_class("toolport-badge"))
-            .and_downcast::<gtk::Label>()
             .unwrap();
-        assert_eq!(off_chip.text(), "Off");
         assert!(off_chip.has_css_class("off"));
+        let off_text = off_chip.last_child().and_downcast::<gtk::Label>().unwrap();
+        assert_eq!(off_text.text(), "Off");
 
         // Turning Linear on moves the same row into the running group.
         let linear_row = off_rows[0].clone();

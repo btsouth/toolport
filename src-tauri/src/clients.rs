@@ -10007,9 +10007,9 @@ pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> Repoin
             let _ = std::thread::Builder::new()
                 .name("toolport-backup-upgrade".into())
                 .spawn(|| {
-                    if let Err(error) = backup_storage::upgrade_legacy_once_open(
-                        crate::http_bridge::KEYRING_POLL,
-                    ) {
+                    if let Err(error) =
+                        backup_storage::upgrade_legacy_once_open(crate::http_bridge::KEYRING_POLL)
+                    {
                         eprintln!("toolport: could not secure client recovery backups: {error}");
                     }
                 });
