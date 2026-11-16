@@ -452,19 +452,26 @@ export function ServerDialog({
   // one as its bearer token. Rows the saved remote server already had stay
   // (older tokens and imports), and Authorization is saved as the bearer token.
   // The backend refuses the same with the same sentence, as GTK shows it.
-  const keptRemoteKeys = new Set(
-    initial && initial.transport !== "stdio" ? initial.env.map((e) => e.key) : [],
-  );
+  // A row that can be sent (a secret or a reference) is kept only if the saved
+  // row already could be: a plain value moved to the keychain is a new token.
+  const sendable = (row: { secret?: boolean | null; source?: unknown }) =>
+    row.secret !== false || !!row.source;
+  const savedRemoteRows = initial && initial.transport !== "stdio" ? initial.env : [];
   const typedRemoteKey = isStdio
     ? undefined
     : envRows
-        .map((r) => r.key.trim())
-        .find(
-          (key) =>
+        .filter((r) => {
+          const key = r.key.trim();
+          return (
             key !== "" &&
             key.toLowerCase() !== "authorization" &&
-            !keptRemoteKeys.has(key),
-        );
+            !savedRemoteRows.some(
+              (saved) =>
+                saved.key === key && (saved.secret || !!saved.source || !sendable(r)),
+            )
+          );
+        })
+        .map((r) => r.key.trim())[0];
   if (typedRemoteKey) {
     const message = t(
       "Remote servers don't read environment variables, so Toolport would send {value0} to this server as its bearer token. Remove it, or name it Authorization if it is this server's token.",

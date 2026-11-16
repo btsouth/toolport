@@ -461,6 +461,14 @@ export function ImportRow({
           {line}
         </p>
       ))}
+      {!!item.skippedEnv?.length && (
+        <p className="mt-1 text-meta text-muted-foreground">
+          {t(
+            "Not imported: {value0}. Remote servers don't read environment variables, so Toolport leaves them out rather than send one as the bearer token.",
+            { value0: item.skippedEnv.join(", ") },
+          )}
+        </p>
+      )}
       {!!item.updates?.length && (
         <p className="mt-1 text-meta text-muted-foreground">
           {t("Changes: {changes}", { changes: item.updates.join(", ") })}
