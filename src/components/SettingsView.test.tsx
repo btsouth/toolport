@@ -1,6 +1,6 @@
 import { type SettingsSubpage } from "@/lib/settingsPages";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { ThemeProvider } from "@/lib/theme";
@@ -323,6 +323,53 @@ describe("SettingsView HTTP endpoint waiting for the keyring", () => {
     expect(startHttpBridge).not.toHaveBeenCalled();
     expect(retryHttpBridge).not.toHaveBeenCalled();
     expect(screen.queryByText("Keyring locked")).not.toBeInTheDocument();
+  });
+});
+
+describe("SettingsView HTTP endpoint status reads", () => {
+  it("keeps a finished Retry when an older status read answers after it", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const stopped = { running: false, port: null, url: null, token: null };
+      let pollStarted = false;
+      let answerPoll: (status: typeof stopped & { keyringLocked: boolean }) => void = () => {};
+      vi.mocked(httpBridgeStatus)
+        .mockResolvedValueOnce({ ...stopped, keyringLocked: true })
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              pollStarted = true;
+              answerPoll = resolve;
+            }),
+        );
+      vi.mocked(retryHttpBridge).mockResolvedValueOnce({
+        running: true,
+        port: 8765,
+        url: "http://localhost:8765",
+        token: "bridge-token",
+        keyringLocked: false,
+      });
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+      renderSettings("connections");
+
+      expect(await screen.findByText("Keyring locked")).toBeInTheDocument();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+      await waitFor(() => expect(pollStarted).toBe(true));
+
+      await user.click(screen.getByRole("button", { name: "Retry" }));
+      expect(await screen.findByText("http://localhost:8765")).toBeInTheDocument();
+
+      // The poll that started before Retry answers last, with the old state.
+      await act(async () => {
+        answerPoll({ ...stopped, keyringLocked: true });
+      });
+      expect(screen.getByText("http://localhost:8765")).toBeInTheDocument();
+      expect(screen.queryByText("Keyring locked")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

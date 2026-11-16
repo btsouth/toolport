@@ -917,13 +917,23 @@ export function SettingsView({
   // One-shot (not polled): the status only changes when the user toggles it here.
   // Exposed as a callback so a failed initial read can be retried explicitly, rather
   // than leaving the panel wedged until an app restart.
+  // Bumped by every read and every Start, Stop or Retry: a response from an
+  // older one (a poll that was still in flight when Retry finished) is dropped.
+  const bridgeGeneration = useRef(0);
+  // No poll starts while a Start, Stop or Retry runs; its result comes next.
+  const bridgeActing = useRef(false);
   const loadBridge = useCallback(() => {
+    if (bridgeActing.current) return;
+    const generation = ++bridgeGeneration.current;
     httpBridgeStatus()
       .then((s) => {
+        if (generation !== bridgeGeneration.current) return;
         setBridge(s);
         setBridgeError(false);
       })
-      .catch(() => setBridgeError(true));
+      .catch(() => {
+        if (generation === bridgeGeneration.current) setBridgeError(true);
+      });
   }, []);
   useEffect(() => {
     loadBridge();
@@ -939,12 +949,16 @@ export function SettingsView({
 
   const retryBridge = async () => {
     setBridgeBusy(true);
+    bridgeActing.current = true;
+    const generation = ++bridgeGeneration.current;
     try {
-      setBridge(await retryHttpBridge());
+      const next = await retryHttpBridge();
+      if (generation === bridgeGeneration.current) setBridge(next);
       setBridgeError(false);
     } catch (e) {
       toastError(t("Couldn't start the HTTP endpoint: {value2}", { value2: String(e) }));
     } finally {
+      bridgeActing.current = false;
       setBridgeBusy(false);
     }
   };
@@ -1021,8 +1035,11 @@ export function SettingsView({
 
   const toggleBridge = async (on: boolean) => {
     setBridgeBusy(true);
+    bridgeActing.current = true;
+    const generation = ++bridgeGeneration.current;
     try {
-      setBridge(on ? await startHttpBridge() : await stopHttpBridge());
+      const next = on ? await startHttpBridge() : await stopHttpBridge();
+      if (generation === bridgeGeneration.current) setBridge(next);
       setBridgeError(false);
     } catch (e) {
       toastError(
@@ -1031,6 +1048,7 @@ export function SettingsView({
           : t("Couldn't stop the HTTP endpoint: {value2}", { value2: String(e) }),
       );
     } finally {
+      bridgeActing.current = false;
       setBridgeBusy(false);
     }
   };
