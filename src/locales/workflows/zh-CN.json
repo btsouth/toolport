@@ -547,5 +547,6 @@
   "Toolport cannot read its record of the servers it moved from this client, so Disconnect cannot put them back in the client config. Choose Discard recovery file to delete the record; the servers stay in Toolport.": "Toolport 无法读取它从此客户端移出的服务器记录，因此断开连接时无法把这些服务器放回客户端配置。选择“丢弃恢复文件”删除该记录；这些服务器仍保留在 Toolport 中。",
   "Discard the unreadable record of servers moved from {client}?": "要丢弃从 {client} 移出的服务器的不可读记录吗？",
   "Toolport cannot read its record of the servers it moved from {client} into Toolport. Without it, Disconnect cannot put those servers back in the client config. Discard deletes only this record. The servers stay in Toolport; to use one in {client} without Toolport, add it there again.\n\nThe client config will not change.": "Toolport 无法读取它从 {client} 移入 Toolport 的服务器记录。没有这份记录，断开连接时就无法把这些服务器放回客户端配置。丢弃只会删除这份记录。这些服务器仍保留在 Toolport 中；如需在不使用 Toolport 的情况下在 {client} 中使用，请在那里重新添加。\n\n客户端配置不会改变。",
-  "Toolport's damaged record of the servers it moved from {client} was deleted. The servers stay in Toolport, and the client config was not changed.": "Toolport 关于从 {client} 移出的服务器的损坏记录已删除。这些服务器仍保留在 Toolport 中，客户端配置未被更改。"
+  "Toolport's damaged record of the servers it moved from {client} was deleted. The servers stay in Toolport, and the client config was not changed.": "Toolport 关于从 {client} 移出的服务器的损坏记录已删除。这些服务器仍保留在 Toolport 中，客户端配置未被更改。",
+  "Toolport kept the toolport entry you edited. Remove it by hand if you uninstall Toolport.": "Toolport 保留了你编辑过的 toolport 条目。如果卸载 Toolport，请手动删除它。"
 }

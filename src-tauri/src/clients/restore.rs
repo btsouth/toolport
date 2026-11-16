@@ -618,6 +618,82 @@ pub(super) fn check_legacy_gateway(
     Ok(())
 }
 
+/// The name of Toolport's entry in `text` when it is one v1.24.x wrote for its Shared
+/// HTTP connection: a URL entry or the `npx mcp-remote` bridge, which no 2.x build writes,
+/// matching the Shared HTTP record v1 kept in the registry. An entry that differs from
+/// that record is a hand edit and gets `None`.
+fn legacy_shared_http_entry(
+    client_id: &str,
+    format: Format,
+    text: &str,
+) -> Result<Option<String>, String> {
+    let servers = parse_client_content(format, text)?;
+    let Some(name) =
+        owned_gateway_name(servers.iter().map(|server| server.name.as_str())).map(str::to_owned)
+    else {
+        return Ok(None);
+    };
+    let registry = crate::registry_controller::registry_for_disconnect()?;
+    let Some(record) = registry
+        .client_managed_entries
+        .get(client_id)
+        .filter(|record| record.transport.eq_ignore_ascii_case("sharedHttp"))
+    else {
+        return Ok(None);
+    };
+    Ok(servers
+        .iter()
+        .any(|server| server.name == name && managed_matches_detected(server, record))
+        .then_some(name))
+}
+
+/// After a 2.x Connect, a v1 Shared HTTP Connect and then this upgrade, v1's entry
+/// differs from this record's last write, so undo would keep it as a hand edit. It is
+/// the entry Toolport wrote: treat it as the last write so undo removes it.
+fn adopt_legacy_shared_http(
+    client_id: &str,
+    format: Format,
+    current: Option<&str>,
+    key: &str,
+    inner_key: Option<&str>,
+    written: &Value,
+    latest: &mut Value,
+) -> Result<(), String> {
+    let servers = |root: &Value| {
+        let map = root.get(key)?;
+        match inner_key {
+            Some(inner) => map.get(inner),
+            None => Some(map),
+        }
+        .and_then(Value::as_object)
+        .cloned()
+    };
+    let (Some(text), Some(mut map)) = (current, servers(latest)) else {
+        return Ok(());
+    };
+    let written = servers(written).unwrap_or_default();
+    let changed = owned_gateway_name(map.keys().map(String::as_str))
+        .is_some_and(|name| map.get(name) != written.get(name));
+    if !changed {
+        return Ok(());
+    }
+    let Some(name) = legacy_shared_http_entry(client_id, format, text)? else {
+        return Ok(());
+    };
+    match written.get(&name) {
+        Some(entry) => map.insert(name, entry.clone()),
+        None => map.remove(&name),
+    };
+    let mut slot = latest.get_mut(key);
+    if let Some(inner) = inner_key {
+        slot = slot.and_then(|value| value.get_mut(inner));
+    }
+    if let Some(slot) = slot {
+        *slot = Value::Object(map);
+    }
+    Ok(())
+}
+
 pub(super) fn released(client_id: &str, path: &Path) -> Result<bool, String> {
     Ok(load(client_id, path)?
         .is_some_and(|record| record.disconnected && record.disconnect_before.is_none()))
@@ -669,12 +745,21 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
     } else {
         None
     };
+    // Toolport already took its entry out. An entry v1 wrote for Shared HTTP since then
+    // is still Toolport's: the caller's plain Disconnect removes it.
+    let legacy_since_disconnect = record.disconnected
+        && current
+            .as_deref()
+            .map(|text| legacy_shared_http_entry(client_id, format, text))
+            .transpose()?
+            .flatten()
+            .is_some();
     if record.disconnected
         && record.original.is_none()
         && record.vault_recovery.is_none()
         && record.disconnect_before.is_none()
     {
-        return Ok(true);
+        return Ok(!legacy_since_disconnect);
     }
     if record.disconnected {
         let receipt = record_path(client_id, path)?;
@@ -719,7 +804,7 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
             return Ok(true);
         }
         if record.disconnect_before.is_none() {
-            return Ok(true);
+            return Ok(!legacy_since_disconnect);
         }
     }
     if record.disconnected
@@ -820,6 +905,15 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
         named_list(&mut written, key)?;
         named_list(&mut latest, key)?;
     }
+    adopt_legacy_shared_http(
+        client_id,
+        format,
+        current.as_deref(),
+        key,
+        inner_key,
+        &written,
+        &mut latest,
+    )?;
     let restored = undo(
         before.get(key),
         written.get(key),

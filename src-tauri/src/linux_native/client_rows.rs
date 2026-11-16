@@ -190,13 +190,13 @@ fn client_detail(client: &state::ClientView, style: RowStyle) -> (String, String
     (text, tooltip)
 }
 
-/// "Connected" or "Customized".
+/// "Connected" or "Custom configuration", as React labels it.
 pub(super) fn status_badge(client: &state::ClientView) -> gtk::Label {
     let connected = client.gateway_state == state::ClientGatewayState::Connected;
     let badge = l10n::label(if connected {
         crate::i18n::msg("Connected")
     } else if client.gateway_state == state::ClientGatewayState::Customized {
-        crate::i18n::msg("Customized")
+        crate::i18n::msg("Custom configuration")
     } else if client.app_present || client.config_exists {
         crate::i18n::msg("Not connected")
     } else {

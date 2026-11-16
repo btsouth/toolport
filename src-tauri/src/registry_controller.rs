@@ -6486,7 +6486,7 @@ API_KEY = "synthetic-first-origin"
             .outcome
             .warnings
             .iter()
-            .any(|warning| warning.contains("kept your edited toolport entry")));
+            .any(|warning| warning.contains("kept the toolport entry you edited")));
         assert_eq!(json_file(&fixture.claude()), native);
     }
 

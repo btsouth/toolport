@@ -44,6 +44,8 @@ pub use locations::{
 #[cfg(test)]
 mod gateway_path_tests;
 pub use t3code::{revision as t3_code_revision, T3CodeUse};
+#[cfg(test)]
+mod legacy_shared_http_tests;
 mod moved;
 mod mutation;
 #[cfg(test)]
@@ -5631,7 +5633,9 @@ fn disconnect_warnings(format: Format, path: &Path) -> Result<Vec<String>, Strin
             server.name.eq_ignore_ascii_case(GATEWAY_ENTRY_NAME) || detected_is_gateway(server)
         });
     Ok(if kept {
-        vec!["kept your edited toolport entry; remove it by hand if you uninstall".into()]
+        vec![crate::i18n::tr(
+            "Toolport kept the toolport entry you edited. Remove it by hand if you uninstall Toolport.",
+        )]
     } else {
         Vec::new()
     })
