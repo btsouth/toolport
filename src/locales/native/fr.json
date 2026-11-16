@@ -1073,6 +1073,7 @@
   "{value0} credentials and settings": "{value0} informations d'identification et paramètres",
   "{value0} direct + {value1} fallback": "{value0} direct + {value1} repli",
   "{value0} failing": "{value0} échec",
+  "{value0} waiting for the keyring": "{value0} en attente du trousseau",
   "{value0} is a boolean and should not reach text coercion": "{value0} est un booléen et ne doit pas atteindre la coercition du texte",
   "{value0} is required": "{value0} est requis",
   "{value0} ms": "{value0} ms",

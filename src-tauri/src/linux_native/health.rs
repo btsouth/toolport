@@ -23,6 +23,16 @@ pub(super) enum ProbeReason {
     Refresh,
 }
 
+/// Enabled servers by health state, for the page's one-line summary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Tally {
+    pub(super) ready: usize,
+    pub(super) auth: usize,
+    pub(super) errors: usize,
+    pub(super) locked: usize,
+    pub(super) pending: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ProbeTicket {
     pub(super) server_id: String,
@@ -162,21 +172,20 @@ impl HealthCache {
     }
 
     /// Ready, needs sign-in, failing and still checking, over enabled servers.
-    pub(super) fn tally<'a>(
-        &self,
-        enabled: impl IntoIterator<Item = &'a str>,
-    ) -> (usize, usize, usize, usize) {
-        let (mut ready, mut auth, mut errors, mut pending) = (0, 0, 0, 0);
+    pub(super) fn tally<'a>(&self, enabled: impl IntoIterator<Item = &'a str>) -> Tally {
+        let mut tally = Tally::default();
         for id in enabled {
             match self.results.get(id) {
-                _ if self.in_flight.contains_key(id) => pending += 1,
-                None => pending += 1,
-                Some(cached) if cached.result.ok => ready += 1,
-                Some(cached) if cached.result.auth_required => auth += 1,
-                Some(_) => errors += 1,
+                _ if self.in_flight.contains_key(id) => tally.pending += 1,
+                None => tally.pending += 1,
+                Some(cached) if cached.result.ok => tally.ready += 1,
+                Some(cached) if cached.result.auth_required => tally.auth += 1,
+                // Not checked: the keyring is locked. Not a failure.
+                Some(cached) if cached.result.keyring_locked => tally.locked += 1,
+                Some(_) => tally.errors += 1,
             }
         }
-        (ready, auth, errors, pending)
+        tally
     }
 
     fn start(&mut self, server_id: &str, fingerprint: u64) -> ProbeTicket {
@@ -246,7 +255,13 @@ mod tests {
                 .plan(&enabled, ProbeReason::ConfigChanged, now)
                 .is_empty());
         }
-        assert_eq!(cache.tally(["a", "b"]), (2, 0, 0, 0));
+        assert_eq!(
+            cache.tally(["a", "b"]),
+            Tally {
+                ready: 2,
+                ..Tally::default()
+            }
+        );
     }
 
     #[test]
@@ -335,7 +350,13 @@ mod tests {
         let ProbeOutcome::Rerun(next) = cache.complete(&refresh[0], ok("a"), now) else {
             panic!("an invalidated probe must be rerun");
         };
-        assert_eq!(cache.tally(["a"]), (0, 0, 0, 1));
+        assert_eq!(
+            cache.tally(["a"]),
+            Tally {
+                pending: 1,
+                ..Tally::default()
+            }
+        );
         assert_eq!(cache.complete(&next, ok("a"), now), ProbeOutcome::Apply);
         // A ticket from an older round never lands.
         assert_eq!(

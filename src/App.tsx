@@ -759,7 +759,13 @@ function App() {
   // Keep these counts independent of `visible` so a filter cannot produce a
   // misleading "0 servers" action while hiding an affected row.
   const authAttention = attentionServers.filter((s) => health[s.id]?.authRequired);
-  const errorAttention = attentionServers.filter((s) => !health[s.id]?.authRequired);
+  // Not failing: not checked, because the keyring is locked.
+  const lockedAttention = attentionServers.filter(
+    (s) => !health[s.id]?.authRequired && health[s.id]?.keyringLocked,
+  );
+  const errorAttention = attentionServers.filter(
+    (s) => !health[s.id]?.authRequired && !health[s.id]?.keyringLocked,
+  );
 
   // Count what would actually be imported: drop the gateway entry and anything
   // already in the registry, then dedupe by name across clients (the backend
@@ -1400,6 +1406,7 @@ function App() {
                             <ServerNextAction
                               authServers={authAttention}
                               errorServers={errorAttention}
+                              lockedServers={lockedAttention}
                             />
                           ) : (
                             <ServerPosture
@@ -1689,13 +1696,30 @@ function ServerPosture({
 function ServerNextAction({
   authServers,
   errorServers,
+  lockedServers = [],
 }: {
   authServers: ServerEntry[];
   errorServers: ServerEntry[];
+  lockedServers?: ServerEntry[];
 }) {
   const { t } = useI18n();
   const authCount = authServers.length;
-  const errorCount = errorServers.length;
+  // Servers the window did not check because the keyring is locked: on their
+  // own they only need an unlock; alongside other problems they count with
+  // those that could not start.
+  const lockedOnly =
+    lockedServers.length > 0 && authCount === 0 && errorServers.length === 0;
+  if (lockedOnly) {
+    return (
+      <StatusCard
+        variant="warning"
+        icon={<KeyRound />}
+        title={t("Keyring locked")}
+        detail={t("Unlock your keyring, then choose Retry.")}
+      />
+    );
+  }
+  const errorCount = errorServers.length + lockedServers.length;
   const title =
     authCount === 1 && errorCount === 0
       ? t("Sign in to {value1}", { value1: authServers[0].name })

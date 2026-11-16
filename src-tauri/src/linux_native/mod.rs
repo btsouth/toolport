@@ -2569,10 +2569,9 @@ impl ServerPage {
             self.posture.set_visible(false);
             return;
         }
-        let (ready, auth, errors, pending) = self.health.borrow().tally(enabled.iter().copied());
+        let tally = self.health.borrow().tally(enabled.iter().copied());
         self.posture.set_visible(true);
-        self.posture
-            .set_label(&posture_line(ready, auth, errors, pending, enabled.len()));
+        self.posture.set_label(&posture_line(tally, enabled.len()));
     }
 
     /// Probe the enabled servers the health cache says need it, in the
@@ -10006,7 +10005,14 @@ fn probe_tooltip(probe: &crate::server_runtime::ProbeResult) -> Option<String> {
 }
 
 /// The one-line posture summary above the server list.
-fn posture_line(ready: usize, auth: usize, errors: usize, pending: usize, total: usize) -> String {
+fn posture_line(tally: health::Tally, total: usize) -> String {
+    let health::Tally {
+        ready,
+        auth,
+        errors,
+        locked,
+        pending,
+    } = tally;
     if pending > 0 {
         return crate::i18n::trf(
             if total == 1 {
@@ -10020,7 +10026,7 @@ fn posture_line(ready: usize, auth: usize, errors: usize, pending: usize, total:
             ],
         );
     }
-    if auth == 0 && errors == 0 {
+    if auth == 0 && errors == 0 && locked == 0 {
         return crate::i18n::trf(
             if total == 1 {
                 crate::i18n::msg("All {value0} enabled server is ready.")
@@ -10048,6 +10054,12 @@ fn posture_line(ready: usize, auth: usize, errors: usize, pending: usize, total:
         parts.push(crate::i18n::trf(
             "{value0} failing",
             &[("value0", &format!("{}", errors))],
+        ));
+    }
+    if locked > 0 {
+        parts.push(crate::i18n::trf(
+            "{value0} waiting for the keyring",
+            &[("value0", &format!("{}", locked))],
         ));
     }
     parts.join(" · ")
@@ -18275,20 +18287,67 @@ mod tests {
 
     #[test]
     fn posture_lines_cover_checking_healthy_and_mixed_states() {
+        // A locked keyring is not a failure: those servers were not checked.
         assert_eq!(
-            posture_line(0, 0, 0, 3, 3),
+            posture_line(
+                health::Tally {
+                    locked: 9,
+                    ..health::Tally::default()
+                },
+                9
+            ),
+            "0 ready · 9 waiting for the keyring"
+        );
+        assert_eq!(
+            posture_line(
+                health::Tally {
+                    ready: 0,
+                    auth: 0,
+                    errors: 0,
+                    locked: 0,
+                    pending: 3,
+                },
+                3
+            ),
             "Checking 3 of 3 enabled servers…"
         );
         assert_eq!(
-            posture_line(4, 0, 0, 0, 4),
+            posture_line(
+                health::Tally {
+                    ready: 4,
+                    auth: 0,
+                    errors: 0,
+                    locked: 0,
+                    pending: 0,
+                },
+                4
+            ),
             "All 4 enabled servers are ready."
         );
         assert_eq!(
-            posture_line(1, 0, 0, 0, 1),
+            posture_line(
+                health::Tally {
+                    ready: 1,
+                    auth: 0,
+                    errors: 0,
+                    locked: 0,
+                    pending: 0,
+                },
+                1
+            ),
             "All 1 enabled server is ready."
         );
         assert_eq!(
-            posture_line(2, 1, 1, 0, 4),
+            posture_line(
+                health::Tally {
+                    ready: 2,
+                    auth: 1,
+                    errors: 1,
+                    locked: 0,
+                    pending: 0,
+                },
+                4
+            ),
             "2 ready · 1 needs sign-in · 1 failing"
         );
     }

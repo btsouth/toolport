@@ -218,6 +218,50 @@ describe("App health visibility", () => {
     expect(screen.queryByRole("status", { name: /^Ready,/i })).not.toBeInTheDocument();
   });
 
+  it("shows a locked keyring as locked, and only a Retry may ask to unlock it", async () => {
+    localStorage.setItem("toolport.onboarded", "1");
+    getRegistry.mockResolvedValue({
+      version: 3,
+      servers: [
+        {
+          id: "server-1",
+          enabled: true,
+          name: "Vaulted server",
+          transport: "stdio",
+          command: "example",
+          args: [],
+          env: [{ key: "TOKEN", secret: true }],
+          url: null,
+          source: "manual",
+        },
+      ],
+      profiles: [{ id: "default", name: "Default", enabledServerIds: ["server-1"] }],
+      activeProfileId: "default",
+    });
+    probeServers.mockResolvedValue([
+      {
+        serverId: "server-1",
+        ok: false,
+        toolCount: 0,
+        error: "keyring locked",
+        authRequired: false,
+        keyringLocked: true,
+      },
+    ]);
+
+    render(<App />);
+
+    expect(
+      await screen.findByText("Unlock your keyring, then choose Retry."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/couldn't start/i)).not.toBeInTheDocument();
+    expect(probeServers).toHaveBeenCalledWith(false);
+    expect(probeServers).not.toHaveBeenCalledWith(true);
+
+    await userEvent.click(screen.getByRole("button", { name: /Retry/ }));
+    await waitFor(() => expect(probeServers).toHaveBeenCalledWith(true));
+  });
+
   it("drops stale health when a server is re-enabled", async () => {
     localStorage.setItem("toolport.onboarded", "1");
     const server = {
