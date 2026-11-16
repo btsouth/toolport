@@ -729,7 +729,7 @@ it("keeps an open Discard confirmation when a reload empties the list", async ()
 it("says plainly when Retry leaves the keyring locked, with the backend's words", async () => {
   // The backend writes this line for both shells; GTK shows the same text.
   const locked =
-    "Your keyring is still locked, so nothing was restored. Unlock it and choose Retry again.";
+    "Keyring locked. Nothing was restored. Unlock your keyring, then choose Retry.";
   api.retryClientRecovery.mockResolvedValue({ ...result(recovery()), message: locked });
   render(<ClientRecoveryBanners refreshKey="initial" />);
   const notice = await screen.findByRole("region", {

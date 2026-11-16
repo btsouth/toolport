@@ -75,26 +75,13 @@ pub(crate) fn delete(server: &str, key: &str, discard_all: bool) -> Result<(), B
     crate::secrets::delete_backup_secret_copies_status(server, key, discard_all)
 }
 
-/// Whether the keyring a new item would go to is locked, without asking to
-/// unlock it. Only Linux's Secret Service prompts on a write; other stores
-/// answer for themselves.
+/// Whether using the store now would ask to unlock it; never asks itself.
 pub(crate) fn store_locked() -> bool {
     #[cfg(test)]
     if let Some(locked) = fake::locked() {
         return locked;
     }
-    if !uses_secret_service() {
-        return false;
-    }
-    secret_service::default_locked().unwrap_or(false)
-}
-
-/// Linux keeps saved copies in the Secret Service unless the encrypted file
-/// vault is in use (`TOOLPORT_SECRET_KEY`, as `secrets` decides it).
-fn uses_secret_service() -> bool {
-    cfg!(target_os = "linux")
-        && crate::brand::env_var("TOOLPORT_SECRET_KEY", "CONDUIT_SECRET_KEY")
-            .is_none_or(|key| key.is_empty())
+    crate::secrets::store_would_prompt()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,9 +98,6 @@ pub(crate) fn request_unlock() -> Unlock {
     #[cfg(test)]
     if let Some(answer) = fake::unlock() {
         return answer;
-    }
-    if !uses_secret_service() {
-        return Unlock::Open;
     }
     match secret_service::unlock() {
         Ok(()) if !store_locked() => Unlock::Open,
@@ -158,13 +142,6 @@ mod secret_service {
         SecretService::connect_with_max_prompt_timeout(EncryptionType::Plain, prompt_seconds).ok()
     }
 
-    /// Reads the Locked property only; never asks for an unlock.
-    pub(super) fn default_locked() -> Option<bool> {
-        let service = connect(0)?;
-        let collection = service.get_default_collection().ok()?;
-        collection.is_locked().ok()
-    }
-
     pub(super) fn unlock() -> Result<(), ()> {
         let service = connect(PROMPT_SECONDS).ok_or(())?;
         if let Ok(collection) = service.get_default_collection() {
@@ -187,9 +164,6 @@ mod secret_service {
 
 #[cfg(not(target_os = "linux"))]
 mod secret_service {
-    pub(super) fn default_locked() -> Option<bool> {
-        None
-    }
     pub(super) fn unlock() -> Result<(), ()> {
         Ok(())
     }
@@ -236,6 +210,16 @@ pub(crate) mod fake {
         let _clear = Clear;
         test();
         with(|store| std::mem::take(&mut store.calls)).unwrap_or_default()
+    }
+
+    /// [`locked_store`] inside `secrets::locked_store`: also returns every
+    /// stored-value read that would have asked to unlock the keyring.
+    pub(crate) fn locked_everywhere(test: impl FnOnce()) -> (Vec<String>, Vec<String>) {
+        let mut prompts = Vec::new();
+        let calls = locked_store(Unlock::StillLocked, || {
+            prompts = crate::secrets::locked_store::prompts_during(test);
+        });
+        (calls, prompts)
     }
 
     pub(super) fn read(

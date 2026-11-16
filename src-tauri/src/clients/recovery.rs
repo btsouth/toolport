@@ -736,7 +736,7 @@ pub struct RecoveryAttempt {
     pub pending: Option<ClientRecovery>,
 }
 const STILL_LOCKED: &str = crate::i18n::msg(
-    "Your keyring is still locked, so nothing was restored. Unlock it and choose Retry again.",
+    "Keyring locked. Nothing was restored. Unlock your keyring, then choose Retry.",
 );
 /// Shared Retry result when the keyring stayed locked, in every shell.
 pub fn still_locked_message() -> String {
@@ -1156,10 +1156,11 @@ mod tests {
             let data = crate::registry::conduit_dir().unwrap();
             let card = locked_card_fixture("cursor", &data.join("listed.json"));
             let mut rows = Vec::new();
-            let calls = backup_vault::fake::locked_store(backup_vault::Unlock::StillLocked, || {
+            let (calls, prompts) = backup_vault::fake::locked_everywhere(|| {
                 rows = list().unwrap();
             });
             assert_eq!(calls, Vec::<String>::new(), "listing made store calls");
+            assert_eq!(prompts, Vec::<String>::new(), "listing would prompt");
             let listed = rows.iter().find(|r| r.id == card.id).unwrap();
             assert_eq!(listed.message, card.message);
             assert!(listed.message.starts_with("Cursor is disconnected."));
@@ -1193,7 +1194,7 @@ mod tests {
             let still = outcome.take().unwrap();
             assert_eq!(
                 still.message,
-                "Your keyring is still locked, so nothing was restored. Unlock it and choose Retry again."
+                "Keyring locked. Nothing was restored. Unlock your keyring, then choose Retry."
             );
             assert_eq!(still.message, still_locked_message());
             assert_eq!(

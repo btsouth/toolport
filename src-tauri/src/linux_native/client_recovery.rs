@@ -1090,14 +1090,12 @@ mod tests {
             let card =
                 crate::clients::recovery::locked_card_fixture("cursor", &data.join("gtk.json"));
             let mut texts = Vec::new();
-            let calls = crate::clients::backup_vault::fake::locked_store(
-                crate::clients::backup_vault::Unlock::StillLocked,
-                || {
-                    texts.push(current_text(&card.id, |r| &r.message, "fallback"));
-                    texts.push(current_text(&card.id, |r| &r.instructions, "fallback"));
-                },
-            );
+            let (calls, prompts) = crate::clients::backup_vault::fake::locked_everywhere(|| {
+                texts.push(current_text(&card.id, |r| &r.message, "fallback"));
+                texts.push(current_text(&card.id, |r| &r.instructions, "fallback"));
+            });
             assert_eq!(calls, Vec::<String>::new(), "card text made store calls");
+            assert_eq!(prompts, Vec::<String>::new(), "card text would prompt");
             assert_eq!(texts, vec![card.message.clone(), card.instructions.clone()]);
         });
     }

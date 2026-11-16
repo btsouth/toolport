@@ -438,11 +438,12 @@ fn a_locked_keyring_defers_the_startup_refresh_without_a_prompt() {
             rows
         };
         let mut outcome = None;
-        let calls = backup_vault::fake::locked_store(backup_vault::Unlock::Open, || {
+        let (calls, prompts) = backup_vault::fake::locked_everywhere(|| {
             outcome = Some(backup_vault::noninteractive(|| {
                 repoint_stale_gateways_in(current, rows(), &HashMap::new())
             }));
         });
+        assert_eq!(prompts, Vec::<String>::new());
         assert!(
             !calls
                 .iter()
@@ -481,9 +482,10 @@ fn a_locked_keyring_defers_sealing_legacy_backups_at_start() {
         let file = legacy.join("1700000000000-mcp.json");
         std::fs::write(&file, &original).unwrap();
         let mut outcome = None;
-        let calls = backup_vault::fake::locked_store(backup_vault::Unlock::Open, || {
+        let (calls, prompts) = backup_vault::fake::locked_everywhere(|| {
             outcome = Some(repoint_stale_gateways(&HashMap::new()));
         });
+        assert_eq!(prompts, Vec::<String>::new());
         assert!(
             !calls
                 .iter()
