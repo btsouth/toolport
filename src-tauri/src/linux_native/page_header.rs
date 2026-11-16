@@ -597,15 +597,16 @@ mod tests {
 
     #[test]
     fn row_controls_split_so_no_control_is_left_alone_when_another_split_exists() {
-        // CI's German "Service key required" row at a 480 px window: chip, Edit
-        // service key, View log, then the switch and menu, in 404 px.
-        assert_eq!(super::balanced_lines(&[191, 205, 136, 88], 8, 404), [2, 2]);
-        // One pixel wider and the chip cannot share its line: it stays alone,
-        // and the switch and menu still get company.
+        // CI's German "Service key required" row in a 480 px window, as laid out
+        // there (border boxes): chip, Edit service key, View log, then the
+        // switch and menu, in 404 px. The chip cannot share its line, and the
+        // switch and menu go with View log instead of alone on a third line.
         assert_eq!(
-            super::balanced_lines(&[191, 206, 136, 88], 8, 404),
+            super::balanced_lines(&[191, 239, 156, 88], 8, 404),
             [1, 1, 2]
         );
+        // When the chip and the first action fit together, they share.
+        assert_eq!(super::balanced_lines(&[191, 205, 156, 88], 8, 404), [2, 2]);
         // English at 480: chip and Sign in, then View log with the switch.
         assert_eq!(super::balanced_lines(&[105, 70, 80, 88], 8, 338), [2, 2]);
         // Everything fits: one line.

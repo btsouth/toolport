@@ -18978,27 +18978,76 @@ mod tests {
                 window.present();
                 let check = |card: &gtk::Box, what: &str| {
                     let label = state(card);
-                    // Wait for the layout of the new status, not a fixed number of
-                    // turns: the chip has its one-line width once it is allocated.
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                    loop {
-                        while gtk::glib::MainContext::default().iteration(false) {}
-                        let (_, natural, _, _) = label.measure(gtk::Orientation::Horizontal, -1);
-                        // Every control that just appeared has its place too.
-                        let flow = label.parent().and_then(|chip| chip.parent()).unwrap();
-                        let mut placed = true;
+                    let flow = label.parent().and_then(|chip| chip.parent()).unwrap();
+                    let chip = label.parent().unwrap();
+                    // Sizes as the flow lays them out: natural widths from
+                    // measure and border-box bounds, both with CSS padding and
+                    // borders (Widget::width() leaves those out).
+                    let natural_width =
+                        |widget: &gtk::Widget| widget.measure(gtk::Orientation::Horizontal, -1).1;
+                    let laid_width = |widget: &gtk::Widget| {
+                        widget
+                            .compute_bounds(&flow)
+                            .map_or(0, |at| at.width().round() as i32)
+                    };
+                    let shown = || {
+                        let mut out = Vec::new();
                         let mut child = flow.first_child();
                         while let Some(widget) = child {
-                            placed &= !widget.should_layout() || widget.width() > 0;
+                            if widget.should_layout() {
+                                out.push(widget.clone());
+                            }
                             child = widget.next_sibling();
                         }
-                        if (label.width() == natural && card.width() > 0 && placed)
-                            || std::time::Instant::now() >= deadline
-                        {
-                            break;
+                        out
+                    };
+                    // Wait for the layout of the new status, then for one whole
+                    // frame after it: a frame runs every pending layout before it
+                    // paints, so no control keeps its place from the last status.
+                    let painted = std::rc::Rc::new(std::cell::Cell::new(0u32));
+                    let clock = window.frame_clock().unwrap();
+                    let counter = clock.connect_after_paint({
+                        let painted = painted.clone();
+                        move |_| painted.set(painted.get() + 1)
+                    });
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let mut settled_at = None;
+                    loop {
+                        while gtk::glib::MainContext::default().iteration(false) {}
+                        let laid_out = laid_width(label.upcast_ref())
+                            == natural_width(label.upcast_ref())
+                            && card.width() > 0
+                            && shown()
+                                .iter()
+                                .all(|w| laid_width(w) == natural_width(w) && laid_width(w) > 0);
+                        match settled_at {
+                            _ if !laid_out => settled_at = None,
+                            Some(frame) if painted.get() > frame => break,
+                            Some(_) => {}
+                            None => {
+                                settled_at = Some(painted.get());
+                                window.queue_allocate();
+                                window.queue_draw();
+                            }
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "{language} at {width}: no settled frame for {what}: painted {} settled {:?} label {}/{} card {} {:?}",
+                            painted.get(),
+                            settled_at,
+                            laid_width(label.upcast_ref()),
+                            natural_width(label.upcast_ref()),
+                            card.width(),
+                            shown()
+                                .iter()
+                                .map(|w| (w.type_().name(), laid_width(w), natural_width(w)))
+                                .collect::<Vec<_>>()
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(2));
                     }
+                    clock.disconnect(counter);
+                    // The chip is one line of whole words: one Pango line, not
+                    // ellipsized, and exactly one line tall.
                     assert!(
                         label.layout().line_count() == 1 && !label.layout().is_ellipsized(),
                         "{language} at {width}: \"{}\" ({what}) takes {} lines in {} px",
@@ -19006,46 +19055,89 @@ mod tests {
                         label.layout().line_count(),
                         label.width()
                     );
+                    assert_eq!(
+                        label
+                            .compute_bounds(&flow)
+                            .map_or(0, |at| at.height().round() as i32),
+                        label.measure(gtk::Orientation::Vertical, -1).1,
+                        "{language} at {width}: \"{}\" ({what}) is taller than one line",
+                        label.text()
+                    );
                     let (min, _, _, _) = card.measure(gtk::Orientation::Horizontal, -1);
                     assert!(
                         min <= width,
                         "{language}: the row needs {min} px of {width}"
                     );
-                    // The controls keep to the right edge, as in React, also on a
-                    // line of their own.
-                    let flow = label.parent().and_then(|chip| chip.parent()).unwrap();
-                    let mut last = flow.last_child();
-                    while let Some(widget) = last.clone().filter(|w| !w.should_layout()) {
-                        last = widget.prev_sibling();
-                    }
-                    let last = last.unwrap();
-                    let bounds = last.compute_bounds(&flow).unwrap();
-                    assert_eq!(
-                        (bounds.x() + bounds.width()).round() as i32,
-                        flow.width(),
-                        "{language} at {width}: the last control leaves the flow's right edge"
-                    );
-                    // React's order: the chip, then what recovers from it, then
-                    // the switch and the menu. No control is ever alone on a line.
-                    let mut placed = Vec::new();
-                    let mut child = flow.first_child();
-                    while let Some(widget) = child {
-                        if widget.should_layout() {
-                            // Grouped by line through their middle: a short chip
-                            // is centered on a line of taller buttons.
+                    // Each control with its line (grouped through its middle: a
+                    // short chip is centered on a line of taller buttons).
+                    let placed = shown()
+                        .into_iter()
+                        .map(|widget| {
                             let at = widget.compute_bounds(&flow).unwrap();
                             let middle = (at.y() + at.height() / 2.0).round() as i32;
-                            placed.push((widget.clone(), middle, at.x()));
+                            (widget, middle, at)
+                        })
+                        .collect::<Vec<_>>();
+                    let layout = || {
+                        format!(
+                            "{:?} in {}",
+                            placed
+                                .iter()
+                                .map(|(w, y, at)| (w.type_().name(), *y, at.x(), at.width()))
+                                .collect::<Vec<_>>(),
+                            flow.width()
+                        )
+                    };
+                    let mut lines: Vec<Vec<usize>> = Vec::new();
+                    for (index, (_, middle, _)) in placed.iter().enumerate() {
+                        match lines.last_mut() {
+                            Some(line) if (placed[line[0]].1 - middle).abs() <= 2 => {
+                                line.push(index)
+                            }
+                            _ => lines.push(vec![index]),
                         }
-                        child = widget.next_sibling();
                     }
-                    // The switch and the menu are one group at the end, so no
-                    // width can split them.
+                    // Every control inside the row, and every line, also one of
+                    // its own, against the right edge as in React.
+                    let flow_in_card = flow.compute_bounds(card).unwrap();
+                    assert!(
+                        flow_in_card.x() >= 0.0
+                            && (flow_in_card.x() + flow_in_card.width()).round() as i32
+                                <= card.width(),
+                        "{language} at {width}: the controls leave the card ({what})"
+                    );
+                    for line in &lines {
+                        for &index in line {
+                            let at = &placed[index].2;
+                            assert!(
+                                at.x() >= 0.0
+                                    && (at.x() + at.width()).round() as i32 <= flow.width(),
+                                "{language} at {width}: a control leaves the row ({what}): {}",
+                                layout()
+                            );
+                        }
+                        let end = &placed[*line.last().unwrap()].2;
+                        assert_eq!(
+                            (end.x() + end.width()).round() as i32,
+                            flow.width(),
+                            "{language} at {width}: a line leaves the right edge ({what}): {}",
+                            layout()
+                        );
+                    }
+                    // React's order: the chip, then what recovers from it, then
+                    // the switch and the menu, one group that no width splits.
+                    assert!(
+                        placed[0].0 == chip,
+                        "{language} at {width}: the chip comes first"
+                    );
                     let pair = &placed.last().unwrap().0;
                     let mut kinds = Vec::new();
+                    let mut middles = Vec::new();
                     let mut child = pair.first_child();
                     while let Some(widget) = child {
                         kinds.push(widget.type_().name());
+                        let at = widget.compute_bounds(&flow).unwrap();
+                        middles.push((at.y() + at.height() / 2.0).round() as i32);
                         child = widget.next_sibling();
                     }
                     assert_eq!(
@@ -19053,67 +19145,54 @@ mod tests {
                         ["GtkSwitch", "GtkMenuButton"],
                         "{language} at {width}: the switch and the menu stay together"
                     );
-                    let chip = label.parent().unwrap();
-                    let chip_at = placed.iter().position(|(w, _, _)| *w == chip).unwrap();
-                    assert_eq!(chip_at, 0, "{language} at {width}: the chip comes first");
-                    // Controls alone on a line: no more than the fewest any
-                    // in-order split of these widths allows, and never the
-                    // switch and menu (they always fit beside the action before).
-                    let mut middles = placed.iter().map(|(_, y, _)| *y).collect::<Vec<_>>();
-                    middles.dedup_by(|a, b| (*a - *b).abs() <= 2);
-                    let per_line = middles
+                    assert!(
+                        (middles[0] - middles[1]).abs() <= 2,
+                        "{language} at {width}: the switch and the menu share a line"
+                    );
+                    // A control is alone on a line only when this run's natural
+                    // widths leave no in-order split with fewer lone controls;
+                    // and the switch and menu are alone only when the control
+                    // before them cannot fit beside them.
+                    let widths = placed
                         .iter()
-                        .map(|middle| {
-                            placed
-                                .iter()
-                                .filter(|(_, y, _)| (*y - middle).abs() <= 2)
-                                .count()
-                        })
+                        .map(|(w, _, _)| natural_width(w))
                         .collect::<Vec<_>>();
-                    let widths = placed.iter().map(|(w, _, _)| w.width()).collect::<Vec<_>>();
+                    let fits = |line: &[i32]| {
+                        line.len() == 1
+                            || line.iter().sum::<i32>() + 8 * (line.len() as i32 - 1)
+                                <= flow.width()
+                    };
                     let fewest_alone = (0u32..1 << (widths.len() - 1))
                         .filter_map(|breaks| {
-                            let mut lines = vec![vec![widths[0]]];
+                            let mut split = vec![vec![widths[0]]];
                             for (index, w) in widths.iter().enumerate().skip(1) {
                                 if breaks & (1 << (index - 1)) != 0 {
-                                    lines.push(vec![*w]);
+                                    split.push(vec![*w]);
                                 } else {
-                                    lines.last_mut().unwrap().push(*w);
+                                    split.last_mut().unwrap().push(*w);
                                 }
                             }
-                            lines
+                            split
                                 .iter()
-                                .all(|line| {
-                                    line.len() == 1
-                                        || line.iter().sum::<i32>() + 8 * (line.len() as i32 - 1)
-                                            <= flow.width()
-                                })
-                                .then(|| lines.iter().filter(|line| line.len() == 1).count())
+                                .all(|line| fits(line))
+                                .then(|| split.iter().filter(|line| line.len() == 1).count())
                         })
                         .min()
                         .unwrap();
-                    let layout = || {
-                        format!(
-                            "{:?} in {}",
-                            placed
-                                .iter()
-                                .map(|(w, y, x)| (w.type_().name(), *y, *x, w.width()))
-                                .collect::<Vec<_>>(),
-                            flow.width()
-                        )
-                    };
                     assert_eq!(
-                        per_line.iter().filter(|count| **count == 1).count(),
+                        lines.iter().filter(|line| line.len() == 1).count(),
                         fewest_alone,
                         "{language} at {width}: a control alone on a line that could share one ({what}): {}",
                         layout()
                     );
-                    assert!(
-                        placed.len() == 1 || *per_line.last().unwrap() > 1,
-                        "{language} at {width}: the switch and menu alone on the last line ({what}): {}",
-                        layout()
-                    );
-                    let in_card = last.compute_bounds(card).unwrap();
+                    if widths.len() > 1 && fits(&widths[widths.len() - 2..]) {
+                        assert!(
+                            lines.last().unwrap().len() > 1,
+                            "{language} at {width}: the switch and menu alone on the last line ({what}): {}",
+                            layout()
+                        );
+                    }
+                    let in_card = pair.compute_bounds(card).unwrap();
                     let line = flow.parent().unwrap();
                     let line_end = line.compute_bounds(card).unwrap();
                     assert_eq!(
