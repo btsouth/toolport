@@ -1910,18 +1910,27 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(dropdowns.len(), 2);
         dropdowns[1].set_selected(3);
+        // Poll the saved file without `registry::load()`. A full load takes the
+        // exclusive registry lock, and while the fixture registry is still absent it
+        // holds that lock through the rename-window read retries (about 225 ms).
+        // Polling it back to back starved the handler's write of the lock for
+        // seconds, which is what made this test flaky.
+        let saved_mode = || {
+            let path = crate::registry::registry_path()?;
+            let contents = std::fs::read_to_string(path).ok()?;
+            crate::registry::parse_registry_contents(&contents)
+                .ok()?
+                .client_discovery
+                .get("codex@work")
+                .cloned()
+        };
         let context = gtk::glib::MainContext::default();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             while context.pending() {
                 context.iteration(false);
             }
-            if crate::registry::load()
-                .unwrap()
-                .client_discovery
-                .get("codex@work")
-                .is_some_and(|mode| mode == "full")
-            {
+            if saved_mode().as_deref() == Some("full") {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
