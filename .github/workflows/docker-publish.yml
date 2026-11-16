@@ -7,8 +7,24 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  # On PRs, only when the image or the gateway binary can change. The binary
+  # reads src-tauri/** and, at compile time, src/locales/** (i18n.rs). Every
+  # other include outside src-tauri is in a cfg(test) module that these release
+  # builds never compile, and linux_native needs the gtk-desktop feature, which
+  # they never enable. Push to main, tags and dispatch always run.
   pull_request:
     branches: [main]
+    paths:
+      - "src-tauri/**"
+      - "!src-tauri/src/linux_native/**"
+      - "src/locales/**"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "Dockerfile"
+      - "docker-entrypoint.sh"
+      - ".dockerignore"
+      - ".github/workflows/docker-publish.yml"
+      - "scripts/ci-apt-install.sh"
   workflow_dispatch:
     inputs:
       registry_tag:
