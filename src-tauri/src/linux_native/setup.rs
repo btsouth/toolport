@@ -291,7 +291,20 @@ pub(super) fn review_with_notice(
             gtk::glib::Propagation::Proceed
         });
     }
-    let lede = {
+    // A review that could not be read shows its error as the body, as React's dialog
+    // does, with no lede, server list or Details.
+    let unreadable = step.retry.is_some();
+    let lede = if unreadable {
+        let widget = gtk::Label::builder()
+            .label(disclosure)
+            .xalign(0.0)
+            .wrap(true)
+            .selectable(true)
+            .focusable(false)
+            .build();
+        widget.add_css_class("warning");
+        widget
+    } else {
         let widget = gtk::Label::builder()
             .label(crate::i18n::tr(
                 "Review the selected servers before continuing.",
@@ -624,6 +637,8 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
         .margin_end(12)
         .build();
     content.append(&path);
+    details.set_visible(!unreadable);
+    rows.set_visible(!unreadable);
     body.append(&details);
     let feedback = gtk::Label::builder()
         .xalign(0.0)
@@ -1351,6 +1366,33 @@ mod tests {
         wait_for(&|| window_titled("Connect Client").is_some());
         let window = window_titled("Connect Client").unwrap();
         assert!(label_shown(&window, "Step 2 of 2: Gone"));
+        // The error is the body, as in React's dialog: not a review lede over an empty
+        // list with the reason folded under Details.
+        assert!(!label_shown(
+            &window,
+            "Review the selected servers before continuing."
+        ));
+        let shown = descendants(window.upcast_ref());
+        assert!(
+            !shown
+                .iter()
+                .any(|w| w.is::<gtk::Expander>() && w.is_visible()),
+            "no Details expander"
+        );
+        assert!(
+            !shown
+                .iter()
+                .any(|w| w.is::<gtk::ListBox>() && w.is_visible()),
+            "no empty server list"
+        );
+        assert!(
+            shown.iter().any(|w| w
+                .downcast_ref::<gtk::Label>()
+                .is_some_and(|l| l.has_css_class("warning")
+                    && l.is_visible()
+                    && !l.text().is_empty())),
+            "the error is shown"
+        );
         let confirm = button_named(&window, "toolport-setup-confirm");
         assert_eq!(confirm.label().as_deref(), Some("Retry"));
         assert!(button_named(&window, "toolport-setup-skip").is_visible());
