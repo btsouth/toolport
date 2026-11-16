@@ -230,7 +230,7 @@ jobs:
         with:
           node-version: 24
       - name: Test check selection and required gate
-        run: node --test .github/scripts/ci-policy.test.mjs .github/scripts/gateway-build-features.test.mjs
+        run: node --test .github/scripts/ci-policy.test.mjs .github/scripts/gateway-build-features.test.mjs .github/scripts/check-guard.test.mjs
       - name: Test macOS acceptance helpers
         run: |
           python3 -B scripts/macos-acceptance/test_render_summary.py

@@ -27,7 +27,8 @@ dist-ssr
 /docs/MONETIZATION.md
 
 # Editor directories and files
-.claude/
+/.claude/*
+!/.claude/skills
 .vscode/*
 !.vscode/extensions.json
 .idea

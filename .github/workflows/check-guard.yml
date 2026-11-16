@@ -1,0 +1,36 @@
+name: Check guard
+
+# Flags PRs that change the checks, tests or review rules that judge them.
+# pull_request_target runs this file and its script from the base branch, so a
+# PR cannot edit the guard it is judged by. PR code is never checked out or run.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: check-guard-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: Check guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Base branch only.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: Check for changes to checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # off, observe (report only) or enforce. Set the repo variable to change it.
+          CHECK_GUARD_MODE: ${{ vars.CHECK_GUARD_MODE || 'observe' }}
+        run: node .github/scripts/check-guard.mjs
