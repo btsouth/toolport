@@ -870,7 +870,7 @@
   "Unsupported": "不支援",
   "Unsupported: {value0}": "不支援：{value0}",
   "Update Toolport": "更新Toolport",
-  "Update toolport-bin with your AUR helper, or rebuild it from the AUR.": "使用 AUR 幫助程式更新 toolport-bin，或從 AUR 重建它。",
+  "toolport-bin is no longer updated. Add the Toolport pacman repository as shown in docs/arch-pacman-repo.md on GitHub, then run sudo pacman -Syu toolport and let pacman replace toolport-bin.": "toolport-bin 已不再更新。請依照 GitHub 上 docs/arch-pacman-repo.md 的說明新增 Toolport pacman 軟體庫，然後執行 sudo pacman -Syu toolport，並讓 pacman 取代 toolport-bin。",
   "Updated authentication for {value0}": "更新了{value0}的身份驗證",
   "Updated discovery for {value0}.": "更新了{value0}的發現。",
   "Updating": "更新中",
