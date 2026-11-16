@@ -141,3 +141,28 @@ impl BridgeController {
         crate::http_bridge::kill_on_exit(&self.state);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Failure mode: with the endpoint left on, every start read its saved
+    /// bearer token, and a locked keyring asked to be unlocked.
+    #[test]
+    fn a_start_with_the_endpoint_left_on_never_asks_to_unlock_the_keyring() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            crate::registry::save(&crate::registry::Registry {
+                http_bridge_enabled: true,
+                http_bridge_port: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+            let bridge = super::BridgeController::default();
+            let mut restored = None;
+            let prompts = crate::secrets::locked_store::prompts_during(|| {
+                restored = Some(bridge.restore());
+            });
+            assert!(prompts.is_empty(), "{prompts:?}");
+            assert_eq!(restored, Some(Ok(false)));
+            assert!(!bridge.status().running);
+        });
+    }
+}

@@ -1776,6 +1776,10 @@ fn set_secret_raw(server_id: &str, key: &str, value: &str) -> Result<(), String>
 
 /// A write with no registration, for Toolport's own internal keys.
 fn write_stored(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+    // A write to a locked Secret Service collection asks to unlock it too.
+    if locked_store::locked() {
+        return Err(locked_store::prompted(server_id, key));
+    }
     scrub_previous(server_id, key, Some(value))?;
     if file::active() {
         return file::set_secret(server_id, key, value);
@@ -2442,6 +2446,9 @@ pub fn retired_scrubs_pending() -> usize {
 }
 
 fn delete_secret_raw(server_id: &str, key: &str) -> Result<(), String> {
+    if locked_store::locked() {
+        return Err(locked_store::prompted(server_id, key));
+    }
     scrub_previous(server_id, key, None)?;
     if file::active() {
         return file::delete_secret(server_id, key);

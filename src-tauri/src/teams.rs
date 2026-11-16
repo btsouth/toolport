@@ -1383,6 +1383,13 @@ pub fn sync_wait(wait_secs: u64) -> Result<SyncResult, String> {
     result
 }
 
+/// One step of the background sync both shells run on their timers. Nobody
+/// asked for it, so it must never ask to unlock the keyring: `None` means it
+/// did not run, and the caller tries again on its next tick without an error.
+pub fn background_sync(wait_secs: u64) -> Option<Result<SyncResult, String>> {
+    Some(sync_wait(wait_secs))
+}
+
 /// Bounded retry pacing for native lifecycle owners; independent of window visibility.
 pub fn sync_retry_seconds(reg: &Registry, failures: u32) -> u64 {
     if crate::personal_sync::is_personal(reg)

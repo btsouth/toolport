@@ -1433,6 +1433,16 @@ mod tests {
                     {"id":"pre-inline","name":"Inline","enabled":true,"source":"fixture","transport":"stdio","command":"node","args":[],"inheritEnv":false,"env":[{"key":"INLINE_TOKEN","value":"pre-inline-value-6Tz1","secret":true}]}
                 ]))
                 .unwrap(),
+                // A signed-in team: the shells' background sync starts with the app.
+                team: Some(
+                    serde_json::from_value(serde_json::json!({
+                        "serverUrl": "https://teams.example.invalid",
+                        "teamId": "pre-team",
+                        "role": "member",
+                        "reportingDeviceId": "pre-device"
+                    }))
+                    .unwrap(),
+                ),
                 ..Default::default()
             };
             crate::registry::save(&registry).unwrap();
@@ -1448,6 +1458,7 @@ mod tests {
             std::fs::write(dir.join(crate::secret_redact::SCRUB_PENDING_FILE), "").unwrap();
             let vaulted = ["pre-on", "pre-remote"];
             let mut checks = Vec::new();
+            let mut team = None;
             let prompts = crate::secrets::locked_store::prompts_during(|| {
                 super::preload_inline_secrets();
                 // The scrub an earlier start left pending.
@@ -1464,8 +1475,15 @@ mod tests {
                         checks.push(crate::server_runtime::probe_health_bounded(&server));
                     }
                 }
+                // Both shells: the first tick of the team background sync.
+                team = crate::teams::background_sync(0);
             });
             assert!(prompts.is_empty(), "{prompts:?}");
+            assert!(
+                team.is_none(),
+                "the sync ran: {:?}",
+                team.as_ref().map(|result| result.as_ref().err())
+            );
             assert_eq!(checks.len(), 4);
             for check in &checks {
                 assert!(!check.ok, "{check:?}");
