@@ -865,6 +865,7 @@ pub(super) fn review_with_notice(
         });
         if !item.updates.is_empty() {
             let changes = adw::ActionRow::builder()
+                .use_markup(false)
                 .title(crate::i18n::tr("Changes"))
                 .subtitle(item.updates.join(", "))
                 .build();
@@ -2834,6 +2835,49 @@ mod tests {
             .into_iter()
             .filter_map(|w| w.downcast::<gtk::Label>().ok())
             .any(|l| l.text() == "Unsupported: SSE"));
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn review_rows_show_markup_characters_as_text() {
+        adw::init().unwrap();
+        let parent = gtk::Window::new();
+        let mut item = import_item("R&D <tools>", None, None);
+        item.command = Some("npx".into());
+        item.args = vec!["--token".into(), "<launch-input>".into()];
+        item.url = None;
+        review(
+            &parent,
+            "Markup fixture",
+            vec![item],
+            "Fixture",
+            "Import selected servers",
+            false,
+            |_, _, _| Err("fixture".into()),
+            || {},
+            None,
+        );
+        let window = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .find(|w| w.title().as_deref() == Some("Markup fixture"))
+            .unwrap();
+        let row = descendants(window.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::ToggleButton>().ok())
+            .find(|t| t.has_css_class("toolport-review-item"))
+            .unwrap();
+        let shown = descendants(row.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .map(|l| l.text().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            shown.iter().any(|t| t == "npx --token <launch-input>"),
+            "{shown:?}"
+        );
+        assert!(shown.iter().any(|t| t == "R&D <tools>"), "{shown:?}");
         window.close();
     }
 

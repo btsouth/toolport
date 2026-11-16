@@ -117,8 +117,6 @@
   "https://toolport.yourcompany.com": "https://toolport.yourcompany.com",
   "If the team or your local servers change before saving, Toolport stops and asks you to review again. ": "If the team or your local servers change before saving, Toolport stops and asks you to review again. ",
   "If your browser cannot open Toolport, copy the manual code shown after approving this device.": "If your browser cannot open Toolport, copy the manual code shown after approving this device.",
-  "Import {value1} server": "Import {value1} server",
-  "Import {value1} servers": "Import {value1} servers",
   "Import a setup": "Import a setup",
   "Imported shared setup": "Imported shared setup",
   "Imported the setup you already confirmed": "Imported the setup you already confirmed",
@@ -550,5 +548,8 @@
   "Toolport's damaged record of the servers it moved from {client} was deleted. The servers stay in Toolport, and the client config was not changed.": "Toolport's damaged record of the servers it moved from {client} was deleted. The servers stay in Toolport, and the client config was not changed.",
   "Toolport kept the toolport entry you edited. Remove it by hand if you uninstall Toolport.": "Toolport kept the toolport entry you edited. Remove it by hand if you uninstall Toolport.",
   "Keyring locked. Nothing was restored. Unlock your keyring, then choose Retry.": "Keyring locked. Nothing was restored. Unlock your keyring, then choose Retry.",
-  "Unlock your keyring to disconnect {client}.": "Unlock your keyring to disconnect {client}."
+  "Unlock your keyring to disconnect {client}.": "Unlock your keyring to disconnect {client}.",
+  "Every server in this setup is already present, so there is nothing to import.": "Every server in this setup is already present, so there is nothing to import.",
+  "All files": "All files",
+  "Couldn't read the pasted setup. Check that you copied all of it, then try again.": "Couldn't read the pasted setup. Check that you copied all of it, then try again."
 }

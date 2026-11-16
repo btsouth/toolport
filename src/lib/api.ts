@@ -1016,9 +1016,10 @@ export function takePendingTrayApprovals(): Promise<boolean> {
   return invoke<boolean>("take_pending_tray_approvals");
 }
 
-/** Import a shared setup, adding servers not already present. */
-export function importConfig(json: string): Promise<Registry> {
-  return invoke<Registry>("import_config", { json });
+/** Import a shared setup, adding servers not already present. `selected` limits it
+ * to the reviewed server names the user kept checked. */
+export function importConfig(json: string, selected?: string[]): Promise<Registry> {
+  return invoke<Registry>("import_config", { json, selected });
 }
 
 /** Read a shared-setup file from disk (path from an open dialog), size-capped. */

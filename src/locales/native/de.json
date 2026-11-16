@@ -375,7 +375,6 @@
   "Import selected servers": "Ausgewählte Server importieren",
   "Import setup…": "Setup importieren…",
   "Import this Toolport setup?": "Dieses Toolport-Setup importieren?",
-  "Import {value0}": "Importieren {value0}",
   "Import, export and setup": "Importieren, exportieren und einrichten",
   "Imported {value0} server. It stays off until you turn it on in Servers.": "{value0} Server importiert. Er bleibt aus, bis Sie ihn unter Server einschalten.",
   "Imported {value0} servers. Check their status under Servers.": "Importierte {value0} Server. Überprüfen Sie ihren Status unter Server.",
@@ -1211,5 +1210,6 @@
   "Show all {value0} entries": "Alle {value0} Einträge anzeigen",
   "Import as {value0}": "Als {value0} importieren",
   "Open the review to check whether this is already in Toolport.": "Öffnen Sie die Überprüfung, um zu sehen, ob dies bereits in Toolport ist.",
-  "{value0} is already in Toolport.": "{value0} ist bereits in Toolport."
+  "{value0} is already in Toolport.": "{value0} ist bereits in Toolport.",
+  "Paste a setup to review it.": "Fügen Sie ein Setup ein, um es zu prüfen."
 }

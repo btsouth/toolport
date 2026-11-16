@@ -375,7 +375,6 @@
   "Import selected servers": "匯入選定的伺服器",
   "Import setup…": "匯入設定...",
   "Import this Toolport setup?": "匯入此 Toolport 設定嗎？",
-  "Import {value0}": "匯入{value0}",
   "Import, export and setup": "匯入、匯出和設定",
   "Imported {value0} server. It stays off until you turn it on in Servers.": "已匯入 {value0} 個伺服器。在「伺服器」中開啟前，它會保持關閉。",
   "Imported {value0} servers. Check their status under Servers.": "已匯入 {value0} 個伺服器。可在“伺服器”中檢視其狀態。",
@@ -1211,5 +1210,6 @@
   "Show all {value0} entries": "顯示全部 {value0} 筆記錄",
   "Import as {value0}": "匯入為 {value0}",
   "Open the review to check whether this is already in Toolport.": "開啟審核，檢查它是否已在 Toolport 中。",
-  "{value0} is already in Toolport.": "{value0} 已在 Toolport 中。"
+  "{value0} is already in Toolport.": "{value0} 已在 Toolport 中。",
+  "Paste a setup to review it.": "貼上設定後即可檢視。"
 }

@@ -375,7 +375,6 @@
   "Import selected servers": "選択したサーバーをインポートする",
   "Import setup…": "セットアップをインポート…",
   "Import this Toolport setup?": "このToolport セットアップをインポートしますか?",
-  "Import {value0}": "インポート {value0}",
   "Import, export and setup": "インポート、エクスポート、セットアップ",
   "Imported {value0} server. It stays off until you turn it on in Servers.": "サーバーを{value0}件インポートしました。「サーバー」でオンにするまでオフのままです。",
   "Imported {value0} servers. Check their status under Servers.": "{value0} サーバーをインポートしました。 「サーバー」でステータスを確認します。",
@@ -1211,5 +1210,6 @@
   "Show all {value0} entries": "{value0} 件をすべて表示",
   "Import as {value0}": "{value0} としてインポート",
   "Open the review to check whether this is already in Toolport.": "レビューを開いて、すでに Toolport にあるか確認してください。",
-  "{value0} is already in Toolport.": "{value0} はすでに Toolport にあります。"
+  "{value0} is already in Toolport.": "{value0} はすでに Toolport にあります。",
+  "Paste a setup to review it.": "確認するにはセットアップを貼り付けてください。"
 }
