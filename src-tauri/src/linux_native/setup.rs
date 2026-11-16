@@ -158,10 +158,14 @@ fn backup_date(backup: &str) -> Option<String> {
         })
 }
 
+/// React's plain `<details>` disclosure in the connect dialogs: the title is a toggle with
+/// no border or fill, and the content sits under it. The spec has no disclosure style, so
+/// React's decides.
 fn details_expander(title: &str) -> (gtk::Expander, gtk::Box) {
     let expander = gtk::Expander::new(Some(title));
-    expander.add_css_class("toolport-details-expander");
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    expander.add_css_class("toolport-disclosure");
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    content.set_margin_top(8);
     expander.set_child(Some(&content));
     (expander, content)
 }
@@ -450,6 +454,8 @@ pub(super) fn review_with_notice(
             "{value0} credentials and settings",
             &[("value0", &item.name.to_string())],
         ));
+        // Small text inside the entry, as React's `text-meta` credentials fold.
+        settings.add_css_class("small");
         let credential_rows = gtk::ListBox::new();
         credential_rows.set_selection_mode(gtk::SelectionMode::None);
         content.append(&credential_rows);
@@ -660,16 +666,16 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
     body.append(&missing_reason);
     refresh_confirm();
     let (details, content) = details_expander(&crate::i18n::tr("Details"));
+    // The review's Details is small text, as React's `text-meta` summary.
+    details.add_css_class("small");
     let path = gtk::Label::builder()
         .label(disclosure)
         .wrap(true)
         .selectable(true)
         .xalign(0.0)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(12)
-        .margin_end(12)
         .build();
+    path.add_css_class("toolport-disclosure-text");
+    path.add_css_class("toolport-muted");
     content.append(&path);
     details.set_widget_name("toolport-setup-review-details");
     // Under the lede and any notice, above the entries, where React's review has it.
@@ -1266,6 +1272,10 @@ mod tests {
             before.text(),
             "Selected entries move into Toolport after verification."
         );
+        // React's plain, small Details fold, not a bordered card.
+        assert!(review_details.has_css_class("toolport-disclosure"));
+        assert!(review_details.has_css_class("small"));
+        assert!(!review_details.has_css_class("toolport-details-expander"));
         assert!(review_details
             .next_sibling()
             .is_some_and(|w| w.widget_name() == "toolport-setup-review-entries"));
@@ -1439,7 +1449,8 @@ mod tests {
             assert!(descendants(window.upcast_ref())
                 .iter()
                 .filter(|w| w.is::<gtk::Expander>())
-                .all(|w| w.has_css_class("toolport-details-expander")));
+                .all(|w| w.has_css_class("toolport-disclosure")
+                    && !w.has_css_class("toolport-details-expander")));
             let button = descendants(window.upcast_ref())
                 .into_iter()
                 .filter_map(|w| w.downcast::<gtk::Button>().ok())
