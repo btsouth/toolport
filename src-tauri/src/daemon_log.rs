@@ -1740,6 +1740,134 @@ mod tests {
         assert!(text.contains("relayed after release\n"), "{text}");
     }
 
+    /// Write to stderr through C stdio until the write blocks, holding that
+    /// stream's lock from then on: a native library stuck in a C write.
+    /// Exit flushes every C stream under its lock (glibc's `exit`, the
+    /// Windows C runtime's flush), so it waits on this one.
+    #[cfg(unix)]
+    fn c_stderr_flood() {
+        let line = [b'c'; 4096];
+        // SAFETY: a stream of its own over fd 2, unbuffered, written from a
+        // live buffer; it is never closed.
+        unsafe {
+            let stream = libc::fdopen(libc::dup(2), c"w".as_ptr());
+            assert!(!stream.is_null());
+            libc::setvbuf(stream, std::ptr::null_mut(), libc::_IONBF, 0);
+            for _ in 0..FLOOD_LINES {
+                libc::fwrite(line.as_ptr().cast(), 1, line.len(), stream);
+            }
+        }
+    }
+
+    /// 4 MiB per writer: far past the relay's queue and both pipes, so each
+    /// writer blocks; and finite, so one that is let go finishes, as a real
+    /// writer does.
+    const FLOOD_LINES: usize = 1024;
+
+    /// The same through the C runtime's own stderr stream.
+    #[cfg(windows)]
+    fn c_stderr_flood() {
+        extern "C" {
+            fn __acrt_iob_func(index: u32) -> *mut std::ffi::c_void;
+            fn fwrite(
+                buffer: *const std::ffi::c_void,
+                size: usize,
+                count: usize,
+                stream: *mut std::ffi::c_void,
+            ) -> usize;
+        }
+        let line = [b'c'; 4096];
+        // SAFETY: the CRT's stderr stream, written from a live buffer.
+        unsafe {
+            let stream = __acrt_iob_func(2);
+            for _ in 0..FLOOD_LINES {
+                fwrite(line.as_ptr().cast(), 1, line.len(), stream);
+            }
+        }
+    }
+
+    /// Child half of the stalled-exit test: the relay is running and stderr's
+    /// destination is a pipe nobody reads, so a Rust writer and a C writer are
+    /// both stuck, holding their locks, when the process exits.
+    #[test]
+    fn stderr_stalled_exit_child() {
+        let Some(secret) = std::env::var_os("TOOLPORT_STDERR_STALLED_CHILD") else {
+            return;
+        };
+        let secret = secret.to_string_lossy().to_string();
+        let _ = install_stderr_redaction();
+        crate::secret_redact::register("stalled-server", "STALLED_TOKEN", &secret);
+        println!("state={:?}", stderr_redaction_state());
+        std::thread::spawn(|| {
+            let line = "r".repeat(4095);
+            for _ in 0..FLOOD_LINES {
+                eprintln!("{line}");
+            }
+        });
+        std::thread::spawn(c_stderr_flood);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let started = std::time::Instant::now();
+        flush_stderr_relay(std::time::Duration::from_millis(500));
+        println!("flushed-ms={}", started.elapsed().as_millis());
+        // How every explicit exit ends (`telemetry::exit_with`).
+        std::process::exit(0);
+    }
+
+    /// Failure mode: with stderr's destination stalled (a client that stopped
+    /// reading it), exit waited on a C writer stuck behind it and never came:
+    /// glibc's `exit` and the Windows C runtime's flush both take the lock that
+    /// writer holds through its blocked write.
+    #[test]
+    fn exit_is_bounded_while_stderr_is_stalled() {
+        use std::io::Read as _;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon_log::tests::stderr_stalled_exit_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(
+                "TOOLPORT_STDERR_STALLED_CHILD",
+                "stalled-canary-2Wp6-SECRET",
+            )
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Held open and never read, so the relay's destination fills and stalls.
+        let stalled = child.stderr.take();
+        // A hang never ends; this only absorbs a slow start on a loaded runner.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if std::time::Instant::now() > deadline {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let mut stdout = String::new();
+        let _ = child.stdout.take().unwrap().read_to_string(&mut stdout);
+        drop(stalled);
+        assert!(stdout.contains("state=Relayed"), "{stdout}");
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "the child did not exit: {stdout}"
+        );
+        let flushed: u128 = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("flushed-ms="))
+            .and_then(|ms| ms.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{stdout}"));
+        assert!(flushed < 2_000, "the flush took {flushed} ms: {stdout}");
+    }
+
     /// Failure mode: every process that wants redaction starts the relay (two
     /// threads, a pipe, a signal thread) at once, though most installs never
     /// register a secret and so have nothing to redact.
