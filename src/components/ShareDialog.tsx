@@ -13,6 +13,7 @@ import {
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
 import { open as openFile, save } from "@tauri-apps/plugin-dialog";
+import { downloadDir, homeDir, join } from "@tauri-apps/api/path";
 import {
   exportConfig,
   exportConfigToPath,
@@ -72,6 +73,8 @@ export function ShareDialog({ trigger, onImported }: Props) {
   // When set, the dialog shows the review-and-confirm view for `pendingJson`.
   const [preview, setPreview] = useState<ImportItem[] | null>(null);
   const [pendingJson, setPendingJson] = useState("");
+  // The new servers in the review that will be imported (default all, by name).
+  const [importSelection, setImportSelection] = useState<Set<string>>(new Set());
   // The user's servers and which to include in the shared stack (default all).
   const [servers, setServers] = useState<
     { id: string; name: string; transport: string }[]
@@ -239,10 +242,12 @@ export function ShareDialog({ trigger, onImported }: Props) {
   async function saveToFile() {
     setSaving(true);
     try {
+      const file = `${slug(name) || "toolport-setup"}.json`;
+      const folder = await setupFolder();
       const path = await save({
         title: t("Save Toolport setup"),
-        defaultPath: `${slug(name) || "toolport-setup"}.json`,
-        filters: [{ name: t("Toolport setup"), extensions: ["json"] }],
+        defaultPath: folder ? await join(folder, file) : file,
+        filters: setupFilters(t),
       });
       if (!path) return;
       await exportConfigToPath(path, name, description, shareFilter);
@@ -260,6 +265,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
       json: string,
       source: "preview-paste" | "preview-file",
       existingRequest?: number,
+      pasted = false,
     ) => {
       const request = existingRequest ?? ++previewRequest.current;
       setBusyAction(source);
@@ -268,9 +274,18 @@ export function ShareDialog({ trigger, onImported }: Props) {
         if (request !== previewRequest.current) return;
         setPendingJson(json);
         setPreview(items);
+        setImportSelection(new Set(items.filter((i) => i.isNew).map((i) => i.name)));
       } catch (e) {
         if (request !== previewRequest.current) return;
-        toastError(t("Couldn't read that setup: {value1}", { value1: String(e) }));
+        // A failed paste says what to do first; the parser detail follows, as in GTK.
+        if (pasted)
+          toastError(
+            t(
+              "Couldn't read the pasted setup. Check that you copied all of it, then try again.",
+            ),
+            { description: String(e) },
+          );
+        else toastError(t("Couldn't read that setup: {value1}", { value1: String(e) }));
       } finally {
         if (request === previewRequest.current) setBusyAction(null);
       }
@@ -284,9 +299,10 @@ export function ShareDialog({ trigger, onImported }: Props) {
     try {
       const path = await openFile({
         title: t("Open a Toolport setup"),
+        defaultPath: await setupFolder(),
         multiple: false,
         directory: false,
-        filters: [{ name: t("Toolport setup"), extensions: ["json"] }],
+        filters: setupFilters(t),
       });
       if (request !== previewRequest.current || !path || typeof path !== "string") return;
       const json = await readSetupFile(path);
@@ -303,9 +319,10 @@ export function ShareDialog({ trigger, onImported }: Props) {
   async function confirmImport() {
     const request = previewRequest.current;
     const json = pendingJson;
+    const chosen = Array.from(importSelection);
     setBusyAction("import");
     try {
-      const imported = await importConfig(json);
+      const imported = await importConfig(json, chosen);
       // The write already happened. Always update the parent registry.
       onImported(imported);
       if (request !== previewRequest.current) {
@@ -368,7 +385,14 @@ export function ShareDialog({ trigger, onImported }: Props) {
   }, [onOpenChange, startPreview, t]);
 
   const newCount = preview?.filter((i) => i.isNew).length ?? 0;
+  const importCount =
+    preview?.filter((i) => i.isNew && importSelection.has(i.name)).length ?? 0;
+  const shareLabels = shareCheckLabels(servers);
   const hasSelection = selected.size > 0 || servers.length === 0;
+  const noShareReason =
+    selected.size === 0 && servers.length > 0
+      ? t("Select at least one server to share.")
+      : undefined;
   const shareReady =
     registryState === "ready" &&
     exportState === "ready" &&
@@ -391,10 +415,38 @@ export function ShareDialog({ trigger, onImported }: Props) {
                 "These servers come from a shared file. Each runs the command shown when you enable it, so review them before importing. You'll add your own keys after. ",
               )}
             </p>
+            {newCount === 0 && (
+              <p id="share-import-reason" className="text-meta text-muted-foreground">
+                {t(
+                  "Every server in this setup is already present, so there is nothing to import.",
+                )}
+              </p>
+            )}
             <div className="flex max-h-72 flex-col gap-2 overflow-y-auto">
-              {preview.map((item, i) => (
-                <ImportRow key={`${item.name}-${i}`} item={item} />
-              ))}
+              {preview.map((item, i) => {
+                const on = item.isNew && importSelection.has(item.name);
+                return (
+                  <button
+                    key={`${item.name}-${i}`}
+                    type="button"
+                    aria-pressed={on}
+                    disabled={busyAction !== null || !item.isNew}
+                    className={`w-full rounded-md text-left transition-colors outline-none hover:bg-muted/60 focus-visible:ring-3 focus-visible:ring-ring/50 disabled:hover:bg-transparent ${
+                      on ? "ring-1 ring-success/60" : ""
+                    }`}
+                    onClick={() =>
+                      setImportSelection((previous) => {
+                        const next = new Set(previous);
+                        if (on) next.delete(item.name);
+                        else next.add(item.name);
+                        return next;
+                      })
+                    }
+                  >
+                    <ImportRow item={item} selected={on} />
+                  </button>
+                );
+              })}
             </div>
             <div className="flex items-center justify-between gap-2 border-t pt-3">
               <Button
@@ -409,7 +461,8 @@ export function ShareDialog({ trigger, onImported }: Props) {
               </Button>
               <Button
                 onClick={confirmImport}
-                disabled={busyAction !== null || newCount === 0}
+                disabled={busyAction !== null || importCount === 0}
+                aria-describedby={newCount === 0 ? "share-import-reason" : undefined}
               >
                 {busyAction === "import" ? (
                   <>
@@ -421,12 +474,14 @@ export function ShareDialog({ trigger, onImported }: Props) {
                     <Check className="size-4" />
                     {newCount === 0
                       ? t("Nothing new to import")
-                      : t(
-                          newCount === 1
-                            ? "Import {value1} server"
-                            : "Import {value1} servers",
-                          { value1: newCount },
-                        )}
+                      : importCount === 0
+                        ? t("Select a server")
+                        : t(
+                            importCount === 1
+                              ? "Import {count} server"
+                              : "Import {count} servers",
+                            { count: importCount },
+                          )}
                   </>
                 )}
               </Button>
@@ -495,12 +550,13 @@ export function ShareDialog({ trigger, onImported }: Props) {
                     </div>
                   </div>
                   <div className="flex flex-wrap gap-1.5">
-                    {servers.map((s) => {
+                    {servers.map((s, index) => {
                       const on = selected.has(s.id);
                       return (
                         <button
                           key={s.id}
                           type="button"
+                          aria-pressed={on}
                           onClick={() => {
                             invalidateShareOutput();
                             setSelected((prev) => {
@@ -516,7 +572,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
                               : "text-muted-foreground hover:bg-accent"
                           }`}
                         >
-                          {s.name}
+                          {shareLabels[index]}
                         </button>
                       );
                     })}
@@ -558,12 +614,14 @@ export function ShareDialog({ trigger, onImported }: Props) {
                 rows={5}
                 className="resize-none font-mono text-meta"
               />
-              <div className="flex flex-wrap gap-2">
+              {/* Disabled buttons take no pointer events, so the row carries the reason too. */}
+              <div className="flex flex-wrap gap-2" title={noShareReason}>
                 <Button
                   size="sm"
                   className="h-8"
                   onClick={createLink}
                   disabled={shareActionDisabled}
+                  title={noShareReason}
                 >
                   {linking ? (
                     <>
@@ -583,6 +641,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
                   className="h-8"
                   onClick={copy}
                   disabled={shareActionDisabled}
+                  title={noShareReason}
                 >
                   {copied ? (
                     <>
@@ -602,6 +661,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
                   className="h-8"
                   onClick={saveToFile}
                   disabled={shareActionDisabled}
+                  title={noShareReason}
                 >
                   {saving ? (
                     <>
@@ -648,7 +708,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
               />
               <div className="flex flex-wrap gap-2">
                 <Button
-                  onClick={() => startPreview(paste, "preview-paste")}
+                  onClick={() => startPreview(paste, "preview-paste", undefined, true)}
                   disabled={busyAction !== null || !paste.trim()}
                 >
                   {busyAction === "preview-paste" ? (
@@ -686,6 +746,32 @@ export function ShareDialog({ trigger, onImported }: Props) {
         )}
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** Setup files first, every file one choice away, as in GTK. */
+function setupFilters(t: (message: string) => string) {
+  return [
+    { name: t("Toolport setup"), extensions: ["json"] },
+    { name: t("All files"), extensions: ["*"] },
+  ];
+}
+
+/** Setup choosers start where exports land: Downloads, else Home, as in GTK. */
+async function setupFolder(): Promise<string | undefined> {
+  try {
+    return await downloadDir();
+  } catch {
+    return homeDir().catch(() => undefined);
+  }
+}
+
+/** Chip labels: the name, plus the id when another server has the same name. */
+export function shareCheckLabels(servers: { id: string; name: string }[]): string[] {
+  return servers.map((s) =>
+    servers.filter((other) => other.name === s.name).length > 1
+      ? `${s.name} (${s.id})`
+      : s.name,
   );
 }
 

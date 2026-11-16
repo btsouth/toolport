@@ -117,8 +117,6 @@
   "https://toolport.yourcompany.com": "https://toolport.yourcompany.com",
   "If the team or your local servers change before saving, Toolport stops and asks you to review again. ": "Wenn sich das Team oder Ihre lokalen Server vor dem Speichern ändern, stoppt Toolport und fordert Sie zu einer erneuten Überprüfung auf. ",
   "If your browser cannot open Toolport, copy the manual code shown after approving this device.": "Wenn Ihr Browser Toolport nicht öffnen kann, kopieren Sie den angezeigten manuellen Code, nachdem Sie dieses Gerät genehmigt haben.",
-  "Import {value1} server": "{value1} Server importieren",
-  "Import {value1} servers": "{value1} Server importieren",
   "Import a setup": "Ein Setup importieren",
   "Imported shared setup": "Gemeinsames Setup importiert",
   "Imported the setup you already confirmed": "Das bereits bestätigte Setup wurde importiert",
@@ -550,5 +548,8 @@
   "Toolport's damaged record of the servers it moved from {client} was deleted. The servers stay in Toolport, and the client config was not changed.": "Toolports beschädigter Eintrag über die Server, die aus {client} verschoben wurden, wurde gelöscht. Die Server bleiben in Toolport, und die Client-Konfiguration wurde nicht geändert.",
   "Toolport kept the toolport entry you edited. Remove it by hand if you uninstall Toolport.": "Toolport hat den von Ihnen bearbeiteten toolport-Eintrag behalten. Entfernen Sie ihn von Hand, wenn Sie Toolport deinstallieren.",
   "Keyring locked. Nothing was restored. Unlock your keyring, then choose Retry.": "Schlüsselbund gesperrt. Es wurde nichts wiederhergestellt. Entsperren Sie Ihren Schlüsselbund und wählen Sie dann „Erneut versuchen“.",
-  "Unlock your keyring to disconnect {client}.": "Entsperren Sie Ihren Schlüsselbund, um {client} zu trennen."
+  "Unlock your keyring to disconnect {client}.": "Entsperren Sie Ihren Schlüsselbund, um {client} zu trennen.",
+  "Every server in this setup is already present, so there is nothing to import.": "Alle Server in diesem Setup sind bereits vorhanden, daher gibt es nichts zu importieren.",
+  "All files": "Alle Dateien",
+  "Couldn't read the pasted setup. Check that you copied all of it, then try again.": "Das eingefügte Setup konnte nicht gelesen werden. Prüfen Sie, ob Sie alles kopiert haben, und versuchen Sie es erneut."
 }

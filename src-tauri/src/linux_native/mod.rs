@@ -2881,7 +2881,6 @@ impl ServerPage {
         *self.feedback_timer.borrow_mut() = Some(timer);
     }
 
-    #[cfg(test)]
     fn hide_feedback(&self) {
         self.cancel_feedback_timer();
         self.feedback.set_visible(false);
@@ -3233,6 +3232,8 @@ impl ClientPage {
         &self,
         candidates: Vec<crate::registry_controller::ClientImportCandidate>,
     ) {
+        // Cancel in the review must not leave the scan line up (D111).
+        self.hide_progress();
         let Some(parent) = self.root.root().and_downcast::<gtk::Window>() else {
             return;
         };
@@ -3743,6 +3744,11 @@ impl ClientPage {
         self.feedback.remove_css_class("error");
         self.feedback.remove_css_class("success");
         self.feedback.set_visible(true);
+    }
+
+    fn hide_progress(&self) {
+        self.cancel_feedback_timer();
+        self.feedback.set_visible(false);
     }
 
     fn show_confirmation(&self, message: &str) {
@@ -10392,6 +10398,21 @@ fn load_share_dialog(window: &adw::Window, body: &gtk::Box, page: ServerPage) {
     });
 }
 
+/// Share list labels: the server name, plus its id when another server has the
+/// same name, so the two checkboxes can be told apart (D80).
+fn share_check_labels(servers: &[(String, String)]) -> Vec<String> {
+    servers
+        .iter()
+        .map(|(id, name)| {
+            if servers.iter().filter(|(_, other)| other == name).count() > 1 {
+                format!("{name} ({id})")
+            } else {
+                name.clone()
+            }
+        })
+        .collect()
+}
+
 fn share_setup_loaded(page: ServerPage, servers: Vec<(String, String)>) {
     let Some(parent) = page
         .list
@@ -10429,7 +10450,6 @@ fn share_setup_loaded(page: ServerPage, servers: Vec<(String, String)>) {
         .visible(false)
         .css_classes(["toolport-feedback"])
         .build();
-    body.append(&feedback);
     let name = {
         let widget = gtk::Entry::builder()
             .placeholder_text(crate::i18n::tr("Setup name (optional)"))
@@ -10462,8 +10482,8 @@ fn share_setup_loaded(page: ServerPage, servers: Vec<(String, String)>) {
     body.append(&select_row);
     let list = gtk::Box::new(gtk::Orientation::Vertical, 4);
     let mut checks: Vec<(String, gtk::CheckButton)> = Vec::new();
-    for (id, server_name) in &servers {
-        let check = gtk::CheckButton::with_label(server_name);
+    for ((id, _), label) in servers.iter().zip(share_check_labels(&servers)) {
+        let check = gtk::CheckButton::with_label(&label);
         check.set_active(true);
         list.append(&check);
         checks.push((id.clone(), check));
@@ -10514,7 +10534,38 @@ fn share_setup_loaded(page: ServerPage, servers: Vec<(String, String)>) {
     actions.append(&copy_json);
     actions.append(&save_file);
     actions.append(&copy_link);
-    body.append(&actions);
+    // The actions and their result stay pinned under the scroller; a result
+    // inside it pushed the buttons below the footer (D23).
+    let action_area = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    action_area.set_widget_name("toolport-share-actions");
+    action_area.set_margin_start(20);
+    action_area.set_margin_end(20);
+    action_area.set_margin_top(8);
+    action_area.set_margin_bottom(8);
+    action_area.append(&feedback);
+    action_area.append(&actions);
+    // With nothing checked there is nothing to share: say so on the buttons
+    // instead of failing after the click.
+    {
+        let buttons = [copy_json.clone(), save_file.clone(), copy_link.clone()];
+        let state = checks.clone();
+        let update = std::rc::Rc::new(move || {
+            let any = state.iter().any(|(_, check)| check.is_active());
+            for button in &buttons {
+                button.set_sensitive(any);
+                button.set_tooltip_text(
+                    (!any)
+                        .then(|| crate::i18n::tr("Select at least one server to share."))
+                        .as_deref(),
+                );
+            }
+        });
+        for (_, check) in checks.iter() {
+            let update = update.clone();
+            check.connect_toggled(move |_| update());
+        }
+        update();
+    }
     let clamp = adw::Clamp::builder()
         .maximum_size(720)
         .tightening_threshold(520)
@@ -10526,6 +10577,7 @@ fn share_setup_loaded(page: ServerPage, servers: Vec<(String, String)>) {
         .child(&clamp)
         .build();
     root.append(&scroller);
+    root.append(&action_area);
     root.append(&dialog_footer(&[&done]));
     close_on_escape(&window);
     window.set_content(Some(&root));
@@ -10681,7 +10733,7 @@ fn share_setup_loaded(page: ServerPage, servers: Vec<(String, String)>) {
                 .accept_label(crate::i18n::tr("Export"))
                 .modal(true)
                 .build();
-            set_file_dialog_folder(&dialog);
+            set_setup_file_dialog(&dialog);
             let feedback = feedback.clone();
             dialog.save(
                 Some(&window_for_save),
@@ -10724,6 +10776,17 @@ fn share_setup_loaded(page: ServerPage, servers: Vec<(String, String)>) {
     let window_for_done = window.clone();
     done.connect_clicked(move |_| window_for_done.close());
     window.present();
+}
+
+/// A failed paste review says what to do first; the parser's detail follows
+/// for whoever needs it (D21).
+fn paste_import_failure(error: &str) -> String {
+    format!(
+        "{}\n\n{error}",
+        crate::i18n::tr(
+            "Couldn't read the pasted setup. Check that you copied all of it, then try again."
+        )
+    )
 }
 
 /// Import a setup from pasted JSON, through the same review dialog as files
@@ -10775,6 +10838,15 @@ fn open_paste_import(page: ServerPage) {
     let editor = gtk::TextView::new();
     editor.set_monospace(true);
     editor.set_wrap_mode(gtk::WrapMode::WordChar);
+    // Tab moves on to the buttons; pasted JSON needs no typed tabs.
+    editor.set_accepts_tab(false);
+    editor.set_top_margin(8);
+    editor.set_bottom_margin(8);
+    editor.set_left_margin(8);
+    editor.set_right_margin(8);
+    l10n::bind_accessible_with(&editor, || {
+        (crate::i18n::tr("Paste a Toolport setup"), None)
+    });
     let editor_scroll = gtk::ScrolledWindow::builder()
         .min_content_height(220)
         .vexpand(true)
@@ -10782,10 +10854,31 @@ fn open_paste_import(page: ServerPage) {
         .build();
     editor_scroll.add_css_class("toolport-text-area");
     body.append(&editor_scroll);
+    // Nothing to review until something is pasted; explain instead of letting
+    // the parser report an end-of-input error.
+    let explain_review = {
+        let review = review.clone();
+        move |buffer: &gtk::TextBuffer| {
+            let ready = !buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                .trim()
+                .is_empty();
+            review.set_sensitive(ready);
+            review.set_tooltip_text(
+                (!ready)
+                    .then(|| crate::i18n::tr("Paste a setup to review it."))
+                    .as_deref(),
+            );
+        }
+    };
+    explain_review(&editor.buffer());
+    editor.buffer().connect_changed(explain_review);
     body.set_vexpand(true);
     root.append(&body);
     root.append(&dialog_footer(&[&cancel, &review]));
     window.set_content(Some(&root));
+    // Start in the paste field, not on Cancel.
+    gtk::prelude::GtkWindowExt::set_focus(&window, Some(&editor));
     let window_for_cancel = window.clone();
     cancel.connect_clicked(move |_| window_for_cancel.close());
     let window_for_review = window.clone();
@@ -10804,6 +10897,7 @@ fn open_paste_import(page: ServerPage) {
         let json_for_preview = json.clone();
         let page = page.clone();
         let window = window_for_review.clone();
+        let buffer = buffer.clone();
         let feedback = feedback.clone();
         let button = button.clone();
         gtk::glib::spawn_future_local(async move {
@@ -10811,7 +10905,12 @@ fn open_paste_import(page: ServerPage) {
                 crate::sharing_controller::preview_import(&json_for_preview)
             })
             .await;
-            button.set_sensitive(true);
+            button.set_sensitive(
+                !buffer
+                    .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                    .trim()
+                    .is_empty(),
+            );
             match result {
                 Ok(Ok(preview)) => {
                     window.close();
@@ -10819,7 +10918,7 @@ fn open_paste_import(page: ServerPage) {
                 }
                 Ok(Err(error)) => {
                     feedback.set_visible(true);
-                    feedback.set_label(&error);
+                    feedback.set_label(&paste_import_failure(&error));
                 }
                 Err(_) => {
                     feedback.set_visible(true);
@@ -10841,6 +10940,7 @@ fn choose_setup_export(page: ServerPage) {
         .accept_label(crate::i18n::tr("Export"))
         .modal(true)
         .build();
+    set_setup_file_dialog(&dialog);
     dialog.save(Some(&parent), gtk::gio::Cancellable::NONE, move |result| {
         let Ok(file) = result else {
             return;
@@ -10885,6 +10985,24 @@ fn set_file_dialog_folder(dialog: &gtk::FileDialog) {
     }
 }
 
+/// Setup choosers start where exports land (Downloads, else Home) and list
+/// setup files first, with every file one choice away (D113).
+fn set_setup_file_dialog(dialog: &gtk::FileDialog) {
+    set_file_dialog_folder(dialog);
+    let setups = gtk::FileFilter::new();
+    setups.set_name(Some(&crate::i18n::tr("Toolport setup")));
+    setups.add_mime_type("application/json");
+    setups.add_suffix("json");
+    let everything = gtk::FileFilter::new();
+    everything.set_name(Some(&crate::i18n::tr("All files")));
+    everything.add_pattern("*");
+    let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&setups);
+    filters.append(&everything);
+    dialog.set_filters(Some(&filters));
+    dialog.set_default_filter(Some(&setups));
+}
+
 fn choose_setup_import(page: ServerPage) {
     let Some(parent) = page.app.active_window() else {
         return;
@@ -10894,6 +11012,7 @@ fn choose_setup_import(page: ServerPage) {
         .accept_label(crate::i18n::tr("Review"))
         .modal(true)
         .build();
+    set_setup_file_dialog(&dialog);
     dialog.open(Some(&parent), gtk::gio::Cancellable::NONE, move |result| {
         let Ok(file) = result else {
             return;
@@ -10934,21 +11053,19 @@ fn show_setup_import_review(
     preview: Vec<crate::sharing_controller::SetupImportItem>,
     page: ServerPage,
 ) {
+    // Cancel in the review must not leave "Reading setup" or "Fetching shared
+    // setup" up (D111).
+    page.hide_feedback();
     let Some(parent) = page.app.active_window() else {
         return;
     };
-    let new_count = preview.iter().filter(|item| item.is_new).count();
     #[allow(deprecated)]
     let dialog = adw::MessageDialog::new(Some(&parent), Some(&crate::i18n::tr("Import this Toolport setup?")), Some(&crate::i18n::tr("Review every launch target below. Existing server names are skipped, and imported servers remain disabled until you enable them.")));
     l10n::bind_dialog_heading(&dialog, "Import this Toolport setup?");
     l10n::bind_dialog_body(&dialog, "Review every launch target below. Existing server names are skipped, and imported servers remain disabled until you enable them.");
     dialog.add_response("cancel", &crate::i18n::tr("Cancel"));
     l10n::bind_dialog_response(&dialog, "cancel", "Cancel");
-    dialog.add_response(
-        "import",
-        &crate::i18n::trf("Import {value0}", &[("value0", &format!("{}", new_count))]),
-    );
-    dialog.set_response_enabled("import", new_count > 0);
+    dialog.add_response("import", &crate::i18n::tr("Select a server"));
     dialog.set_close_response("cancel");
     dialog.set_default_response(Some("cancel"));
     dialog.set_response_appearance("import", adw::ResponseAppearance::Suggested);
@@ -10963,23 +11080,26 @@ fn show_setup_import_review(
             .sensitive(item.is_new)
             .build();
         title_row.append(&check);
-        title_row.append(
-            &gtk::Label::builder()
-                .label(if item.is_new {
-                    item.name.clone()
-                } else {
-                    crate::i18n::trf(
-                        "{value0} · already present",
-                        &[("value0", &item.name.to_string())],
-                    )
-                })
-                .halign(gtk::Align::Start)
-                .hexpand(true)
-                .xalign(0.0)
-                .wrap(true)
-                .css_classes(["heading"])
-                .build(),
-        );
+        let (name, is_new) = (item.name.clone(), item.is_new);
+        let title_text = move || {
+            if is_new {
+                name.clone()
+            } else {
+                crate::i18n::trf("{value0} · already present", &[("value0", &name)])
+            }
+        };
+        let title = gtk::Label::builder()
+            .label(title_text())
+            .halign(gtk::Align::Start)
+            .hexpand(true)
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["heading"])
+            .build();
+        // The checkbox is named by its server, not read as a bare "check box".
+        check.update_relation(&[gtk::accessible::Relation::LabelledBy(&[title.upcast_ref()])]);
+        l10n::bind_accessible_with(&check, move || (title_text(), None));
+        title_row.append(&title);
         row.append(&title_row);
         row.append(
             &gtk::Label::builder()
@@ -11017,14 +11137,46 @@ fn show_setup_import_review(
         }
         rows.append(&row);
     }
+    // Why Import is off when nothing here can be imported.
+    let reason = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .visible(false)
+        .css_classes(["toolport-feedback"])
+        .build();
+    rows.prepend(&reason);
+    dialog.update_relation(&[gtk::accessible::Relation::DescribedBy(&[
+        reason.upcast_ref()
+    ])]);
+    // Grow with the list up to a tall cap, not a 180px slot for a long setup.
     let scroller = gtk::ScrolledWindow::builder()
         .child(&rows)
         .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
         .min_content_height(180)
-        .max_content_height(420)
+        .max_content_height(480)
         .build();
     dialog.set_extra_child(Some(&scroller));
     let selections = std::rc::Rc::new(selections);
+    // The count and Import follow every toggle (D138).
+    let update: std::rc::Rc<dyn Fn()> = {
+        let selections = std::rc::Rc::downgrade(&selections);
+        let dialog = dialog.downgrade();
+        let reason = reason.downgrade();
+        std::rc::Rc::new(move || {
+            if let (Some(dialog), Some(reason), Some(selections)) =
+                (dialog.upgrade(), reason.upgrade(), selections.upgrade())
+            {
+                update_setup_import_selection(&dialog, &selections, &reason);
+            }
+        })
+    };
+    for (_, check) in selections.iter() {
+        let update = update.clone();
+        check.connect_toggled(move |_| update());
+    }
+    update();
+    l10n::on_language_change(&dialog, move || update());
     dialog.connect_response(None, move |dialog, response| {
         if response == "import" {
             let selected: Vec<String> = selections
@@ -11055,6 +11207,40 @@ fn show_setup_import_review(
         dialog.close();
     });
     dialog.present();
+}
+
+/// The Import label and state for the checked servers, and the reason line
+/// when every server in the setup is already present.
+#[allow(deprecated)]
+fn update_setup_import_selection(
+    dialog: &adw::MessageDialog,
+    selections: &[(String, gtk::CheckButton)],
+    reason: &gtk::Label,
+) {
+    let count = selections
+        .iter()
+        .filter(|(_, check)| check.is_active())
+        .count();
+    let label = if selections.is_empty() {
+        crate::i18n::tr("Nothing new to import")
+    } else if count == 0 {
+        crate::i18n::tr("Select a server")
+    } else {
+        crate::i18n::trf(
+            if count == 1 {
+                crate::i18n::msg("Import {count} server")
+            } else {
+                crate::i18n::msg("Import {count} servers")
+            },
+            &[("count", &count.to_string())],
+        )
+    };
+    dialog.set_response_label("import", &label);
+    dialog.set_response_enabled("import", count > 0);
+    reason.set_label(&crate::i18n::tr(
+        "Every server in this setup is already present, so there is nothing to import.",
+    ));
+    reason.set_visible(selections.is_empty());
 }
 
 fn setup_import_target(item: &crate::sharing_controller::SetupImportItem) -> String {
@@ -25029,5 +25215,340 @@ mod client_hints_ui_tests {
             .iter()
             .any(|t| t == "startup_timeout_sec = 75\ntool_timeout_sec = 600"));
         assert!(client_reset_settings_card("Cursor", &[]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod setup_import_share_tests {
+    use super::*;
+
+    fn descendants(widget: &gtk::Widget) -> Vec<gtk::Widget> {
+        let mut out = vec![widget.clone()];
+        let mut child = widget.first_child();
+        while let Some(next) = child {
+            out.extend(descendants(&next));
+            child = next.next_sibling();
+        }
+        out
+    }
+
+    fn toplevel(title: &str) -> gtk::Window {
+        let context = gtk::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        #[allow(deprecated)]
+        let heading = |w: &gtk::Window| {
+            w.downcast_ref::<adw::MessageDialog>()
+                .and_then(|dialog| dialog.heading())
+                .is_some_and(|heading| heading == title)
+        };
+        loop {
+            if let Some(window) = gtk::Window::list_toplevels()
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Window>().ok())
+                .find(|w| (w.title().as_deref() == Some(title) || heading(w)) && w.is_visible())
+            {
+                return window;
+            }
+            assert!(std::time::Instant::now() < deadline, "{title} never opened");
+            context.iteration(false);
+        }
+    }
+
+    /// The Servers page in a presented window, so dialogs have a parent.
+    fn server_page(label: &str) -> (crate::registry::DataDirTestEnv, ServerPage) {
+        let data = crate::registry::DataDirTestEnv::new(label);
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gtk::gio::Cancellable::NONE).unwrap();
+        let (servers, page, _) = build_content(&app, crate::approval_broker::start_native());
+        let window = adw::ApplicationWindow::builder()
+            .application(&app)
+            .content(&servers)
+            .build();
+        window.present();
+        (data, page)
+    }
+
+    fn item(name: &str, is_new: bool) -> crate::sharing_controller::SetupImportItem {
+        crate::sharing_controller::SetupImportItem {
+            name: name.into(),
+            transport: "stdio".into(),
+            command: Some("npx".into()),
+            args: vec![name.to_lowercase()],
+            url: None,
+            is_new,
+            reference_review: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn share_rows_with_the_same_name_show_their_ids() {
+        let servers = vec![
+            ("stripe".to_string(), "Stripe".to_string()),
+            ("stripe-2".to_string(), "Stripe".to_string()),
+            ("github".to_string(), "GitHub".to_string()),
+        ];
+        assert_eq!(
+            share_check_labels(&servers),
+            vec!["Stripe (stripe)", "Stripe (stripe-2)", "GitHub"]
+        );
+    }
+
+    #[test]
+    fn a_failed_paste_says_what_to_do_before_the_parser_detail() {
+        let message = paste_import_failure(
+            "That doesn't look like a Toolport setup: expected ident at line 1 column 2",
+        );
+        assert!(message.starts_with(
+            "Couldn't read the pasted setup. Check that you copied all of it, then try again.\n\n"
+        ));
+        assert!(message.ends_with("expected ident at line 1 column 2"));
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn import_selection_count_tracks_zero_one_and_many() {
+        adw::init().unwrap();
+        #[allow(deprecated)]
+        let dialog = adw::MessageDialog::builder().build();
+        dialog.add_response("import", "Import");
+        let selections = vec![
+            (
+                "one".into(),
+                gtk::CheckButton::builder().active(true).build(),
+            ),
+            (
+                "two".into(),
+                gtk::CheckButton::builder().active(true).build(),
+            ),
+        ];
+        let reason = gtk::Label::new(None);
+        update_setup_import_selection(&dialog, &selections, &reason);
+        assert_eq!(dialog.response_label("import"), "Import 2 servers");
+        assert!(dialog.is_response_enabled("import"));
+        selections[1].1.set_active(false);
+        update_setup_import_selection(&dialog, &selections, &reason);
+        assert_eq!(dialog.response_label("import"), "Import 1 server");
+        selections[0].1.set_active(false);
+        update_setup_import_selection(&dialog, &selections, &reason);
+        assert_eq!(dialog.response_label("import"), "Select a server");
+        assert!(!dialog.is_response_enabled("import"));
+        assert!(!reason.get_visible());
+        update_setup_import_selection(&dialog, &[], &reason);
+        assert_eq!(dialog.response_label("import"), "Nothing new to import");
+        assert!(!dialog.is_response_enabled("import"));
+        assert!(reason.get_visible());
+        assert_eq!(
+            reason.text(),
+            "Every server in this setup is already present, so there is nothing to import."
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn setup_import_review_names_checks_follows_toggles_and_clears_progress() {
+        let (_data, page) = server_page("setup-import-review");
+        page.show_feedback("Reading setup for review…", false);
+        show_setup_import_review(
+            "{\"servers\":[]}".into(),
+            vec![
+                item("Linear", true),
+                item("GitHub", true),
+                item("Stripe", false),
+            ],
+            page.clone(),
+        );
+        assert!(!page.feedback.is_visible(), "the progress line is gone");
+        let window = toplevel("Import this Toolport setup?");
+        #[allow(deprecated)]
+        let dialog = window.clone().downcast::<adw::MessageDialog>().unwrap();
+        let checks = descendants(window.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::CheckButton>().ok())
+            .collect::<Vec<_>>();
+        let names = checks
+            .iter()
+            .map(|check| l10n::accessible_text(check).map(|(name, _)| name))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                Some("Linear".to_string()),
+                Some("GitHub".to_string()),
+                Some("Stripe · already present".to_string()),
+            ]
+        );
+        assert_eq!(dialog.response_label("import"), "Import 2 servers");
+        checks[0].set_active(false);
+        assert_eq!(dialog.response_label("import"), "Import 1 server");
+        checks[1].set_active(false);
+        assert_eq!(dialog.response_label("import"), "Select a server");
+        assert!(!dialog.is_response_enabled("import"));
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn client_import_review_clears_the_scan_line() {
+        let data = crate::registry::DataDirTestEnv::new("client-import-review");
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gtk::gio::Cancellable::NONE).unwrap();
+        let (_, server_page, _) = build_content(&app, crate::approval_broker::start_native());
+        let clients = ClientPage::new(&app, server_page);
+        let window = adw::ApplicationWindow::builder()
+            .application(&app)
+            .content(&clients.root)
+            .build();
+        window.present();
+        clients.show_progress("Looking for servers in client configurations…");
+        clients.show_import_review(vec![crate::registry_controller::ClientImportCandidate {
+            client_id: "cursor".into(),
+            key: "cursor:linear".into(),
+            name: "Linear".into(),
+            transport: "stdio".into(),
+            command: Some("npx".into()),
+            args: vec!["linear".into()],
+            url: None,
+            credentials: Vec::new(),
+            unsupported: None,
+            source_name: None,
+            connection: "linear".into(),
+        }]);
+        assert!(!clients.feedback.is_visible(), "the scan line is gone");
+        toplevel("Review servers to import").close();
+        window.close();
+        drop(data);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn paste_import_starts_in_the_editor_and_needs_text() {
+        let (_data, page) = server_page("paste-import");
+        open_paste_import(page);
+        let window = toplevel("Import pasted setup");
+        let widgets = descendants(window.upcast_ref());
+        let editor = widgets
+            .iter()
+            .find_map(|w| w.downcast_ref::<gtk::TextView>().cloned())
+            .unwrap();
+        let review = widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Button>().cloned())
+            .find(|b| b.label().as_deref() == Some("Review and import"))
+            .unwrap();
+        assert_eq!(
+            gtk::prelude::GtkWindowExt::focus(&window),
+            Some(editor.clone().upcast::<gtk::Widget>())
+        );
+        assert!(!editor.accepts_tab());
+        assert!(editor.left_margin() > 0 && editor.top_margin() > 0);
+        assert_eq!(
+            l10n::accessible_text(&editor)
+                .map(|(name, _)| name)
+                .as_deref(),
+            Some("Paste a Toolport setup")
+        );
+        assert!(!review.is_sensitive());
+        assert_eq!(
+            review.tooltip_text().as_deref(),
+            Some("Paste a setup to review it.")
+        );
+        editor.buffer().set_text("  \n");
+        assert!(!review.is_sensitive());
+        editor.buffer().set_text("{");
+        assert!(review.is_sensitive());
+        assert_eq!(review.tooltip_text(), None);
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn share_actions_stay_pinned_and_need_a_server() {
+        let (_data, page) = server_page("share-actions");
+        share_setup_loaded(
+            page,
+            vec![
+                ("stripe".into(), "Stripe".into()),
+                ("stripe-2".into(), "Stripe".into()),
+            ],
+        );
+        let window = toplevel("Share this setup");
+        let widgets = descendants(window.upcast_ref());
+        let checks = widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::CheckButton>().cloned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            checks
+                .iter()
+                .map(|c| c.label().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["Stripe (stripe)", "Stripe (stripe-2)"]
+        );
+        let actions = widgets
+            .iter()
+            .find(|w| w.widget_name() == "toolport-share-actions")
+            .unwrap();
+        assert!(
+            actions
+                .ancestor(gtk::ScrolledWindow::static_type())
+                .is_none(),
+            "the actions sit outside the scroller"
+        );
+        let buttons = descendants(actions)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .filter(|b| b.label().is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(buttons.len(), 3);
+        assert!(buttons.iter().all(|b| b.is_sensitive()));
+        for check in &checks {
+            check.set_active(false);
+        }
+        for button in &buttons {
+            assert!(!button.is_sensitive());
+            assert_eq!(
+                button.tooltip_text().as_deref(),
+                Some("Select at least one server to share.")
+            );
+        }
+        checks[1].set_active(true);
+        assert!(buttons
+            .iter()
+            .all(|b| b.is_sensitive() && b.tooltip_text().is_none()));
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn setup_file_dialogs_start_in_downloads_and_list_setups_first() {
+        adw::init().unwrap();
+        let dialog = gtk::FileDialog::new();
+        set_setup_file_dialog(&dialog);
+        let expected = dirs::download_dir()
+            .filter(|folder| folder.is_dir())
+            .or_else(dirs::home_dir);
+        assert_eq!(
+            dialog.initial_folder().and_then(|folder| folder.path()),
+            expected
+        );
+        let filters = dialog.filters().unwrap();
+        let names = (0..filters.n_items())
+            .filter_map(|index| filters.item(index).and_downcast::<gtk::FileFilter>())
+            .map(|filter| filter.name().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Toolport setup", "All files"]);
+        assert_eq!(
+            dialog
+                .default_filter()
+                .and_then(|filter| filter.name())
+                .as_deref(),
+            Some("Toolport setup")
+        );
     }
 }

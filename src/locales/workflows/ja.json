@@ -117,8 +117,6 @@
   "https://toolport.yourcompany.com": "https://toolport.yourcompany.com",
   "If the team or your local servers change before saving, Toolport stops and asks you to review again. ": "保存する前にチームまたはローカル サーバーが変更された場合、Toolport は停止し、再度確認するように求めます。 ",
   "If your browser cannot open Toolport, copy the manual code shown after approving this device.": "ブラウザで Toolport を開けない場合は、このデバイスを承認した後に表示されるマニュアル コードをコピーしてください。",
-  "Import {value1} server": "{value1} サーバーをインポート",
-  "Import {value1} servers": "{value1} サーバーをインポートします",
   "Import a setup": "セットアップをインポートする",
   "Imported shared setup": "共有セットアップをインポートしました",
   "Imported the setup you already confirmed": "確認済みのセットアップをインポートしました",
@@ -550,5 +548,8 @@
   "Toolport's damaged record of the servers it moved from {client} was deleted. The servers stay in Toolport, and the client config was not changed.": "{client} から移動したサーバーについての Toolport の破損した記録を削除しました。サーバーは Toolport に残り、クライアントの設定は変更されていません。",
   "Toolport kept the toolport entry you edited. Remove it by hand if you uninstall Toolport.": "Toolport は、あなたが編集した toolport エントリをそのまま残しました。Toolport をアンインストールする場合は、手動で削除してください。",
   "Keyring locked. Nothing was restored. Unlock your keyring, then choose Retry.": "キーリングがロックされています。何も復元されませんでした。キーリングのロックを解除してから「再試行」を選択してください。",
-  "Unlock your keyring to disconnect {client}.": "{client} の接続を解除するには、キーリングのロックを解除してください。"
+  "Unlock your keyring to disconnect {client}.": "{client} の接続を解除するには、キーリングのロックを解除してください。",
+  "Every server in this setup is already present, so there is nothing to import.": "このセットアップのサーバーはすべて既に存在するため、インポートするものはありません。",
+  "All files": "すべてのファイル",
+  "Couldn't read the pasted setup. Check that you copied all of it, then try again.": "貼り付けたセットアップを読み取れませんでした。すべてコピーしたか確認して、もう一度お試しください。"
 }

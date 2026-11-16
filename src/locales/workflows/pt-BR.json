@@ -117,8 +117,6 @@
   "https://toolport.yourcompany.com": "https://toolport.yourcompany.com",
   "If the team or your local servers change before saving, Toolport stops and asks you to review again. ": "Se a equipe ou seus servidores locais mudarem antes de salvar, o Toolport para e pede para você revisar novamente. ",
   "If your browser cannot open Toolport, copy the manual code shown after approving this device.": "Se o seu navegador não conseguir abrir o Toolport, copie o código manual mostrado após aprovar este dispositivo.",
-  "Import {value1} server": "Importar {value1} servidor",
-  "Import {value1} servers": "Importar {value1} servidores",
   "Import a setup": "Importar uma configuração",
   "Imported shared setup": "Configuração compartilhada importada",
   "Imported the setup you already confirmed": "Importou a configuração que você já confirmou",
@@ -550,5 +548,8 @@
   "Toolport's damaged record of the servers it moved from {client} was deleted. The servers stay in Toolport, and the client config was not changed.": "O registro danificado do Toolport sobre os servidores que ele moveu de {client} foi excluído. Os servidores continuam no Toolport, e a configuração do cliente não foi alterada.",
   "Toolport kept the toolport entry you edited. Remove it by hand if you uninstall Toolport.": "O Toolport manteve a entrada toolport que você editou. Remova-a manualmente se desinstalar o Toolport.",
   "Keyring locked. Nothing was restored. Unlock your keyring, then choose Retry.": "Chaveiro bloqueado. Nada foi restaurado. Desbloqueie seu chaveiro e escolha Tentar novamente.",
-  "Unlock your keyring to disconnect {client}.": "Desbloqueie seu chaveiro para desconectar {client}."
+  "Unlock your keyring to disconnect {client}.": "Desbloqueie seu chaveiro para desconectar {client}.",
+  "Every server in this setup is already present, so there is nothing to import.": "Todos os servidores desta configuração já estão presentes, então não há nada para importar.",
+  "All files": "Todos os arquivos",
+  "Couldn't read the pasted setup. Check that you copied all of it, then try again.": "Não foi possível ler a configuração colada. Verifique se você copiou tudo e tente novamente."
 }

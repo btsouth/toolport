@@ -373,7 +373,6 @@
   "Import selected servers": "선택한 서버 가져오기",
   "Import setup…": "설정 가져오기…",
   "Import this Toolport setup?": "이 Toolport 설정을 가져오시겠습니까?",
-  "Import {value0}": "{value0} 가져오기",
   "Import, export and setup": "가져오기, 내보내기 및 설정",
   "Imported {value0} server. It stays off until you turn it on in Servers.": "서버 {value0}개를 가져왔습니다. 서버에서 켜기 전까지 꺼진 상태로 유지됩니다.",
   "Imported {value0} servers. Check their status under Servers.": "{value0} 서버를 가져왔습니다. 서버에서 상태를 확인하세요.",
@@ -1208,5 +1207,6 @@
   "Show all {value0} entries": "항목 {value0}개 모두 표시",
   "Import as {value0}": "{value0}(으)로 가져오기",
   "Open the review to check whether this is already in Toolport.": "검토를 열어 이미 Toolport에 있는지 확인하세요.",
-  "{value0} is already in Toolport.": "{value0}은(는) 이미 Toolport에 있습니다."
+  "{value0} is already in Toolport.": "{value0}은(는) 이미 Toolport에 있습니다.",
+  "Paste a setup to review it.": "검토하려면 설정을 붙여넣으세요."
 }

@@ -117,8 +117,6 @@
   "https://toolport.yourcompany.com": "https://toolport.yourcompany.com",
   "If the team or your local servers change before saving, Toolport stops and asks you to review again. ": "如果团队或您的本地服务器在保存之前发生更改，Toolport 会停止并要求您重新审核。 ",
   "If your browser cannot open Toolport, copy the manual code shown after approving this device.": "如果您的浏览器无法打开Toolport，请复制批准该设备后显示的手动验证码。",
-  "Import {value1} server": "导入 {value1} 个服务器",
-  "Import {value1} servers": "导入 {value1} 个服务器",
   "Import a setup": "导入设置",
   "Imported shared setup": "已导入共享配置",
   "Imported the setup you already confirmed": "导入您已确认的设置",
@@ -550,5 +548,8 @@
   "Toolport's damaged record of the servers it moved from {client} was deleted. The servers stay in Toolport, and the client config was not changed.": "Toolport 关于从 {client} 移出的服务器的损坏记录已删除。这些服务器仍保留在 Toolport 中，客户端配置未被更改。",
   "Toolport kept the toolport entry you edited. Remove it by hand if you uninstall Toolport.": "Toolport 保留了你编辑过的 toolport 条目。如果卸载 Toolport，请手动删除它。",
   "Keyring locked. Nothing was restored. Unlock your keyring, then choose Retry.": "密钥环已锁定。没有恢复任何内容。请解锁密钥环，然后选择“重试”。",
-  "Unlock your keyring to disconnect {client}.": "请解锁密钥环以断开 {client}。"
+  "Unlock your keyring to disconnect {client}.": "请解锁密钥环以断开 {client}。",
+  "Every server in this setup is already present, so there is nothing to import.": "此设置中的所有服务器都已存在，因此没有可导入的内容。",
+  "All files": "所有文件",
+  "Couldn't read the pasted setup. Check that you copied all of it, then try again.": "无法读取粘贴的设置。请检查是否已完整复制，然后重试。"
 }
