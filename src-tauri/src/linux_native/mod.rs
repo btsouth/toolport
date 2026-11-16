@@ -12368,6 +12368,16 @@ fn open_server_editor_prefilled(
     // Set once the field checks exist: a variable row's name changed, so the
     // check for variables on a remote server runs again.
     let rows_changed: LateAction = Default::default();
+    // The saved server, for the check of variables on a remote server.
+    let saved_entry = server_id.as_ref().and_then(|id| {
+        crate::registry::load()
+            .ok()?
+            .servers
+            .into_iter()
+            .find(|saved| &saved.id == id)
+    });
+    // Stored credentials the user removed here; the save drops them.
+    let removed_stored: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
     let plain_env = editing.then(|| {
         let personal = page
             .last_snapshot
@@ -12382,8 +12392,19 @@ fn open_server_editor_prefilled(
             personal,
             &rows_changed,
         );
+        // A remote server's stored credentials are listed with a remove action,
+        // as React does, so a refusal that names one can be acted on here.
+        let stored = stored_env_rows(
+            saved_entry
+                .as_ref()
+                .map(stored_env_keys)
+                .unwrap_or_default(),
+            &removed_stored,
+            &rows_changed,
+        );
+        section.insert_child_after(&stored, section.first_child().as_ref());
         form.append(&section);
-        (section, rows, add, caption)
+        (section, rows, add, caption, stored)
     });
 
     let credentials = gtk::Label::builder()
@@ -12553,17 +12574,28 @@ fn open_server_editor_prefilled(
     let url_row_for_transport = url_row.clone();
     let env_section = plain_env
         .as_ref()
-        .map(|(section, _, add, caption)| (section.clone(), add.clone(), caption.clone()));
+        .map(|(section, _, add, caption, stored)| {
+            (
+                section.clone(),
+                add.clone(),
+                caption.clone(),
+                stored.clone(),
+            )
+        });
     // A remote server has no environment, but variables a stdio server had
     // stay in view after a switch, so they can be removed before saving.
     let had_plain = server
         .as_ref()
-        .is_some_and(|server| !server.plain_env.is_empty());
+        .is_some_and(|server| !server.plain_env.is_empty())
+        || env_section
+            .as_ref()
+            .is_some_and(|(_, _, _, stored)| stored.first_child().is_some());
     // A remote server takes no new variables.
-    if let Some((section, add, caption)) = &env_section {
+    if let Some((section, add, caption, stored)) = &env_section {
         section.set_visible(transport.selected() == 0 || had_plain);
         add.set_visible(transport.selected() == 0);
         set_plain_env_caption(caption, transport.selected() != 0);
+        stored.set_visible(transport.selected() != 0);
     }
     transport.connect_selected_notify(move |transport| {
         update_editor_transport(
@@ -12573,13 +12605,14 @@ fn open_server_editor_prefilled(
             &cwd_row_for_transport,
             &url_row_for_transport,
         );
-        if let Some((section, add, caption)) = &env_section {
+        if let Some((section, add, caption, stored)) = &env_section {
             section.set_visible(transport.selected() == 0 || had_plain);
             add.set_visible(transport.selected() == 0);
             set_plain_env_caption(caption, transport.selected() != 0);
+            stored.set_visible(transport.selected() != 0);
         }
     });
-    let plain_env = plain_env.map(|(_, rows, _, _)| rows);
+    let plain_env = plain_env.map(|(_, rows, _, _, _)| rows);
 
     let clamp = adw::Clamp::builder()
         .maximum_size(680)
@@ -12599,14 +12632,6 @@ fn open_server_editor_prefilled(
     // Start typing the name, not on the footer's first button.
     gtk::prelude::GtkWindowExt::set_focus(&editor, Some(&name));
 
-    // The saved server, for the check of variables on a remote server.
-    let saved_entry = server_id.as_ref().and_then(|id| {
-        crate::registry::load()
-            .ok()?
-            .servers
-            .into_iter()
-            .find(|saved| &saved.id == id)
-    });
     let remote_error = gtk::Label::builder()
         .halign(gtk::Align::Fill)
         .xalign(0.0)
@@ -12663,10 +12688,11 @@ fn open_server_editor_prefilled(
             test.clone(),
         );
         let validation_errors = validation_errors.clone();
-        let (remote_error, saved_entry, plain_rows) = (
+        let (remote_error, saved_entry, plain_rows, removed_stored) = (
             remote_error.clone(),
             saved_entry.clone(),
             plain_env.as_ref().map(std::rc::Rc::downgrade),
+            removed_stored.clone(),
         );
         let pasted = pasted_env.as_ref().map(PastedEnvSection::downgrade);
         std::rc::Rc::new(move || {
@@ -12687,13 +12713,21 @@ fn open_server_editor_prefilled(
                 .and_then(WeakPastedEnvSection::upgrade)
                 .map(|section| section.try_collect())
                 .unwrap_or_default();
-            let refusal = crate::registry_controller::editor_remote_env_refusal(
+            let removed = if remote {
+                removed_stored.borrow().clone()
+            } else {
+                Vec::new()
+            };
+            let refusal = crate::registry_controller::editor_remote_env_refusal_removing(
                 saved_entry.as_ref(),
                 ["stdio", "http", "sse"][(transport.selected() as usize).min(2)],
-                Some(&command.text()),
-                Some(&url.text()),
+                // Only the fields the selected transport shows: a URL left in
+                // the hidden field does not make a stdio server remote.
+                (!remote).then(|| command.text()).as_deref(),
+                remote.then(|| url.text()).as_deref(),
                 plain_keys.as_deref(),
                 &pasted_rows,
+                &removed,
             );
             remote_error.set_label(refusal.as_deref().unwrap_or(""));
             remote_error.set_visible(refusal.is_some());
@@ -12857,6 +12891,7 @@ fn open_server_editor_prefilled(
     let busy_for_test = busy.clone();
     let generation_for_test = generation.clone();
     let validate_for_test = validate.clone();
+    let removed_for_test = removed_stored.clone();
     test.connect_clicked(move |_| {
         let Some(timeout_ms) = timeout_value(&timeout_for_test.text()) else {
             validate_for_test();
@@ -12896,6 +12931,11 @@ fn open_server_editor_prefilled(
             .collect::<Vec<_>>();
         let launch_definition = launch_definition_for_test.clone();
         let env_edits = plain_env_for_test.as_ref().map(collect_plain_env);
+        let removed = if fields.transport != "stdio" {
+            removed_for_test.borrow().clone()
+        } else {
+            Vec::new()
+        };
         // Plain environment rows come and go, so they are compared instead.
         let (started, env_at_start, plain_env) = (
             generation_for_test.get(),
@@ -12913,13 +12953,13 @@ fn open_server_editor_prefilled(
                 if let Some(error) = editor_gate::hold() {
                     return Err(error);
                 }
+                // The editor's values and removals apply before the check.
                 let mut entry = crate::registry_controller::server_entry_for_probe(
                     server_id.as_deref(),
                     fields,
+                    env_edits,
+                    &removed,
                 )?;
-                if let Some(edits) = env_edits {
-                    crate::registry_controller::apply_plain_env(&mut entry, edits)?;
-                }
                 if !binding_changed {
                     if entry.launch.is_none() {
                         entry.launch = launch_definition;
@@ -13005,6 +13045,7 @@ fn open_server_editor_prefilled(
     let original_args_for_save = original_args.clone();
     let busy_for_save = busy;
     let validate_for_save = validate;
+    let removed_for_save = removed_stored;
     save.connect_clicked(move |_| {
         let Some(timeout_ms) = timeout_value(&timeout.text()) else {
             validate_for_save();
@@ -13049,6 +13090,11 @@ fn open_server_editor_prefilled(
             .map(PastedEnvSection::collect)
             .unwrap_or_default();
         let env_edits = plain_env.as_ref().map(collect_plain_env);
+        let removed = if fields.transport != "stdio" {
+            removed_for_save.borrow().clone()
+        } else {
+            Vec::new()
+        };
         let page = page.clone();
         let busy = busy_for_save.clone();
         let validate = validate_for_save.clone();
@@ -13072,7 +13118,7 @@ fn open_server_editor_prefilled(
                     Some(server_id) => {
                         let mut registry =
                             crate::registry_controller::update_server_fields_and_env(
-                                &server_id, fields, env_edits,
+                                &server_id, fields, env_edits, &removed,
                             )?;
                         if !binding_changed {
                             registry = save_launch_entries(&server_id, &launch_values, registry)?;
@@ -14173,6 +14219,67 @@ fn plain_env_section(
     });
     section.append(&add);
     (section, rows, add, caption)
+}
+
+/// A saved server's stored credentials (keychain values and password manager
+/// references) a user can see and remove in the editor. The bearer slot, the
+/// imported URL and header rows are not variables, so they are left out.
+fn stored_env_keys(server: &crate::registry::ServerEntry) -> Vec<String> {
+    let headers = crate::secret_refs::headers(server).unwrap_or_default();
+    server
+        .env
+        .iter()
+        .filter(|env| env.secret || env.unknown_fields.contains_key("source"))
+        .map(|env| env.key.clone())
+        .filter(|key| {
+            key != crate::secrets::HTTP_AUTH_KEY
+                && key != crate::secrets::IMPORTED_URL_KEY
+                && !headers
+                    .iter()
+                    .any(|h| &h.key == key || h.env.as_ref() == Some(key))
+        })
+        .collect()
+}
+
+/// One row per stored credential: its name, "•••• (saved)" and an X that
+/// removes it on save, the same as React's editor.
+fn stored_env_rows(
+    keys: Vec<String>,
+    removed: &std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    changed: &LateAction,
+) -> gtk::Box {
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    for key in keys {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let name = gtk::Label::builder()
+            .label(&key)
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .css_classes(["monospace"])
+            .build();
+        let saved = l10n::label(crate::i18n::msg("•••• (saved)"));
+        saved.add_css_class("dim-label");
+        let remove = gtk::Button::from_icon_name("window-close-symbolic");
+        remove.add_css_class("flat");
+        remove.set_tooltip_text(Some(&crate::i18n::tr("Remove variable")));
+        remove.update_property(&[gtk::accessible::Property::Label(&crate::i18n::tr(
+            "Remove variable",
+        ))]);
+        row.append(&name);
+        row.append(&saved);
+        row.append(&remove);
+        list.append(&row);
+        let (removed, changed, row_weak) = (removed.clone(), changed.clone(), row.downgrade());
+        remove.connect_clicked(move |_| {
+            if let Some(row) = row_weak.upgrade() {
+                row.set_visible(false);
+            }
+            removed.borrow_mut().push(key.clone());
+            run_late(&changed);
+        });
+    }
+    list
 }
 
 /// The plain values' caption for the selected transport: a remote server's
@@ -17814,6 +17921,202 @@ mod tests {
         transport.set_selected(0);
         assert_eq!(caption.label(), local);
         assert!(add.is_visible());
+        editor.close();
+        parent.close();
+    }
+
+    /// A saved server and its editor, for the switch tests below.
+    fn switch_editor(
+        app_id: &str,
+        env: Vec<crate::registry::EnvVar>,
+    ) -> (
+        adw::ApplicationWindow,
+        adw::Window,
+        crate::registry::DataDirTestEnv,
+    ) {
+        use super::*;
+        adw::init().unwrap();
+        let data = crate::registry::DataDirTestEnv::new(app_id);
+        let app = adw::Application::builder()
+            .application_id(format!("com.tsout.Toolport.{app_id}"))
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gtk::gio::Cancellable::NONE).unwrap();
+        let parent = adw::ApplicationWindow::builder().application(&app).build();
+        let (content, page, _) = build_content(&app, crate::approval_broker::start_native());
+        parent.set_content(Some(&content));
+        parent.present();
+        let entry: crate::registry::ServerEntry = serde_json::from_value(serde_json::json!({
+            "id": "local", "name": "Local tool", "transport": "stdio", "command": "npx",
+            "args": [], "env": env,
+        }))
+        .unwrap();
+        let (_, id) = crate::registry::update(|r| Ok(r.add_server(entry.clone()))).unwrap();
+        let server = state::ServerView {
+            id: id.clone(),
+            name: "Local tool".into(),
+            origin_label: "Personal".into(),
+            transport: "stdio".into(),
+            transport_id: "stdio".into(),
+            command: Some("npx".into()),
+            args: vec![],
+            launch: None,
+            url: None,
+            cwd: None,
+            inherit_env: false,
+            hide_prompts: false,
+            secret_keys: entry
+                .env
+                .iter()
+                .filter(|e| e.secret)
+                .map(|e| e.key.clone())
+                .collect(),
+            plain_env: entry
+                .env
+                .iter()
+                .filter(|e| !e.secret)
+                .map(|e| state::PlainEnvView {
+                    key: e.key.clone(),
+                    value: e.value.clone().unwrap_or_default(),
+                    portable: None,
+                })
+                .collect(),
+            secret_references: Default::default(),
+            client_credentials: None,
+            enabled: false,
+            requires_review: false,
+            team_route_removed: false,
+            probe_fingerprint: 1,
+        };
+        let editor = open_server_editor_prefilled(Some(server), Some(id), page, None).unwrap();
+        (parent, editor, data)
+    }
+
+    fn editor_widgets(editor: &adw::Window) -> Vec<gtk::Widget> {
+        fn walk(widget: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+            out.push(widget.clone());
+            let mut child = widget.first_child();
+            while let Some(node) = child {
+                child = node.next_sibling();
+                walk(&node, out);
+            }
+        }
+        let mut all = Vec::new();
+        walk(editor.upcast_ref(), &mut all);
+        all
+    }
+
+    fn shown(widget: &gtk::Widget) -> bool {
+        let mut node = Some(widget.clone());
+        while let Some(widget) = node {
+            if !widget.is_visible() {
+                return false;
+            }
+            node = widget.parent();
+        }
+        true
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn a_stored_variable_can_be_removed_after_a_switch_to_http() {
+        use super::*;
+        let row = |key: &str, secret: bool| crate::registry::EnvVar {
+            key: key.into(),
+            value: (!secret).then(|| "plain".into()),
+            secret,
+            unknown_fields: Default::default(),
+        };
+        let (parent, editor, _data) = switch_editor("StoredSwitch", vec![row("API_KEY", true)]);
+        let all = || editor_widgets(&editor);
+        let transport = all()
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::DropDown>().ok())
+            .unwrap();
+        let entry = |placeholder: &str| {
+            all()
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Entry>().ok())
+                .find(|e| e.placeholder_text().as_deref() == Some(placeholder))
+                .unwrap()
+        };
+        let save = all()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .find(|b| b.label().as_deref() == Some("Save"))
+            .unwrap();
+        transport.set_selected(1);
+        entry("https://example.com/mcp").set_text("https://mcp.example.com/mcp");
+        let refusal = || {
+            all()
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Label>().ok())
+                .find(|l| l.has_css_class("error") && l.label().starts_with("Remote servers don't"))
+                .filter(|l| shown(l.upcast_ref()))
+        };
+        assert!(refusal().unwrap().label().contains("API_KEY"));
+        assert!(!save.is_sensitive());
+        // The stored variable the sentence names is on screen, as in React.
+        let name = all()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .find(|l| l.label() == "API_KEY")
+            .expect("the stored variable is listed");
+        assert!(shown(name.upcast_ref()));
+        let remove = all()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .find(|b| {
+                b.tooltip_text().as_deref() == Some("Remove variable") && shown(b.upcast_ref())
+            })
+            .expect("a remove action");
+        remove.emit_clicked();
+        assert!(refusal().is_none());
+        assert!(save.is_sensitive());
+        editor.close();
+        parent.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn a_stdio_server_is_not_checked_with_its_hidden_url() {
+        use super::*;
+        let (parent, editor, _data) = switch_editor(
+            "HiddenUrl",
+            vec![crate::registry::EnvVar {
+                key: "API_KEY".into(),
+                value: Some("plain".into()),
+                secret: false,
+                unknown_fields: Default::default(),
+            }],
+        );
+        let all = || editor_widgets(&editor);
+        let transport = all()
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::DropDown>().ok())
+            .unwrap();
+        let entry = |placeholder: &str| {
+            all()
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Entry>().ok())
+                .find(|e| e.placeholder_text().as_deref() == Some(placeholder))
+                .unwrap()
+        };
+        let refusal = || {
+            all()
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Label>().ok())
+                .find(|l| l.has_css_class("error") && l.label().starts_with("Remote servers don't"))
+                .filter(|l| shown(l.upcast_ref()))
+        };
+        transport.set_selected(1);
+        entry("https://example.com/mcp").set_text("https://mcp.example.com/mcp");
+        assert!(refusal().is_some());
+        // Back on stdio with the command cleared, the URL left in the hidden
+        // field does not make it a remote server.
+        transport.set_selected(0);
+        entry("npx").set_text("");
+        assert!(refusal().is_none());
         editor.close();
         parent.close();
     }

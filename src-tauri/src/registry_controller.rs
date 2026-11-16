@@ -797,6 +797,20 @@ pub fn editor_remote_env_refusal(
     plain: Option<&[String]>,
     rows: &[ValueRow],
 ) -> Option<String> {
+    editor_remote_env_refusal_removing(previous, transport, command, url, plain, rows, &[])
+}
+
+/// [`editor_remote_env_refusal`] with the stored credentials the editor
+/// removed (`removed`), which the save drops.
+pub fn editor_remote_env_refusal_removing(
+    previous: Option<&ServerEntry>,
+    transport: &str,
+    command: Option<&str>,
+    url: Option<&str>,
+    plain: Option<&[String]>,
+    rows: &[ValueRow],
+    removed: &[String],
+) -> Option<String> {
     let mut next = match previous {
         Some(previous) => previous.clone(),
         None => serde_json::from_value(serde_json::json!({
@@ -838,6 +852,7 @@ pub fn editor_remote_env_refusal(
         env
     }));
     next.env.retain(|env| !env.key.is_empty());
+    drop_stored_rows(&mut next, removed);
     refuse_new_remote_env(previous, &next).err()
 }
 
@@ -867,16 +882,81 @@ fn remote_env_refusal(key: &str) -> String {
     )
 }
 
-pub fn apply_update_entry(registry: &mut Registry, entry: ServerEntry) -> Result<(), String> {
+/// On a remote server, an Authorization row is the server's token, kept in
+/// the bearer slot where sign-in keeps it. An edit takes such a row out of the
+/// entry and returns its typed value, which the caller stores with
+/// [`set_server_secret`] after the save. So no token is written to the
+/// registry file and no row is left with nothing stored under its name. A
+/// row the saved remote server already stored or references stays as it is.
+fn take_remote_authorization(
+    previous: Option<&ServerEntry>,
+    entry: &mut ServerEntry,
+) -> Result<Option<String>, String> {
+    let remote = |entry: &ServerEntry| {
+        entry.transport != "stdio" || (entry.command.is_none() && entry.url.is_some())
+    };
+    if !remote(entry) {
+        return Ok(None);
+    }
+    let header = |key: &str| {
+        entry
+            .unknown_fields
+            .get("headerKeys")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|headers| headers.iter().any(|h| h["key"] == key || h["env"] == key))
+    };
+    let stored = |row: &crate::registry::EnvVar| {
+        row.unknown_fields.contains_key("source")
+            || (row.secret
+                && previous.is_some_and(|previous| {
+                    remote(previous)
+                        && previous.env.iter().any(|e| {
+                            e.key == row.key
+                                && (e.secret || e.unknown_fields.contains_key("source"))
+                        })
+                }))
+    };
+    let (taken, kept): (Vec<_>, Vec<_>) =
+        std::mem::take(&mut entry.env).into_iter().partition(|row| {
+            row.key.trim().eq_ignore_ascii_case("authorization")
+                && !header(&row.key)
+                && !stored(row)
+        });
+    entry.env = kept;
+    if let Some(launch) = &mut entry.launch {
+        launch
+            .required_env
+            .retain(|key| !taken.iter().any(|row| &row.key == key));
+    }
+    let token = taken
+        .into_iter()
+        .filter_map(|row| row.value)
+        .find(|value| crate::import_credentials::provided(value));
+    if let Some(token) = &token {
+        bearer_token(token)?;
+    }
+    Ok(token)
+}
+
+/// Saves an edited entry. Returns the typed token of an Authorization row on
+/// a remote server, for the caller to store in the bearer slot.
+pub fn apply_update_entry(
+    registry: &mut Registry,
+    mut entry: ServerEntry,
+) -> Result<Option<String>, String> {
     crate::secret_refs::validate_server(&entry).map_err(|e| e.to_string())?;
-    refuse_new_remote_env(
-        registry.servers.iter().find(|server| server.id == entry.id),
-        &entry,
-    )?;
+    let previous = registry
+        .servers
+        .iter()
+        .find(|server| server.id == entry.id)
+        .cloned();
+    let token = take_remote_authorization(previous.as_ref(), &mut entry)?;
+    refuse_new_remote_env(previous.as_ref(), &entry)?;
     if let Some(launch) = &entry.launch {
         launch.validate(&entry.args, true)?;
     }
-    registry.update_server(entry)
+    registry.update_server(entry)?;
+    Ok(token)
 }
 
 pub fn apply_update_server_fields(
@@ -1388,12 +1468,15 @@ fn is_vaulted(entry: &crate::registry::EnvVar) -> bool {
 
 /// Saves the editor's fields and, when given, its plain environment values in
 /// one registry write.
+/// `removed` names stored credentials the editor removed (GTK lists them for a
+/// remote server, as React does), dropped in the same write.
 pub fn update_server_fields_and_env(
     server_id: &str,
     fields: ServerFields,
     env: Option<Vec<PlainEnvEdit>>,
+    removed: &[String],
 ) -> Result<Registry, String> {
-    let (registry, ()) = registry::update(|registry| {
+    let (registry, token) = registry::update(|registry| {
         let previous = registry
             .servers
             .iter()
@@ -1408,14 +1491,43 @@ pub fn update_server_fields_and_env(
         if let Some(env) = env {
             apply_plain_env(server, env)?;
         }
-        refuse_new_remote_env(previous.as_ref(), server)
+        drop_stored_rows(server, removed);
+        let token = take_remote_authorization(previous.as_ref(), server)?;
+        refuse_new_remote_env(previous.as_ref(), server)?;
+        Ok(token)
     })?;
-    Ok(registry)
+    match token {
+        Some(token) => set_server_secret(server_id, "Authorization", &token),
+        None => Ok(registry),
+    }
 }
 
+/// Drops the stored credentials (secret or reference rows) named in `removed`.
+/// Their keychain values stay, as when React's editor removes a row.
+fn drop_stored_rows(server: &mut ServerEntry, removed: &[String]) {
+    if removed.is_empty() {
+        return;
+    }
+    let gone = |env: &crate::registry::EnvVar| is_vaulted(env) && removed.contains(&env.key);
+    let dropped: Vec<String> = server
+        .env
+        .iter()
+        .filter(|env| gone(env))
+        .map(|env| env.key.clone())
+        .collect();
+    server.env.retain(|env| !gone(env));
+    if let Some(launch) = &mut server.launch {
+        launch.required_env.retain(|key| !dropped.contains(key));
+    }
+}
+
+/// The entry a GTK Test connects with: the saved server with the editor's
+/// fields, plain values and removed credentials, checked as a save would be.
 pub fn server_entry_for_probe(
     server_id: Option<&str>,
     fields: ServerFields,
+    env: Option<Vec<PlainEnvEdit>>,
+    removed: &[String],
 ) -> Result<ServerEntry, String> {
     match server_id {
         Some(server_id) => {
@@ -1426,11 +1538,15 @@ pub fn server_entry_for_probe(
                 .find(|server| server.id == server_id)
                 .cloned();
             apply_update_server_fields(&mut registry, server_id, fields)?;
-            let probe = registry
+            let mut probe = registry
                 .servers
                 .into_iter()
                 .find(|server| server.id == server_id)
                 .ok_or_else(|| format!("No server with id '{server_id}'"))?;
+            if let Some(env) = env {
+                apply_plain_env(&mut probe, env)?;
+            }
+            drop_stored_rows(&mut probe, removed);
             // A test connects as a save would, stored secrets included.
             refuse_new_remote_env(previous.as_ref(), &probe)?;
             Ok(probe)
@@ -3387,15 +3503,16 @@ fn credential_slot<'a>(
     if server.transport == "stdio" || header_row {
         return Ok((key, value, false));
     }
-    // A bare token is what the bearer slot holds; a Bearer value is unwrapped.
-    let token = match value.trim().split_once(char::is_whitespace) {
-        None => value.trim(),
-        Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => token.trim(),
-        Some(_) => {
-            return Err("Only Bearer authentication is supported for Authorization headers".into());
-        }
-    };
-    Ok((crate::secrets::HTTP_AUTH_KEY, token, true))
+    Ok((crate::secrets::HTTP_AUTH_KEY, bearer_token(value)?, true))
+}
+
+/// A bare token is what the bearer slot holds; a Bearer value is unwrapped.
+fn bearer_token(value: &str) -> Result<&str, String> {
+    match value.trim().split_once(char::is_whitespace) {
+        None => Ok(value.trim()),
+        Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => Ok(token.trim()),
+        Some(_) => Err("Only Bearer authentication is supported for Authorization headers".into()),
+    }
 }
 
 /// Vault a launch argument input without declaring an environment variable.
@@ -5749,7 +5866,7 @@ API_KEY = "synthetic-first-origin"
             registry::update(|r| apply_update_entry(r, edited.clone())).unwrap();
             let mut gtk = fields("legacy renamed again", "http");
             gtk.url = Some(endpoint.url.clone());
-            update_server_fields_and_env(&id, gtk, None).unwrap();
+            update_server_fields_and_env(&id, gtk, None, &[]).unwrap();
             set_server_secret_with(&id, "MY_MCP_TOKEN", "newer-token", |id, key| {
                 Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0)
             })
@@ -5891,7 +6008,7 @@ API_KEY = "synthetic-first-origin"
             }];
             let (_, id) = add_reviewed_entry(entry).unwrap();
             let error =
-                update_server_fields_and_env(&id, fields("switch", "http"), None).unwrap_err();
+                update_server_fields_and_env(&id, fields("switch", "http"), None, &[]).unwrap_err();
             assert!(error.contains("API_KEY"), "{error}");
             let mut react = registry::load()
                 .unwrap()
@@ -5904,7 +6021,7 @@ API_KEY = "synthetic-first-origin"
             react.url = Some("https://example.com/mcp".into());
             assert!(registry::update(|r| apply_update_entry(r, react.clone())).is_err());
             // A test connects with the stored values, so it refuses the same.
-            let probe = server_entry_for_probe(Some(&id), fields("switch", "http"));
+            let probe = server_entry_for_probe(Some(&id), fields("switch", "http"), None, &[]);
             assert!(probe.unwrap_err().contains("API_KEY"));
             // So does an entry that says stdio but has only a URL, which
             // connects as a remote server.
@@ -5913,6 +6030,104 @@ API_KEY = "synthetic-first-origin"
             assert!(registry::update(|r| apply_update_entry(r, disguised.clone())).is_err());
             react.env.clear();
             registry::update(|r| apply_update_entry(r, react.clone())).unwrap();
+        });
+    }
+
+    /// "Name it Authorization" on an edit makes the row the server's token:
+    /// stored where sign-in keeps it, no Authorization row left, and the
+    /// registry file holds names only.
+    #[test]
+    fn an_authorization_row_on_an_edit_becomes_the_token() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let stdio = |name: &str| {
+                let mut entry = entry_from_fields(fields(name, "stdio")).unwrap();
+                entry.env = vec![registry::EnvVar {
+                    key: "REGION".into(),
+                    value: Some("eu".into()),
+                    secret: false,
+                    unknown_fields: Default::default(),
+                }];
+                add_reviewed_entry(entry).unwrap().1
+            };
+            let file = || std::fs::read_to_string(registry::registry_path().unwrap()).unwrap();
+            let server = |id: &str| {
+                registry::load()
+                    .unwrap()
+                    .servers
+                    .into_iter()
+                    .find(|s| s.id == id)
+                    .unwrap()
+            };
+            let assert_token = |id: &str, token: &str| {
+                let saved = server(id);
+                assert!(
+                    !saved
+                        .env
+                        .iter()
+                        .any(|e| e.key.eq_ignore_ascii_case("authorization")),
+                    "{:?}",
+                    saved.env
+                );
+                assert_eq!(
+                    crate::secrets::get_secret_result(id, crate::secrets::HTTP_AUTH_KEY)
+                        .unwrap()
+                        .as_deref(),
+                    Some(token)
+                );
+                assert!(!file().contains(token), "the token is in the registry file");
+            };
+
+            // GTK: the renamed row is a plain value in the edit form.
+            let id = stdio("gtk");
+            let rename = |value: &str| {
+                vec![PlainEnvEdit {
+                    key: "Authorization".into(),
+                    value: value.into(),
+                    local_only: None,
+                }]
+            };
+            update_server_fields_and_env(
+                &id,
+                fields("gtk", "http"),
+                Some(rename("plain-token-1")),
+                &[],
+            )
+            .unwrap();
+            assert_token(&id, "plain-token-1");
+
+            // React with Keychain on: the row is a secret, its value set after.
+            let id = stdio("react");
+            let mut react = server(&id);
+            react.transport = "http".into();
+            react.command = None;
+            react.url = Some("https://example.com/mcp".into());
+            react.env = vec![registry::EnvVar {
+                key: "Authorization".into(),
+                value: None,
+                secret: true,
+                unknown_fields: Default::default(),
+            }];
+            registry::update(|r| apply_update_entry(r, react.clone())).unwrap();
+            set_server_secret(&id, "Authorization", "keychain-token-2").unwrap();
+            assert_token(&id, "keychain-token-2");
+
+            // React with Keychain off: the save hands the typed value back
+            // for the bearer slot, as the update_server command stores it.
+            let id = stdio("plain");
+            let mut react = server(&id);
+            react.transport = "http".into();
+            react.command = None;
+            react.url = Some("https://example.com/mcp".into());
+            react.env = vec![registry::EnvVar {
+                key: "Authorization".into(),
+                value: Some("Bearer plain-token-3".into()),
+                secret: false,
+                unknown_fields: Default::default(),
+            }];
+            let (_, token) = registry::update(|r| apply_update_entry(r, react.clone())).unwrap();
+            assert!(!file().contains("plain-token-3"));
+            set_server_secret(&id, "Authorization", &token.unwrap()).unwrap();
+            assert_token(&id, "plain-token-3");
         });
     }
 

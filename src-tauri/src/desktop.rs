@@ -402,12 +402,33 @@ fn prewarm_launcher(server: &ServerEntry) {
     });
 }
 
+/// Saves an edited server. On a remote server an Authorization row's typed
+/// value goes to the bearer slot, as Credentials stores it, never the file.
 #[tauri::command]
-fn update_server(state: State<RegistryState>, entry: ServerEntry) -> Result<Registry, String> {
-    let (reg, _) = write_registry(state.inner(), |reg| {
-        crate::registry_controller::apply_update_entry(reg, entry)
-    })?;
-    Ok(reg)
+async fn update_server(app: AppHandle, entry: ServerEntry) -> Result<Registry, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<RegistryState>();
+        let id = entry.id.clone();
+        let (reg, token) = write_registry(state.inner(), |reg| {
+            crate::registry_controller::apply_update_entry(reg, entry)
+        })?;
+        let Some(token) = token else {
+            return Ok(reg);
+        };
+        crate::registry_controller::set_server_secret_with(
+            &id,
+            "Authorization",
+            &token,
+            |server_id, key| {
+                let (registry, ()) = write_registry(state.inner(), |registry| {
+                    crate::registry_controller::apply_secret_declaration(registry, server_id, key)
+                })?;
+                Ok(registry)
+            },
+        )
+    })
+    .await
+    .map_err(|e| format!("keychain task join failed: {e}"))?
 }
 
 #[tauri::command]

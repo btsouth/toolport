@@ -408,6 +408,31 @@ describe("ServerDialog", () => {
     expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
   });
 
+  it("refuses an older remote plain value made secret before saving", async () => {
+    // The backend keeps an older remote row only if it could already be sent.
+    // A plain value moved to the keychain would become the server's token.
+    const user = userEvent.setup();
+    const older: ServerEntry = {
+      id: "remote",
+      name: "Remote",
+      transport: "http",
+      command: null,
+      args: [],
+      env: [{ key: "REGION", value: "eu", secret: false }],
+      url: "https://mcp.example.com/mcp",
+      source: "manual",
+    };
+    render(<ServerDialog autoOpen editId="remote" initial={older} onSaved={vi.fn()} />);
+    const refusal =
+      "Remote servers don't read environment variables, so Toolport would send REGION to this server as its bearer token. Remove it, or name it Authorization if it is this server's token.";
+    expect(screen.queryByText(refusal)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    await user.click(screen.getByLabelText("Keep REGION in keychain"));
+    expect(screen.getByText(refusal)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Test connection" })).toBeDisabled();
+  });
+
   it("saves the startup timeout in milliseconds", async () => {
     const initial: ServerEntry = {
       id: "remote",
