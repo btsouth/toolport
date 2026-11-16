@@ -34,6 +34,7 @@ import { SkeletonRows } from "@/components/ui/skeleton";
 import { clientDiscovery } from "@/lib/clientDiscovery";
 import {
   T3_CODE_NAME,
+  compareClientNames,
   connectAllOutcome,
   connectAllSummary,
   t3CodeActivitySegment,
@@ -96,7 +97,7 @@ function sortClients(clients: DetectedClient[]): DetectedClient[] {
         return 4;
     }
   };
-  return [...clients].sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
+  return [...clients].sort((a, b) => rank(a) - rank(b) || compareClientNames(a, b));
 }
 
 function StatusBadge({ status }: { status: ClientStatus }) {
@@ -661,12 +662,25 @@ export function ClientsView({
     /** Ids of the rows skipped so far, in step order. */
     notConnectedIds: string[];
   } | null>(null);
-  // The rows as they are now: the summary is worked out from them when the batch ends,
-  // so an instance turned off or removed meanwhile is neither counted nor named.
-  const clientsNow = useRef(clients);
+  // A batch that just ended, waiting for the rescan after it: the summary is worked out
+  // from the rows that rescan finds, so an instance turned off or removed meanwhile is
+  // neither counted nor named. GTK builds it from its rescan the same way.
+  const [summaryDue, setSummaryDue] = useState<{
+    connectedIds: string[];
+    notConnectedIds: string[];
+    stopped: boolean;
+  } | null>(null);
+  const summaryShown = useRef<typeof summaryDue>(null);
   useEffect(() => {
-    clientsNow.current = clients;
-  }, [clients]);
+    if (!summaryDue || summaryShown.current === summaryDue) return;
+    summaryShown.current = summaryDue;
+    const { text, success } = connectAllSummary({
+      ...connectAllOutcome(clients, summaryDue.connectedIds, summaryDue.notConnectedIds),
+      stopped: summaryDue.stopped,
+    });
+    if (success) toast.success(text);
+    else toast(text, LASTING_TOAST);
+  }, [summaryDue, clients]);
   // When the batch closes, focus goes back to Connect all, or to the T3 Code card once
   // the button is gone, never to the page start.
   const connectAllButton = useRef<HTMLButtonElement>(null);
@@ -678,13 +692,10 @@ export function ClientsView({
   ) => {
     setBatch(null);
     focusAfterBatch.current = true;
-    const { text, success } = connectAllSummary({
-      ...connectAllOutcome(clientsNow.current, connectedIds, notConnectedIds),
-      stopped,
-    });
-    if (success) toast.success(text);
-    else toast(text, LASTING_TOAST);
-    void onChangedRef.current?.().catch(() => {});
+    // The rescan sets the new rows before it resolves; a failed one keeps the old rows.
+    void (onChangedRef.current?.() ?? Promise.resolve())
+      .catch(() => {})
+      .then(() => setSummaryDue({ connectedIds, notConnectedIds, stopped }));
   };
   const onBatchDialogClosed = (event: Event) => {
     if (!focusAfterBatch.current) return;
@@ -695,14 +706,9 @@ export function ClientsView({
     else t3Card.current?.focus();
   };
   const batchTarget = batch ? batch.targets[batch.index] : undefined;
-  // The step names the instances on its row as they are now.
-  const batchNames = (() => {
-    if (!batchTarget) return [];
-    const now = t3CodeEnabledNames(
-      clients.find((client) => client.id === batchTarget.id),
-    );
-    return now.length > 0 ? now : t3CodeEnabledNames(batchTarget);
-  })();
+  // The step names the instances on its row as they were when Connect all started, the
+  // batch the user agreed to; GTK fixes them the same way.
+  const batchNames = t3CodeEnabledNames(batchTarget);
   const present = sorted.filter((client) => statusOf(client) !== "missing");
   const missing = sorted.filter((client) => statusOf(client) === "missing");
   const connected = present.filter((client) => statusOf(client) === "connected");

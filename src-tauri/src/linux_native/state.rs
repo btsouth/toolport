@@ -457,6 +457,16 @@ pub(super) struct ClientView {
     pub(super) t3_code: Vec<crate::clients::T3CodeUse>,
 }
 
+/// The order Clients lists rows in, and so Connect all's steps: installed apps first, then
+/// by Unicode lowercase name, then by id. React's `compareClientNames` is the same rule.
+pub(super) fn client_order(left: &ClientView, right: &ClientView) -> std::cmp::Ordering {
+    right
+        .app_present
+        .cmp(&left.app_present)
+        .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
 impl ClientView {
     fn from_detected(client: crate::clients::DetectedClient) -> Self {
         Self {
@@ -624,12 +634,7 @@ pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
         client.discovery_mode = registry.client_discovery.get(&client.id).cloned();
         client.inherited_discovery = registry.chosen_global_discovery_mode().map(str::to_string);
     }
-    clients.sort_by(|left, right| {
-        right
-            .app_present
-            .cmp(&left.app_present)
-            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-    });
+    clients.sort_by(client_order);
     let (sessions, sessions_error) = client_session_history();
     Ok(ClientSnapshot {
         clients,

@@ -54,6 +54,30 @@ export function t3CodeTargets(clients: DetectedClient[]): DetectedClient[] {
   );
 }
 
+/** By code point, the order Rust's `str` comparison uses. */
+function compareCodePoints(a: string, b: string): number {
+  const left = [...a];
+  const right = [...b];
+  for (let index = 0; index < Math.min(left.length, right.length); index++) {
+    const difference = left[index].codePointAt(0)! - right[index].codePointAt(0)!;
+    if (difference !== 0) return difference;
+  }
+  return left.length - right.length;
+}
+
+/** The order rows (and so Connect all's steps) are listed in among rows of the same
+ * status: by Unicode lowercase name, then by id. GTK's `state::client_order` is the same
+ * rule. */
+export function compareClientNames(
+  a: { name: string; id: string },
+  b: { name: string; id: string },
+): number {
+  return (
+    compareCodePoints(a.name.toLowerCase(), b.name.toLowerCase()) ||
+    compareCodePoints(a.id, b.id)
+  );
+}
+
 /** Enabled instances on the given rows; the card counts instances, not rows. */
 export function t3CodeInstanceCount(targets: DetectedClient[]): number {
   return targets.reduce(

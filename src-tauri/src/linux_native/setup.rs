@@ -100,6 +100,12 @@ pub(super) fn review_title(client_name: &str) -> String {
     crate::i18n::trf("Review and connect {value0}", &[("value0", client_name)])
 }
 
+/// The title of the window shown when a client's review can't be read: "Connect NAME",
+/// as React's dialog titles it.
+pub(super) fn unreadable_review_title(client_name: &str) -> String {
+    crate::i18n::trf("Connect {value0}", &[("value0", client_name)])
+}
+
 // Keep all reviewed dialog fields and its confirmation callback together.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn review(
@@ -248,6 +254,21 @@ pub(super) fn review_with_notice(
     // Set when Retry reopens a review that could not be read; the step goes on.
     let retrying = std::rc::Rc::new(std::cell::Cell::new(false));
     let keyboard = super::keyboard_tracker(&dialog, parent.gets_focus_visible());
+    // Set while the action runs. The window stays open until it finishes, as Cancel and
+    // Escape do and React's dialog does: closing it would end a batch step as stopped
+    // while the config is still being written. Connected first, so a batch step's handler
+    // below never sees this close.
+    let busy = std::rc::Rc::new(std::cell::Cell::new(false));
+    {
+        let busy = busy.clone();
+        dialog.connect_close_request(move |_| {
+            if busy.get() {
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            }
+        });
+    }
     if let Some(closed) = step.closed.clone() {
         let (completed, advanced, skipped, retrying, keyboard) = (
             completed.clone(),
@@ -296,7 +317,6 @@ pub(super) fn review_with_notice(
             String,
             std::collections::BTreeMap<String, String>,
         >::new()));
-    let busy = std::rc::Rc::new(std::cell::Cell::new(false));
     let required_fields = std::rc::Rc::new(std::cell::RefCell::new(Vec::<(
         gtk::glib::WeakRef<gtk::CheckButton>,
         String,
@@ -939,10 +959,9 @@ pub(super) fn connect_step(
                 review_client_name(&id),
             )
         })
-        .await
-        .map(|(preview, name)| preview.map(|preview| (preview, name)));
+        .await;
         match preview {
-            Ok(Ok((preview, client_name))) => {
+            Ok((Ok(preview), client_name)) => {
                 let disclosure = crate::i18n::trf(
                     if force {
                         crate::i18n::msg("Config: {value0}\nBackup directory: {value1}\nSelected entries move after gateway verification. Unchecked entries and plugin servers stay in place. This replaces the customized Toolport entry.")
@@ -989,9 +1008,12 @@ pub(super) fn connect_step(
                 );
             }
             failed => {
-                let error = match failed {
-                    Ok(Err(error)) => error,
-                    _ => crate::i18n::tr("Client review stopped."),
+                let (error, client_name) = match failed {
+                    Ok((Err(error), name)) => (error, name),
+                    _ => (
+                        crate::i18n::tr("Client review stopped."),
+                        crate::i18n::tr("Client"),
+                    ),
                 };
                 // Cancel, Skip in a batch, and Retry, which reads the review again, as
                 // React's dialog offers when the config can't be read.
@@ -1009,7 +1031,7 @@ pub(super) fn connect_step(
                 });
                 review_with_notice(
                     &parent,
-                    &crate::i18n::tr("Could not review setup"),
+                    &unreadable_review_title(&client_name),
                     Vec::new(),
                     &error,
                     None,
@@ -1244,6 +1266,63 @@ mod tests {
 
     #[test]
     #[ignore = "requires isolated GTK display"]
+    fn closing_a_step_window_while_it_connects_keeps_it_open() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        adw::init().unwrap();
+        let release = std::sync::Arc::new(AtomicBool::new(false));
+        let wrote = std::sync::Arc::new(AtomicBool::new(false));
+        let (step, ended) = recorded_step(None, true);
+        let (hold, done) = (release.clone(), wrote.clone());
+        review_with_notice(
+            &gtk::Window::new(),
+            "Slow step",
+            Vec::new(),
+            "Fixture",
+            None,
+            "Connect",
+            true,
+            move |_, _, _| {
+                while !hold.load(SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                done.store(true, SeqCst);
+                Ok("Cursor connected. Restart it to load Toolport.".into())
+            },
+            || {},
+            None,
+            step,
+        );
+        let window = window_titled("Slow step").unwrap();
+        let confirm = button_named(&window, "toolport-setup-confirm");
+        confirm.emit_clicked();
+        wait_for(&|| !confirm.is_sensitive());
+        // The window manager asks the window to close while the config is being written.
+        window.close();
+        let context = gtk::glib::MainContext::default();
+        for _ in 0..20 {
+            while context.iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let still_open = window.is_visible();
+        let not_ended = ended.get().is_none();
+        release.store(true, SeqCst);
+        assert!(still_open, "the window stays open while it connects");
+        assert!(not_ended, "the step has not ended");
+        wait_for(&|| confirm.label().as_deref() == Some("Next"));
+        assert!(wrote.load(SeqCst));
+        // Once it has connected, closing it stops the batch with this row connected.
+        window.close();
+        wait_for(&|| ended.get().is_some());
+        assert_eq!(ended.get(), Some(StepEnd::CompletedAndStopped));
+    }
+
+    #[test]
+    fn a_review_that_cannot_be_read_is_titled_as_react_titles_it() {
+        assert_eq!(unreadable_review_title("Cursor"), "Connect Cursor");
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display"]
     fn a_step_whose_review_cannot_be_read_offers_retry_and_skip() {
         adw::init().unwrap();
         let _lock = crate::registry::data_dir_test_lock();
@@ -1269,8 +1348,8 @@ mod tests {
             None,
             step,
         );
-        wait_for(&|| window_titled("Could not review setup").is_some());
-        let window = window_titled("Could not review setup").unwrap();
+        wait_for(&|| window_titled("Connect Client").is_some());
+        let window = window_titled("Connect Client").unwrap();
         assert!(label_shown(&window, "Step 2 of 2: Gone"));
         let confirm = button_named(&window, "toolport-setup-confirm");
         assert_eq!(confirm.label().as_deref(), Some("Retry"));
@@ -1281,9 +1360,9 @@ mod tests {
         );
         // Retry reads the review again: a new window, and the step has not ended.
         confirm.emit_clicked();
-        wait_for(&|| window_titled("Could not review setup").is_some_and(|again| again != window));
+        wait_for(&|| window_titled("Connect Client").is_some_and(|again| again != window));
         assert!(ended.get().is_none(), "Retry does not end the step");
-        let again = window_titled("Could not review setup").unwrap();
+        let again = window_titled("Connect Client").unwrap();
         assert_ne!(again, window);
         button_named(&again, "toolport-setup-skip").emit_clicked();
         wait_for(&|| ended.get().is_some());

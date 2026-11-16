@@ -1073,7 +1073,7 @@ fn connect_t3_code_targets(page: ClientPage, targets: Vec<state::ClientView>) {
     }
     fn finish(batch: &Batch, stopped: bool, keyboard: bool) {
         batch.page.t3_code_batch.set(false);
-        *batch.page.pending_batch.borrow_mut() = Some(T3BatchOutcome {
+        batch.page.end_t3_code_batch(T3BatchOutcome {
             stopped,
             rows: batch
                 .targets
@@ -1083,7 +1083,6 @@ fn connect_t3_code_targets(page: ClientPage, targets: Vec<state::ClientView>) {
             connected: batch.connected.borrow().clone(),
             keyboard,
         });
-        batch.page.refresh();
     }
     fn run(batch: std::rc::Rc<Batch>, index: usize, keyboard: bool) {
         let Some(client) = batch.targets.get(index) else {
@@ -1095,13 +1094,8 @@ fn connect_t3_code_targets(page: ClientPage, targets: Vec<state::ClientView>) {
             return;
         };
         let total = batch.targets.len();
-        let names = client
-            .t3_code
-            .iter()
-            .filter(|instance| instance.enabled)
-            .map(|instance| instance.display_name.clone())
-            .collect::<Vec<_>>()
-            .join(", ");
+        // Named from the row as it was when Connect all started, as React's steps are.
+        let line_client = client.clone();
         let next = batch.clone();
         let id = client.id.clone();
         let last = index + 1 == total;
@@ -1114,14 +1108,7 @@ fn connect_t3_code_targets(page: ClientPage, targets: Vec<state::ClientView>) {
             Some(batch.page.credential_page.clone()),
             super::setup::Step {
                 line: Some(std::rc::Rc::new(move || {
-                    crate::i18n::trf(
-                        "Step {index} of {total}: {names}",
-                        &[
-                            ("index", &(index + 1).to_string()),
-                            ("total", &total.to_string()),
-                            ("names", &names),
-                        ],
-                    )
+                    t3_code_step_line(index, total, &line_client)
                 })),
                 more: !last,
                 closed: Some(std::rc::Rc::new(move |end, keyboard| match end {
@@ -1150,6 +1137,26 @@ fn connect_t3_code_targets(page: ClientPage, targets: Vec<state::ClientView>) {
         0,
         true,
     );
+}
+
+/// The line under a Connect all step's title: "Step N of M: NAMES", naming the enabled
+/// instances on `client`, the row as the batch holds it from when it started.
+pub(super) fn t3_code_step_line(index: usize, total: usize, client: &state::ClientView) -> String {
+    let names = client
+        .t3_code
+        .iter()
+        .filter(|instance| instance.enabled)
+        .map(|instance| instance.display_name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    crate::i18n::trf(
+        "Step {index} of {total}: {names}",
+        &[
+            ("index", &(index + 1).to_string()),
+            ("total", &total.to_string()),
+            ("names", &names),
+        ],
+    )
 }
 
 /// What a finished Connect all did, by row id. The page builds the summary from it once
@@ -1847,6 +1854,53 @@ mod tests {
         // One row per home; the status line counts enabled instances.
         assert_eq!(t3_code_instance_count(&targets), 3);
         assert!(t3_code_targets(&rows[..2]).is_empty());
+    }
+
+    #[test]
+    fn connect_all_steps_go_by_lowercase_name_then_id_as_react_orders_them() {
+        use state::ClientGatewayState::*;
+        let row = |id: &str, name: &str, on: &str| {
+            let mut row = client(id, Disconnected);
+            row.name = name.into();
+            row.t3_code = vec![instance(on, true)];
+            row
+        };
+        let mut rows = vec![
+            row("zed", "Zed", "Z"),
+            row("ecran", "Écran", "E"),
+            row("codex@b", "codex", "B"),
+            row("codex@a", "Codex", "A"),
+        ];
+        rows.sort_by(state::client_order);
+        // React's ClientsView test of the same rows expects these steps.
+        let steps = t3_code_targets(&rows)
+            .iter()
+            .enumerate()
+            .map(|(index, target)| t3_code_step_line(index, 4, target))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            steps,
+            [
+                "Step 1 of 4: A",
+                "Step 2 of 4: B",
+                "Step 3 of 4: Z",
+                "Step 4 of 4: E"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_step_names_the_instances_on_at_batch_start() {
+        use state::ClientGatewayState::*;
+        let mut codex = client("codex", Disconnected);
+        codex.t3_code = vec![
+            instance("Two", true),
+            instance("Three", true),
+            instance("Off", false),
+        ];
+        // The batch keeps this row as it was when Connect all started; the line names
+        // its enabled instances from it, whatever a later scan finds.
+        assert_eq!(t3_code_step_line(1, 2, &codex), "Step 2 of 2: Two, Three");
     }
 
     #[test]

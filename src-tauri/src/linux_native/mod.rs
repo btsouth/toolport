@@ -2844,9 +2844,11 @@ struct ClientPage {
     claude_copies_shown: std::rc::Rc<std::cell::Cell<bool>>,
     /// Set while T3 Code's Connect all is working through its rows.
     t3_code_batch: std::rc::Rc<std::cell::Cell<bool>>,
-    /// A Connect all that just ended: the next render builds its summary from what it
-    /// reads and puts focus back on the T3 Code card.
+    /// A Connect all whose scan is running: that scan's render builds the summary from
+    /// what it reads and puts focus back on the T3 Code card.
     pending_batch: std::rc::Rc<std::cell::RefCell<Option<client_rows::T3BatchOutcome>>>,
+    /// A Connect all that just ended, waiting for a scan that starts after it.
+    ended_batch: std::rc::Rc<std::cell::RefCell<Option<client_rows::T3BatchOutcome>>>,
     /// The page's wrapping notice that stays until dismissed, and its text.
     lasting: gtk::Box,
     lasting_label: gtk::Label,
@@ -2964,6 +2966,7 @@ impl ClientPage {
             claude_copies_shown: std::rc::Rc::new(std::cell::Cell::new(false)),
             t3_code_batch: Default::default(),
             pending_batch: Default::default(),
+            ended_batch: Default::default(),
             lasting,
             lasting_label,
         };
@@ -3165,6 +3168,22 @@ impl ClientPage {
         self.refresh_with(false);
     }
 
+    /// Connect all ended: read the clients again and show its summary from what that
+    /// scan finds. A scan already running started before the batch ended, so its rows
+    /// can be out of date: the outcome waits for the next scan, which `after_scan` starts.
+    fn end_t3_code_batch(&self, outcome: client_rows::T3BatchOutcome) {
+        *self.ended_batch.borrow_mut() = Some(outcome);
+        self.refresh();
+    }
+
+    /// Called when a scan has finished and its rows are shown: a Connect all that ended
+    /// during it gets its own scan now.
+    fn after_scan(&self) {
+        if self.ended_batch.borrow().is_some() {
+            self.refresh();
+        }
+    }
+
     /// The explicit scan (refresh button, Ctrl+R): also checks saved recovery
     /// values without prompting, then keeps keyboard focus where it was.
     fn scan(&self) {
@@ -3174,6 +3193,10 @@ impl ClientPage {
     fn refresh_with(&self, probe: bool) {
         if self.scanning.replace(true) {
             return;
+        }
+        // This scan starts after the batch ended, so its render shows the summary.
+        if let Some(outcome) = self.ended_batch.borrow_mut().take() {
+            *self.pending_batch.borrow_mut() = Some(outcome);
         }
         // A running recovery action already holds the recovery locks; scan the
         // clients now and leave the saved-value check for the next explicit scan.
@@ -3231,6 +3254,7 @@ impl ClientPage {
                     page.show_scan_error(&error, &error)
                 }
             }
+            page.after_scan();
         });
     }
 
@@ -16317,7 +16341,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
-    fn connect_all_summary_stays_until_dismissed_and_focus_returns_to_the_card() {
+    fn connect_all_summary_stays_until_dismissed_focus_returns_and_it_waits_for_a_later_scan() {
         use super::*;
         adw::init().unwrap();
         let _lock = crate::registry::data_dir_test_lock();
@@ -16470,6 +16494,44 @@ mod tests {
             .find(|w| w.has_css_class("toolport-t3-card-group"))
             .unwrap();
         assert!(card.has_focus(), "focus goes to the T3 Code card");
+
+        // A batch that ends while an older scan (say from the settings watcher) is still
+        // running: that scan's rows predate the batch, so the summary waits for a scan
+        // that starts after it, which always follows.
+        page.lasting.set_visible(false);
+        page.scanning.set(true);
+        page.end_t3_code_batch(client_rows::T3BatchOutcome {
+            stopped: true,
+            rows: vec!["aider".into(), "codex".into()],
+            connected: vec!["aider".into()],
+            keyboard: false,
+        });
+        page.scanning.set(false);
+        page.render(snapshot(vec![
+            row("aider", "Aider", Disconnected),
+            row("codex", "Codex", Disconnected),
+        ]));
+        assert!(
+            !page.lasting.is_visible(),
+            "an older scan does not show the summary"
+        );
+        page.after_scan();
+        assert!(
+            page.scanning.get(),
+            "a scan follows once the older one ends"
+        );
+        let context = gtk::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while page.scanning.get() && std::time::Instant::now() < deadline {
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+        assert!(!page.scanning.get());
+        assert!(page.lasting.is_visible(), "that scan shows the summary");
+        assert!(page
+            .lasting_label
+            .text()
+            .starts_with("Connect all stopped."));
         window.close();
         let _ = std::fs::remove_dir_all(&root);
     }

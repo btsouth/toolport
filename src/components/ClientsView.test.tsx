@@ -1425,6 +1425,127 @@ describe("ClientsView", () => {
         lasting,
       );
     });
+
+    it("works out the summary from the rescan after the batch, as GTK does", async () => {
+      mockConnect();
+      const before = [
+        client({ id: "aider", name: "Aider", t3Code: [on("One")] }),
+        client({ id: "codex", name: "Codex", t3Code: [on("Two"), on("Three")] }),
+      ];
+      // The rescan after the batch finds Aider connected and Three turned off.
+      const after = [
+        client({
+          id: "aider",
+          name: "Aider",
+          gatewayInstalled: true,
+          entryState: "managed",
+          t3Code: [on("One")],
+        }),
+        client({ id: "codex", name: "Codex", t3Code: [on("Two"), off("Three")] }),
+      ];
+      function Page() {
+        const [clients, setClients] = useState(before);
+        return (
+          <ClientsView
+            clients={clients}
+            registry={null}
+            onSelectClient={vi.fn()}
+            onChanged={async () => {
+              await Promise.resolve();
+              setClients(after);
+            }}
+          />
+        );
+      }
+      render(<Page />);
+      await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Connect to Toolport" }),
+      );
+      await userEvent.click(await screen.findByRole("button", { name: "Next" }));
+      expect(await screen.findByText("Review and connect Codex")).toBeVisible();
+      await userEvent.keyboard("{Escape}");
+      await waitFor(() =>
+        expect(toast).toHaveBeenCalledWith(
+          "Connect all stopped. Connected 1 of 2 T3 Code instances. Not connected: Two.",
+          lasting,
+        ),
+      );
+      expect(toast).toHaveBeenCalledTimes(1);
+    });
+
+    it("names each step's instances as they were when Connect all started, as GTK does", async () => {
+      mockConnect();
+      const props = {
+        registry: null,
+        onSelectClient: vi.fn(),
+        onChanged: vi.fn(async () => {}),
+      };
+      const { rerender } = render(
+        <ClientsView
+          clients={[
+            client({ id: "aider", name: "Aider", t3Code: [on("One")] }),
+            client({ id: "codex", name: "Codex", t3Code: [on("Two"), on("Three")] }),
+          ]}
+          {...props}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+      expect(await screen.findByText("Step 1 of 2: One")).toBeVisible();
+      // T3 Code's settings change during the batch: Three is turned off, Four added.
+      rerender(
+        <ClientsView
+          clients={[
+            client({ id: "aider", name: "Aider", t3Code: [on("One")] }),
+            client({
+              id: "codex",
+              name: "Codex",
+              t3Code: [on("Two"), off("Three"), on("Four")],
+            }),
+          ]}
+          {...props}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Connect to Toolport" }));
+      await userEvent.click(await screen.findByRole("button", { name: "Next" }));
+      expect(await screen.findByText("Step 2 of 2: Two, Three")).toBeVisible();
+    });
+
+    it("orders the steps by lowercase name then id, as GTK does", async () => {
+      mockConnect();
+      render(
+        <ClientsView
+          clients={[
+            client({ id: "zed", name: "Zed", t3Code: [on("Z")] }),
+            client({ id: "ecran", name: "Écran", t3Code: [on("E")] }),
+            client({ id: "codex@b", name: "codex", t3Code: [on("B")] }),
+            client({ id: "codex@a", name: "Codex", t3Code: [on("A")] }),
+          ]}
+          registry={null}
+          onSelectClient={vi.fn()}
+          onChanged={vi.fn(async () => {})}
+        />,
+      );
+      const steps: string[] = [];
+      await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+      for (let index = 1; index <= 4; index++) {
+        steps.push(
+          (await screen.findByText(new RegExp(`^Step ${index} of 4: `))).textContent!,
+        );
+        await userEvent.click(
+          screen.getByRole("button", { name: "Connect to Toolport" }),
+        );
+        await userEvent.click(
+          await screen.findByRole("button", { name: index < 4 ? "Next" : "Done" }),
+        );
+      }
+      expect(steps).toEqual([
+        "Step 1 of 4: A",
+        "Step 2 of 4: B",
+        "Step 3 of 4: Z",
+        "Step 4 of 4: E",
+      ]);
+    });
   });
 });
 

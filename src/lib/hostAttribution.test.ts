@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { DetectedClient, T3CodeOther } from "./types";
 import {
+  compareClientNames,
   connectAllOutcome,
   connectAllSummary,
   hostName,
@@ -417,5 +418,27 @@ describe("connectAllOutcome", () => {
       notConnected: ["Codex Home"],
       leftOut: [],
     });
+  });
+});
+
+describe("compareClientNames", () => {
+  it("orders by Unicode lowercase name, then id, as GTK's client_order does", () => {
+    const rows = [
+      { id: "zed", name: "Zed" },
+      { id: "ecran", name: "Écran" },
+      { id: "codex@b", name: "codex" },
+      { id: "codex@a", name: "Codex" },
+      { id: "emoji", name: "\u{1F600} Smile" },
+      { id: "private", name: "\uFF21 Wide" },
+    ];
+    // Code point order: the astral emoji sorts after U+FF21, unlike UTF-16 order.
+    expect([...rows].sort(compareClientNames).map((row) => row.id)).toEqual([
+      "codex@a",
+      "codex@b",
+      "zed",
+      "ecran",
+      "private",
+      "emoji",
+    ]);
   });
 });
