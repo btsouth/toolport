@@ -267,9 +267,25 @@ pub fn probe_registered(server_id: &str) -> Result<ProbeResult, String> {
 /// The health check a shell runs on its own: at start, after a change, when a
 /// page comes back. Nobody asked for it, so it must not ask to unlock the store.
 pub fn probe_health_bounded(server: &ServerEntry) -> ProbeResult {
+    probe_health_checked(server, &KeyringCheck::default())
+}
+
+/// One keyring check for a round of health checks, made by the first one
+/// that needs it: one search, not one per server competing for the store.
+#[derive(Clone, Default)]
+pub struct KeyringCheck(std::sync::Arc<std::sync::OnceLock<bool>>);
+
+impl KeyringCheck {
+    fn would_prompt(&self, check: impl FnOnce() -> bool) -> bool {
+        *self.0.get_or_init(check)
+    }
+}
+
+/// [`probe_health_bounded`] sharing its round's keyring check.
+pub fn probe_health_checked(server: &ServerEntry, check: &KeyringCheck) -> ProbeResult {
     // One search that asks nothing: while a Toolport item is locked, any read
     // of a stored value could raise the unlock prompt.
-    if keeps_values_in_store(server) && secrets::store_would_prompt() {
+    if keeps_values_in_store(server) && check.would_prompt(secrets::store_would_prompt) {
         return ProbeResult {
             server_id: server.id.clone(),
             ok: false,
@@ -307,9 +323,53 @@ fn keeps_values_in_store(server: &ServerEntry) -> bool {
         })
 }
 
-/// [`probe_health_bounded`] for a saved server.
-pub fn probe_health_registered(server_id: &str) -> Result<ProbeResult, String> {
-    Ok(probe_health_bounded(&registered_server(server_id)?))
+/// [`probe_health_checked`] for a saved server.
+pub fn probe_health_registered(
+    server_id: &str,
+    check: &KeyringCheck,
+) -> Result<ProbeResult, String> {
+    Ok(probe_health_checked(&registered_server(server_id)?, check))
+}
+
+/// Servers whose health check found the keyring locked (or busy), checked
+/// again without asking each time a poll finds it open, until none is
+/// locked. Nothing else checks them again while the page stays open. Callers
+/// add to `locked` and start this only when it was empty.
+pub fn recheck_locked_once_open(
+    locked: &std::sync::Mutex<Vec<ServerEntry>>,
+    poll: Duration,
+    report: impl Fn(&ProbeResult) + Sync,
+) {
+    let queue = || locked.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        std::thread::sleep(poll);
+        if queue().is_empty() {
+            return;
+        }
+        if secrets::store_would_prompt() {
+            continue;
+        }
+        let round = queue().clone();
+        let check = KeyringCheck::default();
+        let results: Vec<ProbeResult> = std::thread::scope(|scope| {
+            let handles: Vec<_> = round
+                .iter()
+                .map(|server| scope.spawn(|| probe_health_checked(server, &check)))
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        results.iter().for_each(&report);
+        let mut queue = queue();
+        queue.retain(|server| {
+            results
+                .iter()
+                .find(|result| result.server_id == server.id)
+                .is_none_or(|result| result.keyring_locked)
+        });
+        if queue.is_empty() {
+            return;
+        }
+    }
 }
 
 fn registered_server(server_id: &str) -> Result<ServerEntry, String> {
@@ -374,6 +434,59 @@ mod tests {
             launch: None,
             unknown_fields: serde_json::Map::new(),
         }
+    }
+
+    /// A round of health checks makes one keyring check, not one per server.
+    #[test]
+    fn a_round_of_health_checks_checks_the_keyring_once() {
+        let check = KeyringCheck::default();
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let check = check.clone();
+                let calls = &calls;
+                scope.spawn(move || {
+                    check.would_prompt(|| {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        true
+                    })
+                });
+            }
+        });
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Failure mode: a row that showed "Keyring locked" (a locked or busy
+    /// keyring) kept it after the keyring opened, until a Refresh.
+    #[test]
+    fn locked_rows_are_checked_again_once_the_keyring_opens() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut remote = server();
+            remote.transport = "http".into();
+            remote.url = Some("http://127.0.0.1:1/mcp".into());
+            let locked = std::sync::Mutex::new(vec![remote]);
+            let (sender, results) = std::sync::mpsc::channel();
+            let sender = std::sync::Mutex::new(sender);
+            std::thread::scope(|scope| {
+                let mut early = None;
+                let prompts = crate::secrets::locked_store::prompts_during(|| {
+                    scope.spawn(|| {
+                        recheck_locked_once_open(&locked, Duration::from_millis(10), |result| {
+                            let _ = sender.lock().unwrap().send(result.clone());
+                        })
+                    });
+                    early = Some(results.recv_timeout(Duration::from_millis(300)));
+                });
+                assert!(prompts.is_empty(), "{prompts:?}");
+                assert!(early.unwrap().is_err(), "checked while locked");
+                let result = results
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("checked once open");
+                assert_eq!(result.server_id, "probe");
+                assert!(!result.keyring_locked, "{result:?}");
+            });
+            assert!(locked.lock().unwrap().is_empty());
+        });
     }
 
     #[test]

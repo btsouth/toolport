@@ -121,7 +121,12 @@ pub fn restore_with_retries<H: Clone + Send + 'static>(
             mark_waiting(state_of(&handle), false);
             None
         }
-        Restore::Off | Restore::Running => None,
+        // Turned off between an attempt and its wait: no wait left to show.
+        Restore::Off => {
+            mark_waiting(state_of(&handle), false);
+            None
+        }
+        Restore::Running => None,
     };
     if let Some(next) = next {
         let waiting = handle.clone();
@@ -408,6 +413,25 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         });
+    }
+
+    fn fixture_off(_: &Fixture) -> super::Restore {
+        super::Restore::Off
+    }
+
+    /// Failure mode: a Stop between a failed attempt and its wait left the
+    /// wait set with the setting off, so it showed "Keyring locked" for good.
+    #[test]
+    fn a_restore_that_finds_it_off_clears_the_wait() {
+        let fixture = Fixture(std::sync::Arc::new((
+            super::HttpBridgeState::default(),
+            std::sync::atomic::AtomicU32::new(0),
+            0,
+        )));
+        super::mark_waiting(&fixture.0 .0, true);
+        let outcome = super::restore_with_retries(fixture.clone(), fixture_state, fixture_off, 2);
+        assert_eq!(outcome, super::Restore::Off);
+        assert!(!super::status(&fixture.0 .0).keyring_locked);
     }
 
     /// The retries are bounded: it then shows the endpoint stopped.

@@ -1320,25 +1320,73 @@ async fn probe_servers(
     // One worker thread per server. Each emits its result as soon as it's ready
     // (the UI listens for `server-probed`), then contributes to the returned batch.
     tauri::async_runtime::spawn_blocking(move || {
+        let check = crate::server_runtime::KeyringCheck::default();
         let handles: Vec<_> = servers
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|s| {
                 let app = app.clone();
+                let check = check.clone();
                 std::thread::spawn(move || {
                     let result = if interactive {
                         crate::server_runtime::probe_one_bounded(&s)
                     } else {
-                        crate::server_runtime::probe_health_bounded(&s)
+                        crate::server_runtime::probe_health_checked(&s, &check)
                     };
                     let _ = app.emit("server-probed", &result);
                     result
                 })
             })
             .collect();
-        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        let results: Vec<ProbeResult> = handles.into_iter().filter_map(|h| h.join().ok()).collect();
+        recheck_locked_servers(&app, &servers, &results);
+        results
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Servers whose last check found the keyring locked, for
+/// [`crate::server_runtime::recheck_locked_once_open`].
+static LOCKED_SERVERS: Mutex<Vec<crate::registry::ServerEntry>> = Mutex::new(Vec::new());
+
+/// A row shows "Keyring locked" until something checks it again, and the
+/// keyring may only have been busy: check those rows again (never asking) on
+/// the first poll that finds it open.
+fn recheck_locked_servers(
+    app: &tauri::AppHandle,
+    servers: &[crate::registry::ServerEntry],
+    results: &[ProbeResult],
+) {
+    let mut locked = LOCKED_SERVERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let idle = locked.is_empty();
+    // A round checks every enabled server: its locked ones are the list.
+    locked.clear();
+    for server in servers {
+        if results
+            .iter()
+            .any(|result| result.server_id == server.id && result.keyring_locked)
+        {
+            locked.push(server.clone());
+        }
+    }
+    if !idle || locked.is_empty() {
+        return;
+    }
+    let app = app.clone();
+    let _ = std::thread::Builder::new()
+        .name("toolport-locked-recheck".into())
+        .spawn(move || {
+            crate::server_runtime::recheck_locked_once_open(
+                &LOCKED_SERVERS,
+                crate::http_bridge::KEYRING_POLL,
+                |result| {
+                    let _ = app.emit("server-probed", result);
+                },
+            )
+        });
 }
 
 /// List the tools one server exposes (raw MCP tool objects: name, description,
@@ -3739,7 +3787,20 @@ fn start_http_bridge_with_token_at(
     port: Option<u16>,
     token: Option<String>,
 ) -> Result<HttpBridgeStatus, String> {
+    #[cfg(test)]
+    if FAKE_BRIDGE_START.with(std::cell::Cell::get) {
+        return Ok(HttpBridgeStatus::new(
+            port,
+            Some(token.unwrap_or_else(|| "minted-test-token".into())),
+        ));
+    }
     crate::http_bridge::start_with_token_at(state, port, token)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A start that "comes up" with the token it was given, or a new one.
+    static FAKE_BRIDGE_START: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn stop_http_bridge_with(
@@ -3820,9 +3881,28 @@ fn restore_saved_http_bridge(state: &HttpBridgeState, may_prompt: bool) -> Resul
     if !may_prompt && crate::http_bridge::hold_for_keyring(state) {
         return Ok(false);
     }
-    let token = secrets::get_secret_result(HTTP_BRIDGE_VAULT_SERVER, HTTP_BRIDGE_VAULT_KEY)?
-        .ok_or("The HTTP endpoint is enabled, but its saved bearer token is missing")?;
-    start_http_bridge_with_token_at(state, registry.http_bridge_port, Some(token))?;
+    let saved = secrets::get_secret_result(HTTP_BRIDGE_VAULT_SERVER, HTTP_BRIDGE_VAULT_KEY)?;
+    let minted = saved.is_none();
+    let status = start_http_bridge_with_token_at(state, registry.http_bridge_port, saved)?;
+    if minted {
+        // Turned on while locked before any token was saved: save the new
+        // one, as a first start does.
+        let saved = status
+            .token
+            .as_deref()
+            .ok_or("The HTTP endpoint started without a bearer token")
+            .map_err(str::to_string)
+            .and_then(|token| {
+                secrets::set_secret(HTTP_BRIDGE_VAULT_SERVER, HTTP_BRIDGE_VAULT_KEY, token)
+            });
+        if let Err(error) = saved {
+            let mut bridge = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = stop_http_bridge_with(&mut bridge, std::process::Child::kill);
+            return Err(format!("Could not save the HTTP endpoint token: {error}"));
+        }
+    }
     Ok(true)
 }
 
@@ -3891,7 +3971,7 @@ fn resume_http_bridge_after_update(
         return Ok(false);
     };
     ensure_http_bridge_at(state, intent.port, Some(intent.token.clone()))?;
-    if crate::secrets::store_would_prompt() {
+    if crate::secrets::write_would_ask() {
         // Saving the token would ask to unlock the keyring. The endpoint runs
         // from the update's marker, which stays until a start can save it.
         eprintln!(
@@ -5235,6 +5315,32 @@ mod tests {
                 "{outcome:?}"
             );
             assert!(!crate::http_bridge::status(&state).running);
+        });
+    }
+
+    /// Failure mode: turned on for the first time while locked, the endpoint
+    /// had no saved token, and every Retry failed with "saved bearer token is
+    /// missing". Retry now starts it with a new token and saves it.
+    #[test]
+    fn retry_starts_an_endpoint_turned_on_before_any_token_was_saved() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            registry::save(&Registry::default()).unwrap();
+            let state = HttpBridgeState::default();
+            let registry_state = Mutex::new(registry::load().unwrap());
+            crate::secrets::locked_store::prompts_during(|| {
+                hold_http_bridge_turned_on(&state, &registry_state, Some(1))
+                    .unwrap()
+                    .expect("held while locked");
+            });
+            FAKE_BRIDGE_START.with(|fake| fake.set(true));
+            let retried = restore_saved_http_bridge(&state, true);
+            FAKE_BRIDGE_START.with(|fake| fake.set(false));
+            assert_eq!(retried, Ok(true));
+            assert_eq!(
+                secrets::get_secret(HTTP_BRIDGE_VAULT_SERVER, HTTP_BRIDGE_VAULT_KEY).as_deref(),
+                Some("minted-test-token")
+            );
+            crate::http_bridge::mark_waiting(&state, false);
         });
     }
 

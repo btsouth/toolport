@@ -2230,8 +2230,10 @@ type RegistryReload = std::rc::Rc<dyn Fn()>;
 
 #[derive(Clone)]
 struct HealthRow {
-    /// The row's status chip.
+    /// The row's status text.
     label: gtk::Label,
+    /// The pill around it, which carries the status class.
+    chip: gtk::Box,
     authenticate: gtk::Button,
     copy_error: gtk::Button,
     retry: gtk::Button,
@@ -2599,6 +2601,7 @@ impl ServerPage {
             std::time::Instant::now(),
             retried,
         );
+        let check = crate::server_runtime::KeyringCheck::default();
         for ticket in tickets {
             for row in self
                 .health_rows
@@ -2609,19 +2612,20 @@ impl ServerPage {
             {
                 l10n::bind_text(&row.label, "Checking…");
                 for class in ["success", "error", "review"] {
-                    row.label.remove_css_class(class);
+                    row.chip.remove_css_class(class);
                 }
                 row.label.set_tooltip_text(None);
                 row.authenticate.set_visible(false);
                 row.copy_error.set_visible(false);
                 row.retry.set_visible(false);
             }
-            self.spawn_probe(ticket);
+            self.spawn_probe(ticket, check.clone());
         }
         self.update_posture();
     }
 
-    fn spawn_probe(&self, ticket: health::ProbeTicket) {
+    /// `check`: the round's one keyring check.
+    fn spawn_probe(&self, ticket: health::ProbeTicket, check: crate::server_runtime::KeyringCheck) {
         let interactive = ticket.interactive;
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
@@ -2631,7 +2635,7 @@ impl ServerPage {
                 if interactive {
                     crate::server_runtime::probe_registered(&id_for_probe)
                 } else {
-                    crate::server_runtime::probe_health_registered(&id_for_probe)
+                    crate::server_runtime::probe_health_registered(&id_for_probe, &check)
                 }
             })
             .await;
@@ -2664,11 +2668,50 @@ impl ServerPage {
                 std::time::Instant::now(),
             );
             match outcome {
-                health::ProbeOutcome::Apply => page.apply_probe(&server_id, &probe),
-                health::ProbeOutcome::Rerun(next) => page.spawn_probe(next),
+                health::ProbeOutcome::Apply => {
+                    page.apply_probe(&server_id, &probe);
+                    if probe.keyring_locked {
+                        page.watch_keyring();
+                    } else if interactive {
+                        // The user's check got past the keyring: so can the
+                        // rows that showed it locked.
+                        page.probe_servers(health::ProbeReason::Unlocked);
+                    }
+                }
+                health::ProbeOutcome::Rerun(next) => page.spawn_probe(next, Default::default()),
                 health::ProbeOutcome::Discard => {}
             }
             page.update_posture();
+        });
+    }
+
+    /// "Keyring locked" may only mean the keyring was busy, and nothing else
+    /// checks the row again while the page stays open: while a row shows it,
+    /// check the keyring every few seconds off the main thread, and check
+    /// those rows again (without asking) once it is open.
+    fn watch_keyring(&self) {
+        if !self.health.borrow_mut().start_keyring_poll() {
+            return;
+        }
+        let page = self.clone();
+        let checking = std::rc::Rc::new(std::cell::Cell::new(false));
+        gtk::glib::timeout_add_local(crate::http_bridge::KEYRING_POLL, move || {
+            if !page.health.borrow_mut().keep_polling() {
+                return gtk::glib::ControlFlow::Break;
+            }
+            if !checking.replace(true) {
+                let page = page.clone();
+                let checking = checking.clone();
+                gtk::glib::spawn_future_local(async move {
+                    let open =
+                        gtk::gio::spawn_blocking(|| !crate::secrets::store_would_prompt()).await;
+                    checking.set(false);
+                    if open.unwrap_or(false) {
+                        page.probe_servers(health::ProbeReason::Unlocked);
+                    }
+                });
+            }
+            gtk::glib::ControlFlow::Continue
         });
     }
 
@@ -2683,10 +2726,10 @@ impl ServerPage {
         {
             let (status, class) = probe_status_line(probe);
             row.label.set_label(&status);
-            row.label.remove_css_class("success");
-            row.label.remove_css_class("error");
-            row.label.remove_css_class("review");
-            row.label.add_css_class(class);
+            row.chip.remove_css_class("success");
+            row.chip.remove_css_class("error");
+            row.chip.remove_css_class("review");
+            row.chip.add_css_class(class);
             row.label.set_tooltip_text(probe_tooltip(probe).as_deref());
             row.authenticate
                 .set_label(&crate::i18n::lookup(probe_auth_action(probe)));
@@ -10199,14 +10242,26 @@ fn server_row(
     let health = gtk::Label::builder()
         .valign(gtk::Align::Center)
         .max_width_chars(28)
-        .css_classes(["toolport-badge", "toolport-server-state"])
+        .css_classes(["toolport-server-state"])
         .build();
     client_rows::wrap_row_text(&health);
+    // The pill holds the status color; a dot in it, as in React.
+    let chip = gtk::Box::builder()
+        .spacing(4)
+        .valign(gtk::Align::Center)
+        .css_classes(["toolport-badge", "toolport-badge-wraps"])
+        .build();
+    let dot = gtk::Box::builder()
+        .valign(gtk::Align::Center)
+        .css_classes(["toolport-chip-dot"])
+        .build();
+    chip.append(&dot);
+    chip.append(&health);
     if server.enabled && !server.requires_review {
         l10n::bind_text(&health, "Checking…");
     } else {
         l10n::bind_text(&health, "Off");
-        health.add_css_class("off");
+        chip.add_css_class("off");
     }
     lead.append(&text);
 
@@ -10274,6 +10329,7 @@ fn server_row(
         rows.retain(|row| row.label.root().is_some());
         rows.push(HealthRow {
             label: health.clone(),
+            chip: chip.clone(),
             authenticate: authenticate.clone(),
             copy_error: copy_error.clone(),
             retry: retry.clone(),
@@ -10287,7 +10343,7 @@ fn server_row(
         {
             let (status, class) = probe_status_line(previous);
             health.set_label(&status);
-            health.add_css_class(class);
+            chip.add_css_class(class);
             authenticate.set_label(&crate::i18n::lookup(probe_auth_action(previous)));
             authenticate.set_visible(previous.auth_required);
             copy_error.set_visible(!previous.ok && previous.error.is_some());
@@ -10425,7 +10481,7 @@ l10n::bind_dialog_response(&dialog, "enable", "Enable");
         // No "Enabled" label beside the switch: the chip says the state, and the
         // switch's accessible name says what it changes (spec 6).
         let status = health.clone();
-        controls.append(&health);
+        controls.append(&chip);
         let toggle = gtk::Switch::builder()
             .active(server.enabled)
             .valign(gtk::Align::Center)
@@ -18765,6 +18821,12 @@ mod tests {
             ),
         );
         assert_eq!(health.text(), "Needs sign-in");
+        // Like React's chip: the warning pill with a dot in it.
+        let chip = health.parent().unwrap();
+        assert!(chip.has_css_class("toolport-badge") && chip.has_css_class("review"));
+        assert!(chip
+            .first_child()
+            .is_some_and(|dot| dot.has_css_class("toolport-chip-dot")));
         assert!(health.tooltip_text().is_none());
         assert!(!health.layout().is_ellipsized());
         window.set_child(None::<&gtk::Widget>);

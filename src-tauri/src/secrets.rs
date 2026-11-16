@@ -1081,12 +1081,31 @@ mod platform {
     /// keyring operation holds the store, a timeout, a failed search) says
     /// yes: background work waits rather than risk a prompt.
     pub fn store_would_prompt() -> bool {
+        would_prompt(false)
+    }
+
+    /// [`store_would_prompt`] for a write: a new item goes into the default
+    /// collection, and writing to a locked (or missing) one asks too, even
+    /// with no Toolport item in the store.
+    pub fn write_would_prompt() -> bool {
+        would_prompt(true)
+    }
+
+    fn would_prompt(write: bool) -> bool {
         let search = || {
             let found = with_backup_service(|service| {
-                service
+                let locked = service
                     .search_items(std::collections::HashMap::from([("service", SERVICE)]))
                     .map(|found| !found.locked.is_empty())
-                    .map_err(|error| classify(&error))
+                    .map_err(|error| classify(&error))?;
+                if locked || !write {
+                    return Ok(locked);
+                }
+                match service.get_default_collection() {
+                    Ok(collection) => collection.is_locked().map_err(|error| classify(&error)),
+                    Err(dbus_secret_service::Error::NoResult) => Ok(true),
+                    Err(error) => Err(classify(&error)),
+                }
             });
             let no_service = || {
                 BACKUP_BATCH.with(|slot| {
@@ -1824,7 +1843,7 @@ fn write_stored(server_id: &str, key: &str, value: &str) -> Result<(), String> {
         return Err("the keyring is locked; this background write waits for it".into());
     }
     // A write to a locked Secret Service collection asks to unlock it too.
-    if locked_store::locked() {
+    if locked_store::locked() || locked_store::collection_locked() {
         return Err(locked_store::prompted(server_id, key));
     }
     scrub_previous(server_id, key, Some(value))?;
@@ -1857,6 +1876,12 @@ pub(crate) fn set_backup_secret(server_id: &str, key: &str, value: &str) -> Resu
     }
     if server_id == INTERNAL_SERVER_ID {
         return Err("reserved Toolport secret namespace".to_string());
+    }
+    if write_would_prompt() {
+        return Err("the keyring is locked; this background write waits for it".into());
+    }
+    if locked_store::locked() || locked_store::collection_locked() {
+        return Err(locked_store::prompted(server_id, key));
     }
     let owner = crate::local_auth::owner(server_id)?;
     if file::active() {
@@ -2012,6 +2037,9 @@ pub mod locked_store {
     static LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     #[cfg(any(test, feature = "test-support"))]
     static PROMPTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    #[cfg(any(test, feature = "test-support"))]
+    static COLLECTION_LOCKED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     /// Run `f` with the store locked; every `server/key` read that would have
     /// asked to unlock it, in order.
@@ -2037,6 +2065,44 @@ pub mod locked_store {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
+    }
+
+    /// Run `f` with only the default collection locked and no Toolport item
+    /// in it: reads find nothing to unlock, a new item's write would ask.
+    /// Every write that would have asked, in order.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn write_prompts_during(f: impl FnOnce()) -> Vec<String> {
+        use std::sync::atomic::Ordering;
+        struct Unlock;
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                COLLECTION_LOCKED.store(false, Ordering::SeqCst);
+            }
+        }
+        PROMPTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        COLLECTION_LOCKED.store(true, Ordering::SeqCst);
+        let unlock = Unlock;
+        f();
+        drop(unlock);
+        std::mem::take(
+            &mut *PROMPTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    pub(crate) fn collection_locked() -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            COLLECTION_LOCKED.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            false
+        }
     }
 
     pub(crate) fn locked() -> bool {
@@ -2147,7 +2213,26 @@ fn read_must_not_prompt() -> bool {
 
 /// A write or delete inside [`without_prompts`] while the store would ask.
 fn write_would_prompt() -> bool {
-    !prompts_allowed() && store_would_prompt()
+    !prompts_allowed() && write_would_ask()
+}
+
+/// Whether a write now could ask to unlock the store: [`store_would_prompt`],
+/// or a locked default collection a new item would go into.
+pub(crate) fn write_would_ask() -> bool {
+    if locked_store::locked() || locked_store::collection_locked() {
+        return true;
+    }
+    if file::active() {
+        return false;
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        platform::write_would_prompt()
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        false
+    }
 }
 
 pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
@@ -2900,6 +2985,25 @@ pub(crate) mod tests {
         let _cleanup = Cleanup(dir, std::env::var_os("TOOLPORT_SECRET_KEY"));
         std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
         test();
+    }
+
+    /// Failure mode: the background write gate asked only whether a Toolport
+    /// item was locked, so with none in the store a new item's write to the
+    /// locked default collection asked to unlock it.
+    #[test]
+    fn a_background_write_waits_while_the_default_collection_is_locked() {
+        with_isolated_vault(|| {
+            let mut written = None;
+            let prompts = locked_store::write_prompts_during(|| {
+                assert!(!store_would_prompt(), "reads find nothing to unlock");
+                written = Some(without_prompts(|| {
+                    set_secret("srv", "API_KEY", "collection-locked-value")
+                }));
+            });
+            assert!(prompts.is_empty(), "the write asked: {prompts:?}");
+            assert!(written.unwrap().is_err());
+            assert_eq!(get_secret("srv", "API_KEY"), None);
+        });
     }
 
     /// Deletes a real keychain credential even when a test assertion unwinds.

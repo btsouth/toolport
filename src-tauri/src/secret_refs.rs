@@ -1470,7 +1470,11 @@ mod tests {
                 for server in crate::server_runtime::enabled_servers(&registry) {
                     if vaulted.contains(&server.id.as_str()) {
                         checks.push(
-                            crate::server_runtime::probe_health_registered(&server.id).unwrap(),
+                            crate::server_runtime::probe_health_registered(
+                                &server.id,
+                                &Default::default(),
+                            )
+                            .unwrap(),
                         );
                         checks.push(crate::server_runtime::probe_health_bounded(&server));
                     }

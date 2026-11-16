@@ -21,6 +21,9 @@ pub(super) enum ProbeReason {
     /// The user asked for a fresh check, or credentials outside the registry
     /// changed.
     Refresh,
+    /// The keyring was found open: check again the servers that showed it
+    /// locked, without asking.
+    Unlocked,
 }
 
 /// Enabled servers by health state, for the page's one-line summary.
@@ -78,11 +81,32 @@ pub(super) struct HealthCache {
     results: HashMap<String, Cached>,
     in_flight: HashMap<String, InFlight>,
     next_token: u64,
+    /// The page polls the keyring while a row shows it locked.
+    polling_keyring: bool,
 }
 
 impl HealthCache {
     pub(super) fn result(&self, server_id: &str) -> Option<&ProbeResult> {
         self.results.get(server_id).map(|cached| &cached.result)
+    }
+
+    /// Some row shows "Keyring locked".
+    pub(super) fn has_locked(&self) -> bool {
+        self.results.values().any(|cached| cached.result.keyring_locked)
+    }
+
+    /// Whether to start polling the keyring: some row shows it locked and no
+    /// poll runs yet. [`Self::keep_polling`] ends it.
+    pub(super) fn start_keyring_poll(&mut self) -> bool {
+        let start = self.has_locked() && !self.polling_keyring;
+        self.polling_keyring |= start;
+        start
+    }
+
+    /// The poll goes on while a row shows the keyring locked.
+    pub(super) fn keep_polling(&mut self) -> bool {
+        self.polling_keyring = self.has_locked();
+        self.polling_keyring
     }
 
     pub(super) fn is_checking(&self, server_id: &str) -> bool {
@@ -145,6 +169,7 @@ impl HealthCache {
                                 // server, and may only mean the keyring was
                                 // busy: check again whenever the page opens.
                                 || cached.result.keyring_locked))
+                        || (reason == ProbeReason::Unlocked && cached.result.keyring_locked)
                 }
             };
             if let Some(flight) = self.in_flight.get_mut(id) {
@@ -270,6 +295,31 @@ mod tests {
             let id = ticket.server_id.clone();
             assert_eq!(cache.complete(&ticket, ok(&id), now), ProbeOutcome::Apply);
         }
+    }
+
+    /// Failure mode: after a Retry on one locked row, or an unlock by
+    /// anything else, the other rows kept "Keyring locked" until Refresh.
+    #[test]
+    fn an_open_keyring_checks_every_locked_row_again_and_only_those() {
+        let mut cache = HealthCache::default();
+        let now = Instant::now();
+        let enabled = [("a", 1), ("b", 2), ("c", 3)];
+        for ticket in cache.plan(&enabled, ProbeReason::ConfigChanged, now) {
+            let mut result = ok(&ticket.server_id);
+            result.ok = ticket.server_id == "c";
+            result.keyring_locked = !result.ok;
+            assert_eq!(cache.complete(&ticket, result, now), ProbeOutcome::Apply);
+        }
+        assert!(cache.start_keyring_poll());
+        assert!(!cache.start_keyring_poll(), "one poll");
+        let again = cache.plan(&enabled, ProbeReason::Unlocked, now);
+        assert_eq!(ids(&again), ["a", "b"]);
+        assert!(again.iter().all(|ticket| !ticket.interactive));
+        assert!(cache.plan(&enabled, ProbeReason::Unlocked, now).is_empty());
+        assert!(cache.keep_polling(), "still showing locked while checked");
+        settle(&mut cache, again, now);
+        assert!(!cache.has_locked());
+        assert!(!cache.keep_polling());
     }
 
     #[test]
