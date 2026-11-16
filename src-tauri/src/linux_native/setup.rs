@@ -474,6 +474,22 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
         error_chip.set_visible(false);
         row.add_suffix(&error_chip);
         rows.append(&row);
+        // Names only: a remote server's variables the import leaves out.
+        if !item.skipped_env.is_empty() {
+            let skipped = gtk::Label::builder()
+                .label(crate::i18n::trf(
+                    "Not imported: {value0}. Remote servers don't read environment variables, so Toolport leaves them out rather than send one as the bearer token.",
+                    &[("value0", &item.skipped_env.join(", "))],
+                ))
+                .wrap(true)
+                .xalign(0.0)
+                .margin_start(16)
+                .margin_end(16)
+                .margin_bottom(8)
+                .css_classes(["dim-label", "caption"])
+                .build();
+            rows.append(&skipped);
+        }
         let row_error = gtk::Label::builder()
             .wrap(true)
             .xalign(0.0)
@@ -1076,6 +1092,7 @@ mod tests {
                 }],
                 unsupported: None,
                 updates: Vec::new(),
+                skipped_env: Vec::new(),
             }],
             "Fixture",
             "Connect",
@@ -1140,6 +1157,7 @@ mod tests {
                 }],
                 unsupported: None,
                 updates: vec![],
+                skipped_env: Vec::new(),
             }],
             "Fixture",
             "Connect",
@@ -1198,6 +1216,7 @@ mod tests {
                 }],
                 unsupported: None,
                 updates: vec!["Environment".into(), "Launch settings".into()],
+                skipped_env: Vec::new(),
             }],
             "Fixture",
             "Connect",
@@ -1360,6 +1379,7 @@ mod tests {
                 },
                 unsupported: None,
                 updates: Vec::new(),
+                skipped_env: Vec::new(),
             })
             .collect();
         review(

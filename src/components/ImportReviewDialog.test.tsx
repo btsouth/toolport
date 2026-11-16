@@ -59,6 +59,25 @@ function renderDialog(overrides: Partial<Parameters<typeof ImportReviewDialog>[0
 }
 
 describe("ImportReviewDialog", () => {
+  it("names a remote server's variables the import leaves out, names only", () => {
+    const remote: ImportItem = {
+      key: "r",
+      name: "resend",
+      transport: "http",
+      command: null,
+      args: [],
+      url: "https://mcp.example.com/mcp",
+      isNew: true,
+      skippedEnv: ["RESEND_API_KEY"],
+    };
+    renderDialog({ items: [remote] });
+    expect(
+      screen.getByText(
+        "Not imported: RESEND_API_KEY. Remote servers don't read environment variables, so Toolport leaves them out rather than send one as the bearer token.",
+      ),
+    ).toBeVisible();
+  });
+
   it("discloses changed settings on existing servers", () => {
     renderDialog({
       items: [

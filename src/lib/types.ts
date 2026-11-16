@@ -435,6 +435,8 @@ export interface ImportItem {
   referenceReview?: string[];
   credentials?: { key: string; secret: boolean; present: boolean; required: boolean }[];
   unsupported?: string | null;
+  /** A remote server's environment variables the import leaves out (names only). */
+  skippedEnv?: string[];
   envKeys?: string[];
   /** Opaque key used to confirm a detected-client import. Absent for shared setups. */
   key?: string;

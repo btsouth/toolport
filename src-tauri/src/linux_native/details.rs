@@ -1071,6 +1071,7 @@ mod tests {
             url: None,
             credentials: vec![],
             unsupported: None,
+            skipped_env: vec![],
         };
         assert!(
             selected_imports(std::slice::from_ref(&selection), vec![candidate.clone()]).is_ok()

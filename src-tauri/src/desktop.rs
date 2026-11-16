@@ -2959,6 +2959,7 @@ struct ImportItem {
     reference_review: Vec<String>,
     credentials: Vec<crate::registry_controller::CredentialReview>,
     unsupported: Option<String>,
+    skipped_env: Vec<String>,
 }
 
 /// Show exactly what the bulk client import would add without changing the
@@ -2987,6 +2988,7 @@ async fn preview_import_servers(
             is_new: true,
             credentials: server.credentials,
             unsupported: server.unsupported,
+            skipped_env: server.skipped_env,
         })
         .collect())
 }
@@ -3022,6 +3024,7 @@ fn preview_import(state: State<RegistryState>, json: String) -> Result<Vec<Impor
                 is_new,
                 credentials: Vec::new(),
                 unsupported: None,
+                skipped_env: Vec::new(),
             }
         })
         .collect())

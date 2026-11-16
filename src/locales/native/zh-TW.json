@@ -1215,5 +1215,6 @@
   "Add a value for {value0} before saving. The pasted config did not include it.": "儲存前請為 {value0} 新增值。貼上的設定中沒有包含它。",
   "Use each variable name once. Rename or remove the second {value0}.": "每個變數名稱只能使用一次。請重新命名或刪除第二個 {value0}。",
   "Remote servers don't read environment variables, so Toolport would send {value0} to this server as its bearer token. Remove it, or name it Authorization if it is this server's token.": "遠端伺服器不會讀取環境變數，因此 Toolport 會把 {value0} 當作 Bearer 權杖傳送給此伺服器。請移除它；如果它就是此伺服器的權杖，請將其命名為 Authorization。",
-  "Remote servers have no environment. When this server has no other token, Toolport sends the first stored value to it as its bearer token.": "遠端伺服器沒有環境。如果此伺服器沒有其他權杖，Toolport 會把第一個儲存的值當作 Bearer 權杖傳送給它。"
+  "Remote servers have no environment. When this server has no other token, Toolport sends the first stored value to it as its bearer token.": "遠端伺服器沒有環境。如果此伺服器沒有其他權杖，Toolport 會把第一個儲存的值當作 Bearer 權杖傳送給它。",
+  "Not imported: {value0}. Remote servers don't read environment variables, so Toolport leaves them out rather than send one as the bearer token.": "未匯入：{value0}。遠端伺服器不會讀取環境變數，因此 Toolport 會將其排除，而不是將其作為 Bearer 權杖傳送。"
 }

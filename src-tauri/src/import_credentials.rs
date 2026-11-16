@@ -252,9 +252,17 @@ pub(crate) fn serialize_command<S: Serializer>(
 pub(crate) struct Import {
     pub entry: ServerEntry,
     values: Vec<(String, Option<String>)>,
+    /// Environment variables of a remote server left out of the import.
+    skipped: Vec<String>,
 }
 
 impl Import {
+    /// The names of a remote server's environment variables the import leaves
+    /// out, for the review. Never their values.
+    pub(crate) fn skipped_env(&self) -> &[String] {
+        &self.skipped
+    }
+
     fn required(&self, key: &str) -> bool {
         self.entry.launch.as_ref().is_none_or(|launch| {
             launch
@@ -433,7 +441,27 @@ impl Import {
                 plain.push(env);
             }
         }
+        let mut skipped = Vec::new();
         if entry.transport != "stdio" {
+            // A remote server has no environment, and Toolport sends a stored
+            // env row to one as its bearer token. Only Authorization and the
+            // client's bearer token variable are tokens; other variables are
+            // left out and named in the review.
+            let token =
+                |key: &str| key.eq_ignore_ascii_case("authorization") || bearer_env.contains(key);
+            for key in values
+                .iter()
+                .map(|(key, _)| key)
+                .chain(plain.iter().map(|env| &env.key))
+                .chain(references.iter().map(|env| &env.key))
+            {
+                if !token(key) && !skipped.contains(key) {
+                    skipped.push(key.clone());
+                }
+            }
+            values.retain(|(key, _)| token(key));
+            plain.retain(|env| token(&env.key));
+            references.retain(|env| token(&env.key));
             // Arbitrary header schemes have no equivalent in Toolport's bearer
             // transport. Refuse the cutover instead of silently dropping them.
             if let Some(definition) = definition {
@@ -539,7 +567,11 @@ impl Import {
         if had_launch || !launch.inputs.is_empty() || !launch.required_env.is_empty() {
             entry.launch = Some(launch);
         }
-        Ok(Self { entry, values })
+        Ok(Self {
+            entry,
+            values,
+            skipped,
+        })
     }
 
     pub(crate) fn updates(&self, existing: &ServerEntry) -> Vec<String> {
@@ -884,6 +916,58 @@ mod tests {
                 "{key} was falsely vaulted"
             );
         }
+    }
+
+    #[test]
+    fn a_remote_server_imports_only_its_token_from_env() {
+        // Cursor keeps `env` on a URL server but never sends it. Toolport would
+        // send a stored env row as the bearer token, so only the token comes in.
+        let mut raw = entry(true);
+        raw.env.clear();
+        raw.url = Some("https://example.invalid/mcp".into());
+        let import = Import::prepare(
+            raw,
+            Some(&json!({"env":{"RESEND_API_KEY":"re_synthetic","REGION":"eu","OTHER_REF":"${OTHER_REF}"}})),
+        )
+        .unwrap();
+        let keys: Vec<_> = import.entry.env.iter().map(|e| e.key.as_str()).collect();
+        assert!(keys.is_empty(), "{keys:?}");
+        assert!(import.values.is_empty());
+        // Named in the review, values never.
+        let mut skipped = import.skipped_env().to_vec();
+        skipped.sort();
+        assert_eq!(skipped, ["OTHER_REF", "REGION", "RESEND_API_KEY"]);
+
+        // The tokens a remote import names still come in: Authorization and
+        // the bearer_token_env_var (Codex) or bearerTokenEnvVar (Kimi) key.
+        for definition in [
+            json!({"bearerTokenEnvVar":"KIMI_TOKEN","env":{"RESEND_API_KEY":"re_synthetic"}}),
+            json!({"bearer_token_env_var":"KIMI_TOKEN","env":{"RESEND_API_KEY":"re_synthetic"}}),
+        ] {
+            let mut raw = entry(true);
+            raw.env.clear();
+            raw.url = Some("https://example.invalid/mcp".into());
+            let import = Import::prepare(raw, Some(&definition)).unwrap();
+            let keys: Vec<_> = import.entry.env.iter().map(|e| e.key.as_str()).collect();
+            assert_eq!(keys, ["KIMI_TOKEN"]);
+        }
+        let mut raw = entry(true);
+        raw.env.clear();
+        raw.url = Some("https://example.invalid/mcp".into());
+        let import = Import::prepare(
+            raw,
+            Some(&json!({"env":{"Authorization":"Bearer synthetic","RESEND_API_KEY":"re_synthetic"}})),
+        )
+        .unwrap();
+        let keys: Vec<_> = import.entry.env.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, [secrets::HTTP_AUTH_KEY]);
+
+        // A stdio server keeps its environment.
+        let mut raw = entry(false);
+        raw.env.clear();
+        let import =
+            Import::prepare(raw, Some(&json!({"env":{"RESEND_API_KEY":"re_synthetic"}}))).unwrap();
+        assert!(import.entry.env.iter().any(|e| e.key == "RESEND_API_KEY"));
     }
 
     #[test]

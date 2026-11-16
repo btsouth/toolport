@@ -20,6 +20,8 @@ pub struct ClientImportCandidate {
     pub url: Option<String>,
     pub credentials: Vec<CredentialReview>,
     pub unsupported: Option<String>,
+    /// A remote server's environment variables the import leaves out.
+    pub skipped_env: Vec<String>,
 }
 
 const AUTH_LOCK_LEASE_SECS: u64 = 180;
@@ -570,26 +572,29 @@ fn preview_client_imports_scoped(
             } else {
                 clients::import_dedupe_key(&server.name, server.command.as_deref(), &server.args)
             };
-            let (credentials, unsupported) = match crate::import_credentials::Import::prepare(
-                server.clone(),
-                definition.as_ref(),
-            ) {
-                Ok(import) => (
-                    import
-                        .review_credentials()
-                        .into_iter()
-                        .map(|(key, secret, present, required)| CredentialReview {
-                            key,
-                            secret,
-                            present,
-                            required,
-                        })
-                        .collect(),
-                    None,
-                ),
-                Err(error) => (Vec::new(), Some(error)),
-            };
+            let (credentials, unsupported, skipped_env) =
+                match crate::import_credentials::Import::prepare(
+                    server.clone(),
+                    definition.as_ref(),
+                ) {
+                    Ok(import) => (
+                        import
+                            .review_credentials()
+                            .into_iter()
+                            .map(|(key, secret, present, required)| CredentialReview {
+                                key,
+                                secret,
+                                present,
+                                required,
+                            })
+                            .collect(),
+                        None,
+                        import.skipped_env().to_vec(),
+                    ),
+                    Err(error) => (Vec::new(), Some(error), Vec::new()),
+                };
             Ok(ClientImportCandidate {
+                skipped_env,
                 client_id: client.id.clone(),
                 credentials,
                 unsupported,
@@ -2393,6 +2398,8 @@ pub struct SetupItem {
     pub credentials: Vec<CredentialReview>,
     pub unsupported: Option<String>,
     pub updates: Vec<String>,
+    /// A remote server's environment variables the import leaves out.
+    pub skipped_env: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2435,6 +2442,17 @@ pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String
                         .map(|existing| import.updates(existing))
                 })
                 .unwrap_or_default();
+            let skipped_env = prepared
+                .as_ref()
+                .map(|import| import.skipped_env().to_vec())
+                .unwrap_or_default();
+            // Variables left out are not credentials of the imported server.
+            let env_keys = s
+                .env_keys
+                .iter()
+                .filter(|key| !skipped_env.contains(key))
+                .cloned()
+                .collect();
             let (credentials, unsupported) = match prepared {
                 Ok(import) => (
                     import
@@ -2457,6 +2475,7 @@ pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String
                 Err(error) => (Vec::new(), Some(error)),
             };
             Ok(SetupItem {
+                skipped_env,
                 updates,
                 credentials,
                 unsupported,
@@ -2472,7 +2491,7 @@ pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String
                 }),
                 args: crate::import_credentials::shown_args(&s.args),
                 url: s.url.as_deref().map(crate::import_credentials::shown_url),
-                env_keys: s.env_keys.clone(),
+                env_keys,
                 is_new: !registry
                     .servers
                     .iter()
