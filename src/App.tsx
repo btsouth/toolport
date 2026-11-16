@@ -776,13 +776,14 @@ function App() {
     (s) => !health[s.id]?.authRequired && !health[s.id]?.keyringLocked,
   );
 
-  // Count what would actually be imported: drop the gateway entry and anything
-  // already in the registry, then dedupe by name across clients (the backend
-  // import dedupes too). Using raw server counts here made the banner promise
-  // imports that the importer then correctly skipped.
+  // Count what would actually be imported: the backend's candidates, deduped
+  // across clients by connection as the import does. Using raw server counts here
+  // made the banner promise imports that the importer then correctly skipped.
   const importable = new Set(
-    clients.flatMap((c) =>
-      importableServers(c, registry).map((s) => s.name.toLowerCase()),
+    clients.flatMap(
+      (c) =>
+        c.importableKeys ??
+        importableServers(c, registry).map((s) => s.name.toLowerCase()),
     ),
   ).size;
   const selectedServer = selectedServerId
@@ -956,6 +957,10 @@ function App() {
       const before = registry?.servers.length ?? 0;
       const next = await importServers(selected);
       applyRegistryChange(next);
+      // Detection decides what each client still has to import; scan again.
+      void detectClients(false)
+        .then(setClients)
+        .catch(() => {});
       const added = next.servers.length - before;
       toast.success(
         added > 0

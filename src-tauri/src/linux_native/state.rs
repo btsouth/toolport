@@ -409,8 +409,18 @@ pub(super) enum ClientGatewayState {
 }
 
 /// Detail inventory stays out of debug logs, just as it did before details existed.
+/// The second field is what Import would add, each named as it would be saved, marked
+/// when it came from a plugin, and with the connection id its review item carries.
 #[derive(Clone)]
-pub(super) struct ClientDetailData(pub(super) crate::clients::DetectedClient);
+pub(super) struct ClientDetailData(
+    pub(super) crate::clients::DetectedClient,
+    pub(super) Vec<(crate::clients::McpServer, bool, String)>,
+);
+impl ClientDetailData {
+    pub(super) fn new(client: crate::clients::DetectedClient) -> Self {
+        Self(client, Vec::new())
+    }
+}
 impl std::fmt::Debug for ClientDetailData {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("ClientDetailData(<private>)")
@@ -433,9 +443,9 @@ pub(super) struct ClientView {
     pub(super) config_exists: bool,
     pub(super) uses_connectors: bool,
     pub(super) server_count: usize,
-    /// Config-file servers other than the gateway itself: what a one-shot
-    /// migration would import and then move out of the client. Plugin-detected
-    /// servers are excluded because migration leaves them untouched.
+    /// Config-file servers other than the gateway itself that are not in Toolport
+    /// yet: what a one-shot migration would import. Plugin-detected servers are
+    /// excluded because migration leaves them untouched.
     pub(super) movable_server_count: usize,
     /// Servers the client lists besides Toolport's own entry, plugins included.
     pub(super) other_server_count: usize,
@@ -482,7 +492,7 @@ pub(super) fn name_order(
 impl ClientView {
     fn from_detected(client: crate::clients::DetectedClient) -> Self {
         Self {
-            detected: Some(ClientDetailData(client.clone())),
+            detected: Some(ClientDetailData::new(client.clone())),
             imported_names: Vec::new(),
             id: client.id,
             name: client.name,
@@ -617,6 +627,25 @@ fn unreadable_session_history_is_optional_to_client_detection() {
     assert!(error);
 }
 
+/// Import candidates, counts and managed names under the one identity rule React gets
+/// from `detect_clients`, never by matching names.
+pub(super) fn apply_import_state(client: &mut ClientView, registry: &crate::registry::Registry) {
+    let Some(detected) = client.detected.as_mut() else {
+        return;
+    };
+    let configured = detected.servers.len();
+    let slots = crate::clients::importable_server_slots(&detected.0, registry);
+    client.movable_server_count = slots
+        .iter()
+        .filter(|(index, _, _)| *index < configured)
+        .count();
+    client.imported_names = crate::clients::managed_server_names(&detected.0, registry);
+    detected.1 = slots
+        .into_iter()
+        .map(|(index, server, key)| (server, index >= configured, key))
+        .collect();
+}
+
 pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
     let mut clients = crate::clients::detect_clients_for_display()?;
     let registry = crate::registry::load()?;
@@ -631,11 +660,7 @@ pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
         .map(ClientView::from_detected)
         .collect::<Vec<_>>();
     for client in &mut clients {
-        client.imported_names = registry
-            .servers
-            .iter()
-            .map(|s| s.name.to_lowercase())
-            .collect();
+        apply_import_state(client, &registry);
         client.shared_http = shared_http_clients.contains(&client.id);
         client.scope_id = registry
             .client_scopes
@@ -1042,7 +1067,109 @@ fn connect_reload(monitor: &gio::FileMonitor, controller: Weak<RegistryControlle
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
+    fn mcp(
+        name: &str,
+        command: Option<&str>,
+        args: &[&str],
+        url: Option<&str>,
+    ) -> crate::clients::McpServer {
+        crate::clients::McpServer {
+            name: name.into(),
+            transport: if url.is_some() { "http" } else { "stdio" }.into(),
+            command: command.map(str::to_string),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            env_keys: Vec::new(),
+            url: url.map(str::to_string),
+        }
+    }
+
+    pub(in crate::linux_native) fn detected_fixture(
+        servers: Vec<crate::clients::McpServer>,
+        plugin_servers: Vec<crate::clients::McpServer>,
+    ) -> crate::clients::DetectedClient {
+        crate::clients::DetectedClient {
+            discovery: crate::clients::discovery_capabilities("fixture"),
+            id: "fixture".into(),
+            name: "Fixture".into(),
+            uses_connectors: false,
+            location_removable: false,
+            location_kept_by_t3_code: false,
+            config_path: String::new(),
+            config_exists: true,
+            app_present: true,
+            servers,
+            plugin_servers,
+            gateway_installed: false,
+            entry_state: crate::clients::GatewayEntryState::Absent,
+            error: None,
+            claude_profile: None,
+            t3_code: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn import_counts_and_names_follow_the_connection_not_the_name() {
+        let mut registry = crate::registry::Registry::default();
+        for (name, command, args) in [
+            (
+                "github",
+                "npx",
+                vec!["-y", "@modelcontextprotocol/server-github"],
+            ),
+            ("notes", "notes-mcp", vec![]),
+        ] {
+            let mut entry = crate::registry_controller::server_from_detected(
+                &mcp(name, Some(command), &args, None),
+                "other",
+            );
+            entry.id = name.into();
+            registry.servers.push(entry);
+        }
+        let detected = detected_fixture(
+            vec![
+                mcp(
+                    "github",
+                    None,
+                    &[],
+                    Some("https://api.githubcopilot.com/mcp/"),
+                ),
+                // Already in Toolport under another name.
+                mcp("my-notes", Some("notes-mcp"), &[], None),
+                mcp(
+                    crate::clients::GATEWAY_ENTRY_NAME,
+                    Some("toolport-gateway"),
+                    &[],
+                    None,
+                ),
+            ],
+            vec![
+                mcp("github", Some("npx"), &["-y", "@acme/github-mcp"], None),
+                mcp("linear", Some("linear-mcp"), &[], None),
+            ],
+        );
+        let mut client = super::ClientView::from_detected(detected);
+        super::apply_import_state(&mut client, &registry);
+        assert_eq!(client.movable_server_count, 1);
+        assert_eq!(client.imported_names, ["my-notes"]);
+        let importable = client
+            .detected
+            .as_ref()
+            .unwrap()
+            .1
+            .iter()
+            .map(|(server, plugin, _)| (server.name.as_str(), *plugin))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            importable,
+            [
+                ("github (2)", false),
+                ("github (3)", true),
+                ("linear", true)
+            ]
+        );
+    }
+
     #[test]
     fn snapshot_conversion_does_not_open_the_sync_receipt() {
         let data = crate::registry::DataDirTestEnv::new("gtk-snapshot-no-io");

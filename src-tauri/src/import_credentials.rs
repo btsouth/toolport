@@ -606,9 +606,18 @@ impl Import {
             return Ok(false);
         }
         let existing_url = if has_imported_url(existing) {
-            secrets::get_vault_secret_result(&existing.id, secrets::IMPORTED_URL_KEY)
+            // The registry holds only the redacted display URL; comparing that would
+            // claim (or deny) identity on a URL that is not the real endpoint.
+            let url = secrets::get_vault_secret_result(&existing.id, secrets::IMPORTED_URL_KEY)
                 .map_err(|_| VAULT_FAILURE)?
-                .or(existing.url.clone())
+                .filter(|url| url::Url::parse(url).is_ok())
+                .ok_or_else(|| {
+                    format!(
+                        "The saved address of {} is missing from the keychain. Enter its URL again under Servers.",
+                        existing.name
+                    )
+                })?;
+            Some(url)
         } else {
             existing.url.clone()
         };

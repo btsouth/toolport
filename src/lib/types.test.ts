@@ -6,6 +6,7 @@ import {
   isGatewayServer,
   type DetectedClient,
   type McpServer,
+  type Registry,
   type ServerEntry,
 } from "./types";
 
@@ -23,6 +24,25 @@ describe("gateway identity", () => {
     };
 
     expect(isGatewayServer(server)).toBe(true);
+  });
+
+  it("uses backend import candidates despite a colliding registry name", () => {
+    const remote: McpServer = {
+      name: "github (2)",
+      transport: "http",
+      command: null,
+      args: [],
+      envKeys: [],
+      url: "https://api.githubcopilot.com/mcp/",
+    };
+    const client = {
+      servers: [{ ...remote, name: "github" }],
+      pluginServers: [],
+      importableServers: [remote],
+    } as unknown as DetectedClient;
+    const registry = { servers: [{ name: "GitHub" }] } as unknown as Registry;
+    expect(importableServers(client, registry)).toEqual([remote]);
+    expect(importableServers({ ...client, importableServers: [] }, null)).toEqual([]);
   });
 
   it("never surfaces a legacy toolport entry as an import candidate", () => {

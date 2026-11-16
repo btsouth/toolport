@@ -92,6 +92,8 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   // Snapshotted at dialog-open time so a registry-changed event mid-review can't
   // reshuffle `toImport` out from under the indices the user already confirmed.
   const [bulkImportServers, setBulkImportServers] = useState<ImportItem[] | null>(null);
+  // A refused import shows in the review that is still open, not behind it.
+  const [bulkImportError, setBulkImportError] = useState<string>();
   // Empty uses the default access; named access sets narrow enabled servers.
   const [profile, setProfile] = useState("");
   const [migrateOpen, setMigrateOpen] = useState(false);
@@ -322,9 +324,19 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
 
   const movable = client.servers.filter((s) => !isGatewayDetected(s));
   const importedNames = new Set(
-    (registry?.servers ?? []).map((s) => s.name.toLowerCase()),
+    client.managedServerNames ??
+      (registry?.servers ?? []).map((s) => s.name.toLowerCase()),
   );
-  const pluginNames = new Set(client.pluginServers.map((s) => s.name.toLowerCase()));
+  // Import candidates can carry a saved name (`github (2)`), so a plugin is
+  // recognized by its connection, as the GTK shell does.
+  const sameConnection = (a: McpServer, b: McpServer) =>
+    a.transport === b.transport &&
+    a.command === b.command &&
+    a.url === b.url &&
+    JSON.stringify(a.args) === JSON.stringify(b.args);
+  const isPluginServer = (server: McpServer) =>
+    !client.servers.some((s) => sameConnection(s, server)) &&
+    client.pluginServers.some((s) => sameConnection(s, server));
 
   // Every client-side server worth showing, deduped by name, minus Toolport's
   // own gateway entry. These exist here only as import candidates.
@@ -333,26 +345,38 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     if (isGatewayDetected(s)) continue;
     if (!byName.has(s.name.toLowerCase())) byName.set(s.name.toLowerCase(), s);
   }
-  const allServers = [...byName.values()];
   const toImport = importableServers(client, registry);
+  // What Import would add, then what is already in Toolport. A server the backend
+  // could not confirm is in neither list.
+  const allServers = client.importableServers
+    ? [
+        ...toImport,
+        ...[...byName.values()].filter((s) => importedNames.has(s.name.toLowerCase())),
+      ]
+    : [...byName.values()];
   const bulkImportPreview = bulkImportServers;
 
   async function reviewServers(servers: McpServer[]) {
     try {
       const preview = await previewImportServers(client.id);
-      const items = servers.map((server) =>
-        preview.find(
-          (item) =>
-            item.name === server.name &&
-            item.command === server.command &&
-            item.url === server.url &&
-            JSON.stringify(item.args) === JSON.stringify(server.args),
-        ),
-      );
+      const items = servers.map((server) => {
+        // By the backend's connection id: the saved name can differ between the list
+        // and the review, and two servers whose secrets differ can look alike here.
+        const connection = client.importableKeys?.[toImport.indexOf(server)];
+        return preview.find((item) =>
+          connection
+            ? item.connection === connection
+            : item.name === server.name &&
+              item.command === server.command &&
+              item.url === server.url &&
+              JSON.stringify(item.args) === JSON.stringify(server.args),
+        );
+      });
       if (items.some((item) => !item?.key))
         throw new Error(
           translate("Server changed. Refresh the client and review again."),
         );
+      setBulkImportError(undefined);
       setBulkImportServers(items as ImportItem[]);
     } catch (error) {
       showFeedback(String(error));
@@ -380,8 +404,10 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         translate("Imported selected servers. Check their status under Servers."),
       );
       setBulkImportServers(null);
+      // Detection decides what is in Toolport now; scan again.
+      onChanged();
     } catch (error) {
-      showFeedback(String(error));
+      setBulkImportError(String(error));
     } finally {
       setBusy(false);
     }
@@ -969,12 +995,16 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           )}
 
           <div className="grid gap-2 sm:grid-cols-2">
-            {allServers.map((server) => (
+            {allServers.map((server, index) => (
               <ServerMiniCard
-                key={server.name}
+                key={`${index}-${server.name}`}
                 server={server}
-                isPlugin={pluginNames.has(server.name.toLowerCase())}
-                imported={importedNames.has(server.name.toLowerCase())}
+                isPlugin={isPluginServer(server)}
+                imported={
+                  client.importableServers
+                    ? index >= toImport.length
+                    : importedNames.has(server.name.toLowerCase())
+                }
                 busy={busy || !!client.error}
                 // Same review dialog as "Import all": a per-row import must show the
                 // same shell/private-host warnings before anything is added.
@@ -1025,6 +1055,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         open={bulkImportPreview !== null}
         items={bulkImportPreview ?? []}
         busy={busy}
+        error={bulkImportError}
         title={t("Review {value1} servers", { value1: client.name })}
         onOpenChange={(open) => {
           if (!open && !busy) setBulkImportServers(null);

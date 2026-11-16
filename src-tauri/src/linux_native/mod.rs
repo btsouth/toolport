@@ -18886,13 +18886,20 @@ mod tests {
             }
         }
 
-        // Match React: Connect remains available so the shared backend can
-        // explain a config error rather than leaving an inert client row.
+        // Match React: a config that could not be read disables the row's actions
+        // and says why, instead of offering a Connect that cannot work.
         client.gateway_state = state::ClientGatewayState::Disconnected;
         client.config_error = true;
         {
             let row = client_row(&client, page.clone(), RowStyle::Line);
-            let (_, _, controls) = parts(&row, true);
+            let (_, detail, controls) = parts(&row, true);
+            assert!(
+                detail
+                    .text()
+                    .contains("Configuration could not be read safely"),
+                "{}",
+                detail.text()
+            );
             let button = controls
                 .unwrap()
                 .first_child()
@@ -18900,7 +18907,7 @@ mod tests {
                 .downcast::<gtk::Button>()
                 .unwrap();
             assert_eq!(button.label().as_deref(), Some("Connect"));
-            assert!(button.is_sensitive());
+            assert!(!button.is_sensitive());
         }
         client.config_error = false;
 
@@ -18929,7 +18936,8 @@ mod tests {
             .downcast::<gtk::Label>()
             .unwrap();
         assert_eq!(account.text(), "me@home.example");
-        assert_eq!(detail.text(), "~/.claude2");
+        // Profile rows list a nonzero local count since #1342 (see caption_tests).
+        assert_eq!(detail.text(), "~/.claude2 · 2 local MCP servers");
         // Narrower than the name and its chips: the chips wrap to a second line and the
         // name keeps its full width instead of being squeezed.
         let (_, name_width, _, _) = command.measure(gtk::Orientation::Horizontal, -1);
@@ -18969,7 +18977,7 @@ mod tests {
             .unwrap();
         assert_eq!(command.text(), "codex-work");
         assert!(command.next_sibling().is_none());
-        assert_eq!(detail.text(), "~/Codex-Work/.codex");
+        assert_eq!(detail.text(), "~/Codex-Work/.codex · 2 local MCP servers");
         let mut main = client.clone();
         main.id = "codex".into();
         main.name = "Codex".into();
