@@ -118,6 +118,10 @@ pub(crate) fn request_unlock() -> Unlock {
 /// the start-up one would not.
 static STARTUP_DEFERRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static REFRESHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg_attr(
+    not(any(feature = "desktop", feature = "gtk-desktop")),
+    allow(dead_code)
+)]
 static WAITER: std::sync::Once = std::sync::Once::new();
 
 fn startup_deferred() -> bool {
@@ -131,6 +135,10 @@ fn startup_deferred() -> bool {
 /// Called by the start-up refresh's callers. When it put clients off, keep
 /// one waiter that finishes them once the keyring opens (by itself or by a
 /// user action elsewhere), checking without asking every few seconds.
+#[cfg_attr(
+    not(any(feature = "desktop", feature = "gtk-desktop")),
+    allow(dead_code)
+)]
 pub(crate) fn note_startup_deferred(waiting: bool) {
     if !waiting {
         return;
@@ -153,6 +161,10 @@ pub(crate) fn note_startup_deferred(waiting: bool) {
 }
 
 /// Polls until nothing is waiting; refreshes whenever the store is open.
+#[cfg_attr(
+    not(any(feature = "desktop", feature = "gtk-desktop")),
+    allow(dead_code)
+)]
 pub(super) fn wait_for_open(
     poll: std::time::Duration,
     would_ask: impl Fn() -> bool,
