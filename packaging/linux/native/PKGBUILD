@@ -26,7 +26,7 @@ options=('!lto')
 source=("toolport-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         "toolport.install"
         "disconnect-users.sh")
-sha256sums=('SKIP'
+sha256sums=('953436abdceee6b320c12dd0fac83176bc8a4ac9cb3d00bcfd7a54d2e34a2ecb'
             '0083ee13186ff966eb3c5379a75e2f1107e4f51fbeb9cd213ffa807acc7b97ab'
             '84fab489c8c11413a32f51e7cc4d8f00a52ca63a1ff35b560d7bbd8e9b8dc68b')
 
