@@ -776,6 +776,7 @@ mod tests {
                 entry_state: crate::clients::GatewayEntryState::Absent,
                 error: None,
                 claude_profile: None,
+                t3_code: Vec::new(),
             };
             let definition = crate::clients::import_definition(&client, "native")
                 .unwrap()

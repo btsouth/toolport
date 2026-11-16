@@ -464,6 +464,7 @@ mod tests {
             entry_state: GatewayEntryState::Managed,
             error: None,
             claude_profile: None,
+            t3_code: Vec::new(),
             location_removable: false,
         };
         let results = all_with_clients(false, true, || vec![client]).unwrap();

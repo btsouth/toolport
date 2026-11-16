@@ -6,6 +6,41 @@ it reads when you start it in a terminal. So Toolport connects to the providers,
 not to T3 Code. There is no T3 Code entry on the Clients page, and you do not need
 one: connect Claude Code, Codex or the other provider on the Clients page as usual.
 
+## Rows T3 Code uses
+
+Toolport reads T3 Code's list of provider instances from `~/.t3/userdata/settings.json` (or
+`$T3CODE_HOME/userdata/settings.json`). It reads only each instance's provider,
+name, on/off state and home folder. That file can also hold API keys; Toolport
+skips them and never stores, shows or logs them. It reads the file only when the
+file it opened is inside T3 Code's data folder, so a link swapped in to point
+elsewhere is never read.
+
+- Each row a T3 Code instance uses is labelled **Used by T3 Code** with the
+  instance names. An instance that is off in T3 Code reads "(off)". This includes
+  rows such as Cursor or Kiro that T3 Code runs with their usual config.
+- An instance's home comes from its home folder setting, else `CLAUDE_CONFIG_DIR`
+  or `CODEX_HOME` from its environment variables, else the default.
+- A Claude Code or Codex home only T3 Code knows about, such as one under `~/.t3`,
+  gets its own row once its folder exists, so it can be connected like any other.
+  Homes of other providers, such as OpenCode, Grok or Pi, get no row of their own.
+- Folders named like `~/.claude_personal` and `~/.codex_personal`, which T3 Code's
+  guides suggest, are found the same way as `~/.claude2`.
+- Toolport uses only homes inside your home folder, written plainly. A home outside
+  it, on a network share or device, or written with `.`, `..` or `//` is ignored
+  without being opened. A home with a link anywhere below your home folder (the home
+  itself, a folder above it, or its config file) is not followed: it gets no row and
+  labels nothing. To use such a folder anyway, add it on the Clients page with **Add
+  client location**.
+- A folder you added by hand and the same folder named in T3 Code are one row.
+- An instance whose home folder is marked sensitive, isn't plain text or is a
+  relative path labels no row: Toolport can't tell which config it reads.
+- When you add, remove or switch on an instance in T3 Code, the open Clients page
+  updates within a few seconds while Toolport's window is in front, or as soon as
+  you switch back to it. Without T3 Code, Toolport checks for it only when the page
+  opens and when you switch back to Toolport.
+- A connected T3 Code home whose folder is deleted moves to **Not installed**. Once
+  T3 Code no longer lists it, it can be forgotten there.
+
 ## What Activity shows
 
 Calls from a T3 Code session keep their usual client name, so filters and totals do

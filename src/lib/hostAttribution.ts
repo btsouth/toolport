@@ -1,5 +1,5 @@
 import { msg, translate } from "./i18n";
-import type { HostAttribution } from "./types";
+import type { HostAttribution, T3CodeUse } from "./types";
 
 /** The host id T3 Code passes on. Matches `crate::host_attribution::T3_CODE`. */
 export const T3_CODE = "t3-code";
@@ -56,4 +56,28 @@ export function t3CodeActivitySegment(row: {
       : msg("{count} sessions via T3 Code"),
     { count: sessions },
   );
+}
+
+function useName(use: T3CodeUse): string {
+  return use.enabled
+    ? use.displayName
+    : translate("{name} (off)", { name: use.displayName });
+}
+
+/** The Clients row badge for the T3 Code instances that use a client's config: its text
+ * and one tooltip line per instance. GTK's `t3_code_badge_text` says the same. */
+export function t3CodeBadge(uses: T3CodeUse[]): { text: string; title: string } | null {
+  if (uses.length === 0) return null;
+  return {
+    text: translate("Used by T3 Code: {names}", {
+      names: uses.map(useName).join(", "),
+    }),
+    title: uses
+      .map((use) =>
+        use.enabled
+          ? translate("{name} is on in T3 Code", { name: use.displayName })
+          : translate("{name} is off in T3 Code", { name: use.displayName }),
+      )
+      .join("\n"),
+  };
 }

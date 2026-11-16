@@ -110,6 +110,12 @@ A home found through a launcher stays listed while the launcher exists. If you
 remove the launcher after connecting that home, it stays until you disconnect and
 remove it.
 
+### T3 Code instances
+
+T3 Code runs Claude Code, Codex and other clients as providers. Toolport labels the
+rows T3 Code's instances use and lists homes only T3 Code knows about. See
+[Toolport with T3 Code](t3-code.md).
+
 ### Auggie CLI setup
 
 Toolport manages Auggie's user settings at `~/.augment/settings.json`

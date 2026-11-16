@@ -4233,6 +4233,7 @@ fn detected_profile(
         entry_state: crate::clients::GatewayEntryState::Absent,
         error: None,
         claude_profile: None,
+        t3_code: Vec::new(),
     }
 }
 

@@ -1,4 +1,8 @@
 {
+  "Used by T3 Code: {names}": "T3 Code에서 사용: {names}",
+  "{name} (off)": "{name}(꺼짐)",
+  "{name} is on in T3 Code": "{name}이(가) T3 Code에서 켜져 있습니다",
+  "{name} is off in T3 Code": "{name}이(가) T3 Code에서 꺼져 있습니다",
   " · {count} call today": " · 오늘 호출 {count}회",
   " · {count} calls today": " · 오늘 호출 {count}회",
   " · Last saw {value0} tools": " · 마지막 확인: 도구 {value0}개",

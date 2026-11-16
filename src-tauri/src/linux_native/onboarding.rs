@@ -1305,6 +1305,7 @@ mod tests {
                 config_error: false,
                 location_removable: false,
                 claude_profile: None,
+                t3_code: Vec::new(),
             }],
             profiles: Vec::new(),
             sessions: Vec::new(),

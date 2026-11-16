@@ -1160,6 +1160,9 @@ button.toolport-activity-filter {{
   padding: 2px 8px;
 }}
 
+/* A chip that wraps: half its one-line height, so one line is still a pill. */
+.toolport-badge.toolport-badge-wraps {{ border-radius: 10px; }}
+
 .toolport-badge.success {{
   background-color: alpha(@toolport_success, 0.12);
   color: @toolport_success;

@@ -1263,12 +1263,9 @@ fn client_gateway_state(
     managed: &HashMap<String, ManagedEntry>,
     client_id: &str,
 ) -> Option<GatewayEntryState> {
-    let mut detected = clients::detect_clients();
+    let mut detected: Vec<_> = clients::detect_client(client_id).into_iter().collect();
     clients::apply_entry_states(&mut detected, managed);
-    detected
-        .into_iter()
-        .find(|client| client.id == client_id)
-        .map(|client| client.entry_state)
+    detected.pop().map(|client| client.entry_state)
 }
 
 fn refuse_customized_client(state: Option<GatewayEntryState>, force: bool) -> Result<(), String> {
@@ -1959,10 +1956,7 @@ pub struct ClientSetupReview {
 
 pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String> {
     let revision = clients::setup_revision(client_id)?;
-    let client = clients::detect_clients()
-        .into_iter()
-        .find(|c| c.id == client_id)
-        .ok_or("Unknown client")?;
+    let client = clients::detect_client(client_id).ok_or("Unknown client")?;
     if client.error.is_some() {
         return Err("Could not read this client config. Fix it before connecting.".into());
     }
@@ -2288,10 +2282,7 @@ fn migrate_client_reviewed_inputs_with(
         client_gateway_state(&current.client_managed_entries, client_id),
         force,
     )?;
-    let mut client = clients::detect_clients()
-        .into_iter()
-        .find(|c| c.id == client_id)
-        .ok_or("Unknown client")?;
+    let mut client = clients::detect_client(client_id).ok_or("Unknown client")?;
     if names.iter().any(|name| {
         !client
             .servers
@@ -3572,6 +3563,7 @@ mod tests {
                     entry_state: GatewayEntryState::Absent,
                     error: None,
                     claude_profile: None,
+                    t3_code: Vec::new(),
                 },
             }
         }

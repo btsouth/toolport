@@ -1,4 +1,8 @@
 {
+  "Used by T3 Code: {names}": "Von T3 Code verwendet: {names}",
+  "{name} (off)": "{name} (aus)",
+  "{name} is on in T3 Code": "{name} ist in T3 Code eingeschaltet",
+  "{name} is off in T3 Code": "{name} ist in T3 Code ausgeschaltet",
   " · {count} call today": " · Heute {count} Aufruf",
   " · {count} calls today": " · Heute {count} Aufrufe",
   " · Last saw {value0} tools": " · Zuletzt {value0} Tools erkannt",

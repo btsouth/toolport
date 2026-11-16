@@ -1,9 +1,14 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DetectedClient, McpServer } from "@/lib/types";
 import { ClientsView } from "./ClientsView";
-import { getClientSessions, refreshClientRecoveryStatus } from "@/lib/api";
+import {
+  getClientSessions,
+  listClientRecoveries,
+  refreshClientRecoveryStatus,
+  t3CodeRevision,
+} from "@/lib/api";
 vi.mock("@/lib/api", () => ({
   getClientSessions: vi.fn(),
   listClientRecoveries: vi.fn().mockResolvedValue([]),
@@ -11,8 +16,36 @@ vi.mock("@/lib/api", () => ({
   dismissClientRecovery: vi.fn(),
   discardClientRecovery: vi.fn(),
   refreshClientRecoveryStatus: vi.fn().mockResolvedValue(undefined),
+  t3CodeRevision: vi.fn(),
 }));
-beforeEach(() => vi.mocked(getClientSessions).mockResolvedValue([]));
+// Whether the window is on screen and focused, as `useWindowVisible` reports it.
+const visibility = vi.hoisted(() => ({ value: true, listeners: new Set<() => void>() }));
+vi.mock("@/lib/windowVisible", async () => {
+  const { useSyncExternalStore } = await import("react");
+  return {
+    useWindowVisible: () =>
+      useSyncExternalStore(
+        (listener) => {
+          visibility.listeners.add(listener);
+          return () => visibility.listeners.delete(listener);
+        },
+        () => visibility.value,
+      ),
+  };
+});
+function setWindowVisible(value: boolean) {
+  visibility.value = value;
+  visibility.listeners.forEach((listener) => listener());
+}
+beforeEach(() => {
+  visibility.value = true;
+  vi.mocked(getClientSessions).mockResolvedValue([]);
+  vi.mocked(t3CodeRevision).mockResolvedValue(null);
+});
+afterEach(() => {
+  vi.useRealTimers();
+  vi.clearAllMocks();
+});
 
 it("waits for the saved-value check before completing an explicit refresh", async () => {
   let finish!: () => void;
@@ -593,4 +626,182 @@ describe("ClientsView", () => {
       "false",
     );
   });
+
+  describe("T3 Code", () => {
+    const on = (displayName: string, instanceId = displayName.toLowerCase()) => ({
+      instanceId,
+      displayName,
+      enabled: true,
+    });
+    const off = (displayName: string) => ({ ...on(displayName), enabled: false });
+
+    it("badges rows T3 Code uses, marking instances that are off", async () => {
+      render(
+        <ClientsView
+          clients={[
+            client({ id: "codex", name: "Codex", t3Code: [on("Work"), off("Home")] }),
+          ]}
+          registry={null}
+          onSelectClient={vi.fn()}
+          onChanged={vi.fn(async () => {})}
+        />,
+      );
+      const badge = screen.getByText("Used by T3 Code: Work, Home (off)");
+      await userEvent.hover(badge);
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(
+        "Work is on in T3 Code Home is off in T3 Code",
+      );
+    });
+
+    it("badges profile rows inside a group", () => {
+      const profile = (id: string, folder: string, t3Code?: ReturnType<typeof on>[]) =>
+        client({
+          id,
+          name: `Claude Code (${id})`,
+          claudeProfile: {
+            command: id,
+            account: `${id}@example.com`,
+            folder,
+            lastUsedMs: null,
+            sameAs: null,
+          },
+          t3Code,
+        });
+      render(
+        <ClientsView
+          clients={[
+            profile("claude-code", "~/.claude.json", [on("Main")]),
+            profile("claude-code@claude2", "~/.claude2"),
+          ]}
+          registry={null}
+          onSelectClient={vi.fn()}
+        />,
+      );
+      const row = screen.getByText("Used by T3 Code: Main").closest("button");
+      expect(row).toHaveAttribute("data-client-id", "claude-code");
+      expect(within(row!).getByText("claude-code@example.com")).toBeVisible();
+      expect(screen.getAllByText(/Used by T3 Code/)).toHaveLength(1);
+    });
+
+    it("adds nothing without T3 Code, and a null revision never rescans", async () => {
+      vi.useFakeTimers();
+      const onChanged = vi.fn(async () => {});
+      render(
+        <ClientsView
+          clients={[client()]}
+          registry={null}
+          onSelectClient={vi.fn()}
+          onChanged={onChanged}
+        />,
+      );
+      await act(() => vi.advanceTimersByTimeAsync(16_000));
+      // One check when the page opens; no polling while T3 Code is absent.
+      expect(t3CodeRevision).toHaveBeenCalledTimes(1);
+      expect(onChanged).not.toHaveBeenCalled();
+      // Focus checks again, once.
+      act(() => setWindowVisible(false));
+      act(() => setWindowVisible(true));
+      await act(() => vi.advanceTimersByTimeAsync(16_000));
+      expect(t3CodeRevision).toHaveBeenCalledTimes(2);
+      expect(onChanged).not.toHaveBeenCalled();
+      expect(screen.queryByText(/T3 Code/)).not.toBeInTheDocument();
+    });
+
+    it("rescans quietly when the T3 Code revision changes, null to a value on focus", async () => {
+      vi.useFakeTimers();
+      vi.mocked(t3CodeRevision)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce("a")
+        .mockResolvedValueOnce("a")
+        .mockResolvedValue("b");
+      const onChanged = vi.fn(async () => {});
+      const { unmount } = render(
+        <ClientsView
+          clients={[client()]}
+          registry={null}
+          onSelectClient={vi.fn()}
+          onChanged={onChanged}
+        />,
+      );
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(onChanged).not.toHaveBeenCalled();
+      // No T3 Code yet: nothing polls. Installing it is noticed when the window
+      // gets focus again, and from then on its settings are checked every 5 seconds.
+      await act(() => vi.advanceTimersByTimeAsync(20_000));
+      expect(t3CodeRevision).toHaveBeenCalledTimes(1);
+      act(() => setWindowVisible(false));
+      act(() => setWindowVisible(true));
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(onChanged).toHaveBeenCalledTimes(1);
+      await act(() => vi.advanceTimersByTimeAsync(5_000));
+      expect(onChanged).toHaveBeenCalledTimes(1);
+      await act(() => vi.advanceTimersByTimeAsync(5_000));
+      expect(onChanged).toHaveBeenCalledTimes(2);
+      unmount();
+      const calls = vi.mocked(t3CodeRevision).mock.calls.length;
+      await act(() => vi.advanceTimersByTimeAsync(20_000));
+      expect(t3CodeRevision).toHaveBeenCalledTimes(calls);
+    });
+  });
+});
+
+it("keeps a T3 Code home row's label beside its recovery cards", async () => {
+  const id = "codex@t3-0123456789abcdef";
+  const name = "Codex (~/.t3/cx/codex)";
+  const base = {
+    clientId: id,
+    clientName: name,
+    path: "/fixture/.t3/cx/codex/config.toml",
+    backupPath: "/fixture/backups/codex/original.toml",
+    dismissed: false,
+    discardValues: [],
+    discardStarted: false,
+    discardAction: "Discard these saved values",
+    cleanup: false,
+    instructions: "Unlock your keyring, then choose Retry.",
+    retention: "The recovery backup does not expire.",
+    details: "fixture",
+  };
+  vi.mocked(listClientRecoveries).mockResolvedValueOnce([
+    {
+      ...base,
+      id: "owed",
+      missing: [{ server: "server-a", key: "API_KEY" }],
+      message: `${name} is disconnected.\n\nThe config has placeholders for these values for now.`,
+      description: "Its original config is back. These values still have placeholders:",
+      valueLines: ["API_KEY for server-a: keyring locked"],
+      error: null,
+      canDiscard: true,
+      canRetry: true,
+    },
+    {
+      ...base,
+      id: "receipt",
+      missing: [],
+      message: `${name} recovery needs attention.\n\nToolport could not read this recovery file.`,
+      description: "Toolport could not read this recovery file. Check its permissions.",
+      valueLines: [],
+      error: "Toolport could not read this recovery file. Check its permissions.",
+      canDiscard: false,
+      canRetry: true,
+    },
+  ] as Awaited<ReturnType<typeof listClientRecoveries>>);
+  render(
+    <ClientsView
+      clients={[
+        client({
+          id,
+          name,
+          t3Code: [{ instanceId: "cx", displayName: "Codex Extra", enabled: false }],
+        }),
+      ]}
+      registry={null}
+      onSelectClient={vi.fn()}
+      onChanged={vi.fn(async () => {})}
+    />,
+  );
+  expect(await screen.findAllByRole("region")).toHaveLength(2);
+  expect(screen.getByText(`${name} is disconnected.`)).toBeInTheDocument();
+  expect(screen.getByText(`${name} recovery needs attention.`)).toBeInTheDocument();
+  expect(screen.getByText("Used by T3 Code: Codex Extra (off)")).toBeInTheDocument();
 });

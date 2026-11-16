@@ -1202,6 +1202,11 @@ export function addSnippetServers(
 }
 
 /** Recent privacy-safe session summaries, capped by the backend. */
+/** A token that changes when T3 Code's settings change; null when there are none. */
+export function t3CodeRevision(): Promise<string | null> {
+  return invoke<string | null>("t3_code_revision");
+}
+
 export function getClientSessions(): Promise<ClientActivity[]> {
   const sinceMs = new Date().setHours(0, 0, 0, 0);
   return invoke<ClientActivity[]>("get_client_sessions", { sinceMs });

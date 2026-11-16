@@ -181,6 +181,13 @@ async fn detect_clients(
     Ok(list)
 }
 
+/// A token that changes when T3 Code's provider instances may have changed, so an open
+/// Clients page can scan again. `None` without T3 Code settings. One `stat`.
+#[tauri::command]
+fn t3_code_revision() -> Option<String> {
+    clients::t3_code_revision()
+}
+
 #[tauri::command]
 async fn client_location_types() -> Result<Vec<clients::ClientLocationType>, String> {
     tauri::async_runtime::spawn_blocking(clients::client_location_types)
@@ -4503,6 +4510,7 @@ pub fn run() {
             refresh_client_recovery_notice,
             refresh_client_recovery_status,
             dismiss_client_recovery,
+            t3_code_revision,
             client_location_types,
             add_client_location,
             remove_client_location,
@@ -5368,6 +5376,7 @@ mod tests {
             entry_state: clients::GatewayEntryState::Absent,
             error: None,
             claude_profile: None,
+            t3_code: Vec::new(),
         }
     }
 

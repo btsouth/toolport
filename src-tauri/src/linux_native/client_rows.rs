@@ -220,6 +220,76 @@ pub(super) fn status_badge(client: &state::ClientView) -> gtk::Label {
 /// The width a row's logo and text keep before its controls wrap below them.
 const ROW_MIN_TEXT: i32 = 220;
 
+/// "Used by T3 Code: Work, Personal (off)": every T3 Code instance that runs this client.
+/// "T3 Code" is a product name and stays as is in every language.
+pub(super) fn t3_code_badge_text(uses: &[crate::clients::T3CodeUse]) -> String {
+    let names = uses
+        .iter()
+        .map(|instance| {
+            if instance.enabled {
+                instance.display_name.clone()
+            } else {
+                crate::i18n::trf("{name} (off)", &[("name", &instance.display_name)])
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    crate::i18n::trf("Used by T3 Code: {names}", &[("names", &names)])
+}
+
+/// One line per instance: whether it is on in T3 Code.
+pub(super) fn t3_code_badge_tooltip(uses: &[crate::clients::T3CodeUse]) -> String {
+    uses.iter()
+        .map(|instance| {
+            if instance.enabled {
+                crate::i18n::trf(
+                    "{name} is on in T3 Code",
+                    &[("name", &instance.display_name)],
+                )
+            } else {
+                crate::i18n::trf(
+                    "{name} is off in T3 Code",
+                    &[("name", &instance.display_name)],
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Let a row's chip or detail wrap onto more lines in a narrow window instead of cutting
+/// its text to what only a hover tooltip shows, so keyboard users can read all of it.
+pub(super) fn wrap_row_text(label: &gtk::Label) {
+    label.set_ellipsize(gtk::pango::EllipsizeMode::None);
+    label.set_single_line_mode(false);
+    label.set_wrap(true);
+    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    label.set_xalign(0.0);
+    if label.has_css_class("toolport-badge") {
+        // A pill on one line, a rounded box over several.
+        label.add_css_class("toolport-badge-wraps");
+    }
+}
+
+/// The row badge for a client that T3 Code runs as a provider. It wraps in a narrow
+/// window, like the account badge; the tooltip says which instances are on.
+fn t3_code_badge(uses: &[crate::clients::T3CodeUse]) -> gtk::Label {
+    let badge = gtk::Label::new(None);
+    badge.add_css_class("toolport-badge");
+    badge.add_css_class("caption");
+    wrap_row_text(&badge);
+    badge.set_valign(gtk::Align::Center);
+    {
+        let uses = uses.to_vec();
+        l10n::bind_label_with(&badge, move || t3_code_badge_text(&uses));
+    }
+    {
+        let uses = uses.to_vec();
+        l10n::bind_tooltip_with(&badge, move || t3_code_badge_tooltip(&uses));
+    }
+    badge
+}
+
 /// One client: name and a one-line detail on the left, its controls on the right.
 pub(super) fn client_row(
     client: &state::ClientView,
@@ -243,7 +313,8 @@ pub(super) fn client_row(
     let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
     copy.set_hexpand(true);
     copy.set_valign(gtk::Align::Center);
-    let title = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    // The name first at its full width; chips that do not fit beside it wrap below.
+    let title = super::wrap_box::WrapBox::new(8, 4);
     let profile = client
         .claude_profile
         .as_ref()
@@ -270,6 +341,7 @@ pub(super) fn client_row(
         ))
         .css_classes(["heading"])
         .build();
+    wrap_row_text(&name);
     if profile.is_some() {
         name.add_css_class("monospace");
     }
@@ -281,9 +353,12 @@ pub(super) fn client_row(
         };
         account.add_css_class("toolport-badge");
         account.add_css_class("caption");
-        account.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        wrap_row_text(&account);
         account.set_valign(gtk::Align::Center);
         title.append(&account);
+    }
+    if !client.t3_code.is_empty() {
+        title.append(&t3_code_badge(&client.t3_code));
     }
     let open = gtk::Button::builder()
         .child(&title)
@@ -295,11 +370,9 @@ pub(super) fn client_row(
     open.connect_clicked(move |_| details::client(&selected, &selected_page));
     copy.append(&open);
     let detail = gtk::Label::builder()
-        .xalign(0.0)
-        .ellipsize(gtk::pango::EllipsizeMode::End)
-        .single_line_mode(true)
         .css_classes(["toolport-muted", "caption"])
         .build();
+    wrap_row_text(&detail);
     {
         let client = client.clone();
         l10n::bind_label_with(&detail, move || client_detail(&client, style).0);
@@ -472,10 +545,12 @@ pub(super) fn profile_group(
     let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
     copy.set_hexpand(true);
     copy.set_valign(gtk::Align::Center);
-    let title = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let title = super::wrap_box::WrapBox::new(8, 4);
     let name = gtk::Label::new(Some(product.name()));
     name.add_css_class("heading");
     name.set_xalign(0.0);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    name.set_single_line_mode(true);
     title.append(&name);
     let count = l10n::formatted_label(
         if shown.len() == 1 {
@@ -652,6 +727,7 @@ mod caption_tests {
             config_error: false,
             location_removable: false,
             claude_profile: None,
+            t3_code: Vec::new(),
         };
         for style in [RowStyle::Line, RowStyle::Profile] {
             let (text, tooltip) = client_detail(&client, style);
@@ -681,5 +757,57 @@ mod caption_tests {
         let (text, _) = client_detail(&client, RowStyle::Line);
         assert!(text.contains("3 other servers"), "{text}");
         assert!(!text.contains("to import"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn instance(name: &str, enabled: bool) -> crate::clients::T3CodeUse {
+        crate::clients::T3CodeUse {
+            instance_id: name.to_lowercase(),
+            display_name: name.into(),
+            enabled,
+        }
+    }
+
+    #[test]
+    fn t3_code_badge_names_each_instance_and_marks_off_ones() {
+        let uses = [instance("Work", true), instance("Personal", false)];
+        assert_eq!(
+            t3_code_badge_text(&uses),
+            "Used by T3 Code: Work, Personal (off)"
+        );
+        assert_eq!(
+            t3_code_badge_tooltip(&uses),
+            "Work is on in T3 Code\nPersonal is off in T3 Code"
+        );
+        assert_eq!(
+            t3_code_badge_text(&[instance("Claude", true)]),
+            "Used by T3 Code: Claude"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn t3_code_badge_wraps_in_a_narrow_row_instead_of_cutting_names() {
+        gtk::init().expect("isolated GTK desktop");
+        let badge = t3_code_badge(&[
+            instance(
+                "Claude account number 07 for the long running client work",
+                true,
+            ),
+            instance("Personal", false),
+        ]);
+        assert!(badge.wraps());
+        assert_eq!(badge.ellipsize(), gtk::pango::EllipsizeMode::None);
+        let natural = badge.measure(gtk::Orientation::Horizontal, -1).1;
+        let (_, one_line, _, _) = badge.measure(gtk::Orientation::Vertical, natural);
+        let (_, narrow, _, _) = badge.measure(gtk::Orientation::Vertical, natural / 3);
+        assert!(
+            narrow > one_line,
+            "wraps onto more lines: {narrow} vs {one_line}"
+        );
     }
 }
