@@ -23,7 +23,8 @@ pub(crate) fn noninteractive<T>(f: impl FnOnce() -> T) -> T {
     }
     NONINTERACTIVE.with(|depth| depth.set(depth.get() + 1));
     let _leave = Leave;
-    f()
+    // Also the store's own gate, so any write it reaches here waits too.
+    crate::secrets::without_prompts(f)
 }
 
 fn is_noninteractive() -> bool {
@@ -37,7 +38,9 @@ pub(crate) fn locked_error() -> String {
 
 /// True when `error` came from a locked keyring rather than a real failure.
 pub(crate) fn is_locked_error(error: &str) -> bool {
-    error.contains(&locked_error())
+    // The store's own refusal of a background write while it would ask.
+    const STORE_WAITS: &str = "the keyring is locked; this background write waits for it";
+    error.contains(&locked_error()) || error.contains(STORE_WAITS)
 }
 
 pub(crate) fn status(server: &str, key: &str) -> Result<Option<String>, BackupSecretError> {
@@ -61,7 +64,9 @@ pub(crate) fn write(server: &str, key: &str, value: &str) -> Result<(), String> 
     if let Some(result) = fake::write(server, key, is_noninteractive()) {
         return result;
     }
-    if is_noninteractive() && store_locked() {
+    // A new item can go into a locked default collection even when no saved
+    // item is locked, so ask the store's write check, not only the read one.
+    if is_noninteractive() && (store_locked() || crate::secrets::write_would_ask()) {
         return Err(locked_error());
     }
     crate::secrets::set_backup_secret(server, key, value)
