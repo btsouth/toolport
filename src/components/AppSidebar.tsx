@@ -54,6 +54,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { ShareDialog } from "@/components/ShareDialog";
+import { navItemTitle } from "@/lib/shortcuts";
 
 const FOCUS_RING =
   "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
@@ -549,7 +550,7 @@ export function AppSidebar({
     <button
       onClick={onClick}
       aria-label={t(label)}
-      title={`${t(label)}${["Servers", "Clients", "Activity", "Settings"].includes(label) ? ` (${/Mac/.test(navigator.platform) ? "⌘" : "Ctrl"}${["Servers", "Clients", "Activity", "Settings"].indexOf(label) + 1})` : ""}`}
+      title={navItemTitle(label, t(label), /Mac/.test(navigator.platform))}
       aria-current={active ? "page" : undefined}
       className={`${NAV_ITEM} ${label === "Settings" ? "font-semibold" : ""} ${active ? "bg-accent font-medium text-foreground" : "text-muted-foreground"}`}
     >

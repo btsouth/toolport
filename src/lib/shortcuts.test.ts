@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   isTextEntry,
   resolveShortcut,
+  navItemTitle,
   shortcutHelp,
   SHORTCUT_VIEWS,
   type ShortcutEvent,
@@ -113,6 +114,29 @@ describe("shortcutHelp", () => {
     expect(shortcutHelp(true)[0].keys).toContain("⌘");
     expect(shortcutHelp(false)[0].keys).toContain("Ctrl");
     expect(shortcutHelp(false)[0].keys).toContain("4");
+  });
+
+  it("writes the Ctrl shortcuts with a plus, as the GTK app does", () => {
+    expect(shortcutHelp(false)[0].keys).toBe("Ctrl+1 – Ctrl+4");
+    expect(shortcutHelp(false).map((r) => r.keys)).toContain("Ctrl+N");
+    expect(shortcutHelp(true)[0].keys).toBe("⌘1 – ⌘4");
+  });
+});
+
+describe("navItemTitle", () => {
+  it("names each sidebar view's shortcut with a plus on Linux and Windows", () => {
+    expect(
+      ["Servers", "Clients", "Activity", "Settings"].map((l) =>
+        navItemTitle(l, l, false),
+      ),
+    ).toEqual([
+      "Servers (Ctrl+1)",
+      "Clients (Ctrl+2)",
+      "Activity (Ctrl+3)",
+      "Settings (Ctrl+4)",
+    ]);
+    expect(navItemTitle("Clients", "Clients", true)).toBe("Clients (⌘2)");
+    expect(navItemTitle("Skills", "Skills", false)).toBe("Skills");
   });
 
   it("documents every action the resolver can produce", () => {

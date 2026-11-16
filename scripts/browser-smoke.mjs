@@ -220,7 +220,9 @@ try {
   const firstToggle = await page
     .getByRole("switch", { name: `Toggle ${longServer}`, exact: true })
     .boundingBox();
-  expect(firstToggle.y + firstToggle.height).toBeLessThanOrEqual(360);
+  // The long name keeps the switch in the window: it wraps under the name
+  // rather than being pushed off the right edge.
+  expect(firstToggle.x + firstToggle.width).toBeLessThanOrEqual(480);
   await page
     .getByRole("button", { name: `Show ${longServer} details`, exact: true })
     .click();
@@ -298,6 +300,25 @@ try {
   await expect(page.getByText("Needs sign-in", { exact: true })).toBeVisible();
   await expect(page.getByText("Unreachable", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Retry", exact: true })).toHaveCount(2);
+  // A narrow window moves a row's status and actions under its name instead of
+  // squeezing the name to nothing.
+  await page.setViewportSize({ width: 480, height: 900 });
+  const serverNames = page.locator("[data-server-id] span.truncate.font-semibold");
+  expect(await serverNames.count()).toBeGreaterThan(2);
+  for (const name of await serverNames.all()) {
+    // The name's column keeps 200px or more, and the name itself is not cut.
+    await expect
+      .poll(() =>
+        name.evaluate(
+          (el) =>
+            el.parentElement.parentElement.clientWidth >= 200 &&
+            el.scrollWidth <= el.clientWidth,
+        ),
+      )
+      .toBe(true);
+  }
+  await page.screenshot({ path: path.join(output, "servers-narrow-480.png") });
+  await page.setViewportSize({ width: 1440, height: 1000 });
   await page.getByRole("button", { name: "View log", exact: true }).first().click();
   await expect(page.getByRole("tab", { name: "Overview", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Settings", exact: true }).click();

@@ -21,8 +21,8 @@ const PATTERNS: Array<[RegExp, (m: RegExpMatchArray) => string]> = [
   [/ENOENT/i, () => translate("Command or file not found (ENOENT)")],
   [/ENOTFOUND/i, () => translate("Host not found (ENOTFOUND)")],
   [/EAI_AGAIN/i, () => translate("Temporary DNS failure (EAI_AGAIN)")],
-  [/ECONNREFUSED/i, () => translate("Connection refused")],
-  [/ECONNRESET/i, () => translate("Connection reset")],
+  [/ECONNREFUSED|connection refused/i, () => translate("Connection refused")],
+  [/ECONNRESET|connection reset/i, () => translate("Connection reset")],
   [/EACCES/i, () => translate("Permission denied (EACCES)")],
   [/EPERM/i, () => translate("Permission denied (EPERM)")],
   [

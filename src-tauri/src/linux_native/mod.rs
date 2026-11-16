@@ -2665,8 +2665,7 @@ impl ServerPage {
             row.label.remove_css_class("error");
             row.label.remove_css_class("review");
             row.label.add_css_class(class);
-            row.label
-                .set_tooltip_text(probe.error.as_deref().filter(|error| !error.is_empty()));
+            row.label.set_tooltip_text(probe_tooltip(probe).as_deref());
             row.authenticate
                 .set_label(&crate::i18n::lookup(probe_auth_action(probe)));
             row.authenticate.set_visible(probe.auth_required);
@@ -4595,6 +4594,7 @@ impl ActivityPage {
             }
         });
         filter_server.set_factory(Some(&factory));
+        filter_server.set_list_factory(Some(&details::checked_list_factory()));
         filter_row.insert(&filter_server, -1);
         let errors_only = gtk::ToggleButton::new();
         l10n::bind_button(errors_only.upcast_ref(), "Errors only");
@@ -9854,7 +9854,7 @@ fn probe_status_line(probe: &crate::server_runtime::ProbeResult) -> (String, &'s
         )
     } else {
         (
-            probe.failure_label().to_string(),
+            crate::i18n::lookup(probe.failure_label()),
             if probe.auth_required {
                 "review"
             } else {
@@ -9862,6 +9862,125 @@ fn probe_status_line(probe: &crate::server_runtime::ProbeResult) -> (String, &'s
             },
         )
     }
+}
+
+/// A short, plain headline for a raw connection error, the same one React's
+/// `errorHeadline` (`src/lib/errors.ts`) gives. Keep the two in step.
+pub(super) fn error_headline(raw: &str) -> String {
+    use std::sync::LazyLock;
+    type Headline = fn(&regex::Captures) -> String;
+    static PATTERNS: LazyLock<Vec<(regex::Regex, Headline)>> = LazyLock::new(|| {
+        let pattern = |re: &str| regex::Regex::new(re).expect("static error pattern");
+        vec![
+            (
+                pattern(r"(?i)EADDRINUSE[^\n]*?(\d{1,3}(?:\.\d{1,3}){3}:\d+|:\d+)"),
+                |m| crate::i18n::trf("Port already in use ({port})", &[("port", &m[1])]),
+            ),
+            (pattern(r"(?i)EADDRINUSE"), |_| {
+                crate::i18n::tr("Port already in use")
+            }),
+            (pattern(r"(?i)ENOENT"), |_| {
+                crate::i18n::tr("Command or file not found (ENOENT)")
+            }),
+            (pattern(r"(?i)ENOTFOUND"), |_| {
+                crate::i18n::tr("Host not found (ENOTFOUND)")
+            }),
+            (pattern(r"(?i)EAI_AGAIN"), |_| {
+                crate::i18n::tr("Temporary DNS failure (EAI_AGAIN)")
+            }),
+            (pattern(r"(?i)ECONNREFUSED|connection refused"), |_| {
+                crate::i18n::tr("Connection refused")
+            }),
+            (pattern(r"(?i)ECONNRESET|connection reset"), |_| {
+                crate::i18n::tr("Connection reset")
+            }),
+            (pattern(r"(?i)EACCES"), |_| {
+                crate::i18n::tr("Permission denied (EACCES)")
+            }),
+            (pattern(r"(?i)EPERM"), |_| {
+                crate::i18n::tr("Permission denied (EPERM)")
+            }),
+            (
+                pattern(r"(?i)timed out waiting for initialize|timed? ?out"),
+                |_| crate::i18n::tr("Timed out waiting for the server"),
+            ),
+            (pattern(r"(?i)\b401\b|unauthorized"), |_| {
+                crate::i18n::tr("Authentication required (401)")
+            }),
+            (pattern(r"(?i)\b403\b|forbidden"), |_| {
+                crate::i18n::tr("Access forbidden (403)")
+            }),
+            (
+                pattern(r"(?i)(?:HTTP\s+|status\s+|returned\s+)429\b|\b429\s+Too Many Requests"),
+                |_| crate::i18n::tr("Rate limited (429)"),
+            ),
+            (
+                pattern(
+                    r"(?i)(?:HTTP\s+|status\s+|returned\s+)(5\d{2})\b|\b(5\d{2})\s+(?:Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout|error)",
+                ),
+                |m| {
+                    let status = m.get(1).or_else(|| m.get(2)).map_or("", |s| s.as_str());
+                    crate::i18n::trf("Server error ({status})", &[("status", status)])
+                },
+            ),
+            (
+                pattern(
+                    r"(?i)UNABLE_TO_VERIFY_LEAF_SIGNATURE|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN",
+                ),
+                |_| crate::i18n::tr("TLS certificate not trusted"),
+            ),
+        ]
+    });
+    static EXIT: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?i)exit(?:ed)?\s+(?:with\s+)?(?:status|code)\s+(\d+)")
+            .expect("static exit pattern")
+    });
+    static URL: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"https?://\S+").expect("static url pattern"));
+    fn middle(text: &str, max: usize) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        if chars.len() <= max {
+            return text.to_string();
+        }
+        let head = (max - 1).div_ceil(2);
+        let tail = (max - 1) / 2;
+        let mut out: String = chars[..head].iter().collect();
+        out.push('…');
+        out.extend(&chars[chars.len() - tail..]);
+        out
+    }
+    let text = raw.trim();
+    if text.is_empty() {
+        return crate::i18n::tr("Unknown error");
+    }
+    for (pattern, headline) in PATTERNS.iter() {
+        if let Some(found) = pattern.captures(text) {
+            return headline(&found);
+        }
+    }
+    if let Some(found) = EXIT.captures(text) {
+        return crate::i18n::trf("Exited with status {status}", &[("status", &found[1])]);
+    }
+    let last = text
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .unwrap_or(text);
+    let short = URL.replace_all(last, |found: &regex::Captures| middle(&found[0], 60));
+    middle(&short, 160)
+}
+
+/// The status chip's tooltip: a short headline for an error, as React shows,
+/// and nothing for a server that only needs sign-in (the chip says so).
+fn probe_tooltip(probe: &crate::server_runtime::ProbeResult) -> Option<String> {
+    if probe.ok || probe.auth_required {
+        return None;
+    }
+    probe
+        .error
+        .as_deref()
+        .filter(|error| !error.trim().is_empty())
+        .map(error_headline)
 }
 
 /// The one-line posture summary above the server list.
@@ -9925,15 +10044,16 @@ fn server_order_key(server: &state::ServerView) -> (String, String) {
     (server.name.to_lowercase(), server.id.clone())
 }
 
+/// A server's name. It wraps in a narrow window rather than shrinking to "…".
 fn bounded_title(name: &str) -> gtk::Label {
-    gtk::Label::builder()
+    let label = gtk::Label::builder()
         .label(name)
         .xalign(0.0)
         .hexpand(true)
-        .ellipsize(gtk::pango::EllipsizeMode::End)
         .max_width_chars(24)
-        .tooltip_text(name)
-        .build()
+        .build();
+    client_rows::wrap_row_text(&label);
+    label
 }
 
 fn open_server_details(server: &state::ServerView, page: &ServerPage, show_tools: bool) {
@@ -9952,15 +10072,21 @@ fn server_row(
 ) -> gtk::Box {
     // Two lines (spec 9): the name, then where it comes from and how it runs. The
     // status chip, the switch and the menu trail on the right.
-    let card = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 8);
     card.set_widget_name(&format!("toolport-profile:{profile_id}"));
     card.add_css_class("toolport-card");
     card.add_css_class("toolport-server-row");
 
+    // The logo and text; the controls join them on one line in a HeaderWrap,
+    // and move under the text in a narrow window, as on the Clients page.
+    let lead = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    controls.set_valign(gtk::Align::Center);
+    controls.set_halign(gtk::Align::End);
     let icon = branding::server_logo(&server.name, &server.transport);
     icon.set_valign(gtk::Align::Center);
     if !detail {
-        card.append(&icon);
+        lead.append(&icon);
     }
 
     let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -9970,7 +10096,6 @@ fn server_row(
         .child(&bounded_title(&server.name))
         .halign(gtk::Align::Fill)
         .css_classes(["flat", "heading", "toolport-card-title"])
-        .tooltip_text(&server.name)
         .build();
     details.set_widget_name(&format!("detail-open:{}", server.id));
     let server_for_details = server.clone();
@@ -9997,10 +10122,9 @@ fn server_row(
     let meta = gtk::Label::builder()
         .halign(gtk::Align::Fill)
         .xalign(0.0)
-        .ellipsize(gtk::pango::EllipsizeMode::End)
-        .single_line_mode(true)
         .css_classes(["toolport-muted", "caption"])
         .build();
+    client_rows::wrap_row_text(&meta);
     {
         let origin = server.origin_label.clone();
         let transport = server.transport.clone();
@@ -10014,7 +10138,6 @@ fn server_row(
             }
             parts.join(" · ")
         };
-        l10n::bind_tooltip_with(&meta, line.clone());
         l10n::bind_label_with(&meta, line);
     }
     text.append(&meta);
@@ -10039,17 +10162,17 @@ fn server_row(
     // The status chip: the probe result for an enabled server, Off otherwise.
     let health = gtk::Label::builder()
         .valign(gtk::Align::Center)
-        .ellipsize(gtk::pango::EllipsizeMode::End)
         .max_width_chars(28)
         .css_classes(["toolport-badge", "toolport-server-state"])
         .build();
+    client_rows::wrap_row_text(&health);
     if server.enabled && !server.requires_review {
         l10n::bind_text(&health, "Checking…");
     } else {
         l10n::bind_text(&health, "Off");
         health.add_css_class("off");
     }
-    card.append(&text);
+    lead.append(&text);
 
     let authenticate = l10n::button("Sign in");
     authenticate.add_css_class("toolport-secondary-action");
@@ -10108,7 +10231,7 @@ fn server_row(
     health_actions.append(&authenticate);
     health_actions.append(&retry);
     health_actions.append(&copy_error);
-    card.append(&health_actions);
+    controls.append(&health_actions);
     if server.enabled && !server.requires_review {
         let mut all_rows = page.health_rows.borrow_mut();
         let rows = all_rows.entry(server.id.clone()).or_default();
@@ -10132,7 +10255,7 @@ fn server_row(
             authenticate.set_label(&crate::i18n::lookup(probe_auth_action(previous)));
             authenticate.set_visible(previous.auth_required);
             copy_error.set_visible(!previous.ok && previous.error.is_some());
-            health.set_tooltip_text(previous.error.as_deref());
+            health.set_tooltip_text(probe_tooltip(previous).as_deref());
             retry.set_visible(!previous.ok && !previous.auth_required);
         }
     }
@@ -10168,7 +10291,7 @@ fn server_row(
         // A server synced from another machine is reviewed right here; only
         // team servers still go to the Teams page.
         badge.set_visible(!personal);
-        card.append(&badge);
+        controls.append(&badge);
         let review = l10n::button(if personal {
             crate::i18n::msg("Review and enable")
         } else {
@@ -10261,12 +10384,12 @@ l10n::bind_dialog_response(&dialog, "enable", "Enable");
             });
             dialog.present();
         });
-        card.append(&review);
+        controls.append(&review);
     } else {
         // No "Enabled" label beside the switch: the chip says the state, and the
         // switch's accessible name says what it changes (spec 6).
         let status = health.clone();
-        card.append(&health);
+        controls.append(&health);
         let toggle = gtk::Switch::builder()
             .active(server.enabled)
             .valign(gtk::Align::Center)
@@ -10371,7 +10494,7 @@ l10n::bind_dialog_response(&dialog, "enable", "Enable");
             });
             gtk::glib::Propagation::Stop
         });
-        card.append(&toggle);
+        controls.append(&toggle);
     }
     let actions = server_actions(server, page, true);
     let popover = gtk::Popover::new();
@@ -10423,8 +10546,17 @@ l10n::bind_dialog_response(&dialog, "enable", "Enable");
         .build();
     quiet_tooltips::guard_menu(&menu);
     if !detail {
-        card.append(&menu);
+        controls.append(&menu);
     }
+    let line = page_header::HeaderWrap::row(
+        &lead,
+        &controls,
+        client_rows::ROW_MIN_TEXT,
+        (!detail)
+            .then(|| icon.upcast_ref::<gtk::Widget>().clone())
+            .as_ref(),
+    );
+    card.append(&line);
     card
 }
 
@@ -12568,12 +12700,18 @@ fn open_server_editor_prefilled(
     scroller.set_child(Some(&clamp));
     root.append(&scroller);
     form.remove(&feedback);
-    // Lined up with the form's fields, just above the footer.
-    feedback.set_margin_start(30);
-    feedback.set_margin_end(30);
-    feedback.set_margin_bottom(8);
-    root.append(&feedback);
-    root.append(&dialog_footer(&[&test, &cancel, &save]));
+    // The result and the buttons are one footer under one rule: the form
+    // scrolls above both, so the result never reads as covering a field.
+    let footer = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    footer.add_css_class("toolport-dialog-footer");
+    // Lined up with the form's fields (the footer's own padding is 20).
+    feedback.set_margin_start(10);
+    feedback.set_margin_end(10);
+    footer.append(&feedback);
+    let buttons = dialog_footer(&[&test, &cancel, &save]);
+    buttons.remove_css_class("toolport-dialog-footer");
+    footer.append(&buttons);
+    root.append(&footer);
     editor.set_content(Some(&root));
     // Start typing the name, not on the footer's first button.
     gtk::prelude::GtkWindowExt::set_focus(&editor, Some(&name));
@@ -12891,14 +13029,15 @@ fn open_server_editor_prefilled(
                     feedback.add_css_class("error");
                 }
                 Ok(Ok(probe)) => {
-                    l10n::bind_formatted_label(
-                        &feedback,
-                        "Connection failed: {value0}",
-                        &[(
-                            "value0",
-                            probe.error.as_deref().unwrap_or("unknown connection error"),
-                        )],
-                    );
+                    // The same plain headline React shows for this result.
+                    match probe.error.as_deref().filter(|e| !e.trim().is_empty()) {
+                        Some(error) => l10n::bind_formatted_label(
+                            &feedback,
+                            "Connection failed: {value0}",
+                            &[("value0", &error_headline(error))],
+                        ),
+                        None => l10n::bind_text(&feedback, "Couldn't connect."),
+                    }
                     feedback.remove_css_class("success");
                     feedback.add_css_class("error");
                 }
@@ -17306,6 +17445,16 @@ mod tests {
                 .is_none(),
             "test feedback must remain visible outside the form scroller"
         );
+        // It sits in the footer, under the footer's rule and above the
+        // buttons, so the form scrolls above it and no field is covered.
+        let footer = feedback.parent().unwrap();
+        assert!(footer.has_css_class("toolport-dialog-footer"));
+        assert!(footer
+            .prev_sibling()
+            .is_some_and(|scroller| scroller.is::<gtk::ScrolledWindow>()));
+        assert!(feedback
+            .next_sibling()
+            .is_some_and(|buttons| buttons.observe_children().n_items() >= 3));
         feedback.set_label("Old failure");
         feedback.set_visible(true);
         name.set_text("");
@@ -17460,6 +17609,34 @@ mod tests {
             120_000
         );
         assert_eq!(suggested_startup_timeout_ms("fixture-command", &[]), 10_000);
+    }
+
+    #[test]
+    fn connection_errors_read_as_the_same_plain_headline_react_shows() {
+        assert_eq!(
+            error_headline("transport error (retryable): Connection refused (os error 111)"),
+            "Connection refused"
+        );
+        assert_eq!(
+            error_headline(r#"HTTP 401 (needs authentication): {"error":"invalid_token"}"#),
+            "Authentication required (401)"
+        );
+        assert_eq!(
+            error_headline("spawn failed\nchild exited with status 3"),
+            "Exited with status 3"
+        );
+        assert_eq!(error_headline("  "), "Unknown error");
+        let url = format!(
+            "first line\nfailed at https://example.com/{}",
+            "a".repeat(200)
+        );
+        let headline = error_headline(&url);
+        assert!(
+            headline.starts_with("failed at https://example.com/"),
+            "{headline}"
+        );
+        assert!(headline.chars().count() < 80, "{headline}");
+        assert!(headline.contains('…'), "{headline}");
     }
 
     #[test]
@@ -18331,6 +18508,198 @@ mod tests {
 
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn dropdown_lists_with_their_own_button_mark_the_current_choice() {
+        adw::init().unwrap();
+        let choices = gtk::StringList::new(&[
+            "Default access (from Settings)",
+            "All enabled servers",
+            "Default",
+        ]);
+        let selection = gtk::SingleSelection::new(Some(choices));
+        selection.set_selected(2);
+        let list = gtk::ListView::new(
+            Some(selection.clone()),
+            Some(details::checked_list_factory()),
+        );
+        let window = gtk::Window::builder()
+            .default_width(360)
+            .default_height(200)
+            .child(&list)
+            .build();
+        window.present();
+        let marks = || {
+            let mut out = Vec::new();
+            let mut row = list.first_child();
+            while let Some(widget) = row {
+                if let Some(content) = widget.first_child() {
+                    let label = content.first_child().and_downcast::<gtk::Label>().unwrap();
+                    out.push((
+                        label.text().to_string(),
+                        content.last_child().unwrap().opacity(),
+                    ));
+                }
+                row = widget.next_sibling();
+            }
+            out
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while marks().len() < 3 && std::time::Instant::now() < deadline {
+            gtk::glib::MainContext::default().iteration(false);
+        }
+        assert_eq!(
+            marks(),
+            [
+                ("Default access (from Settings)".to_string(), 0.0),
+                ("All enabled servers".to_string(), 0.0),
+                ("Default".to_string(), 1.0),
+            ]
+        );
+        selection.set_selected(0);
+        assert_eq!(marks()[0].1, 1.0);
+        assert_eq!(marks()[2].1, 0.0);
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn server_rows_keep_their_name_and_status_text_in_a_narrow_window() {
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.NarrowServerRows")
+            .build();
+        let page = ServerPage {
+            details: Default::default(),
+            app: app.clone(),
+            share_requests: Default::default(),
+            server_count: gtk::Label::new(None),
+            section_title: gtk::Label::new(None),
+            posture: gtk::Label::new(None),
+            search: gtk::SearchEntry::new(),
+            feedback: gtk::Label::new(None),
+            list: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            last_snapshot: Default::default(),
+            feedback_timer: Default::default(),
+            health_rows: Default::default(),
+            rows: Default::default(),
+            no_matches: Default::default(),
+            off_heading: Default::default(),
+            health: Default::default(),
+            registry_reload: Default::default(),
+        };
+        let mut view = server("Cloudflare (Full API)", "Local stdio");
+        view.id = "cloudflare".into();
+        let card = server_card(&view, "default", page.clone());
+        // A failed check shows Retry and View log beside the status, the case
+        // that left only "…" of the name at 720 px.
+        let probe = |error: &str, auth_required: bool| crate::server_runtime::ProbeResult {
+            server_id: "cloudflare".into(),
+            ok: false,
+            tool_count: 0,
+            error: Some(error.into()),
+            auth_required,
+            failure: None,
+            auth_target: None,
+        };
+        page.apply_probe(
+            "cloudflare",
+            &probe(
+                "transport error (retryable): Connection refused (os error 111)",
+                false,
+            ),
+        );
+        let labels = || {
+            let mut out = Vec::new();
+            fn walk(widget: &gtk::Widget, out: &mut Vec<gtk::Label>) {
+                if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                    out.push(label.clone());
+                }
+                let mut child = widget.first_child();
+                while let Some(next) = child {
+                    walk(&next, out);
+                    child = next.next_sibling();
+                }
+            }
+            walk(card.upcast_ref(), &mut out);
+            out
+        };
+        let name = labels()
+            .into_iter()
+            .find(|l| l.text() == "Cloudflare (Full API)")
+            .unwrap();
+        let health = labels()
+            .into_iter()
+            .find(|l| l.has_css_class("toolport-server-state"))
+            .unwrap();
+        // The status tooltip is the plain headline React shows.
+        assert_eq!(health.tooltip_text().as_deref(), Some("Connection refused"));
+        // Rows fit a narrow window by moving the controls under the text.
+        let wide = card.measure(gtk::Orientation::Vertical, 880).1;
+        let (min, _, _, _) = card.measure(gtk::Orientation::Horizontal, -1);
+        assert!(min <= 300, "row fits a narrow window: {min}");
+        assert!(card.measure(gtk::Orientation::Vertical, 300).1 > wide);
+        // The row's width at a 720 px window, after the sidebar.
+        let window = gtk::Window::builder()
+            .default_width(430)
+            .default_height(300)
+            .child(&card)
+            .build();
+        window.present();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while name.width() == 0 && std::time::Instant::now() < deadline {
+            gtk::glib::MainContext::default().iteration(false);
+        }
+        for _ in 0..20 {
+            gtk::glib::MainContext::default().iteration(false);
+        }
+        let (_, natural, _, _) = name.measure(gtk::Orientation::Horizontal, -1);
+        assert!(
+            name.width() >= natural.min(200),
+            "the name keeps its width: {} of {natural}",
+            name.width()
+        );
+        for label in [&name, &health] {
+            assert!(!label.layout().is_ellipsized(), "{} is cut", label.text());
+        }
+        assert!(!health.text().ends_with('…'), "{}", health.text());
+        // A server that only needs sign-in: the chip says so, with no raw
+        // response in a tooltip.
+        page.apply_probe(
+            "cloudflare",
+            &probe(
+                r#"HTTP 401 (needs authentication): {"error":"invalid_token"}"#,
+                true,
+            ),
+        );
+        assert_eq!(health.text(), "Needs sign-in");
+        assert!(health.tooltip_text().is_none());
+        assert!(!health.layout().is_ellipsized());
+        window.set_child(None::<&gtk::Widget>);
+        window.close();
+        // A row too narrow for the controls beside the name, wide enough for them
+        // on their own line: the chip keeps its words on one line, not
+        // "Unrea-chable".
+        page.apply_probe("cloudflare", &probe("connection refused", false));
+        let window = gtk::Window::builder()
+            .default_width(600)
+            .default_height(300)
+            .child(&card)
+            .build();
+        window.present();
+        for _ in 0..40 {
+            gtk::glib::MainContext::default().iteration(false);
+        }
+        assert_eq!(
+            health.layout().line_count(),
+            1,
+            "\"{}\" splits across lines in a {}px row",
+            health.text(),
+            card.width()
+        );
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn b4_server_rows_sit_in_row_groups_and_move_between_them() {
         adw::init().unwrap();
         let app = adw::Application::builder()
@@ -18404,8 +18773,22 @@ mod tests {
         assert!(!labels
             .iter()
             .any(|text| text == "Enabled" || text == "Disabled"));
-        // The status chip, then the switch, then the menu, at the trailing edge.
-        let trailing = children(&row);
+        // The status chip, then the switch, then the menu, at the trailing edge
+        // (one box, which a narrow window moves under the name).
+        fn holding_switch(widget: &gtk::Widget) -> Option<gtk::Widget> {
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if current.is::<gtk::Switch>() {
+                    return Some(widget.clone());
+                }
+                if let Some(found) = holding_switch(&current) {
+                    return Some(found);
+                }
+                child = current.next_sibling();
+            }
+            None
+        }
+        let trailing = children(&holding_switch(&row).expect("the row controls"));
         let switch = trailing
             .iter()
             .position(|widget| widget.is::<gtk::Switch>())
@@ -18416,7 +18799,7 @@ mod tests {
             .expect("status chip");
         assert!(chip < switch);
         assert!(switch < trailing.len() - 1, "the menu trails the switch");
-        let off_chip = children(&off_rows[0])
+        let off_chip = children(&holding_switch(&off_rows[0]).expect("the off row controls"))
             .into_iter()
             .find(|widget| widget.has_css_class("toolport-badge"))
             .and_downcast::<gtk::Label>()

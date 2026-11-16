@@ -25,6 +25,15 @@ describe("errorHeadline", () => {
     expect(errorHeadline("HTTP 403 Forbidden")).toBe("Access forbidden (403)");
   });
 
+  it("reads the backend's own refused and reset wording, as the GTK app does", () => {
+    expect(
+      errorHeadline("transport error (retryable): Connection refused (os error 111)"),
+    ).toBe("Connection refused");
+    expect(errorHeadline("Connection reset by peer (os error 104)")).toBe(
+      "Connection reset",
+    );
+  });
+
   it("recognizes DNS, reset, permission, rate limit, 5xx, and TLS failures", () => {
     expect(errorHeadline("getaddrinfo ENOTFOUND api.example.com")).toBe(
       "Host not found (ENOTFOUND)",

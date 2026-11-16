@@ -237,7 +237,9 @@ pub(super) fn bind_tooltip_with(
             let Some(widget) = weak.upgrade() else {
                 return false;
             };
-            widget.set_tooltip_text(Some(&formatter()));
+            // Empty means no tooltip.
+            let text = formatter();
+            widget.set_tooltip_text((!text.is_empty()).then_some(text.as_str()));
             true
         }),
     );

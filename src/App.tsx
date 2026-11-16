@@ -126,6 +126,7 @@ import { useTheme } from "@/lib/theme";
 import { fmtTs } from "@/lib/utils";
 import { createSingleFlight } from "@/lib/singleFlight";
 import {
+  modKey,
   resolveShortcut,
   shortcutHelp,
   SKILLS_REFRESH_EVENT,
@@ -1075,7 +1076,7 @@ function App() {
                         onChange={(e) => setQuery(e.target.value)}
                         placeholder={translate("Search servers")}
                         title={translate("Search servers (/ or {value1}F)", {
-                          value1: String(isMac ? "⌘" : "Ctrl"),
+                          value1: modKey(isMac),
                         })}
                         className="h-8 w-32 pl-8 sm:w-44"
                       />
@@ -1087,7 +1088,7 @@ function App() {
                         <Button
                           variant="outline"
 
-                          title={isMac ? t("Add server (⌘N)") : t("Add server (CtrlN)")}
+                          title={isMac ? t("Add server (⌘N)") : t("Add server (Ctrl+N)")}
                         >
                           <Plus className="size-4" /> {t("Add server")}{" "}
                         </Button>
@@ -1196,7 +1197,7 @@ function App() {
                     title={
                       isMac
                         ? t("Reload servers, clients, and health (⌘R)")
-                        : t("Reload servers, clients, and health (CtrlR)")
+                        : t("Reload servers, clients, and health (Ctrl+R)")
                     }
                     onClick={() => void manualRefresh()}
                     disabled={loading || checkingClientRecoveries}

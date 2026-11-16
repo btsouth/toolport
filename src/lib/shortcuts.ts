@@ -99,9 +99,23 @@ export interface ShortcutHelpRow {
   what: string;
 }
 
+/** The modifier prefix for a shortcut hint: "⌘N" on a Mac, "Ctrl+N" elsewhere (as the GTK app writes it). */
+export function modKey(isMac: boolean): string {
+  return isMac ? "⌘" : "Ctrl+";
+}
+
+/** The sidebar views reachable with the modifier and a digit, in shortcut order. */
+const NAV_SHORTCUTS = ["Servers", "Clients", "Activity", "Settings"];
+
+/** A sidebar item's tooltip: its label plus its shortcut, when it has one. */
+export function navItemTitle(label: string, translated: string, isMac: boolean): string {
+  const index = NAV_SHORTCUTS.indexOf(label);
+  return index < 0 ? translated : `${translated} (${modKey(isMac)}${index + 1})`;
+}
+
 /** The cheat sheet, built for the platform so a Mac user is not told to press Ctrl. */
 export function shortcutHelp(isMac: boolean): ShortcutHelpRow[] {
-  const mod = isMac ? "⌘" : "Ctrl";
+  const mod = modKey(isMac);
   const rows: { keys: string; what: SourceMessage }[] = [
     { keys: `${mod}1 – ${mod}4`, what: msg("Switch view") },
     { keys: `/ or ${mod}F`, what: msg("Focus the server search") },

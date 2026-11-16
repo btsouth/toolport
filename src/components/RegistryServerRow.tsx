@@ -281,7 +281,7 @@ export function RegistryServerRow({
             ? undefined
             : () => (onOpen ? onOpen("overview") : setExpanded((v) => !v))
         }
-        className="flex min-h-14 cursor-pointer items-center gap-3 px-4 py-3 transition-colors hover:bg-foreground/[0.04]"
+        className={`flex min-h-14 cursor-pointer items-center gap-3 px-4 py-3 transition-colors hover:bg-foreground/[0.04] ${detail ? "" : "flex-wrap gap-y-2"}`}
       >
         {detail && (
           <span className="mr-auto text-sm font-semibold">{translate("Connection")}</span>
@@ -291,7 +291,9 @@ export function RegistryServerRow({
         )}
 
         {!detail && (
-          <span className="min-w-0 flex-1">
+          // The name keeps 220px, as in the GTK app; past that the status and
+          // actions wrap onto the next line.
+          <span className="min-w-0 flex-1 basis-[220px]">
             <span title={server.name} className="flex min-w-0 items-center gap-1.5">
               <span className="truncate text-sm font-semibold">{server.name}</span>
               {isTeam && (

@@ -227,10 +227,11 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         registry?.defaultAccessProfileId ||
         (registry?.defaultAccessLegacyPolicy ? registry.defaultAccessContextId : null);
       const name = profiles.find((p) => p.id === defaultId)?.name;
-      // A set that is itself named "Default" would read "Default access (Default)".
+      // A set that is itself named "Default" would read "Default access (Default)",
+      // and plain "Default access" next to it reads as the same choice.
       return name && name.trim().toLowerCase() !== "default"
         ? translate("Default access ({name})", { name })
-        : translate("Default access");
+        : translate("Default access (from Settings)");
     }
     return scopeRef === "@all-enabled"
       ? translate("All enabled servers")

@@ -494,6 +494,24 @@ describe("ServerDialog", () => {
     ]);
   });
 
+  it("words a refused connection plainly, as the GTK app does", async () => {
+    api.testServer.mockResolvedValueOnce({
+      ...failure,
+      error: "transport error (retryable): Connection refused (os error 111)",
+    });
+    const user = userEvent.setup();
+
+    render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    await fillServer(user, "unreachable");
+    await user.click(screen.getByRole("button", { name: "Test connection" }));
+
+    expect(
+      await screen.findByText("Connection failed: Connection refused"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/os error 111/)).not.toBeInTheDocument();
+  });
+
   it("keeps an edited in-flight test busy and discards its result", async () => {
     const request = deferred<ProbeResult>();
     api.testServer.mockReturnValueOnce(request.promise);
@@ -816,10 +834,10 @@ describe("ServerDialog", () => {
     );
 
     await act(async () => second.resolve(failure));
-    expect(screen.getByText(failure.error as string)).toBeInTheDocument();
+    expect(screen.getByText(`Connection failed: ${failure.error}`)).toBeInTheDocument();
 
     await act(async () => first.resolve(success));
-    expect(screen.getByText(failure.error as string)).toBeInTheDocument();
+    expect(screen.getByText(`Connection failed: ${failure.error}`)).toBeInTheDocument();
     expect(screen.queryByText(/Connected\. Found/)).not.toBeInTheDocument();
   });
 });
