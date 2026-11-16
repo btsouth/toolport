@@ -2706,6 +2706,9 @@ pub struct SetupItem {
     pub credentials: Vec<CredentialReview>,
     pub unsupported: Option<String>,
     pub updates: Vec<String>,
+    /// The client's own name when `name`, the name an import saves, differs from it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_name: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2774,6 +2777,7 @@ pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String
                 Err(error) => (Vec::new(), Some(error)),
             };
             Ok(SetupItem {
+                source_name: None,
                 updates,
                 credentials,
                 unsupported,

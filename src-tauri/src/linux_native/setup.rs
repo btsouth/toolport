@@ -192,6 +192,7 @@ fn credential_prompt(
 const REVIEW_COMMAND_WRAP_CHARS: usize = 72;
 
 struct ReviewItem {
+    hint: Option<gtk::Label>,
     subtitle: gtk::Label,
     suffixes: gtk::Box,
     check: gtk::ToggleButton,
@@ -199,9 +200,10 @@ struct ReviewItem {
 }
 
 impl ReviewItem {
-    fn new(check: &gtk::ToggleButton, name: &str, command: &str) -> Self {
-        // React's ImportRow: the dot, the name and the status on one line, then the
-        // command on its own line across the whole entry.
+    fn new(check: &gtk::ToggleButton, name: &str, hint: Option<&str>, command: &str) -> Self {
+        // React's ImportRow: the dot, the name and the status on one line, then where it
+        // lands when that differs ("Import as github (2)"), then the command on its own
+        // line across the whole entry.
         let entry = gtk::Box::new(gtk::Orientation::Vertical, 4);
         let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -221,6 +223,18 @@ impl ReviewItem {
         suffixes.set_valign(gtk::Align::Center);
         line.append(&suffixes);
         entry.append(&line);
+        let hint = hint.map(|text| {
+            let label = gtk::Label::builder()
+                .label(text)
+                .xalign(0.0)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .build();
+            label.add_css_class("dim-label");
+            label.add_css_class("toolport-review-hint");
+            entry.append(&label);
+            label
+        });
         let subtitle = gtk::Label::builder().label(command).xalign(0.0).build();
         if command.chars().count() > REVIEW_COMMAND_WRAP_CHARS {
             // Like React, a long command keeps both ends; hover shows it in full.
@@ -237,6 +251,7 @@ impl ReviewItem {
         entry.append(&subtitle);
         check.set_child(Some(&entry));
         let item = Self {
+            hint,
             subtitle,
             suffixes,
             check: check.clone(),
@@ -251,13 +266,15 @@ impl ReviewItem {
         // A status label that changes or shows later (the credential state, the Error
         // chip) updates what a screen reader hears, as React's button text does.
         if let Some(label) = widget.dynamic_cast_ref::<gtk::Label>() {
-            let (check, name, subtitle, suffixes) = (
+            let (check, name, hint, subtitle, suffixes) = (
                 self.check.clone(),
                 self.name.clone(),
+                self.hint.clone(),
                 self.subtitle.clone(),
                 self.suffixes.clone(),
             );
-            let describe = move || describe_toggle(&check, &name, &subtitle, &suffixes);
+            let describe =
+                move || describe_toggle(&check, &name, hint.as_ref(), &subtitle, &suffixes);
             let again = describe.clone();
             label.connect_label_notify(move |_| describe());
             label.connect_visible_notify(move |_| again());
@@ -276,20 +293,29 @@ impl ReviewItem {
     }
 
     fn describe(&self) {
-        describe_toggle(&self.check, &self.name, &self.subtitle, &self.suffixes);
+        describe_toggle(
+            &self.check,
+            &self.name,
+            self.hint.as_ref(),
+            &self.subtitle,
+            &self.suffixes,
+        );
     }
 }
 
-/// The name is the toggle's accessible name. Its description is the command, then each
-/// status label shown beside the name (New, the credential state, Error), as a screen
-/// reader reads React's button text. The toggle itself reports pressed.
+/// The name is the toggle's accessible name. Its description is where it lands when that
+/// differs, the command, then each status label shown beside the name (New, the credential
+/// state, Error), as a screen reader reads React's button text. The toggle itself reports
+/// pressed.
 fn describe_toggle(
     check: &gtk::ToggleButton,
     name: &str,
+    hint: Option<&gtk::Label>,
     subtitle: &gtk::Label,
     suffixes: &gtk::Box,
 ) {
-    let mut parts = vec![subtitle.label().to_string()];
+    let mut parts: Vec<String> = hint.map(|h| h.label().to_string()).into_iter().collect();
+    parts.push(subtitle.label().to_string());
     let mut child = suffixes.first_child();
     while let Some(widget) = child {
         if let Some(label) = widget.downcast_ref::<gtk::Label>() {
@@ -320,6 +346,20 @@ fn backup_date(backup: &str) -> Option<String> {
                 t.day_of_month() as u32,
                 t.hour() as u32,
                 t.minute() as u32,
+            )
+        })
+}
+
+/// "Import as github (2)" when an import saves under another name than the client's.
+/// An unsupported server is not imported, so it gets no hint.
+fn import_hint(item: &SetupItem) -> Option<String> {
+    item.source_name
+        .as_deref()
+        .filter(|source| *source != item.name && item.unsupported.is_none())
+        .map(|_| {
+            crate::i18n::trf(
+                crate::i18n::msg("Import as {value0}"),
+                &[("value0", item.name.as_str())],
             )
         })
 }
@@ -791,7 +831,12 @@ pub(super) fn review_with_notice(
             .hexpand(true)
             .build();
         check.add_css_class("toolport-review-item");
-        let row = ReviewItem::new(&check, &item.name, &command);
+        let row = ReviewItem::new(
+            &check,
+            item.source_name.as_deref().unwrap_or(&item.name),
+            import_hint(&item).as_deref(),
+            &command,
+        );
         required_fields.borrow_mut().push((
             check.downgrade(),
             item.name.clone(),
@@ -809,7 +854,9 @@ pub(super) fn review_with_notice(
         // React's plain list of credential lines, no row fill.
         let credential_rows = gtk::Box::new(gtk::Orientation::Vertical, 8);
         content.append(&credential_rows);
-        let tag = l10n::label(if !item.updates.is_empty() {
+        let tag = l10n::label(if item.unsupported.is_some() {
+            crate::i18n::msg("Needs review")
+        } else if !item.updates.is_empty() {
             crate::i18n::msg("Updates existing server")
         } else if item.is_new {
             crate::i18n::msg("New")
@@ -2477,6 +2524,7 @@ mod tests {
                 }],
                 unsupported: None,
                 updates: Vec::new(),
+                source_name: None,
             }],
             "Fixture",
             "Connect",
@@ -2551,6 +2599,7 @@ mod tests {
                 }],
                 unsupported: None,
                 updates: vec![],
+                source_name: None,
             }],
             "Fixture",
             "Connect",
@@ -2584,6 +2633,106 @@ mod tests {
         window.close();
     }
 
+    fn import_item(name: &str, source: Option<&str>, unsupported: Option<&str>) -> SetupItem {
+        SetupItem {
+            key: name.into(),
+            name: name.into(),
+            transport: "http".into(),
+            command: None,
+            args: Vec::new(),
+            url: Some("https://example.invalid/mcp".into()),
+            env_keys: Vec::new(),
+            is_new: true,
+            credentials: Vec::new(),
+            unsupported: unsupported.map(str::to_string),
+            updates: Vec::new(),
+            source_name: source.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn import_hint_names_the_saved_name_only_when_it_differs() {
+        assert_eq!(
+            import_hint(&import_item("github (2)", Some("github"), None)).as_deref(),
+            Some("Import as github (2)")
+        );
+        assert_eq!(
+            import_hint(&import_item("github", Some("github"), None)),
+            None
+        );
+        assert_eq!(import_hint(&import_item("github", None, None)), None);
+        // An unsupported server is not imported, so it lands nowhere.
+        assert_eq!(
+            import_hint(&import_item("github (2)", Some("github"), Some("SSE"))),
+            None
+        );
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn import_review_shows_saved_names_and_marks_unsupported_for_review() {
+        adw::init().unwrap();
+        let parent = gtk::Window::new();
+        review(
+            &parent,
+            "Import fixture",
+            vec![
+                import_item("github (2)", Some("github"), None),
+                import_item(
+                    "remote",
+                    None,
+                    Some("The saved connection could not be resolved."),
+                ),
+            ],
+            "Fixture",
+            "Import selected servers",
+            false,
+            |_, _, _| Err("fixture".into()),
+            || {},
+            None,
+        );
+        let window = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .find(|w| w.title().as_deref() == Some("Import fixture"))
+            .unwrap();
+        let toggles = descendants(window.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::ToggleButton>().ok())
+            .filter(|t| t.has_css_class("toolport-review-item"))
+            .collect::<Vec<_>>();
+        assert_eq!(toggles.len(), 2);
+        let visible_texts = |toggle: &gtk::ToggleButton| {
+            descendants(toggle.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Label>().ok())
+                .filter(|l| l.is_visible())
+                .map(|l| l.text().to_string())
+                .collect::<Vec<_>>()
+        };
+        // The client's own name, its status, then where it lands above the command.
+        let (github, remote) = (&toggles[0], &toggles[1]);
+        assert_eq!(
+            visible_texts(github),
+            [
+                "github",
+                "New",
+                "Import as github (2)",
+                "https://example.invalid/mcp"
+            ]
+        );
+        assert!(described_as(
+            github,
+            "Import as github (2), https://example.invalid/mcp, New"
+        ));
+        assert!(github.is_active() && github.is_sensitive());
+        let remote_texts = visible_texts(remote);
+        assert_eq!(remote_texts[..2], ["remote", "Needs review"]);
+        assert!(!remote_texts.iter().any(|t| t.starts_with("Import as")));
+        assert!(!remote.is_active() && !remote.is_sensitive());
+        window.close();
+    }
+
     /// Each entry is one toggle like React's review button: a square dot that fills when
     /// selected, the name and command read by screen readers, the pressed state on the
     /// toggle, and an unsupported entry off and not pressable.
@@ -2604,6 +2753,7 @@ mod tests {
             credentials: Vec::new(),
             unsupported: unsupported.map(str::to_string),
             updates: Vec::new(),
+            source_name: None,
         };
         review(
             &parent,
@@ -2712,6 +2862,7 @@ mod tests {
                 }],
                 unsupported: None,
                 updates: vec!["Environment".into(), "Launch settings".into()],
+                source_name: None,
             }],
             "Fixture",
             "Connect",
@@ -2899,6 +3050,7 @@ mod tests {
                 },
                 unsupported: None,
                 updates: Vec::new(),
+                source_name: None,
             })
             .collect();
         review(

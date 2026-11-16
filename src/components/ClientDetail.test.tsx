@@ -262,11 +262,7 @@ it("lists backend import candidates by connection, not by registry name", async 
   expect(within(card("notes") as HTMLElement).getByText(/in Toolport/)).toBeVisible();
   expect(screen.queryByText("github", { selector: "span.font-medium" })).toBeNull();
   await userEvent.click(screen.getByRole("button", { name: "Import all (2)" }));
-  expect(
-    within(await screen.findByRole("dialog")).getByText("github (2)", {
-      selector: "span.font-medium",
-    }),
-  ).toBeVisible();
+  expect(await screen.findByText("Import as github (2)")).toBeVisible();
   await userEvent.click(screen.getByRole("button", { name: "Import 2 servers" }));
   await waitFor(() => expect(importServers).toHaveBeenCalledWith(["remote", "linear"]));
   expect(onChanged).toHaveBeenCalled();
