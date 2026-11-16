@@ -88,10 +88,19 @@ export function ConnectReviewDialog({
   const quietFirst = useRef(keyringQuiet);
   // Answered before the error (and its Skip) shows, so the next step is already quiet
   // when Skip moves on, as GTK records it before showing the error.
+  // Whether this step is still open: a check that answers after it closed (Cancel, then
+  // a new run) must not make that new run quiet.
+  const open = useRef(true);
+  useEffect(() => {
+    open.current = true;
+    return () => {
+      open.current = false;
+    };
+  }, []);
   const noteFailure = async (message: string) => {
     if (!onKeyringLocked) return;
     try {
-      if (await keyringLockedAfter(message)) onKeyringLocked();
+      if ((await keyringLockedAfter(message)) && open.current) onKeyringLocked();
     } catch {
       // Unknown: the next step keeps the batch's current mode.
     }

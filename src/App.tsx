@@ -112,7 +112,7 @@ import { Callout } from "@/components/Callout";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { GitHubStarPrompt, type StarSurface } from "@/components/GitHubStarPrompt";
 import { serverNameOrder } from "@/lib/serverOrder";
-import type { T3CodeSeen } from "@/components/ClientsView";
+import type { ConnectAllCard, T3CodeSeen } from "@/components/ClientsView";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -145,6 +145,8 @@ function App() {
   const [clients, setClients] = useState<DetectedClient[]>([]);
   // The T3 Code settings revision these clients match; Clients unmounts behind details.
   const t3Seen = useRef<T3CodeSeen>(null);
+  // Connect all's summary stays until dismissed, also while a client's details are open.
+  const [connectAllCard, setConnectAllCard] = useState<ConnectAllCard | null>(null);
   const [importPreview, setImportPreview] = useState<ImportItem[] | null>(null);
   const [importing, setImporting] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
@@ -1312,6 +1314,8 @@ function App() {
                           onSelectClient={selectClient}
                           onChanged={load}
                           t3Seen={t3Seen}
+                          connectAllCard={connectAllCard}
+                          onConnectAllCard={setConnectAllCard}
                         />
                       )
                     ) : view === "skills" ? (

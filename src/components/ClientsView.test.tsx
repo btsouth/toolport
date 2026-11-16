@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DetectedClient, McpServer, T3CodeOther } from "@/lib/types";
 import { useRef, useState } from "react";
-import { ClientsView, type T3CodeSeen } from "./ClientsView";
+import { ClientsView, type ConnectAllCard, type T3CodeSeen } from "./ClientsView";
 import {
   getClientSessions,
   listClientRecoveries,
@@ -1578,6 +1578,84 @@ describe("ClientsView", () => {
         expect(await connectAllSummary(tone)).toBe(text);
         unmount();
       }
+    });
+
+    it("keeps the summary when the page is left and opened again", async () => {
+      mockConnect();
+      function Page() {
+        const [shown, setShown] = useState(true);
+        const [card, setCard] = useState<ConnectAllCard | null>(null);
+        return (
+          <>
+            <button onClick={() => setShown(!shown)}>toggle page</button>
+            {shown && (
+              <ClientsView
+                clients={[client({ id: "aider", name: "Aider", t3Code: [on("One")] })]}
+                registry={null}
+                onSelectClient={vi.fn()}
+                onChanged={vi.fn(async () => {})}
+                connectAllCard={card}
+                onConnectAllCard={setCard}
+              />
+            )}
+          </>
+        );
+      }
+      render(<Page />);
+      await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Connect to Toolport" }),
+      );
+      await userEvent.click(await screen.findByRole("button", { name: "Done" }));
+      expect(await connectAllSummary("success")).toBe("Connected 1 of 1 T3 Code instance.");
+      // A client's details open (the page unmounts) and close again.
+      await userEvent.click(screen.getByText("toggle page"));
+      await userEvent.click(screen.getByText("toggle page"));
+      expect(await connectAllSummary("success")).toBe("Connected 1 of 1 T3 Code instance.");
+      await userEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+      expect(screen.queryByTestId("connect-all-summary")).not.toBeInTheDocument();
+    });
+
+    it("ignores a keyring answer that comes after its step closed", async () => {
+      mockConnect();
+      vi.mocked(previewClientSetup).mockRejectedValueOnce("Saved credential recovery: Locked");
+      let answer: (locked: boolean) => void = () => {};
+      vi.mocked(keyringLockedAfter).mockImplementationOnce(
+        () =>
+          new Promise<boolean>((resolve) => {
+            answer = resolve;
+          }),
+      );
+      render(
+        <ClientsView
+          clients={[
+            client({ id: "aider", name: "Aider", t3Code: [on("One")] }),
+            client({ id: "codex", name: "Codex", t3Code: [on("Two")] }),
+          ]}
+          registry={null}
+          onSelectClient={vi.fn()}
+          onChanged={vi.fn(async () => {})}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+      await waitFor(() => expect(keyringLockedAfter).toHaveBeenCalled());
+      // The run is stopped while the check is still out, and a new run starts.
+      await userEvent.keyboard("{Escape}");
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "Connect all" })).toBeEnabled(),
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+      await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+      await act(async () => {
+        answer(true);
+      });
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Connect to Toolport" }),
+      );
+      await userEvent.click(await screen.findByRole("button", { name: "Next" }));
+      expect(await screen.findByText("Review and connect Codex")).toBeVisible();
+      // The new run was never told the keyring is locked, so it may still ask.
+      expect(vi.mocked(previewClientSetup).mock.calls.at(-1)).toEqual(["codex"]);
     });
 
     it("finishes when the last step is skipped after its config could not be read", async () => {

@@ -483,6 +483,12 @@ function ProfileGroup({
 /** The last T3 Code settings revision the Clients page saw, `null` before the first check.
  * The page rescans whenever it sees a new one, so this matches the scanned clients. */
 export type T3CodeSeen = { value: string | null } | null;
+/** Connect all's summary card, kept until dismissed. */
+export type ConnectAllCard = {
+  title: string;
+  detail: string;
+  tone: "success" | "warning" | "info";
+};
 
 export function ClientsView({
   clients,
@@ -492,6 +498,8 @@ export function ClientsView({
   onSelectClient,
   onChanged,
   t3Seen: keptT3Seen,
+  connectAllCard: keptCard,
+  onConnectAllCard,
 }: {
   clients: DetectedClient[];
   registry: Registry | null;
@@ -502,6 +510,10 @@ export function ClientsView({
   /** Kept with the scanned clients, so a change made while the page is unmounted (a
    * client's details or another view open) rescans on return. */
   t3Seen?: RefObject<T3CodeSeen>;
+  /** Connect all's summary, kept with the page data so opening a client's details and
+   * coming back does not drop it; only Dismiss clears it. */
+  connectAllCard?: ConnectAllCard | null;
+  onConnectAllCard?: (card: ConnectAllCard | null) => void;
 }) {
   const { t, locale } = useI18n();
   const [showMissing, setShowMissing] = useState(false);
@@ -667,11 +679,9 @@ export function ClientsView({
     stopped: boolean;
   } | null>(null);
   const summaryShown = useRef<typeof summaryDue>(null);
-  const [allSummary, setAllSummary] = useState<{
-    title: string;
-    detail: string;
-    tone: "success" | "warning" | "info";
-  } | null>(null);
+  const [ownSummary, setOwnSummary] = useState<ConnectAllCard | null>(null);
+  const allSummary = onConnectAllCard ? (keptCard ?? null) : ownSummary;
+  const setAllSummary = onConnectAllCard ?? setOwnSummary;
   useEffect(() => {
     if (!summaryDue || summaryShown.current === summaryDue) return;
     summaryShown.current = summaryDue;

@@ -436,6 +436,24 @@ describe("connectAllOutcome", () => {
     });
   });
 
+  it("does not count a customized row as connected, as its row does not", () => {
+    const clients = [
+      client({
+        id: "codex",
+        name: "Codex",
+        gatewayInstalled: true,
+        entryState: "customized",
+        t3Code: [use("Codex Home")],
+      }),
+    ];
+    expect(connectAllOutcome(clients, [], ["codex"])).toEqual({
+      connected: 0,
+      total: 1,
+      notConnected: ["Codex Home"],
+      leftOut: [],
+    });
+  });
+
   it("counts a row the rescan shows connected, even when its step reported a failure", () => {
     const clients = [
       client({

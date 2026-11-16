@@ -3095,6 +3095,8 @@ impl ClientPage {
                 gtk::gio::spawn_blocking(crate::registry_controller::preview_client_imports).await;
             page.scanning.set(false);
             page.import_button.set_sensitive(true);
+            // A Connect all that ended while this ran waits for a scan; start it now.
+            page.after_scan();
             match result {
                 Ok(Ok(candidates)) if candidates.is_empty() => {
                     page.show_confirmation(&crate::i18n::tr(

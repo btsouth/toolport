@@ -420,7 +420,11 @@ export function connectAllOutcome(
   const byId = (id: string) => clients.find((client) => client.id === id);
   // A row the rescan shows connected counts as connected, even when its step reported a
   // failure after the connect took effect.
-  const connectedNow = (id: string) => byId(id)?.gatewayInstalled === true;
+  // As the row shows it: a customized entry still needs a reset, so it is not connected.
+  const connectedNow = (id: string) => {
+    const client = byId(id);
+    return client?.gatewayInstalled === true && client.entryState !== "customized";
+  };
   const connectedRows = [...connectedIds, ...notConnectedIds.filter(connectedNow)];
   const connected = connectedRows.reduce(
     (sum, id) => sum + t3CodeEnabledNames(byId(id)).length,

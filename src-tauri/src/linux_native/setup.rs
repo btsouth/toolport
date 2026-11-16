@@ -9,6 +9,9 @@ pub(super) struct Completion {
     pub servers: Vec<crate::registry_controller::SetupServerResult>,
     pub tools: Vec<serde_json::Value>,
     pub backup: Option<String>,
+    /// What the connect could not finish tidying up (an old token left in the keychain),
+    /// shown under the servers as React shows them.
+    pub warnings: Vec<String>,
 }
 impl From<String> for Completion {
     fn from(message: String) -> Self {
@@ -872,6 +875,17 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                         results.append(&row);
                     }
                     body.append(&results);
+                    for warning in &outcome.warnings {
+                        let label = gtk::Label::builder()
+                            .label(warning)
+                            .wrap(true)
+                            .wrap_mode(gtk::pango::WrapMode::WordChar)
+                            .selectable(true)
+                            .xalign(0.0)
+                            .build();
+                        label.add_css_class("dim-label");
+                        body.append(&label);
+                    }
                     if !outcome.tools.is_empty() {
                         let (agent, content) =
                             details_expander(&crate::i18n::tr("What your agent sees"));
@@ -1054,6 +1068,7 @@ pub(super) fn connect_step(
                             servers: outcome.servers,
                             tools: outcome.tools,
                             backup: outcome.result.outcome.backup,
+                            warnings: outcome.result.outcome.warnings,
                         })
                     },
                     move || finished(),
@@ -1839,7 +1854,16 @@ mod tests {
             "Fixture",
             "Connect",
             true,
-            |_, _, _| Ok("Claude Code connected. Restart it to load Toolport.".into()),
+            |_, _, _| {
+                Ok(Completion {
+                    message: "Claude Code connected. Restart it to load Toolport.".into(),
+                    // A connect's cleanup warning is shown, as React shows it.
+                    warnings: vec![
+                        "connected; could not remove the old keychain token: locked".into()
+                    ],
+                    ..Completion::default()
+                })
+            },
             || {},
             None,
         );
@@ -1867,6 +1891,12 @@ mod tests {
             .iter()
             .filter_map(|w| w.downcast_ref::<gtk::Label>())
             .any(|label| label.text() == "Restart it to load Toolport." && label.is_visible()));
+        assert!(widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .any(|label| label.text()
+                == "connected; could not remove the old keychain token: locked"
+                && label.is_visible()));
         assert!(!widgets
             .iter()
             .filter_map(|w| w.downcast_ref::<gtk::Button>())
@@ -1967,6 +1997,7 @@ mod tests {
                         serde_json::json!({"name":"toolport_call_tool"}),
                     ],
                     backup: None,
+                    warnings: Vec::new(),
                 })
             },
             || {},

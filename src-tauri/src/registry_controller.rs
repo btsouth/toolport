@@ -2263,6 +2263,10 @@ pub fn migrate_client_reviewed_choices(
     )
 }
 
+/// What a reviewed connect's rollback says when it could not undo everything.
+const ROLLBACK_KEPT_EDITS: &str = "Registry changed during setup. Concurrent edits were kept. Review Servers before retrying. Credentials for retained servers were kept.";
+const ROLLBACK_KEPT_CREDENTIALS: &str = "Imported credential values were kept.";
+
 /// Connect all's keyring rule, the one #1378 set for Disconnect: a step the user confirms
 /// may ask to unlock the keyring, but a run of steps must not ask again and again. Once a
 /// step has failed with the keyring still locked, the run's later steps are `quiet`: no
@@ -2281,7 +2285,16 @@ pub fn connect_step<T>(quiet: bool, f: impl FnOnce() -> Result<T, String>) -> Re
         if clients::backup_vault::is_locked_error(&error)
             || (crate::import_credentials::is_vault_failure(&error) && locked_now())
         {
-            crate::i18n::tr("Unlock your keyring, then choose Retry.")
+            let unlock = crate::i18n::tr("Unlock your keyring, then choose Retry.");
+            // A rollback that kept something says so; that stays with the instruction.
+            if [ROLLBACK_KEPT_EDITS, ROLLBACK_KEPT_CREDENTIALS]
+                .iter()
+                .any(|note| error.contains(note))
+            {
+                format!("{unlock}\n\n{error}")
+            } else {
+                unlock
+            }
         } else {
             error
         }
@@ -2398,8 +2411,8 @@ fn migrate_client_reviewed_inputs_with(
             "Client config changed. Review it again before connecting. Config unchanged.".into(),
         );
     }
-    let (mut result, imported, moved, verification) = crate::import_credentials::transaction(
-        |writes| {
+    let (mut result, imported, moved, verification) =
+        crate::import_credentials::transaction(|writes| {
             let mut prepared = current.clone();
             let (imported, moved) = prepare_client_servers_for_migration(
                 &mut prepared,
@@ -2442,18 +2455,15 @@ fn migrate_client_reviewed_inputs_with(
                     Ok((true, _)) => Err(error),
                     Ok((false, retained)) => {
                         writes.keep_servers(&retained);
-                        Err(format!("{error} Registry changed during setup. Concurrent edits were kept. Review Servers before retrying. Credentials for retained servers were kept."))
+                        Err(format!("{error} {ROLLBACK_KEPT_EDITS}"))
                     }
                     Err(rollback) => {
                         writes.keep();
-                        Err(format!(
-                            "{error} {rollback} Imported credential values were kept."
-                        ))
+                        Err(format!("{error} {rollback} {ROLLBACK_KEPT_CREDENTIALS}"))
                     }
                 },
             }
-        },
-    )?;
+        })?;
     if !unsupported.is_empty() {
         result.outcome.warnings.push(format!(
             "Unsupported servers stayed in the client: {}",
@@ -4879,6 +4889,14 @@ API_KEY = "synthetic-first-origin"
             assert_eq!(
                 fail("the keyring is locked; this background write waits for it"),
                 unlock
+            );
+        });
+        // A rollback that kept something keeps saying so after the instruction.
+        crate::secrets::locked_store::write_prompts_during(|| {
+            let kept = format!("{vault} {ROLLBACK_KEPT_EDITS}");
+            assert_eq!(
+                fail(&kept),
+                Some(format!("Unlock your keyring, then choose Retry.\n\n{kept}"))
             );
         });
         // Unlocked, a vault failure is not blamed on the keyring.
