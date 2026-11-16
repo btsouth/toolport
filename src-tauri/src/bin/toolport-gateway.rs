@@ -44989,6 +44989,136 @@ mod tests {
             .any(|tool| tool["name"] == "one__greet"));
     }
 
+    /// Failure mode: a downstream's lists were screened only when fetched, so
+    /// a value registered later stayed in the cached `tools/list` (served from
+    /// the surface cache, past the final reply pass) until the server itself
+    /// changed its list. Clients holding the old list were never told.
+    #[test]
+    fn a_secret_learned_after_tools_list_is_rescreened_and_routes_by_alias() {
+        let _env = DataDirTestEnv::new("late-secret-rescreen");
+        let secret = "late-secret-tool-7Kq";
+        let mut live = Registry {
+            servers: vec![stub_server("one", "One")],
+            ..Default::default()
+        };
+        live.servers[0].enabled = true;
+        let mut router = router_with_registry_policy(&live);
+        router.add(
+            DownstreamServer::connect(
+                "one".into(),
+                Box::new(MockRoute {
+                    tools: vec![json!({"name": secret, "description": format!("calls {secret}")})],
+                }),
+            )
+            .unwrap(),
+        );
+        let cached = Arc::new(CatalogSnapshot::new(router.shared_tools()));
+        let reg_path = registry::resolved_path().unwrap();
+        registry::save_to(&reg_path, &live).unwrap();
+        let mut watcher = WatchLoopState {
+            last_mtime: None,
+            last_relevant: router_relevant(&live),
+        };
+        // The request path a client takes, so a cached surface is what it gets.
+        let state = http_state(false);
+        *state.registry.lock().unwrap() = live.clone();
+        *state.cached_tools.lock().unwrap() = cached;
+        swap_router(&state, router);
+        let host = &*state.host;
+        host.set_discovery_mode(DiscoveryMode::Full);
+        let session = Arc::new(SessionState::new_http(Some(McpSessionOwner {
+            identity: "one".into(),
+            profile: None,
+            tool_scope: None,
+            scope: Some(vec!["one".into()]),
+        })));
+        host.mcp_sessions
+            .lock()
+            .unwrap()
+            .extend([("client".into(), Arc::clone(&session))]);
+        let tick = |watcher: &mut WatchLoopState| {
+            watch_tick(
+                &reg_path,
+                &test_stdio_session(),
+                &Arc::new(Mutex::new(None)),
+                None,
+                None,
+                false,
+                &Arc::new(Mutex::new(None)),
+                None,
+                watcher,
+                host,
+            );
+        };
+        let listed = || -> String {
+            let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+            let response = process_request_wire(
+                &state,
+                &req,
+                &SearchGuard::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                DiscoveryMode::Full,
+            )
+            .unwrap();
+            assert!(response.surface.is_some(), "a cached surface was served");
+            serde_json::to_string(&response).unwrap()
+        };
+        tick(&mut watcher);
+        session.outbound.lock().unwrap().clear();
+        assert!(
+            listed().contains(secret),
+            "the premise: nothing is known yet"
+        );
+
+        // A value no catalog holds moves the generation but refreshes nothing.
+        conduit_lib::secret_redact::register("one", "OTHER", "unrelated-value-3Wz8Pq");
+        tick(&mut watcher);
+        assert!(session.outbound.lock().unwrap().is_empty());
+
+        // Several values learned at once (a burst of first reads) are one
+        // refresh, on one tick.
+        conduit_lib::secret_redact::register("one", "LATE", secret);
+        conduit_lib::secret_redact::register("one", "MORE", "another-late-value-5Hd2");
+        // Before the tick, the list a client fetches is already redacted.
+        assert!(!listed().contains(secret), "{}", listed());
+        tick(&mut watcher);
+        {
+            let queue = session.outbound.lock().unwrap();
+            assert_eq!(queue.len(), 1, "one list_changed for the burst");
+            let note: Value = serde_json::from_str(&queue[0].json).unwrap();
+            assert_eq!(note["method"], "notifications/tools/list_changed");
+        }
+        // After the refresh the name is an alias again, and it routes: the
+        // router maps it to the server's alias, which the transport sends back
+        // to the server as its own name.
+        let live_router = Arc::clone(&host.router.lock().unwrap());
+        let tools = live_router.aggregated_tools();
+        let name = tools[0]["name"].as_str().unwrap().to_string();
+        assert!(name.starts_with("one___secret_LATE_"), "{name}");
+        assert!(!serde_json::to_string(&tools).unwrap().contains(secret));
+        let (server, alias) = live_router.route_of(&name).expect("the alias routes");
+        assert_eq!(server, "one");
+        assert_eq!(
+            conduit_lib::secret_redact::upstream_identifier(
+                "one",
+                conduit_lib::secret_redact::Catalog::Tool,
+                alias
+            ),
+            secret
+        );
+        tick(&mut watcher);
+        assert_eq!(
+            session.outbound.lock().unwrap().len(),
+            1,
+            "no refresh again"
+        );
+    }
+
     /// P1.3: the discovery mode belongs to the host, so one host's switch cannot decide what
     /// another host advertises.
     ///
