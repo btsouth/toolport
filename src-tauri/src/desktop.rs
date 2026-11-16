@@ -4981,6 +4981,7 @@ pub fn run() {
                         .map(|r| r.client_managed_entries)
                         .unwrap_or_default();
                     let repoint = clients::repoint_stale_gateways(&managed_snapshot);
+                    clients::backup_vault::note_startup_deferred(!repoint.deferred.is_empty());
                     if !repoint.repointed.is_empty() {
                         let ids: Vec<&str> = repoint
                             .repointed

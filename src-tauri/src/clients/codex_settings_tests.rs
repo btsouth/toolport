@@ -508,6 +508,31 @@ fn a_locked_keyring_defers_sealing_legacy_backups_at_start() {
     });
 }
 
+/// K10: a pass that runs again while the keyring would still ask starts no
+/// second backup-upgrade waiter.
+#[test]
+fn repeated_start_up_passes_start_one_backup_upgrade_waiter() {
+    crate::secrets::tests::with_isolated_vault(|| {
+        let dir = crate::registry::conduit_dir().unwrap();
+        let _env_lock = env_test_lock();
+        let _client_env = isolated_client_env(&dir);
+        let _home = TestHome::set(&dir);
+        let legacy = backup_dir("cursor").unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        let original = "{\"mcpServers\":{\"native\":{\"command\":\"echo\",\"env\":{\"API_KEY\":\"sk-legacy-waiter-fixture\"}}}}\n";
+        std::fs::write(legacy.join("1700000000000-mcp.json"), original).unwrap();
+        crate::secrets::locked_store::prompts_during(|| {
+            for _ in 0..3 {
+                let outcome = repoint_stale_gateways(&HashMap::new());
+                assert!(outcome
+                    .deferred
+                    .contains(&"client recovery backups".to_string()));
+            }
+        });
+        assert_eq!(UPGRADE_WAITERS.load(std::sync::atomic::Ordering::SeqCst), 1);
+    });
+}
+
 /// F1: the log names what the pass was doing; the same path is a refresh.
 #[test]
 fn refresh_failures_do_not_claim_a_repoint_onto_the_same_path() {

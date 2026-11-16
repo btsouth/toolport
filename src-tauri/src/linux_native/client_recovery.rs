@@ -559,15 +559,7 @@ impl ClientPage {
     /// Lists from the recovery files only; it never contacts the credential
     /// store, so it is safe on the UI thread.
     pub(super) fn reload_recoveries(&self) {
-        self.set_recoveries(crate::clients::recovery::list());
-    }
-
-    /// Show rows the client scan already listed on its worker thread.
-    pub(super) fn set_recoveries(
-        &self,
-        rows: Result<Vec<crate::clients::recovery::ClientRecovery>, String>,
-    ) {
-        match rows {
+        match crate::clients::recovery::list() {
             Ok(records) => *self.recoveries.borrow_mut() = records,
             Err(error) => self.show_error(&error),
         }
@@ -798,6 +790,8 @@ impl ClientPage {
             page.recovery_feedback
                 .borrow_mut()
                 .retain(|(id, _)| id != &record.id);
+            // Deferred client refreshes ran: show the rewritten client rows.
+            let rescan = matches!(&result, Ok(Ok(result)) if result.refreshed);
             match result {
                 Ok(Ok(result)) if result.pending.is_none() => {
                     page.set_recovery_result(&record.client_id, result.message, true);
@@ -817,6 +811,9 @@ impl ClientPage {
             }
             page.reload_recoveries();
             page.refresh_open_detail();
+            if rescan {
+                page.refresh_with(false);
+            }
             focus_first_later(
                 &page.root,
                 vec![

@@ -104,24 +104,91 @@ pub(crate) fn request_unlock() -> Unlock {
     if let Some(answer) = fake::unlock() {
         return answer;
     }
+    // Trust the unlock session's own answer: a separate store check can time
+    // out behind another keyring user and would call an open keyring locked.
     match secret_service::unlock() {
-        Ok(()) if !store_locked() => Unlock::Open,
-        _ => Unlock::StillLocked,
+        Ok(()) => Unlock::Open,
+        Err(()) => Unlock::StillLocked,
     }
 }
 
-/// After a user unlocked the keyring, finish the client refreshes start-up
-/// deferred while it was locked, off the caller's thread.
-pub(crate) fn after_unlock() {
+/// This process's start-up client refresh put clients off for the keyring.
+/// Only the start-up callers set it, after their own guards (a data-dir
+/// override instance, a debug GTK build), so a later refresh never runs where
+/// the start-up one would not.
+static STARTUP_DEFERRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static REFRESHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static WAITER: std::sync::Once = std::sync::Once::new();
+
+fn startup_deferred() -> bool {
     #[cfg(test)]
-    if fake::record("refresh deferred client configs") {
+    if let Some(deferred) = fake::startup_deferred() {
+        return deferred;
+    }
+    STARTUP_DEFERRED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Called by the start-up refresh's callers. When it put clients off, keep
+/// one waiter that finishes them once the keyring opens (by itself or by a
+/// user action elsewhere), checking without asking every few seconds.
+pub(crate) fn note_startup_deferred(waiting: bool) {
+    if !waiting {
         return;
     }
-    let _ = std::thread::Builder::new()
-        .name("toolport-client-refresh".into())
-        .spawn(|| {
-            super::refresh_stale_client_configs();
-        });
+    STARTUP_DEFERRED.store(true, std::sync::atomic::Ordering::SeqCst);
+    WAITER.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("toolport-client-refresh".into())
+            .spawn(|| {
+                wait_for_open(
+                    crate::http_bridge::KEYRING_POLL,
+                    crate::secrets::write_would_ask,
+                    || {
+                        refresh_deferred();
+                    },
+                    startup_deferred,
+                )
+            });
+    });
+}
+
+/// Polls until nothing is waiting; refreshes whenever the store is open.
+pub(super) fn wait_for_open(
+    poll: std::time::Duration,
+    would_ask: impl Fn() -> bool,
+    mut refresh: impl FnMut(),
+    waiting: impl Fn() -> bool,
+) {
+    while waiting() {
+        if !would_ask() {
+            refresh();
+            if !waiting() {
+                break;
+            }
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// Finish the client refreshes this process's start-up put off for the
+/// keyring, if it put any off. Never asks to unlock; one run at a time.
+/// True when a refresh ran.
+pub(crate) fn refresh_deferred() -> bool {
+    if !startup_deferred() {
+        return false;
+    }
+    #[cfg(test)]
+    if fake::record("refresh deferred client configs") {
+        return true;
+    }
+    let Ok(_one) = REFRESHING.try_lock() else {
+        return false;
+    };
+    let outcome = super::refresh_stale_client_configs();
+    if outcome.deferred.is_empty() {
+        STARTUP_DEFERRED.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    true
 }
 
 #[cfg(target_os = "linux")]
@@ -163,7 +230,15 @@ mod secret_service {
                 .unlock_all(&found.locked.iter().collect::<Vec<_>>())
                 .map_err(|_| ())?;
         }
-        Ok(())
+        // The same session's search says whether anything is still locked.
+        let after = service
+            .search_items(std::collections::HashMap::from([("service", SERVICE)]))
+            .map_err(|_| ())?;
+        if after.locked.is_empty() {
+            Ok(())
+        } else {
+            Err(())
+        }
     }
 }
 
@@ -187,6 +262,8 @@ pub(crate) mod fake {
         locked: bool,
         unlock_answer: Option<Unlock>,
         calls: Vec<String>,
+        startup_deferred: Option<bool>,
+        check_times_out: bool,
     }
     thread_local! {
         static STORE: RefCell<Option<Store>> = const { RefCell::new(None) };
@@ -210,6 +287,8 @@ pub(crate) mod fake {
                 locked: true,
                 unlock_answer: Some(unlock),
                 calls: Vec::new(),
+                startup_deferred: Some(true),
+                check_times_out: false,
             })
         });
         let _clear = Clear;
@@ -267,8 +346,32 @@ pub(crate) mod fake {
         with(|store| store.calls.push(call.into())).is_some()
     }
 
+    pub(super) fn startup_deferred() -> Option<bool> {
+        with(|store| store.startup_deferred).flatten()
+    }
+
+    /// Inside [`locked_store`]: whether start-up put a client refresh off
+    /// (true unless a test says otherwise).
+    pub(crate) fn set_startup_deferred(deferred: bool) {
+        with(|store| store.startup_deferred = Some(deferred));
+    }
+
+    /// An open store for tests that need the fake's records without a lock.
+    pub(crate) fn open_store(test: impl FnOnce()) -> Vec<String> {
+        locked_store(Unlock::Open, || {
+            with(|store| store.locked = false);
+            test();
+        })
+    }
+
+    /// Inside [`locked_store`]: the store check answers "would prompt" (as a
+    /// timed-out check does) while reads and writes reach the real vault.
+    pub(crate) fn set_check_times_out() {
+        with(|store| store.check_times_out = true);
+    }
+
     pub(super) fn locked() -> Option<bool> {
-        with(|store| store.locked)
+        with(|store| store.locked || store.check_times_out)
     }
 
     pub(super) fn unlock() -> Option<Unlock> {
@@ -280,5 +383,46 @@ pub(crate) mod fake {
             }
             answer
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// K2: the start-up waiter checks without asking, refreshes once the
+    /// store opens, and stops when nothing is waiting any more.
+    #[test]
+    fn the_waiter_refreshes_once_the_store_opens_and_then_stops() {
+        use std::cell::Cell;
+        let checks = Cell::new(0);
+        let refreshes = Cell::new(0);
+        let waiting = Cell::new(true);
+        wait_for_open(
+            std::time::Duration::ZERO,
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() < 3
+            },
+            || {
+                refreshes.set(refreshes.get() + 1);
+                waiting.set(false);
+            },
+            || waiting.get(),
+        );
+        assert_eq!((checks.get(), refreshes.get()), (3, 1));
+        // Still waiting after a refresh (the keyring locked again): keep polling.
+        let refreshes = Cell::new(0);
+        let left = Cell::new(2);
+        wait_for_open(
+            std::time::Duration::ZERO,
+            || false,
+            || {
+                refreshes.set(refreshes.get() + 1);
+                left.set(left.get() - 1);
+            },
+            || left.get() > 0,
+        );
+        assert_eq!(refreshes.get(), 2);
     }
 }

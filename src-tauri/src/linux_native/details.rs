@@ -1206,7 +1206,6 @@ mod tests {
             ],
             sessions: vec![],
             sessions_error: false,
-            recoveries: None,
         }
     }
     fn app() -> adw::Application {

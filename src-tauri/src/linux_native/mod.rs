@@ -917,6 +917,7 @@ fn run_startup_maintenance() {
         .map(|registry| registry.client_managed_entries)
         .unwrap_or_default();
     let repoint = crate::clients::repoint_stale_gateways(&managed);
+    crate::clients::backup_vault::note_startup_deferred(!repoint.deferred.is_empty());
     if !repoint.repointed.is_empty() {
         let _ = crate::registry::update(|registry| {
             for (client_id, entry) in &repoint.repointed {
@@ -3195,10 +3196,9 @@ impl ClientPage {
 
     fn render(&self, snapshot: state::ClientSnapshot) {
         self.loaded.set(true);
-        match snapshot.recoveries {
-            Some(rows) => self.set_recoveries(rows),
-            None => self.reload_recoveries(),
-        }
+        // Listing reads only the recovery files, so it is safe here, and a
+        // fresh list can never be overwritten by an older scan's copy.
+        self.reload_recoveries();
         *self.profiles.borrow_mut() = snapshot.profiles;
         let sessions = snapshot.sessions;
         let clients = snapshot.clients;
@@ -15750,7 +15750,7 @@ mod tests {
             t3_code: Vec::new(),
         })
         .collect();
-        clients.render(state::ClientSnapshot { clients: fixture_clients, profiles: Vec::new(), sessions_error: false, recoveries: None, sessions: vec![serde_json::json!({"clientName":"Codex","clientType":"codex","sessionCount":5,"callsToday":60,"lastActiveMs":now-180000,"firstCatalogSize":1711})] });
+        clients.render(state::ClientSnapshot { clients: fixture_clients, profiles: Vec::new(), sessions_error: false, sessions: vec![serde_json::json!({"clientName":"Codex","clientType":"codex","sessionCount":5,"callsToday":60,"lastActiveMs":now-180000,"firstCatalogSize":1711})] });
         let approvals = gtk::Box::new(gtk::Orientation::Vertical, 12);
         approvals.set_margin_top(20);
         approvals.set_margin_bottom(20);
@@ -16013,7 +16013,7 @@ mod tests {
                 registry_reload: Default::default(),
             };
             let clients = ClientPage::new(&app, server_page);
-            clients.render(state::ClientSnapshot { clients: Vec::new(), profiles: Vec::new(), sessions_error: false, recoveries: None, sessions: vec![serde_json::json!({
+            clients.render(state::ClientSnapshot { clients: Vec::new(), profiles: Vec::new(), sessions_error: false, sessions: vec![serde_json::json!({
             "clientName":canonical, "clientLabel":"kt 1", "phase":"close",
             "toolsListCount":3, "listChangedCount":1, "firstCatalogSize":4, "contentChanged":true,
         })] });

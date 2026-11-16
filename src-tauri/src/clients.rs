@@ -10034,6 +10034,11 @@ pub fn refresh_stale_client_configs() -> RepointOutcome {
     outcome
 }
 
+/// Backup-upgrade waiters this test process started.
+#[cfg(test)]
+pub(crate) static UPGRADE_WAITERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 fn repoint_stale_gateways_quietly(managed: &HashMap<String, ManagedEntry>) -> RepointOutcome {
     let mut outcome = RepointOutcome::default();
     match backup_storage::upgrade_legacy_at_start() {
@@ -10048,15 +10053,23 @@ fn repoint_stale_gateways_quietly(managed: &HashMap<String, ManagedEntry>) -> Re
             .push(("client recovery backups".into(), error)),
         None => {
             outcome.deferred.push("client recovery backups".into());
-            let _ = std::thread::Builder::new()
-                .name("toolport-backup-upgrade".into())
-                .spawn(|| {
-                    if let Err(error) =
-                        backup_storage::upgrade_legacy_once_open(crate::http_bridge::KEYRING_POLL)
-                    {
-                        eprintln!("toolport: could not secure client recovery backups: {error}");
-                    }
-                });
+            // One waiter per process, however often this pass runs again.
+            static UPGRADE_WAITER: std::sync::Once = std::sync::Once::new();
+            UPGRADE_WAITER.call_once(|| {
+                #[cfg(test)]
+                UPGRADE_WAITERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = std::thread::Builder::new()
+                    .name("toolport-backup-upgrade".into())
+                    .spawn(|| {
+                        if let Err(error) = backup_storage::upgrade_legacy_once_open(
+                            crate::http_bridge::KEYRING_POLL,
+                        ) {
+                            eprintln!(
+                                "toolport: could not secure client recovery backups: {error}"
+                            );
+                        }
+                    });
+            });
         }
     }
     let current = match resolve_gateway_path() {
