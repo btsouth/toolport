@@ -1087,5 +1087,6 @@
   "net token change": "net token change",
   "extra tokens": "extra tokens",
   "Toolport measured a net token change of {tokens} across {sessions} client sessions. Full catalog baselines minus all catalog and search responses, counted locally with cl100k_base; not a billing figure. toolport.app": "Toolport measured a net token change of {tokens} across {sessions} client sessions. Full catalog baselines minus all catalog and search responses, counted locally with cl100k_base; not a billing figure. toolport.app",
-  "{baseline} baseline tokens − {catalog} catalog response tokens − {search} search response tokens = {net} net token change. A negative change means responses used more tokens than the baseline.": "{baseline} baseline tokens − {catalog} catalog response tokens − {search} search response tokens = {net} net token change. A negative change means responses used more tokens than the baseline."
+  "{baseline} baseline tokens − {catalog} catalog response tokens − {search} search response tokens = {net} net token change. A negative change means responses used more tokens than the baseline.": "{baseline} baseline tokens − {catalog} catalog response tokens − {search} search response tokens = {net} net token change. A negative change means responses used more tokens than the baseline.",
+  "A saved credential can't be renamed. Remove it and add a new one with the name you want.": "A saved credential can't be renamed. Remove it and add a new one with the name you want."
 }

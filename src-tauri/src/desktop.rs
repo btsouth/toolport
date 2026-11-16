@@ -413,25 +413,13 @@ async fn update_server(app: AppHandle, entry: ServerEntry) -> Result<Registry, S
     .map_err(|e| format!("keychain task join failed: {e}"))?
 }
 
-/// [`update_server`]'s work.
+/// [`update_server`]'s work: the token is stored before the registry write.
 fn update_server_in_app(state: &RegistryState, entry: ServerEntry) -> Result<Registry, String> {
     let id = entry.id.clone();
-    let (reg, token) = write_registry(state, |reg| {
-        crate::registry_controller::apply_update_entry(reg, entry)
-    })?;
-    let Some(token) = token else {
-        return Ok(reg);
-    };
-    crate::registry_controller::set_server_secret_with(
+    crate::registry_controller::commit_edit_storing_token(
         &id,
-        "Authorization",
-        &token,
-        |server_id, key| {
-            let (registry, ()) = write_registry(state, |registry| {
-                crate::registry_controller::apply_secret_declaration(registry, server_id, key)
-            })?;
-            Ok(registry)
-        },
+        |reg| crate::registry_controller::apply_update_entry(reg, entry.clone()),
+        |edit| Ok(write_registry(state, |reg| edit(reg))?.0),
     )
 }
 

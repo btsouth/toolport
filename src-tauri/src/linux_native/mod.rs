@@ -14257,6 +14257,9 @@ fn stored_env_rows(
             .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
             .css_classes(["monospace"])
+            .tooltip_text(crate::i18n::tr(
+                "A saved credential can't be renamed. Remove it and add a new one with the name you want.",
+            ))
             .build();
         let saved = l10n::label(crate::i18n::msg("•••• (saved)"));
         saved.add_css_class("dim-label");

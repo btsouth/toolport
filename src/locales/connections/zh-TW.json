@@ -1087,5 +1087,6 @@
   "net token change": "Token 淨變化",
   "extra tokens": "額外的 Token",
   "Toolport measured a net token change of {tokens} across {sessions} client sessions. Full catalog baselines minus all catalog and search responses, counted locally with cl100k_base; not a billing figure. toolport.app": "Toolport 測得，在 {sessions} 個用戶端會話中 Token 淨變化為 {tokens}。以完整工具目錄為基線，減去所有目錄和搜尋響應，使用 cl100k_base 在本機計數；此數值不代表賬單用量。toolport.app",
-  "{baseline} baseline tokens − {catalog} catalog response tokens − {search} search response tokens = {net} net token change. A negative change means responses used more tokens than the baseline.": "{baseline} 個基線 Token − {catalog} 個目錄響應 Token − {search} 個搜尋響應 Token = Token 淨變化 {net}。負值表示響應使用的 Token 多於基線。"
+  "{baseline} baseline tokens − {catalog} catalog response tokens − {search} search response tokens = {net} net token change. A negative change means responses used more tokens than the baseline.": "{baseline} 個基線 Token − {catalog} 個目錄響應 Token − {search} 個搜尋響應 Token = Token 淨變化 {net}。負值表示響應使用的 Token 多於基線。",
+  "A saved credential can't be renamed. Remove it and add a new one with the name you want.": "已儲存的憑證無法重新命名。請將其移除，然後以想要的名稱新增憑證。"
 }

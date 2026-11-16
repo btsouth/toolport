@@ -142,6 +142,8 @@ export function ServerDialog({
       secret?: boolean;
       portable?: boolean;
       source?: { ref: string };
+      /** A saved keychain value or reference, which cannot be renamed. */
+      stored?: boolean;
     }[]
   >(
     initial?.env.map((e) => ({
@@ -150,6 +152,7 @@ export function ServerDialog({
       secret: e.secret,
       source: e.source,
       portable: e.portable,
+      stored: e.secret || !!e.source,
     })) ?? [],
   );
   // Keys a paste brought in without a value (a `$TOKEN` it could not read, or a
@@ -237,6 +240,7 @@ export function ServerDialog({
           secret: e.secret,
           source: e.source,
           portable: e.portable,
+          stored: e.secret || !!e.source,
         })) ?? [],
       );
       setLaunch(initial?.launch ?? null);
@@ -336,6 +340,12 @@ export function ServerDialog({
     }
   }
 
+  // An edited remote server's Authorization value goes with the save, which
+  // stores it as the server's token before it writes the registry. Vaulting it
+  // after the save could lose it if the keychain refused it.
+  const editedToken = (r: { key: string; source?: unknown }) =>
+    editing && !isStdio && !r.source && r.key.trim().toLowerCase() === "authorization";
+
   // Build the entry from the form. For a real save the secret values are vaulted
   // separately (never written to the registry); for a connection test they ride
   // along on `env` so the probe can actually launch/authenticate the server.
@@ -373,7 +383,9 @@ export function ServerDialog({
       env: declared.map((r) => ({
         key: r.key.trim(),
         value:
-          !r.source && (withSecretValues || r.secret === false) && r.value
+          !r.source &&
+          (withSecretValues || r.secret === false || editedToken(r)) &&
+          r.value
             ? r.value
             : null,
         secret: r.source ? true : r.secret !== false,
@@ -543,7 +555,7 @@ export function ServerDialog({
       const failedKeys: string[] = [];
       if (id) {
         for (const r of declared) {
-          if (r.source || !r.value || r.secret === false) continue;
+          if (r.source || !r.value || r.secret === false || editedToken(r)) continue;
           const key = r.key.trim();
           try {
             result = await setSecret(id, key, r.value);
@@ -1017,6 +1029,14 @@ export function ServerDialog({
                     placeholder={t("ENV_NAME")}
                     className="font-mono"
                     value={row.key}
+                    readOnly={editing && row.stored}
+                    title={
+                      editing && row.stored
+                        ? t(
+                            "A saved credential can't be renamed. Remove it and add a new one with the name you want.",
+                          )
+                        : undefined
+                    }
                     onChange={(e) => setEnvRow(i, "key", e.target.value)}
                   />
                   {row.secret !== false && (

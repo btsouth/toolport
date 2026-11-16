@@ -884,10 +884,12 @@ fn remote_env_refusal(key: &str) -> String {
 
 /// On a remote server, an Authorization row is the server's token, kept in
 /// the bearer slot where sign-in keeps it. An edit takes such a row out of the
-/// entry and returns its typed value, which the caller stores with
-/// [`set_server_secret`] after the save. So no token is written to the
-/// registry file and no row is left with nothing stored under its name. A
-/// row the saved remote server already stored or references stays as it is.
+/// entry and returns its typed value, which [`commit_edit_storing_token`]
+/// stores before the save. So no token is written to the registry file and no
+/// row is left with nothing stored under its name. A row the saved remote
+/// server already stored or references stays as it is, and so does a plain
+/// row this edit did not change: it was never sent, and taking it would
+/// replace the working token and sign the server out.
 fn take_remote_authorization(
     previous: Option<&ServerEntry>,
     entry: &mut ServerEntry,
@@ -916,11 +918,22 @@ fn take_remote_authorization(
                         })
                 }))
     };
+    let unchanged = |row: &crate::registry::EnvVar| {
+        !row.secret
+            && previous.is_some_and(|previous| {
+                remote(previous)
+                    && previous
+                        .env
+                        .iter()
+                        .any(|e| e.key == row.key && !is_vaulted(e) && e.value == row.value)
+            })
+    };
     let (taken, kept): (Vec<_>, Vec<_>) =
         std::mem::take(&mut entry.env).into_iter().partition(|row| {
             row.key.trim().eq_ignore_ascii_case("authorization")
                 && !header(&row.key)
                 && !stored(row)
+                && !unchanged(row)
         });
     entry.env = kept;
     if let Some(launch) = &mut entry.launch {
@@ -928,14 +941,58 @@ fn take_remote_authorization(
             .required_env
             .retain(|key| !taken.iter().any(|row| &row.key == key));
     }
-    let token = taken
-        .into_iter()
-        .filter_map(|row| row.value)
-        .find(|value| crate::import_credentials::provided(value));
-    if let Some(token) = &token {
-        bearer_token(token)?;
+    let Some(row) = taken.into_iter().next() else {
+        return Ok(None);
+    };
+    match row.value {
+        Some(token) if crate::import_credentials::provided(&token) => {
+            bearer_token(&token)?;
+            Ok(Some(token))
+        }
+        _ => Err(EMPTY_CREDENTIAL.into()),
     }
-    Ok(token)
+}
+
+const EMPTY_CREDENTIAL: &str = "Enter a credential value. Placeholder values cannot be saved.";
+
+/// Commits an edit that may hand back a typed token (see
+/// [`take_remote_authorization`]). With a token, the token is stored first and
+/// the edit is committed with the bearer slot's declaration in the same
+/// registry write: a failed keychain write leaves the registry as it was, and
+/// a failed registry write rolls the keychain back. `edit` runs once on a copy
+/// to find the token, then again inside `write`'s registry write.
+pub fn commit_edit_storing_token<E, W>(
+    server_id: &str,
+    mut edit: E,
+    write: W,
+) -> Result<Registry, String>
+where
+    E: FnMut(&mut Registry) -> Result<Option<String>, String>,
+    W: FnOnce(&mut dyn FnMut(&mut Registry) -> Result<(), String>) -> Result<Registry, String>,
+{
+    let changed = || "This server changed while saving. Review it and save again.".to_string();
+    let token = edit(&mut read_registry_exact_or_default()?)?;
+    let Some(token) = token else {
+        return write(&mut |registry| match edit(registry)? {
+            None => Ok(()),
+            Some(_) => Err(changed()),
+        });
+    };
+    let bearer = bearer_token(&token)?.to_string();
+    store_credential(
+        server_id,
+        crate::secrets::HTTP_AUTH_KEY,
+        &bearer,
+        true,
+        |server_id, key| {
+            write(&mut |registry| {
+                if edit(registry)?.as_deref() != Some(token.as_str()) {
+                    return Err(changed());
+                }
+                apply_secret_declaration(registry, server_id, key)
+            })
+        },
+    )
 }
 
 /// Saves an edited entry. Returns the typed token of an Authorization row on
@@ -1476,30 +1533,29 @@ pub fn update_server_fields_and_env(
     env: Option<Vec<PlainEnvEdit>>,
     removed: &[String],
 ) -> Result<Registry, String> {
-    let (registry, token) = registry::update(|registry| {
+    let edit = |registry: &mut Registry| {
         let previous = registry
             .servers
             .iter()
             .find(|server| server.id == server_id)
             .cloned();
-        apply_update_server_fields(registry, server_id, fields)?;
+        apply_update_server_fields(registry, server_id, fields.clone())?;
         let server = registry
             .servers
             .iter_mut()
             .find(|server| server.id == server_id)
             .ok_or_else(|| format!("No server with id '{server_id}'"))?;
-        if let Some(env) = env {
-            apply_plain_env(server, env)?;
+        if let Some(env) = &env {
+            apply_plain_env(server, env.clone())?;
         }
         drop_stored_rows(server, removed);
         let token = take_remote_authorization(previous.as_ref(), server)?;
         refuse_new_remote_env(previous.as_ref(), server)?;
         Ok(token)
-    })?;
-    match token {
-        Some(token) => set_server_secret(server_id, "Authorization", &token),
-        None => Ok(registry),
-    }
+    };
+    commit_edit_storing_token(server_id, edit, |edit| {
+        Ok(registry::update(|registry| edit(registry))?.0)
+    })
 }
 
 /// Drops the stored credentials (secret or reference rows) named in `removed`.
@@ -3432,6 +3488,19 @@ pub fn set_server_secret_with(
 ) -> Result<Registry, String> {
     // Both shells store through here, so both get the same rules.
     let (key, value, bearer) = credential_slot(server_id, key, value)?;
+    store_credential(server_id, key, value, bearer, write_registry)
+}
+
+/// Stores `value` under `key` (the bearer slot when `bearer`, which also
+/// clears an older sign-in), then runs `write_registry`, rolling the keychain
+/// back if it fails.
+fn store_credential(
+    server_id: &str,
+    key: &str,
+    value: &str,
+    bearer: bool,
+    write_registry: impl FnOnce(&str, &str) -> Result<Registry, String>,
+) -> Result<Registry, String> {
     let key = normalize_secret_key(key)?;
     let _lock = acquire_auth_lock(server_id)?;
     if bearer {
@@ -3484,7 +3553,7 @@ fn credential_slot<'a>(
     value: &'a str,
 ) -> Result<(&'a str, &'a str, bool), String> {
     if !crate::import_credentials::provided(value) {
-        return Err("Enter a credential value. Placeholder values cannot be saved.".into());
+        return Err(EMPTY_CREDENTIAL.into());
     }
     if !key.trim().eq_ignore_ascii_case("authorization") {
         return Ok((key, value, false));
@@ -6095,7 +6164,8 @@ API_KEY = "synthetic-first-origin"
             .unwrap();
             assert_token(&id, "plain-token-1");
 
-            // React with Keychain on: the row is a secret, its value set after.
+            // React with Keychain on: the value goes with the save, which
+            // stores it before it writes the registry.
             let id = stdio("react");
             let mut react = server(&id);
             react.transport = "http".into();
@@ -6103,12 +6173,16 @@ API_KEY = "synthetic-first-origin"
             react.url = Some("https://example.com/mcp".into());
             react.env = vec![registry::EnvVar {
                 key: "Authorization".into(),
-                value: None,
+                value: Some("keychain-token-2".into()),
                 secret: true,
                 unknown_fields: Default::default(),
             }];
-            registry::update(|r| apply_update_entry(r, react.clone())).unwrap();
-            set_server_secret(&id, "Authorization", "keychain-token-2").unwrap();
+            commit_edit_storing_token(
+                &id,
+                |r| apply_update_entry(r, react.clone()),
+                |edit| Ok(registry::update(|r| edit(r))?.0),
+            )
+            .unwrap();
             assert_token(&id, "keychain-token-2");
 
             // React with Keychain off: the save hands the typed value back
@@ -6165,19 +6239,21 @@ API_KEY = "synthetic-first-origin"
             let before = registry_file();
             let slot =
                 || crate::secrets::get_secret_result(&id, crate::secrets::HTTP_AUTH_KEY).unwrap();
-            let refused = crate::secrets::tests::with_failed_write(
-                crate::secrets::HTTP_AUTH_KEY,
-                || {
+            let refused =
+                crate::secrets::tests::with_failed_write(crate::secrets::HTTP_AUTH_KEY, || {
                     update_server_fields_and_env(
                         &id,
                         fields("locked", "http"),
                         renamed_to_authorization("tok-locked-1"),
                         &[],
                     )
-                },
-            );
+                });
             assert!(refused.is_err(), "{refused:?}");
-            assert_eq!(registry_file(), before, "a refused save changed the registry");
+            assert_eq!(
+                registry_file(),
+                before,
+                "a refused save changed the registry"
+            );
             assert_eq!(slot(), None);
 
             update_server_fields_and_env(
