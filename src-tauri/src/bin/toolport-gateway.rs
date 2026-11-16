@@ -45167,6 +45167,148 @@ mod tests {
         );
     }
 
+    /// The same for a folder's own launch: its lists live in the root pool, not
+    /// the host router, so the tick must look there too.
+    #[test]
+    fn a_secret_learned_after_a_folder_list_is_rescreened_and_routes_by_alias() {
+        let env = DataDirTestEnv::new("late-secret-rooted");
+        let secret = "late-folder-tool-4Rv";
+        let state = http_state(false);
+        state.daemon_mode.store(true, Ordering::SeqCst);
+        let root = env.dir.display().to_string();
+        let mut server = stub_server("folder", "Folder");
+        server.cwd = Some("${ROOT}".into());
+        let mut reg = Registry::default();
+        reg.servers.push(server);
+        reg.set_server_enabled("default", "folder", true).unwrap();
+        *state.registry.lock().unwrap() = reg.clone();
+        let reg_path = registry::resolved_path().unwrap();
+        registry::save_to(&reg_path, &reg).unwrap();
+        let mut view = Router::new();
+        view.add(
+            DownstreamServer::connect(
+                "folder".into(),
+                Box::new(MockRoute {
+                    tools: vec![json!({"name": secret, "description": format!("calls {secret}")})],
+                }),
+            )
+            .unwrap(),
+        );
+        let view = Arc::new(view);
+        let specs = daemon_root_servers(&reg);
+        let keys = root_launch_keys(&specs, &root, reg.secrets_generation);
+        let subs = Arc::new(Mutex::new(ResourceSubscriptionTable::default()));
+        {
+            let mut pool = state.root_launch_pool.lock().unwrap();
+            pool.specs = specs;
+            pool.secrets_generation = reg.secrets_generation;
+            pool.base = Some(state.router.lock().unwrap().clone());
+            pool.launches.insert(
+                keys[0].clone(),
+                RootLaunch {
+                    slot: view.server_slot("folder").unwrap(),
+                    subscriptions: Arc::clone(&subs),
+                    subscription_key: ("folder".into(), root.clone()),
+                    active: Arc::new(AtomicBool::new(true)),
+                },
+            );
+            pool.subscriptions
+                .insert(("folder".into(), root.clone()), subs);
+            pool.views.insert(keys.clone(), view);
+            pool.root_scopes.insert(
+                keys.clone(),
+                format!("root:{}", registry::sha256_hex(&root)),
+            );
+        }
+        let session = Arc::new(SessionState::new_http(Some(McpSessionOwner {
+            identity: "adapter:claude-code".into(),
+            profile: None,
+            tool_scope: None,
+            scope: None,
+        })));
+        *session.client_root_override.lock().unwrap() = Some(root.clone());
+        state
+            .mcp_sessions
+            .lock()
+            .unwrap()
+            .extend([("folder-client".into(), Arc::clone(&session))]);
+        // The registry is already loaded: a reload would retire the folder's
+        // launch, and this test is about the launch that keeps running.
+        let mut watcher = WatchLoopState {
+            last_mtime: mtime(&reg_path),
+            last_relevant: router_relevant(&reg),
+        };
+        let tick = |watcher: &mut WatchLoopState| {
+            watch_tick(
+                &reg_path,
+                &test_stdio_session(),
+                &Arc::new(Mutex::new(None)),
+                None,
+                None,
+                true,
+                &Arc::new(Mutex::new(None)),
+                None,
+                watcher,
+                &state.host,
+            );
+        };
+        // The folder's view as a request builds it: a refresh of the host
+        // router retires the cached views, and the next request rebuilds them
+        // over the launches that kept running.
+        let folder_view = || {
+            let base = Arc::clone(&state.router.lock().unwrap());
+            state.router_for_root(base, &reg, Some(&root), None)
+        };
+        let notes = || -> Vec<String> {
+            session
+                .outbound
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|queued| {
+                    serde_json::from_str::<Value>(&queued.json).unwrap()["method"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        };
+        tick(&mut watcher);
+        session.outbound.lock().unwrap().clear();
+        assert!(
+            serde_json::to_string(&folder_view().aggregated_tools())
+                .unwrap()
+                .contains(secret),
+            "the premise: nothing is known yet"
+        );
+
+        conduit_lib::secret_redact::register("folder", "LATE", secret);
+        conduit_lib::secret_redact::register("folder", "MORE", "another-folder-value-8Jm3");
+        tick(&mut watcher);
+        assert_eq!(
+            notes(),
+            vec!["notifications/tools/list_changed".to_string()],
+            "one list_changed for the burst"
+        );
+        let refreshed = folder_view();
+        let tools = refreshed.aggregated_tools();
+        assert!(!serde_json::to_string(&tools).unwrap().contains(secret));
+        let name = tools[0]["name"].as_str().unwrap().to_string();
+        assert!(name.starts_with("folder___secret_LATE_"), "{name}");
+        let (server, alias) = refreshed.route_of(&name).expect("the alias routes");
+        assert_eq!(server, "folder");
+        assert_eq!(
+            conduit_lib::secret_redact::upstream_identifier(
+                "folder",
+                conduit_lib::secret_redact::Catalog::Tool,
+                alias
+            ),
+            secret
+        );
+        tick(&mut watcher);
+        assert_eq!(notes().len(), 1, "no refresh again");
+    }
+
     /// P1.3: the discovery mode belongs to the host, so one host's switch cannot decide what
     /// another host advertises.
     ///
