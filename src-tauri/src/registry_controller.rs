@@ -2542,7 +2542,7 @@ pub fn connect_client_stdio(
     })
 }
 
-const CLIENT_HTTP_VAULT_SERVER: &str = "__toolport_http_clients__";
+pub(crate) const CLIENT_HTTP_VAULT_SERVER: &str = "__toolport_http_clients__";
 
 fn random_token() -> Result<String, String> {
     let mut bytes = [0u8; 24];
@@ -2556,14 +2556,39 @@ fn finish_http_disconnect(
     result: &mut ClientMutationResult,
     revoke: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    let warnings = clients::finish_uninstall_with_warnings(client_id, &result.outcome)?;
+    let outcome = &result.outcome;
+    let finish = || clients::finish_uninstall_with_warnings(client_id, outcome);
+    let mut warnings = Vec::new();
+    let finished = finish_http_cleanup(&mut warnings, finish, revoke);
     result.outcome.warnings.extend(warnings);
-    if let Err(error) = revoke() {
-        result.outcome.warnings.push(format!(
-            "config restored; could not remove the revoked keychain token: {error}"
-        ));
+    finished
+}
+
+/// Both cleanup steps run after the registry write, even when one fails: the
+/// bearer row is already gone, so a retried Disconnect takes the stdio branch
+/// and would never retry the keychain delete. Both results are reported.
+fn finish_http_cleanup(
+    warnings: &mut Vec<String>,
+    finish: impl FnOnce() -> Result<Vec<String>, String>,
+    revoke: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let finished = finish();
+    let revoked = revoke().map_err(|error| {
+        format!("config restored; could not remove the revoked keychain token: {error}")
+    });
+    match (finished, revoked) {
+        (Ok(more), Ok(())) => {
+            warnings.extend(more);
+            Ok(())
+        }
+        (Ok(more), Err(keychain)) => {
+            warnings.extend(more);
+            warnings.push(keychain);
+            Ok(())
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(keychain)) => Err(format!("{error}\n\n{keychain}")),
     }
-    Ok(())
 }
 
 pub(crate) fn registry_for_disconnect() -> Result<Registry, String> {
@@ -2580,6 +2605,28 @@ fn disconnect_client_with_revocation(
     client_id: &str,
     revoke: impl FnOnce() -> Result<(), String>,
 ) -> Result<ClientMutationResult, String> {
+    disconnect_client_with(client_id, update_registry_on_disk, revoke)
+}
+
+fn update_registry_on_disk(apply: &dyn Fn(&mut Registry)) -> Result<Registry, String> {
+    let (registry, ()) = registry::update(|registry| {
+        apply(registry);
+        Ok(())
+    })?;
+    Ok(registry)
+}
+
+/// The one Disconnect path for both shells. `update_registry` persists the
+/// registry change it is handed (GTK writes the file; the Tauri shell also
+/// refreshes its in-memory registry), and a failure there rolls the client
+/// config back. `revoke` deletes the vaulted Shared HTTP bearer after its
+/// registry row is gone; a failure there is reported as a warning because the
+/// bearer no longer authenticates.
+pub(crate) fn disconnect_client_with(
+    client_id: &str,
+    update_registry: impl FnOnce(&dyn Fn(&mut Registry)) -> Result<Registry, String>,
+    revoke: impl FnOnce() -> Result<(), String>,
+) -> Result<ClientMutationResult, String> {
     let current = read_registry_exact_or_default()?;
     let http_id = format!("client:{client_id}");
     let has_shared_http_token = current
@@ -2588,25 +2635,23 @@ fn disconnect_client_with_revocation(
         .any(|client| client.id == http_id);
     if !has_shared_http_token {
         return disconnect_client_stdio_with(client_id, false, |_| {
-            let (registry, ()) = registry::update(|registry| {
+            update_registry(&|registry| {
                 registry.set_client_scope(client_id, None);
                 registry.clear_client_managed_entry(client_id);
-                Ok(())
-            })?;
-            Ok(registry)
+            })
         });
     }
 
     let _lock = acquire_auth_lock(&format!("client-config:{client_id}"))?;
     let outcome = clients::uninstall_gateway(client_id)?;
     let mut result = finish_client_config_mutation(outcome, |_| {
-        let (registry, ()) = registry::update(|registry| {
+        update_registry(&|registry| {
             registry.set_client_scope(client_id, None);
             registry.clear_client_managed_entry(client_id);
+            // The row is what authenticates the bearer, so dropping it in the
+            // same write as the scope revokes the token atomically.
             registry.http_clients.retain(|row| row.id != http_id);
-            Ok(())
-        })?;
-        Ok(registry)
+        })
     })?;
     finish_http_disconnect(client_id, &mut result, revoke)?;
     Ok(result)
@@ -3431,6 +3476,48 @@ pub fn test_secret_reference(
 
 #[cfg(test)]
 mod tests {
+    /// A failed recovery cleanup still lets the keychain delete run, and both
+    /// failures are reported (one shared helper for GTK and React).
+    #[test]
+    fn http_disconnect_cleanup_runs_both_steps_and_reports_both() {
+        let revoked = std::cell::Cell::new(false);
+        let mut warnings = Vec::new();
+        let err = finish_http_cleanup(
+            &mut warnings,
+            || Err("recovery cleanup failed".into()),
+            || {
+                revoked.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            revoked.get(),
+            "the keychain delete must run after a cleanup failure"
+        );
+        assert_eq!(err, "recovery cleanup failed");
+
+        let err = finish_http_cleanup(
+            &mut warnings,
+            || Err("recovery cleanup failed".into()),
+            || Err("keychain locked".into()),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("recovery cleanup failed") && err.contains("keychain locked"),
+            "{err}"
+        );
+
+        let mut warnings = Vec::new();
+        finish_http_cleanup(
+            &mut warnings,
+            || Ok(vec!["recovery warning".into()]),
+            || Err("keychain locked".into()),
+        )
+        .unwrap();
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[1].contains("keychain locked"));
+    }
 
     /// A filesystem-safe label for a scratch path. `thread::current().name()` is
     /// the test's full path (`registry_controller::tests::foo`), and `:` is not a

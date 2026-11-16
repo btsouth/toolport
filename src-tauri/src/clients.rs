@@ -5873,8 +5873,8 @@ const CONFIG_BACKUP_GENERATIONS: usize = 5;
 /// These copies are not inert: a Shared HTTP client's config carries a live
 /// `Authorization: Bearer <token>`, and since #503 that bearer is the one the client
 /// actually sends. Repoint runs on every launch, so an unpruned directory accumulated
-/// working credentials indefinitely, and `revoke_client_http_token` (which exists
-/// precisely so "a leftover backup" cannot keep authenticating) only covers Disconnect.
+/// working credentials indefinitely, and the Shared HTTP bearer revocation on Disconnect
+/// (which exists precisely so "a leftover backup" cannot keep authenticating) only covers Disconnect.
 /// Bounding the count bounds how long a rotated-away token survives on disk.
 ///
 /// Best-effort: a failure here must never fail the write the backup was protecting.

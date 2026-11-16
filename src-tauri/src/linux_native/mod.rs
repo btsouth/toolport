@@ -4128,6 +4128,19 @@ fn confirm_client_disconnect(client: &state::ClientView, button: gtk::Button, pa
     dialog.present();
 }
 
+/// Disconnect warnings minus the ones a recovery card already shows (they
+/// begin with that card's message). The React shell filters the same way.
+fn other_warnings(warnings: Vec<String>, recoveries: &[String]) -> Vec<String> {
+    warnings
+        .into_iter()
+        .filter(|warning| {
+            !recoveries
+                .iter()
+                .any(|message| warning.starts_with(message.as_str()))
+        })
+        .collect()
+}
+
 fn run_client_mutation(
     client: &state::ClientView,
     connect: bool,
@@ -4195,13 +4208,20 @@ fn run_client_mutation(
                         ],
                     )
                 };
-                if !connect
-                    && crate::clients::recovery::list().is_ok_and(|records| {
-                        records
-                            .iter()
-                            .any(|record| record.client_name == client_name)
-                    })
-                {
+                // A recovery card owns its own notice, so its text is not repeated
+                // here; every other warning (a keychain cleanup failure, say) is.
+                let recoveries: Vec<String> = if connect {
+                    Vec::new()
+                } else {
+                    crate::clients::recovery::list()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|record| record.client_name == client_name)
+                        .map(|record| record.message)
+                        .collect()
+                };
+                let warnings = other_warnings(result.outcome.warnings, &recoveries);
+                if !recoveries.is_empty() && warnings.is_empty() {
                     page.detail_notice.borrow_mut().take();
                     page.pending_confirmation.borrow_mut().take();
                     page.feedback.set_visible(false);
@@ -4209,7 +4229,7 @@ fn run_client_mutation(
                 } else {
                     page.refresh_with_confirmation(
                         std::iter::once(message)
-                            .chain(result.outcome.warnings)
+                            .chain(warnings)
                             .collect::<Vec<_>>()
                             .join(" "),
                     );
@@ -13577,6 +13597,22 @@ mod tests {
         // Removed again: rescan once, then stop polling.
         assert!(watch.observe(None));
         assert!(!watch.polls());
+    }
+
+    #[test]
+    fn disconnect_keeps_warnings_a_recovery_card_does_not_show() {
+        let recovery = "Cursor is disconnected.".to_string();
+        let kept = super::other_warnings(
+            vec![
+                format!("{recovery}\n\nChoose Retry."),
+                "config restored; could not remove the revoked keychain token: locked".into(),
+            ],
+            &[recovery],
+        );
+        assert_eq!(
+            kept,
+            vec!["config restored; could not remove the revoked keychain token: locked"]
+        );
     }
 
     /// Manual synthetic visual fixture. Run only in omabox with a request file;
