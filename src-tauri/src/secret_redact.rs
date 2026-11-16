@@ -6606,6 +6606,43 @@ mod tests {
         assert_eq!(m.redact_text("xab12y"), "xab12y");
     }
 
+    /// Failure mode: a request the gateway sends to a client (sampling,
+    /// elicitation, roots) was edited in place as one line, id included, so an
+    /// id equal to a secret came back changed and the client's answer could
+    /// not be matched to it.
+    #[test]
+    fn a_request_to_the_client_keeps_its_id_and_redacts_its_params() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-push-id-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        register("push-srv", "PIN", "482193");
+        register("push-srv", "KEY", "sk-PushBodySecret77");
+        for id in [
+            serde_json::json!(482193),
+            serde_json::json!("sk-PushBodySecret77"),
+        ] {
+            let request = serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "sampling/createMessage",
+                "params": {"messages": [{"content": {"type": "text", "text": "key sk-PushBodySecret77 pin 482193"}}]}
+            });
+            let out: Value =
+                serde_json::from_str(&redact_outgoing_json(request.to_string())).unwrap();
+            assert_eq!(out["id"], id);
+            assert_eq!(out["jsonrpc"], "2.0");
+            assert_eq!(
+                out["params"]["messages"][0]["content"]["text"],
+                "key [secret:KEY] pin [secret:PIN]"
+            );
+        }
+        // A notification has no id to keep, and is redacted as before.
+        let note = r#"{"jsonrpc":"2.0","method":"notifications/message","params":{"data":"sk-PushBodySecret77"}}"#;
+        assert_eq!(
+            redact_outgoing_json(note.to_string()),
+            r#"{"jsonrpc":"2.0","method":"notifications/message","params":{"data":"[secret:KEY]"}}"#
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_reply_is_redacted_in_its_result_and_error_never_its_id() {
         let _lock = crate::registry::data_dir_test_lock();
