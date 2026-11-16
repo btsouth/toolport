@@ -18063,6 +18063,11 @@ mod tests {
             .find(|l| l.label() == "API_KEY")
             .expect("the stored variable is listed");
         assert!(shown(name.upcast_ref()));
+        // A stored row cannot be renamed, and says so as React's does.
+        assert_eq!(
+            name.tooltip_text().as_deref(),
+            Some("A saved credential can't be renamed. Remove it and add a new one with the name you want.")
+        );
         let remove = all()
             .into_iter()
             .filter_map(|w| w.downcast::<gtk::Button>().ok())

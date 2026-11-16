@@ -6131,6 +6131,184 @@ API_KEY = "synthetic-first-origin"
         });
     }
 
+    /// A stdio server with a plain `TOKEN` value, for the edit-token tests.
+    fn stdio_with_token(name: &str, token: &str) -> String {
+        let mut entry = entry_from_fields(fields(name, "stdio")).unwrap();
+        entry.env = vec![registry::EnvVar {
+            key: "TOKEN".into(),
+            value: Some(token.into()),
+            secret: false,
+            unknown_fields: Default::default(),
+        }];
+        add_reviewed_entry(entry).unwrap().1
+    }
+
+    fn registry_file() -> String {
+        std::fs::read_to_string(registry::registry_path().unwrap()).unwrap()
+    }
+
+    fn renamed_to_authorization(value: &str) -> Option<Vec<PlainEnvEdit>> {
+        Some(vec![PlainEnvEdit {
+            key: "Authorization".into(),
+            value: value.into(),
+            local_only: None,
+        }])
+    }
+
+    /// N1: the token is stored before the registry is saved. With the keychain
+    /// locked the save is refused and nothing changes: the value is still the
+    /// server's plain row in the file and nothing is in the bearer slot.
+    #[test]
+    fn a_locked_keychain_leaves_an_edit_with_a_token_unsaved() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let id = stdio_with_token("locked", "tok-locked-1");
+            let before = registry_file();
+            let slot =
+                || crate::secrets::get_secret_result(&id, crate::secrets::HTTP_AUTH_KEY).unwrap();
+            let refused = crate::secrets::tests::with_failed_write(
+                crate::secrets::HTTP_AUTH_KEY,
+                || {
+                    update_server_fields_and_env(
+                        &id,
+                        fields("locked", "http"),
+                        renamed_to_authorization("tok-locked-1"),
+                        &[],
+                    )
+                },
+            );
+            assert!(refused.is_err(), "{refused:?}");
+            assert_eq!(registry_file(), before, "a refused save changed the registry");
+            assert_eq!(slot(), None);
+
+            update_server_fields_and_env(
+                &id,
+                fields("locked", "http"),
+                renamed_to_authorization("tok-locked-1"),
+                &[],
+            )
+            .unwrap();
+            assert_eq!(slot().as_deref(), Some("tok-locked-1"));
+            assert!(!registry_file().contains("tok-locked-1"));
+        });
+    }
+
+    /// N2: a plain Authorization row the saved remote server already had was
+    /// never sent. Saving the server without changing it keeps the row, the
+    /// working token and the sign-in; changing it makes it the token.
+    #[test]
+    fn an_unchanged_authorization_row_keeps_the_token_and_sign_in() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut entry = entry_from_fields(fields("signed-in", "http")).unwrap();
+            entry.env = vec![registry::EnvVar {
+                key: "Authorization".into(),
+                value: Some("Bearer old".into()),
+                secret: false,
+                unknown_fields: Default::default(),
+            }];
+            let (_, id) = registry::update(|r| Ok(r.add_server(entry))).unwrap();
+            crate::secrets::set_secret(&id, crate::secrets::HTTP_AUTH_KEY, "oauth-access").unwrap();
+            crate::secrets::set_secret(&id, "__oauth_state__", "{}").unwrap();
+            let slot =
+                || crate::secrets::get_secret_result(&id, crate::secrets::HTTP_AUTH_KEY).unwrap();
+            let signed_in = || {
+                crate::secrets::get_secret_result(&id, "__oauth_state__")
+                    .unwrap()
+                    .is_some()
+            };
+            let row = || {
+                registry::load()
+                    .unwrap()
+                    .servers
+                    .into_iter()
+                    .find(|s| s.id == id)
+                    .unwrap()
+                    .env
+                    .into_iter()
+                    .find(|e| e.key == "Authorization")
+                    .and_then(|e| e.value)
+            };
+
+            // GTK sends its plain rows with every save.
+            update_server_fields_and_env(
+                &id,
+                fields("renamed", "http"),
+                renamed_to_authorization("Bearer old"),
+                &[],
+            )
+            .unwrap();
+            // React sends the saved entry back.
+            let mut react = registry::load()
+                .unwrap()
+                .servers
+                .into_iter()
+                .find(|s| s.id == id)
+                .unwrap();
+            react.name = "renamed again".into();
+            let (_, token) = registry::update(|r| apply_update_entry(r, react)).unwrap();
+            assert_eq!(token, None);
+            assert_eq!(slot().as_deref(), Some("oauth-access"));
+            assert!(signed_in(), "an untouched row signed the server out");
+            assert_eq!(row().as_deref(), Some("Bearer old"));
+
+            update_server_fields_and_env(
+                &id,
+                fields("renamed", "http"),
+                renamed_to_authorization("Bearer new"),
+                &[],
+            )
+            .unwrap();
+            assert_eq!(slot().as_deref(), Some("new"));
+            assert!(!signed_in());
+            assert_eq!(row(), None);
+        });
+    }
+
+    /// N6: an empty or placeholder Authorization value is refused with the
+    /// empty-value message instead of saving the server with no token.
+    #[test]
+    fn an_empty_authorization_value_is_refused() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let id = stdio_with_token("empty", "tok-empty-1");
+            let before = registry_file();
+            for value in ["", "${TOKEN}", "YOUR_TOKEN"] {
+                assert_eq!(
+                    update_server_fields_and_env(
+                        &id,
+                        fields("empty", "http"),
+                        renamed_to_authorization(value),
+                        &[],
+                    )
+                    .unwrap_err(),
+                    "Enter a credential value. Placeholder values cannot be saved.",
+                    "{value:?}"
+                );
+            }
+            // React with Keychain on and nothing typed.
+            let mut react = registry::load()
+                .unwrap()
+                .servers
+                .into_iter()
+                .find(|s| s.id == id)
+                .unwrap();
+            react.transport = "http".into();
+            react.command = None;
+            react.url = Some("https://example.com/mcp".into());
+            react.env = vec![registry::EnvVar {
+                key: "Authorization".into(),
+                value: None,
+                secret: true,
+                unknown_fields: Default::default(),
+            }];
+            assert_eq!(
+                registry::update(|r| apply_update_entry(r, react))
+                    .err()
+                    .as_deref(),
+                Some("Enter a credential value. Placeholder values cannot be saved.")
+            );
+            assert_eq!(registry_file(), before);
+        });
+    }
+
     /// A pasted key renamed to match another row would keep only one value.
     /// The add is refused before anything is read or written.
     #[test]

@@ -433,6 +433,64 @@ describe("ServerDialog", () => {
     expect(screen.getByRole("button", { name: "Test connection" })).toBeDisabled();
   });
 
+  it("sends an edited Authorization value with the save, not after it", async () => {
+    // The save stores the token before it writes the registry, so a locked
+    // keychain cannot leave the server saved without it.
+    const user = userEvent.setup();
+    const local: ServerEntry = {
+      id: "local",
+      name: "Local",
+      transport: "stdio",
+      command: "local-server",
+      args: [],
+      env: [{ key: "TOKEN", value: "tok-1", secret: false }],
+      url: null,
+      source: "manual",
+    };
+    api.updateServer.mockResolvedValueOnce(savedRegistry("local"));
+    render(<ServerDialog autoOpen editId="local" initial={local} onSaved={vi.fn()} />);
+    await user.click(screen.getByLabelText("Transport"));
+    await user.click(screen.getByRole("option", { name: "http (remote)" }));
+    await user.type(screen.getByLabelText("URL"), "https://mcp.example.com/mcp");
+    const key = screen.getByDisplayValue("TOKEN");
+    await user.clear(key);
+    await user.type(key, "Authorization");
+    await user.click(screen.getByLabelText("Keep Authorization in keychain"));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(api.updateServer).toHaveBeenCalledTimes(1));
+    expect(api.updateServer.mock.calls[0][0].env).toEqual([
+      { key: "Authorization", value: "tok-1", secret: true },
+    ]);
+    expect(api.setSecret).not.toHaveBeenCalled();
+  });
+
+  it("does not rename a saved credential", async () => {
+    // Its value is in the keychain under its name, so a new name would have
+    // none. GTK shows the same hint on its saved rows.
+    const initial: ServerEntry = {
+      id: "local",
+      name: "Local",
+      transport: "stdio",
+      command: "local-server",
+      args: [],
+      env: [
+        { key: "API_KEY", value: null, secret: true },
+        { key: "REGION", value: "eu", secret: false },
+      ],
+      url: null,
+      source: "manual",
+    };
+    render(<ServerDialog autoOpen editId="local" initial={initial} onSaved={vi.fn()} />);
+    const stored = screen.getByDisplayValue("API_KEY");
+    expect(stored).toHaveAttribute("readonly");
+    expect(stored).toHaveAttribute(
+      "title",
+      "A saved credential can't be renamed. Remove it and add a new one with the name you want.",
+    );
+    expect(screen.getByDisplayValue("REGION")).not.toHaveAttribute("readonly");
+  });
+
   it("saves the startup timeout in milliseconds", async () => {
     const initial: ServerEntry = {
       id: "remote",

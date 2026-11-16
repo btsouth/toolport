@@ -407,28 +407,32 @@ fn prewarm_launcher(server: &ServerEntry) {
 #[tauri::command]
 async fn update_server(app: AppHandle, entry: ServerEntry) -> Result<Registry, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<RegistryState>();
-        let id = entry.id.clone();
-        let (reg, token) = write_registry(state.inner(), |reg| {
-            crate::registry_controller::apply_update_entry(reg, entry)
-        })?;
-        let Some(token) = token else {
-            return Ok(reg);
-        };
-        crate::registry_controller::set_server_secret_with(
-            &id,
-            "Authorization",
-            &token,
-            |server_id, key| {
-                let (registry, ()) = write_registry(state.inner(), |registry| {
-                    crate::registry_controller::apply_secret_declaration(registry, server_id, key)
-                })?;
-                Ok(registry)
-            },
-        )
+        update_server_in_app(app.state::<RegistryState>().inner(), entry)
     })
     .await
     .map_err(|e| format!("keychain task join failed: {e}"))?
+}
+
+/// [`update_server`]'s work.
+fn update_server_in_app(state: &RegistryState, entry: ServerEntry) -> Result<Registry, String> {
+    let id = entry.id.clone();
+    let (reg, token) = write_registry(state, |reg| {
+        crate::registry_controller::apply_update_entry(reg, entry)
+    })?;
+    let Some(token) = token else {
+        return Ok(reg);
+    };
+    crate::registry_controller::set_server_secret_with(
+        &id,
+        "Authorization",
+        &token,
+        |server_id, key| {
+            let (registry, ()) = write_registry(state, |registry| {
+                crate::registry_controller::apply_secret_declaration(registry, server_id, key)
+            })?;
+            Ok(registry)
+        },
+    )
 }
 
 #[tauri::command]
@@ -7206,6 +7210,69 @@ mod tests {
 
     fn clear_revoke_hooks() {
         FAIL_NEXT_REGISTRY_WRITE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// N1: React's save stores the token before the registry. A locked
+    /// keychain saves nothing; a failed registry write puts the keychain back.
+    /// Either way the token is still the server's plain row.
+    #[test]
+    fn update_server_stores_the_token_before_the_registry() {
+        let _generation = GEN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _hooks = REVOKE_HOOK_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_revoke_hooks();
+        crate::secrets::tests::with_isolated_vault(|| {
+            let plain = |key: &str, value: &str| crate::registry::EnvVar {
+                key: key.into(),
+                value: Some(value.into()),
+                secret: false,
+                unknown_fields: Default::default(),
+            };
+            let mut entry: ServerEntry = serde_json::from_value(serde_json::json!({
+                "id": "", "name": "react", "transport": "stdio", "command": "npx",
+                "args": [], "env": [],
+            }))
+            .unwrap();
+            entry.env = vec![plain("TOKEN", "tok-react-1")];
+            let (_, id) = crate::registry_controller::add_reviewed_entry(entry).unwrap();
+            let state: RegistryState = Mutex::new(registry::load().unwrap());
+            let file = || std::fs::read_to_string(registry::registry_path().unwrap()).unwrap();
+            let slot =
+                || crate::secrets::get_secret_result(&id, crate::secrets::HTTP_AUTH_KEY).unwrap();
+            let mut edit = registry::load()
+                .unwrap()
+                .servers
+                .into_iter()
+                .find(|s| s.id == id)
+                .unwrap();
+            edit.transport = "http".into();
+            edit.command = None;
+            edit.url = Some("https://example.com/mcp".into());
+            edit.env = vec![plain("Authorization", "Bearer tok-react-1")];
+            let before = file();
+
+            let locked =
+                crate::secrets::tests::with_failed_write(crate::secrets::HTTP_AUTH_KEY, || {
+                    update_server_in_app(&state, edit.clone())
+                });
+            assert!(locked.is_err(), "{locked:?}");
+            assert_eq!(file(), before, "a locked keychain changed the registry");
+            assert_eq!(slot(), None);
+
+            fail_next_registry_write();
+            let refused = update_server_in_app(&state, edit.clone());
+            clear_revoke_hooks();
+            assert!(refused.is_err(), "{refused:?}");
+            assert_eq!(file(), before);
+            assert_eq!(slot(), None, "the keychain was not rolled back");
+
+            update_server_in_app(&state, edit).unwrap();
+            assert_eq!(slot().as_deref(), Some("tok-react-1"));
+            assert!(!file().contains("tok-react-1"));
+        });
     }
 
     // ----- React Disconnect goes through the registry controller -------------
