@@ -367,7 +367,8 @@ jobs:
             tests::server_status_chips_keep_whole_words_on_one_line_in_narrow_windows \
             settings::tests::endpoint_action_style_tracks_status_and_live_language \
             tests::client_access_menu_stays_on_one_line_in_every_language \
-            tests::a_connected_row_with_a_migration_fits_a_narrow_window_in_every_language
+            tests::a_connected_row_with_a_migration_fits_a_narrow_window_in_every_language \
+            tests::pasted_rows_offer_the_react_choices
           do
             xvfb-run -a dbus-run-session -- cargo test \
               --manifest-path src-tauri/Cargo.toml --no-default-features \

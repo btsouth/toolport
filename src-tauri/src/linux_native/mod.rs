@@ -13362,7 +13362,7 @@ fn open_server_editor_prefilled(
             .collect::<Vec<_>>();
         let launch_definition = original_launch_for_save.clone();
         let display_name = fields.name.trim().to_string();
-        let (env, keychain) = pasted_env
+        let env = pasted_env
             .as_ref()
             .map(PastedEnvSection::collect)
             .unwrap_or_default();
@@ -13418,14 +13418,18 @@ fn open_server_editor_prefilled(
                         Ok((registry, Vec::new(), Vec::new()))
                     }
                     None => {
-                        let outcome = crate::registry_controller::add_snippet_server_choices(
-                            fields, env, &keychain,
-                        )?;
-                        Ok::<_, String>((
-                            outcome.registry,
-                            outcome.declared_without_value,
-                            outcome.failed,
-                        ))
+                        let without_value = env
+                            .iter()
+                            .filter(|row| {
+                                !row.key.is_empty()
+                                    && row.value.is_empty()
+                                    && row.reference.is_none()
+                            })
+                            .map(|row| row.key.clone())
+                            .collect();
+                        let outcome =
+                            crate::registry_controller::add_server_with_rows(fields, env)?;
+                        Ok::<_, String>((outcome.registry, without_value, outcome.failed))
                     }
                 }
             })
@@ -13448,18 +13452,35 @@ fn open_server_editor_prefilled(
                     }
                     editor.close();
                 }
+                // The same wording as the React dialog's error.
                 Ok(Err(error)) => {
                     l10n::bind_formatted_label(
                         &feedback,
-                        "Could not save: {value0}",
-                        &[("value0", &error.to_string())],
+                        "Couldn't save {value1}: {value2}",
+                        &[("value1", &display_name), ("value2", &error.to_string())],
                     );
+                    // The paste result may have left this label styled as a success.
+                    feedback.remove_css_class("success");
+                    feedback.add_css_class("error");
                     busy.set(false);
                     validate();
                     feedback.set_visible(true);
                 }
                 Err(_) => {
-                    l10n::bind_text(&feedback, "Could not save: the operation stopped");
+                    l10n::bind_label_with(&feedback, {
+                        let name = display_name.clone();
+                        move || {
+                            crate::i18n::trf(
+                                "Couldn't save {value1}: {value2}",
+                                &[
+                                    ("value1", &name),
+                                    ("value2", &crate::i18n::tr("the operation stopped")),
+                                ],
+                            )
+                        }
+                    });
+                    feedback.remove_css_class("success");
+                    feedback.add_css_class("error");
                     busy.set(false);
                     validate();
                     feedback.set_visible(true);
@@ -13932,10 +13953,9 @@ fn section_heading(title: &'static str, subtitle: &'static str) -> gtk::Box {
 }
 
 /// The environment values a paste brought into Add server, laid out like the
-/// React dialog's rows: name, value and Keychain, plus the same notice for values
-/// the paste left out (a `$TOKEN` it could not read, or a key with no value).
-/// Pasted values to save: each key, and its value when one was given.
-type PastedEnv = Vec<(String, Option<String>)>;
+/// React dialog's rows: name, key source, value or password manager reference,
+/// Keychain and "Same on every machine", plus the same notice for values the
+/// paste left out (a `$TOKEN` it could not read, or a key with no value).
 
 #[derive(Clone)]
 struct PastedEnvSection {
@@ -13977,6 +13997,59 @@ struct PastedEnvRow {
     key: gtk::Entry,
     value: gtk::Entry,
     keychain: gtk::CheckButton,
+    /// "Paste a key" or "From a password manager", for a keychain value.
+    source: gtk::DropDown,
+    reference: gtk::Entry,
+    /// "Same on every machine", for a plain value.
+    sync: gtk::CheckButton,
+    /// The sync choice once the user makes one; until then sync's default shows.
+    portable: std::rc::Rc<std::cell::Cell<Option<bool>>>,
+}
+
+impl PastedEnvRow {
+    fn uses_reference(&self) -> bool {
+        self.keychain.is_active() && self.source.selected() == 1
+    }
+
+    /// The password manager reference to save, once one is entered.
+    fn reference(&self) -> Option<String> {
+        let reference = self.reference.text().trim().to_string();
+        (self.uses_reference() && !reference.is_empty()).then_some(reference)
+    }
+
+    /// What "Same on every machine" shows, the React dialog's rule for a new server.
+    fn syncs(&self) -> bool {
+        let key = self.key.text();
+        if crate::personal_sync::risky_sync_env(key.trim()) {
+            return false;
+        }
+        self.portable.get().unwrap_or_else(|| {
+            !crate::personal_sync::looks_machine_local(key.trim(), &self.value.text())
+        })
+    }
+
+    /// Show the controls that apply to the row's current choices, as React does.
+    fn refresh_controls(&self) {
+        let secret = self.keychain.is_active();
+        self.source.set_visible(secret);
+        self.value.set_visible(!self.uses_reference());
+        self.value.set_visibility(!secret);
+        self.sync.set_visible(!secret);
+        let risky = crate::personal_sync::risky_sync_env(self.key.text().trim());
+        self.sync.set_sensitive(!risky);
+        if risky {
+            l10n::bind_tooltip(
+                &self.sync,
+                "This variable changes how programs run, so it always stays on this machine.",
+            );
+        } else {
+            l10n::unbind(&self.sync, "tooltip-text");
+            self.sync.set_tooltip_text(None);
+        }
+        // Shown, not chosen: the toggled handler records only a change the
+        // user makes, one that differs from what the row would show.
+        self.sync.set_active(self.syncs());
+    }
 }
 
 fn pasted_env_section() -> PastedEnvSection {
@@ -14079,7 +14152,8 @@ impl PastedEnvSection {
     }
 
     fn add_row(&self, key_text: &str, value_text: Option<&str>, secret: bool) {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        // The name and value lines; a password manager reference opens under them.
+        let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
         let key = {
             let widget = gtk::Entry::builder()
                 .text(key_text)
@@ -14107,24 +14181,62 @@ impl PastedEnvSection {
         let keychain = l10n::check_button("Keychain");
         keychain.set_active(secret);
         keychain.set_valign(gtk::Align::Center);
+        let feedback = gtk::Label::builder()
+            .halign(gtk::Align::Fill)
+            .xalign(0.0)
+            .wrap(true)
+            .visible(false)
+            .css_classes(["toolport-muted", "caption"])
+            .build();
+        // A new server has no id yet; the reference test runs without one, as in React.
+        let (source, reference_box, reference) = secret_reference_fields("", None, &feedback);
+        source.set_valign(gtk::Align::Center);
+        let sync = l10n::check_button("Same on every machine");
+        sync.set_valign(gtk::Align::Center);
         let remove = gtk::Button::builder()
             .icon_name("user-trash-symbolic")
             .valign(gtk::Align::Center)
             .css_classes(["flat", "toolport-destructive-icon"])
             .build();
         l10n::bind_tooltip(&remove, "Remove this value");
+        // React's order, wrapped onto two lines as React's narrow dialog wraps it.
+        key.set_hexpand(true);
+        let name_line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        name_line.append(&key);
+        name_line.append(&source);
+        let value_line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        value_line.append(&value);
+        value_line.append(&keychain);
+        value_line.append(&sync);
+        value_line.append(&remove);
+        row.append(&name_line);
+        row.append(&value_line);
+        row.append(&reference_box);
+        row.append(&feedback);
+        let entry = PastedEnvRow {
+            row: row.clone(),
+            key: key.clone(),
+            value: value.clone(),
+            keychain: keychain.clone(),
+            source: source.clone(),
+            reference,
+            sync: sync.clone(),
+            portable: Default::default(),
+        };
         let name_accessible = {
-            let (key, value, keychain, remove) = (
+            let (key, value, keychain, source, remove) = (
                 key.downgrade(),
                 value.downgrade(),
                 keychain.downgrade(),
+                source.downgrade(),
                 remove.downgrade(),
             );
             move || {
-                let (Some(key), Some(value), Some(keychain), Some(remove)) = (
+                let (Some(key), Some(value), Some(keychain), Some(source), Some(remove)) = (
                     key.upgrade(),
                     value.upgrade(),
                     keychain.upgrade(),
+                    source.upgrade(),
                     remove.upgrade(),
                 ) else {
                     return;
@@ -14140,45 +14252,67 @@ impl PastedEnvSection {
                     "Keep {value1} in keychain",
                     &[("value1", &name)],
                 ))]);
+                source.update_property(&[gtk::accessible::Property::Label(&crate::i18n::trf(
+                    "Key source for {value1}",
+                    &[("value1", &name)],
+                ))]);
                 remove.update_property(&[gtk::accessible::Property::Label(&crate::i18n::tr(
                     "Remove this value",
                 ))]);
             }
         };
         name_accessible();
+        self.list.append(&row);
+        self.rows.borrow_mut().push(entry);
+        entry_refresh(&self.downgrade(), &row.downgrade());
         {
-            let section = self.downgrade();
+            let (section, row_ref) = (self.downgrade(), row.downgrade());
             key.connect_changed(move |_| {
                 name_accessible();
-                if let Some(section) = section.upgrade() {
-                    section.refresh_notice();
-                }
+                entry_refresh(&section, &row_ref);
             });
         }
         {
-            let value = value.downgrade();
+            let (section, row_ref) = (self.downgrade(), row.downgrade());
+            value.connect_changed(move |_| entry_refresh(&section, &row_ref));
+        }
+        if let Some(reference) =
+            with_row(&self.downgrade(), &row.downgrade(), |r| r.reference.clone())
+        {
+            let (section, row_ref) = (self.downgrade(), row.downgrade());
+            reference.connect_changed(move |_| entry_refresh(&section, &row_ref));
+        }
+        {
+            let (section, row_ref) = (self.downgrade(), row.downgrade());
             keychain.connect_toggled(move |check| {
-                if let Some(value) = value.upgrade() {
-                    value.set_visibility(!check.is_active());
+                // A plain value cannot come from a password manager.
+                if !check.is_active() {
+                    if let Some(source) = with_row(&section, &row_ref, |r| r.source.clone()) {
+                        source.set_selected(0);
+                    }
                 }
+                entry_refresh(&section, &row_ref);
             });
         }
-        row.append(&key);
-        row.append(&value);
-        row.append(&keychain);
-        row.append(&remove);
-        self.list.append(&row);
-        self.rows.borrow_mut().push(PastedEnvRow {
-            row: row.clone(),
-            key,
-            value: value.clone(),
-            keychain,
-        });
         {
-            let section = self.downgrade();
-            value.connect_changed(move |_| {
-                if let Some(section) = section.upgrade() {
-                    section.refresh_notice();
+            let (section, row_ref) = (self.downgrade(), row.downgrade());
+            source.connect_selected_notify(move |_| {
+                // Switching the source starts the value over, as in React.
+                if let Some(value) = with_row(&section, &row_ref, |r| r.value.clone()) {
+                    value.set_text("");
+                }
+                entry_refresh(&section, &row_ref);
+            });
+        }
+        {
+            let (section, row_ref) = (self.downgrade(), row.downgrade());
+            sync.connect_toggled(move |check| {
+                let Some(portable) = with_row(&section, &row_ref, |r| r.portable.clone()) else {
+                    return;
+                };
+                let shown = with_row(&section, &row_ref, PastedEnvRow::syncs);
+                if shown != Some(check.is_active()) {
+                    portable.set(Some(check.is_active()));
                 }
             });
         }
@@ -14203,7 +14337,15 @@ impl PastedEnvSection {
             .rows
             .borrow()
             .iter()
-            .map(|r| (r.key.text().trim().to_string(), r.value.text().is_empty()))
+            .map(|r| {
+                // A shown value box that is empty, or a reference not entered yet.
+                let empty = if r.uses_reference() {
+                    r.reference().is_none()
+                } else {
+                    r.value.text().is_empty()
+                };
+                (r.key.text().trim().to_string(), empty)
+            })
             .filter(|(key, empty)| *empty && names.contains(key))
             .map(|(key, _)| key)
             .collect();
@@ -14220,20 +14362,45 @@ impl PastedEnvSection {
         }
     }
 
-    /// The values to save and each key's Keychain choice.
-    fn collect(&self) -> (PastedEnv, std::collections::BTreeMap<String, bool>) {
-        let mut env = Vec::new();
-        let mut keychain = std::collections::BTreeMap::new();
-        for row in self.rows.borrow().iter() {
-            let key = row.key.text().trim().to_string();
-            if key.is_empty() {
-                continue;
-            }
-            let value = row.value.text().to_string();
-            keychain.insert(key.clone(), row.keychain.is_active());
-            env.push((key, (!value.is_empty()).then_some(value)));
-        }
-        (env, keychain)
+    /// The rows to save, as the React dialog collects them.
+    fn collect(&self) -> Vec<crate::registry_controller::ValueRow> {
+        self.rows
+            .borrow()
+            .iter()
+            .map(|row| crate::registry_controller::ValueRow {
+                key: row.key.text().trim().to_string(),
+                value: if row.uses_reference() {
+                    String::new()
+                } else {
+                    row.value.text().to_string()
+                },
+                secret: row.keychain.is_active(),
+                reference: row.reference(),
+                portable: row.portable.get(),
+            })
+            .collect()
+    }
+}
+
+/// Run `f` on the row whose box is `row`, if the section and row still exist.
+fn with_row<T>(
+    section: &WeakPastedEnvSection,
+    row: &gtk::glib::WeakRef<gtk::Box>,
+    f: impl FnOnce(&PastedEnvRow) -> T,
+) -> Option<T> {
+    let (section, row) = (section.upgrade()?, row.upgrade()?);
+    let rows = section.rows.borrow();
+    rows.iter().find(|r| r.row == row).map(f)
+}
+
+/// Bring a row's controls and the section's notice up to date.
+fn entry_refresh(section: &WeakPastedEnvSection, row: &gtk::glib::WeakRef<gtk::Box>) {
+    // Cloned out first: refreshing changes widgets whose handlers read the rows.
+    if let Some(entry) = with_row(section, row, PastedEnvRow::clone) {
+        entry.refresh_controls();
+    }
+    if let Some(section) = section.upgrade() {
+        section.refresh_notice();
     }
 }
 
@@ -14986,7 +15153,9 @@ mod tests {
         let remove = removed
             .upgrade()
             .unwrap()
-            .last_child()
+            .first_child()
+            .and_then(|line| line.next_sibling())
+            .and_then(|line| line.last_child())
             .and_downcast::<gtk::Button>()
             .unwrap();
         remove.emit_clicked();
@@ -15014,6 +15183,98 @@ mod tests {
             removed.upgrade().is_none(),
             "a removed row outlived the dialog"
         );
+    }
+
+    /// The pasted rows offer what the React dialog's rows do, in its order:
+    /// key source and password manager reference for a keychain value, "Same on
+    /// every machine" for a plain one, and the same defaults.
+    #[test]
+    #[ignore = "requires GTK; explicitly run in the isolated omabox session"]
+    fn pasted_rows_offer_the_react_choices() {
+        use super::*;
+        gtk::init().expect("this regression runs inside omabox");
+        let window = gtk::Window::new();
+        let section = pasted_env_section();
+        window.set_child(Some(&section.section));
+        let var = |key: &str, value: Option<&str>| crate::clients::SnippetEnvVar {
+            key: key.into(),
+            value: value.map(Into::into),
+        };
+        section.fill(&[
+            var("API_KEY", Some("sk-live-SECRET42")),
+            var("REGION", Some("eu")),
+            var("NODE_OPTIONS", Some("--max-old-space-size=4096")),
+            var("TOKEN", None),
+        ]);
+        window.present();
+        let rows = section.rows.borrow().clone();
+        let [api, region, node, token] = [0, 1, 2, 3].map(|i| rows[i].clone());
+        let line: Vec<gtk::Widget> = {
+            let mut children = Vec::new();
+            let mut line = api.row.first_child();
+            for _ in 0..2 {
+                let current = line.unwrap();
+                let mut child = current.first_child();
+                while let Some(widget) = child {
+                    child = widget.next_sibling();
+                    children.push(widget);
+                }
+                line = current.next_sibling();
+            }
+            children
+        };
+        assert_eq!(
+            line,
+            [
+                api.key.clone().upcast(),
+                api.source.clone().upcast(),
+                api.value.clone().upcast(),
+                api.keychain.clone().upcast(),
+                api.sync.clone().upcast(),
+                line[5].clone(),
+            ],
+            "React's order: name, source, value, Keychain, sync, remove"
+        );
+        // A keychain value: source shown, value hidden as typed, no sync choice.
+        assert!(api.source.is_visible() && !api.sync.is_visible());
+        assert!(!EntryExt::is_visible(&api.value));
+        // Plain values: sync's default, and a variable that changes how programs
+        // run always stays on this machine.
+        assert!(region.sync.is_visible() && region.sync.is_active() && region.sync.is_sensitive());
+        assert!(!region.source.is_visible());
+        assert!(!node.sync.is_active() && !node.sync.is_sensitive());
+        assert!(node.sync.tooltip_text().is_some());
+        assert!(section.notice.is_visible());
+        // A password manager reference replaces the value and fills the gap.
+        token.source.set_selected(1);
+        assert!(!WidgetExt::is_visible(&token.value));
+        assert!(section.notice.is_visible(), "no reference entered yet");
+        token.reference.set_text("op://Private/Server/token");
+        assert!(!section.notice.is_visible());
+        api.source.set_selected(1);
+        assert_eq!(api.value.text(), "", "switching the source starts over");
+        api.source.set_selected(0);
+        api.value.set_text("typed");
+        // A choice the user makes is kept; an untouched default is left to sync.
+        region.sync.set_active(false);
+        assert!(!region.sync.is_active());
+        api.keychain.set_active(false);
+        assert_eq!(api.source.selected(), 0);
+        assert!(api.sync.is_visible() && EntryExt::is_visible(&api.value));
+        let saved = section.collect();
+        let row = |key: &str| saved.iter().find(|r| r.key == key).unwrap().clone();
+        assert_eq!(row("REGION").portable, Some(false));
+        assert_eq!(row("NODE_OPTIONS").portable, None);
+        assert_eq!(
+            row("TOKEN").reference.as_deref(),
+            Some("op://Private/Server/token")
+        );
+        assert!(row("TOKEN").secret && row("TOKEN").value.is_empty());
+        assert_eq!(
+            (row("API_KEY").secret, row("API_KEY").value.as_str()),
+            (false, "typed")
+        );
+        window.destroy();
     }
 
     /// The arguments box keeps a pasted list exactly until the user edits it.
