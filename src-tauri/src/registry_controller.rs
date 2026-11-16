@@ -3656,6 +3656,7 @@ mod tests {
                     name: "ZCode".into(),
                     uses_connectors: false,
                     location_removable: false,
+                    location_kept_by_t3_code: false,
                     config_path: path.display().to_string(),
                     config_exists: true,
                     app_present: true,

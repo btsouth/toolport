@@ -916,6 +916,7 @@
   "This client's rules file is up to date.": "이 클라이언트의 규칙 파일은 최신입니다.",
   "This deletes the server from Toolport on this machine. Any saved secrets stay in your keychain.": "그러면 이 시스템의 Toolport에서 서버가 삭제됩니다. 저장된 모든 비밀은 키체인에 유지됩니다.",
   "This forgets the added location. Your client config and backups are kept. Auto-detected Claude folders still appear in Clients.": "추가된 위치는 잊어버립니다. 클라이언트 구성 및 백업이 유지됩니다. 자동 감지된 Claude 폴더는 여전히 클라이언트에 나타납니다.",
+  "T3 Code still uses this folder. Remove it from T3 Code's provider settings first.": "T3 Code에서 아직 이 폴더를 사용하고 있습니다. 먼저 T3 Code의 공급자 설정에서 제거하세요.",
   "This isn't necessarily empty — Toolport couldn't check.": "Toolport가 확인하지 못했으므로 값이 저장되어 있을 수도 있습니다.",
   "This machine only": "이 기기만",
   "This older HTTP connection exposes its bearer credential in process arguments. Review migration to stdio below. Your existing connection is preserved until you confirm.": "이전 HTTP 연결은 프로세스 인수에 Bearer 자격 증명을 노출합니다. 아래에서 stdio 전환을 검토하세요. 확인할 때까지 기존 연결은 유지됩니다.",

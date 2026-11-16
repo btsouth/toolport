@@ -5348,6 +5348,7 @@ mod tests {
             name: id.into(),
             uses_connectors: false,
             location_removable: false,
+            location_kept_by_t3_code: false,
             config_path: String::new(),
             config_exists: true,
             app_present: true,

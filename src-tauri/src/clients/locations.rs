@@ -567,8 +567,20 @@ fn launcher_is_gone(row: &ClientLocation) -> bool {
 
 /// Saved locations Toolport can forget: ones added by hand, automatic ones whose folder
 /// is gone, and launcher homes whose launcher is gone.
+/// A saved T3 Code home is decided by [`super::t3code::walk_below_home`] alone, before
+/// any other disk check, so nothing looks past a folder that became a link. One whose
+/// folder exists but has no config yet is kept while T3 Code still lists it.
 pub(super) fn forgettable(row: &ClientLocation) -> bool {
-    row.manual || automatic_path_is_missing(row) || launcher_is_gone(row) || t3_home_is_gone(row)
+    if is_t3_home(row) {
+        return t3_home_folder_is_gone(row) || t3_home_is_gone(row);
+    }
+    row.manual || automatic_path_is_missing(row) || launcher_is_gone(row)
+}
+
+/// A T3 Code home that cannot be forgotten because T3 Code still lists it. Both shells
+/// show its Remove location control disabled, with why.
+pub(super) fn kept_by_t3_code(row: &ClientLocation) -> bool {
+    is_t3_home(row) && !forgettable(row)
 }
 
 /// Whether a Codex home outside the saved list is one automatic discovery lists.
@@ -668,14 +680,20 @@ pub(super) fn automatic_path_is_missing(row: &ClientLocation) -> bool {
 }
 
 pub(super) fn validate(row: &ClientLocation) -> Result<(), String> {
-    if row.manual
-        || automatic_path_is_missing(row)
-        || (row.client_type == "claude-code"
-            && home().is_some_and(|root| automatic_path_is_safe(&root, &row.config_path)))
-        || (row.client_type == "codex"
-            && home().is_some_and(|root| codex_automatic_path_is_safe(&root, &row.config_path)))
-        || (is_t3_home(row) && super::t3code::path_is_safe(&row.config_path))
-    {
+    // A saved T3 Code home goes through the walk first and only: the older checks below
+    // look at the folder with calls that follow a link higher up the path, and would let
+    // a write recreate a home whose folder was deleted.
+    let ok = if is_t3_home(row) {
+        super::t3code::path_is_safe(&row.config_path)
+    } else {
+        row.manual
+            || automatic_path_is_missing(row)
+            || (row.client_type == "claude-code"
+                && home().is_some_and(|root| automatic_path_is_safe(&root, &row.config_path)))
+            || (row.client_type == "codex"
+                && home().is_some_and(|root| codex_automatic_path_is_safe(&root, &row.config_path)))
+    };
+    if ok {
         Ok(())
     } else {
         Err("This automatic client location needs attention. Choose an ordinary config file inside home, or add the location manually to use a linked or external folder.".into())

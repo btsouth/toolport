@@ -109,6 +109,9 @@ pub struct DetectedClient {
     /// is misleading, so the UI shows a connector indicator instead.
     pub uses_connectors: bool,
     pub location_removable: bool,
+    /// A T3 Code home T3 Code still lists, so it cannot be forgotten yet. The shells show
+    /// Remove location disabled with why instead of hiding it.
+    pub location_kept_by_t3_code: bool,
     pub discovery: DiscoveryCapabilities,
     pub config_path: String,
     pub config_exists: bool,
@@ -4849,6 +4852,10 @@ fn read_client(def: &ClientDef) -> DetectedClient {
                 .unwrap_or_else(|| def.name.to_string()),
             uses_connectors: def.uses_connectors,
             location_removable: def.location.as_ref().is_some_and(locations::forgettable),
+            location_kept_by_t3_code: def
+                .location
+                .as_ref()
+                .is_some_and(locations::kept_by_t3_code),
             discovery: def.discovery,
             config_path,
             config_exists,
@@ -4993,6 +5000,7 @@ fn config_error_row(id: &str, name: &str, path: String, error: String) -> Detect
         name: name.into(),
         uses_connectors: false,
         location_removable: false,
+        location_kept_by_t3_code: false,
         discovery: discovery::capabilities("claude-code"),
         config_path: path,
         config_exists: true,
@@ -5219,6 +5227,7 @@ pub fn client_metadata() -> Vec<DetectedClient> {
                     .unwrap_or_else(|| def.name.into()),
                 uses_connectors: def.uses_connectors,
                 location_removable: def.location.as_ref().is_some_and(|row| row.manual),
+                location_kept_by_t3_code: false,
                 discovery: def.discovery,
                 app_present: app_present_for(&config_path, config_exists),
                 config_path,
@@ -13133,6 +13142,7 @@ bad = "not-a-table"
             name: id.into(),
             uses_connectors: false,
             location_removable: false,
+            location_kept_by_t3_code: false,
             discovery: discovery::capabilities(id),
             config_path: format!("/tmp/{id}.json"),
             config_exists: true,

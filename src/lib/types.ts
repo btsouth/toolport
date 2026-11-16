@@ -29,6 +29,8 @@ export type GatewayEntryState = "managed" | "customized" | "absent";
 
 export interface DetectedClient {
   locationRemovable?: boolean;
+  /** A T3 Code home T3 Code still lists: Remove location is shown disabled, with why. */
+  locationKeptByT3Code?: boolean;
   id: string;
   name: string;
   usesConnectors: boolean;

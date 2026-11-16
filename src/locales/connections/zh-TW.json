@@ -916,6 +916,7 @@
   "This client's rules file is up to date.": "該用戶端的規則檔案是最新的。",
   "This deletes the server from Toolport on this machine. Any saved secrets stay in your keychain.": "這將從該電腦上的 Toolport 中刪除伺服器。所有已儲存的機密值都保留在您的 鑰匙圈 中。",
   "This forgets the added location. Your client config and backups are kept. Auto-detected Claude folders still appear in Clients.": "這會忘記新增的位置。您的用戶端設定和備份將被保留。自動偵測到的 Claude 資料夾仍然出現在用戶端。",
+  "T3 Code still uses this folder. Remove it from T3 Code's provider settings first.": "T3 Code 仍在使用此資料夾。請先從 T3 Code 的提供者設定中將其移除。",
   "This isn't necessarily empty — Toolport couldn't check.": "這不一定是空的－Toolport無法檢查。",
   "This machine only": "限本機",
   "This older HTTP connection exposes its bearer credential in process arguments. Review migration to stdio below. Your existing connection is preserved until you confirm.": "此舊版 HTTP 連線會在程序引數中暴露 Bearer 憑證。請審核下方遷移到 stdio 的方案；確認前，現有連線保持不變。",

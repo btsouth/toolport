@@ -432,7 +432,8 @@ pub(super) fn client_row(
             controls.append(&connected_client_actions_menu(client.clone(), page.clone()));
         }
     }
-    if client.location_removable && client.gateway_state == state::ClientGatewayState::Disconnected
+    if shows_remove_location(client)
+        && client.gateway_state == state::ClientGatewayState::Disconnected
     {
         controls.append(&remove_location_button(client, page.clone()));
     }
@@ -450,15 +451,44 @@ pub(super) fn client_row(
     card
 }
 
+/// Whether a client shows Remove location: when it can be forgotten, and disabled with
+/// why for a T3 Code home T3 Code still lists (React's client details says the same).
+pub(super) fn shows_remove_location(client: &state::ClientView) -> bool {
+    client.location_removable || client.location_kept_by_t3_code
+}
+
 pub(super) fn remove_location_button(client: &state::ClientView, page: ClientPage) -> gtk::Button {
     let remove = gtk::Button::from_icon_name("user-trash-symbolic");
     remove.add_css_class("flat");
     remove.set_valign(gtk::Align::Center);
-    remove.set_sensitive(!client.config_error);
-    let label = crate::i18n::trf("Remove location {value0}", &[("value0", &client.name)]);
-    remove.set_tooltip_text(Some(&crate::i18n::tr("Remove location")));
-    l10n::bind_tooltip(&remove, "Remove location");
-    remove.update_property(&[gtk::accessible::Property::Label(&label)]);
+    remove.set_sensitive(!client.config_error && !client.location_kept_by_t3_code);
+    let kept = client.location_kept_by_t3_code;
+    // What it does, or why it is disabled.
+    remove.set_tooltip_text(Some(&crate::i18n::tr(if kept {
+        "T3 Code still uses this folder. Remove it from T3 Code's provider settings first."
+    } else {
+        "Remove location"
+    })));
+    l10n::bind_tooltip(
+        &remove,
+        if kept {
+            "T3 Code still uses this folder. Remove it from T3 Code's provider settings first."
+        } else {
+            "Remove location"
+        },
+    );
+    // Both follow language changes, like the tooltip.
+    let name = client.name.clone();
+    l10n::bind_accessible_with(&remove, move || {
+        (
+            crate::i18n::trf("Remove location {value0}", &[("value0", &name)]),
+            kept.then(|| {
+                crate::i18n::tr(
+                    "T3 Code still uses this folder. Remove it from T3 Code's provider settings first.",
+                )
+            }),
+        )
+    });
     let id = client.id.clone();
     remove.connect_clicked(move |_| {
         let Some(parent) = page.root.root().and_downcast::<gtk::Window>() else {
@@ -726,6 +756,7 @@ mod caption_tests {
             inherited_discovery: None,
             config_error: false,
             location_removable: false,
+            location_kept_by_t3_code: false,
             claude_profile: None,
             t3_code: Vec::new(),
         };
@@ -787,6 +818,42 @@ mod tests {
             t3_code_badge_text(&[instance("Claude", true)]),
             "Used by T3 Code: Claude"
         );
+    }
+
+    #[test]
+    fn a_t3_home_t3_code_still_lists_shows_remove_location_disabled_with_why() {
+        let mut client = state::ClientView {
+            detected: None,
+            imported_names: Vec::new(),
+            id: "codex@t3-0123456789abcdef".into(),
+            name: "Codex (~/.codex2)".into(),
+            app_present: true,
+            config_exists: false,
+            uses_connectors: false,
+            server_count: 0,
+            movable_server_count: 0,
+            other_server_count: 0,
+            gateway_state: state::ClientGatewayState::Disconnected,
+            shared_http: false,
+            legacy_bearer_argv: false,
+            scope_id: None,
+            scope_name: None,
+            discovery_mode: None,
+            inherited_discovery: None,
+            config_error: false,
+            location_removable: false,
+            location_kept_by_t3_code: true,
+            claude_profile: None,
+            t3_code: Vec::new(),
+        };
+        assert!(shows_remove_location(&client));
+        client.location_kept_by_t3_code = false;
+        assert!(
+            !shows_remove_location(&client),
+            "other kept rows stay hidden"
+        );
+        client.location_removable = true;
+        assert!(shows_remove_location(&client));
     }
 
     #[test]

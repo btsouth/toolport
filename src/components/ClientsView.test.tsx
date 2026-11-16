@@ -2,7 +2,8 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DetectedClient, McpServer } from "@/lib/types";
-import { ClientsView } from "./ClientsView";
+import { useRef, useState } from "react";
+import { ClientsView, type T3CodeSeen } from "./ClientsView";
 import {
   getClientSessions,
   listClientRecoveries,
@@ -741,6 +742,53 @@ describe("ClientsView", () => {
       const calls = vi.mocked(t3CodeRevision).mock.calls.length;
       await act(() => vi.advanceTimersByTimeAsync(20_000));
       expect(t3CodeRevision).toHaveBeenCalledTimes(calls);
+    });
+
+    it("rescans on return from a client's details when T3 Code's settings changed meanwhile", async () => {
+      vi.useFakeTimers();
+      vi.mocked(t3CodeRevision).mockResolvedValue("a");
+      // As in App: the scanned clients and the revision they match live above the page,
+      // which unmounts while a client's details are open.
+      function Harness() {
+        const [detail, setDetail] = useState(false);
+        const [rows, setRows] = useState([client({ t3Code: [on("Work")] })]);
+        const seen = useRef<T3CodeSeen>(null);
+        return (
+          <>
+            <button onClick={() => setDetail((value) => !value)}>toggle</button>
+            {detail ? (
+              <p>details</p>
+            ) : (
+              <ClientsView
+                clients={rows}
+                registry={null}
+                onSelectClient={vi.fn()}
+                t3Seen={seen}
+                onChanged={async () => {
+                  onChanged();
+                  setRows([client({ t3Code: [on("Renamed")] })]);
+                }}
+              />
+            )}
+          </>
+        );
+      }
+      const onChanged = vi.fn();
+      render(<Harness />);
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(screen.getByText("Used by T3 Code: Work")).toBeInTheDocument();
+      act(() => screen.getByText("toggle").click());
+      vi.mocked(t3CodeRevision).mockResolvedValue("b");
+      await act(() => vi.advanceTimersByTimeAsync(20_000));
+      act(() => screen.getByText("toggle").click());
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(onChanged).toHaveBeenCalledTimes(1);
+      expect(screen.getByText("Used by T3 Code: Renamed")).toBeInTheDocument();
+      // Unchanged since: returning again does not rescan.
+      act(() => screen.getByText("toggle").click());
+      act(() => screen.getByText("toggle").click());
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(onChanged).toHaveBeenCalledTimes(1);
     });
   });
 });

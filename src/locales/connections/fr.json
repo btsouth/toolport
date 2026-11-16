@@ -916,6 +916,7 @@
   "This client's rules file is up to date.": "Le fichier de règles de ce client est à jour.",
   "This deletes the server from Toolport on this machine. Any saved secrets stay in your keychain.": "Cela supprime le serveur de Toolport sur cette machine. Les secrets enregistrés restent dans votre trousseau.",
   "This forgets the added location. Your client config and backups are kept. Auto-detected Claude folders still appear in Clients.": "Cela oublie l'emplacement ajouté. La configuration de votre client et vos sauvegardes sont conservées. Les dossiers Claude détectés automatiquement apparaissent toujours dans les clients.",
+  "T3 Code still uses this folder. Remove it from T3 Code's provider settings first.": "T3 Code utilise encore ce dossier. Retirez-le d'abord des paramètres des fournisseurs de T3 Code.",
   "This isn't necessarily empty — Toolport couldn't check.": "Ce n'est pas nécessairement vide — Toolport n'a pas pu vérifier.",
   "This machine only": "Cette machine uniquement",
   "This older HTTP connection exposes its bearer credential in process arguments. Review migration to stdio below. Your existing connection is preserved until you confirm.": "Cette ancienne connexion HTTP expose son identifiant Bearer dans les arguments du processus. Examinez la migration vers stdio ci-dessous. Votre connexion existante est conservée jusqu'à votre confirmation.",

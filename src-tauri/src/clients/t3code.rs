@@ -974,14 +974,42 @@ pub(super) fn annotate(clients: &mut [DetectedClient]) {
     annotate_with(clients, &instances);
 }
 
+/// The file OpenCode reads in a folder, chosen as its row's is
+/// ([`resolve_opencode_config_path`]): `opencode.jsonc` when only that exists. For a path
+/// T3 Code names, called only once the walk has passed for it, and the `.jsonc` is walked
+/// too, so a link there is never followed.
+fn opencode_file(path: PathBuf, named: bool) -> PathBuf {
+    if path.file_name().is_none_or(|name| name != "opencode.json") {
+        return path;
+    }
+    if named
+        && !home().is_some_and(|home| {
+            walk_below_home(&path.with_extension("jsonc"), &home) == HomeWalk::Plain
+        })
+    {
+        return path;
+    }
+    resolve_opencode_config_path(path.clone()).unwrap_or(path)
+}
+
 pub(super) fn annotate_with(clients: &mut [DetectedClient], instances: &[Instance]) {
     for instance in instances {
         // A home that fails the walk (a link, gone, not plain) labels nothing.
         let Some(path) = checked_path(instance) else {
             continue;
         };
-        let canonical = checked_canonical(instance);
+        let mut canonical = checked_canonical(instance);
         let client_type = instance.provider.client_type();
+        // OpenCode's row shows `opencode.jsonc` when only that exists.
+        let path = if instance.provider == Provider::OpenCode {
+            let file = opencode_file(path, instance.config_path.is_some());
+            if let (Some(canonical), Some(name)) = (canonical.as_mut(), file.file_name()) {
+                canonical.set_file_name(name);
+            }
+            file
+        } else {
+            path
+        };
         let Some(client) = clients.iter_mut().find(|client| {
             (client.id == client_type || client.id.starts_with(&format!("{client_type}@")))
                 && !client.config_path.is_empty()

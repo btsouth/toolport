@@ -5,7 +5,7 @@ import { trustedClientName, clientIdentityTooltip } from "@/lib/clientIdentity";
 import { getClientSessions, t3CodeRevision } from "@/lib/api";
 import type { ClientActivity } from "@/lib/types";
 import { fmtAgo } from "@/lib/utils";
-import { useEffect, useId, useRef, useState } from "react";
+import { type RefObject, useEffect, useId, useRef, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -457,6 +457,10 @@ function ProfileGroup({
   );
 }
 
+/** The last T3 Code settings revision the Clients page saw, `null` before the first check.
+ * The page rescans whenever it sees a new one, so this matches the scanned clients. */
+export type T3CodeSeen = { value: string | null } | null;
+
 export function ClientsView({
   clients,
   registry,
@@ -464,6 +468,7 @@ export function ClientsView({
   error,
   onSelectClient,
   onChanged,
+  t3Seen: keptT3Seen,
 }: {
   clients: DetectedClient[];
   registry: Registry | null;
@@ -471,6 +476,9 @@ export function ClientsView({
   error?: string | null;
   onSelectClient: (id: string) => void;
   onChanged?: () => Promise<void>;
+  /** Kept with the scanned clients, so a change made while the page is unmounted (a
+   * client's details or another view open) rescans on return. */
+  t3Seen?: RefObject<T3CodeSeen>;
 }) {
   const { t, locale } = useI18n();
   const [showMissing, setShowMissing] = useState(false);
@@ -507,8 +515,9 @@ export function ClientsView({
   }, [clients, sessionRetry]);
   // T3 Code: rescan when its settings change while this page is on screen, so the row
   // badges follow instances added, renamed or turned off. The page unmounts when another
-  // view is shown; the last revision seen survives the window being hidden, so a change
-  // made meanwhile still rescans on return. Without T3 Code its settings are checked (one
+  // view or a client's details are shown; the last revision seen is kept with the scanned
+  // clients (`t3Seen`), so a change made meanwhile, or while the window is hidden, still
+  // rescans on return. Without T3 Code its settings are checked (one
   // `stat`) only when the page opens and when the window gets focus; every five seconds
   // only while they exist. GTK does the same.
   const onChangedRef = useRef(onChanged);
@@ -516,7 +525,8 @@ export function ClientsView({
     onChangedRef.current = onChanged;
   }, [onChanged]);
   const windowVisible = useWindowVisible();
-  const t3Seen = useRef<{ value: string | null } | null>(null);
+  const ownT3Seen = useRef<T3CodeSeen>(null);
+  const t3Seen = keptT3Seen ?? ownT3Seen;
   useEffect(() => {
     if (!windowVisible) return;
     let active = true;
@@ -549,7 +559,7 @@ export function ClientsView({
       active = false;
       window.clearTimeout(timer);
     };
-  }, [windowVisible]);
+  }, [windowVisible, t3Seen]);
   const sorted = sortClients(clients);
   const present = sorted.filter((client) => statusOf(client) !== "missing");
   const missing = sorted.filter((client) => statusOf(client) === "missing");

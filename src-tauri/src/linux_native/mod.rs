@@ -14937,6 +14937,7 @@ mod tests {
             inherited_discovery: None,
             config_error: false,
             location_removable: false,
+            location_kept_by_t3_code: false,
             claude_profile: None,
             t3_code: Vec::new(),
         })
@@ -15413,6 +15414,7 @@ mod tests {
             inherited_discovery: None,
             config_error: false,
             location_removable: false,
+            location_kept_by_t3_code: false,
             claude_profile: None,
             t3_code: Vec::new(),
         };
@@ -15632,6 +15634,7 @@ mod tests {
             inherited_discovery: None,
             config_error: false,
             location_removable: false,
+            location_kept_by_t3_code: false,
             claude_profile: None,
             t3_code: Vec::new(),
         };

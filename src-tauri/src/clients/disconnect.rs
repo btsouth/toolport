@@ -466,6 +466,7 @@ mod tests {
             claude_profile: None,
             t3_code: Vec::new(),
             location_removable: false,
+            location_kept_by_t3_code: false,
         };
         let results = all_with_clients(false, true, || vec![client]).unwrap();
         assert_eq!(results.len(), 1);

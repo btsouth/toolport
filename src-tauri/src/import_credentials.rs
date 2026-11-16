@@ -777,6 +777,7 @@ mod tests {
                 name: "nanobot".into(),
                 uses_connectors: false,
                 location_removable: false,
+                location_kept_by_t3_code: false,
                 discovery: crate::clients::DiscoveryCapabilities {
                     auto_mode: "lazy",
                     native_tool_search: Some(false),
