@@ -17702,7 +17702,10 @@ mod tests {
         );
         held(&save, &edit, "synthetic save failure");
         assert!(feedback.is_visible());
-        assert_eq!(feedback.label(), "Could not save: synthetic save failure");
+        assert_eq!(
+            feedback.label(),
+            "Couldn't save edited while busy: synthetic save failure"
+        );
         assert!(editor.is_visible(), "a failed save keeps the editor open");
         assert!(crate::registry::load().unwrap().servers.is_empty());
         editor.close();
