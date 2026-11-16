@@ -776,12 +776,18 @@ mod tests {
 
     #[test]
     fn zcode_snippets_preserve_values_and_reject_behavior_the_import_cannot_carry() {
-        let supported = r#"{"ui":{"theme":"dark"},"mcp":{"servers":{"local":{"command":"node","args":["s.js"],"environment":{"PATH_HINT":"/srv"}},"remote":{"type":"sse","url":"https://example.test/sse","headers":{"X-Key":"pasted"}}}}}"#;
+        let supported = r#"{"ui":{"theme":"dark"},"mcp":{"servers":{"local":{"command":"node","args":["s.js"],"environment":{"PATH_HINT":"/srv"}},"remote":{"type":"sse","url":"https://example.test/sse","headers":{"Authorization":"Bearer pasted"}}}}}"#;
         let servers = super::super::parse_snippet(supported).unwrap();
         assert_eq!(servers.len(), 2);
         assert_eq!(servers[0].env[0].value.as_deref(), Some("/srv"));
         assert_eq!(servers[1].transport, "sse");
-        assert_eq!(servers[1].env[0].value.as_deref(), Some("pasted"));
+        assert_eq!(servers[1].env[0].value.as_deref(), Some("Bearer pasted"));
+        // A header Toolport cannot send is refused rather than saved unsent.
+        let custom = supported.replace(r#""Authorization":"Bearer pasted""#, r#""X-Key":"pasted""#);
+        assert_eq!(
+            super::super::parse_snippet(&custom).unwrap_err(),
+            super::super::unsupported_header_message()
+        );
         for (field, value) in [
             ("cwd", serde_json::json!("/srv")),
             ("timeoutMs", serde_json::json!(1234)),

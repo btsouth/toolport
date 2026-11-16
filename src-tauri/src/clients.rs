@@ -18,6 +18,7 @@ use crate::registry::{ManagedEntry, ServerEntry};
 #[cfg(windows)]
 pub(crate) mod backup_permissions;
 pub(crate) mod backup_storage;
+mod claude_add;
 mod claude_profiles;
 pub use claude_profiles::ClaudeProfile;
 mod diagnostics;
@@ -3687,6 +3688,14 @@ pub struct ParsedSnippetServer {
     pub url: Option<String>,
     /// Full env entries (key + optional value), since the user pasted them.
     pub env: Vec<SnippetEnvVar>,
+    /// The paste sets an HTTP header Toolport cannot send yet. Remote servers
+    /// with one are refused rather than saved without it.
+    #[serde(skip)]
+    pub unsupported_headers: bool,
+    /// The paste sets environment variables. A remote server cannot use them,
+    /// and a vaulted one would go out as its bearer token, so it is refused.
+    #[serde(skip)]
+    pub plain_env: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3725,19 +3734,9 @@ fn json_server_with_values(name: &str, def: &serde_json::Value) -> ParsedSnippet
     // ownership matching and import need both visible as env_keys). Tabnine nests
     // remote headers under `requestInit.headers`, the MCP SDK transport option.
     let mut env: Vec<SnippetEnvVar> = Vec::new();
-    for field in ["/env", "/headers", "/requestInit/headers"] {
-        if let Some(o) = def.pointer(field).and_then(|e| e.as_object()) {
-            for (k, v) in o {
-                if env.iter().any(|e| e.key == *k) {
-                    continue;
-                }
-                env.push(SnippetEnvVar {
-                    key: k.clone(),
-                    value: json_value_to_string(v),
-                });
-            }
-        }
-    }
+    push_new_env(&mut env, def.get("env"));
+    let plain_env = !env.is_empty();
+    let unsupported_headers = fold_headers(def, &mut env);
     // `type` is the common hint key (VS Code, Droid); Kimi Code marks legacy
     // SSE endpoints with `transport: "sse"` instead. Both mean the same thing
     // anywhere they appear, so either keys the hint.
@@ -3765,7 +3764,65 @@ fn json_server_with_values(name: &str, def: &serde_json::Value) -> ParsedSnippet
         args,
         url,
         env,
+        unsupported_headers,
+        plain_env,
     }
+}
+
+/// Append `settings`' entries to `env`, keeping the first of a repeated key.
+fn push_new_env(env: &mut Vec<SnippetEnvVar>, settings: Option<&serde_json::Value>) {
+    for (k, v) in settings.and_then(|e| e.as_object()).into_iter().flatten() {
+        if !env.iter().any(|e| e.key == *k) {
+            env.push(SnippetEnvVar {
+                key: k.clone(),
+                value: json_value_to_string(v),
+            });
+        }
+    }
+}
+
+/// Whether Toolport can send this header for a server added from a paste.
+/// Only `Authorization: Bearer` is carried (as the server's bearer token).
+/// Other headers would be saved as plain credentials and never sent, or worse,
+/// a secret-looking one would go out as the bearer token.
+fn header_supported(name: &str, value: Option<&str>) -> bool {
+    // No value yet (a shell variable or an empty placeholder) is asked for.
+    name.eq_ignore_ascii_case("authorization")
+        && value.map(str::trim_start).is_none_or(|value| {
+            value.is_empty()
+                || value
+                    .get(..7)
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer "))
+        })
+}
+
+/// The fields a pasted definition can carry HTTP headers in.
+const HEADER_FIELDS: [&str; 4] = ["headers", "requestInit", "http_headers", "env_http_headers"];
+
+/// [`fold_headers`] for a YAML definition. One JSON cannot represent (a null
+/// key, say) refuses its headers instead of dropping them.
+fn yaml_fold_headers(def: &serde_yaml::Mapping, env: &mut Vec<SnippetEnvVar>) -> bool {
+    match serde_json::to_value(def) {
+        Ok(def) => fold_headers(&def, env),
+        Err(_) => HEADER_FIELDS.iter().any(|field| def.get(*field).is_some()),
+    }
+}
+
+/// Fold a definition's headers into `env`, as import expects, and report
+/// whether any of them is one Toolport cannot send.
+fn fold_headers(def: &serde_json::Value, env: &mut Vec<SnippetEnvVar>) -> bool {
+    let mut unsupported = def
+        .get("env_http_headers")
+        .and_then(|h| h.as_object())
+        .is_some_and(|h| !h.is_empty());
+    for field in ["/headers", "/requestInit/headers", "/http_headers"] {
+        let headers = def.pointer(field);
+        for (k, v) in headers.and_then(|h| h.as_object()).into_iter().flatten() {
+            unsupported |= !header_supported(k, json_value_to_string(v).as_deref());
+        }
+        push_new_env(env, headers);
+    }
+    unsupported
 }
 
 /// Coerce a JSON value to its env-var string representation. Strings pass
@@ -3858,21 +3915,92 @@ fn extract_claude_cli(input: &str) -> Option<(String, String)> {
     Some((name.unwrap_or_default(), json_str.to_string()))
 }
 
+/// Why the paste box could not read a snippet. It holds no pasted text, so a
+/// shell can keep it to re-render the message after a language change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnippetError(SnippetErrorKind);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnippetErrorKind {
+    Command(claude_add::PasteError),
+    Unreadable,
+}
+
+/// The refusal for a pasted header Toolport cannot send.
+#[cfg(test)]
+pub(crate) fn unsupported_header_message() -> String {
+    claude_add::PasteError::CustomHeader.message()
+}
+
+/// The refusals a JSON, TOML or YAML paste shows as is: fixed text that names
+/// nothing pasted.
+fn refused_header(servers: &[ParsedSnippetServer]) -> Option<claude_add::PasteError> {
+    let remote = || servers.iter().filter(|server| server.transport != "stdio");
+    if remote().any(|server| server.unsupported_headers) {
+        Some(claude_add::PasteError::CustomHeader)
+    } else if remote().any(|server| server.plain_env) {
+        Some(claude_add::PasteError::EnvOnRemote)
+    } else {
+        None
+    }
+}
+
+impl SnippetError {
+    /// The message in the user's language.
+    pub fn message(self) -> String {
+        match self.0 {
+            SnippetErrorKind::Command(error) => error.message(),
+            SnippetErrorKind::Unreadable => {
+                crate::i18n::tr("Could not read the pasted config. Check its syntax and retry.")
+            }
+        }
+    }
+}
+
+/// [`parse_snippet`] for the paste box in both shells. A refused `claude mcp add`
+/// command says what to change: those messages never hold pasted text. Every
+/// other format keeps one opaque message, because JSON, TOML and YAML parser
+/// errors can quote the pasted line, and with it a secret.
+pub fn parse_snippet_for_user(content: &str) -> Result<Vec<ParsedSnippetServer>, SnippetError> {
+    if let Err(error) = claude_add::parse(content.trim()) {
+        return Err(SnippetError(SnippetErrorKind::Command(error)));
+    }
+    let servers =
+        parse_snippet_formats(content).map_err(|_| SnippetError(SnippetErrorKind::Unreadable))?;
+    match refused_header(&servers) {
+        Some(error) => Err(SnippetError(SnippetErrorKind::Command(error))),
+        None => Ok(servers),
+    }
+}
+
 /// Parse a pasted config snippet, auto-detecting the format.
 ///
-/// Tries each format in order: Claude Code CLI → TOML → JSON (mcpServers,
+/// Tries each format in order: Claude Code CLI (`mcp add` or `mcp add-json`) → TOML → JSON (mcpServers,
 /// servers, context_servers, or bare server object) → YAML. Returns all servers
 /// found (the first is pre-filled in the UI; extras get a toast).
 ///
 /// Unlike `detect_clients`, this includes env-var values because the user
 /// explicitly pasted them.
 pub fn parse_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String> {
+    let servers = parse_snippet_formats(content)?;
+    match refused_header(&servers) {
+        Some(error) => Err(error.message()),
+        None => Ok(servers),
+    }
+}
+
+/// [`parse_snippet`] before the header check.
+fn parse_snippet_formats(content: &str) -> Result<Vec<ParsedSnippetServer>, String> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return Err("Empty input".to_string());
     }
 
-    // 1. Claude Code CLI: `claude mcp add-json ... <name> '{...}'`
+    // 1. Claude Code CLI: `claude mcp add [options] <name> <commandOrUrl> [args...]`
+    if let Some(server) = claude_add::parse(trimmed).map_err(|e| e.message())? {
+        return Ok(vec![server]);
+    }
+    //    and `claude mcp add-json ... <name> '{...}'`
     if let Some((name, json_str)) = extract_claude_cli(trimmed) {
         let value: serde_json::Value =
             serde_json::from_str(&json_str).map_err(|e| diagnostics::json(&e))?;
@@ -3904,7 +4032,7 @@ pub fn parse_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String> 
     }
 
     Err(
-        "Could not detect format. Expected JSON, TOML, YAML, or a 'claude mcp add-json' command."
+        "Could not detect format. Expected JSON, TOML, YAML, or a 'claude mcp add' or 'claude mcp add-json' command."
             .to_string(),
     )
 }
@@ -4206,7 +4334,7 @@ fn parse_toml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                 .and_then(|a| a.as_array())
                 .map(|arr| arr.iter().filter_map(toml_value_to_string).collect())
                 .unwrap_or_default();
-            let env = def
+            let mut env: Vec<SnippetEnvVar> = def
                 .get("env")
                 .and_then(|e| e.as_table())
                 .map(|t| {
@@ -4219,6 +4347,9 @@ fn parse_toml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                 })
                 .unwrap_or_default();
             let type_hint = def.get("type").and_then(|t| t.as_str());
+            let plain_env = !env.is_empty();
+            let unsupported_headers =
+                fold_headers(&serde_json::to_value(def).unwrap_or_default(), &mut env);
             let transport = classify(&command, &url, type_hint);
             ParsedSnippetServer {
                 name: name.clone(),
@@ -4227,6 +4358,8 @@ fn parse_toml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                 args,
                 url,
                 env,
+                unsupported_headers,
+                plain_env,
             }
         })
         .collect();
@@ -4282,7 +4415,7 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                     .and_then(|v| v.as_sequence())
                     .map(|seq| seq.iter().filter_map(yaml_value_to_string).collect())
                     .unwrap_or_default();
-                let env = def
+                let mut env: Vec<SnippetEnvVar> = def
                     .get("env")
                     .and_then(|v| v.as_mapping())
                     .map(|m| {
@@ -4294,6 +4427,8 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                             .collect()
                     })
                     .unwrap_or_default();
+                let plain_env = !env.is_empty();
+                let unsupported_headers = yaml_fold_headers(def, &mut env);
                 let transport = classify(&command, &url, str_of("type").as_deref());
                 Some(ParsedSnippetServer {
                     name,
@@ -4302,6 +4437,8 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                     args,
                     url,
                     env,
+                    unsupported_headers,
+                    plain_env,
                 })
             })
             .collect();
@@ -4328,7 +4465,7 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                     .and_then(|v| v.as_sequence())
                     .map(|seq| seq.iter().filter_map(yaml_value_to_string).collect())
                     .unwrap_or_default();
-                let env = def
+                let mut env: Vec<SnippetEnvVar> = def
                     .get("envs")
                     .and_then(|v| v.as_mapping())
                     .map(|m| {
@@ -4340,6 +4477,8 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                             .collect()
                     })
                     .unwrap_or_default();
+                let plain_env = !env.is_empty();
+                let unsupported_headers = yaml_fold_headers(def, &mut env);
                 let transport = classify(&command, &url, str_of("type").as_deref());
                 Some(ParsedSnippetServer {
                     name,
@@ -4348,6 +4487,8 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                     args,
                     url,
                     env,
+                    unsupported_headers,
+                    plain_env,
                 })
             })
             .collect();
@@ -4379,7 +4520,7 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                     .map(|seq| seq.iter().filter_map(yaml_value_to_string).collect())
                     .unwrap_or_default();
 
-                let env = def
+                let mut env: Vec<SnippetEnvVar> = def
                     .get("env")
                     .and_then(|v| v.as_mapping())
                     .map(|mapping| {
@@ -4395,6 +4536,8 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                     })
                     .unwrap_or_default();
 
+                let plain_env = !env.is_empty();
+                let unsupported_headers = yaml_fold_headers(def, &mut env);
                 let transport = classify(&command, &url, str_of("type").as_deref());
 
                 Some(ParsedSnippetServer {
@@ -4404,6 +4547,8 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                     args,
                     url,
                     env,
+                    unsupported_headers,
+                    plain_env,
                 })
             })
             .collect();
@@ -4598,6 +4743,18 @@ fn opencode_server_with_values(
     }
     env.sort_by(|left, right| left.key.cmp(&right.key));
     env.dedup_by(|left, right| left.key == right.key);
+    let plain_env = obj
+        .get("environment")
+        .and_then(|environment| environment.as_object())
+        .is_some_and(|environment| !environment.is_empty());
+    let unsupported_headers = obj
+        .get("headers")
+        .and_then(|headers| headers.as_object())
+        .is_some_and(|headers| {
+            headers
+                .iter()
+                .any(|(k, v)| !header_supported(k, json_value_to_string(v).as_deref()))
+        });
 
     Ok(Some(ParsedSnippetServer {
         name: name.to_string(),
@@ -4610,6 +4767,8 @@ fn opencode_server_with_values(
         args,
         url,
         env,
+        unsupported_headers,
+        plain_env,
     }))
 }
 

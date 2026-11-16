@@ -313,14 +313,15 @@ async fn add_snippet_servers(
 fn parse_server_snippet(text: String) -> Result<Vec<clients::ParsedSnippetServer>, String> {
     const MAX_SNIPPET_BYTES: usize = 256 * 1024;
     if text.len() > MAX_SNIPPET_BYTES {
-        return Err(format!(
-            "Snippet is {} KB; limit is {} KB. Paste a single server config, not an entire file.",
-            text.len() / 1024,
-            MAX_SNIPPET_BYTES / 1024,
+        return Err(trf(
+            "Snippet is {value0} KB; limit is {value1} KB. Paste a single server config, not an entire file.",
+            &[
+                ("value0", &format!("{}", text.len() / 1024)),
+                ("value1", &format!("{}", MAX_SNIPPET_BYTES / 1024)),
+            ],
         ));
     }
-    clients::parse_snippet(&text)
-        .map_err(|_| "Could not read the pasted config. Check its syntax and retry.".into())
+    clients::parse_snippet_for_user(&text).map_err(clients::SnippetError::message)
 }
 
 #[tauri::command]

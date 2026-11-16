@@ -659,7 +659,7 @@
   "Password manager": "密碼管理器",
   "Password manager provider": "密碼管理器提供者",
   "Password manager: {reference}": "密碼管理器：{reference}",
-  "Paste a config snippet from any client:\n\n• Claude Code: claude mcp add-json ...\n• Cursor/Devin/Antigravity: {\"mcpServers\": ...}\n• VS Code: {\"servers\": ...}\n• Codex: [mcp_servers.name]\n• Zed: {\"context_servers\": ...}": "貼上任意使用者端的設定片段：\n\n• Claude Code: claude mcp add-json ...\n• Cursor/Devin/Antigravity: {\"mcpServers\": ...}\n• VS Code: {\"servers\": ...}\n• Codex: [mcp_servers.name]\n• Zed: {\"context_servers\": ...}",
+  "Paste a config snippet from any client:\n\n• Claude Code: claude mcp add ... / claude mcp add-json ...\n• Cursor/Devin/Antigravity: {\"mcpServers\": ...}\n• VS Code: {\"servers\": ...}\n• Codex: [mcp_servers.name]\n• Zed: {\"context_servers\": ...}": "貼上任意使用者端的設定片段：\n\n• Claude Code: claude mcp add ... / claude mcp add-json ...\n• Cursor/Devin/Antigravity: {\"mcpServers\": ...}\n• VS Code: {\"servers\": ...}\n• Codex: [mcp_servers.name]\n• Zed: {\"context_servers\": ...}",
   "Paste a key": "貼上金鑰",
   "paste access token": "貼上存取權杖",
   "Paste the invite code your team shared. Toolport connects this device and pulls the team's server set.": "貼上您的團隊共享的邀請碼。 Toolport 連線此裝置並拉取團隊的伺服器集。",

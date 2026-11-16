@@ -940,6 +940,24 @@ pub fn add_snippet_server(
     fields: ServerFields,
     env: Vec<(String, Option<String>)>,
 ) -> Result<SnippetAddOutcome, String> {
+    add_snippet_server_choices(fields, env, &Default::default())
+}
+
+/// [`add_snippet_server`] with the user's Keychain choice per key; a key absent
+/// from `keychain` keeps the import's own secret detection.
+pub fn add_snippet_server_choices(
+    fields: ServerFields,
+    env: Vec<(String, Option<String>)>,
+    keychain: &std::collections::BTreeMap<String, bool>,
+) -> Result<SnippetAddOutcome, String> {
+    let mut seen = std::collections::BTreeSet::new();
+    if let Some((key, _)) = env.iter().find(|(key, _)| !seen.insert(key.as_str())) {
+        // A JSON map below would keep only one of them and drop the other value.
+        return Err(crate::i18n::trf(
+            "Use each variable name once. Rename or remove the second {value0}.",
+            &[("value0", key)],
+        ));
+    }
     let mut entry = entry_from_fields(fields)?;
     entry.env = env
         .iter()
@@ -951,7 +969,11 @@ pub fn add_snippet_server(
         })
         .collect();
     let definition = serde_json::json!({"env": env.into_iter().map(|(key, value)| (key, value.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null))).collect::<serde_json::Map<_, _>>()});
-    let import = crate::import_credentials::Import::prepare(entry, Some(&definition))?;
+    let import = crate::import_credentials::Import::prepare_with_choices(
+        entry,
+        Some(&definition),
+        Some(keychain),
+    )?;
     add_snippet_imports(vec![import], &Default::default())
 }
 
@@ -5144,6 +5166,224 @@ API_KEY = "synthetic-first-origin"
             inherit_env: None,
             hide_prompts: None,
         }
+    }
+
+    /// Each request's headers, in order.
+    type SeenHeaders = std::sync::Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>;
+
+    /// A loopback MCP endpoint that records the headers of every request.
+    struct HeaderEndpoint {
+        url: String,
+        seen: SeenHeaders,
+        server: std::sync::Arc<tiny_http::Server>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl HeaderEndpoint {
+        fn new() -> Self {
+            let server = std::sync::Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+            let url = format!("http://{}/mcp", server.server_addr());
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (endpoint, record) = (server.clone(), seen.clone());
+            let worker = std::thread::spawn(move || {
+                while let Ok(mut request) = endpoint.recv() {
+                    record.lock().unwrap().push(
+                        request
+                            .headers()
+                            .iter()
+                            .map(|h| (h.field.to_string(), h.value.to_string()))
+                            .collect(),
+                    );
+                    let mut body = String::new();
+                    let _ = request.as_reader().read_to_string(&mut body);
+                    let message: serde_json::Value =
+                        serde_json::from_str(&body).unwrap_or_default();
+                    if message.get("id").is_none() {
+                        let _ = request.respond(tiny_http::Response::empty(202));
+                        continue;
+                    }
+                    let result = serde_json::json!({"jsonrpc":"2.0","id":message["id"],"result":{
+                        "protocolVersion":"2025-06-18","capabilities":{"tools":{}},
+                        "serverInfo":{"name":"headers","version":"1"},"tools":[]}});
+                    let _ = request.respond(
+                        tiny_http::Response::from_string(result.to_string()).with_header(
+                            tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                .unwrap(),
+                        ),
+                    );
+                }
+            });
+            Self {
+                url,
+                seen,
+                server,
+                worker: Some(worker),
+            }
+        }
+
+        /// Every value of `name` the endpoint received, in order.
+        fn values(&self, name: &str) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .filter(|(field, _)| field.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+                .collect()
+        }
+    }
+
+    impl Drop for HeaderEndpoint {
+        fn drop(&mut self) {
+            self.server.unblock();
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum AddPath {
+        /// React: `add_server` with the form's rows, then `set_secret` per vaulted value.
+        React,
+        /// GTK: `add_snippet_server_choices` with the pasted rows.
+        Gtk,
+    }
+
+    /// Paste `paste` (with `{url}` replaced), save it through one shell's add
+    /// path, connect, and return the endpoint that saw the requests.
+    fn save_and_connect(paste: &str, path: AddPath) -> Result<HeaderEndpoint, String> {
+        let endpoint = HeaderEndpoint::new();
+        let paste = paste.replace("{url}", &endpoint.url);
+        let parsed = crate::clients::parse_snippet_for_user(&paste)
+            .map_err(crate::clients::SnippetError::message)?
+            .remove(0);
+        let fields = ServerFields {
+            sync_local_only: false,
+            initialize_timeout_ms: None,
+            name: parsed.name.clone(),
+            transport: parsed.transport.clone(),
+            command: parsed.command.clone(),
+            args: parsed.args.clone(),
+            url: parsed.url.clone(),
+            cwd: None,
+            inherit_env: None,
+            hide_prompts: None,
+        };
+        let secret = |e: &crate::clients::SnippetEnvVar| {
+            crate::import_credentials::secret_env(&e.key, e.value.as_deref())
+        };
+        let id = match path {
+            AddPath::Gtk => {
+                let env = parsed
+                    .env
+                    .iter()
+                    .map(|e| (e.key.clone(), e.value.clone()))
+                    .collect();
+                let keychain = parsed
+                    .env
+                    .iter()
+                    .map(|e| (e.key.clone(), secret(e)))
+                    .collect();
+                add_snippet_server_choices(fields, env, &keychain)?;
+                registry::load()?
+                    .servers
+                    .iter()
+                    .find(|s| s.name == parsed.name)
+                    .ok_or("saved")?
+                    .id
+                    .clone()
+            }
+            AddPath::React => {
+                let mut entry = entry_from_fields(fields)?;
+                entry.env = parsed
+                    .env
+                    .iter()
+                    .map(|e| registry::EnvVar {
+                        key: e.key.clone(),
+                        value: if secret(e) { None } else { e.value.clone() },
+                        secret: secret(e),
+                        unknown_fields: Default::default(),
+                    })
+                    .collect();
+                let (_, id) = add_reviewed_entry(entry)?;
+                for e in parsed.env.iter().filter(|e| secret(e)) {
+                    let Some(value) = &e.value else { continue };
+                    set_server_secret_with(&id, &e.key, value, |id, key| {
+                        Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0)
+                    })?;
+                }
+                id
+            }
+        };
+        let server = registry::load()?
+            .servers
+            .into_iter()
+            .find(|s| s.id == id)
+            .ok_or("saved")?;
+        crate::remote::connect_remote(&server)?;
+        Ok(endpoint)
+    }
+
+    /// A pasted header Toolport cannot send is refused before either shell saves
+    /// anything. Before, both shells saved it as a credential that was never sent
+    /// as `X-API-Key` and went out as `Authorization: Bearer abc` instead.
+    #[test]
+    fn pasted_custom_header_is_refused_in_both_shells() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            for paste in [
+                "claude mcp add -t http demo {url} -H 'X-API-Key: abc'",
+                r#"{"mcpServers":{"demo":{"type":"http","url":"{url}","headers":{"X-API-Key":"abc"}}}}"#,
+            ] {
+                for path in [AddPath::React, AddPath::Gtk] {
+                    let Err(error) = save_and_connect(paste, path) else {
+                        panic!("{path:?}: {paste} was saved");
+                    };
+                    assert_eq!(
+                        error,
+                        crate::clients::unsupported_header_message(),
+                        "{path:?}: {paste}"
+                    );
+                }
+            }
+            assert!(registry::load().unwrap().servers.is_empty());
+        });
+    }
+
+    #[test]
+    fn pasted_bearer_header_is_sent_as_written() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            for path in [AddPath::React, AddPath::Gtk] {
+                let endpoint = save_and_connect(
+                    &format!("claude mcp add -t http bearer-{path:?} {{url}} -H 'Authorization: Bearer abc'"),
+                    path,
+                )
+                .unwrap_or_else(|e| panic!("{path:?}: {e}"));
+                let sent = endpoint.values("Authorization");
+                assert!(!sent.is_empty(), "{path:?}");
+                assert!(sent.iter().all(|v| v == "Bearer abc"), "{path:?}: {sent:?}");
+            }
+        });
+    }
+
+    /// A pasted key renamed to match another row would keep only one value.
+    /// The add is refused before anything is read or written.
+    #[test]
+    fn snippet_add_refuses_a_repeated_variable_name() {
+        let env = vec![
+            ("API_KEY".to_string(), Some("abc".to_string())),
+            ("API_KEY".to_string(), None),
+        ];
+        let Err(error) =
+            add_snippet_server_choices(fields("dup", "stdio"), env, &Default::default())
+        else {
+            panic!("a repeated name is refused");
+        };
+        assert_eq!(
+            error,
+            "Use each variable name once. Rename or remove the second API_KEY."
+        );
     }
 
     fn test_path(label: &str) -> std::path::PathBuf {

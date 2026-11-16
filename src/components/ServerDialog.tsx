@@ -134,6 +134,12 @@ export function ServerDialog({
       portable: e.portable,
     })) ?? [],
   );
+  // Keys a paste brought in without a value (a `$TOKEN` it could not read, or a
+  // key the config left empty). The notice above the rows names them until filled.
+  const [pastedMissing, setPastedMissing] = useState<ReadonlySet<string>>(new Set());
+  const missingPasted = envRows
+    .filter((r) => r.key.trim() && !r.value && !r.source && pastedMissing.has(r.key))
+    .map((r) => r.key.trim());
   const [launch, setLaunch] = useState<LaunchConfig | null>(initial?.launch ?? null);
   const [launchValues, setLaunchValues] = useState<Record<string, string>>(
     Object.fromEntries(
@@ -224,6 +230,7 @@ export function ServerDialog({
       setTest(IDLE_TEST);
       setShowPaste(false);
       setPasteText("");
+      setPastedMissing(new Set());
     }
     setOpen(next);
     if (!next) setTouched(new Set());
@@ -284,6 +291,7 @@ export function ServerDialog({
           secret: e.secret ?? true,
         })),
       );
+      setPastedMissing(new Set(s.env.filter((e) => !e.value).map((e) => e.key)));
       setLaunch(null);
       setLaunchValues({});
       setBindingCleared(false);
@@ -292,7 +300,9 @@ export function ServerDialog({
       setShowPaste(false);
       setPasteText("");
     } catch (e) {
-      toastError(t("Couldn't parse: {value1}", { value1: String(e) }));
+      // The backend message is already in the user's language and never holds
+      // pasted text; GTK shows the same sentence.
+      toastError(String(e));
     } finally {
       setParsing(false);
     }
@@ -393,6 +403,22 @@ export function ServerDialog({
         "srv-initialize-timeout",
       ]);
     }
+  }
+  // Two rows with one name would save only one of their values. GTK refuses the
+  // same with the same sentence.
+  const seenKeys = new Set<string>();
+  const duplicateKey = envRows
+    .map((r) => r.key.trim())
+    .find((key) => key !== "" && (seenKeys.has(key) || (seenKeys.add(key), false)));
+  if (duplicateKey) {
+    const message = t(
+      "Use each variable name once. Rename or remove the second {value0}.",
+      {
+        value0: duplicateKey,
+      },
+    );
+    errors.push(message);
+    visibleErrors.push(message);
   }
   const ownName = editing
     ? (initial?.name ?? partialEdit?.name)?.trim().toLowerCase()
@@ -603,7 +629,7 @@ export function ServerDialog({
                 <textarea
                   className="min-h-[100px] w-full resize-y rounded-md bg-muted/50 p-2 font-mono text-meta"
                   placeholder={t(
-                    'Paste a config snippet from any client:\n\n• Claude Code: claude mcp add-json ...\n• Cursor/Devin/Antigravity: {"mcpServers": ...}\n• VS Code: {"servers": ...}\n• Codex: [mcp_servers.name]\n• Zed: {"context_servers": ...}',
+                    'Paste a config snippet from any client:\n\n• Claude Code: claude mcp add ... / claude mcp add-json ...\n• Cursor/Devin/Antigravity: {"mcpServers": ...}\n• VS Code: {"servers": ...}\n• Codex: [mcp_servers.name]\n• Zed: {"context_servers": ...}',
                   )}
                   value={pasteText}
                   onChange={(e) => setPasteText(e.target.value)}
@@ -908,6 +934,14 @@ export function ServerDialog({
                 }}
               />
             </p>
+            {missingPasted.length > 0 && (
+              <p role="status" className="text-meta text-warning">
+                {t(
+                  "Add a value for {value0} before saving. The pasted config did not include it.",
+                  { value0: missingPasted.join(", ") },
+                )}
+              </p>
+            )}
             {envRows.map((row, i) => (
               <div key={i} className="flex flex-wrap items-center gap-2">
                 <Input

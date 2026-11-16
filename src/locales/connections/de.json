@@ -659,7 +659,7 @@
   "Password manager": "Passwort-Manager",
   "Password manager provider": "Anbieter von Passwort-Managern",
   "Password manager: {reference}": "Passwort-Manager: {reference}",
-  "Paste a config snippet from any client:\n\n• Claude Code: claude mcp add-json ...\n• Cursor/Devin/Antigravity: {\"mcpServers\": ...}\n• VS Code: {\"servers\": ...}\n• Codex: [mcp_servers.name]\n• Zed: {\"context_servers\": ...}": "Konfigurationsausschnitt eines Clients einfügen:\n\n• Claude Code: claude mcp add-json ...\n• Cursor/Devin/Antigravity: {\"mcpServers\": ...}\n• VS Code: {\"servers\": ...}\n• Codex: [mcp_servers.name]\n• Zed: {\"context_servers\": ...}",
+  "Paste a config snippet from any client:\n\n• Claude Code: claude mcp add ... / claude mcp add-json ...\n• Cursor/Devin/Antigravity: {\"mcpServers\": ...}\n• VS Code: {\"servers\": ...}\n• Codex: [mcp_servers.name]\n• Zed: {\"context_servers\": ...}": "Konfigurationsausschnitt eines Clients einfügen:\n\n• Claude Code: claude mcp add ... / claude mcp add-json ...\n• Cursor/Devin/Antigravity: {\"mcpServers\": ...}\n• VS Code: {\"servers\": ...}\n• Codex: [mcp_servers.name]\n• Zed: {\"context_servers\": ...}",
   "Paste a key": "Fügen Sie einen Schlüssel ein",
   "paste access token": "Zugriffstoken einfügen",
   "Paste the invite code your team shared. Toolport connects this device and pulls the team's server set.": "Fügen Sie den Einladungscode ein, den Ihr Team geteilt hat. Toolport verbindet dieses Gerät und ruft den Serversatz des Teams ab.",
