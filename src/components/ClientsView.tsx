@@ -7,6 +7,7 @@ import type { ClientActivity, T3CodeOther } from "@/lib/types";
 import { fmtAgo } from "@/lib/utils";
 import { type RefObject, useEffect, useId, useRef, useState } from "react";
 import {
+  Check,
   ChevronDown,
   ChevronRight,
   Download,
@@ -14,6 +15,7 @@ import {
   MonitorCog,
   Puzzle,
   RefreshCw,
+  TriangleAlert,
 } from "lucide-react";
 import { ClientRecoveryBanners } from "@/components/ClientRecoveryBanners";
 import { ConnectReviewDialog } from "@/components/ConnectReviewDialog";
@@ -661,19 +663,21 @@ export function ClientsView({
     stopped: boolean;
   } | null>(null);
   const summaryShown = useRef<typeof summaryDue>(null);
-  const [allSummary, setAllSummary] = useState<{ text: string; success: boolean } | null>(
-    null,
-  );
+  const [allSummary, setAllSummary] = useState<{
+    title: string;
+    detail: string;
+    success: boolean;
+  } | null>(null);
   useEffect(() => {
     if (!summaryDue || summaryShown.current === summaryDue) return;
     summaryShown.current = summaryDue;
-    const { text, success } = connectAllSummary({
+    const { title, detail, success } = connectAllSummary({
       ...connectAllOutcome(clients, summaryDue.connectedIds, summaryDue.notConnectedIds),
       stopped: summaryDue.stopped,
     });
     // On the page until dismissed, as GTK shows it and as Clients keeps its restart
     // reminder: a toast fades before a long list of what was not connected is read.
-    setAllSummary({ text, success });
+    setAllSummary({ title, detail, success });
   }, [summaryDue, clients]);
   // When the batch closes, focus goes back to Connect all, or to the T3 Code card once
   // the button is gone, never to the page start.
@@ -773,35 +777,38 @@ export function ClientsView({
         onRecovered={() => void onChanged?.()}
       />
       {allSummary && (
-        // Connect all's summary, above the card as GTK places it. A long name breaks
-        // anywhere instead of running off a narrow window.
-        <div
+        // Connect all's summary, above the card as GTK places it: a spec §10 card that
+        // stays until dismissed. A long name breaks anywhere instead of running off a
+        // narrow window.
+        <StatusCard
           role="status"
-          data-testid="connect-all-summary"
-          data-tone={allSummary.success ? "success" : "warning"}
-          className={`flex select-text items-start gap-2 toolport-alert px-3 py-2 text-sm ${
-            allSummary.success
-              ? "border-success bg-success/8"
-              : "border-warning bg-warning/8"
-          }`}
-        >
-          <p className="min-w-0 flex-1 self-center text-foreground [overflow-wrap:anywhere]">
-            {allSummary.text}
-          </p>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => {
-              setAllSummary(null);
-              // Focus stays on the page, on Connect all or the card, as in GTK.
-              const button = connectAllButton.current;
-              if (button && !button.disabled) button.focus();
-              else t3Card.current?.focus();
-            }}
-          >
-            {t("Dismiss")}
-          </Button>
-        </div>
+          testId="connect-all-summary"
+          variant={allSummary.success ? "success" : "warning"}
+          icon={allSummary.success ? <Check /> : <TriangleAlert />}
+          title={allSummary.title}
+          detail={
+            allSummary.detail && (
+              <span className="select-text [overflow-wrap:anywhere]">
+                {allSummary.detail}
+              </span>
+            )
+          }
+          actions={
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setAllSummary(null);
+                // Focus stays on the page, on Connect all or the card, as in GTK.
+                const button = connectAllButton.current;
+                if (button && !button.disabled) button.focus();
+                else t3Card.current?.focus();
+              }}
+            >
+              {t("Dismiss")}
+            </Button>
+          }
+        />
       )}
       {sessionError && (
         <ErrorCallout

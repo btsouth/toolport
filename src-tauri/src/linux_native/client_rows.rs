@@ -1192,16 +1192,16 @@ pub(super) struct T3BatchOutcome {
     pub(super) keyboard: bool,
 }
 
-/// The Connect all summary: "[Connect all stopped. ]Connected X of Y T3 Code
-/// instance(s).[ Not connected: NAMES.][ LEFT OUT LINES]". React's `connectAllSummary`
-/// builds the same text.
+/// The Connect all summary as a card title and detail: "[Connect all stopped. ]Connected
+/// X of Y T3 Code instance(s).[ Not connected: NAMES.][ LEFT OUT LINES]", its first
+/// sentence as the title. React's `connectAllSummary` splits it the same way.
 pub(super) fn t3_code_batch_summary(
     stopped: bool,
     connected: usize,
     total: usize,
     not_connected: &[String],
     left_out: &[String],
-) -> String {
+) -> (String, String) {
     let mut parts = Vec::new();
     if stopped {
         parts.push(crate::i18n::tr("Connect all stopped."));
@@ -1224,15 +1224,17 @@ pub(super) fn t3_code_batch_summary(
         ));
     }
     parts.extend(left_out.iter().cloned());
-    parts.join(" ")
+    // The card's title is the first sentence; the rest is its detail.
+    let title = parts.remove(0);
+    (title, parts.join(" "))
 }
 
-/// The Connect all summary for `outcome` against the current rows, and whether it is a
-/// full success. React's `connectAllOutcome` and `connectAllSummary` work out the same.
+/// The Connect all summary for `outcome` against the current rows, as a card title and
+/// detail, and whether it is a full success. React's `connectAllOutcome` and `connectAllSummary` work out the same.
 pub(super) fn t3_code_batch_result(
     clients: &[state::ClientView],
     outcome: &T3BatchOutcome,
-) -> (String, bool) {
+) -> (String, String, bool) {
     // The enabled instances on a row as it is now, named as the steps name them.
     let enabled = |id: &String| {
         clients
@@ -1262,16 +1264,14 @@ pub(super) fn t3_code_batch_result(
         .collect::<Vec<_>>();
     let left_out = t3_code_left_out_lines(&t3_code_left_out(&others));
     let success = !outcome.stopped && not_connected.is_empty() && left_out.is_empty();
-    (
-        t3_code_batch_summary(
-            outcome.stopped,
-            connected,
-            connected + not_connected.len(),
-            &not_connected,
-            &left_out,
-        ),
-        success,
-    )
+    let (title, detail) = t3_code_batch_summary(
+        outcome.stopped,
+        connected,
+        connected + not_connected.len(),
+        &not_connected,
+        &left_out,
+    );
+    (title, detail, success)
 }
 
 /// A client's profiles under one entry: Claude Code profiles or Codex homes. Copies of the
@@ -1945,11 +1945,11 @@ mod tests {
     fn t3_code_batch_summary_says_what_stopped_and_what_is_not_connected() {
         assert_eq!(
             t3_code_batch_summary(false, 3, 3, &[], &[]),
-            "Connected 3 of 3 T3 Code instances."
+            ("Connected 3 of 3 T3 Code instances.".into(), String::new())
         );
         assert_eq!(
             t3_code_batch_summary(false, 1, 1, &[], &[]),
-            "Connected 1 of 1 T3 Code instance."
+            ("Connected 1 of 1 T3 Code instance.".into(), String::new())
         );
         assert_eq!(
             t3_code_batch_summary(
@@ -1959,7 +1959,10 @@ mod tests {
                 &["Cursor".into(), "Claude Code (claude_personal)".into()],
                 &[]
             ),
-            "Connected 2 of 4 T3 Code instances. Not connected: Cursor, Claude Code (claude_personal)."
+            (
+                "Connected 2 of 4 T3 Code instances.".into(),
+                "Not connected: Cursor, Claude Code (claude_personal).".into()
+            )
         );
         assert_eq!(
             t3_code_batch_summary(
@@ -1969,7 +1972,10 @@ mod tests {
                 &["Aider".into(), "Codex".into()],
                 &["F uses Kiro, which isn't installed. Install Kiro, then connect it.".into()]
             ),
-            "Connect all stopped. Connected 0 of 5 T3 Code instances. Not connected: Aider, Codex. F uses Kiro, which isn't installed. Install Kiro, then connect it."
+            (
+                "Connect all stopped.".into(),
+                "Connected 0 of 5 T3 Code instances. Not connected: Aider, Codex. F uses Kiro, which isn't installed. Install Kiro, then connect it.".into()
+            )
         );
     }
 
@@ -2004,7 +2010,8 @@ mod tests {
         assert_eq!(
             t3_code_batch_result(&clients, &outcome),
             (
-                "Connected 1 of 2 T3 Code instances. Not connected: OpenCode Go. F uses Kiro, which isn't installed. Install Kiro, then connect it.".into(),
+                "Connected 1 of 2 T3 Code instances.".into(),
+                "Not connected: OpenCode Go. F uses Kiro, which isn't installed. Install Kiro, then connect it.".into(),
                 false
             )
         );
@@ -2015,7 +2022,11 @@ mod tests {
         };
         assert_eq!(
             t3_code_batch_result(&clients[..1], &all),
-            ("Connected 1 of 1 T3 Code instance.".into(), true)
+            (
+                "Connected 1 of 1 T3 Code instance.".into(),
+                String::new(),
+                true
+            )
         );
         // A batch row that can no longer be read is named once, not again as left out.
         let mut broken = client("codex", Disconnected);
@@ -2029,7 +2040,8 @@ mod tests {
         assert_eq!(
             t3_code_batch_result(&[broken], &stopped),
             (
-                "Connect all stopped. Connected 0 of 1 T3 Code instance. Not connected: Codex Home.".into(),
+                "Connect all stopped.".into(),
+                "Connected 0 of 1 T3 Code instance. Not connected: Codex Home.".into(),
                 false
             )
         );

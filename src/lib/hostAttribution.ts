@@ -450,7 +450,7 @@ export function connectAllSummary({
   stopped: boolean;
   notConnected: string[];
   leftOut?: string[];
-}): { text: string; success: boolean } {
+}): { text: string; title: string; detail: string; success: boolean } {
   const parts = [
     stopped && translate("Connect all stopped."),
     translate(
@@ -462,9 +462,13 @@ export function connectAllSummary({
     notConnected.length > 0 &&
       translate("Not connected: {names}.", { names: notConnected.join(", ") }),
     ...leftOut,
-  ].filter(Boolean);
+  ].filter(Boolean) as string[];
+  // The card's title is the first sentence; the rest is its detail. GTK splits the same.
+  const [title, ...rest] = parts;
   return {
     text: parts.join(" "),
+    title,
+    detail: rest.join(" "),
     success: !stopped && notConnected.length === 0 && leftOut.length === 0,
   };
 }

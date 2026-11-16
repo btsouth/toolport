@@ -325,10 +325,20 @@ describe("connectAllSummary", () => {
   it("says only the count when every instance connected", () => {
     expect(
       connectAllSummary({ connected: 3, total: 3, stopped: false, notConnected: [] }),
-    ).toEqual({ text: "Connected 3 of 3 T3 Code instances.", success: true });
+    ).toEqual({
+      text: "Connected 3 of 3 T3 Code instances.",
+      title: "Connected 3 of 3 T3 Code instances.",
+      detail: "",
+      success: true,
+    });
     expect(
       connectAllSummary({ connected: 1, total: 1, stopped: false, notConnected: [] }),
-    ).toEqual({ text: "Connected 1 of 1 T3 Code instance.", success: true });
+    ).toEqual({
+      text: "Connected 1 of 1 T3 Code instance.",
+      title: "Connected 1 of 1 T3 Code instance.",
+      detail: "",
+      success: true,
+    });
   });
 
   it("names the rows it left out last, and is not a full success then", () => {
@@ -342,6 +352,8 @@ describe("connectAllSummary", () => {
       }),
     ).toEqual({
       text: "Connected 1 of 1 T3 Code instance. F uses Kiro, which isn't installed. Install Kiro, then connect it.",
+      title: "Connected 1 of 1 T3 Code instance.",
+      detail: "F uses Kiro, which isn't installed. Install Kiro, then connect it.",
       success: false,
     });
   });
@@ -356,6 +368,8 @@ describe("connectAllSummary", () => {
       }),
     ).toEqual({
       text: "Connected 2 of 4 T3 Code instances. Not connected: Cursor, Claude Code (claude_personal).",
+      title: "Connected 2 of 4 T3 Code instances.",
+      detail: "Not connected: Cursor, Claude Code (claude_personal).",
       success: false,
     });
   });
@@ -370,6 +384,8 @@ describe("connectAllSummary", () => {
       }),
     ).toEqual({
       text: "Connect all stopped. Connected 0 of 5 T3 Code instances. Not connected: Aider, Codex.",
+      title: "Connect all stopped.",
+      detail: "Connected 0 of 5 T3 Code instances. Not connected: Aider, Codex.",
       success: false,
     });
   });

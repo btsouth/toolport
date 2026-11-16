@@ -2851,7 +2851,7 @@ struct ClientPage {
     ended_batch: std::rc::Rc<std::cell::RefCell<Option<client_rows::T3BatchOutcome>>>,
     /// The page's wrapping notice that stays until dismissed, and its text.
     lasting: gtk::Box,
-    lasting_label: gtk::Label,
+    lasting_card: StatusCard,
 }
 
 impl ClientPage {
@@ -2895,25 +2895,14 @@ impl ClientPage {
         let recovery_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
         page.append(&recovery_box);
         page.append(&feedback);
-        // Connect all's summary lists what was not connected and why: it wraps here and
+        // Connect all's summary lists what was not connected and why: a spec §10 card that
         // stays until dismissed, through the rescans that hide the line above.
-        let lasting = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        lasting.add_css_class("toolport-feedback");
-        lasting.add_css_class("toolport-lasting-notice");
-        lasting.set_accessible_role(gtk::AccessibleRole::Status);
+        let lasting_card = StatusCard::new();
+        let lasting = lasting_card.root.clone();
         lasting.set_visible(false);
-        let lasting_label = gtk::Label::builder()
-            .xalign(0.0)
-            .hexpand(true)
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .valign(gtk::Align::Center)
-            .build();
-        lasting.append(&lasting_label);
         let dismiss = l10n::button("Dismiss");
         dismiss.add_css_class("flat");
-        dismiss.set_valign(gtk::Align::Start);
-        lasting.append(&dismiss);
+        lasting_card.actions.append(&dismiss);
         page.append(&lasting);
 
         // Full width, like every other list page; the row groups line up with Servers.
@@ -2968,7 +2957,7 @@ impl ClientPage {
             pending_batch: Default::default(),
             ended_batch: Default::default(),
             lasting,
-            lasting_label,
+            lasting_card,
         };
         watch_t3_code_settings(&client_page);
         let page_for_add = client_page.clone();
@@ -3287,16 +3276,20 @@ impl ClientPage {
         let batch = self.pending_batch.borrow_mut().take();
         if let Some(outcome) = &batch {
             // Built from this scan, so it counts what exists and is on now.
-            let (summary, success) = client_rows::t3_code_batch_result(&clients, outcome);
-            // Kept until dismissed either way, as React keeps it: green for a full
-            // success, amber when something was not connected.
+            let (title, detail, success) = client_rows::t3_code_batch_result(&clients, outcome);
+            // Kept until dismissed either way, as React keeps it: a success card for a
+            // full success, a warning card when something was not connected.
             self.cancel_feedback_timer();
             self.feedback.set_visible(false);
-            self.lasting_label.set_label(&summary);
-            self.lasting
-                .remove_css_class(if success { "warning" } else { "success" });
-            self.lasting
-                .add_css_class(if success { "success" } else { "warning" });
+            self.lasting_card.show(
+                if success {
+                    StatusTone::Success
+                } else {
+                    StatusTone::Warning
+                },
+                &title,
+                &detail,
+            );
             self.lasting.set_visible(true);
         } else if let Some(confirmation) = self.pending_confirmation.borrow_mut().take() {
             self.show_confirmation(&confirmation);
@@ -14683,6 +14676,129 @@ fn error_callout_with(
     card
 }
 
+/// A spec §10 card's tone: its tile colour, icon and status bar. Info has no bar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum StatusTone {
+    Info,
+    Success,
+    Warning,
+}
+
+impl StatusTone {
+    fn class(self) -> &'static str {
+        match self {
+            // Not libadwaita's .success or .warning, which colour all the card's text.
+            Self::Info => "status-info",
+            Self::Success => "status-success",
+            Self::Warning => "status-warning",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Info => "dialog-information-symbolic",
+            Self::Success => "object-select-symbolic",
+            Self::Warning => "dialog-warning-symbolic",
+        }
+    }
+}
+
+/// React's `StatusCard` (spec §10) whose tone and text change in place: a 32px tinted tile,
+/// a 14/600 title, optional detail and actions beside the title that move under the
+/// detail below 560px. Announced as a status.
+#[derive(Clone)]
+pub(super) struct StatusCard {
+    pub(super) root: gtk::Box,
+    tile: gtk::Image,
+    pub(super) title: gtk::Label,
+    pub(super) detail: gtk::Label,
+    pub(super) actions: gtk::Box,
+}
+
+impl StatusCard {
+    pub(super) fn new() -> Self {
+        let root = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .accessible_role(gtk::AccessibleRole::Status)
+            .build();
+        root.add_css_class("toolport-status-card");
+        let layout = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        let tile = gtk::Image::new();
+        tile.set_pixel_size(16);
+        tile.set_size_request(32, 32);
+        tile.set_valign(gtk::Align::Start);
+        tile.add_css_class("toolport-status-tile");
+        layout.append(&tile);
+        let copy = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        copy.set_hexpand(true);
+        let label = || {
+            gtk::Label::builder()
+                .xalign(0.0)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .selectable(true)
+                .build()
+        };
+        let title = label();
+        title.add_css_class("toolport-status-title");
+        copy.append(&title);
+        let detail = label();
+        detail.add_css_class("toolport-muted");
+        detail.add_css_class("toolport-status-detail");
+        copy.append(&detail);
+        layout.append(&copy);
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.set_valign(gtk::Align::Start);
+        layout.append(&actions);
+        let bin = adw::BreakpointBin::builder()
+            .width_request(280)
+            .height_request(1)
+            .build();
+        bin.set_child(Some(&layout));
+        let breakpoint =
+            adw::Breakpoint::new(adw::BreakpointCondition::parse("max-width: 560px").unwrap());
+        let (wide, narrow, buttons) = (layout.clone(), copy.clone(), actions.clone());
+        breakpoint.connect_apply(move |_| {
+            wide.remove(&buttons);
+            buttons.set_margin_top(8);
+            narrow.append(&buttons);
+        });
+        let (wide, narrow, buttons) = (layout.clone(), copy.clone(), actions.clone());
+        breakpoint.connect_unapply(move |_| {
+            narrow.remove(&buttons);
+            buttons.set_margin_top(0);
+            wide.append(&buttons);
+        });
+        bin.add_breakpoint(breakpoint);
+        root.append(&skills::IssueFrame::new(&bin, &layout));
+        let card = Self {
+            root,
+            tile,
+            title,
+            detail,
+            actions,
+        };
+        card.show(StatusTone::Info, "", "");
+        card
+    }
+
+    /// Shows `title` and `detail` (hidden when empty) in `tone`.
+    pub(super) fn show(&self, tone: StatusTone, title: &str, detail: &str) {
+        for other in [StatusTone::Info, StatusTone::Success, StatusTone::Warning] {
+            self.root.remove_css_class(other.class());
+        }
+        self.root.add_css_class(tone.class());
+        self.tile.set_icon_name(Some(tone.icon()));
+        self.title.set_label(title);
+        self.detail.set_label(detail);
+        self.detail.set_visible(!detail.is_empty());
+        self.root.update_property(&[
+            gtk::accessible::Property::Label(title),
+            gtk::accessible::Property::Description(detail),
+        ]);
+    }
+}
+
 fn state_card(icon_name: &str, title: &'static str, body: &'static str, error: bool) -> gtk::Box {
     // role="status" like React's EmptyState.
     let card = gtk::Box::builder()
@@ -16450,11 +16566,30 @@ mod tests {
             row("codex", "Codex", Disconnected),
         ]));
         settle();
-        let summary =
-            "Connect all stopped. Connected 1 of 2 T3 Code instances. Not connected: Codex.";
         assert!(page.lasting.is_visible(), "the summary shows");
-        assert_eq!(page.lasting_label.text(), summary);
-        assert!(page.lasting.has_css_class("warning"), "amber, as React's");
+        assert_eq!(page.lasting_card.title.text(), "Connect all stopped.");
+        assert_eq!(
+            page.lasting_card.detail.text(),
+            "Connected 1 of 2 T3 Code instances. Not connected: Codex."
+        );
+        // Spec §10: a warning status card with its tile and bar, announced as a status.
+        assert!(page.lasting.has_css_class("toolport-status-card"));
+        assert!(
+            page.lasting.has_css_class("status-warning"),
+            "amber, as React's"
+        );
+        // Only the bar and tile take the tone; the text keeps its own colour.
+        assert!(!page.lasting.has_css_class("warning"));
+        assert!(!page.lasting.has_css_class("toolport-feedback"));
+        assert_eq!(page.lasting.accessible_role(), gtk::AccessibleRole::Status);
+        assert_eq!(
+            page.lasting_card.tile.icon_name().as_deref(),
+            Some("dialog-warning-symbolic")
+        );
+        assert!(page
+            .lasting_card
+            .title
+            .has_css_class("toolport-status-title"));
         let button = connect_all(&page).unwrap();
         assert!(button.has_focus(), "focus returns to Connect all");
         assert!(
@@ -16496,11 +16631,17 @@ mod tests {
             "a full success is kept until dismissed"
         );
         assert_eq!(
-            page.lasting_label.text(),
+            page.lasting_card.title.text(),
             "Connected 1 of 1 T3 Code instance."
         );
-        assert!(page.lasting.has_css_class("success"));
-        assert!(!page.lasting.has_css_class("warning"));
+        assert!(!page.lasting_card.detail.is_visible(), "no detail to show");
+        assert!(page.lasting.has_css_class("status-success"));
+        assert!(!page.lasting.has_css_class("success"));
+        assert_eq!(
+            page.lasting_card.tile.icon_name().as_deref(),
+            Some("object-select-symbolic")
+        );
+        assert!(!page.lasting.has_css_class("status-warning"));
         let card = fixture_descendants(page.list.upcast_ref())
             .into_iter()
             .find(|w| w.has_css_class("toolport-t3-card-group"))
@@ -16540,10 +16681,7 @@ mod tests {
         }
         assert!(!page.scanning.get());
         assert!(page.lasting.is_visible(), "that scan shows the summary");
-        assert!(page
-            .lasting_label
-            .text()
-            .starts_with("Connect all stopped."));
+        assert_eq!(page.lasting_card.title.text(), "Connect all stopped.");
         window.close();
         let _ = std::fs::remove_dir_all(&root);
     }

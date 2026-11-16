@@ -51,9 +51,14 @@ vi.mock("sonner", () => ({
 /** Connect all's summary on the page, which stays until dismissed as GTK's does. */
 async function connectAllSummary(tone: "success" | "warning") {
   const summary = await screen.findByTestId("connect-all-summary");
-  expect(summary).toHaveAttribute("data-tone", tone);
+  // Spec §10: a status card in the outcome's tone, its first sentence as the title.
+  expect(summary).toHaveAttribute("data-slot", "status-card");
+  expect(summary).toHaveAttribute("data-variant", tone);
   expect(summary).toHaveAttribute("role", "status");
-  return summary;
+  const title =
+    summary.querySelector('[data-slot="status-card-title"]')?.textContent ?? "";
+  const detail = summary.querySelector('[data-slot="status-card-detail"]')?.textContent;
+  return [title, detail].filter(Boolean).join(" ");
 }
 beforeEach(() => {
   visibility.value = true;
@@ -1209,7 +1214,7 @@ describe("ClientsView", () => {
       await userEvent.click(screen.getByRole("button", { name: "Connect to Toolport" }));
       await userEvent.click(await screen.findByRole("button", { name: "Done" }));
       expect(previewClientSetup).not.toHaveBeenCalledWith("skip");
-      expect(await connectAllSummary("success")).toHaveTextContent(
+      expect(await connectAllSummary("success")).toContain(
         "Connected 3 of 3 T3 Code instances.",
       );
       expect(onChanged).toHaveBeenCalled();
@@ -1238,7 +1243,7 @@ describe("ClientsView", () => {
       expect(await screen.findByText("Step 1 of 1: One")).toBeVisible();
       await userEvent.click(screen.getByRole("button", { name: "Connect to Toolport" }));
       await userEvent.click(await screen.findByRole("button", { name: "Done" }));
-      expect(await connectAllSummary("warning")).toHaveTextContent(
+      expect(await connectAllSummary("warning")).toContain(
         "Connected 1 of 1 T3 Code instance. Work, Home use Kiro, which isn't installed. Install Kiro, then connect it.",
       );
       // It stays until dismissed, as GTK's does.
@@ -1270,8 +1275,16 @@ describe("ClientsView", () => {
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
       expect(previewClientSetup).not.toHaveBeenCalledWith("zed");
       expect(migrateClient).toHaveBeenCalledTimes(1);
-      expect(await connectAllSummary("warning")).toHaveTextContent(
+      expect(await connectAllSummary("warning")).toContain(
         "Connect all stopped. Connected 1 of 3 T3 Code instances. Not connected: One, Two.",
+      );
+      // The first sentence is the card's title, the rest its detail.
+      const card = screen.getByTestId("connect-all-summary");
+      expect(card.querySelector('[data-slot="status-card-title"]')).toHaveTextContent(
+        /^Connect all stopped\.$/,
+      );
+      expect(card.querySelector('[data-slot="status-card-detail"]')).toHaveTextContent(
+        /^Connected 1 of 3 T3 Code instances\. Not connected: One, Two\.$/,
       );
       expect(onChanged).toHaveBeenCalled();
       await waitFor(() =>
@@ -1300,7 +1313,7 @@ describe("ClientsView", () => {
       await userEvent.keyboard("{Escape}");
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
       expect(previewClientSetup).not.toHaveBeenCalledWith("codex");
-      expect(await connectAllSummary("warning")).toHaveTextContent(
+      expect(await connectAllSummary("warning")).toContain(
         "Connect all stopped. Connected 1 of 2 T3 Code instances. Not connected: Two.",
       );
       await waitFor(() =>
@@ -1341,7 +1354,7 @@ describe("ClientsView", () => {
       expect(screen.getByText("Step 2 of 2: Two, Three")).toBeVisible();
       await userEvent.click(screen.getByRole("button", { name: "Connect to Toolport" }));
       await userEvent.click(await screen.findByRole("button", { name: "Done" }));
-      expect(await connectAllSummary("warning")).toHaveTextContent(
+      expect(await connectAllSummary("warning")).toContain(
         "Connected 2 of 3 T3 Code instances. Not connected: One.",
       );
       await waitFor(() =>
@@ -1378,7 +1391,7 @@ describe("ClientsView", () => {
       expect(await screen.findByText("unreadable")).toBeVisible();
       await userEvent.click(screen.getByRole("button", { name: "Skip" }));
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-      expect(await connectAllSummary("warning")).toHaveTextContent(
+      expect(await connectAllSummary("warning")).toContain(
         "Connected 1 of 2 T3 Code instances. Not connected: Two.",
       );
     });
@@ -1457,7 +1470,7 @@ describe("ClientsView", () => {
         />,
       );
       await userEvent.keyboard("{Escape}");
-      expect(await connectAllSummary("warning")).toHaveTextContent(
+      expect(await connectAllSummary("warning")).toContain(
         "Connect all stopped. Connected 0 of 2 T3 Code instances. Not connected: One, Two.",
       );
     });
@@ -1501,7 +1514,7 @@ describe("ClientsView", () => {
       await userEvent.click(await screen.findByRole("button", { name: "Next" }));
       expect(await screen.findByText("Review and connect Codex")).toBeVisible();
       await userEvent.keyboard("{Escape}");
-      expect(await connectAllSummary("warning")).toHaveTextContent(
+      expect(await connectAllSummary("warning")).toContain(
         "Connect all stopped. Connected 1 of 2 T3 Code instances. Not connected: Two.",
       );
       expect(screen.getAllByTestId("connect-all-summary")).toHaveLength(1);

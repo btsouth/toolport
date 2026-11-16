@@ -35,6 +35,7 @@ export function StatusCard({
   children,
   role,
   className,
+  testId,
 }: {
   variant?: keyof typeof BAR;
   icon: ReactNode;
@@ -44,10 +45,12 @@ export function StatusCard({
   children?: ReactNode;
   role?: string;
   className?: string;
+  testId?: string;
 }) {
   return (
     <div
       role={role}
+      data-testid={testId}
       data-slot="status-card"
       data-variant={variant}
       className={cn(
@@ -66,7 +69,10 @@ export function StatusCard({
         {icon}
       </div>
       <div className="grid min-w-0 flex-1 grid-cols-[minmax(0,1fr)_auto] gap-x-2 @max-[560px]:grid-cols-1">
-        <p className="col-start-1 row-start-1 text-sm font-semibold break-words">
+        <p
+          data-slot="status-card-title"
+          className="col-start-1 row-start-1 text-sm font-semibold break-words"
+        >
           {title}
         </p>
         {actions && (
@@ -75,7 +81,10 @@ export function StatusCard({
           </div>
         )}
         {detail && (
-          <div className="col-span-full mt-1 text-meta break-words text-muted-foreground">
+          <div
+            data-slot="status-card-detail"
+            className="col-span-full mt-1 text-meta break-words text-muted-foreground"
+          >
             {detail}
           </div>
         )}
