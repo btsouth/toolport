@@ -18,13 +18,38 @@ pub struct ReapOutcome {
 }
 
 impl BridgeController {
+    /// At start: bring back an endpoint the user left on. Never asks to
+    /// unlock the keyring: while it is locked the endpoint shows as locked
+    /// and starts on the first unlock, or on the user's Retry.
     pub fn restore(&self) -> Result<bool, String> {
         let registry = crate::registry::load()?;
         if !registry.http_bridge_enabled {
             return Ok(false);
         }
+        if self.status().running {
+            return Ok(true);
+        }
+        if crate::http_bridge::hold_for_keyring(&self.state) {
+            let waiting = self.clone();
+            let later = self.clone();
+            crate::http_bridge::restore_after_unlock(
+                move || crate::http_bridge::waiting_for_keyring(&waiting.state),
+                move || {
+                    if let Err(error) = later.restore() {
+                        eprintln!("toolport: could not restore the native HTTP endpoint: {error}");
+                    }
+                },
+            );
+            return Ok(false);
+        }
         self.start(registry.http_bridge_port)?;
         Ok(true)
+    }
+
+    /// The user's Retry on a locked endpoint: may ask to unlock the keyring.
+    pub fn retry_restore(&self) -> Result<crate::http_bridge::HttpBridgeStatus, String> {
+        let registry = crate::registry::load()?;
+        self.start(registry.http_bridge_port)
     }
 
     pub fn start(&self, port: Option<u16>) -> Result<crate::http_bridge::HttpBridgeStatus, String> {
@@ -163,6 +188,8 @@ mod tests {
             assert!(prompts.is_empty(), "{prompts:?}");
             assert_eq!(restored, Some(Ok(false)));
             assert!(!bridge.status().running);
+            // End its wait for an unlock inside this test's data dir.
+            crate::http_bridge::stop(&bridge.state).unwrap();
         });
     }
 }

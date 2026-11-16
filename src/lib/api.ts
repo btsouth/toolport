@@ -410,6 +410,8 @@ export interface HttpBridgeStatus {
   port: number | null;
   url: string | null;
   token: string | null;
+  /** Left on, and waiting for the keyring to unlock before it starts. */
+  keyringLocked?: boolean;
 }
 
 /** Start the supervised toolport-gateway HTTP/OpenAPI server (Open WebUI etc.). */
@@ -420,6 +422,11 @@ export function startHttpBridge(port?: number): Promise<HttpBridgeStatus> {
 /** Stop the supervised HTTP/OpenAPI server. */
 export function stopHttpBridge(): Promise<HttpBridgeStatus> {
   return invoke<HttpBridgeStatus>("stop_http_bridge");
+}
+
+/** The user's Retry on an endpoint waiting for the keyring; may ask to unlock it. */
+export function retryHttpBridge(): Promise<HttpBridgeStatus> {
+  return invoke<HttpBridgeStatus>("retry_http_bridge");
 }
 
 /** Current HTTP/OpenAPI bridge status (reaps the child if it exited). */

@@ -2198,38 +2198,41 @@ fn start_team_lifecycle(app: &tauri::AppHandle) {
                     failures = 0;
                     3
                 }
-                Ok(true) => {
-                    let result = teams::sync_wait(25);
-                    let _ = handle.emit("team-sync-status", crate::team_sync_status::current());
-                    match result {
-                        Ok(result) => {
-                            failures = 0;
-                            if stop.load(std::sync::atomic::Ordering::Acquire) {
-                                break;
+                Ok(true) => match teams::background_sync(25) {
+                    // The keyring is locked: no prompt, no error, the next tick tries again.
+                    None => 5,
+                    Some(result) => {
+                        let _ = handle.emit("team-sync-status", crate::team_sync_status::current());
+                        match result {
+                            Ok(result) => {
+                                failures = 0;
+                                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                                    break;
+                                }
+                                let state = handle.state::<RegistryState>();
+                                match finish_sync(&handle, state.inner(), result) {
+                                    Ok(fresh) => {
+                                        let _ = handle.emit("team-sync-registry", &fresh);
+                                    }
+                                    Err(error) => {
+                                        let _ = handle.emit("team-sync-error", &error);
+                                    }
+                                }
+                                teams::retry_delay_seconds(0)
                             }
-                            let state = handle.state::<RegistryState>();
-                            match finish_sync(&handle, state.inner(), result) {
-                                Ok(fresh) => {
+                            Err(error) => {
+                                failures = failures.saturating_add(1);
+                                let _ = handle.emit("team-sync-error", &error);
+                                if let Ok(fresh) = registry::load() {
                                     let _ = handle.emit("team-sync-registry", &fresh);
                                 }
-                                Err(error) => {
-                                    let _ = handle.emit("team-sync-error", &error);
-                                }
+                                registry::load()
+                                    .map(|r| teams::sync_retry_seconds(&r, failures))
+                                    .unwrap_or_else(|_| teams::retry_delay_seconds(failures))
                             }
-                            teams::retry_delay_seconds(0)
-                        }
-                        Err(error) => {
-                            failures = failures.saturating_add(1);
-                            let _ = handle.emit("team-sync-error", &error);
-                            if let Ok(fresh) = registry::load() {
-                                let _ = handle.emit("team-sync-registry", &fresh);
-                            }
-                            registry::load()
-                                .map(|r| teams::sync_retry_seconds(&r, failures))
-                                .unwrap_or_else(|_| teams::retry_delay_seconds(failures))
                         }
                     }
-                }
+                },
                 Err(error) => {
                     failures = failures.saturating_add(1);
                     eprintln!("Toolport: Teams registry unavailable: {error}");
@@ -3739,7 +3742,15 @@ async fn stop_http_bridge(app: AppHandle) -> Result<HttpBridgeStatus, String> {
     .map_err(|error| format!("HTTP endpoint task failed: {error}"))?
 }
 
+/// At start: bring back an endpoint the user left on. Never asks to unlock
+/// the keyring: while it would, the endpoint shows as locked (`Ok(false)`),
+/// and [`restore_http_bridge_on_start`] starts it on the first unlock.
 fn restore_persisted_http_bridge(state: &HttpBridgeState) -> Result<bool, String> {
+    restore_saved_http_bridge(state, false)
+}
+
+/// `may_prompt` only for the user's Retry.
+fn restore_saved_http_bridge(state: &HttpBridgeState, may_prompt: bool) -> Result<bool, String> {
     let _lifecycle = HTTP_BRIDGE_LIFECYCLE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3747,10 +3758,52 @@ fn restore_persisted_http_bridge(state: &HttpBridgeState) -> Result<bool, String
     if !registry.http_bridge_enabled {
         return Ok(false);
     }
+    if crate::http_bridge::status(state).running {
+        return Ok(true);
+    }
+    if !may_prompt && crate::http_bridge::hold_for_keyring(state) {
+        return Ok(false);
+    }
     let token = secrets::get_secret_result(HTTP_BRIDGE_VAULT_SERVER, HTTP_BRIDGE_VAULT_KEY)?
         .ok_or("The HTTP endpoint is enabled, but its saved bearer token is missing")?;
     start_http_bridge_with_token_at(state, registry.http_bridge_port, Some(token))?;
     Ok(true)
+}
+
+/// Restore the saved endpoint at start, and if the keyring is locked, again as
+/// soon as it is unlocked.
+fn restore_http_bridge_on_start(app: AppHandle) {
+    let state = app.state::<HttpBridgeState>();
+    match restore_persisted_http_bridge(state.inner()) {
+        Ok(true) => eprintln!("toolport: restored the saved HTTP endpoint"),
+        Ok(false) if crate::http_bridge::waiting_for_keyring(state.inner()) => {
+            eprintln!("toolport: the saved HTTP endpoint waits for the keyring to unlock");
+            let waiting = app.clone();
+            crate::http_bridge::restore_after_unlock(
+                move || {
+                    crate::http_bridge::waiting_for_keyring(
+                        waiting.state::<HttpBridgeState>().inner(),
+                    )
+                },
+                move || restore_http_bridge_on_start(app),
+            );
+        }
+        Ok(false) => {}
+        Err(error) => eprintln!("toolport: could not restore the saved HTTP endpoint: {error}"),
+    }
+}
+
+/// The user's Retry on an endpoint that waited for the keyring. It may ask to
+/// unlock it.
+#[tauri::command]
+async fn retry_http_bridge(app: AppHandle) -> Result<HttpBridgeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<HttpBridgeState>();
+        restore_saved_http_bridge(state.inner(), true)?;
+        Ok(crate::http_bridge::status(state.inner()))
+    })
+    .await
+    .map_err(|error| format!("HTTP endpoint task failed: {error}"))?
 }
 
 /// Make an update-restored endpoint durable before its one-shot recovery marker
@@ -3781,6 +3834,14 @@ fn resume_http_bridge_after_update(
         return Ok(false);
     };
     ensure_http_bridge_at(state, intent.port, Some(intent.token.clone()))?;
+    if crate::secrets::store_would_prompt() {
+        // Saving the token would ask to unlock the keyring. The endpoint runs
+        // from the update's marker, which stays until a start can save it.
+        eprintln!(
+            "toolport: restored the HTTP endpoint after the update; it is saved once the keyring is unlocked"
+        );
+        return Ok(true);
+    }
     if let Err(error) = persist_restored_http_bridge(registry, intent.port, &intent.token) {
         eprintln!(
             "toolport: restored the HTTP endpoint, but could not save its persistent state: {error}"
@@ -3798,11 +3859,7 @@ fn resume_http_bridge_after_update(
 /// Report whether the HTTP bridge is running, reaping it if it has exited.
 #[tauri::command]
 fn http_bridge_status(state: State<HttpBridgeState>) -> Result<HttpBridgeStatus, String> {
-    let mut bridge = state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    http_bridge_alive(&mut bridge);
-    Ok(HttpBridgeStatus::new(bridge.port, bridge.token.clone()))
+    Ok(crate::http_bridge::status(state.inner()))
 }
 
 /// macOS only: show the Dock icon when a window is visible, and drop it (Accessory
@@ -4644,6 +4701,7 @@ pub fn run() {
             start_http_bridge,
             stop_http_bridge,
             http_bridge_status,
+            retry_http_bridge,
             stop_spawned_gateways,
             recover_update_gateways,
             stop_stale_gateways,
@@ -4763,15 +4821,7 @@ pub fn run() {
                         "toolport: could not restore the HTTP endpoint after the in-app update: {error}"
                     ),
                 }
-                match restore_persisted_http_bridge(
-                    migrate_handle.state::<HttpBridgeState>().inner(),
-                ) {
-                    Ok(true) => eprintln!("toolport: restored the saved HTTP endpoint"),
-                    Ok(false) => {}
-                    Err(error) => eprintln!(
-                        "toolport: could not restore the saved HTTP endpoint: {error}"
-                    ),
-                }
+                restore_http_bridge_on_start(migrate_handle.clone());
                 // Ownership map from disk (this launch thread has no RegistryState handle).
                 if !isolated_data_dir {
                     let managed_snapshot = registry::load()
@@ -5097,6 +5147,7 @@ mod tests {
             port: Some(9876),
             token: Some("preserved-secret-token".to_string()),
             proxy_mode: false,
+            waiting_for_keyring: false,
         };
 
         let error = stop_http_bridge_with(&mut bridge, |_| {

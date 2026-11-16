@@ -1387,6 +1387,9 @@ pub fn sync_wait(wait_secs: u64) -> Result<SyncResult, String> {
 /// asked for it, so it must never ask to unlock the keyring: `None` means it
 /// did not run, and the caller tries again on its next tick without an error.
 pub fn background_sync(wait_secs: u64) -> Option<Result<SyncResult, String>> {
+    if crate::secrets::store_would_prompt() {
+        return None;
+    }
     Some(sync_wait(wait_secs))
 }
 

@@ -13,6 +13,7 @@ import {
   EyeOff,
   FolderOpen,
   Globe,
+  KeyRound,
   Layers,
   Monitor,
   Moon,
@@ -79,6 +80,7 @@ import {
   setPiiRedaction,
   setToolPinned,
   startHttpBridge,
+  retryHttpBridge,
   stopHttpBridge,
   stopStaleGateways,
   clientsNeedingRestart,
@@ -926,6 +928,26 @@ export function SettingsView({
   useEffect(() => {
     loadBridge();
   }, [loadBridge]);
+  // An endpoint left on waits for the keyring at start, and starts by itself on
+  // the first unlock: re-read it until then so the panel shows it running.
+  const bridgeLocked = !!bridge?.keyringLocked;
+  useEffect(() => {
+    if (!bridgeLocked) return;
+    const timer = window.setInterval(loadBridge, 3000);
+    return () => window.clearInterval(timer);
+  }, [bridgeLocked, loadBridge]);
+
+  const retryBridge = async () => {
+    setBridgeBusy(true);
+    try {
+      setBridge(await retryHttpBridge());
+      setBridgeError(false);
+    } catch (e) {
+      toastError(t("Couldn't start the HTTP endpoint: {value2}", { value2: String(e) }));
+    } finally {
+      setBridgeBusy(false);
+    }
+  };
 
   useEffect(() => {
     let current = true;
@@ -1896,6 +1918,26 @@ export function SettingsView({
                 <button
                   type="button"
                   onClick={loadBridge}
+                  className="shrink-0 font-medium text-foreground underline underline-offset-2 hover:text-primary"
+                >
+                  {translate("Retry")}
+                </button>
+              </p>
+            )}
+            {bridgeLocked && (
+              <p className="flex items-center gap-1.5 text-meta text-muted-foreground">
+                <KeyRound className="size-3.5 shrink-0 text-warning" />
+                <span>
+                  <span className="font-medium text-foreground">
+                    {translate("Keyring locked")}
+                  </span>
+                  {" · "}
+                  {translate("Unlock your keyring, then choose Retry.")}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void retryBridge()}
+                  disabled={bridgeBusy}
                   className="shrink-0 font-medium text-foreground underline underline-offset-2 hover:text-primary"
                 >
                   {translate("Retry")}

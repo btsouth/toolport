@@ -1459,6 +1459,9 @@ struct SyncLoop {
     timer: RefCell<Option<gtk::glib::SourceId>>,
 }
 
+/// Seconds before a sync skipped for a locked keyring tries again.
+const KEYRING_RETRY_SECONDS: u64 = 5;
+
 fn sync_background_step(page: TeamsPage, runtime: Rc<SyncLoop>) {
     if runtime.stopped.get() || runtime.running.replace(true) {
         return;
@@ -1473,11 +1476,14 @@ fn sync_background_step(page: TeamsPage, runtime: Rc<SyncLoop>) {
                 // only the sync retry schedule, never a second fallback poll.
                 return Ok((None, 60));
             }
-            let result = crate::teams::sync_wait(25);
+            let Some(result) = crate::teams::background_sync(25) else {
+                // The keyring is locked: no prompt, no error, the next tick tries again.
+                return Ok((Some(None), KEYRING_RETRY_SECONDS));
+            };
             let retry = crate::registry::load()
                 .map(|r| crate::teams::sync_retry_seconds(&r, failures.saturating_add(1)))
                 .unwrap_or_else(|_| crate::teams::retry_delay_seconds(failures.saturating_add(1)));
-            Ok::<_, String>((Some(result), retry))
+            Ok::<_, String>((Some(Some(result)), retry))
         })
         .await;
         runtime.running.set(false);
@@ -1485,7 +1491,8 @@ fn sync_background_step(page: TeamsPage, runtime: Rc<SyncLoop>) {
             return;
         }
         let unpaired = matches!(&result, Ok(Ok((None, _))));
-        if !unpaired {
+        let skipped = matches!(&result, Ok(Ok((Some(None), _))));
+        if !unpaired && !skipped {
             page.app.activate_action("hidden-sync-finished", None);
         }
         let delay = match result {
@@ -1494,7 +1501,11 @@ fn sync_background_step(page: TeamsPage, runtime: Rc<SyncLoop>) {
                 runtime.failures.set(0);
                 delay
             }
-            Ok(Ok((Some(Ok(outcome)), _))) => {
+            Ok(Ok((Some(None), delay))) => {
+                runtime.unpaired.set(false);
+                delay
+            }
+            Ok(Ok((Some(Some(Ok(outcome))), _))) => {
                 runtime.unpaired.set(false);
                 runtime.failures.set(0);
                 page.absorb_sync_result(outcome);
@@ -1507,7 +1518,7 @@ fn sync_background_step(page: TeamsPage, runtime: Rc<SyncLoop>) {
                     page.refresh();
                 }
                 match error {
-                    Ok(Ok((Some(Err(_)), retry))) => retry,
+                    Ok(Ok((Some(Some(Err(_))), retry))) => retry,
                     _ => crate::teams::retry_delay_seconds(runtime.failures.get()),
                 }
             }

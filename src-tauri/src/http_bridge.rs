@@ -14,6 +14,10 @@ pub struct HttpBridge {
     pub(crate) port: Option<u16>,
     pub(crate) token: Option<String>,
     pub(crate) proxy_mode: bool,
+    /// The endpoint was left on, but restoring it at start would have had to
+    /// ask to unlock the keyring for its token. It waits for an unlock or the
+    /// user's Retry instead, and the shells show it as locked, not stopped.
+    pub(crate) waiting_for_keyring: bool,
 }
 
 pub type HttpBridgeState = Mutex<HttpBridge>;
@@ -25,6 +29,8 @@ pub struct HttpBridgeStatus {
     pub port: Option<u16>,
     pub url: Option<String>,
     pub token: Option<String>,
+    /// Left on, and waiting for the keyring to unlock before it starts.
+    pub keyring_locked: bool,
 }
 
 impl HttpBridgeStatus {
@@ -34,7 +40,67 @@ impl HttpBridgeStatus {
             url: port.map(|port| format!("http://localhost:{port}")),
             port,
             token,
+            keyring_locked: false,
         }
+    }
+
+    fn of(bridge: &HttpBridge) -> Self {
+        let mut status = Self::new(bridge.port, bridge.token.clone());
+        status.keyring_locked = !status.running && bridge.waiting_for_keyring;
+        status
+    }
+}
+
+/// How often a start held for the keyring checks, without asking, whether it
+/// has been unlocked.
+pub const KEYRING_POLL: Duration = Duration::from_secs(3);
+
+/// At start, before the saved token is read: true when reading it would ask to
+/// unlock the keyring. The state then shows as locked until the endpoint starts
+/// or is turned off. A running endpoint is never held.
+pub fn hold_for_keyring(state: &HttpBridgeState) -> bool {
+    let running = {
+        let mut bridge = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        alive(&mut bridge)
+    };
+    let hold = !running && crate::secrets::store_would_prompt();
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .waiting_for_keyring = hold;
+    hold
+}
+
+pub fn waiting_for_keyring(state: &HttpBridgeState) -> bool {
+    let mut bridge = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    !alive(&mut bridge) && bridge.waiting_for_keyring
+}
+
+/// Run `restore` once the keyring is unlocked (by anything: the first use of a
+/// server, another app, the user), checking without asking. Gives up when
+/// `still_waiting` turns false: the user started, retried or turned it off.
+pub fn restore_after_unlock(
+    still_waiting: impl Fn() -> bool + Send + 'static,
+    restore: impl FnOnce() + Send + 'static,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("toolport-bridge-unlock".into())
+        .spawn(move || loop {
+            std::thread::sleep(KEYRING_POLL);
+            if !still_waiting() {
+                return;
+            }
+            if !crate::secrets::store_would_prompt() {
+                restore();
+                return;
+            }
+        });
+    if let Err(error) = spawned {
+        eprintln!("toolport: could not wait for the keyring to restore the HTTP endpoint: {error}");
     }
 }
 
@@ -43,7 +109,7 @@ pub fn status(state: &HttpBridgeState) -> HttpBridgeStatus {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     alive(&mut bridge);
-    HttpBridgeStatus::new(bridge.port, bridge.token.clone())
+    HttpBridgeStatus::of(&bridge)
 }
 
 /// Reap the child if it has already exited; returns true if it is still alive.
@@ -156,6 +222,7 @@ pub fn start_with_token_at(
     bridge.port = Some(port);
     bridge.token = Some(token.clone());
     bridge.proxy_mode = true;
+    bridge.waiting_for_keyring = false;
     Ok(HttpBridgeStatus::new(Some(port), Some(token)))
 }
 
@@ -163,6 +230,8 @@ pub fn stop_with(
     bridge: &mut HttpBridge,
     kill_child: impl FnOnce(&mut std::process::Child) -> std::io::Result<()>,
 ) -> Result<HttpBridgeStatus, String> {
+    // Turning it off ends any wait for the keyring.
+    bridge.waiting_for_keyring = false;
     if let Some(mut child) = bridge.child.take() {
         let gracefully_exited = if bridge.proxy_mode {
             // Closing the parent-held pipe tells the proxy to release the
@@ -226,4 +295,47 @@ pub fn kill_on_exit(state: &HttpBridgeState) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _ = stop_with(&mut bridge, std::process::Child::kill);
+}
+
+#[cfg(test)]
+mod tests {
+    /// An endpoint held at start shows as locked, not stopped, until it is
+    /// turned off, and its restore runs on the first unlock, never before.
+    #[test]
+    fn a_held_endpoint_shows_locked_and_restores_on_the_first_unlock() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let state = std::sync::Arc::new(super::HttpBridgeState::default());
+            let (restored, restores) = std::sync::mpsc::channel();
+            let prompts = crate::secrets::locked_store::prompts_during(|| {
+                assert!(super::hold_for_keyring(&state));
+                let status = super::status(&state);
+                assert!(status.keyring_locked && !status.running, "{status:?}");
+                let waiting = state.clone();
+                super::restore_after_unlock(
+                    move || super::waiting_for_keyring(&waiting),
+                    move || restored.send(()).unwrap(),
+                );
+                // Still locked a full poll later: nothing restored.
+                let early = restores.recv_timeout(super::KEYRING_POLL * 2);
+                assert!(early.is_err(), "restored while the keyring was locked");
+            });
+            assert!(prompts.is_empty(), "{prompts:?}");
+            // Unlocked: the next poll restores it.
+            restores
+                .recv_timeout(super::KEYRING_POLL * 3)
+                .expect("restored after the unlock");
+
+            assert!(
+                !super::hold_for_keyring(&state),
+                "unlocked: nothing to hold"
+            );
+            crate::secrets::locked_store::prompts_during(|| {
+                assert!(super::hold_for_keyring(&state));
+            });
+            super::stop(&state).unwrap();
+            let status = super::status(&state);
+            assert!(!status.keyring_locked, "turned off: {status:?}");
+            assert!(!super::waiting_for_keyring(&state));
+        });
+    }
 }

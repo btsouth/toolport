@@ -53,6 +53,8 @@ pub(super) struct SettingsPage {
     launch_at_login: gtk::Switch,
     endpoint_status: gtk::Label,
     endpoint_button: gtk::Button,
+    /// A timer is re-reading a keyring-locked endpoint until it starts.
+    endpoint_watch: Rc<Cell<bool>>,
     copy_endpoint: gtk::Button,
     copy_endpoint_token: gtk::Button,
     reveal_endpoint_token: gtk::ToggleButton,
@@ -860,6 +862,7 @@ l10n::bind_dialog_heading(&error_dialog, msg("Could not start data removal"));
             launch_at_login,
             endpoint_status,
             endpoint_button,
+            endpoint_watch: Rc::new(Cell::new(false)),
             copy_endpoint: copy_endpoint.clone(),
             copy_endpoint_token: copy_endpoint_token.clone(),
             reveal_endpoint_token: reveal_endpoint_token.clone(),
@@ -1088,7 +1091,11 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
 
     fn toggle_endpoint(&self) {
         self.endpoint_button.set_sensitive(false);
-        let running = self.bridge.status().running;
+        let current = self.bridge.status();
+        let running = current.running;
+        // Retry on an endpoint left on while the keyring was locked: the user
+        // asked, so this one may ask to unlock it.
+        let retry = current.keyring_locked;
         l10n::bind_label(
             &self.feedback,
             if running {
@@ -1103,6 +1110,8 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
             let result = gtk::gio::spawn_blocking(move || {
                 if running {
                     bridge.stop()
+                } else if retry {
+                    bridge.retry_restore()
                 } else {
                     bridge.start(None)
                 }
@@ -1673,8 +1682,21 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
             }
             self.add_http_client.set_sensitive(true);
         } else {
-            self.endpoint_status.set_label(&tr("Stopped"));
-            l10n::bind_button(&self.endpoint_button, msg("Start"));
+            if status.keyring_locked {
+                l10n::bind_label_with(&self.endpoint_status, || {
+                    format!(
+                        "{} · {}",
+                        tr("Keyring locked"),
+                        tr("Unlock your keyring, then choose Retry.")
+                    )
+                });
+                l10n::bind_button(&self.endpoint_button, msg("Retry"));
+                self.watch_locked_endpoint();
+            } else {
+                // Bound, so it replaces the locked text's binding too.
+                l10n::bind_label(&self.endpoint_status, msg("Stopped"));
+                l10n::bind_button(&self.endpoint_button, msg("Start"));
+            }
             self.endpoint_button
                 .remove_css_class("toolport-destructive");
             self.endpoint_button.add_css_class("suggested-action");
@@ -1686,6 +1708,24 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
             self.endpoint_token_value.set_visible(false);
             self.add_http_client.set_sensitive(false);
         }
+    }
+
+    /// While the endpoint waits for the keyring, re-read it so the page shows
+    /// it running as soon as an unlock brings it back.
+    fn watch_locked_endpoint(&self) {
+        if self.endpoint_watch.replace(true) {
+            return;
+        }
+        let page = self.clone();
+        gtk::glib::timeout_add_local(crate::http_bridge::KEYRING_POLL, move || {
+            let status = page.bridge.status();
+            if status.keyring_locked {
+                return gtk::glib::ControlFlow::Continue;
+            }
+            page.endpoint_watch.set(false);
+            page.render_endpoint(status);
+            gtk::glib::ControlFlow::Break
+        });
     }
 
     fn render_http_clients(&self, settings: crate::registry_controller::HttpClientSettings) {

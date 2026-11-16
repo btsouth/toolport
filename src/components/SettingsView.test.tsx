@@ -13,7 +13,9 @@ import {
   removeToolportData,
   getRegistry,
   getBaselineNotice,
+  httpBridgeStatus,
   isAutostartEnabled,
+  retryHttpBridge,
   listServerTools,
   listQuarantined,
   releaseQuarantine,
@@ -51,6 +53,8 @@ vi.mock("@/lib/api", async (importOriginal) => {
     setSafetyLevel: vi.fn(),
     clientsNeedingRestart: vi.fn().mockResolvedValue([]),
     stopStaleGateways: vi.fn(),
+    httpBridgeStatus: vi.fn(actual.httpBridgeStatus),
+    retryHttpBridge: vi.fn(),
   };
 });
 
@@ -256,6 +260,37 @@ describe("SettingsView launch at login", () => {
     await waitFor(() => expect(control).toBeEnabled());
     expect(control).toHaveAttribute("aria-checked", "true");
     expect(screen.queryByText(/couldn't read the os setting/i)).not.toBeInTheDocument();
+  });
+});
+
+describe("SettingsView HTTP endpoint", () => {
+  it("shows an endpoint waiting for the keyring as locked, and Retry starts it", async () => {
+    const stopped = { running: false, port: null, url: null, token: null };
+    vi.mocked(httpBridgeStatus).mockResolvedValueOnce({
+      ...stopped,
+      keyringLocked: true,
+    });
+    vi.mocked(retryHttpBridge).mockResolvedValueOnce({
+      running: true,
+      port: 8765,
+      url: "http://localhost:8765",
+      token: "bridge-token",
+      keyringLocked: false,
+    });
+    const user = userEvent.setup();
+    renderSettings("connections");
+
+    expect(await screen.findByText("Keyring locked")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Unlock your keyring, then choose Retry\./),
+    ).toBeInTheDocument();
+    expect(retryHttpBridge).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(await screen.findByText("http://localhost:8765")).toBeInTheDocument();
+    expect(retryHttpBridge).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Keyring locked")).not.toBeInTheDocument();
   });
 });
 
