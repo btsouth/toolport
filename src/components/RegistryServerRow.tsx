@@ -59,13 +59,14 @@ interface Props {
   onReprobe?: () => void;
 }
 
-type Status = "disabled" | "checking" | "connected" | "needs-auth" | "error";
+type Status = "disabled" | "checking" | "connected" | "needs-auth" | "locked" | "error";
 
 function statusOf(enabled: boolean, health?: ProbeResult): Status {
   if (!enabled) return "disabled";
   // No probe result yet (loading, or queued behind an in-flight probe): checking.
   if (!health) return "checking";
   if (health.ok) return "connected";
+  if (health.keyringLocked) return "locked";
   if (health.authRequired) return "needs-auth";
   return "error";
 }
@@ -76,6 +77,8 @@ const STATUS_BADGE: Record<Status, "off" | "success" | "warning" | "destructive"
   checking: "off",
   connected: "success",
   "needs-auth": "warning",
+  // Waits on the user, like a sign-in: not a failure.
+  locked: "warning",
   error: "destructive",
 };
 
@@ -91,6 +94,7 @@ const STATUS_ARIA_LABEL: Record<Status, SourceMessage> = {
   checking: msg("Checking connection"),
   connected: msg("Connected"),
   "needs-auth": msg("Authentication required"),
+  locked: msg("Keyring locked"),
   error: msg("Connection error"),
 };
 
@@ -206,7 +210,7 @@ export function RegistryServerRow({
               : msg("Ready · {count} tools"),
             { count: health?.toolCount ?? 0 },
           )
-        : status === "error"
+        : status === "error" || status === "locked"
           ? serverFailureLabel(health!)
           : status === "checking"
             ? initializing
@@ -317,7 +321,7 @@ export function RegistryServerRow({
                 ? launcher
                   ? translate("Installing the server package")
                   : translate("Server initializing")
-                : status === "needs-auth" || status === "error"
+                : status === "needs-auth" || status === "error" || status === "locked"
                   ? label
                   : status === "connected"
                     ? label.replace(" · ", ", ")
@@ -348,7 +352,7 @@ export function RegistryServerRow({
 
           {health && !health.ok && health.error && (
             <span className="flex gap-1">
-              {status === "error" && onReprobe && (
+              {(status === "error" || status === "locked") && onReprobe && (
                 <button
                   type="button"
                   title={translate("Retry {value0} connection", { value0: server.name })}

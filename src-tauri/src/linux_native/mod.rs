@@ -9876,7 +9876,8 @@ fn probe_status_line(probe: &crate::server_runtime::ProbeResult) -> (String, &'s
     } else {
         (
             crate::i18n::lookup(probe.failure_label()),
-            if probe.auth_required {
+            // A locked keyring waits on the user, like a sign-in: not a failure.
+            if probe.auth_required || probe.keyring_locked {
                 "review"
             } else {
                 "error"
@@ -18375,6 +18376,14 @@ mod tests {
         assert_eq!(
             probe_status_line(&probe(false, 0, false)),
             ("Connection failed".to_string(), "error")
+        );
+        let locked = crate::server_runtime::ProbeResult {
+            keyring_locked: true,
+            ..probe(false, 0, false)
+        };
+        assert_eq!(
+            probe_status_line(&locked),
+            ("Keyring locked".to_string(), "review")
         );
     }
 

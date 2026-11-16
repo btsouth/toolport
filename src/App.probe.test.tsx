@@ -255,6 +255,12 @@ describe("App health visibility", () => {
       await screen.findByText("Unlock your keyring, then choose Retry."),
     ).toBeInTheDocument();
     expect(screen.queryByText(/couldn't start/i)).not.toBeInTheDocument();
+    // The row's chip: waiting on the user (warning), not failing (destructive).
+    const chip = screen
+      .getAllByText("Keyring locked")
+      .map((node) => node.closest("[data-slot='badge']"))
+      .find(Boolean);
+    expect(chip).toHaveAttribute("data-variant", "warning");
     expect(probeServers).toHaveBeenCalledWith(false);
     expect(probeServers).not.toHaveBeenCalledWith(true);
 
