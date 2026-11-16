@@ -268,6 +268,58 @@ describe("App health visibility", () => {
     await waitFor(() => expect(probeServers).toHaveBeenCalledWith(true));
   });
 
+  it("names servers waiting for the keyring as GTK does, not as servers that couldn't start", async () => {
+    localStorage.setItem("toolport.onboarded", "1");
+    const entry = (id: string, name: string) => ({
+      id,
+      enabled: true,
+      name,
+      transport: "stdio",
+      command: "example",
+      args: [],
+      env: [{ key: "TOKEN", secret: true }],
+      url: null,
+      source: "manual",
+    });
+    getRegistry.mockResolvedValue({
+      version: 3,
+      servers: [
+        entry("signin", "Needs sign-in server"),
+        entry("vault", "Vaulted server"),
+      ],
+      profiles: [
+        { id: "default", name: "Default", enabledServerIds: ["signin", "vault"] },
+      ],
+      activeProfileId: "default",
+    });
+    probeServers.mockResolvedValue([
+      {
+        serverId: "signin",
+        ok: false,
+        toolCount: 0,
+        error: "401",
+        authRequired: true,
+        keyringLocked: false,
+      },
+      {
+        serverId: "vault",
+        ok: false,
+        toolCount: 0,
+        error: "keyring locked",
+        authRequired: false,
+        keyringLocked: true,
+      },
+    ]);
+
+    render(<App />);
+
+    expect(
+      await screen.findByText("1 needs sign-in · 1 waiting for the keyring"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("2 servers need a quick check")).toBeInTheDocument();
+    expect(screen.queryByText(/couldn't start/i)).not.toBeInTheDocument();
+  });
+
   it("asks to unlock on Refresh and Ctrl+R, even queued behind the window's own probe", async () => {
     localStorage.setItem("toolport.onboarded", "1");
     getRegistry.mockResolvedValue({

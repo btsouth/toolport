@@ -1725,7 +1725,32 @@ function ServerNextAction({
       />
     );
   }
-  const errorCount = errorServers.length + lockedServers.length;
+  // Servers waiting for the keyring are named for that, as GTK's summary does,
+  // not counted with servers that couldn't start.
+  if (lockedServers.length > 0) {
+    const parts = [
+      authCount === 1
+        ? t("{value0} needs sign-in", { value0: authCount })
+        : authCount > 1
+          ? t("{value0} need sign-in", { value0: authCount })
+          : null,
+      errorServers.length > 0
+        ? t("{value0} failing", { value0: errorServers.length })
+        : null,
+      t("{value0} waiting for the keyring", { value0: lockedServers.length }),
+    ].filter((part): part is string => part !== null);
+    return (
+      <StatusCard
+        variant={errorServers.length > 0 ? "danger" : "warning"}
+        icon={<TriangleAlert />}
+        title={t("{value1} servers need a quick check", {
+          value1: authCount + errorServers.length + lockedServers.length,
+        })}
+        detail={parts.join(" · ")}
+      />
+    );
+  }
+  const errorCount = errorServers.length;
   const title =
     authCount === 1 && errorCount === 0
       ? t("Sign in to {value1}", { value1: authServers[0].name })

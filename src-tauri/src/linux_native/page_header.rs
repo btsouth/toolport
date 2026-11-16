@@ -133,8 +133,18 @@ mod imp {
             let indent = self.indent();
             let actions_width = (width - indent).min(actions_nat).max(actions_min);
             let top = title_height + ROW_GAP;
+            // Actions that keep to the right edge (server rows, as React's) sit
+            // there on their own line too.
+            let right = actions
+                .downcast_ref::<super::ActionFlow>()
+                .is_some_and(|flow| flow.imp().lines_end.get());
+            let left = if right {
+                (width - actions_width).max(indent)
+            } else {
+                indent
+            };
             actions.size_allocate(
-                &gtk::Allocation::new(indent, top, actions_width, (height - top).max(0)),
+                &gtk::Allocation::new(left, top, actions_width, (height - top).max(0)),
                 -1,
             );
         }
@@ -227,7 +237,10 @@ mod flow_imp {
     use super::*;
 
     #[derive(Default)]
-    pub struct ActionFlow;
+    pub struct ActionFlow {
+        /// Each line sits at the right edge, as React's row controls do.
+        pub(super) lines_end: std::cell::Cell<bool>,
+    }
 
     #[glib::object_subclass]
     impl ObjectSubclass for ActionFlow {
@@ -268,6 +281,11 @@ mod flow_imp {
             let mut top = 0;
             for line in lines(&children, width) {
                 let mut left = 0;
+                if self.lines_end.get() {
+                    let used = line.items.iter().map(|(_, w, _)| *w).sum::<i32>()
+                        + super::ACTION_SPACING * (line.items.len() as i32 - 1).max(0);
+                    left = (width - used).max(0);
+                }
                 for (child, child_width, child_height) in line.items {
                     child.size_allocate(
                         &gtk::Allocation::new(
@@ -358,6 +376,12 @@ impl ActionFlow {
 
     pub(super) fn append(&self, widget: &impl IsA<gtk::Widget>) {
         widget.insert_before(self, None::<&gtk::Widget>);
+    }
+
+    /// Put each line at the right edge instead of the left.
+    pub(super) fn set_lines_end(&self, end: bool) {
+        self.imp().lines_end.set(end);
+        self.queue_allocate();
     }
 }
 

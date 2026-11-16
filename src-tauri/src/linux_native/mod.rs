@@ -10162,7 +10162,10 @@ fn server_row(
     // The logo and text; the controls join them on one line in a HeaderWrap,
     // and move under the text in a narrow window, as on the Clients page.
     let lead = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    // The controls flow onto a second line when the row is too narrow for all of
+    // them, so no control (above all the status chip) is squeezed.
+    let controls = page_header::ActionFlow::new();
+    controls.set_lines_end(true);
     controls.set_valign(gtk::Align::Center);
     controls.set_halign(gtk::Align::End);
     let icon = branding::server_logo(&server.name, &server.transport);
@@ -10242,17 +10245,20 @@ fn server_row(
         });
     }
     // The status chip: the probe result for an enabled server, Off otherwise.
+    // Whole words on one line, as React's chip: never wrapped or cut. The name
+    // gives up its width first, and the controls move to their own line.
     let health = gtk::Label::builder()
         .valign(gtk::Align::Center)
-        .max_width_chars(28)
+        .single_line_mode(true)
+        .wrap(false)
+        .ellipsize(gtk::pango::EllipsizeMode::None)
         .css_classes(["toolport-server-state"])
         .build();
-    client_rows::wrap_row_text(&health);
     // The pill holds the status color; a dot in it, as in React.
     let chip = gtk::Box::builder()
         .spacing(4)
         .valign(gtk::Align::Center)
-        .css_classes(["toolport-badge", "toolport-badge-wraps"])
+        .css_classes(["toolport-badge"])
         .build();
     let dot = gtk::Box::builder()
         .valign(gtk::Align::Center)
@@ -18855,6 +18861,157 @@ mod tests {
             card.width()
         );
         window.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn server_status_chips_keep_whole_words_on_one_line_in_narrow_windows() {
+        adw::init().unwrap();
+        let scratch =
+            std::env::temp_dir().join(format!("toolport-status-chips-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&scratch);
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.StatusChips")
+            .build();
+        let page = ServerPage {
+            details: Default::default(),
+            app: app.clone(),
+            share_requests: Default::default(),
+            server_count: gtk::Label::new(None),
+            section_title: gtk::Label::new(None),
+            posture: gtk::Label::new(None),
+            search: gtk::SearchEntry::new(),
+            feedback: gtk::Label::new(None),
+            list: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            last_snapshot: Default::default(),
+            feedback_timer: Default::default(),
+            health_rows: Default::default(),
+            rows: Default::default(),
+            no_matches: Default::default(),
+            off_heading: Default::default(),
+            health: Default::default(),
+            registry_reload: Default::default(),
+        };
+        let mut view = server("Clerk (Full API)", "Local stdio");
+        view.id = "clerk".into();
+        let mut off = server("Cloudflare (Full API)", "Local stdio");
+        off.id = "cloudflare".into();
+        off.enabled = false;
+        let probe = |auth: Option<crate::call_failure::AuthTarget>, locked: bool, error: &str| {
+            crate::server_runtime::ProbeResult {
+                server_id: "clerk".into(),
+                ok: false,
+                tool_count: 0,
+                error: Some(error.into()),
+                auth_required: auth.is_some(),
+                failure: None,
+                auth_target: auth,
+                keyring_locked: locked,
+            }
+        };
+        use crate::call_failure::AuthTarget;
+        let ready = crate::server_runtime::ProbeResult {
+            ok: true,
+            tool_count: 12,
+            error: None,
+            ..probe(None, false, "")
+        };
+        let probes = [
+            probe(Some(AuthTarget::ServiceCredential), false, "401"),
+            probe(Some(AuthTarget::Endpoint), false, "401"),
+            probe(Some(AuthTarget::Scope), false, "403"),
+            probe(None, true, "keyring locked"),
+            probe(None, false, "ENOENT: no such file"),
+            probe(None, false, "downstream server exited"),
+            probe(None, false, "connection refused"),
+            ready,
+        ];
+        let state = |card: &gtk::Box| {
+            fn find(widget: &gtk::Widget) -> Option<gtk::Label> {
+                if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                    if label.has_css_class("toolport-server-state") {
+                        return Some(label.clone());
+                    }
+                }
+                let mut child = widget.first_child();
+                while let Some(next) = child {
+                    if let Some(found) = find(&next) {
+                        return Some(found);
+                    }
+                    child = next.next_sibling();
+                }
+                None
+            }
+            find(card.upcast_ref()).unwrap()
+        };
+        // The card's width in a 480 px window (no sidebar) and a 720 px one
+        // (after the sidebar), and at full width.
+        for width in [432, 452, 900] {
+            for language in [
+                "en", "de", "es", "fr", "pt-BR", "ja", "ko", "zh-CN", "zh-TW",
+            ] {
+                crate::i18n::set_language(language).unwrap();
+                let card = server_card(&view, "default", page.clone());
+                let off_card = server_card(&off, "default", page.clone());
+                let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                column.append(&card);
+                column.append(&off_card);
+                let window = gtk::Window::builder()
+                    .default_width(width)
+                    .default_height(400)
+                    .child(&column)
+                    .build();
+                window.present();
+                let check = |card: &gtk::Box, what: &str| {
+                    for _ in 0..30 {
+                        gtk::glib::MainContext::default().iteration(false);
+                    }
+                    let label = state(card);
+                    assert!(
+                        label.layout().line_count() == 1 && !label.layout().is_ellipsized(),
+                        "{language} at {width}: \"{}\" ({what}) takes {} lines in {} px",
+                        label.text(),
+                        label.layout().line_count(),
+                        label.width()
+                    );
+                    let (min, _, _, _) = card.measure(gtk::Orientation::Horizontal, -1);
+                    assert!(
+                        min <= width,
+                        "{language}: the row needs {min} px of {width}"
+                    );
+                    // The controls keep to the right edge, as in React, also on a
+                    // line of their own.
+                    let flow = label.parent().and_then(|chip| chip.parent()).unwrap();
+                    let mut last = flow.last_child();
+                    while let Some(widget) = last.clone().filter(|w| !w.should_layout()) {
+                        last = widget.prev_sibling();
+                    }
+                    let last = last.unwrap();
+                    let bounds = last.compute_bounds(&flow).unwrap();
+                    assert_eq!(
+                        (bounds.x() + bounds.width()).round() as i32,
+                        flow.width(),
+                        "{language} at {width}: the last control leaves the flow's right edge"
+                    );
+                    let in_card = last.compute_bounds(card).unwrap();
+                    let line = flow.parent().unwrap();
+                    let line_end = line.compute_bounds(card).unwrap();
+                    assert_eq!(
+                        (in_card.x() + in_card.width()).round() as i32,
+                        (line_end.x() + line_end.width()).round() as i32,
+                        "{language} at {width}: the controls leave the row's right edge"
+                    );
+                };
+                for probe in &probes {
+                    page.apply_probe("clerk", probe);
+                    check(&card, probe.failure_label());
+                }
+                check(&off_card, "off");
+                window.set_child(None::<&gtk::Widget>);
+                window.close();
+            }
+        }
+        crate::i18n::set_language("en").unwrap();
     }
 
     #[test]
