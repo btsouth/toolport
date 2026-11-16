@@ -17818,6 +17818,202 @@ mod tests {
         parent.close();
     }
 
+    /// A saved server and its editor, for the switch tests below.
+    fn switch_editor(
+        app_id: &str,
+        env: Vec<crate::registry::EnvVar>,
+    ) -> (
+        adw::ApplicationWindow,
+        adw::Window,
+        crate::registry::DataDirTestEnv,
+    ) {
+        use super::*;
+        adw::init().unwrap();
+        let data = crate::registry::DataDirTestEnv::new(app_id);
+        let app = adw::Application::builder()
+            .application_id(format!("com.tsout.Toolport.{app_id}"))
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gtk::gio::Cancellable::NONE).unwrap();
+        let parent = adw::ApplicationWindow::builder().application(&app).build();
+        let (content, page, _) = build_content(&app, crate::approval_broker::start_native());
+        parent.set_content(Some(&content));
+        parent.present();
+        let entry: crate::registry::ServerEntry = serde_json::from_value(serde_json::json!({
+            "id": "local", "name": "Local tool", "transport": "stdio", "command": "npx",
+            "args": [], "env": env,
+        }))
+        .unwrap();
+        let (_, id) = crate::registry::update(|r| Ok(r.add_server(entry.clone()))).unwrap();
+        let server = state::ServerView {
+            id: id.clone(),
+            name: "Local tool".into(),
+            origin_label: "Personal".into(),
+            transport: "stdio".into(),
+            transport_id: "stdio".into(),
+            command: Some("npx".into()),
+            args: vec![],
+            launch: None,
+            url: None,
+            cwd: None,
+            inherit_env: false,
+            hide_prompts: false,
+            secret_keys: entry
+                .env
+                .iter()
+                .filter(|e| e.secret)
+                .map(|e| e.key.clone())
+                .collect(),
+            plain_env: entry
+                .env
+                .iter()
+                .filter(|e| !e.secret)
+                .map(|e| state::PlainEnvView {
+                    key: e.key.clone(),
+                    value: e.value.clone().unwrap_or_default(),
+                    portable: None,
+                })
+                .collect(),
+            secret_references: Default::default(),
+            client_credentials: None,
+            enabled: false,
+            requires_review: false,
+            team_route_removed: false,
+            probe_fingerprint: 1,
+        };
+        let editor = open_server_editor_prefilled(Some(server), Some(id), page, None).unwrap();
+        (parent, editor, data)
+    }
+
+    fn editor_widgets(editor: &adw::Window) -> Vec<gtk::Widget> {
+        fn walk(widget: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+            out.push(widget.clone());
+            let mut child = widget.first_child();
+            while let Some(node) = child {
+                child = node.next_sibling();
+                walk(&node, out);
+            }
+        }
+        let mut all = Vec::new();
+        walk(editor.upcast_ref(), &mut all);
+        all
+    }
+
+    fn shown(widget: &gtk::Widget) -> bool {
+        let mut node = Some(widget.clone());
+        while let Some(widget) = node {
+            if !widget.is_visible() {
+                return false;
+            }
+            node = widget.parent();
+        }
+        true
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn a_stored_variable_can_be_removed_after_a_switch_to_http() {
+        use super::*;
+        let row = |key: &str, secret: bool| crate::registry::EnvVar {
+            key: key.into(),
+            value: (!secret).then(|| "plain".into()),
+            secret,
+            unknown_fields: Default::default(),
+        };
+        let (parent, editor, _data) = switch_editor("StoredSwitch", vec![row("API_KEY", true)]);
+        let all = || editor_widgets(&editor);
+        let transport = all()
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::DropDown>().ok())
+            .unwrap();
+        let entry = |placeholder: &str| {
+            all()
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Entry>().ok())
+                .find(|e| e.placeholder_text().as_deref() == Some(placeholder))
+                .unwrap()
+        };
+        let save = all()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .find(|b| b.label().as_deref() == Some("Save"))
+            .unwrap();
+        transport.set_selected(1);
+        entry("https://example.com/mcp").set_text("https://mcp.example.com/mcp");
+        let refusal = || {
+            all()
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Label>().ok())
+                .find(|l| l.has_css_class("error") && l.label().starts_with("Remote servers don't"))
+                .filter(|l| shown(l.upcast_ref()))
+        };
+        assert!(refusal().unwrap().label().contains("API_KEY"));
+        assert!(!save.is_sensitive());
+        // The stored variable the sentence names is on screen, as in React.
+        let name = all()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .find(|l| l.label() == "API_KEY")
+            .expect("the stored variable is listed");
+        assert!(shown(name.upcast_ref()));
+        let remove = all()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .find(|b| {
+                b.tooltip_text().as_deref() == Some("Remove variable") && shown(b.upcast_ref())
+            })
+            .expect("a remove action");
+        remove.emit_clicked();
+        assert!(refusal().is_none());
+        assert!(save.is_sensitive());
+        editor.close();
+        parent.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn a_stdio_server_is_not_checked_with_its_hidden_url() {
+        use super::*;
+        let (parent, editor, _data) = switch_editor(
+            "HiddenUrl",
+            vec![crate::registry::EnvVar {
+                key: "API_KEY".into(),
+                value: Some("plain".into()),
+                secret: false,
+                unknown_fields: Default::default(),
+            }],
+        );
+        let all = || editor_widgets(&editor);
+        let transport = all()
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::DropDown>().ok())
+            .unwrap();
+        let entry = |placeholder: &str| {
+            all()
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Entry>().ok())
+                .find(|e| e.placeholder_text().as_deref() == Some(placeholder))
+                .unwrap()
+        };
+        let refusal = || {
+            all()
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Label>().ok())
+                .find(|l| l.has_css_class("error") && l.label().starts_with("Remote servers don't"))
+                .filter(|l| shown(l.upcast_ref()))
+        };
+        transport.set_selected(1);
+        entry("https://example.com/mcp").set_text("https://mcp.example.com/mcp");
+        assert!(refusal().is_some());
+        // Back on stdio with the command cleared, the URL left in the hidden
+        // field does not make it a remote server.
+        transport.set_selected(0);
+        entry("npx").set_text("");
+        assert!(refusal().is_none());
+        editor.close();
+        parent.close();
+    }
+
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn a_refused_paste_leaves_the_form_and_shows_only_the_refusal() {

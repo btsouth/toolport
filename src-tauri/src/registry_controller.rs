@@ -5916,6 +5916,81 @@ API_KEY = "synthetic-first-origin"
         });
     }
 
+    /// "Name it Authorization" on an edit makes the row the server's token:
+    /// stored where sign-in keeps it, no Authorization row left, and the
+    /// registry file holds names only.
+    #[test]
+    fn an_authorization_row_on_an_edit_becomes_the_token() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let stdio = |name: &str| {
+                let mut entry = entry_from_fields(fields(name, "stdio")).unwrap();
+                entry.env = vec![registry::EnvVar {
+                    key: "REGION".into(),
+                    value: Some("eu".into()),
+                    secret: false,
+                    unknown_fields: Default::default(),
+                }];
+                add_reviewed_entry(entry).unwrap().1
+            };
+            let file = || std::fs::read_to_string(registry::registry_path().unwrap()).unwrap();
+            let server = |id: &str| {
+                registry::load()
+                    .unwrap()
+                    .servers
+                    .into_iter()
+                    .find(|s| s.id == id)
+                    .unwrap()
+            };
+            let assert_token = |id: &str, token: &str| {
+                let saved = server(id);
+                assert!(
+                    !saved
+                        .env
+                        .iter()
+                        .any(|e| e.key.eq_ignore_ascii_case("authorization")),
+                    "{:?}",
+                    saved.env
+                );
+                assert_eq!(
+                    crate::secrets::get_secret_result(id, crate::secrets::HTTP_AUTH_KEY)
+                        .unwrap()
+                        .as_deref(),
+                    Some(token)
+                );
+                assert!(!file().contains(token), "the token is in the registry file");
+            };
+
+            // GTK: the renamed row is a plain value in the edit form.
+            let id = stdio("gtk");
+            let rename = |value: &str| {
+                vec![PlainEnvEdit {
+                    key: "Authorization".into(),
+                    value: value.into(),
+                    local_only: None,
+                }]
+            };
+            update_server_fields_and_env(&id, fields("gtk", "http"), Some(rename("plain-token-1")))
+                .unwrap();
+            assert_token(&id, "plain-token-1");
+
+            // React with Keychain on: the row is a secret, its value set after.
+            let id = stdio("react");
+            let mut react = server(&id);
+            react.transport = "http".into();
+            react.command = None;
+            react.url = Some("https://example.com/mcp".into());
+            react.env = vec![registry::EnvVar {
+                key: "Authorization".into(),
+                value: None,
+                secret: true,
+                unknown_fields: Default::default(),
+            }];
+            registry::update(|r| apply_update_entry(r, react.clone())).unwrap();
+            set_server_secret(&id, "Authorization", "keychain-token-2").unwrap();
+            assert_token(&id, "keychain-token-2");
+        });
+    }
+
     /// A pasted key renamed to match another row would keep only one value.
     /// The add is refused before anything is read or written.
     #[test]

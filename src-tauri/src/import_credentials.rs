@@ -887,6 +887,54 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_server_imports_only_its_token_from_env() {
+        // Cursor keeps `env` on a URL server but never sends it. Toolport would
+        // send a stored env row as the bearer token, so only the token comes in.
+        let mut raw = entry(true);
+        raw.env.clear();
+        raw.url = Some("https://example.invalid/mcp".into());
+        let import = Import::prepare(
+            raw,
+            Some(&json!({"env":{"RESEND_API_KEY":"re_synthetic","REGION":"eu","OTHER_REF":"${OTHER_REF}"}})),
+        )
+        .unwrap();
+        let keys: Vec<_> = import.entry.env.iter().map(|e| e.key.as_str()).collect();
+        assert!(keys.is_empty(), "{keys:?}");
+        assert!(import.values.is_empty());
+
+        // The tokens a remote import names still come in: Authorization and
+        // the bearer_token_env_var (Codex) or bearerTokenEnvVar (Kimi) key.
+        for definition in [
+            json!({"bearerTokenEnvVar":"KIMI_TOKEN","env":{"RESEND_API_KEY":"re_synthetic"}}),
+            json!({"bearer_token_env_var":"KIMI_TOKEN","env":{"RESEND_API_KEY":"re_synthetic"}}),
+        ] {
+            let mut raw = entry(true);
+            raw.env.clear();
+            raw.url = Some("https://example.invalid/mcp".into());
+            let import = Import::prepare(raw, Some(&definition)).unwrap();
+            let keys: Vec<_> = import.entry.env.iter().map(|e| e.key.as_str()).collect();
+            assert_eq!(keys, ["KIMI_TOKEN"]);
+        }
+        let mut raw = entry(true);
+        raw.env.clear();
+        raw.url = Some("https://example.invalid/mcp".into());
+        let import = Import::prepare(
+            raw,
+            Some(&json!({"env":{"Authorization":"Bearer synthetic","RESEND_API_KEY":"re_synthetic"}})),
+        )
+        .unwrap();
+        let keys: Vec<_> = import.entry.env.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, [secrets::HTTP_AUTH_KEY]);
+
+        // A stdio server keeps its environment.
+        let mut raw = entry(false);
+        raw.env.clear();
+        let import =
+            Import::prepare(raw, Some(&json!({"env":{"RESEND_API_KEY":"re_synthetic"}}))).unwrap();
+        assert!(import.entry.env.iter().any(|e| e.key == "RESEND_API_KEY"));
+    }
+
+    #[test]
     fn reviewed_bearer_env_names_always_remain_secret() {
         for key in ["LINEAR_APIKEY", "MCP_CRED"] {
             let mut raw = entry(true);
