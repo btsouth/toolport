@@ -507,6 +507,8 @@ pub(super) struct ClientSnapshot {
     pub(super) profiles: Vec<ProfileView>,
     pub(super) sessions: Vec<serde_json::Value>,
     pub(super) sessions_error: bool,
+    /// T3 Code instances Toolport can't connect, for the T3 Code card.
+    pub(super) t3_others: Vec<crate::clients::T3CodeOther>,
 }
 
 fn default_access_display_label(registry: &Registry) -> String {
@@ -634,6 +636,8 @@ pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
         profiles: client_access_options(&registry),
         sessions,
         sessions_error,
+        // Read off the main thread: it may look at an instance's home folder.
+        t3_others: crate::clients::t3_code_other_instances(),
     })
 }
 

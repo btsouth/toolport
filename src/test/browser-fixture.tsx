@@ -1139,6 +1139,8 @@ mockIPC(
       case "plugin:updater|check":
       case "t3_code_revision":
         return null;
+      case "t3_code_other_instances":
+        return [];
       case "savings_summary":
         return savingsSummary;
       case "plugin:app|version":

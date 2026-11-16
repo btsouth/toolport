@@ -114,7 +114,14 @@ fn fixture_home() -> PathBuf {
 
 fn instances_of(reading: Reading) -> Vec<Instance> {
     match reading {
-        Reading::Instances(instances) => instances,
+        Reading::Instances(instances, _, _) => instances,
+        other => panic!("expected instances, got {other:?}"),
+    }
+}
+
+fn others_of(reading: Reading) -> Vec<T3CodeOther> {
+    match reading {
+        Reading::Instances(_, others, _) => others,
         other => panic!("expected instances, got {other:?}"),
     }
 }
@@ -219,6 +226,145 @@ fn reads_only_allow_listed_fields_and_maps_each_provider() {
 }
 
 #[test]
+fn instances_toolport_cannot_connect_are_listed_with_why() {
+    let home = fixture_home();
+    let others = others_of(parse(fixture(&home).into_bytes(), &home));
+    let summary: Vec<(&str, &str, &str, bool, T3CodeGap)> = others
+        .iter()
+        .map(|o| {
+            (
+                o.instance_id.as_str(),
+                o.provider_name.as_str(),
+                o.display_name.as_str(),
+                o.enabled,
+                o.gap,
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            // ACP Registry instances are on by default in T3 Code; the agent is named
+            // only when its id is a plain identifier.
+            (
+                "acp_goose",
+                "ACP Registry: goose",
+                "ACP Registry: goose",
+                true,
+                T3CodeGap::Unsupported
+            ),
+            (
+                "acp_odd",
+                "ACP Registry",
+                "Odd agent",
+                false,
+                T3CodeGap::Unsupported
+            ),
+            // T3 Code gives Antigravity a private GEMINI_HOME.
+            (
+                "antigravity",
+                "Antigravity",
+                "Antigravity",
+                false,
+                T3CodeGap::PrivateHome
+            ),
+            // A config that is not an object says nothing about the home.
+            (
+                "array_config",
+                "Claude",
+                "Array Config",
+                true,
+                T3CodeGap::Malformed
+            ),
+            // A driver id that is not an identifier is not shown; the instance still is.
+            (
+                "bad driver",
+                "",
+                "bad driver",
+                false,
+                T3CodeGap::Unsupported
+            ),
+            // An environment that is not a list: only plain-text fields are shown.
+            (
+                "broken_env",
+                "Grok",
+                "Broken Env",
+                true,
+                T3CodeGap::Malformed
+            ),
+            // CLAUDE_CONFIG_DIR is marked sensitive: the home is unknown and not read.
+            (
+                "claude_hidden",
+                "Claude",
+                "Claude Hidden",
+                true,
+                T3CodeGap::HiddenHome
+            ),
+            // T3 Code passes CLAUDE_CONFIG_DIR as it is, so `~` is not the home folder.
+            (
+                "claude_tilde",
+                "Claude",
+                "Claude Tilde",
+                true,
+                T3CodeGap::RelativeHome
+            ),
+            (
+                "codex_hidden",
+                "Codex",
+                "Codex Hidden",
+                true,
+                T3CodeGap::HiddenHome
+            ),
+            (
+                "codex_relative_env",
+                "Codex",
+                "Codex Relative",
+                true,
+                T3CodeGap::RelativeHome
+            ),
+            // A driver T3 Code adds later shows under its id.
+            (
+                "future",
+                "somethingNew",
+                "somethingNew",
+                false,
+                T3CodeGap::Unsupported
+            ),
+            ("fx", "fx", "fx", true, T3CodeGap::Unsupported),
+            // A home behind a sensitive variable is unknown, and its value is not read.
+            ("grok_hidden", "Grok", "Grok", true, T3CodeGap::HiddenHome),
+            (
+                "hidden_xdg",
+                "OpenCode",
+                "Hidden",
+                true,
+                T3CodeGap::HiddenHome
+            ),
+            (
+                "muse",
+                "Muse Code",
+                "Muse Code",
+                false,
+                T3CodeGap::Unsupported
+            ),
+            // A display name that is not text is not shown: the provider's name instead.
+            ("odd_name", "Codex", "Codex", true, T3CodeGap::Malformed),
+            // A home variable whose value is not text.
+            ("pi_hidden", "Pi", "Pi Hidden", true, T3CodeGap::HiddenHome),
+            (
+                "relative_codex",
+                "Codex",
+                "Relative",
+                true,
+                T3CodeGap::RelativeHome
+            ),
+            // An entry that is not an object at all: its id only.
+            ("text_entry", "", "text_entry", true, T3CodeGap::Malformed),
+        ]
+    );
+}
+
+#[test]
 fn a_key_in_the_settings_never_reaches_any_output() {
     let root = std::env::temp_dir().join(format!(
         "toolport-t3-secrets-{}-{}",
@@ -285,8 +431,21 @@ fn a_key_in_the_settings_never_reaches_any_output() {
             );
         }
     }
+    let others = other_instances();
+    // Every way an instance can be listed without being connected is in this output.
+    for gap in [
+        T3CodeGap::Unsupported,
+        T3CodeGap::PrivateHome,
+        T3CodeGap::Malformed,
+        T3CodeGap::HiddenHome,
+        T3CodeGap::RelativeHome,
+    ] {
+        assert!(others.iter().any(|other| other.gap == gap), "{gap:?}");
+    }
     let outputs = [
         format!("{reading:?}"),
+        format!("{others:?}"),
+        serde_json::to_string(&others).unwrap(),
         format!("{rows:?}"),
         serde_json::to_string(&clients).unwrap(),
         format!("{clients:?}"),
@@ -383,6 +542,35 @@ fn malformed_or_odd_files_fall_back_without_breaking() {
     );
     // "bad" keeps its id from the default but contributes no instance.
     assert!(instances.iter().all(|i| i.id != "bad"));
+    // Neither is dropped silently: the card lists both, with why.
+    let others = others_of(parse(
+        br#"{"providerInstances": {
+            "bad": {"driver": "claudeAgent", "config": {"homePath": 42}},
+            "relative": {"driver": "claudeAgent", "config": {"homePath": "relative/dir"}},
+            "number": 5
+        }}"#
+        .to_vec(),
+        &home,
+    ));
+    let summary: Vec<(&str, &str, &str, T3CodeGap)> = others
+        .iter()
+        .map(|o| {
+            (
+                o.instance_id.as_str(),
+                o.provider_name.as_str(),
+                o.display_name.as_str(),
+                o.gap,
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            ("bad", "Claude", "Claude", T3CodeGap::Malformed),
+            ("number", "", "number", T3CodeGap::Malformed),
+            ("relative", "Claude", "Claude", T3CodeGap::RelativeHome),
+        ]
+    );
 }
 
 #[test]
@@ -536,6 +724,7 @@ fn location_ids_are_stable_and_recognised() {
 
 #[test]
 fn t3_homes_without_launchers_become_locations_once() {
+    let _lock = crate::registry::data_dir_test_lock();
     let root = std::env::temp_dir().join(format!(
         "toolport-t3-rows-{}-{}",
         std::process::id(),
@@ -560,8 +749,6 @@ fn t3_homes_without_launchers_become_locations_once() {
         ),
     )
     .unwrap();
-    // `automatic` reads the saved locations, so the data folder must be a scratch one.
-    let _lock = crate::registry::data_dir_test_lock();
     let _data = crate::registry::DataDirOverride::set(root.join("data"));
     let _home = TestHome::set(&home);
     let real = std::fs::canonicalize(&home).unwrap();
@@ -724,6 +911,169 @@ fn a_saved_t3_home_whose_folder_is_gone_reads_as_not_installed() {
     assert!(client.location_removable, "it can be forgotten");
     // Nothing recreates the folder: writes still need a safe, existing folder.
     assert!(locations::validate_mutation(&row.id, &row.config_path).is_err());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// R2-5: an instance whose home Toolport will not use is listed on the card with why,
+/// never dropped: a home outside home or with `..` (classified by its text only), a folder
+/// that does not exist yet, and a folder or config file that is a link. An OpenCode, Grok
+/// or Pi home no row covers, existing or not, is listed to add by hand; one that is an
+/// existing row's config (here the client's default, spelled as T3 Code or as Toolport
+/// does) is not. Only the display name and provider are shown, never the path text from
+/// the settings.
+#[test]
+fn every_home_toolport_will_not_use_is_listed_with_why() {
+    let _lock = crate::registry::data_dir_test_lock();
+    let root = std::env::temp_dir().join(format!(
+        "toolport-t3-homes-{}-{}",
+        std::process::id(),
+        epoch_millis()
+    ));
+    let home = root.join("home");
+    let outside = root.join("outside-folder");
+    std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+    std::fs::create_dir_all(home.join("ok")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::create_dir_all(home.join(".oc-xdg/opencode")).unwrap();
+    std::fs::write(home.join(".oc-xdg/opencode/opencode.json"), "{}").unwrap();
+    std::fs::create_dir_all(home.join(".grok")).unwrap();
+    #[cfg(not(unix))]
+    let linked = "";
+    #[cfg(unix)]
+    let linked = {
+        std::fs::create_dir_all(home.join("real")).unwrap();
+        std::os::unix::fs::symlink(home.join("real"), home.join("link")).unwrap();
+        std::fs::create_dir_all(home.join("lf")).unwrap();
+        std::fs::write(home.join("real/.claude.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(home.join("real/.claude.json"), home.join("lf/.claude.json"))
+            .unwrap();
+        r#",
+            "linked": {"driver": "claudeAgent", "displayName": "Linked", "config": {"homePath": "~/link"}},
+            "linked_file": {"driver": "claudeAgent", "displayName": "Linked File", "config": {"homePath": "~/lf"}}"#
+    };
+    let o = json_path(&outside);
+    std::fs::write(
+        home.join(".t3/userdata/settings.json"),
+        format!(
+            r#"{{"providerInstances": {{
+            "outside": {{"driver": "claudeAgent", "displayName": "Outside", "config": {{"homePath": "{o}"}}}},
+            "net": {{"driver": "codex", "config": {{"homePath": "/net/host/share"}}}},
+            "traversal": {{"driver": "claudeAgent", "displayName": "Traversal",
+              "config": {{"homePath": "~/ok/../../someone-else"}}}},
+            "missing": {{"driver": "grok", "displayName": "Missing", "enabled": true,
+              "environment": [{{"name": "GROK_HOME", "value": "~/.grok-not-yet"}}]}},
+            "oc_plain": {{"driver": "opencode", "displayName": "Plain OC", "enabled": true,
+              "environment": [{{"name": "XDG_CONFIG_HOME", "value": "~/.oc-xdg"}}]}},
+            "grok_default": {{"driver": "grok", "displayName": "Grok Default",
+              "environment": [{{"name": "GROK_HOME", "value": "~/.grok"}}]}},
+            "pi_default": {{"driver": "pi", "displayName": "Pi Default",
+              "environment": [{{"name": "PI_CODING_AGENT_DIR", "value": "~/.pi/agent"}}]}},
+            "off_missing": {{"driver": "claudeAgent", "displayName": "Off Missing", "enabled": false,
+              "config": {{"homePath": "~/gone-off"}}}},
+            "inside": {{"driver": "claudeAgent", "displayName": "Inside", "config": {{"homePath": "~/ok"}}}}{linked}
+        }}}}"#
+        ),
+    )
+    .unwrap();
+    let _data = crate::registry::DataDirOverride::set(root.join("data"));
+    let _home = TestHome::set(&home);
+    let others = other_instances();
+    let gap = |other: &T3CodeOther| {
+        serde_json::to_value(other.gap)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let mut summary: Vec<(&str, &str, &str, bool, String)> = others
+        .iter()
+        .map(|o| {
+            (
+                o.instance_id.as_str(),
+                o.provider_name.as_str(),
+                o.display_name.as_str(),
+                o.enabled,
+                gap(o),
+            )
+        })
+        .collect();
+    summary.sort();
+    let mut expected = vec![
+        (
+            "missing",
+            "Grok",
+            "Missing",
+            true,
+            "unlistedHome".to_string(),
+        ),
+        ("net", "Codex", "Codex", true, "outsideHome".to_string()),
+        (
+            "oc_plain",
+            "OpenCode",
+            "Plain OC",
+            true,
+            "unlistedOpenCodeHome".to_string(),
+        ),
+        (
+            "off_missing",
+            "Claude",
+            "Off Missing",
+            false,
+            "missingHome".to_string(),
+        ),
+        (
+            "outside",
+            "Claude",
+            "Outside",
+            true,
+            "outsideHome".to_string(),
+        ),
+        (
+            "traversal",
+            "Claude",
+            "Traversal",
+            true,
+            "outsideHome".to_string(),
+        ),
+    ];
+    if cfg!(unix) {
+        expected.push(("linked", "Claude", "Linked", true, "linkedHome".to_string()));
+        expected.push((
+            "linked_file",
+            "Claude",
+            "Linked File",
+            true,
+            "linkedHome".to_string(),
+        ));
+    }
+    expected.sort();
+    assert_eq!(summary, expected);
+    // The usable home is a row, as before, and the others still are not.
+    let real = std::fs::canonicalize(&home).unwrap();
+    assert_eq!(
+        automatic(&[])
+            .into_iter()
+            .map(|row| row.config_path)
+            .collect::<Vec<_>>(),
+        vec![real.join("ok/.claude.json")]
+    );
+    // No path text from the settings reaches the card.
+    let shown = format!("{others:?}{}", serde_json::to_string(&others).unwrap());
+    let h = json_path(&home);
+    for text in [
+        o.as_str(),
+        h.as_str(),
+        "/net",
+        "share",
+        "someone-else",
+        "grok-not-yet",
+        "oc-xdg",
+        "gone-off",
+        "~/link",
+        "~/lf",
+    ] {
+        assert!(!shown.contains(text), "{text} in {shown}");
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1304,11 +1654,25 @@ fn hostile_settings_cannot_reach_outside_home_or_t3_codes_folder() {
         "]".repeat(200_000)
     ));
     match &*current() {
-        Reading::Instances(found) => assert!(found.iter().all(|i| i.id != "x")),
+        Reading::Instances(found, others, _) => {
+            assert!(found.iter().all(|i| i.id != "x"));
+            assert_eq!(
+                others
+                    .iter()
+                    .map(|o| (o.instance_id.as_str(), o.display_name.as_str(), o.gap))
+                    .collect::<Vec<_>>(),
+                vec![("x", "x", T3CodeGap::Malformed)]
+            );
+        }
         other => panic!("expected instances, got {other:?}"),
     }
     write(&format!("{}1{}", "[".repeat(200_000), "]".repeat(200_000)));
     assert_eq!(*current(), Reading::Unreadable);
+    // The card says the file can't be read, naming only the file.
+    let unreadable = other_instances();
+    assert_eq!(unreadable.len(), 1);
+    assert_eq!(unreadable[0].gap, T3CodeGap::Unreadable);
+    assert_eq!(unreadable[0].display_name, "~/.t3/userdata/settings.json");
     write(&" ".repeat((SETTINGS_READ_LIMIT + 1) as usize));
     assert_eq!(*current(), Reading::Unreadable);
 
@@ -1333,7 +1697,7 @@ fn hostile_settings_cannot_reach_outside_home_or_t3_codes_folder() {
         std::fs::remove_file(&settings).unwrap();
         std::os::unix::fs::symlink(home.join(".t3/userdata/real.json"), &settings).unwrap();
         assert!(
-            matches!(&*current(), Reading::Instances(found) if found.iter().any(|i| i.display_name == "Inside"))
+            matches!(&*current(), Reading::Instances(found, _, _) if found.iter().any(|i| i.display_name == "Inside"))
         );
         // A dangling link is unreadable, not "no settings yet".
         std::fs::remove_file(&settings).unwrap();
@@ -1369,7 +1733,7 @@ fn a_swap_between_the_check_and_the_open_is_not_read() {
     let _data = crate::registry::DataDirOverride::set(root.join("data"));
     let _home = TestHome::set(&home);
     let reads_outside = || match &*current() {
-        Reading::Instances(found) => found.iter().any(|i| i.display_name == "Outside"),
+        Reading::Instances(found, _, _) => found.iter().any(|i| i.display_name == "Outside"),
         _ => false,
     };
     let inside = |padding: usize| {
@@ -1565,10 +1929,14 @@ fn an_opencode_home_with_only_jsonc_labels_its_row() {
     std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
     std::fs::create_dir_all(home.join(".oc-xdg/opencode")).unwrap();
     std::fs::write(home.join(".oc-xdg/opencode/opencode.jsonc"), "{}").unwrap();
+    std::fs::create_dir_all(home.join(".oc2/opencode")).unwrap();
+    std::fs::write(home.join(".oc2/opencode/opencode.jsonc"), "{}").unwrap();
     std::fs::write(
         home.join(".t3/userdata/settings.json"),
         r#"{"providerInstances": {"oc": {"driver": "opencode", "displayName": "OC", "enabled": true,
-            "environment": [{"name": "XDG_CONFIG_HOME", "value": "~/.oc-xdg"}]}}}"#,
+            "environment": [{"name": "XDG_CONFIG_HOME", "value": "~/.oc-xdg"}]},
+          "oc2": {"driver": "opencode", "displayName": "OC Two", "enabled": true,
+            "environment": [{"name": "XDG_CONFIG_HOME", "value": "~/.oc2"}]}}}"#,
     )
     .unwrap();
     let _data = crate::registry::DataDirOverride::set(root.join("data"));
@@ -1600,6 +1968,26 @@ fn an_opencode_home_with_only_jsonc_labels_its_row() {
             .collect::<Vec<_>>(),
         ["OC"]
     );
+    // A home whose only file is `opencode.jsonc`, added as a location under that name, is
+    // the location's row and not a home to add.
+    assert!(other_instances()
+        .iter()
+        .any(|other| other.instance_id == "oc2"));
+    locations::remember(&locations::ClientLocation {
+        id: "opencode@oc2".into(),
+        manual: true,
+        client_type: "opencode".into(),
+        name: "OpenCode (oc2)".into(),
+        config_path: home.join(".oc2/opencode/opencode.jsonc"),
+    })
+    .unwrap();
+    assert!(
+        other_instances()
+            .iter()
+            .all(|other| other.instance_id != "oc2"),
+        "{:?}",
+        other_instances()
+    );
     #[cfg(unix)]
     {
         let elsewhere = root.join("elsewhere.jsonc");
@@ -1610,5 +1998,161 @@ fn an_opencode_home_with_only_jsonc_labels_its_row() {
         annotate(&mut clients);
         assert!(clients[0].t3_code.is_empty(), "{:?}", clients[0].t3_code);
     }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The card compares a Grok, OpenCode or Pi home with the path that client's own row
+/// uses, which honors Toolport's `GROK_HOME`, `XDG_CONFIG_HOME` and
+/// `PI_CODING_AGENT_DIR`. A T3 Code instance naming that same folder has a row.
+#[test]
+fn a_home_that_is_the_clients_own_row_is_not_listed() {
+    let _lock = crate::registry::data_dir_test_lock();
+    let root = std::env::temp_dir().join(format!(
+        "toolport-t3-own-row-{}-{}",
+        std::process::id(),
+        epoch_millis()
+    ));
+    let home = root.join("home");
+    std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+    for folder in [".grok-mine", ".xdg-mine/opencode", ".pi-mine"] {
+        std::fs::create_dir_all(home.join(folder)).unwrap();
+    }
+    std::fs::write(
+        home.join(".t3/userdata/settings.json"),
+        r#"{"providerInstances": {
+            "g": {"driver": "grok", "displayName": "G", "enabled": true,
+              "environment": [{"name": "GROK_HOME", "value": "~/.grok-mine"}]},
+            "o": {"driver": "opencode", "displayName": "O", "enabled": true,
+              "environment": [{"name": "XDG_CONFIG_HOME", "value": "~/.xdg-mine"}]},
+            "p": {"driver": "pi", "displayName": "P", "enabled": true,
+              "environment": [{"name": "PI_CODING_AGENT_DIR", "value": "~/.pi-mine"}]}
+        }}"#,
+    )
+    .unwrap();
+    let _data = crate::registry::DataDirOverride::set(root.join("data"));
+    let _home = TestHome::set(&home);
+    // Without Toolport's variables each home is one to add by hand.
+    assert_eq!(other_instances().len(), 3, "{:?}", other_instances());
+    let _grok = EnvRestore::set("GROK_HOME", &home.join(".grok-mine"));
+    let _xdg = EnvRestore::set("XDG_CONFIG_HOME", &home.join(".xdg-mine"));
+    let _pi = EnvRestore::set("PI_CODING_AGENT_DIR", &home.join(".pi-mine"));
+    assert_eq!(other_instances(), Vec::new());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A home T3 Code names outside home is listed until a saved location covers it, matched
+/// by text only: the outside folder is never opened (here it does not even exist). A
+/// home spelled with `//` matches the plain spelling. One spelled with `.` keeps its line,
+/// since a hand-added folder is saved resolved and text alone cannot tell they are one.
+#[test]
+fn an_outside_home_added_by_hand_is_no_longer_listed() {
+    let _lock = crate::registry::data_dir_test_lock();
+    let root = std::env::temp_dir().join(format!(
+        "toolport-t3-outside-added-{}-{}",
+        std::process::id(),
+        epoch_millis()
+    ));
+    let home = root.join("home");
+    let outside = root.join("not-created");
+    std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+    let o = json_path(&outside);
+    std::fs::write(
+        home.join(".t3/userdata/settings.json"),
+        format!(
+            r#"{{"providerInstances": {{
+            "away": {{"driver": "codex", "displayName": "Away", "config": {{"homePath": "{o}"}}}},
+            "slashes": {{"driver": "claudeAgent", "displayName": "Slashes", "config": {{"homePath": "~//cc"}}}},
+            "dot": {{"driver": "claudeAgent", "displayName": "Dot", "config": {{"homePath": "~/./dd"}}}},
+            "oc": {{"driver": "opencode", "displayName": "OC", "enabled": true,
+              "environment": [{{"name": "XDG_CONFIG_HOME", "value": "{o}/xdg"}}]}}
+        }}}}"#
+        ),
+    )
+    .unwrap();
+    let _data = crate::registry::DataDirOverride::set(root.join("data"));
+    let _home = TestHome::set(&home);
+    let listed = || {
+        let mut ids: Vec<String> = other_instances()
+            .into_iter()
+            .filter(|other| other.gap == T3CodeGap::OutsideHome)
+            .map(|other| other.instance_id)
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(listed(), ["away", "dot", "oc", "slashes"]);
+    let manual = |client_type: &str, config_path: PathBuf| locations::ClientLocation {
+        id: format!(
+            "{client_type}@{}",
+            &crate::registry::sha256_hex(&config_path.to_string_lossy())[..16]
+        ),
+        manual: true,
+        client_type: client_type.into(),
+        name: client_type.into(),
+        config_path,
+    };
+    for row in [
+        manual("codex", outside.join("config.toml")),
+        manual("claude-code", home.join("cc/.claude.json")),
+        manual("claude-code", home.join("dd/.claude.json")),
+        manual("opencode", outside.join("xdg/opencode/opencode.json")),
+    ] {
+        locations::remember(&row).unwrap();
+    }
+    assert!(!outside.exists());
+    assert_eq!(listed(), ["dot"]);
+    // The row that covers an outside home says T3 Code uses it, so the card counts it.
+    let mut row = config_error_row(
+        "codex@away",
+        "Codex (away)",
+        outside.join("config.toml").display().to_string(),
+        String::new(),
+    );
+    row.error = None;
+    let mut clients = vec![row];
+    annotate(&mut clients);
+    assert_eq!(
+        clients[0]
+            .t3_code
+            .iter()
+            .map(|use_| (use_.instance_id.as_str(), use_.display_name.as_str()))
+            .collect::<Vec<_>>(),
+        [("away", "Away")]
+    );
+    assert!(!outside.exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A settings file that is a link to nothing still gives a revision, so the page asks
+/// for the card's lines and shows that T3 Code's settings can't be read. Nothing is
+/// read through the link.
+#[cfg(unix)]
+#[test]
+fn a_broken_settings_link_still_has_a_revision() {
+    let _lock = crate::registry::data_dir_test_lock();
+    let root = std::env::temp_dir().join(format!(
+        "toolport-t3-broken-rev-{}-{}",
+        std::process::id(),
+        epoch_millis()
+    ));
+    let home = root.join("home");
+    std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
+    let _data = crate::registry::DataDirOverride::set(root.join("data"));
+    let _home = TestHome::set(&home);
+    assert_eq!(revision(), None, "no settings file yet");
+    std::os::unix::fs::symlink(
+        root.join("nothing"),
+        home.join(".t3/userdata/settings.json"),
+    )
+    .unwrap();
+    assert!(revision().is_some());
+    assert_eq!(*current(), Reading::Unreadable);
+    assert_eq!(
+        other_instances()
+            .iter()
+            .map(|other| other.gap)
+            .collect::<Vec<_>>(),
+        [T3CodeGap::Unreadable]
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
