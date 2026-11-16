@@ -175,6 +175,32 @@ impl CatalogPage {
                 page_for_change.schedule_suggestions(entry.text().as_str());
             }
         });
+        // Escape closes the suggestions, from the search field (GTK's
+        // stop-search) or from inside the list after a click moved focus.
+        // With the list already closed, Escape clears the search, as in the
+        // React catalog.
+        let page_for_stop = catalog.clone();
+        catalog.search.connect_stop_search(move |entry| {
+            if page_for_stop.suggestion_popover.is_visible() {
+                page_for_stop.close_suggestions();
+            } else {
+                entry.set_text("");
+            }
+        });
+        // Capture runs before GTK's own popover key handling, which would
+        // otherwise pop down without returning focus to the search.
+        let escape = gtk::EventControllerKey::new();
+        escape.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let page_for_escape = catalog.clone();
+        escape.connect_key_pressed(move |_, key, _, _| {
+            if key != gtk::gdk::Key::Escape {
+                return gtk::glib::Propagation::Proceed;
+            }
+            page_for_escape.close_suggestions();
+            page_for_escape.search.grab_focus();
+            gtk::glib::Propagation::Stop
+        });
+        catalog.suggestion_popover.add_controller(escape);
         let outside_click = gtk::GestureClick::new();
         outside_click.set_propagation_phase(gtk::PropagationPhase::Capture);
         let page_for_outside = catalog.clone();
@@ -967,16 +993,26 @@ mod tests {
         assert!(page.pending_notice.borrow().is_none());
     }
 
-    #[test]
-    #[ignore = "requires an isolated GTK desktop; run in omabox"]
-    fn catalog_outage_and_installed_states() {
-        adw::init().unwrap();
-        let app = adw::Application::builder()
-            .application_id("com.tsout.Toolport.CatalogFixture")
-            .build();
-        app.register(None::<&gtk::gio::Cancellable>).unwrap();
-        // Only the catalog is mounted. No broker, registry load or probes run.
-        let server_page = super::super::ServerPage {
+    /// The first row's Add button, not the Try again button above the rows.
+    fn first_add_button(widget: &gtk::Widget) -> Option<gtk::Button> {
+        if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+            if button.has_css_class("toolport-catalog-action") {
+                return Some(button.clone());
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Some(button) = first_add_button(&current) {
+                return Some(button);
+            }
+            child = current.next_sibling();
+        }
+        None
+    }
+
+    /// Only the catalog is mounted. No broker, registry load or probes run.
+    fn catalog_only(app: &adw::Application) -> CatalogPage {
+        CatalogPage::new(super::super::ServerPage {
             details: Default::default(),
             app: app.clone(),
             share_requests: Default::default(),
@@ -994,8 +1030,103 @@ mod tests {
             off_heading: Default::default(),
             health: Default::default(),
             registry_reload: Default::default(),
+        })
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn escape_closes_the_suggestions_and_then_clears_the_search() {
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.CatalogEscapeFixture")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let _data = crate::registry::DataDirTestEnv::new("catalog-escape");
+        let page = catalog_only(&app);
+        page.registry_fetch.replace(Some(std::sync::Arc::new(|_| {
+            Err(crate::catalog::RegistryStatus::Unavailable)
+        })));
+        let window = adw::ApplicationWindow::builder()
+            .application(&app)
+            .default_width(1000)
+            .default_height(720)
+            .content(&page.root)
+            .build();
+        window.present();
+        let open = |page: &CatalogPage| {
+            page.search.set_text("github");
+            page.load_suggestions("github");
+            wait_until(|| page.suggestion_popover.is_visible());
         };
-        let page = CatalogPage::new(server_page);
+
+        // Real Escape key presses through the X server, so the key travels
+        // GTK's whole event path (window, popover capture, focused widget).
+        let press_escape = || {
+            let status = std::process::Command::new("xdotool")
+                .args(["key", "--clearmodifiers", "Escape"])
+                .status()
+                .expect("xdotool runs (install it next to xvfb)");
+            assert!(status.success(), "xdotool key Escape failed");
+        };
+        wait_until(|| window.is_active());
+        // Focus sits on the widget or, for the search field, its inner text.
+        let focus_on = |widget: &gtk::Widget| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let inside = |widget: &gtk::Widget| {
+                gtk::prelude::GtkWindowExt::focus(&window)
+                    .is_some_and(|focus| &focus == widget || focus.is_ancestor(widget))
+            };
+            while !inside(widget) {
+                let focus = gtk::prelude::GtkWindowExt::focus(&window);
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "focus is on {:?} {:?}, not {}",
+                    focus.as_ref().map(|w| w.type_().name()),
+                    focus.as_ref().map(|w| w.css_classes()),
+                    widget.type_().name()
+                );
+                gtk::glib::MainContext::default().iteration(false);
+            }
+        };
+
+        // Escape in the search field closes the list and keeps the text.
+        open(&page);
+        focus_on(page.search.upcast_ref());
+        press_escape();
+        wait_until(|| !page.suggestion_popover.is_visible());
+        assert_eq!(page.search.text(), "github");
+        focus_on(page.search.upcast_ref());
+
+        // Escape with focus on an Add button inside the list closes the list,
+        // puts focus back on the search field and keeps the text.
+        open(&page);
+        let add = first_add_button(page.suggestion_list.upcast_ref())
+            .expect("the suggestion list has an Add button");
+        assert!(add.grab_focus());
+        focus_on(add.upcast_ref());
+        press_escape();
+        wait_until(|| !page.suggestion_popover.is_visible());
+        focus_on(page.search.upcast_ref());
+        assert_eq!(page.search.text(), "github");
+
+        // With the list closed, a second Escape clears the search.
+        press_escape();
+        wait_until(|| page.search.text().is_empty());
+        assert!(!page.suggestion_popover.is_visible());
+        focus_on(page.search.upcast_ref());
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn catalog_outage_and_installed_states() {
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.CatalogFixture")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let page = catalog_only(&app);
         let window = adw::ApplicationWindow::builder()
             .application(&app)
             .title("Toolport catalog fixture")

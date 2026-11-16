@@ -432,25 +432,23 @@ mod tests {
 
     /// The shell's code without comments or its test modules.
     fn product_source(path: &std::path::Path) -> String {
-        let mut source = std::fs::read_to_string(path).unwrap();
+        strip_test_modules(
+            &std::fs::read_to_string(path).unwrap(),
+            &path.display().to_string(),
+        )
+    }
+
+    /// The source without its `#[cfg(test)]` modules, comment lines blanked.
+    /// Panics when a test module does not close: everything after it would
+    /// silently drop out of the check.
+    fn strip_test_modules(source: &str, file: &str) -> String {
+        let mut source = source.to_string();
         while let Some(at) = source.find("#[cfg(test)]\nmod ") {
             let open = at + source[at..].find('{').unwrap();
-            let mut depth = 0;
-            let mut close = source.len();
-            for (offset, c) in source[open..].char_indices() {
-                match c {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            close = open + offset + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            source.replace_range(at..close, "");
+            let close = matching_brace(&source, open).unwrap_or_else(|| {
+                panic!("{file}: the test module at byte {at} does not close before the end")
+            });
+            source.replace_range(at..=close, "");
         }
         source
             .lines()
@@ -463,6 +461,121 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The `}` closing the `{` at `open`, skipping braces inside comments and
+    /// string, raw string and char literals.
+    fn matching_brace(source: &str, open: usize) -> Option<usize> {
+        let bytes = source.as_bytes();
+        let ident =
+            |i: usize| i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        let mut depth = 0usize;
+        let mut i = open;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                    i = source[i..].find('\n').map_or(bytes.len(), |end| i + end);
+                    continue;
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    let mut nested = 0usize;
+                    while i < bytes.len() {
+                        if bytes[i..].starts_with(b"/*") {
+                            nested += 1;
+                            i += 2;
+                        } else if bytes[i..].starts_with(b"*/") {
+                            nested -= 1;
+                            i += 2;
+                            if nested == 0 {
+                                break;
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+                // r"…", r#"…"#, br"…": no escapes, ends at the quote and hashes.
+                b'r' if !ident(i) || (i > 0 && bytes[i - 1] == b'b' && !ident(i - 1)) => {
+                    let hashes = bytes[i + 1..].iter().take_while(|&&b| b == b'#').count();
+                    if bytes.get(i + 1 + hashes) == Some(&b'"') {
+                        let end = format!("\"{}", "#".repeat(hashes));
+                        let body = i + 2 + hashes;
+                        i = source[body..]
+                            .find(&end)
+                            .map_or(bytes.len(), |at| body + at + end.len());
+                        continue;
+                    }
+                }
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                // A char literal, not a lifetime: 'x', '\n', '\u{7d}', '}'.
+                b'\'' => {
+                    if bytes.get(i + 1) == Some(&b'\\') {
+                        // Skip the escaped character itself, which may be a quote.
+                        i = source
+                            .get(i + 3..)
+                            .and_then(|rest| rest.find('\''))
+                            .map_or(bytes.len(), |at| i + 3 + at);
+                    } else if let Some(c) = source[i + 1..].chars().next() {
+                        if source[i + 1 + c.len_utf8()..].starts_with('\'') {
+                            i += c.len_utf8() + 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    #[test]
+    fn the_test_module_scanner_ignores_braces_in_literals_and_comments() {
+        let source = concat!(
+            "fn before() {}\n",
+            "#[cfg(test)]\nmod tests {\n",
+            "    const OPEN: &str = \"{ not a block\";\n",
+            "    const RAW: &str = r#\"}\" still raw {\"#;\n",
+            "    const BYTES: &[u8] = br\"{\";\n",
+            "    const ESCAPED: &str = \"\\\" {\";\n",
+            "    const CLOSE: char = '}';\n",
+            "    const QUOTE: u8 = b'\\'';\n",
+            "    const OPEN_BYTE: u8 = b'{';\n",
+            "    const UNICODE: char = '\\u{7b}';\n",
+            "    fn borrow<'a>(text: &'a str) -> &'a str { text }\n",
+            "    // a comment with {\n",
+            "    /* a block { /* nested } */ comment */\n",
+            "}\n",
+            "fn secret_reference_fields() {}\n",
+        );
+        let kept = strip_test_modules(source, "fixture.rs");
+        assert!(kept.contains("fn before()"));
+        assert!(
+            kept.contains("fn secret_reference_fields()"),
+            "code after the test module stays checked: {kept}"
+        );
+        assert!(!kept.contains("not a block"));
+    }
+
+    #[test]
+    #[should_panic(expected = "does not close before the end")]
+    fn a_test_module_that_never_closes_fails_the_check() {
+        strip_test_modules(
+            "#[cfg(test)]\nmod tests {\n    fn open() {\n}\nfn product() {}\n",
+            "fixture.rs",
+        );
     }
 
     /// The function a position is in: the nearest `fn NAME` before it.

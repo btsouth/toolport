@@ -190,6 +190,13 @@ export function CatalogView({ registry, onAdded }: Props) {
           )}
           className="h-11 pl-9 text-base"
           onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => {
+            // Escape leaves the search and returns to the browse list, as in
+            // the GTK catalog. While an input method is composing, Escape
+            // cancels the composition instead (229 is the IME key code).
+            const composing = e.nativeEvent.isComposing || e.keyCode === 229;
+            if (e.key === "Escape" && !composing && query !== "") setQuery("");
+          }}
         />
       </div>
 
