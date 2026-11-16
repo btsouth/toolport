@@ -2842,6 +2842,14 @@ struct ClientPage {
     codex_open: std::rc::Rc<std::cell::Cell<bool>>,
     /// Whether copies of the default Claude Code profile are listed as rows.
     claude_copies_shown: std::rc::Rc<std::cell::Cell<bool>>,
+    /// Set while T3 Code's Connect all is working through its rows.
+    t3_code_batch: std::rc::Rc<std::cell::Cell<bool>>,
+    /// A Connect all that just ended: the next render builds its summary from what it
+    /// reads and puts focus back on the T3 Code card.
+    pending_batch: std::rc::Rc<std::cell::RefCell<Option<client_rows::T3BatchOutcome>>>,
+    /// The page's wrapping notice that stays until dismissed, and its text.
+    lasting: gtk::Box,
+    lasting_label: gtk::Label,
 }
 
 impl ClientPage {
@@ -2885,6 +2893,26 @@ impl ClientPage {
         let recovery_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
         page.append(&recovery_box);
         page.append(&feedback);
+        // Connect all's summary lists what was not connected and why: it wraps here and
+        // stays until dismissed, through the rescans that hide the line above.
+        let lasting = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        lasting.add_css_class("toolport-feedback");
+        lasting.add_css_class("toolport-lasting-notice");
+        lasting.set_accessible_role(gtk::AccessibleRole::Status);
+        lasting.set_visible(false);
+        let lasting_label = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .valign(gtk::Align::Center)
+            .build();
+        lasting.append(&lasting_label);
+        let dismiss = l10n::button("Dismiss");
+        dismiss.add_css_class("flat");
+        dismiss.set_valign(gtk::Align::Start);
+        lasting.append(&dismiss);
+        page.append(&lasting);
 
         // Full width, like every other list page; the row groups line up with Servers.
         let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -2898,6 +2926,14 @@ impl ClientPage {
 
         let details = details::DetailHost::default();
         details.attach(&root);
+        {
+            let (notice, list) = (lasting.clone(), list.clone());
+            dismiss.connect_clicked(move |_| {
+                notice.set_visible(false);
+                // Focus stays on the page instead of falling back to the sidebar.
+                list.child_focus(gtk::DirectionType::TabForward);
+            });
+        }
         let client_page = Self {
             details,
             detail_clients: Default::default(),
@@ -2926,6 +2962,10 @@ impl ClientPage {
             claude_open: std::rc::Rc::new(std::cell::Cell::new(true)),
             codex_open: std::rc::Rc::new(std::cell::Cell::new(true)),
             claude_copies_shown: std::rc::Rc::new(std::cell::Cell::new(false)),
+            t3_code_batch: Default::default(),
+            pending_batch: Default::default(),
+            lasting,
+            lasting_label,
         };
         watch_t3_code_settings(&client_page);
         let page_for_add = client_page.clone();
@@ -3220,7 +3260,21 @@ impl ClientPage {
             .filter(|client| client.gateway_state != state::ClientGatewayState::Connected)
             .copied()
             .collect::<Vec<_>>();
-        if let Some(confirmation) = self.pending_confirmation.borrow_mut().take() {
+        let batch = self.pending_batch.borrow_mut().take();
+        if let Some(outcome) = &batch {
+            // Built from this scan, so it counts what exists and is on now.
+            let (summary, success) = client_rows::t3_code_batch_result(&clients, outcome);
+            if success {
+                // A full success needs no keeping; an older summary would contradict it.
+                self.lasting.set_visible(false);
+                self.show_confirmation(&summary);
+            } else {
+                self.cancel_feedback_timer();
+                self.feedback.set_visible(false);
+                self.lasting_label.set_label(&summary);
+                self.lasting.set_visible(true);
+            }
+        } else if let Some(confirmation) = self.pending_confirmation.borrow_mut().take() {
             self.show_confirmation(&confirmation);
         } else {
             self.cancel_feedback_timer();
@@ -3233,8 +3287,25 @@ impl ClientPage {
             .collect::<Vec<_>>();
         let t3_others = snapshot.t3_others;
         if clients.iter().any(|client| !client.t3_code.is_empty()) || !t3_others.is_empty() {
-            self.list
-                .append(&client_rows::t3_code_card(&clients, &t3_others));
+            let (card, button) = client_rows::t3_code_card(&clients, &t3_others, self.clone());
+            self.list.append(&card);
+            if let Some(outcome) = batch {
+                // Connect all ended (Done, Cancel or Escape): focus returns to its button,
+                // or to the card when nothing is left to connect, never the sidebar.
+                let list = self.list.clone();
+                gtk::glib::idle_add_local_once(move || {
+                    let focused = button.is_some_and(|button| button.grab_focus())
+                        || client_rows::focus_t3_code_card(&card);
+                    if !focused {
+                        list.child_focus(gtk::DirectionType::TabForward);
+                    }
+                    if outcome.keyboard {
+                        if let Some(window) = list.root().and_downcast::<gtk::Window>() {
+                            window.set_focus_visible(true);
+                        }
+                    }
+                });
+            }
         }
         if installed.is_empty() {
             let card = state_card(
@@ -3676,6 +3747,30 @@ pub(super) fn dialog_footer(actions: &[&gtk::Button]) -> gtk::Box {
     footer
 }
 
+/// Whether the last press in `widget` came from the keyboard: a key press sets it, a
+/// pointer or touch press clears it. Read when a control is about to take focus (or a
+/// window closes) to decide whether it shows its focus ring, which GTK drops when a
+/// control is disabled or a dialog closes.
+pub(super) fn keyboard_tracker(
+    widget: &impl IsA<gtk::Widget>,
+    initial: bool,
+) -> std::rc::Rc<std::cell::Cell<bool>> {
+    let keyboard = std::rc::Rc::new(std::cell::Cell::new(initial));
+    let events = gtk::EventControllerLegacy::new();
+    events.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let seen = keyboard.clone();
+    events.connect_event(move |_, event| {
+        match event.event_type() {
+            gtk::gdk::EventType::KeyPress => seen.set(true),
+            gtk::gdk::EventType::ButtonPress | gtk::gdk::EventType::TouchBegin => seen.set(false),
+            _ => {}
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    widget.add_controller(events);
+    keyboard
+}
+
 /// Esc closes a sheet, as every dialog does. Widgets inside that use Esc themselves,
 /// like a search entry or an open menu, still get it first.
 pub(super) fn close_on_escape(window: &impl IsA<gtk::Window>) {
@@ -4049,9 +4144,11 @@ fn client_scope_menu(client: state::ClientView, page: ClientPage) -> gtk::MenuBu
     let menu = gtk::MenuButton::builder()
         .always_show_arrow(true)
         .child(
+            // Wraps between words in a narrow window rather than cutting the access name.
             &gtk::Label::builder()
                 .label(&label)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::Word)
                 .max_width_chars(24)
                 .build(),
         )
@@ -16216,6 +16313,175 @@ mod tests {
                 main_loop.run();
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn connect_all_summary_stays_until_dismissed_and_focus_returns_to_the_card() {
+        use super::*;
+        adw::init().unwrap();
+        let _lock = crate::registry::data_dir_test_lock();
+        let root = std::env::temp_dir().join(format!(
+            "toolport-gtk-connect-all-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        let _data = crate::registry::DataDirOverride::set(root.join("data"));
+        let _home = crate::clients::TestHome::set(&root.join("home"));
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.ConnectAllFixture")
+            .build();
+        let server_page = ServerPage {
+            details: Default::default(),
+            app: app.clone(),
+            share_requests: Default::default(),
+            server_count: gtk::Label::new(None),
+            section_title: gtk::Label::new(None),
+            posture: gtk::Label::new(None),
+            search: gtk::SearchEntry::new(),
+            feedback: gtk::Label::new(None),
+            list: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            last_snapshot: Default::default(),
+            feedback_timer: Default::default(),
+            health_rows: Default::default(),
+            rows: Default::default(),
+            no_matches: Default::default(),
+            off_heading: Default::default(),
+            health: Default::default(),
+            registry_reload: Default::default(),
+        };
+        let page = ClientPage::new(&app, server_page);
+        let window = gtk::Window::new();
+        window.set_child(Some(&page.root));
+        window.present();
+        let row = |id: &str, name: &str, state: state::ClientGatewayState| state::ClientView {
+            detected: None,
+            imported_names: Vec::new(),
+            id: id.into(),
+            name: name.into(),
+            app_present: true,
+            config_exists: true,
+            uses_connectors: false,
+            server_count: 0,
+            movable_server_count: 0,
+            other_server_count: 0,
+            gateway_state: state,
+            shared_http: false,
+            legacy_bearer_argv: false,
+            scope_id: None,
+            scope_name: None,
+            discovery_mode: None,
+            inherited_discovery: None,
+            config_error: false,
+            location_removable: false,
+            location_kept_by_t3_code: false,
+            claude_profile: None,
+            t3_code: vec![crate::clients::T3CodeUse {
+                instance_id: name.to_lowercase(),
+                display_name: name.into(),
+                enabled: true,
+            }],
+        };
+        let snapshot = |clients: Vec<state::ClientView>| state::ClientSnapshot {
+            clients,
+            profiles: Vec::new(),
+            sessions: Vec::new(),
+            sessions_error: false,
+            t3_others: Vec::new(),
+        };
+        let settle = || {
+            let context = gtk::glib::MainContext::default();
+            for _ in 0..50 {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        let connect_all = |page: &ClientPage| {
+            fixture_descendants(page.list.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Button>().ok())
+                .find(|b| b.label().as_deref() == Some("Connect all"))
+        };
+        use state::ClientGatewayState::*;
+        page.render(snapshot(vec![
+            row("aider", "Aider", Disconnected),
+            row("codex", "Codex", Disconnected),
+        ]));
+        assert!(connect_all(&page).is_some(), "the card offers Connect all");
+        // Escape on the second step: Aider connected, Codex not.
+        *page.pending_batch.borrow_mut() = Some(client_rows::T3BatchOutcome {
+            stopped: true,
+            rows: vec!["aider".into(), "codex".into()],
+            connected: vec!["aider".into()],
+            keyboard: true,
+        });
+        page.render(snapshot(vec![
+            row("aider", "Aider", Connected),
+            row("codex", "Codex", Disconnected),
+        ]));
+        settle();
+        let summary =
+            "Connect all stopped. Connected 1 of 2 T3 Code instances. Not connected: Codex.";
+        assert!(page.lasting.is_visible(), "the summary shows");
+        assert_eq!(page.lasting_label.text(), summary);
+        let button = connect_all(&page).unwrap();
+        assert!(button.has_focus(), "focus returns to Connect all");
+        assert!(
+            window.gets_focus_visible(),
+            "with the ring after the keyboard"
+        );
+        // A later scan keeps it; Dismiss hides it.
+        page.render(snapshot(vec![
+            row("aider", "Aider", Connected),
+            row("codex", "Codex", Disconnected),
+        ]));
+        assert!(
+            page.lasting.is_visible(),
+            "the summary stays until dismissed"
+        );
+        let dismiss = fixture_descendants(page.lasting.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .find(|b| b.label().as_deref() == Some("Dismiss"))
+            .unwrap();
+        dismiss.emit_clicked();
+        assert!(!page.lasting.is_visible());
+        // A batch that connects everything: no lasting summary, and with Connect all gone
+        // focus goes to the T3 Code card.
+        *page.pending_batch.borrow_mut() = Some(client_rows::T3BatchOutcome {
+            stopped: false,
+            rows: vec!["codex".into()],
+            connected: vec!["codex".into()],
+            keyboard: false,
+        });
+        page.render(snapshot(vec![
+            row("aider", "Aider", Connected),
+            row("codex", "Codex", Connected),
+        ]));
+        settle();
+        assert!(connect_all(&page).is_none());
+        assert!(!page.lasting.is_visible(), "a full success is not kept");
+        let card = fixture_descendants(page.list.upcast_ref())
+            .into_iter()
+            .find(|w| w.has_css_class("toolport-t3-card-group"))
+            .unwrap();
+        assert!(card.has_focus(), "focus goes to the T3 Code card");
+        window.close();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn fixture_descendants(widget: &gtk::Widget) -> Vec<gtk::Widget> {
+        let mut out = vec![widget.clone()];
+        let mut child = widget.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            out.extend(fixture_descendants(&widget));
+        }
+        out
     }
 
     #[test]

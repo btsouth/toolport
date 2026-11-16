@@ -84,6 +84,23 @@ as it is, with why and what to do:
 The card names instances by their name and provider only, never by the paths in the
 settings file.
 
+### Connect all
+
+While a row an instance uses can be connected as it is, the card offers **Connect
+all**. It opens the usual connect review for each of those rows in turn, with a line
+such as "Step 1 of 3: Claude Work" naming the instances on that row. Instances that are
+off are skipped; you can still connect one yourself.
+
+- **Next** moves on after a row connects, **Done** ends the last one.
+- When a row fails, **Retry** tries again and **Skip** moves on without it.
+- **Escape**, **Cancel** or closing a review stops the batch. Rows already connected
+  stay connected.
+
+When the batch ends, a summary says how many instances it connected. If any were
+skipped, failed or not reached, or a row needs attention first, it names them and
+stays until you dismiss it. Focus returns to **Connect all**, or to the card once
+everything it can connect is connected.
+
 ## What Activity shows
 
 Calls from a T3 Code session keep their usual client name, so filters and totals do

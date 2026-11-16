@@ -18,6 +18,8 @@ interface Props {
   items: ImportItem[];
   busy?: boolean;
   title?: string;
+  /** A short progress line under the title, such as one step of a batch. */
+  step?: string;
   description?: string;
   confirmLabel?: string;
   allowEmpty?: boolean;
@@ -26,6 +28,8 @@ interface Props {
   /** Shown under the description, before the user confirms. */
   notice?: ReactNode;
   error?: string;
+  /** Inside a batch: offered beside Retry after a failure, to move on to the next step. */
+  onSkip?: () => void;
   /** Where focus goes when the dialog closes; Radix defaults to its trigger. */
   onCloseAutoFocus?: (event: Event) => void;
   onOpenChange: (open: boolean) => void;
@@ -46,6 +50,7 @@ export function ImportReviewDialog({
   items,
   busy = false,
   title,
+  step,
   description,
   confirmLabel,
   allowEmpty = false,
@@ -53,6 +58,7 @@ export function ImportReviewDialog({
   details,
   notice,
   error,
+  onSkip,
   onCloseAutoFocus,
   onOpenChange,
   onConfirm,
@@ -66,6 +72,7 @@ export function ImportReviewDialog({
         items={items}
         busy={busy}
         title={title ?? t("Review servers to import")}
+        step={step}
         description={description}
         confirmLabel={confirmLabel}
         allowEmpty={allowEmpty}
@@ -73,6 +80,7 @@ export function ImportReviewDialog({
         details={details}
         notice={notice}
         error={error}
+        onSkip={onSkip}
         onCloseAutoFocus={onCloseAutoFocus}
         onOpenChange={onOpenChange}
         onConfirm={onConfirm}
@@ -85,6 +93,7 @@ function ImportReviewContent({
   items,
   busy = false,
   title,
+  step,
   description,
   confirmLabel,
   allowEmpty = false,
@@ -92,6 +101,7 @@ function ImportReviewContent({
   details,
   notice,
   error,
+  onSkip,
   onCloseAutoFocus,
   onOpenChange,
   onConfirm,
@@ -108,6 +118,13 @@ function ImportReviewContent({
     if (!active || !content.contains(active) || active.matches(":disabled"))
       content.focus();
   }, [busy]);
+  // After a failure, focus goes to the confirm button (Retry), with Skip and Cancel
+  // beside it; the buttons were disabled while busy, which dropped focus.
+  const confirmRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!error || busy) return;
+    (confirmRef.current?.disabled ? cancelRef.current : confirmRef.current)?.focus();
+  }, [error, busy]);
   const keyedItems = items.map((item, index) => ({
     item,
     key: item.key ?? `${item.name}-${index}`,
@@ -168,6 +185,7 @@ function ImportReviewContent({
     >
       <DialogHeader>
         <DialogTitle>{title ?? t("Review servers to import")}</DialogTitle>
+        {step && <p className="text-meta text-muted-foreground">{step}</p>}
       </DialogHeader>
       <div className="flex flex-col gap-4 py-1">
         <p className="text-meta text-muted-foreground">
@@ -387,7 +405,13 @@ function ImportReviewContent({
         >
           {t("Cancel")}
         </Button>
+        {error && onSkip && (
+          <Button variant="outline" className="ml-auto" onClick={onSkip} disabled={busy}>
+            {t("Skip")}
+          </Button>
+        )}
         <Button
+          ref={confirmRef}
           onClick={() => {
             if (items.some((item) => item.credentials?.length))
               onConfirm(

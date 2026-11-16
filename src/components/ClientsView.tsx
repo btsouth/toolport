@@ -16,6 +16,8 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { ClientRecoveryBanners } from "@/components/ClientRecoveryBanners";
+import { ConnectReviewDialog } from "@/components/ConnectReviewDialog";
+import { toast } from "sonner";
 import { requestClientRecoveryScan } from "@/lib/clientRecoveryEvents";
 import { ClientLogo } from "@/components/ClientLogo";
 import {
@@ -32,12 +34,16 @@ import { SkeletonRows } from "@/components/ui/skeleton";
 import { clientDiscovery } from "@/lib/clientDiscovery";
 import {
   T3_CODE_NAME,
+  connectAllOutcome,
+  connectAllSummary,
   t3CodeActivitySegment,
   t3CodeBadge,
   t3CodeGapLines,
   t3CodeLeftOut,
   t3CodeLeftOutLines,
   t3CodeAnyEnabled,
+  t3CodeEnabledNames,
+  t3CodeInstanceCount,
   t3CodeStatus,
   t3CodeTargets,
   t3CodeUnconnectedCount,
@@ -50,6 +56,17 @@ import {
 } from "@/lib/types";
 
 type ClientStatus = "connected" | "ready" | "customized" | "error" | "missing";
+
+/** Toast options for a summary that lists what was not connected: it stays until it is
+ * dismissed, and a long name breaks anywhere instead of running off a narrow window. */
+const LASTING_TOAST = {
+  duration: Infinity,
+  closeButton: true,
+  classNames: {
+    title: "[overflow-wrap:anywhere]",
+    description: "[overflow-wrap:anywhere]",
+  },
+};
 
 /** A chip whose text wraps onto more lines instead of hiding names behind an ellipsis;
  * a smaller radius keeps the corners of a tall chip from cutting into its text. */
@@ -620,11 +637,72 @@ export function ClientsView({
   const t3Gaps = t3CodeGapLines(t3Others);
   const t3LeftOut = t3CodeLeftOut(clients);
   const t3Lines = [...t3CodeLeftOutLines(t3LeftOut), ...t3Gaps];
-  const t3Unconnected = t3CodeUnconnectedCount(
-    t3CodeTargets(sorted),
-    t3LeftOut,
-    t3Others,
-  );
+  // Connect all connects these rows, the ones the count includes that can be connected
+  // as they are; instances Toolport can't use at all have no row to connect.
+  const t3Targets = t3CodeTargets(sorted);
+  const t3Count = t3CodeInstanceCount(t3Targets);
+  const t3Unconnected = t3CodeUnconnectedCount(t3Targets, t3LeftOut, t3Others);
+  const t3Card = useRef<HTMLDivElement>(null);
+  // Connect all went away (everything it could connect is connected, say after a batch)
+  // and took focus with it: the card takes focus instead of the page start.
+  const lastT3Count = useRef(t3Count);
+  useEffect(() => {
+    const was = lastT3Count.current;
+    lastT3Count.current = t3Count;
+    if (was === 0 || t3Count > 0) return;
+    if (!document.activeElement || document.activeElement === document.body)
+      t3Card.current?.focus();
+  }, [t3Count]);
+  const [batch, setBatch] = useState<{
+    targets: DetectedClient[];
+    index: number;
+    /** Ids of the rows connected so far. */
+    connectedIds: string[];
+    /** Ids of the rows skipped so far, in step order. */
+    notConnectedIds: string[];
+  } | null>(null);
+  // The rows as they are now: the summary is worked out from them when the batch ends,
+  // so an instance turned off or removed meanwhile is neither counted nor named.
+  const clientsNow = useRef(clients);
+  useEffect(() => {
+    clientsNow.current = clients;
+  }, [clients]);
+  // When the batch closes, focus goes back to Connect all, or to the T3 Code card once
+  // the button is gone, never to the page start.
+  const connectAllButton = useRef<HTMLButtonElement>(null);
+  const focusAfterBatch = useRef(false);
+  const finishBatch = (
+    connectedIds: string[],
+    notConnectedIds: string[],
+    stopped: boolean,
+  ) => {
+    setBatch(null);
+    focusAfterBatch.current = true;
+    const { text, success } = connectAllSummary({
+      ...connectAllOutcome(clientsNow.current, connectedIds, notConnectedIds),
+      stopped,
+    });
+    if (success) toast.success(text);
+    else toast(text, LASTING_TOAST);
+    void onChangedRef.current?.().catch(() => {});
+  };
+  const onBatchDialogClosed = (event: Event) => {
+    if (!focusAfterBatch.current) return;
+    focusAfterBatch.current = false;
+    event.preventDefault();
+    const button = connectAllButton.current;
+    if (button && !button.disabled) button.focus();
+    else t3Card.current?.focus();
+  };
+  const batchTarget = batch ? batch.targets[batch.index] : undefined;
+  // The step names the instances on its row as they are now.
+  const batchNames = (() => {
+    if (!batchTarget) return [];
+    const now = t3CodeEnabledNames(
+      clients.find((client) => client.id === batchTarget.id),
+    );
+    return now.length > 0 ? now : t3CodeEnabledNames(batchTarget);
+  })();
   const present = sorted.filter((client) => statusOf(client) !== "missing");
   const missing = sorted.filter((client) => statusOf(client) === "missing");
   const connected = present.filter((client) => statusOf(client) === "connected");
@@ -711,7 +789,14 @@ export function ClientsView({
         />
       )}
       {(hasT3Rows || t3Gaps.length > 0) && (
-        <div data-t3-code-card="" role="group" aria-label={T3_CODE_NAME}>
+        <div
+          data-t3-code-card=""
+          ref={t3Card}
+          tabIndex={-1}
+          role="group"
+          aria-label={T3_CODE_NAME}
+          className="rounded-xl outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+        >
           <StatusCard
             icon={<Layers />}
             title={T3_CODE_NAME}
@@ -732,8 +817,69 @@ export function ClientsView({
                 ))}
               </>
             }
+            actions={
+              t3Count > 0 && (
+                <Button
+                  ref={connectAllButton}
+                  size="sm"
+                  disabled={batch !== null}
+                  onClick={() =>
+                    setBatch({
+                      targets: t3Targets,
+                      index: 0,
+                      connectedIds: [],
+                      notConnectedIds: [],
+                    })
+                  }
+                >
+                  {t("Connect all")}
+                </Button>
+              )
+            }
           />
         </div>
+      )}
+      {batch && batchTarget && (
+        <ConnectReviewDialog
+          key={`${batch.index}:${batchTarget.id}`}
+          clientId={batchTarget.id}
+          clientName={batchTarget.name}
+          step={t("Step {index} of {total}: {names}", {
+            index: batch.index + 1,
+            total: batch.targets.length,
+            names: batchNames.join(", "),
+          })}
+          hasNext={batch.index + 1 < batch.targets.length}
+          onCloseAutoFocus={onBatchDialogClosed}
+          onSkip={() => {
+            const notConnectedIds = [...batch.notConnectedIds, batchTarget.id];
+            const next = batch.index + 1;
+            if (next >= batch.targets.length)
+              finishBatch(batch.connectedIds, notConnectedIds, false);
+            else setBatch({ ...batch, index: next, notConnectedIds });
+          }}
+          onClose={(done, advance) => {
+            const next = batch.index + 1;
+            const connectedIds = done
+              ? [...batch.connectedIds, batchTarget.id]
+              : batch.connectedIds;
+            const rest = batch.targets.slice(done ? next : batch.index);
+            if (!advance && rest.length > 0) {
+              // Cancel, close or Escape, on a review or a completion screen, stops the
+              // batch; the rows not connected yet stay unconnected.
+              finishBatch(
+                connectedIds,
+                [...batch.notConnectedIds, ...rest.map((target) => target.id)],
+                true,
+              );
+              return;
+            }
+            if (next >= batch.targets.length)
+              finishBatch(connectedIds, batch.notConnectedIds, false);
+            else setBatch({ ...batch, index: next, connectedIds });
+          }}
+          onConnected={() => {}}
+        />
       )}
 
       {connected.length > 0 && (

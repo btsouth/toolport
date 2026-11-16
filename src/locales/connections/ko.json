@@ -2,7 +2,6 @@
   "Used by T3 Code: {names}": "T3 Code에서 사용: {names}",
   "{name} (off)": "{name}(꺼짐)",
   "{name} is on in T3 Code": "{name}이(가) T3 Code에서 켜져 있습니다",
-  "{name} is off in T3 Code": "{name}이(가) T3 Code에서 꺼져 있습니다",
   "T3 Code runs these clients as providers. Each reads its own MCP config, so Toolport connects to them, not to T3 Code.": "T3 Code는 이 클라이언트들을 공급자로 실행합니다. 각 클라이언트는 자체 MCP 구성을 읽으므로 Toolport는 T3 Code가 아니라 각 클라이언트에 연결합니다.",
   "Every enabled T3 Code instance is connected.": "활성화된 모든 T3 Code 인스턴스가 연결되었습니다.",
   "{count} enabled T3 Code instance is not connected.": "활성화된 T3 Code 인스턴스 {count}개가 연결되지 않았습니다.",
@@ -1124,5 +1123,13 @@
   "Latest {count} entries available.": "최신 항목 {count}개를 볼 수 있습니다.",
   "Showing 1 matching entry from the latest {total}.": "최신 항목 {total}개 중 일치하는 1개를 표시하고 있습니다.",
   "No errors in the latest entry.": "최신 항목 1개에 오류가 없습니다.",
-  "No errors in the latest {count} entries.": "최신 항목 {count}개에 오류가 없습니다."
+  "No errors in the latest {count} entries.": "최신 항목 {count}개에 오류가 없습니다.",
+  "{name} is off in T3 Code. Connect all skips it; you can still connect it here.": "{name}이(가) T3 Code에서 꺼져 있습니다. 모두 연결에서는 건너뛰지만 여기에서 연결할 수 있습니다.",
+  "Connect all": "모두 연결",
+  "Step {index} of {total}: {names}": "{total}단계 중 {index}단계: {names}",
+  "Connect all stopped.": "모두 연결을 중단했습니다.",
+  "Connected {connected} of {total} T3 Code instance.": "T3 Code 인스턴스 {total}개 중 {connected}개를 연결했습니다.",
+  "Connected {connected} of {total} T3 Code instances.": "T3 Code 인스턴스 {total}개 중 {connected}개를 연결했습니다.",
+  "Not connected: {names}.": "연결되지 않음: {names}.",
+  "Skip": "건너뛰기"
 }

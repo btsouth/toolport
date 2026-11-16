@@ -2,7 +2,6 @@
   "Used by T3 Code: {names}": "T3 Code が使用: {names}",
   "{name} (off)": "{name}（オフ）",
   "{name} is on in T3 Code": "{name} は T3 Code でオンです",
-  "{name} is off in T3 Code": "{name} は T3 Code でオフです",
   "T3 Code runs these clients as providers. Each reads its own MCP config, so Toolport connects to them, not to T3 Code.": "T3 Code はこれらのクライアントをプロバイダーとして実行します。各クライアントは独自の MCP 設定を読み込むため、Toolport は T3 Code ではなく各クライアントに接続します。",
   "Every enabled T3 Code instance is connected.": "有効な T3 Code インスタンスはすべて接続済みです。",
   "{count} enabled T3 Code instance is not connected.": "有効な T3 Code インスタンス {count} 件が未接続です。",
@@ -1124,5 +1123,13 @@
   "Latest {count} entries available.": "最新の {count} 件を表示できます。",
   "Showing 1 matching entry from the latest {total}.": "最新の {total} 件のうち、一致する 1 件を表示しています。",
   "No errors in the latest entry.": "最新の 1 件にエラーはありません。",
-  "No errors in the latest {count} entries.": "最新の {count} 件にエラーはありません。"
+  "No errors in the latest {count} entries.": "最新の {count} 件にエラーはありません。",
+  "{name} is off in T3 Code. Connect all skips it; you can still connect it here.": "{name} は T3 Code でオフです。「すべて接続」ではスキップされますが、ここから接続できます。",
+  "Connect all": "すべて接続",
+  "Step {index} of {total}: {names}": "ステップ {index}/{total}: {names}",
+  "Connect all stopped.": "すべて接続を中止しました。",
+  "Connected {connected} of {total} T3 Code instance.": "T3 Code インスタンス {total} 件中 {connected} 件を接続しました。",
+  "Connected {connected} of {total} T3 Code instances.": "T3 Code インスタンス {total} 件中 {connected} 件を接続しました。",
+  "Not connected: {names}.": "未接続: {names}。",
+  "Skip": "スキップ"
 }

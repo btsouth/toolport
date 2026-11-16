@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { DetectedClient, T3CodeOther } from "./types";
 import {
+  connectAllOutcome,
+  connectAllSummary,
   hostName,
   hostThreadChip,
   hostedClientName,
@@ -184,7 +186,8 @@ describe("t3CodeBadge", () => {
     expect(t3CodeBadge([])).toBeNull();
     expect(t3CodeBadge([use("Work"), use("Home", false)])).toEqual({
       text: "Used by T3 Code: Work, Home (off)",
-      title: "Work is on in T3 Code\nHome is off in T3 Code",
+      title:
+        "Work is on in T3 Code\nHome is off in T3 Code. Connect all skips it; you can still connect it here.",
     });
     expect(t3CodeBadge([use("Claude")])?.text).toBe("Used by T3 Code: Claude");
   });
@@ -314,5 +317,105 @@ describe("t3CodeGapLines for homes Toolport won't use", () => {
         ],
       ),
     ).toBe(2);
+  });
+});
+
+describe("connectAllSummary", () => {
+  it("says only the count when every instance connected", () => {
+    expect(
+      connectAllSummary({ connected: 3, total: 3, stopped: false, notConnected: [] }),
+    ).toEqual({ text: "Connected 3 of 3 T3 Code instances.", success: true });
+    expect(
+      connectAllSummary({ connected: 1, total: 1, stopped: false, notConnected: [] }),
+    ).toEqual({ text: "Connected 1 of 1 T3 Code instance.", success: true });
+  });
+
+  it("names the rows it left out last, and is not a full success then", () => {
+    expect(
+      connectAllSummary({
+        connected: 1,
+        total: 1,
+        stopped: false,
+        notConnected: [],
+        leftOut: ["F uses Kiro, which isn't installed. Install Kiro, then connect it."],
+      }),
+    ).toEqual({
+      text: "Connected 1 of 1 T3 Code instance. F uses Kiro, which isn't installed. Install Kiro, then connect it.",
+      success: false,
+    });
+  });
+
+  it("names skipped rows in step order without the stopped prefix", () => {
+    expect(
+      connectAllSummary({
+        connected: 2,
+        total: 4,
+        stopped: false,
+        notConnected: ["Cursor", "Claude Code (claude_personal)"],
+      }),
+    ).toEqual({
+      text: "Connected 2 of 4 T3 Code instances. Not connected: Cursor, Claude Code (claude_personal).",
+      success: false,
+    });
+  });
+
+  it("says when the user stopped it", () => {
+    expect(
+      connectAllSummary({
+        connected: 0,
+        total: 5,
+        stopped: true,
+        notConnected: ["Aider", "Codex"],
+      }),
+    ).toEqual({
+      text: "Connect all stopped. Connected 0 of 5 T3 Code instances. Not connected: Aider, Codex.",
+      success: false,
+    });
+  });
+});
+
+describe("connectAllOutcome", () => {
+  it("names instances, not rows, and counts only what is still on when the batch ends", () => {
+    const clients = [
+      client({
+        id: "claude",
+        name: "Claude Code (claude_personal)",
+        t3Code: [use("Claude Personal")],
+      }),
+      client({
+        id: "opencode",
+        name: "OpenCode",
+        t3Code: [use("OpenCode Go"), use("OpenCode Zen", false)],
+      }),
+      // Turned off in T3 Code while the batch ran.
+      client({ id: "cursor", name: "Cursor", t3Code: [use("Cursor Work", false)] }),
+      client({ id: "kiro", name: "Kiro", appPresent: false, t3Code: [use("F")] }),
+    ];
+    // Removed from T3 Code while the batch ran: "gone" no longer exists.
+    expect(
+      connectAllOutcome(clients, ["claude"], ["opencode", "cursor", "gone"]),
+    ).toEqual({
+      connected: 1,
+      total: 2,
+      notConnected: ["OpenCode Go"],
+      leftOut: ["F uses Kiro, which isn't installed. Install Kiro, then connect it."],
+    });
+  });
+
+  it("leaves a batch row out of the left-out lines even when it can no longer be read", () => {
+    const clients = [
+      client({
+        id: "codex",
+        name: "Codex",
+        error: "denied",
+        t3Code: [use("Codex Home")],
+      }),
+    ];
+    expect(connectAllOutcome(clients, [], ["codex"])).toEqual({
+      connected: 0,
+      total: 1,
+      notConnected: ["Codex Home"],
+      leftOut: [],
+    });
   });
 });

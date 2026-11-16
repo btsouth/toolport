@@ -367,8 +367,80 @@ export function t3CodeBadge(uses: T3CodeUse[]): { text: string; title: string } 
       .map((use) =>
         use.enabled
           ? translate("{name} is on in T3 Code", { name: use.displayName })
-          : translate("{name} is off in T3 Code", { name: use.displayName }),
+          : translate(
+              "{name} is off in T3 Code. Connect all skips it; you can still connect it here.",
+              { name: use.displayName },
+            ),
       )
       .join("\n"),
+  };
+}
+
+/** The enabled instances on a row, by name, as each Connect all step lists them. */
+export function t3CodeEnabledNames(client: DetectedClient | undefined): string[] {
+  return (client?.t3Code ?? [])
+    .filter((use) => use.enabled)
+    .map((use) => use.displayName);
+}
+
+/** What `connectAllSummary` reports, worked out when the batch ends against the rows as
+ * they are then: an instance turned off or removed during the batch is neither counted
+ * nor named. `connectedIds` are the rows connected, `notConnectedIds` the rows skipped,
+ * failed or never reached, in step order. Left-out rows are found again, without the
+ * batch's own rows. GTK's `t3_code_batch_result` does the same. */
+export function connectAllOutcome(
+  clients: DetectedClient[],
+  connectedIds: string[],
+  notConnectedIds: string[],
+): { connected: number; total: number; notConnected: string[]; leftOut: string[] } {
+  const byId = (id: string) => clients.find((client) => client.id === id);
+  const connected = connectedIds.reduce(
+    (sum, id) => sum + t3CodeEnabledNames(byId(id)).length,
+    0,
+  );
+  const notConnected = notConnectedIds.flatMap((id) => t3CodeEnabledNames(byId(id)));
+  const batchIds = new Set([...connectedIds, ...notConnectedIds]);
+  return {
+    connected,
+    total: connected + notConnected.length,
+    notConnected,
+    leftOut: t3CodeLeftOutLines(
+      t3CodeLeftOut(clients).filter((row) => !batchIds.has(row.client.id)),
+    ),
+  };
+}
+
+/** The summary when Connect all ends: "[Connect all stopped. ]Connected X of Y T3 Code
+ * instance(s).[ Not connected: NAMES.][ LEFT OUT LINES]". `stopped` is true when the user
+ * ended it (Cancel, close or Escape). A full success only when nothing was stopped, left
+ * unconnected or left out. GTK's `t3_code_batch_summary` builds the same text. */
+export function connectAllSummary({
+  connected,
+  total,
+  stopped,
+  notConnected,
+  leftOut = [],
+}: {
+  connected: number;
+  total: number;
+  stopped: boolean;
+  notConnected: string[];
+  leftOut?: string[];
+}): { text: string; success: boolean } {
+  const parts = [
+    stopped && translate("Connect all stopped."),
+    translate(
+      total === 1
+        ? msg("Connected {connected} of {total} T3 Code instance.")
+        : msg("Connected {connected} of {total} T3 Code instances."),
+      { connected, total },
+    ),
+    notConnected.length > 0 &&
+      translate("Not connected: {names}.", { names: notConnected.join(", ") }),
+    ...leftOut,
+  ].filter(Boolean);
+  return {
+    text: parts.join(" "),
+    success: !stopped && notConnected.length === 0 && leftOut.length === 0,
   };
 }

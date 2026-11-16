@@ -1563,6 +1563,18 @@ button.toolport-skill-chip:hover {{ background-color: alpha(@toolport_fg, 0.13);
 .toolport-feedback + .toolport-feedback {{
   border-top: 1px solid @toolport_border;
 }}
+/* Connect all's summary stays until dismissed: one box, no divider from the hidden
+   one-line notice before it. */
+.toolport-feedback + .toolport-feedback.toolport-lasting-notice {{
+  border-top: none;
+}}
+.toolport-lasting-notice {{ padding-top: 4px; padding-bottom: 4px; }}
+.toolport-lasting-notice > label {{ padding-top: 6px; padding-bottom: 6px; }}
+/* After Connect all, focus returns to the T3 Code card when it has no button left. */
+.toolport-t3-card-group:focus:focus-visible {{
+  outline: 2px solid @toolport_accent;
+  outline-offset: 2px;
+}}
 
 .toolport-native .toolport-badge {{
   font-size: 12px;

@@ -7,12 +7,17 @@ import { ClientsView, type T3CodeSeen } from "./ClientsView";
 import {
   getClientSessions,
   listClientRecoveries,
+  migrateClient,
+  previewClientSetup,
   refreshClientRecoveryStatus,
   t3CodeOtherInstances,
   t3CodeRevision,
 } from "@/lib/api";
+import { toast } from "sonner";
 vi.mock("@/lib/api", () => ({
   getClientSessions: vi.fn(),
+  previewClientSetup: vi.fn(),
+  migrateClient: vi.fn(),
   listClientRecoveries: vi.fn().mockResolvedValue([]),
   retryClientRecovery: vi.fn(),
   dismissClientRecovery: vi.fn(),
@@ -40,6 +45,11 @@ function setWindowVisible(value: boolean) {
   visibility.value = value;
   visibility.listeners.forEach((listener) => listener());
 }
+vi.mock("sonner", () => ({
+  toast: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn() }),
+}));
+// A summary that lists what was not connected stays until it is dismissed.
+const lasting = expect.objectContaining({ duration: Infinity, closeButton: true });
 beforeEach(() => {
   visibility.value = true;
   vi.mocked(getClientSessions).mockResolvedValue([]);
@@ -1081,6 +1091,338 @@ describe("ClientsView", () => {
       );
       expect(card()).toHaveTextContent(
         "Toolport won't use the home folder Linked (Claude) (off) uses: it, or its config file, is a link or not a plain folder or file.",
+      );
+    });
+
+    function mockConnect() {
+      vi.mocked(previewClientSetup).mockImplementation(async (id) => ({
+        configPath: `/fixture/${id}`,
+        backupDir: "/fixture/backups",
+        revision: `rev-${id}`,
+        items: [],
+      }));
+      vi.mocked(migrateClient).mockResolvedValue({
+        registry: { servers: [] } as never,
+        imported: 0,
+        moved: [],
+        outcome: { path: "/fixture/config", backup: null },
+        tools: [],
+        servers: [],
+      } as never);
+    }
+
+    it("offers Connect all only while a row it can connect is not connected", () => {
+      const { rerender } = render(
+        <ClientsView
+          clients={[client({ t3Code: [on("Work")] })]}
+          registry={null}
+          onSelectClient={vi.fn()}
+        />,
+      );
+      expect(screen.getByRole("button", { name: "Connect all" })).toBeVisible();
+      rerender(
+        <ClientsView
+          clients={[
+            client({ gatewayInstalled: true, entryState: "managed", t3Code: [on("A")] }),
+            client({ id: "b", name: "B", entryState: "customized", t3Code: [on("B")] }),
+            client({ id: "c", name: "C", error: "bad json", t3Code: [on("C")] }),
+            client({ id: "d", name: "D", appPresent: false, t3Code: [on("D")] }),
+            client({ id: "e", name: "E", t3Code: [off("E")] }),
+          ]}
+          registry={null}
+          onSelectClient={vi.fn()}
+        />,
+      );
+      expect(
+        screen.queryByRole("button", { name: "Connect all" }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("connects each row in turn with a step line and reports the total", async () => {
+      mockConnect();
+      const onChanged = vi.fn(async () => {});
+      render(
+        <ClientsView
+          clients={[
+            client({ id: "zed", name: "Zed", t3Code: [on("Two")] }),
+            client({ id: "codex", name: "Codex", t3Code: [on("One"), on("Home")] }),
+            client({ id: "skip", name: "Aider", t3Code: [off("Off")] }),
+          ]}
+          registry={null}
+          onSelectClient={vi.fn()}
+          onChanged={onChanged}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+      expect(await screen.findByText("Review and connect Codex")).toBeVisible();
+      expect(screen.getByText("Step 1 of 2: One, Home")).toBeVisible();
+      await userEvent.click(screen.getByRole("button", { name: "Connect to Toolport" }));
+      expect(migrateClient).toHaveBeenLastCalledWith(
+        "codex",
+        undefined,
+        undefined,
+        [],
+        "rev-codex",
+      );
+      await userEvent.click(await screen.findByRole("button", { name: "Next" }));
+      expect(await screen.findByText("Review and connect Zed")).toBeVisible();
+      expect(screen.getByText("Step 2 of 2: Two")).toBeVisible();
+      await userEvent.click(screen.getByRole("button", { name: "Connect to Toolport" }));
+      await userEvent.click(await screen.findByRole("button", { name: "Done" }));
+      expect(previewClientSetup).not.toHaveBeenCalledWith("skip");
+      expect(toast.success).toHaveBeenCalledWith("Connected 3 of 3 T3 Code instances.");
+      expect(onChanged).toHaveBeenCalled();
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    });
+
+    it("names the rows it left out in a summary that stays", async () => {
+      mockConnect();
+      render(
+        <ClientsView
+          clients={[
+            client({ id: "codex", name: "Codex", t3Code: [on("One")] }),
+            client({
+              id: "kiro",
+              name: "Kiro",
+              appPresent: false,
+              t3Code: [on("Work"), on("Home")],
+            }),
+          ]}
+          registry={null}
+          onSelectClient={vi.fn()}
+          onChanged={vi.fn(async () => {})}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+      expect(await screen.findByText("Step 1 of 1: One")).toBeVisible();
+      await userEvent.click(screen.getByRole("button", { name: "Connect to Toolport" }));
+      await userEvent.click(await screen.findByRole("button", { name: "Done" }));
+      expect(toast.success).not.toHaveBeenCalled();
+      expect(toast).toHaveBeenCalledWith(
+        "Connected 1 of 1 T3 Code instance. Work, Home use Kiro, which isn't installed. Install Kiro, then connect it.",
+        lasting,
+      );
+    });
+
+    it("stops on Escape and names what it did not reach", async () => {
+      mockConnect();
+      const onChanged = vi.fn(async () => {});
+      render(
+        <ClientsView
+          clients={[
+            client({ id: "codex", name: "Codex", t3Code: [on("One")] }),
+            client({ id: "zed", name: "Zed", t3Code: [on("Two")] }),
+            client({ id: "aider", name: "Aider", t3Code: [on("Three")] }),
+          ]}
+          registry={null}
+          onSelectClient={vi.fn()}
+          onChanged={onChanged}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+      expect(await screen.findByText("Review and connect Aider")).toBeVisible();
+      await userEvent.click(screen.getByRole("button", { name: "Connect to Toolport" }));
+      await userEvent.click(await screen.findByRole("button", { name: "Next" }));
+      expect(await screen.findByText("Review and connect Codex")).toBeVisible();
+      await userEvent.keyboard("{Escape}");
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      expect(previewClientSetup).not.toHaveBeenCalledWith("zed");
+      expect(migrateClient).toHaveBeenCalledTimes(1);
+      expect(toast).toHaveBeenCalledWith(
+        "Connect all stopped. Connected 1 of 3 T3 Code instances. Not connected: One, Two.",
+        lasting,
+      );
+      expect(onChanged).toHaveBeenCalled();
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "Connect all" })).toHaveFocus(),
+      );
+    });
+
+    it("stops on Escape from a step's success screen", async () => {
+      mockConnect();
+      render(
+        <ClientsView
+          clients={[
+            client({ id: "aider", name: "Aider", t3Code: [on("One")] }),
+            client({ id: "codex", name: "Codex", t3Code: [on("Two")] }),
+          ]}
+          registry={null}
+          onSelectClient={vi.fn()}
+          onChanged={vi.fn(async () => {})}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Connect to Toolport" }),
+      );
+      expect(await screen.findByRole("button", { name: "Next" })).toBeVisible();
+      await userEvent.keyboard("{Escape}");
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      expect(previewClientSetup).not.toHaveBeenCalledWith("codex");
+      expect(toast).toHaveBeenCalledWith(
+        "Connect all stopped. Connected 1 of 2 T3 Code instances. Not connected: Two.",
+        lasting,
+      );
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "Connect all" })).toHaveFocus(),
+      );
+    });
+
+    it("offers Skip and Retry after a failure and names what was not connected", async () => {
+      mockConnect();
+      vi.mocked(migrateClient)
+        .mockRejectedValueOnce("Permission denied")
+        .mockRejectedValueOnce("Permission denied");
+      render(
+        <ClientsView
+          clients={[
+            client({ id: "aider", name: "Aider", t3Code: [on("One")] }),
+            client({ id: "codex", name: "Codex", t3Code: [on("Two"), on("Three")] }),
+          ]}
+          registry={null}
+          onSelectClient={vi.fn()}
+          onChanged={vi.fn(async () => {})}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+      expect(await screen.findByText("Review and connect Aider")).toBeVisible();
+      expect(screen.queryByRole("button", { name: "Skip" })).not.toBeInTheDocument();
+      await userEvent.click(screen.getByRole("button", { name: "Connect to Toolport" }));
+      expect(await screen.findByText("Permission denied")).toBeVisible();
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "Retry" })).toHaveFocus(),
+      );
+      expect(screen.getByRole("button", { name: "Cancel" })).toBeVisible();
+      await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+      expect(await screen.findByText("Permission denied")).toBeVisible();
+      expect(migrateClient).toHaveBeenCalledTimes(2);
+      await userEvent.click(screen.getByRole("button", { name: "Skip" }));
+      expect(await screen.findByText("Review and connect Codex")).toBeVisible();
+      expect(screen.getByText("Step 2 of 2: Two, Three")).toBeVisible();
+      await userEvent.click(screen.getByRole("button", { name: "Connect to Toolport" }));
+      await userEvent.click(await screen.findByRole("button", { name: "Done" }));
+      expect(toast).toHaveBeenCalledWith(
+        "Connected 2 of 3 T3 Code instances. Not connected: One.",
+        lasting,
+      );
+      expect(toast.success).not.toHaveBeenCalled();
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "Connect all" })).toHaveFocus(),
+      );
+    });
+
+    it("finishes when the last step is skipped after its config could not be read", async () => {
+      mockConnect();
+      vi.mocked(previewClientSetup)
+        .mockImplementationOnce(async () => ({
+          configPath: "/fixture/aider",
+          backupDir: "/fixture/backups",
+          revision: "rev-aider",
+          items: [],
+        }))
+        .mockRejectedValueOnce("unreadable");
+      render(
+        <ClientsView
+          clients={[
+            client({ id: "aider", name: "Aider", t3Code: [on("One")] }),
+            client({ id: "codex", name: "Codex", t3Code: [on("Two")] }),
+          ]}
+          registry={null}
+          onSelectClient={vi.fn()}
+          onChanged={vi.fn(async () => {})}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Connect to Toolport" }),
+      );
+      await userEvent.click(await screen.findByRole("button", { name: "Next" }));
+      expect(await screen.findByText("unreadable")).toBeVisible();
+      await userEvent.click(screen.getByRole("button", { name: "Skip" }));
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      expect(toast).toHaveBeenCalledWith(
+        "Connected 1 of 2 T3 Code instances. Not connected: Two.",
+        lasting,
+      );
+    });
+
+    it("moves focus to the T3 Code card when Connect all goes away after the batch", async () => {
+      mockConnect();
+      const props = {
+        registry: null,
+        onSelectClient: vi.fn(),
+        onChanged: vi.fn(async () => {}),
+      };
+      const { rerender } = render(
+        <ClientsView
+          clients={[client({ id: "aider", name: "Aider", t3Code: [on("One")] })]}
+          {...props}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Connect to Toolport" }),
+      );
+      await userEvent.click(await screen.findByRole("button", { name: "Done" }));
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "Connect all" })).toHaveFocus(),
+      );
+      // The rescan after the batch finds Aider connected.
+      rerender(
+        <ClientsView
+          clients={[
+            client({
+              id: "aider",
+              name: "Aider",
+              gatewayInstalled: true,
+              entryState: "managed",
+              t3Code: [on("One")],
+            }),
+          ]}
+          {...props}
+        />,
+      );
+      expect(
+        screen.queryByRole("button", { name: "Connect all" }),
+      ).not.toBeInTheDocument();
+      expect(screen.getByRole("group", { name: "T3 Code" })).toHaveFocus();
+    });
+
+    it("works out the summary from the settings as they are when the batch ends", async () => {
+      mockConnect();
+      const props = {
+        registry: null,
+        onSelectClient: vi.fn(),
+        onChanged: vi.fn(async () => {}),
+      };
+      const { rerender } = render(
+        <ClientsView
+          clients={[
+            client({ id: "aider", name: "Aider", t3Code: [on("One")] }),
+            client({ id: "codex", name: "Codex", t3Code: [on("Two"), on("Three")] }),
+            client({ id: "zed", name: "Zed", t3Code: [on("Four")] }),
+          ]}
+          {...props}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+      expect(await screen.findByText("Review and connect Aider")).toBeVisible();
+      // T3 Code's settings change while the dialog is open: Three is turned off and
+      // Zed's instance is removed.
+      rerender(
+        <ClientsView
+          clients={[
+            client({ id: "aider", name: "Aider", t3Code: [on("One")] }),
+            client({ id: "codex", name: "Codex", t3Code: [on("Two"), off("Three")] }),
+            client({ id: "zed", name: "Zed" }),
+          ]}
+          {...props}
+        />,
+      );
+      await userEvent.keyboard("{Escape}");
+      expect(toast).toHaveBeenCalledWith(
+        "Connect all stopped. Connected 0 of 2 T3 Code instances. Not connected: One, Two.",
+        lasting,
       );
     });
   });
