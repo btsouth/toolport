@@ -611,9 +611,13 @@ fn redirect_stderr() -> Option<Redirect> {
 }
 
 /// Point stderr somewhere harmless and close this process's write end of the
-/// relay pipe, so the relay reads end-of-file once every writer is done.
+/// relay pipe, so the relay reads end-of-file once every writer is done. True
+/// once that is done.
+///
+/// Unix: `dup2` does not wait for a write running on fd 2, so this cannot
+/// block and needs no budget.
 #[cfg(unix)]
-fn release_stderr(_relay: &Relay) {
+fn release_stderr(_relay: &Relay, _budget: std::time::Duration) -> bool {
     // SAFETY: swaps fd 2 for /dev/null, closing this process's pipe write end.
     unsafe {
         let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
@@ -622,29 +626,46 @@ fn release_stderr(_relay: &Relay) {
             libc::close(null);
         }
     }
+    true
 }
 
+/// Windows: flushing the C streams and repointing the CRT's fd 2 take the
+/// locks a native thread holds while its C write to stderr is blocked (the
+/// relay stalled on a destination nobody reads). So the release runs on its
+/// own thread and is waited for only within `budget`; past it, exit goes on
+/// and the stalled thread ends with the process.
 #[cfg(windows)]
-fn release_stderr(relay: &Relay) {
+fn release_stderr(relay: &Relay, budget: std::time::Duration) -> bool {
     use std::os::windows::io::IntoRawHandle as _;
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE};
-    // SAFETY: the NUL handle is leaked on purpose: it stays this process's stderr
-    // until exit. The write end was ours alone once stderr no longer names it;
-    // the CRT's fd 2 duplicate is replaced (and so closed) by a NUL duplicate.
-    unsafe {
-        crt_flush();
-        if let Ok(null) = std::fs::OpenOptions::new().write(true).open("NUL") {
-            let null = null.into_raw_handle();
-            crt_point_fd2(null as _);
-            SetStdHandle(STD_ERROR_HANDLE, null as _);
-        }
-        CloseHandle(relay.write as _);
-    }
+    let write = relay.write;
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("toolport-stderr-release".into())
+        .spawn(move || {
+            // SAFETY: the NUL handle is leaked on purpose: it stays this
+            // process's stderr until exit. The write end was ours alone once
+            // stderr no longer names it; the CRT's fd 2 duplicate is replaced
+            // (and so closed) by a NUL duplicate.
+            unsafe {
+                crt_flush();
+                if let Ok(null) = std::fs::OpenOptions::new().write(true).open("NUL") {
+                    let null = null.into_raw_handle();
+                    crt_point_fd2(null as _);
+                    SetStdHandle(STD_ERROR_HANDLE, null as _);
+                }
+                CloseHandle(write as _);
+            }
+            let _ = done_tx.send(());
+        });
+    spawned.is_ok() && done_rx.recv_timeout(budget).is_ok()
 }
 
 #[cfg(not(any(unix, windows)))]
-fn release_stderr(_relay: &Relay) {}
+fn release_stderr(_relay: &Relay, _budget: std::time::Duration) -> bool {
+    true
+}
 
 /// Drain the stderr relay before an explicit exit, so the last lines (a fatal
 /// error, a panic report) are not lost with the process. Bounded: a child still
@@ -659,11 +680,76 @@ pub fn flush_stderr_relay(budget: std::time::Duration) {
     else {
         return;
     };
-    release_stderr(&relay);
+    let released = release_stderr(&relay, budget.saturating_sub(started.elapsed()));
     drop(relay.to_writer);
-    let _ = relay
-        .done
-        .recv_timeout(budget.saturating_sub(started.elapsed()));
+    // Unreleased, the relay never reads end-of-file, so there is nothing to
+    // wait for.
+    let drained = released
+        && relay
+            .done
+            .recv_timeout(budget.saturating_sub(started.elapsed()))
+            .is_ok();
+    if !drained {
+        // The destination has stalled. A thread blocked writing into the
+        // relay holds its C stream's lock, and exit flushes every C stream
+        // under that lock (glibc's `exit`, the Windows C runtime's flush in
+        // the release). Emptying the pipe lets that write finish and the
+        // lock go, so exit is not held by a destination nobody reads. What
+        // is still in the pipe is dropped, never written unredacted.
+        discard_relay_input(relay.read);
+    }
+}
+
+/// Read and drop whatever reaches the relay pipe from now on, on a thread of
+/// its own through its own copy of the read end, so it stays valid whatever the
+/// reader does with its own.
+fn discard_relay_input(read: usize) {
+    use std::io::Read as _;
+    let Some(mut own) = duplicate_read_end(read) else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("toolport-stderr-drain".into())
+        .spawn(move || {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match own.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        });
+}
+
+#[cfg(unix)]
+fn duplicate_read_end(read: usize) -> Option<std::fs::File> {
+    use std::os::fd::FromRawFd as _;
+    // SAFETY: duplicates the relay's own pipe fd, which the reader keeps open;
+    // the new fd is owned by the returned file alone.
+    let fd = unsafe { libc::fcntl(read as libc::c_int, libc::F_DUPFD_CLOEXEC, 0) };
+    (fd >= 0).then(|| unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(windows)]
+fn duplicate_read_end(read: usize) -> Option<std::fs::File> {
+    use std::os::windows::io::FromRawHandle as _;
+    use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut own = std::ptr::null_mut();
+    // SAFETY: duplicates the relay's own pipe handle, which the reader keeps
+    // open, within this process; the duplicate is owned by the returned file.
+    let ok = unsafe {
+        let me = GetCurrentProcess();
+        DuplicateHandle(me, read as _, me, &mut own, 0, 0, DUPLICATE_SAME_ACCESS)
+    };
+    (ok != 0).then(|| unsafe { std::fs::File::from_raw_handle(own as _) })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn duplicate_read_end(_read: usize) -> Option<std::fs::File> {
+    None
 }
 
 /// Record every panic, on any thread, with its message and location, then run
