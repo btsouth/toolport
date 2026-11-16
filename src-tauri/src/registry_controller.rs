@@ -771,6 +771,71 @@ pub fn apply_update_entry(registry: &mut Registry, entry: ServerEntry) -> Result
     registry.update_server(entry)
 }
 
+/// Runs an edited command, arguments and URL through the same credential
+/// preparation as Add, so a secret argument becomes a keychain launch input
+/// and a URL token moves to the keychain with the shown URL kept in the
+/// registry. Fields the edit left alone are not prepared again. The returned
+/// preparation holds the values to write inside the save's transaction.
+fn prepare_edited_credentials(
+    old: &ServerEntry,
+    server: &mut ServerEntry,
+) -> Result<Option<crate::import_credentials::Import>, String> {
+    let command_changed = server.command != old.command;
+    let args_changed = server.args != old.args;
+    let url_changed = server.url != old.url;
+    if !command_changed && !args_changed && !url_changed {
+        return Ok(None);
+    }
+    let mut probe = server.clone();
+    probe.env = Vec::new();
+    probe.unknown_fields.remove("importedUrlKey");
+    if !command_changed {
+        probe.command = None;
+    }
+    if !args_changed {
+        probe.args = Vec::new();
+        probe.launch = None;
+    }
+    if !url_changed {
+        probe.url = None;
+    }
+    let import = crate::import_credentials::Import::prepare_with_choices(probe, None, None)
+        .map_err(|error| {
+            error
+                .trim_end_matches(" Client config unchanged.")
+                .to_string()
+        })?;
+    if args_changed {
+        server.args = import.entry.args.clone();
+        if let Some(mut launch) = import.entry.launch.clone() {
+            if server.launch.is_none() {
+                // No launch settings meant every variable was required.
+                launch.required_env = server.env.iter().map(|e| e.key.clone()).collect();
+            }
+            server.launch = Some(launch);
+        }
+    }
+    if url_changed {
+        server.url = import.entry.url.clone();
+        match import.entry.unknown_fields.get("importedUrlKey") {
+            Some(key) => {
+                server
+                    .unknown_fields
+                    .insert("importedUrlKey".into(), key.clone());
+            }
+            None => {
+                // A URL without a credential is used as typed, not the one
+                // stored for the old endpoint.
+                server.unknown_fields.remove("importedUrlKey");
+                server
+                    .env
+                    .retain(|env| env.key != crate::secrets::IMPORTED_URL_KEY);
+            }
+        }
+    }
+    Ok(Some(import))
+}
+
 pub fn apply_update_server_fields(
     registry: &mut Registry,
     server_id: &str,
@@ -1435,28 +1500,45 @@ pub fn update_server_entry_with<T>(
     changes: &SecretKeyChanges,
     write: impl FnOnce(ServerEntry) -> Result<T, String>,
 ) -> Result<T, String> {
-    let mut entry = entry;
-    rename_required_env(entry.launch.as_mut(), changes);
-    let plan_now = || -> Result<VaultPlan, String> {
-        let previous = read_registry_exact_or_default()?;
-        match previous.servers.iter().find(|server| server.id == entry.id) {
-            Some(old) => {
-                plan_vault_changes(&previous, old, &entry.env, entry.launch.as_ref(), changes)
-            }
-            None => Ok(VaultPlan::default()),
-        }
-    };
-    // A save that removes or renames no keychain variable touches no stored
-    // value, so it needs no credential lock; it is still checked.
+    // A save that removes or renames no keychain variable and keeps the
+    // command, arguments and URL touches no stored value, so it needs no
+    // credential lock; it is still checked. A changed command, argument or URL
+    // may hold a secret that moves to the keychain, so that save locks.
     if changes.removed.is_empty() && changes.renamed.is_empty() {
-        plan_now()?;
-        return write(entry);
+        let previous = read_registry_exact_or_default()?;
+        let old = previous.servers.iter().find(|server| server.id == entry.id);
+        let untouched = old.is_none_or(|old| {
+            old.command == entry.command && old.args == entry.args && old.url == entry.url
+        });
+        if untouched {
+            if let Some(old) = old {
+                plan_vault_changes(&previous, old, &entry.env, entry.launch.as_ref(), changes)?;
+            }
+            return write(entry);
+        }
     }
     let _auth = acquire_auth_lock(&entry.id)?;
-    let mut plan = plan_now()?;
+    let previous = read_registry_exact_or_default()?;
+    let old = previous.servers.iter().find(|server| server.id == entry.id);
+    let mut plan = match old {
+        Some(old) => {
+            plan_vault_changes(&previous, old, &entry.env, entry.launch.as_ref(), changes)?
+        }
+        None => VaultPlan::default(),
+    };
+    let mut entry = entry;
+    rename_required_env(entry.launch.as_mut(), changes);
+    let edited = match old {
+        Some(old) => prepare_edited_credentials(old, &mut entry)?,
+        None => None,
+    };
     let id = entry.id.clone();
     let saved = crate::import_credentials::transaction(|writes| {
         plan.write_moves(&id, writes)?;
+        if let Some(edited) = &edited {
+            // The caller holds this server's credential lock.
+            edited.transfer_locked(&id, writes, true)?;
+        }
         write(entry)
     })?;
     plan.delete_after_commit(&id);
@@ -1700,6 +1782,11 @@ fn save_server_editor_fields_with(
             }
         }
     }
+    // An edited argument or URL carrying a secret goes to the keychain as on Add.
+    let edited = match previous.servers.iter().find(|s| s.id == id) {
+        Some(old) if !is_new => prepare_edited_credentials(old, server)?,
+        _ => None,
+    };
     // A value typed here replaces any team override for that variable, as the
     // Credentials dialog does; otherwise the override would win at launch.
     if let Some(overrides) = server
@@ -1725,7 +1812,12 @@ fn save_server_editor_fields_with(
         let missing: Vec<String> = match &import {
             // The caller already holds this server's credential lock.
             Some(import) => import.transfer_locked(&id, writes, false)?,
-            None => Vec::new(),
+            None => {
+                if let Some(edited) = &edited {
+                    edited.transfer_locked(&id, writes, true)?;
+                }
+                Vec::new()
+            }
         }
         .into_iter()
         // Values typed in this dialog and password manager references are
@@ -5595,6 +5687,171 @@ API_KEY = "synthetic-first-origin"
         let on_disk = std::fs::read_to_string(registry::resolved_path().unwrap()).unwrap();
         assert!(!on_disk.contains("sk-live-synthetic0123456789abcdef"));
         assert!(!on_disk.contains("synthetic-url-token"));
+    }
+
+    /// The stored endpoint, checked the way a remote connection checks it.
+    fn connected_url(server: &ServerEntry) -> String {
+        assert!(crate::import_credentials::has_imported_url(server));
+        let url =
+            crate::secrets::get_vault_secret_result(&server.id, crate::secrets::IMPORTED_URL_KEY)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            server.url.as_deref(),
+            Some(crate::import_credentials::shown_url(&url).as_str())
+        );
+        url
+    }
+
+    fn on_disk() -> String {
+        std::fs::read_to_string(registry::resolved_path().unwrap()).unwrap()
+    }
+
+    fn opened_empty() -> SecretKeyChanges {
+        SecretKeyChanges {
+            opened_with: Some(Vec::new()),
+            ..SecretKeyChanges::default()
+        }
+    }
+
+    #[test]
+    fn editing_a_url_token_keeps_it_out_of_the_registry() {
+        let _fixture = MoveFixture::new(&Registry::default());
+        let mut remote = fields("hooky", "http");
+        remote.url = Some("https://example.com/mcp?token=first-url-token".into());
+        let saved = save_server_editor_fields(
+            None,
+            remote,
+            Vec::new(),
+            &SecretKeyChanges::default(),
+            None,
+            &[],
+        )
+        .unwrap();
+        let id = saved.servers[0].id.clone();
+        let mut rotated = fields("hooky", "http");
+        rotated.url = Some("https://example.com/mcp?token=rotated-url-token".into());
+        let saved =
+            save_server_editor_fields(Some(&id), rotated, Vec::new(), &opened_empty(), None, &[])
+                .unwrap();
+        assert!(!on_disk().contains("rotated-url-token"));
+        assert_eq!(
+            connected_url(&saved.servers[0]),
+            "https://example.com/mcp?token=rotated-url-token"
+        );
+
+        // The shown URL saved unchanged keeps the stored one.
+        let mut shown = fields("hooky", "http");
+        shown.url = saved.servers[0].url.clone();
+        let saved =
+            save_server_editor_fields(Some(&id), shown, Vec::new(), &opened_empty(), None, &[])
+                .unwrap();
+        assert_eq!(
+            connected_url(&saved.servers[0]),
+            "https://example.com/mcp?token=rotated-url-token"
+        );
+
+        // A URL without a credential is used as typed.
+        let mut plain = fields("hooky", "http");
+        plain.url = Some("https://other.example.com/mcp".into());
+        let saved =
+            save_server_editor_fields(Some(&id), plain, Vec::new(), &opened_empty(), None, &[])
+                .unwrap();
+        let server = &saved.servers[0];
+        assert!(!crate::import_credentials::has_imported_url(server));
+        assert_eq!(server.url.as_deref(), Some("https://other.example.com/mcp"));
+    }
+
+    #[test]
+    fn editing_args_keeps_a_secret_argument_out_of_the_registry() {
+        let _fixture = MoveFixture::new(&Registry::default());
+        let saved = save_server_editor_fields(
+            None,
+            fields("argy", "stdio"),
+            Vec::new(),
+            &SecretKeyChanges::default(),
+            None,
+            &[],
+        )
+        .unwrap();
+        let id = saved.servers[0].id.clone();
+        let mut local = fields("argy", "stdio");
+        local.args.extend([
+            "--api-key".to_string(),
+            "sk-live-synthetic0123456789abcdef".to_string(),
+        ]);
+        let saved =
+            save_server_editor_fields(Some(&id), local, Vec::new(), &opened_empty(), None, &[])
+                .unwrap();
+        assert!(!on_disk().contains("sk-live-synthetic0123456789abcdef"));
+        let expected = [
+            "-y",
+            "example-server",
+            "--api-key",
+            "sk-live-synthetic0123456789abcdef",
+        ];
+        let resolved = crate::launch_inputs::resolve_args(&saved.servers[0]).unwrap();
+        assert_eq!(resolved.args, expected);
+
+        // Saved again with the shown arguments, it keeps the stored value.
+        let mut shown = fields("argy", "stdio");
+        shown.args = saved.servers[0].args.clone();
+        let saved =
+            save_server_editor_fields(Some(&id), shown, Vec::new(), &opened_empty(), None, &[])
+                .unwrap();
+        let resolved = crate::launch_inputs::resolve_args(&saved.servers[0]).unwrap();
+        assert_eq!(resolved.args, expected);
+    }
+
+    #[test]
+    fn react_edits_keep_secret_arguments_and_url_tokens_out_of_the_registry() {
+        let (mut initial, local) = stored_server(&[]);
+        let mut remote = entry_from_fields(fields("hooky", "http")).unwrap();
+        remote.id = "hooky".into();
+        initial.servers.push(remote.clone());
+        let _fixture = MoveFixture::new(&initial);
+
+        let mut edited = local;
+        edited.args.extend([
+            "--api-key".to_string(),
+            "sk-live-synthetic0123456789abcdef".to_string(),
+        ]);
+        update_server_entry_with(edited, &SecretKeyChanges::default(), save_registry).unwrap();
+        remote.url = Some("https://example.com/mcp?token=react-url-token".into());
+        let saved =
+            update_server_entry_with(remote, &SecretKeyChanges::default(), save_registry).unwrap();
+
+        let disk = on_disk();
+        assert!(!disk.contains("sk-live-synthetic0123456789abcdef"));
+        assert!(!disk.contains("react-url-token"));
+        let srv = saved.servers.iter().find(|s| s.id == "srv").unwrap();
+        assert_eq!(
+            crate::launch_inputs::resolve_args(srv).unwrap().args,
+            [
+                "-y",
+                "example-server",
+                "--api-key",
+                "sk-live-synthetic0123456789abcdef"
+            ]
+        );
+        let hooky = saved.servers.iter().find(|s| s.id == "hooky").unwrap();
+        assert_eq!(
+            connected_url(hooky),
+            "https://example.com/mcp?token=react-url-token"
+        );
+
+        // The shown values sent back unchanged keep the stored ones.
+        update_server_entry_with(srv.clone(), &SecretKeyChanges::default(), save_registry).unwrap();
+        let saved =
+            update_server_entry_with(hooky.clone(), &SecretKeyChanges::default(), save_registry)
+                .unwrap();
+        let srv = saved.servers.iter().find(|s| s.id == "srv").unwrap();
+        assert!(crate::launch_inputs::resolve_args(srv).is_ok());
+        let hooky = saved.servers.iter().find(|s| s.id == "hooky").unwrap();
+        assert_eq!(
+            connected_url(hooky),
+            "https://example.com/mcp?token=react-url-token"
+        );
     }
 
     #[test]
