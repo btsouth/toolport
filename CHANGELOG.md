@@ -6,8 +6,113 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [2.3.6] - 2026-11-16
+
+Toolport 2.3.6 keeps your stored secrets out of logs and messages, protects the
+credentials in client config backups, and fixes uninstall and client setup on macOS.
+
+If you are on Toolport 1.24.x, this is also your update to Toolport 2. Read the
+[upgrade guide](https://github.com/btsouth/toolport/blob/main/docs/migration.md)
+before updating.
+
+### Security
+
+- Secrets you store for a server are replaced with `[secret:NAME]` in the
+  Activity log, daemon log, error messages and tool results, even when a server
+  echoes them back encoded, or split across lines, JSON strings or output
+  chunks. Toolport also cleans them out of logs written by earlier versions.
+  (#1343, #1366)
+- Client config backups no longer keep credentials in plain text. They live in
+  your system keyring or Toolport's vault. (#1342)
+- Servers from a shared setup file are now imported switched off, so nothing in
+  someone else's file starts or connects until you turn it on in Servers. (#1348)
+
+### Changed
+
+- Starting Toolport, opening Clients and showing a recovery card no longer ask
+  to unlock your keyring on Linux. Servers whose stored values are locked show
+  **Keyring locked** until you unlock it and choose Retry, and the first real use
+  of a server can still ask once. A Shared HTTP endpoint that is on also waits
+  until the keyring is unlocked, then starts by itself. With KeePassXC locked,
+  checking a server may still ask once. (#1343, #1368, #1376, #1380)
+- Toolport now writes its entry where Goose (macOS), Devin Desktop, Cline, Crush
+  (Windows), Antigravity, Hermes (Windows), OpenCode, Amazon Q and LM Studio
+  actually read it. It removes the old entry only when the client no longer reads
+  that file. VS Code, Cursor and Copilot CLI entries get the `type` those clients
+  expect. (#1340)
+- Toolport's Codex entry now allows parallel tool calls and longer startup and
+  tool timeouts, unless you set those keys yourself. (#1336)
 - Arch and Omarchy install only from the Toolport pacman repository. The
-  unpublished AUR `toolport-bin` package and its workflow are gone.
+  unpublished AUR `toolport-bin` package and its workflow are gone. If you built
+  `toolport-bin` yourself, Settings now tells you how to switch. (#1338, #1359)
+
+### Added
+
+- You can paste a `claude mcp add` command, the kind most server READMEs give,
+  into Add server and Toolport fills in the server for you. Nothing in the
+  command is run. (#1349)
+- Claude Code now loads Toolport's search and call tools right away, so it no
+  longer has to look them up first. (#1336)
+- In code mode, search results show each tool's arguments as a short TypeScript
+  signature, and scripts can call `toolport.describe(name)` for the full schema.
+  (#1334)
+- Toolport finds the Claude Code and Codex instances T3 Code runs, labels their
+  rows on Clients, and connects them like any other client. Activity and approval
+  prompts show when a call came through T3 Code. (#1341, #1347)
+- The GTK server editor has a Startup timeout field, shows the Test connection
+  result next to the buttons, and points out each field that needs fixing. (#1357)
+- Run on the Tools tab now starts a server that is not running yet. Activity
+  lists these Runs as **Toolport Tools tab**. (#1351, #1366)
+- The macOS dmg shows an Applications shortcut to drag Toolport into. (#1340)
+
+### Fixed
+
+- Disconnect restores your original client config exactly when you have not
+  edited it. If a saved value cannot be read, Toolport still disconnects and
+  shows a card where you can retry or discard it. The cards look and work the
+  same in both apps, and Retry tells you when the keyring is still locked. On an
+  install upgraded from 2.3.5 whose keyring is still locked, Disconnect asks once
+  to unlock it. Remove from all clients does not ask and leaves those clients
+  connected until the keyring is unlocked. (#1342, #1355, #1376, #1378)
+- Disconnect in the desktop app now works the same way as in GTK: if saving
+  fails, your client config is put back. (#1356)
+- If you went back to 1.24 after trying 2.x and turned on Shared HTTP there,
+  Disconnect now removes the entry 1.24 wrote instead of calling it hand-edited.
+  This covers Claude Code, Codex, Cursor, Devin Desktop, Antigravity, Devin CLI,
+  Copilot CLI, VS Code and OpenCode. If you already chose Disconnect on 2.3.5 or
+  earlier, remove the `toolport` entry from that client's config by hand. (#1370)
+- On macOS, Remove Toolport data no longer stops on a keychain item that is
+  already gone, and the background gateway stops when no client is using it and
+  you quit the app, remove Toolport from your clients or move the app to the
+  Trash. (#1340)
+- Uninstalling with Homebrew, the Windows installer or a Linux package now
+  removes launch at login. `brew uninstall` restores your clients and only
+  `brew uninstall --zap` removes your data. (#1340)
+- On Windows, a secret no longer reads as missing while another Toolport process
+  is saving one, and Toolport cleans up leftover credential pieces that could fill
+  Credential Manager until new secrets failed to save. (#1332)
+- Pasting a server with headers Toolport cannot send now says so, instead of
+  saving a value that was never sent. Toolport sends only an
+  `Authorization: Bearer` header for now. A refused paste leaves the form as it
+  was. (#1349, #1366)
+- Activity durations now include the time a call waited for its server to
+  start. (#1366)
+- Server names and status stay readable in narrow windows, connection errors
+  read plainly (for example "Connection failed: Connection refused"), and the
+  Default access menu marks the current choice. (#1369, #1380)
+- The GTK app no longer freezes on Hyprland when you open a menu or dropdown
+  while a tooltip is showing, or when a keyring prompt is open over the Clients
+  page. (#1344, #1350, #1376)
+- In GTK, Escape closes the Catalog suggestions and keeps what you typed. (#1354)
+- A deleted T3 Code home stays deleted, and OpenCode instances that only have
+  `opencode.jsonc` are labelled. (#1358)
+- Long tool results that no longer fit in memory stay available to fetch, and a
+  cancelled call can no longer cancel a later one. (#1336)
+- Opening sign-in pages, files and folders no longer leaves stray processes
+  behind until Toolport quits. (#1346, #1353)
+- On Fedora, openSUSE and other RPM systems, the install script picks the GTK
+  package when your system supports it. On Arch it sets up the pacman keyring,
+  including on a system that has none yet. (#1342, #1364)
 
 ## [2.3.5] - 2026-11-13
 
