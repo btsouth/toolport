@@ -20892,14 +20892,14 @@ fn insecure_loopback_requested(args: &[String]) -> bool {
     args.iter().any(|arg| arg == INSECURE_LOOPBACK_FLAG)
 }
 
-/// Whether the operator asked this process to be the host daemon (`--daemon`).
-/// Phase 2: the daemon role currently serves the internal identity handshake and
-/// exits after an idle grace; it does not own a router yet.
 /// The secrets a gateway learns at start, in every role: inline values only.
 fn learn_startup_secrets() {
     conduit_lib::secret_refs::preload_inline_secrets();
 }
 
+/// Whether the operator asked this process to be the host daemon (`--daemon`).
+/// Phase 2: the daemon role currently serves the internal identity handshake and
+/// exits after an idle grace; it does not own a router yet.
 fn daemon_requested(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "--daemon")
 }
