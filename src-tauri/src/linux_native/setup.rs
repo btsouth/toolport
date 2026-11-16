@@ -53,6 +53,111 @@ impl From<&str> for Completion {
 
 /// The inside of a review entry's toggle, laid out as React's `ImportRow`: a 12px square
 /// dot, the name over its command, then the labels on the right.
+/// React's dialog width (`sm:max-w-lg`), for the review, its result and its prompts.
+const REVIEW_WIDTH: i32 = 512;
+/// The tallest the review's body grows before it scrolls.
+const REVIEW_MAX_BODY_HEIGHT: i32 = 600;
+
+/// Asks for one credential value in a sheet with the spec §5 footer (Cancel, then "Use for
+/// connection"), in place of a message dialog with a response strip. Esc cancels.
+fn credential_prompt(
+    owner: &impl IsA<gtk::Window>,
+    name: &str,
+    key: &str,
+    on_save: impl Fn(String) + 'static,
+) -> adw::Window {
+    // React's default dialog width (`sm:max-w-sm`), narrower than the review.
+    let prompt = adw::Window::builder()
+        .transient_for(owner)
+        .modal(true)
+        .default_width(384)
+        .default_height(-1)
+        .build();
+    prompt.set_widget_name("toolport-credential-prompt");
+    let heading = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .build();
+    l10n::bind_formatted_label(&heading, "{value0} credentials", &[("value0", name)]);
+    let title = crate::i18n::trf("{value0} credentials", &[("value0", name)]);
+    prompt.set_title(Some(&title));
+    let (header, _) = dialog_header(&prompt, &heading);
+    let text = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .build();
+    text.add_css_class("toolport-dialog-lede");
+    l10n::bind_text(
+        &text,
+        crate::i18n::msg(
+            "This value is used only for the selected server. It is saved only if connection succeeds.",
+        ),
+    );
+    // The key names the field above it, as React's label does.
+    let field = gtk::Label::builder().label(key).xalign(0.0).build();
+    field.add_css_class("toolport-dialog-field");
+    let entry = gtk::PasswordEntry::builder()
+        .show_peek_icon(true)
+        .activates_default(true)
+        .build();
+    entry.update_property(&[gtk::accessible::Property::Label(key)]);
+    // Spec §13: the shared 32px input with a surface fill and accent focus ring.
+    entry.add_css_class("toolport-input");
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    body.set_margin_top(12);
+    body.set_margin_bottom(24);
+    body.set_margin_start(24);
+    body.set_margin_end(24);
+    body.append(&text);
+    let labelled = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    labelled.append(&field);
+    labelled.append(&entry);
+    body.append(&labelled);
+    let cancel = l10n::button("Cancel");
+    cancel.add_css_class("flat");
+    let save = l10n::button("Use for connection");
+    save.set_widget_name("toolport-credential-save");
+    save.add_css_class("suggested-action");
+    save.set_sensitive(false);
+    {
+        let save = save.clone();
+        entry.connect_changed(move |entry| save.set_sensitive(!entry.text().is_empty()));
+    }
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.append(&header);
+    root.append(&body);
+    root.append(&super::dialog_footer(&[&cancel, &save]));
+    prompt.set_content(Some(&root));
+    prompt.set_default_widget(Some(&save));
+    super::close_on_escape(&prompt);
+    {
+        let prompt = prompt.downgrade();
+        cancel.connect_clicked(move |_| {
+            if let Some(prompt) = prompt.upgrade() {
+                prompt.close();
+            }
+        });
+    }
+    {
+        let prompt = prompt.downgrade();
+        let entry = entry.clone();
+        save.connect_clicked(move |_| {
+            if entry.text().is_empty() {
+                return;
+            }
+            on_save(entry.text().to_string());
+            if let Some(prompt) = prompt.upgrade() {
+                prompt.close();
+            }
+        });
+    }
+    prompt.present();
+    entry.grab_focus();
+    prompt
+}
+
 /// Commands up to this length wrap in a review entry; longer ones keep both ends, as
 /// React's ImportRow does.
 const REVIEW_COMMAND_WRAP_CHARS: usize = 72;
@@ -301,6 +406,33 @@ pub(super) fn unreadable_review_title(client_name: &str) -> String {
     crate::i18n::trf("Connect {value0}", &[("value0", client_name)])
 }
 
+/// React's dialog header: the title on the left and a close button on the right, in
+/// place of a centred header bar title. The row still moves the window.
+fn dialog_header(window: &adw::Window, heading: &gtk::Label) -> (gtk::WindowHandle, gtk::Button) {
+    heading.set_hexpand(true);
+    heading.add_css_class("toolport-dialog-title");
+    heading.set_accessible_role(gtk::AccessibleRole::Heading);
+    let close = super::header_icon_button("window-close-symbolic");
+    close.set_valign(gtk::Align::Start);
+    l10n::bind_tooltip(&close, "Close");
+    close.update_property(&[gtk::accessible::Property::Label(&crate::i18n::tr("Close"))]);
+    let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    title_row.set_margin_top(16);
+    title_row.set_margin_start(24);
+    title_row.set_margin_end(12);
+    title_row.append(heading);
+    title_row.append(&close);
+    let header = gtk::WindowHandle::new();
+    header.set_child(Some(&title_row));
+    let window = window.downgrade();
+    close.connect_clicked(move |_| {
+        if let Some(window) = window.upgrade() {
+            window.close();
+        }
+    });
+    (header, close)
+}
+
 // Keep all reviewed dialog fields and its confirmation callback together.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn review(
@@ -373,9 +505,11 @@ pub(super) fn gateway_settings_card(sentence: &str, lines: &str) -> gtk::Box {
         if monospace {
             // A long setting has no spaces to break at; let it break anywhere.
             label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-            label.add_css_class("monospace");
+            // React's notice is 13px throughout, its settings in mono (spec §2).
+            label.add_css_class("toolport-path-text");
             label.set_margin_bottom(12);
         } else {
+            label.add_css_class("toolport-dialog-field");
             label.set_margin_top(12);
         }
         card.append(&label);
@@ -411,43 +545,21 @@ pub(super) fn review_with_notice(
         .transient_for(parent)
         .modal(true)
         .title(title)
-        .default_width(620)
-        .default_height(540)
+        // React's dialog: the height follows the content as folds open and close, so no
+        // empty band sits above the footer (spec §8). A fixed-size window is sized to its
+        // content by GTK on every change, where a resizable one keeps its first size.
+        .resizable(false)
         .build();
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    // React's dialog header: the title on the left and a close button on the right, in
-    // place of a centred header bar title. The row still moves the window.
     let heading = gtk::Label::builder()
         .label(title)
         .xalign(0.0)
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
-        .hexpand(true)
         .build();
     heading.set_widget_name("toolport-setup-title");
-    heading.add_css_class("toolport-dialog-title");
-    heading.set_accessible_role(gtk::AccessibleRole::Heading);
-    let close = super::header_icon_button("window-close-symbolic");
-    close.set_valign(gtk::Align::Start);
+    let (header, close) = dialog_header(&dialog, &heading);
     close.set_widget_name("toolport-setup-close");
-    l10n::bind_tooltip(&close, "Close");
-    close.update_property(&[gtk::accessible::Property::Label(&crate::i18n::tr("Close"))]);
-    let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    title_row.set_margin_top(16);
-    title_row.set_margin_start(24);
-    title_row.set_margin_end(12);
-    title_row.append(&heading);
-    title_row.append(&close);
-    let header = gtk::WindowHandle::new();
-    header.set_child(Some(&title_row));
-    {
-        let dialog = dialog.downgrade();
-        close.connect_clicked(move |_| {
-            if let Some(dialog) = dialog.upgrade() {
-                dialog.close();
-            }
-        });
-    }
     let cancel = l10n::button("Cancel");
     // Close is off while a check runs, as Cancel is and as React's close button is.
     cancel
@@ -546,6 +658,9 @@ pub(super) fn review_with_notice(
             .xalign(0.0)
             .wrap(true)
             .build();
+        // A description: 13px secondary text (spec §2).
+        widget.add_css_class("toolport-dialog-lede");
+        widget.set_widget_name("toolport-setup-lede");
         l10n::bind_label(&widget, source);
         widget
     };
@@ -660,8 +775,8 @@ pub(super) fn review_with_notice(
         ));
         // Small text inside the entry, as React's `text-meta` credentials fold.
         settings.add_css_class("small");
-        let credential_rows = gtk::ListBox::new();
-        credential_rows.set_selection_mode(gtk::SelectionMode::None);
+        // React's plain list of credential lines, no row fill.
+        let credential_rows = gtk::Box::new(gtk::Orientation::Vertical, 8);
         content.append(&credential_rows);
         let tag = l10n::label(if !item.updates.is_empty() {
             crate::i18n::msg("Updates existing server")
@@ -780,7 +895,14 @@ pub(super) fn review_with_notice(
                     &[("value0", &env.key.to_string())],
                 ))
                 .active(env.secret)
+                .valign(gtk::Align::Center)
                 .build();
+            // The choice text wraps before the line runs out of room.
+            if let Some(text) = choice.last_child().and_downcast::<gtk::Label>() {
+                text.set_wrap(true);
+                text.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+                text.set_xalign(0.0);
+            }
             row_choices.borrow_mut().push(choice.downgrade());
             let refresh = refresh_state.clone();
             choice.connect_toggled(move |_| refresh());
@@ -789,50 +911,60 @@ pub(super) fn review_with_notice(
                     && !env.key.starts_with("__")
                     && env.key != crate::secrets::IMPORTED_URL_KEY,
             );
-            let value_row = adw::ActionRow::builder()
-                .title(&env.key)
-                .subtitle(crate::i18n::tr(if !env.required {
-                    "Optional"
-                } else if env.present {
-                    "Found"
+            // One line as in React: the keychain choice, "Optional" when it is, the
+            // value's state on the right, then Enter value when it is missing.
+            let value_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            value_row.set_widget_name("toolport-setup-credential");
+            value_row.append(&choice);
+            if !env.required {
+                let optional = l10n::label(crate::i18n::msg("Optional"));
+                optional.add_css_class("toolport-muted");
+                optional.set_valign(gtk::Align::Center);
+                value_row.append(&optional);
+            }
+            let value_state = gtk::Label::builder()
+                .label(if env.present {
+                    crate::i18n::tr("Found")
+                } else if env.required {
+                    crate::i18n::tr("Missing")
                 } else {
-                    "Missing"
-                }))
+                    String::new()
+                })
+                .hexpand(true)
+                .xalign(1.0)
+                .valign(gtk::Align::Center)
+                .css_classes(["toolport-muted"])
                 .build();
-            value_row.add_suffix(&choice);
-            value_row.set_activatable_widget(Some(&choice));
+            value_row.append(&value_state);
             credential_rows.append(&value_row);
             if !env.present {
                 let open = l10n::button("Enter value");
+                open.set_valign(gtk::Align::Center);
                 let owner = dialog.clone();
                 let inputs = credential_inputs.clone();
                 let name = item.name.clone();
                 let key = env.key.clone();
                 let refresh_state = refresh_state.clone();
-                let value_row_for_input = value_row.clone();
+                let value_row_for_input = value_state.clone();
                 open.connect_clicked(move |_| {
-                    let prompt = adw::MessageDialog::new(Some(&owner), Some(&crate::i18n::trf("{value0} credentials", &[("value0", &name.to_string())])), Some(&crate::i18n::trf("Enter {value0}. This value is used only for the selected server. It is saved only if connection succeeds.", &[("value0", &key.to_string())])));
-l10n::bind_formatted_dialog_heading(&prompt, "{value0} credentials", &[("value0", &name.to_string())]);
-l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used only for the selected server. It is saved only if connection succeeds.", &[("value0", &key.to_string())]);
-                    let entry = gtk::PasswordEntry::builder().show_peek_icon(true).build();
-                    prompt.set_extra_child(Some(&entry));
-                    prompt.add_responses(&[("cancel", "Cancel"), ("save", "Use for connection")]);
-                    l10n::bind_dialog_response(&prompt, "cancel", "Cancel");
-                    l10n::bind_dialog_response(&prompt, "save", "Use for connection");
-                    prompt.set_response_appearance("save", adw::ResponseAppearance::Suggested);
-                    prompt.set_default_response(Some("save"));
-                    prompt.set_close_response("cancel");
-                    let (inputs, name, key, value_row, refresh) = (inputs.clone(), name.clone(), key.clone(), value_row_for_input.clone(), refresh_state.clone());
-                    prompt.connect_response(None, move |_, response| {
-                        if response == "save" && !entry.text().is_empty() {
-                            inputs.borrow_mut().entry(name.clone()).or_default().insert(key.clone(), entry.text().to_string());
-                            value_row.set_subtitle(&crate::i18n::tr("Ready for connection"));
-                            refresh();
-                        }
+                    let (inputs, name_key, key_key, value_row, refresh) = (
+                        inputs.clone(),
+                        name.clone(),
+                        key.clone(),
+                        value_row_for_input.clone(),
+                        refresh_state.clone(),
+                    );
+                    credential_prompt(&owner, &name, &key, move |value| {
+                        inputs
+                            .borrow_mut()
+                            .entry(name_key.clone())
+                            .or_default()
+                            .insert(key_key.clone(), value);
+                        value_row.set_label(&crate::i18n::tr("Ready for connection"));
+                        refresh();
                     });
-                    prompt.present();
                 });
-                value_row.add_suffix(&open);
+                value_row.append(&open);
             }
             credential_choices.push((item.name.clone(), env.key, choice));
         }
@@ -879,6 +1011,7 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
         .xalign(0.0)
         .build();
     path.add_css_class("toolport-disclosure-text");
+    path.add_css_class("toolport-path-text");
     path.add_css_class("toolport-muted");
     content.append(&path);
     details.set_visible(!unreadable);
@@ -901,15 +1034,25 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
         .child(&body)
         .vexpand(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .max_content_height(REVIEW_MAX_BODY_HEIGHT)
         .build();
     // Natural heights, then scroll: at minimum heights a result page taller than the
     // window shrinks its status to the icon and cuts off the title.
     if let Some(viewport) = scroller.child().and_downcast::<gtk::Viewport>() {
         viewport.set_vscroll_policy(gtk::ScrollablePolicy::Natural);
     }
+    scroller.set_widget_name("toolport-setup-scroller");
     root.append(&scroller);
     root.append(&super::dialog_footer(&[&cancel, &skip, &confirm]));
-    dialog.set_content(Some(&root));
+    // React's 512px width: never narrower, and long lines wrap instead of widening it.
+    root.set_width_request(REVIEW_WIDTH);
+    let clamp = adw::Clamp::builder()
+        .maximum_size(REVIEW_WIDTH)
+        .tightening_threshold(REVIEW_WIDTH)
+        .child(&root)
+        .build();
+    dialog.set_content(Some(&clamp));
     {
         let (closing, skipped) = (dialog.clone(), skipped.clone());
         skip.connect_clicked(move |_| {
@@ -1172,12 +1315,13 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                         // React's Details: the config, then the backup when one was saved.
                         let (detail, content) = details_expander(&crate::i18n::tr("Details"));
                         detail.set_widget_name("toolport-setup-details");
-                        let mut lines = vec![crate::i18n::trf(
-                            "Config: {path}",
-                            &[("path", &connect.config_path)],
+                        // Lines that hold a path are mono 13 (spec §2).
+                        let mut lines = vec![(
+                            crate::i18n::trf("Config: {path}", &[("path", &connect.config_path)]),
+                            true,
                         )];
                         if let Some(backup) = &outcome.backup {
-                            lines.push(
+                            lines.push((
                                 backup_date(backup)
                                     .map(|date| {
                                         crate::i18n::trf(
@@ -1186,10 +1330,14 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                                         )
                                     })
                                     .unwrap_or_else(|| crate::i18n::tr("Backup saved")),
-                            );
-                            lines.push(crate::i18n::trf("Backup: {path}", &[("path", backup)]));
+                                false,
+                            ));
+                            lines.push((
+                                crate::i18n::trf("Backup: {path}", &[("path", backup)]),
+                                true,
+                            ));
                         }
-                        for line in lines {
+                        for (line, path) in lines {
                             let label = gtk::Label::builder()
                                 .label(line)
                                 .xalign(0.0)
@@ -1197,6 +1345,9 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                                 .selectable(true)
                                 .build();
                             label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+                            if path {
+                                label.add_css_class("toolport-path-text");
+                            }
                             content.append(&label);
                         }
                         body.append(&detail);
@@ -1914,9 +2065,14 @@ mod tests {
         }
         let lines = labels
             .iter()
-            .find(|l| l.has_css_class("monospace"))
+            .find(|l| l.has_css_class("toolport-path-text"))
             .unwrap();
         assert!(lines.wraps());
+        // React's 13px notice: the sentence in body text, the settings in 13px mono.
+        assert!(labels
+            .iter()
+            .any(|l| l.text() == "Toolport also adds these settings."
+                && l.has_css_class("toolport-dialog-field")));
         assert_eq!(lines.wrap_mode(), gtk::pango::WrapMode::WordChar);
         let (min, _, _, _) = card.measure(gtk::Orientation::Horizontal, -1);
         assert!(
@@ -1988,6 +2144,51 @@ mod tests {
         assert!(!labels(&window)
             .iter()
             .any(|t| t == "Review the selected servers before continuing."));
+        // Spec §2 and §8: a 13px secondary lede, React's 512px width, and a height that
+        // follows the content instead of a fixed 540px with an empty band.
+        let named_widget = |name: &str| {
+            descendants(window.upcast_ref())
+                .into_iter()
+                .find(|w| w.widget_name() == name)
+                .unwrap_or_else(|| panic!("{name}"))
+        };
+        assert!(named_widget("toolport-setup-lede").has_css_class("toolport-dialog-lede"));
+        assert!(named_widget("toolport-setup-title").has_css_class("toolport-dialog-title"));
+        // The window takes its content's size: 512 wide, and as tall as the content
+        // instead of the old fixed 540px. Checked on the real allocation, after layout.
+        let context = gtk::glib::MainContext::default();
+        let settle = |done: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !done() && std::time::Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::yield_now();
+            }
+        };
+        assert!(!window.is_resizable());
+        let content = window.child().unwrap();
+        let natural_height = || content.measure(gtk::Orientation::Vertical, REVIEW_WIDTH).1;
+        let fits = || {
+            window.width() == REVIEW_WIDTH
+                // The content plus the window's own frame, and no more.
+                && (0..=12).contains(&(window.height() - natural_height()))
+        };
+        settle(&fits);
+        assert!(
+            fits(),
+            "{}x{} for {}px of content",
+            window.width(),
+            window.height(),
+            natural_height()
+        );
+        let natural = natural_height();
+        assert!(
+            natural < 540,
+            "this small review needs less than the old fixed height"
+        );
+        let scroller = named_widget("toolport-setup-scroller")
+            .downcast::<gtk::ScrolledWindow>()
+            .unwrap();
+        assert!(scroller.propagates_natural_height());
         // Details sits right under the lede, above the entries, as in React.
         let review_details = descendants(window.upcast_ref())
             .into_iter()
@@ -2005,6 +2206,23 @@ mod tests {
         assert!(review_details.has_css_class("toolport-disclosure"));
         assert!(review_details.has_css_class("small"));
         assert!(!review_details.has_css_class("toolport-details-expander"));
+        // Opening a fold grows the window to fit, and closing it shrinks it back.
+        let folded = window.height();
+        let fold = review_details.downcast_ref::<gtk::Expander>().unwrap();
+        fold.set_expanded(true);
+        settle(&|| window.height() > folded && fits());
+        assert!(
+            window.height() > folded && fits(),
+            "{} after opening, {folded} before",
+            window.height()
+        );
+        fold.set_expanded(false);
+        settle(&|| window.height() <= folded + 2 && fits());
+        assert!(
+            window.height() <= folded + 2,
+            "{} after closing",
+            window.height()
+        );
         assert!(review_details
             .next_sibling()
             .is_some_and(|w| w.widget_name() == "toolport-setup-review-entries"));
@@ -2251,6 +2469,16 @@ mod tests {
             .filter_map(|w| w.downcast_ref::<gtk::CheckButton>())
             .find(|c| c.label().as_deref() == Some("Keep PORT in keychain"))
             .unwrap();
+        // React's one line: the choice, then the value's state, with no row fill.
+        let line = choice.parent().unwrap();
+        assert_eq!(line.widget_name(), "toolport-setup-credential");
+        assert!(line
+            .last_child()
+            .and_downcast::<gtk::Label>()
+            .is_some_and(|state| state.text() == "Found"));
+        assert!(!widgets
+            .iter()
+            .any(|w| w.is::<gtk::ListBox>() && w.ancestor(gtk::Expander::static_type()).is_some()));
         assert!(!choice.is_active());
         choice.set_active(true);
         assert!(widgets
@@ -2695,5 +2923,75 @@ mod tests {
         let quit = main_loop.clone();
         gtk::glib::timeout_add_seconds_local_once(seconds, move || quit.quit());
         main_loop.run();
+    }
+
+    /// Spec §5: the credential prompt is a sheet with a right-aligned footer, Cancel then
+    /// "Use for connection", not a message dialog's response strip.
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn credential_prompt_uses_the_dialog_footer() {
+        adw::init().unwrap();
+        let owner = gtk::Window::new();
+        let saved = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+        let prompt = {
+            let saved = saved.clone();
+            credential_prompt(&owner, "notes", "NOTES_TOKEN", move |value| {
+                *saved.borrow_mut() = Some(value)
+            })
+        };
+        // React's default dialog width, its header with a close button, its lede, and the
+        // key as the field's label.
+        assert_eq!(prompt.default_width(), 384);
+        let widgets = descendants(prompt.upcast_ref());
+        assert!(widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Button>())
+            .any(|b| b.icon_name().as_deref() == Some("window-close-symbolic")));
+        let labels = widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .collect::<Vec<_>>();
+        assert!(labels.iter().any(|l| l.text()
+            == "This value is used only for the selected server. It is saved only if connection succeeds."
+            && l.has_css_class("toolport-dialog-lede")));
+        assert!(labels
+            .iter()
+            .any(|l| l.text() == "NOTES_TOKEN" && l.has_css_class("toolport-dialog-field")));
+        let footer = widgets
+            .iter()
+            .find(|w| w.has_css_class("toolport-dialog-footer"))
+            .expect("the dialog footer");
+        let buttons = descendants(footer)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            buttons
+                .iter()
+                .map(|b| b.label().unwrap_or_default().to_string())
+                .collect::<Vec<_>>(),
+            ["Cancel", "Use for connection"]
+        );
+        assert!(buttons[0].has_css_class("flat"));
+        assert!(buttons[1].has_css_class("suggested-action"));
+        assert!(!buttons[1].is_sensitive(), "nothing to use yet");
+        let heading = widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .find(|l| l.has_css_class("toolport-dialog-title"))
+            .unwrap();
+        assert_eq!(heading.text(), "notes credentials");
+        let entry = widgets
+            .iter()
+            .find_map(|w| w.downcast_ref::<gtk::PasswordEntry>())
+            .unwrap()
+            .clone();
+        assert!(entry.has_css_class("toolport-input"));
+        entry.set_text("secret-value");
+        assert!(buttons[1].is_sensitive());
+        buttons[1].emit_clicked();
+        assert_eq!(saved.borrow().as_deref(), Some("secret-value"));
+        assert!(!prompt.is_visible(), "saving closes the sheet");
+        owner.destroy();
     }
 }

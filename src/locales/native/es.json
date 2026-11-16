@@ -316,7 +316,6 @@
   "Enter a value first.": "Introduzca un valor primero.",
   "Enter both a variable name and a secret value.": "Introduzca un nombre de variable y un valor secreto.",
   "Enter the sync service URL and manual code": "Ingrese la URL del servicio de sincronización y el código manual",
-  "Enter {value0}. This value is used only for the selected server. It is saved only if connection succeeds.": "Ingrese {value0}. Este valor se utiliza sólo para el servidor seleccionado. Se guarda sólo si la conexión se realiza correctamente.",
   "Environment / credential keys": "Claves de entorno/credenciales",
   "Every device keeps syncing for {count} more days": "Cada dispositivo se sigue sincronizando durante {count} días más",
   "Everything is included unless you uncheck it.": "Todo está incluido a menos que lo desmarques.",

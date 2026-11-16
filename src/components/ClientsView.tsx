@@ -1,4 +1,5 @@
 import { ErrorCallout, StatusCard } from "@/components/ui/status-card";
+import { dismissClientNotice, useClientNotices } from "@/lib/clientNotice";
 import { msg, Trans, translate, useI18n } from "@/lib/i18n";
 import { Button } from "@/components/ui/button";
 import { trustedClientName, clientIdentityTooltip } from "@/lib/clientIdentity";
@@ -517,6 +518,8 @@ export function ClientsView({
 }) {
   const { t, locale } = useI18n();
   const [showMissing, setShowMissing] = useState(false);
+  // The restart reminder from a connect, shared with the client's details page.
+  const restartNotice = useClientNotices().list;
   const [refreshing, setRefreshing] = useState(false);
   const [sessionRetry, setSessionRetry] = useState(0);
   const refresh = async () => {
@@ -826,6 +829,26 @@ export function ClientsView({
                 if (button && !button.disabled) button.focus();
                 else t3Card.current?.focus();
               }}
+            >
+              {t("Dismiss")}
+            </Button>
+          }
+        />
+      )}
+      {restartNotice && (
+        <StatusCard
+          role="status"
+          variant="info"
+          className="select-text"
+          icon={<RefreshCw />}
+          title={restartNotice.title}
+          detail={restartNotice.text}
+          actions={
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => dismissClientNotice(restartNotice)}
             >
               {t("Dismiss")}
             </Button>

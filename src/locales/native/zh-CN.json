@@ -316,7 +316,6 @@
   "Enter a value first.": "首先输入一个值。",
   "Enter both a variable name and a secret value.": "请输入变量名称和机密值。",
   "Enter the sync service URL and manual code": "输入同步服务 URL 和手动验证码",
-  "Enter {value0}. This value is used only for the selected server. It is saved only if connection succeeds.": "输入{value0}。该值仅用于选定的服务器。仅当连接成功时才会保存。",
   "Environment / credential keys": "环境变量名 / 凭证键名",
   "Every device keeps syncing for {count} more days": "所有设备还可继续同步 {count} 天",
   "Everything is included unless you uncheck it.": "除非您取消选中它，否则一切都包括在内。",
