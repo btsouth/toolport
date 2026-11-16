@@ -391,7 +391,10 @@ pub(super) fn client_row(
     copy.append(&detail);
     lead.append(&copy);
 
-    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    // The controls wrap onto right-aligned lines in a narrow window, as on the
+    // Servers page, instead of making the page wider than the window.
+    let controls = super::page_header::ActionFlow::new();
+    controls.set_lines_end(true);
     controls.add_css_class("toolport-client-controls");
     controls.set_sensitive(!client.config_error && (client.app_present || client.config_exists));
     controls.set_valign(gtk::Align::Center);
@@ -435,8 +438,11 @@ pub(super) fn client_row(
         }
         state::ClientGatewayState::Customized => {}
         state::ClientGatewayState::Connected => {
-            controls.append(&client_scope_menu(client.clone(), page.clone()));
-            controls.append(&connected_client_actions_menu(client.clone(), page.clone()));
+            // The access menu and ⋮ stay side by side on one line.
+            let menus = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            menus.append(&client_scope_menu(client.clone(), page.clone()));
+            menus.append(&connected_client_actions_menu(client.clone(), page.clone()));
+            controls.append(&menus);
         }
     }
     if shows_remove_location(client)

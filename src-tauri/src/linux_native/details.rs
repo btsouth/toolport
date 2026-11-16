@@ -360,6 +360,17 @@ fn bound_dropdown(control: &gtk::DropDown) {
     control.set_list_factory(Some(&checked_list_factory()));
 }
 
+/// A choice in an open dropdown list: one line that never breaks inside a word,
+/// so the list grows to fit it ("Default access (from Setting-s)" broke there
+/// when it wrapped in a narrow list).
+pub(super) fn checked_list_label() -> gtk::Label {
+    gtk::Label::builder()
+        .xalign(0.0)
+        .hexpand(true)
+        .single_line_mode(true)
+        .build()
+}
+
 /// The open list of a dropdown with its own button factory: each choice in full,
 /// with a check mark on the current one, as GTK's default list and the Language
 /// dropdown show.
@@ -368,8 +379,7 @@ pub(super) fn checked_list_factory() -> gtk::SignalListItemFactory {
     factory.connect_setup(|_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        let label = gtk::Label::builder().xalign(0.0).hexpand(true).build();
-        client_rows::wrap_row_text(&label);
+        let label = checked_list_label();
         let check = gtk::Image::from_icon_name("object-select-symbolic");
         row.append(&label);
         row.append(&check);
