@@ -837,6 +837,32 @@ describe("ClientsView", () => {
       expect(screen.queryByText(/T3 Code/)).not.toBeInTheDocument();
     });
 
+    it("tries a failed read of the instances again on the next check", async () => {
+      vi.useFakeTimers();
+      vi.mocked(t3CodeRevision).mockResolvedValue("a");
+      vi.mocked(t3CodeOtherInstances)
+        .mockRejectedValueOnce(new Error("ipc"))
+        .mockResolvedValueOnce([other("muse", "Muse Code", "Muse Code", "unsupported")])
+        .mockResolvedValue([]);
+      render(
+        <ClientsView
+          clients={[client()]}
+          registry={null}
+          onSelectClient={vi.fn()}
+          onChanged={vi.fn(async () => {})}
+        />,
+      );
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(screen.queryByRole("group", { name: "T3 Code" })).not.toBeInTheDocument();
+      // The revision has not changed, but the failed read is tried again.
+      await act(() => vi.advanceTimersByTimeAsync(5_000));
+      expect(card()).toHaveTextContent("Not supported by Toolport yet: Muse Code.");
+      // Once a read has worked, an unchanged revision reads nothing more.
+      const reads = vi.mocked(t3CodeOtherInstances).mock.calls.length;
+      await act(() => vi.advanceTimersByTimeAsync(5_000));
+      expect(t3CodeOtherInstances).toHaveBeenCalledTimes(reads);
+    });
+
     it("reads the instances again after a scan, and not without T3 Code", async () => {
       vi.useFakeTimers();
       vi.mocked(t3CodeRevision).mockResolvedValue("a");

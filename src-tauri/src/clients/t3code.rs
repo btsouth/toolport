@@ -1201,10 +1201,18 @@ fn home_gaps(instances: &[Instance]) -> Vec<T3CodeOther> {
             let resolved = real_home.as_ref().map(|root| root.join(&below));
             // Only a home that passed the walk may be resolved to compare it.
             let plain = walk == HomeWalk::Plain;
+            // OpenCode's row names `opencode.jsonc` when only that exists, as the label
+            // ([`annotate_with`]) reads it.
+            let file = (plain && instance.provider == Provider::OpenCode)
+                .then(|| opencode_file(path.to_path_buf(), true))
+                .filter(|file| file != path);
             let names = |other: &Path| {
                 same_text(other, path)
                     || resolved.as_deref().is_some_and(|r| same_text(other, r))
                     || (plain && locations::same_path(other, path))
+                    || file
+                        .as_deref()
+                        .is_some_and(|file| locations::same_path(other, file))
             };
             let client_type = instance.provider.client_type();
             if client_config_path_for_type(client_type).is_some_and(|main| names(&main))
@@ -1375,11 +1383,44 @@ pub(super) fn lists(config: &Path) -> bool {
 
 /// Label each client row with the T3 Code instances that use its config.
 pub(super) fn annotate(clients: &mut [DetectedClient]) {
-    let instances = instances();
-    if instances.is_empty() {
+    let reading = current();
+    let Reading::Instances(instances, others, outside) = &*reading else {
         return;
+    };
+    annotate_with(clients, instances);
+    annotate_outside(clients, others, outside);
+}
+
+/// Label the rows that cover a home outside the user's home: the card leaves those
+/// instances out ([`outside_covered`]), so their row says T3 Code uses it and counts
+/// them as connected or not. Compared by text only, as the card does, so the folder is
+/// never opened.
+fn annotate_outside(clients: &mut [DetectedClient], others: &[T3CodeOther], outside: &[Outside]) {
+    for home in outside {
+        let Some(other) = others.get(home.index) else {
+            continue;
+        };
+        let Some(client) = clients.iter_mut().find(|client| {
+            (client.id == home.client_type
+                || client.id.starts_with(&format!("{}@", home.client_type)))
+                && !client.config_path.is_empty()
+                && same_text(Path::new(&client.config_path), &home.config)
+        }) else {
+            continue;
+        };
+        if client
+            .t3_code
+            .iter()
+            .any(|known| known.instance_id == other.instance_id)
+        {
+            continue;
+        }
+        client.t3_code.push(T3CodeUse {
+            instance_id: other.instance_id.clone(),
+            display_name: other.display_name.clone(),
+            enabled: other.enabled,
+        });
     }
-    annotate_with(clients, &instances);
 }
 
 /// The file OpenCode reads in a folder, chosen as its row's is

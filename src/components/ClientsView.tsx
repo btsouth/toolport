@@ -543,13 +543,19 @@ export function ClientsView({
   // settings change and after each scan (a home folder may have appeared meanwhile).
   const [t3Others, setT3Others] = useState<T3CodeOther[]>([]);
   const t3Read = useRef(0);
+  // A read that failed is tried again on the next check, even with no settings change.
+  const t3ReadFailed = useRef(false);
   const readT3Others = () => {
     const read = ++t3Read.current;
     void t3CodeOtherInstances()
       .then((others) => {
-        if (read === t3Read.current) setT3Others(others);
+        if (read !== t3Read.current) return;
+        t3ReadFailed.current = false;
+        setT3Others(others);
       })
-      .catch(() => {});
+      .catch(() => {
+        if (read === t3Read.current) t3ReadFailed.current = true;
+      });
   };
   const readT3OthersRef = useRef(readT3Others);
   useEffect(() => {
@@ -577,7 +583,10 @@ export function ClientsView({
       if (!active) return;
       const previous = t3Seen.current;
       t3Seen.current = { value: revision };
-      if (previous && previous.value === revision) return;
+      if (previous && previous.value === revision) {
+        if (revision !== null && t3ReadFailed.current) readT3OthersRef.current();
+        return;
+      }
       if (revision === null) {
         t3Read.current += 1;
         setT3Others([]);

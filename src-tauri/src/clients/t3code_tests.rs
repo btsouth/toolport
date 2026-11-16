@@ -1929,10 +1929,14 @@ fn an_opencode_home_with_only_jsonc_labels_its_row() {
     std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
     std::fs::create_dir_all(home.join(".oc-xdg/opencode")).unwrap();
     std::fs::write(home.join(".oc-xdg/opencode/opencode.jsonc"), "{}").unwrap();
+    std::fs::create_dir_all(home.join(".oc2/opencode")).unwrap();
+    std::fs::write(home.join(".oc2/opencode/opencode.jsonc"), "{}").unwrap();
     std::fs::write(
         home.join(".t3/userdata/settings.json"),
         r#"{"providerInstances": {"oc": {"driver": "opencode", "displayName": "OC", "enabled": true,
-            "environment": [{"name": "XDG_CONFIG_HOME", "value": "~/.oc-xdg"}]}}}"#,
+            "environment": [{"name": "XDG_CONFIG_HOME", "value": "~/.oc-xdg"}]},
+          "oc2": {"driver": "opencode", "displayName": "OC Two", "enabled": true,
+            "environment": [{"name": "XDG_CONFIG_HOME", "value": "~/.oc2"}]}}}"#,
     )
     .unwrap();
     let _data = crate::registry::DataDirOverride::set(root.join("data"));
@@ -1963,6 +1967,26 @@ fn an_opencode_home_with_only_jsonc_labels_its_row() {
             .map(|use_| use_.display_name.as_str())
             .collect::<Vec<_>>(),
         ["OC"]
+    );
+    // A home whose only file is `opencode.jsonc`, added as a location under that name, is
+    // the location's row and not a home to add.
+    assert!(other_instances()
+        .iter()
+        .any(|other| other.instance_id == "oc2"));
+    locations::remember(&locations::ClientLocation {
+        id: "opencode@oc2".into(),
+        manual: true,
+        client_type: "opencode".into(),
+        name: "OpenCode (oc2)".into(),
+        config_path: home.join(".oc2/opencode/opencode.jsonc"),
+    })
+    .unwrap();
+    assert!(
+        other_instances()
+            .iter()
+            .all(|other| other.instance_id != "oc2"),
+        "{:?}",
+        other_instances()
     );
     #[cfg(unix)]
     {
@@ -2077,6 +2101,25 @@ fn an_outside_home_added_by_hand_is_no_longer_listed() {
     }
     assert!(!outside.exists());
     assert_eq!(listed(), ["dot"]);
+    // The row that covers an outside home says T3 Code uses it, so the card counts it.
+    let mut row = config_error_row(
+        "codex@away",
+        "Codex (away)",
+        outside.join("config.toml").display().to_string(),
+        String::new(),
+    );
+    row.error = None;
+    let mut clients = vec![row];
+    annotate(&mut clients);
+    assert_eq!(
+        clients[0]
+            .t3_code
+            .iter()
+            .map(|use_| (use_.instance_id.as_str(), use_.display_name.as_str()))
+            .collect::<Vec<_>>(),
+        [("away", "Away")]
+    );
+    assert!(!outside.exists());
     let _ = std::fs::remove_dir_all(&root);
 }
 
