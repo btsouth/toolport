@@ -357,9 +357,24 @@ install_arch_repo() {
       ;;
   esac
 
+  # A keyring that already exists is left as it is. One this script has to
+  # create starts empty, and pacman then rejects every official package as
+  # "unknown trust", so it also gets the distribution keys that pacman-key
+  # ships in /usr/share/pacman/keyrings.
+  keyring_existed=0
+  if $sudo pacman-key --list-keys >/dev/null 2>&1; then
+    keyring_existed=1
+  fi
   say "Initializing the local pacman keyring if needed"
   $sudo pacman-key --init ||
     err "The local pacman keyring could not be initialized. Run: sudo pacman-key --init; sudo pacman-key --populate archlinux. Then retry this installer."
+  if [ "$keyring_existed" = 0 ]; then
+    say "Adding your distribution's signing keys to the new keyring"
+    $sudo pacman-key --populate ||
+      err "pacman-key could not add your distribution's signing keys to the new keyring." \
+        "Run: sudo pacman-key --populate" \
+        "Then retry this installer."
+  fi
   say "Importing the Toolport signing key"
   tmpkey="$tmp/toolport.gpg"
   curl -fsSL "$keyring_url" -o "$tmpkey" ||
@@ -379,8 +394,21 @@ install_arch_repo() {
   fi
 
   say "Installing toolport"
-  $sudo pacman -Syu --noconfirm toolport ||
-    err "pacman could not install toolport. Check the output above."
+  pacman_log="$tmp/pacman.log"
+  if ! $sudo pacman -Syu --noconfirm toolport 2>&1 | tee "$pacman_log"; then
+    if grep -qiE 'unknown trust|PGP signature|signature from|key .* could not be looked up' "$pacman_log"; then
+      # Either the keyring lacks the distribution keys or a download was damaged.
+      # With --noconfirm pacman already deleted a corrupted file from its cache,
+      # so a plain retry downloads it again.
+      err "pacman rejected a package signature." \
+        "If your keyring is new or missing keys, run: sudo pacman-key --populate" \
+        "If a download was damaged, pacman has removed it: run this installer again."
+    fi
+    # The patterns above are pacman's English text. pacman keeps the user's
+    # language, so a translated signature error lands here: say it anyway.
+    err "pacman could not install toolport. Check the output above." \
+      "If the output above mentions signatures or keys, run: sudo pacman-key --populate, then run this installer again."
+  fi
 
   say "Installed. Launch Toolport from your app menu, or run: toolport-gtk"
   say "Updates arrive with your normal system update (pacman -Syu)."
