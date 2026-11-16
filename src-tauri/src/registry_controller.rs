@@ -6404,6 +6404,51 @@ API_KEY = "synthetic-first-origin"
         });
     }
 
+    /// N3: several pasted servers keep a Kimi `bearerTokenEnvVar` as the
+    /// server's token. Typed in the review, it is stored; left empty, the
+    /// server is added off and the outcome names it.
+    #[test]
+    fn a_multi_paste_keeps_a_kimi_bearer_token() {
+        let text = r#"{"mcpServers":{"authed":{"url":"https://mcp.example.com/mcp","bearerTokenEnvVar":"MY_MCP_TOKEN"},"local":{"command":"npx","args":["x"]}}}"#;
+        let both = ["0".to_string(), "1".to_string()];
+        let authed = |outcome: &SnippetAddOutcome| {
+            let server = outcome.servers.iter().find(|s| s.name == "authed").unwrap();
+            (server.status.clone(), server.missing.clone())
+        };
+        crate::secrets::tests::with_isolated_vault(|| {
+            let inputs = [(
+                "authed".to_string(),
+                [("MY_MCP_TOKEN".to_string(), "tok-kimi-1".to_string())].into(),
+            )]
+            .into();
+            let outcome =
+                add_snippet_servers_inputs(text, &both, &Default::default(), &inputs).unwrap();
+            assert_eq!(authed(&outcome), ("added".to_string(), vec![]));
+            let id = &outcome
+                .registry
+                .servers
+                .iter()
+                .find(|s| s.name == "authed")
+                .unwrap()
+                .id;
+            assert_eq!(
+                crate::secrets::get_secret_result(id, "MY_MCP_TOKEN")
+                    .unwrap()
+                    .as_deref(),
+                Some("tok-kimi-1")
+            );
+        });
+        crate::secrets::tests::with_isolated_vault(|| {
+            let outcome =
+                add_snippet_servers_inputs(text, &both, &Default::default(), &Default::default())
+                    .unwrap();
+            assert_eq!(
+                authed(&outcome),
+                ("needs input".to_string(), vec!["MY_MCP_TOKEN".to_string()])
+            );
+        });
+    }
+
     /// A pasted key renamed to match another row would keep only one value.
     /// The add is refused before anything is read or written.
     #[test]

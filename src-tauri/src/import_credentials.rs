@@ -970,6 +970,40 @@ mod tests {
         assert!(import.entry.env.iter().any(|e| e.key == "RESEND_API_KEY"));
     }
 
+    /// N4: an import keeps exactly the rows a remote save allows.
+    #[test]
+    fn a_remote_import_keeps_what_a_remote_save_allows() {
+        let mut raw = entry(true);
+        raw.env.clear();
+        raw.url = Some("https://example.invalid/mcp".into());
+        raw.unknown_fields
+            .insert("headerKeys".into(), json!([{"key": "X-Api-Key"}]));
+        let definition = json!({"env": {
+            secrets::HTTP_AUTH_KEY: "slot-synthetic",
+            "X-Api-Key": "header-synthetic",
+            "RESEND_API_KEY": "re_synthetic",
+        }});
+        let import = Import::prepare(raw.clone(), Some(&definition)).unwrap();
+        let mut keys: Vec<_> = import.entry.env.iter().map(|e| e.key.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, ["X-Api-Key", secrets::HTTP_AUTH_KEY]);
+        assert_eq!(import.skipped_env(), ["RESEND_API_KEY"]);
+        for key in [secrets::HTTP_AUTH_KEY, "X-Api-Key", "RESEND_API_KEY"] {
+            let mut next = raw.clone();
+            next.env = vec![registry::EnvVar {
+                key: key.into(),
+                value: None,
+                secret: true,
+                unknown_fields: Default::default(),
+            }];
+            assert_eq!(
+                crate::registry_controller::refuse_new_remote_env(None, &next).is_ok(),
+                keys.contains(&key),
+                "{key}"
+            );
+        }
+    }
+
     #[test]
     fn reviewed_bearer_env_names_always_remain_secret() {
         for key in ["LINEAR_APIKEY", "MCP_CRED"] {
