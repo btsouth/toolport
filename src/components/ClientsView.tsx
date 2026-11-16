@@ -379,10 +379,12 @@ function ProfileGroup({
     .sort((a, b) => {
       const left = a.claudeProfile;
       const right = b.claudeProfile;
+      // By the same rule as the rows, which GTK's `profile_order` also uses.
       return (
         Number(!left?.command) - Number(!right?.command) ||
-        (left?.command ?? left?.folder ?? "").localeCompare(
-          right?.command ?? right?.folder ?? "",
+        compareClientNames(
+          { name: left?.command ?? left?.folder ?? "", id: a.id },
+          { name: right?.command ?? right?.folder ?? "", id: b.id },
         )
       );
     });

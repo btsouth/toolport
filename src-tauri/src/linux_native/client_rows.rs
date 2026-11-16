@@ -1139,6 +1139,23 @@ fn connect_t3_code_targets(page: ClientPage, targets: Vec<state::ClientView>) {
     );
 }
 
+/// The order of a group's profiles or homes: those started by a command first, by
+/// command; the rest by folder; each by `state::name_order`, as React's group sorts them.
+pub(super) fn profile_order(a: &state::ClientView, b: &state::ClientView) -> std::cmp::Ordering {
+    let key = |client: &state::ClientView| {
+        let profile = client.claude_profile.as_ref();
+        let command = profile.and_then(|profile| profile.command.clone());
+        (
+            command.is_none(),
+            command.unwrap_or_else(|| profile.map(|p| p.folder.clone()).unwrap_or_default()),
+        )
+    };
+    let ((a_plain, a_key), (b_plain, b_key)) = (key(a), key(b));
+    a_plain
+        .cmp(&b_plain)
+        .then_with(|| state::name_order(&a_key, &a.id, &b_key, &b.id))
+}
+
 /// The line under a Connect all step's title: "Step N of M: NAMES", naming the enabled
 /// instances on `client`, the row as the batch holds it from when it started.
 pub(super) fn t3_code_step_line(index: usize, total: usize, client: &state::ClientView) -> String {
@@ -1273,15 +1290,7 @@ pub(super) fn profile_group(
                 .as_ref()
                 .is_some_and(|profile| profile.same_as.is_some())
         });
-    // Profiles started by a command first, by command; the rest by folder.
-    shown.sort_by_key(|client| {
-        let profile = client.claude_profile.as_ref();
-        let command = profile.and_then(|profile| profile.command.clone());
-        (
-            command.is_none(),
-            command.unwrap_or_else(|| profile.map(|p| p.folder.clone()).unwrap_or_default()),
-        )
-    });
+    shown.sort_by(|a, b| profile_order(a, b));
     if let [only] = shown.as_slice() {
         // One real profile and its copies: an ordinary row, with the note under it.
         group.append(&client_row(only, page.clone(), RowStyle::Line));
@@ -1886,6 +1895,34 @@ mod tests {
                 "Step 3 of 4: Z",
                 "Step 4 of 4: E"
             ]
+        );
+    }
+
+    #[test]
+    fn a_groups_homes_go_by_lowercase_folder_then_id_as_react_lists_them() {
+        use state::ClientGatewayState::*;
+        let home = |id: &str, folder: &str| {
+            let mut row = client(id, Disconnected);
+            row.claude_profile = Some(crate::clients::ClaudeProfile {
+                command: None,
+                account: None,
+                folder: folder.into(),
+                last_used_ms: None,
+                same_as: None,
+            });
+            row
+        };
+        let mut rows = [
+            home("codex@ecran", "~/.t3/écran"),
+            home("codex@zed", "~/.t3/zed"),
+            home("codex@b", "~/.t3/Work"),
+            home("codex@a", "~/.t3/work"),
+        ];
+        rows.sort_by(profile_order);
+        // React's ClientsView test of the same homes expects this order.
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["codex@a", "codex@b", "codex@zed", "codex@ecran"]
         );
     }
 

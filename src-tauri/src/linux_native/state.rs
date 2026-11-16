@@ -463,8 +463,20 @@ pub(super) fn client_order(left: &ClientView, right: &ClientView) -> std::cmp::O
     right
         .app_present
         .cmp(&left.app_present)
-        .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-        .then_with(|| left.id.cmp(&right.id))
+        .then_with(|| name_order(&left.name, &left.id, &right.name, &right.id))
+}
+
+/// Text Clients sorts by, such as a row's name or a profile's folder: by Unicode
+/// lowercase, then by id. React's `compareClientNames` is the same rule.
+pub(super) fn name_order(
+    left: &str,
+    left_id: &str,
+    right: &str,
+    right_id: &str,
+) -> std::cmp::Ordering {
+    left.to_lowercase()
+        .cmp(&right.to_lowercase())
+        .then_with(|| left_id.cmp(right_id))
 }
 
 impl ClientView {

@@ -66,8 +66,8 @@ function compareCodePoints(a: string, b: string): number {
 }
 
 /** The order rows (and so Connect all's steps) are listed in among rows of the same
- * status: by Unicode lowercase name, then by id. GTK's `state::client_order` is the same
- * rule. */
+ * status, and a group's profiles by command or folder: by Unicode lowercase text, then by
+ * id. GTK's `state::name_order` is the same rule. */
 export function compareClientNames(
   a: { name: string; id: string },
   b: { name: string; id: string },

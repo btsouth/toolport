@@ -477,6 +477,40 @@ describe("ClientsView", () => {
     expect(screen.getByText("~/.codex2")).toBeInTheDocument();
   });
 
+  it("lists a group's homes by lowercase folder then id, as GTK does", () => {
+    const home = (id: string, folder: string) =>
+      client({
+        id,
+        name: `Codex (${folder})`,
+        claudeProfile: {
+          command: null,
+          account: null,
+          folder,
+          lastUsedMs: null,
+          sameAs: null,
+        },
+      });
+    render(
+      <ClientsView
+        clients={[
+          home("codex@ecran", "~/.t3/écran"),
+          home("codex@zed", "~/.t3/zed"),
+          home("codex@b", "~/.t3/Work"),
+          home("codex@a", "~/.t3/work"),
+        ]}
+        registry={null}
+        onSelectClient={vi.fn()}
+      />,
+    );
+    const group = screen
+      .getByRole("button", { name: "Codex profiles" })
+      .closest("section")!;
+    const ids = [...group.querySelectorAll("[data-client-id]")].map((row) =>
+      row.getAttribute("data-client-id"),
+    );
+    expect(ids).toEqual(["codex@a", "codex@b", "codex@zed", "codex@ecran"]);
+  });
+
   it("describes each client by its servers and discovery, with the config path on hover", () => {
     render(
       <ClientsView
