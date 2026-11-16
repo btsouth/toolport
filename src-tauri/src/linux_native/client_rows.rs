@@ -674,6 +674,14 @@ pub(super) fn t3_code_instance_count(rows: &[&state::ClientView]) -> usize {
         .sum()
 }
 
+/// Whether any T3 Code instance on the rows is on, or any is counted as not connected.
+pub(super) fn t3_code_any_enabled(clients: &[state::ClientView], unconnected: usize) -> bool {
+    unconnected > 0
+        || clients
+            .iter()
+            .any(|client| client.t3_code.iter().any(|instance| instance.enabled))
+}
+
 /// The T3 Code card's status line for this many unconnected enabled instances.
 pub(super) fn t3_code_status_text(count: usize) -> String {
     match count {
@@ -931,8 +939,9 @@ pub(super) fn t3_code_card(
         .css_classes(["caption"])
         .build();
     l10n::bind_label_with(&status, move || t3_code_status_text(unconnected));
-    // With only instances Toolport cannot connect, there is nothing to count.
-    status.set_visible(has_rows);
+    // With only instances Toolport cannot connect, there is nothing to count, and with
+    // every instance off, nothing to say is connected.
+    status.set_visible(has_rows && t3_code_any_enabled(clients, unconnected));
     copy.append(&status);
     // Left-out rows first, then instances Toolport can't use, as React orders them.
     let lines = |left: &[T3LeftOut], others: &[crate::clients::T3CodeOther]| {
@@ -1278,6 +1287,21 @@ mod tests {
             claude_profile: None,
             t3_code: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_status_line_needs_an_instance_that_is_on() {
+        let mut work = client("claude-code", state::ClientGatewayState::Connected);
+        work.t3_code = vec![instance("Work", false)];
+        let mut home = client("codex", state::ClientGatewayState::Disconnected);
+        home.t3_code = vec![instance("Home", false)];
+        // Every instance off: nothing to say is connected.
+        assert!(!t3_code_any_enabled(&[work.clone(), home.clone()], 0));
+        // One on, connected: every enabled instance is connected.
+        work.t3_code = vec![instance("Work", true)];
+        assert!(t3_code_any_enabled(&[work, home.clone()], 0));
+        // Only instances Toolport can't use, counted as not connected.
+        assert!(t3_code_any_enabled(&[home], 1));
     }
 
     fn ids<'a>(rows: &[&'a state::ClientView]) -> Vec<&'a str> {

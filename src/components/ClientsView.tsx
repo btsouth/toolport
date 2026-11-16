@@ -37,6 +37,7 @@ import {
   t3CodeGapLines,
   t3CodeLeftOut,
   t3CodeLeftOutLines,
+  t3CodeAnyEnabled,
   t3CodeStatus,
   t3CodeTargets,
   t3CodeUnconnectedCount,
@@ -554,8 +555,13 @@ export function ClientsView({
   useEffect(() => {
     readT3OthersRef.current = readT3Others;
   });
+  // Without T3 Code there is no timer, so while it is absent each scan (Refresh, or after
+  // a connect) checks again whether it has appeared; GTK reads the card's instances on
+  // every scan too.
+  const t3Tick = useRef<(() => Promise<void>) | null>(null);
   useEffect(() => {
     if (t3Seen.current?.value != null) readT3OthersRef.current();
+    else if (t3Seen.current) void t3Tick.current?.();
   }, [clients, t3Seen]);
   useEffect(() => {
     if (!windowVisible) return;
@@ -589,9 +595,11 @@ export function ClientsView({
         timer = window.setTimeout(() => void tick(), 5_000);
       }
     };
+    t3Tick.current = tick;
     void tick();
     return () => {
       active = false;
+      t3Tick.current = null;
       window.clearTimeout(timer);
     };
   }, [windowVisible, t3Seen]);
@@ -705,7 +713,9 @@ export function ClientsView({
                     "T3 Code runs these clients as providers. Each reads its own MCP config, so Toolport connects to them, not to T3 Code.",
                   )}
                 </p>
-                {hasT3Rows && <p className="mt-1">{t3CodeStatus(t3Unconnected)}</p>}
+                {hasT3Rows && t3CodeAnyEnabled(clients, t3Unconnected) && (
+                  <p className="mt-1">{t3CodeStatus(t3Unconnected)}</p>
+                )}
                 {t3Lines.map((line) => (
                   <p key={line} className="mt-1">
                     {line}

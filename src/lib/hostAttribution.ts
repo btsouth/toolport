@@ -157,6 +157,18 @@ export function t3CodeUnconnectedCount(
   );
 }
 
+/** Whether any instance on the rows is on, or any is counted as not connected. With every
+ * instance off there is nothing to say is connected, so the card shows no status line. */
+export function t3CodeAnyEnabled(
+  clients: DetectedClient[],
+  unconnected: number,
+): boolean {
+  return (
+    unconnected > 0 ||
+    clients.some((client) => (client.t3Code ?? []).some((instance) => instance.enabled))
+  );
+}
+
 /** The card's status line. */
 export function t3CodeStatus(count: number): string {
   if (count === 0) return translate("Every enabled T3 Code instance is connected.");

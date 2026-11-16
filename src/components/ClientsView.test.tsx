@@ -859,6 +859,54 @@ describe("ClientsView", () => {
       expect(screen.queryByText(/T3 Code/)).not.toBeInTheDocument();
     });
 
+    it("says nothing is connected or not when every instance is off", () => {
+      render(
+        <ClientsView
+          clients={[
+            client({ t3Code: [off("Work")] }),
+            client({ id: "codex", name: "Codex", t3Code: [off("Home")] }),
+          ]}
+          registry={null}
+          onSelectClient={vi.fn()}
+        />,
+      );
+      expect(card()).toBeInTheDocument();
+      expect(card()).not.toHaveTextContent(/is connected|not connected/);
+    });
+
+    it("lists the instances it can't use once T3 Code appears and the page rescans", async () => {
+      vi.useFakeTimers();
+      // T3 Code is absent at first, so there is no timer.
+      vi.mocked(t3CodeRevision).mockResolvedValue(null);
+      vi.mocked(t3CodeOtherInstances).mockResolvedValue([
+        other("fx1", "fx", "Fx One", "unsupported"),
+      ]);
+      const onChanged = vi.fn(async () => {});
+      const { rerender } = render(
+        <ClientsView
+          clients={[client()]}
+          registry={null}
+          onSelectClient={vi.fn()}
+          onChanged={onChanged}
+        />,
+      );
+      await act(() => vi.advanceTimersByTimeAsync(20_000));
+      expect(t3CodeOtherInstances).not.toHaveBeenCalled();
+      // It is installed, then the user refreshes: the scan labels a row.
+      vi.mocked(t3CodeRevision).mockResolvedValue("a");
+      rerender(
+        <ClientsView
+          clients={[client({ t3Code: [on("Work")] })]}
+          registry={null}
+          onSelectClient={vi.fn()}
+          onChanged={onChanged}
+        />,
+      );
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(card()).toHaveTextContent("Not supported by Toolport yet: Fx One (fx).");
+      expect(card()).toHaveTextContent("2 enabled T3 Code instances are not connected.");
+    });
+
     it("says T3 Code's settings can't be read once a revision exists", async () => {
       vi.useFakeTimers();
       // A broken settings link still has a revision, so the card reads the instances.
