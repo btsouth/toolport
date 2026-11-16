@@ -1071,22 +1071,49 @@ mod platform {
         }
     }
 
-    /// Whether any Toolport item is locked, by one search that never unlocks.
-    /// Unknown (the service is missing or busy) is false: those reads fail
-    /// without a prompt.
+    /// How long a check of its own waits for another keyring operation before
+    /// it answers "unknown".
+    const STORE_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// Whether a read could ask to unlock, by one search that never unlocks.
+    /// Only a search that finds no locked Toolport item, or no Secret Service
+    /// to connect to (a read cannot prompt either), says no. Unknown (another
+    /// keyring operation holds the store, a timeout, a failed search) says
+    /// yes: background work waits rather than risk a prompt.
     pub fn store_would_prompt() -> bool {
         let search = || {
-            with_backup_service(|service| {
+            let found = with_backup_service(|service| {
                 service
                     .search_items(std::collections::HashMap::from([("service", SERVICE)]))
                     .map(|found| !found.locked.is_empty())
                     .map_err(|error| classify(&error))
-            })
+            });
+            let no_service = || {
+                BACKUP_BATCH.with(|slot| {
+                    slot.borrow()
+                        .as_ref()
+                        .is_some_and(|batch| batch.service.is_none() && batch.failure.is_some())
+                })
+            };
+            match found {
+                Ok(locked) => locked,
+                Err(_) if no_service() => false,
+                Err(_) => true,
+            }
         };
         if BACKUP_BATCH.with(|slot| slot.borrow().is_some()) {
-            search().unwrap_or(false)
+            search()
         } else {
-            with_backup_batch(search).unwrap_or(false)
+            with_backup_batch(|| {
+                BACKUP_BATCH.with(|slot| {
+                    if let Some(batch) = slot.borrow_mut().as_mut() {
+                        batch.deadline = batch
+                            .deadline
+                            .min(std::time::Instant::now() + STORE_CHECK_TIMEOUT);
+                    }
+                });
+                search()
+            })
         }
     }
 
@@ -1303,6 +1330,19 @@ mod platform {
                     0
                 );
             });
+        }
+
+        /// Failure mode: while another keyring operation held the store, the
+        /// check could not search and answered "would not prompt", so
+        /// background work went on to a read that asks to unlock.
+        #[test]
+        fn a_busy_store_counts_as_one_that_would_prompt() {
+            let _held = SERVICE_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let started = std::time::Instant::now();
+            assert!(store_would_prompt(), "unknown must wait, not read");
+            assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
         }
 
         #[test]
@@ -1776,6 +1816,9 @@ fn set_secret_raw(server_id: &str, key: &str, value: &str) -> Result<(), String>
 
 /// A write with no registration, for Toolport's own internal keys.
 fn write_stored(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+    if write_would_prompt() {
+        return Err("the keyring is locked; this background write waits for it".into());
+    }
     // A write to a locked Secret Service collection asks to unlock it too.
     if locked_store::locked() {
         return Err(locked_store::prompted(server_id, key));
@@ -2064,6 +2107,45 @@ pub(crate) fn has_own_credentials(server: &crate::registry::ServerEntry) -> Resu
     Ok(false)
 }
 
+thread_local! {
+    static WITHOUT_PROMPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Run work nobody asked for (background sync, a restore at start) so that no
+/// keyring call in it, on this thread, can ask to unlock: reads use the
+/// non-prompting path, and a write or delete fails while the store would
+/// prompt. A check made before the work cannot cover a keyring that locks
+/// during it; this does.
+pub fn without_prompts<T>(f: impl FnOnce() -> T) -> T {
+    struct Leave;
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            WITHOUT_PROMPTS.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+    WITHOUT_PROMPTS.with(|depth| depth.set(depth.get() + 1));
+    let _leave = Leave;
+    f()
+}
+
+fn prompts_allowed() -> bool {
+    WITHOUT_PROMPTS.with(|depth| depth.get() == 0)
+}
+
+/// Inside [`without_prompts`], on a store whose ordinary reads can ask to
+/// unlock (Secret Service). macOS, Windows and the file vault never ask, so
+/// their reads keep their usual path.
+fn read_must_not_prompt() -> bool {
+    !prompts_allowed()
+        && (locked_store::locked()
+            || (cfg!(all(not(target_os = "macos"), not(target_os = "windows"))) && !file::active()))
+}
+
+/// A write or delete inside [`without_prompts`] while the store would ask.
+fn write_would_prompt() -> bool {
+    !prompts_allowed() && store_would_prompt()
+}
+
 pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
     #[cfg(test)]
     tests::record_read(server_id, key);
@@ -2074,6 +2156,9 @@ pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, S
     if server_id == INTERNAL_SERVER_ID {
         return Err("reserved Toolport secret namespace".to_string());
     }
+    if read_must_not_prompt() {
+        return get_secret_without_prompt(server_id, key);
+    }
     get_secret_result_raw(&crate::local_auth::owner(server_id)?, key)
 }
 
@@ -2082,6 +2167,9 @@ pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, S
 pub fn get_vault_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
     if server_id == INTERNAL_SERVER_ID {
         return Err("reserved Toolport secret namespace".to_string());
+    }
+    if read_must_not_prompt() {
+        return get_vault_secret_without_prompt(server_id, key);
     }
     let owner = crate::local_auth::owner(server_id)?;
     let server_id = owner.as_str();
@@ -2446,6 +2534,9 @@ pub fn retired_scrubs_pending() -> usize {
 }
 
 fn delete_secret_raw(server_id: &str, key: &str) -> Result<(), String> {
+    if write_would_prompt() {
+        return Err("the keyring is locked; this background delete waits for it".into());
+    }
     if locked_store::locked() {
         return Err(locked_store::prompted(server_id, key));
     }

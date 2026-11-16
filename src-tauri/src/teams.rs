@@ -1390,7 +1390,20 @@ pub fn background_sync(wait_secs: u64) -> Option<Result<SyncResult, String>> {
     if crate::secrets::store_would_prompt() {
         return None;
     }
-    Some(sync_wait(wait_secs))
+    background_sync_step(wait_secs)
+}
+
+/// The step itself. The keyring can lock after the check above (while this
+/// waits for another sync, or during the long poll), so every keyring call in
+/// it is made without asking; one that failed because the keyring locked
+/// meanwhile is a skipped step, not an error.
+fn background_sync_step(wait_secs: u64) -> Option<Result<SyncResult, String>> {
+    let result = crate::secrets::without_prompts(|| sync_recorded(wait_secs));
+    if result.is_err() && crate::secrets::store_would_prompt() {
+        return None;
+    }
+    crate::personal_sync::record_error(result.as_ref().err().map(String::as_str));
+    Some(result)
 }
 
 /// Bounded retry pacing for native lifecycle owners; independent of window visibility.
@@ -5334,6 +5347,37 @@ pub fn remove_team(reg: &mut Registry, team_id: &str) {
 
 #[cfg(test)]
 mod tests {
+    /// Failure mode: the check before a background sync passed, the keyring
+    /// locked while it waited or long-polled, and its token read asked to
+    /// unlock it.
+    #[test]
+    fn a_keyring_that_locks_during_background_sync_is_never_asked() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            crate::registry::save(&crate::registry::Registry {
+                team: Some(
+                    serde_json::from_value(serde_json::json!({
+                        "serverUrl": "https://teams.example.invalid",
+                        "teamId": "bg-team",
+                        "role": "member",
+                        "reportingDeviceId": "bg-device"
+                    }))
+                    .unwrap(),
+                ),
+                ..Default::default()
+            })
+            .unwrap();
+            let mut step = None;
+            let prompts = crate::secrets::locked_store::prompts_during(|| {
+                step = Some(super::background_sync_step(0));
+            });
+            assert!(prompts.is_empty(), "{prompts:?}");
+            assert!(
+                matches!(step, Some(None)),
+                "a step the lock stopped is skipped, not an error"
+            );
+        });
+    }
+
     #[test]
     fn reconnecting_keeps_this_machines_servers_and_sync_state() {
         let previous: TeamConnection = serde_json::from_value(json!({
