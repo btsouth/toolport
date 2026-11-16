@@ -11642,6 +11642,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
                         feedback.add_css_class("error");
                     }
                 }
+                reveal(&feedback);
             });
         });
     }
@@ -11848,6 +11849,7 @@ fn auth_write<T: Send + 'static>(
 /// Show a result label as success or error.
 fn credential_feedback(label: &gtk::Label, error: bool) {
     label.set_visible(true);
+    reveal(label);
     if error {
         label.remove_css_class("success");
         label.add_css_class("error");
@@ -12297,7 +12299,39 @@ fn credential_focus(editor: &adw::Window, started: &gtk::Widget, target: &impl I
     };
     if lost {
         target.grab_focus();
+        reveal(target);
     }
+}
+
+/// Scroll `widget` into view once its dialog has laid out new content.
+fn reveal(widget: &impl IsA<gtk::Widget>) {
+    let widget = widget.clone().upcast::<gtk::Widget>();
+    // Low priority runs after GTK's layout pass.
+    gtk::glib::idle_add_local_full(gtk::glib::Priority::LOW, move || {
+        let scroller = widget
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .and_downcast::<gtk::ScrolledWindow>();
+        let content = scroller
+            .as_ref()
+            .and_then(|scroller| scroller.child())
+            .and_then(|viewport| viewport.first_child());
+        if let (Some(scroller), Some(bounds)) = (
+            scroller,
+            content.and_then(|content| widget.compute_bounds(&content)),
+        ) {
+            let adjustment = scroller.vadjustment();
+            let (top, bottom) = (
+                f64::from(bounds.y()),
+                f64::from(bounds.y() + bounds.height()),
+            );
+            if top < adjustment.value() {
+                adjustment.set_value(top);
+            } else if bottom > adjustment.value() + adjustment.page_size() {
+                adjustment.set_value(bottom - adjustment.page_size());
+            }
+        }
+        gtk::glib::ControlFlow::Break
+    });
 }
 
 /// Ask before deleting a stored credential. Cancel makes no call and puts focus
