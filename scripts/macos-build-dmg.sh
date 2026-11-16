@@ -26,12 +26,18 @@ detach() {
 # fails the build when the app or the shortcut is missing.
 build_dmg() {
   local app="$1" out="$2" assets="$ASSETS"
-  local stage rw size device check
+  local stage rw size attach_out device volume check
   stage="$(mktemp -d)"
   rw="$(mktemp -u).dmg"
   ditto "$app" "$stage/Toolport.app"
   ln -s /Applications "$stage/Applications"
   mkdir "$stage/.background"
+  # macOS keeps a file-event journal in .fseventsd on any volume mounted
+  # read-write, and the Finder layout below writes to this one. A no_log marker
+  # present at mount time tells fseventsd not to journal this volume; the folder
+  # itself is removed before the image is sealed, so the dmg ships without it.
+  mkdir "$stage/.fseventsd"
+  touch "$stage/.fseventsd/no_log"
   # One TIFF with both resolutions keeps the background sharp on Retina.
   tiffutil -cathidpicheck "$assets/background.png" "$assets/background@2x.png" \
     -out "$stage/.background/background.tiff" >/dev/null
@@ -39,7 +45,10 @@ build_dmg() {
   # ("No space left on device"), so size the image from the app plus headroom.
   size=$(( $(du -sm "$stage" | cut -f1) * 5 / 4 + 64 ))
   hdiutil create -volname "Toolport" -srcfolder "$stage" -size "${size}m" -ov -format UDRW "$rw"
-  device="$(hdiutil attach -readwrite -noverify -noautoopen "$rw" | awk '/^\/dev\// {print $1; exit}')"
+  attach_out="$(hdiutil attach -readwrite -noverify -noautoopen "$rw")"
+  device="$(printf '%s\n' "$attach_out" | awk '/^\/dev\// {print $1; exit}')"
+  volume="$(printf '%s\n' "$attach_out" | awk -F '\t' '/\/Volumes\// {sub(/^[ \t]+/, "", $NF); print $NF; exit}')"
+  [ -n "$volume" ] && [ -d "$volume" ] || die "could not find where the dmg volume was mounted"
   if ! osascript <<'OSA'
 tell application "Finder"
   tell disk "Toolport"
@@ -66,7 +75,8 @@ OSA
   then
     log "Finder layout for the dmg window failed; the dmg keeps its Applications shortcut"
   fi
-  chmod -Rf go-w /Volumes/Toolport || true
+  chmod -Rf go-w "$volume" || true
+  rm -rf "$volume/.fseventsd"
   sync
   detach "$device"
   rm -f "$out"
@@ -77,6 +87,12 @@ OSA
   if [ ! -d "$check/Toolport.app" ] || [ "$(readlink "$check/Applications")" != /Applications ]; then
     detach "$check" || true
     die "dmg is missing Toolport.app or its Applications shortcut"
+  fi
+  # The release asserts the dmg against the payload manifest after notarizing,
+  # which is far too late to find volume metadata. Fail here instead.
+  if [ -e "$check/.fseventsd" ]; then
+    detach "$check" || true
+    die "dmg still carries .fseventsd (macOS file-event journal)"
   fi
   detach "$check"
 }

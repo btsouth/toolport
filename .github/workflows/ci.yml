@@ -140,6 +140,10 @@ jobs:
           test -f "$mount/.background/background.tiff"
           test -f "$mount/.DS_Store" || echo "::warning::Finder layout was not written; the dmg still has its Applications shortcut"
           hdiutil detach "$mount" || { sleep 5; hdiutil detach "$mount" -force; }
+      # The same manifest check the release runs on the shipped dmg, so volume
+      # metadata or a stray file fails here instead of on a tag.
+      - name: Check every dmg file
+        run: node .github/scripts/package-contents.mjs "$RUNNER_TEMP/Toolport.dmg"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-payload
