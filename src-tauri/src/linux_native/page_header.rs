@@ -270,7 +270,7 @@ mod flow_imp {
                     + super::ACTION_SPACING * (children.len() as i32 - 1).max(0);
                 return (min, nat, -1, -1);
             }
-            let lines = lines(&children, for_size);
+            let lines = lines(&children, for_size, self.lines_end.get());
             let height = lines.iter().map(|line| line.height).sum::<i32>()
                 + super::ACTION_SPACING * (lines.len() as i32 - 1).max(0);
             (height, height, -1, -1)
@@ -279,7 +279,7 @@ mod flow_imp {
         fn size_allocate(&self, width: i32, _height: i32, _baseline: i32) {
             let children = self.children();
             let mut top = 0;
-            for line in lines(&children, width) {
+            for line in lines(&children, width, self.lines_end.get()) {
                 let mut left = 0;
                 if self.lines_end.get() {
                     let used = line.items.iter().map(|(_, w, _)| *w).sum::<i32>()
@@ -326,7 +326,7 @@ mod flow_imp {
 
     /// Children at natural width, left to right, starting a new line when the
     /// next one would pass `width` (any width when `width` is negative).
-    fn lines(children: &[(gtk::Widget, i32, i32)], width: i32) -> Vec<Line> {
+    fn lines(children: &[(gtk::Widget, i32, i32)], width: i32, balance: bool) -> Vec<Line> {
         let mut out: Vec<Line> = Vec::new();
         let mut used = 0;
         for (widget, min, nat) in children {
@@ -354,7 +354,30 @@ mod flow_imp {
             line.height = line.height.max(height);
             used += child_width;
         }
+        if balance && width >= 0 {
+            balance_last_line(&mut out, width);
+        }
         out
+    }
+
+    /// Never leave the last control alone on its line: take the one before it
+    /// down too, when the line above keeps at least two and the pair fits.
+    fn balance_last_line(out: &mut [Line], width: i32) {
+        let count = out.len();
+        if count < 2 || out[count - 1].items.len() != 1 || out[count - 2].items.len() < 3 {
+            return;
+        }
+        let (above, last) = out.split_at_mut(count - 1);
+        let (above, last) = (&mut above[count - 2], &mut last[0]);
+        let moved = above.items.last().expect("the line has items").clone();
+        let alone = last.items[0].1;
+        if moved.1 + super::ACTION_SPACING + alone > width {
+            return;
+        }
+        above.items.pop();
+        last.items.insert(0, moved);
+        above.height = above.items.iter().map(|(_, _, h)| *h).max().unwrap_or(0);
+        last.height = last.items.iter().map(|(_, _, h)| *h).max().unwrap_or(0);
     }
 }
 

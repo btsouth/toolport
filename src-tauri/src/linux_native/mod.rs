@@ -10326,12 +10326,16 @@ fn server_row(
     retry.connect_clicked(move |_| page_for_retry.retry_probe(&retry_id));
     // Recovery actions sit with the status they recover from, as in React; the
     // name and meta lines ellipsize to make room for them.
-    let health_actions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    health_actions.set_valign(gtk::Align::Center);
-    health_actions.append(&authenticate);
-    health_actions.append(&retry);
-    health_actions.append(&copy_error);
-    controls.append(&health_actions);
+    // Each recovery action is its own item in the row's controls, so a narrow
+    // row can split them over two lines instead of leaving one control alone.
+    let health_actions = [authenticate.clone(), retry.clone(), copy_error.clone()];
+    for action in &health_actions {
+        action.set_valign(gtk::Align::Center);
+    }
+    // The switch and the row menu stay side by side at the right end, so a
+    // narrow row never leaves one of them alone on a line.
+    let trailing = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    trailing.set_valign(gtk::Align::Center);
     if server.enabled && !server.requires_review {
         let mut all_rows = page.health_rows.borrow_mut();
         let rows = all_rows.entry(server.id.clone()).or_default();
@@ -10392,6 +10396,9 @@ fn server_row(
         // A server synced from another machine is reviewed right here; only
         // team servers still go to the Teams page.
         badge.set_visible(!personal);
+        for action in &health_actions {
+            controls.append(action);
+        }
         controls.append(&badge);
         let review = l10n::button(if personal {
             crate::i18n::msg("Review and enable")
@@ -10490,7 +10497,11 @@ l10n::bind_dialog_response(&dialog, "enable", "Enable");
         // No "Enabled" label beside the switch: the chip says the state, and the
         // switch's accessible name says what it changes (spec 6).
         let status = health.clone();
+        // React's order: the status chip, then what recovers from it.
         controls.append(&chip);
+        for action in &health_actions {
+            controls.append(action);
+        }
         let toggle = gtk::Switch::builder()
             .active(server.enabled)
             .valign(gtk::Align::Center)
@@ -10595,7 +10606,7 @@ l10n::bind_dialog_response(&dialog, "enable", "Enable");
             });
             gtk::glib::Propagation::Stop
         });
-        controls.append(&toggle);
+        trailing.append(&toggle);
     }
     let actions = server_actions(server, page, true);
     let popover = gtk::Popover::new();
@@ -10647,7 +10658,10 @@ l10n::bind_dialog_response(&dialog, "enable", "Enable");
         .build();
     quiet_tooltips::guard_menu(&menu);
     if !detail {
-        controls.append(&menu);
+        trailing.append(&menu);
+    }
+    if trailing.first_child().is_some() {
+        controls.append(&trailing);
     }
     let line = page_header::HeaderWrap::row(
         &lead,
@@ -18963,10 +18977,28 @@ mod tests {
                     .build();
                 window.present();
                 let check = |card: &gtk::Box, what: &str| {
-                    for _ in 0..30 {
-                        gtk::glib::MainContext::default().iteration(false);
-                    }
                     let label = state(card);
+                    // Wait for the layout of the new status, not a fixed number of
+                    // turns: the chip has its one-line width once it is allocated.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    loop {
+                        while gtk::glib::MainContext::default().iteration(false) {}
+                        let (_, natural, _, _) = label.measure(gtk::Orientation::Horizontal, -1);
+                        // Every control that just appeared has its place too.
+                        let flow = label.parent().and_then(|chip| chip.parent()).unwrap();
+                        let mut placed = true;
+                        let mut child = flow.first_child();
+                        while let Some(widget) = child {
+                            placed &= !widget.should_layout() || widget.width() > 0;
+                            child = widget.next_sibling();
+                        }
+                        if (label.width() == natural && card.width() > 0 && placed)
+                            || std::time::Instant::now() >= deadline
+                        {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
                     assert!(
                         label.layout().line_count() == 1 && !label.layout().is_ellipsized(),
                         "{language} at {width}: \"{}\" ({what}) takes {} lines in {} px",
@@ -18993,6 +19025,56 @@ mod tests {
                         flow.width(),
                         "{language} at {width}: the last control leaves the flow's right edge"
                     );
+                    // React's order: the chip, then what recovers from it, then
+                    // the switch and the menu. No control is ever alone on a line.
+                    let mut placed = Vec::new();
+                    let mut child = flow.first_child();
+                    while let Some(widget) = child {
+                        if widget.should_layout() {
+                            // Grouped by line through their middle: a short chip
+                            // is centered on a line of taller buttons.
+                            let at = widget.compute_bounds(&flow).unwrap();
+                            let middle = (at.y() + at.height() / 2.0).round() as i32;
+                            placed.push((widget.clone(), middle, at.x()));
+                        }
+                        child = widget.next_sibling();
+                    }
+                    // The switch and the menu are one group at the end, so no
+                    // width can split them.
+                    let pair = &placed.last().unwrap().0;
+                    let mut kinds = Vec::new();
+                    let mut child = pair.first_child();
+                    while let Some(widget) = child {
+                        kinds.push(widget.type_().name());
+                        child = widget.next_sibling();
+                    }
+                    assert_eq!(
+                        kinds,
+                        ["GtkSwitch", "GtkMenuButton"],
+                        "{language} at {width}: the switch and the menu stay together"
+                    );
+                    let chip = label.parent().unwrap();
+                    let chip_at = placed.iter().position(|(w, _, _)| *w == chip).unwrap();
+                    assert_eq!(chip_at, 0, "{language} at {width}: the chip comes first");
+                    if placed.len() > 1 {
+                        let mut middles = placed.iter().map(|(_, y, _)| *y).collect::<Vec<_>>();
+                        middles.dedup_by(|a, b| (*a - *b).abs() <= 2);
+                        for middle in middles {
+                            let on_line = placed
+                                .iter()
+                                .filter(|(_, y, _)| (*y - middle).abs() <= 2)
+                                .count();
+                            assert!(
+                                on_line > 1,
+                                "{language} at {width}: one control alone on a line ({what}): {:?} in {}",
+                                placed
+                                    .iter()
+                                    .map(|(w, y, x)| (w.type_().name(), *y, *x, w.width()))
+                                    .collect::<Vec<_>>(),
+                                flow.width()
+                            );
+                        }
+                    }
                     let in_card = last.compute_bounds(card).unwrap();
                     let line = flow.parent().unwrap();
                     let line_end = line.compute_bounds(card).unwrap();
@@ -19089,8 +19171,8 @@ mod tests {
         assert!(!labels
             .iter()
             .any(|text| text == "Enabled" || text == "Disabled"));
-        // The status chip, then the switch, then the menu, at the trailing edge
-        // (one box, which a narrow window moves under the name).
+        // The status chip, then the switch and the menu side by side, at the
+        // trailing edge (a narrow window moves them under the name).
         fn holding_switch(widget: &gtk::Widget) -> Option<gtk::Widget> {
             let mut child = widget.first_child();
             while let Some(current) = child {
@@ -19104,18 +19186,22 @@ mod tests {
             }
             None
         }
-        let trailing = children(&holding_switch(&row).expect("the row controls"));
+        let pair = holding_switch(&row).expect("the switch and menu");
+        let trailing = children(&pair);
         let switch = trailing
             .iter()
             .position(|widget| widget.is::<gtk::Switch>())
             .expect("switch");
-        let chip = trailing
+        assert!(switch < trailing.len() - 1, "the menu trails the switch");
+        let controls = children(&pair.parent().expect("the row controls"));
+        let chip = controls
             .iter()
             .position(|widget| widget.has_css_class("toolport-badge"))
             .expect("status chip");
-        assert!(chip < switch);
-        assert!(switch < trailing.len() - 1, "the menu trails the switch");
-        let off_chip = children(&holding_switch(&off_rows[0]).expect("the off row controls"))
+        let pair_at = controls.iter().position(|widget| *widget == pair).unwrap();
+        assert!(chip < pair_at);
+        let off_pair = holding_switch(&off_rows[0]).expect("the off row switch");
+        let off_chip = children(&off_pair.parent().expect("the off row controls"))
             .into_iter()
             .find(|widget| widget.has_css_class("toolport-badge"))
             .unwrap();
