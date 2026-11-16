@@ -1,5 +1,5 @@
 import { msg, translate, useI18n } from "@/lib/i18n";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useId, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { ArgBinding, Registry } from "@/lib/types";
 import {
@@ -179,6 +179,9 @@ export function PersonalSyncView({
   const [busy, setBusy] = useState(false);
   const [url, setUrl] = useState(HOSTED_TEAMS_URL);
   const [code, setCode] = useState("");
+  // Sign in with code needs both fields; the line under it says so (D46).
+  const manualReady = !!url.trim() && !!code.trim();
+  const manualReasonId = useId();
   const [pending, setPending] = useState<{ url: string; token: string } | null>(null);
   useEffect(() => {
     if (!pending) return;
@@ -366,7 +369,8 @@ export function PersonalSyncView({
             </label>
             <Button
               className="mt-3"
-              disabled={busy || !code.trim()}
+              disabled={busy || !manualReady}
+              aria-describedby={manualReady ? undefined : manualReasonId}
               onClick={() =>
                 void run(async () => {
                   const invalid = teamUrlError(url);
@@ -386,6 +390,11 @@ export function PersonalSyncView({
             >
               {t("Sign in with code")}
             </Button>
+            {!manualReady && (
+              <p id={manualReasonId} className="mt-2 text-meta text-muted-foreground">
+                {t("Enter the sync service URL and manual code")}
+              </p>
+            )}
           </details>
         </>
       ) : (

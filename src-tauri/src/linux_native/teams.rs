@@ -422,16 +422,32 @@ impl TeamsPage {
         group.append(&field(msg("Manual code"), &code));
         group.append(&field(msg("Your name"), &name));
         let button = l10n::button("Sign in with code");
+        // Both fields are required; the button says so beside the fields
+        // instead of failing at the top of the page after a click. While a
+        // sign-in is in flight, editing a field must not re-enable it (D46).
+        let busy = Rc::new(Cell::new(false));
+        let (explain, reason) = wire_manual_join(&button, &url, &code, &busy);
         let page = self.clone();
-        button.connect_clicked(move |b| {
+        button.connect_clicked(move |_| {
+            let filled = !url.text().trim().is_empty() && !code.text().trim().is_empty();
+            if !join_ready(filled, busy.get()) {
+                return;
+            }
+            busy.set(true);
+            explain();
+            let (busy, explain) = (busy.clone(), explain.clone());
             page.connect_team(
                 url.text().to_string(),
                 code.text().to_string(),
                 name.text().to_string(),
-                b.clone(),
+                move || {
+                    busy.set(false);
+                    explain();
+                },
             )
         });
         group.append(&button);
+        group.append(&reason);
         let manual = gtk::Expander::builder()
             .label_widget(&l10n::label(msg("Use a manual code")))
             .expanded(false)
@@ -970,12 +986,13 @@ impl TeamsPage {
         });
         dialog.present();
     }
-    fn connect_team(&self, url: String, code: String, name: String, button: gtk::Button) {
+    /// `done` runs once the attempt has finished, whatever its outcome.
+    fn connect_team(&self, url: String, code: String, name: String, done: impl FnOnce() + 'static) {
         if url.trim().is_empty() || code.trim().is_empty() {
             self.show_error(&tr("Enter the sync service URL and manual code"));
+            done();
             return;
         }
-        button.set_sensitive(false);
         self.feedback.set_label(&tr("Signing in to sync…"));
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
@@ -986,7 +1003,7 @@ impl TeamsPage {
                 crate::teams::connect(&url_for_join, code.trim(), name_for_join.as_deref())
             })
             .await;
-            button.set_sensitive(true);
+            done();
             match result {
                 Ok(Ok(crate::teams::ConnectOutcome::Connected(_))) => {
                     page.cancel_join_poll();
@@ -1803,16 +1820,81 @@ fn sync_server_row(
     row
 }
 
+/// Keeps Sign in with code in step with its fields and the in-flight flag.
+/// Returns the recompute to call when the flag changes, and the line under
+/// the button that says what is missing.
+fn wire_manual_join(
+    button: &gtk::Button,
+    url: &gtk::Entry,
+    code: &gtk::PasswordEntry,
+    busy: &Rc<Cell<bool>>,
+) -> (Rc<dyn Fn()>, gtk::Label) {
+    const MISSING: &str = msg("Enter the sync service URL and manual code");
+    let reason = l10n::label(MISSING);
+    reason.set_xalign(0.0);
+    reason.set_wrap(true);
+    reason.add_css_class("toolport-muted");
+    reason.add_css_class("caption");
+    button.update_relation(&[gtk::accessible::Relation::DescribedBy(&[
+        reason.upcast_ref()
+    ])]);
+    let explain: Rc<dyn Fn()> = {
+        let (button, url, code, line) = (
+            button.downgrade(),
+            url.downgrade(),
+            code.downgrade(),
+            reason.downgrade(),
+        );
+        let busy = busy.clone();
+        Rc::new(move || {
+            let (Some(button), Some(url), Some(code), Some(line)) = (
+                button.upgrade(),
+                url.upgrade(),
+                code.upgrade(),
+                line.upgrade(),
+            ) else {
+                return;
+            };
+            let filled = !url.text().trim().is_empty() && !code.text().trim().is_empty();
+            button.set_sensitive(join_ready(filled, busy.get()));
+            line.set_visible(!filled);
+            button.update_state(&[gtk::accessible::State::Busy(busy.get())]);
+        })
+    };
+    explain();
+    {
+        let explain = explain.clone();
+        url.connect_changed(move |_| explain());
+    }
+    {
+        let explain = explain.clone();
+        code.connect_changed(move |_| explain());
+    }
+    (explain, reason)
+}
+
+/// Sign in with code needs both fields and no sign-in already in flight.
+fn join_ready(filled: bool, busy: bool) -> bool {
+    filled && !busy
+}
+
 fn field(label: &'static str, input: &impl IsA<gtk::Widget>) -> gtk::Box {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    root.append(&source_label(
+    let caption = source_label(
         label,
         gtk::Label::builder()
             .label(label)
             .halign(gtk::Align::Start)
             .css_classes(["heading"])
             .build(),
-    ));
+    );
+    // The visible caption names the field for screen readers (D46).
+    input
+        .as_ref()
+        .update_relation(&[gtk::accessible::Relation::LabelledBy(&[
+            caption.upcast_ref()
+        ])]);
+    root.append(&caption);
     root.append(input);
     root
 }
@@ -2455,6 +2537,56 @@ fn source_formatted_label(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manual_join_waits_for_both_fields_and_no_sign_in_in_flight() {
+        assert!(super::join_ready(true, false));
+        assert!(!super::join_ready(true, true));
+        assert!(!super::join_ready(false, false));
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn manual_join_needs_both_fields_says_so_and_stays_off_while_signing_in() {
+        use super::*;
+        let _data = crate::registry::DataDirTestEnv::new("manual-join-fields");
+        adw::init().unwrap();
+        crate::i18n::set_language("en").unwrap();
+        let button = l10n::button("Sign in with code");
+        let url = gtk::Entry::new();
+        let code = gtk::PasswordEntry::new();
+        let busy = Rc::new(Cell::new(false));
+        let (explain, reason) = wire_manual_join(&button, &url, &code, &busy);
+        assert_eq!(
+            reason.label().as_str(),
+            "Enter the sync service URL and manual code"
+        );
+        assert!(!button.is_sensitive() && reason.get_visible(), "both empty");
+        url.set_text("https://sync.example.test");
+        assert!(
+            !button.is_sensitive() && reason.get_visible(),
+            "the code is still empty"
+        );
+        code.set_text("ABCD");
+        assert!(button.is_sensitive() && !reason.get_visible());
+        url.set_text(" ");
+        assert!(
+            !button.is_sensitive() && reason.get_visible(),
+            "the URL was cleared"
+        );
+        url.set_text("https://sync.example.test");
+        // A sign-in is now in flight.
+        busy.set(true);
+        explain();
+        assert!(!button.is_sensitive());
+        code.set_text("ABCDE");
+        url.set_text("https://sync.example.test/");
+        assert!(!button.is_sensitive(), "typing re-enabled a second sign-in");
+        // It finished.
+        busy.set(false);
+        explain();
+        assert!(button.is_sensitive());
+    }
+
     #[test]
     fn paired_registry_without_valid_account_status_has_safe_fallback() {
         for status in [

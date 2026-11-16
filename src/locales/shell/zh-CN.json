@@ -280,5 +280,11 @@
   "Keep English": "保留英语",
   "Skills and rules each agent loads, and where they live": "每个智能体加载的技能和规则，以及它们的存放位置",
   "Back to servers": "返回服务器",
-  "Add a config folder for a client Toolport did not find on its own": "为 Toolport 未自动找到的客户端添加配置文件夹"
+  "Add a config folder for a client Toolport did not find on its own": "为 Toolport 未自动找到的客户端添加配置文件夹",
+  "Enter an access set name.": "请输入访问集名称。",
+  "Delete {name}?": "删除{name}？",
+  "Clients and project folders that use it will see no servers until you choose another access set.": "使用它的客户端和项目文件夹将看不到任何服务器，直到你选择另一个访问集。",
+  "Keep at least one access set.": "请至少保留一个访问集。",
+  "This is the default access set. Choose another default before deleting it.": "这是默认访问集。删除前请先选择另一个默认访问集。",
+  "Default access still uses this set's tool rules, so it cannot be deleted.": "默认访问仍在使用此访问集的工具规则，因此无法删除。"
 }

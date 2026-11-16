@@ -280,5 +280,11 @@
   "Keep English": "英語のままにする",
   "Skills and rules each agent loads, and where they live": "各エージェントが読み込むスキルとルール、その保存場所",
   "Back to servers": "サーバーに戻る",
-  "Add a config folder for a client Toolport did not find on its own": "Toolport が自動検出できなかったクライアントの設定フォルダーを追加"
+  "Add a config folder for a client Toolport did not find on its own": "Toolport が自動検出できなかったクライアントの設定フォルダーを追加",
+  "Enter an access set name.": "アクセスセット名を入力してください。",
+  "Delete {name}?": "{name} を削除しますか?",
+  "Clients and project folders that use it will see no servers until you choose another access set.": "このアクセスセットを使うクライアントとプロジェクトフォルダーは、別のアクセスセットを選ぶまでサーバーが表示されなくなります。",
+  "Keep at least one access set.": "アクセスセットを少なくとも1つ残してください。",
+  "This is the default access set. Choose another default before deleting it.": "これはデフォルトのアクセスセットです。削除する前に別のデフォルトを選んでください。",
+  "Default access still uses this set's tool rules, so it cannot be deleted.": "デフォルトのアクセスがまだこのセットのツールルールを使っているため、削除できません。"
 }

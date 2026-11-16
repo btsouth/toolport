@@ -10,6 +10,7 @@ import {
   clientsNeedingRestart,
   disconnectAllClients,
   dataRemovalPlan,
+  deleteProfile,
   removeToolportData,
   getRegistry,
   getBaselineNotice,
@@ -40,6 +41,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
     ...actual,
     disconnectAllClients: vi.fn(),
     dataRemovalPlan: vi.fn(),
+    deleteProfile: vi.fn(),
     removeToolportData: vi.fn(),
     getRegistry: vi.fn(),
     getBaselineNotice: vi.fn().mockResolvedValue(null),
@@ -468,6 +470,8 @@ it("shows protections kept from 1.x and drops them on request", async () => {
       expect.objectContaining({ safetyLevel: "off", keptV1Safety: undefined }),
     ),
   );
+  // The button goes with the kept note; focus moves to the level in force.
+  await waitFor(() => expect(screen.getByRole("radio", { name: "Off" })).toHaveFocus());
 });
 
 it("selects and persists one safety level", async () => {
@@ -714,6 +718,74 @@ it("keeps access sets and folder routing under Access and changes the default ex
   await waitFor(() => expect(setDefaultAccess).toHaveBeenCalledWith(null));
   expect(onChange).toHaveBeenCalledWith(
     expect.objectContaining({ defaultAccessProfileId: null }),
+  );
+});
+
+it("says why Create access set is off until the set has a name", async () => {
+  const user = userEvent.setup();
+  render(
+    <ThemeProvider>
+      <SettingsView
+        page="access"
+        registry={{ ...registry, version: 3 }}
+        onRegistryChange={vi.fn()}
+      />
+    </ThemeProvider>,
+  );
+  const create = screen.getByRole("button", { name: "Create access set" });
+  expect(create).toBeDisabled();
+  expect(create).toHaveAccessibleDescription("Enter an access set name.");
+  await user.type(screen.getByRole("textbox", { name: "Access set name" }), "  ");
+  expect(create).toBeDisabled();
+  await user.type(screen.getByRole("textbox", { name: "Access set name" }), "Team");
+  expect(create).toBeEnabled();
+  expect(screen.queryByText("Enter an access set name.")).not.toBeInTheDocument();
+});
+
+it("asks before deleting an access set and says why the default cannot be", async () => {
+  const user = userEvent.setup();
+  const onChange = vi.fn();
+  const sets = {
+    ...registry,
+    version: 3,
+    defaultAccessProfileId: "default",
+    profiles: [
+      { id: "default", name: "Default", enabledServerIds: ["github"] },
+      { id: "work", name: "Work", enabledServerIds: [] },
+    ],
+  };
+  vi.mocked(deleteProfile).mockResolvedValue({
+    ...sets,
+    profiles: [sets.profiles[0]],
+  });
+  render(
+    <ThemeProvider>
+      <SettingsView page="access" registry={sets} onRegistryChange={onChange} />
+    </ThemeProvider>,
+  );
+  const reason =
+    "This is the default access set. Choose another default before deleting it.";
+  expect(screen.getByText(reason)).toBeVisible();
+  const [first, second] = screen.getAllByRole("button", { name: "Delete access set" });
+  expect(first).toBeDisabled();
+  expect(first).toHaveAttribute("title", reason);
+  await user.click(second);
+  const dialog = await screen.findByRole("dialog", { name: "Delete Work?" });
+  expect(dialog).toHaveTextContent(
+    "Clients and project folders that use it will see no servers until you choose another access set.",
+  );
+  await user.keyboard("{Escape}");
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  expect(deleteProfile).not.toHaveBeenCalled();
+  await user.click(second);
+  await user.click(
+    within(await screen.findByRole("dialog")).getByRole("button", {
+      name: "Delete access set",
+    }),
+  );
+  await waitFor(() => expect(deleteProfile).toHaveBeenCalledWith("work"));
+  expect(onChange).toHaveBeenCalledWith(
+    expect.objectContaining({ profiles: [sets.profiles[0]] }),
   );
 });
 

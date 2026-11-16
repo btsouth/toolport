@@ -13488,6 +13488,24 @@ fn launch_editor_value(
     }
 }
 
+/// Keep on this machine only, with what it does, only while signed in to sync,
+/// as React shows it: signed out, there is no sync to keep a server out of
+/// (D116).
+fn sync_local_choice(
+    fields: &gtk::Box,
+    server: &crate::registry::ServerEntry,
+    personal: bool,
+) -> Option<gtk::CheckButton> {
+    if !personal {
+        return None;
+    }
+    let local = l10n::check_button("Keep on this machine only");
+    local.set_active(crate::personal_sync::keep_local(server));
+    fields.append(&local);
+    fields.append(&{ let widget = gtk::Label::builder().label(crate::i18n::tr("Stops future sync for this server on this machine. Copies already on your other machines stay there.")).wrap(true).xalign(0.0).build(); l10n::bind_label(&widget, "Stops future sync for this server on this machine. Copies already on your other machines stay there."); widget });
+    Some(local)
+}
+
 fn open_sync_settings(server_id: &str, page: &ServerPage) {
     let Ok(reg) = crate::registry::load() else {
         return;
@@ -13503,11 +13521,7 @@ fn open_sync_settings(server_id: &str, page: &ServerPage) {
     l10n::bind_dialog_heading(&dialog, "Sync settings");
     l10n::bind_dialog_body(&dialog, "Only values marked nonsecret can be the same on every machine. Secret values and approvals always stay on this machine.");
     let fields = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    let local = l10n::check_button("Keep on this machine only");
-    local.set_active(crate::personal_sync::keep_local(server));
-    local.set_sensitive(crate::personal_sync::is_personal(&reg));
-    fields.append(&local);
-    fields.append(&{ let widget = gtk::Label::builder().label(crate::i18n::tr("Stops future sync for this server on this machine. Copies already on your other machines stay there.")).wrap(true).xalign(0.0).build(); l10n::bind_label(&widget, "Stops future sync for this server on this machine. Copies already on your other machines stay there."); widget });
+    let local = sync_local_choice(&fields, server, crate::personal_sync::is_personal(&reg));
     let mut portable = Vec::new();
     for (kind, key, label, secret, unknown) in server
         .env
@@ -13548,7 +13562,7 @@ fn open_sync_settings(server_id: &str, page: &ServerPage) {
         }
         let id = id.clone();
         let page = page.clone();
-        let local = local.is_active();
+        let local = local.as_ref().is_some_and(gtk::CheckButton::is_active);
         let marks: Vec<_> = portable
             .iter()
             .map(|(k, key, c)| (k.clone(), key.clone(), c.is_active()))
@@ -14479,6 +14493,178 @@ fn confirm_remove_server(server_id: &str, server_name: &str, page: ServerPage) {
     dialog.present();
 }
 
+/// The accessible name for a control whose visible text is only part of it,
+/// or that has none of its own (a switch beside its row title). GTK names a
+/// button, and a dropdown, after its own text through `labelled-by`, which
+/// outranks a plain label property; so the relation is cleared and the name
+/// re-applied after every language change.
+pub(super) fn name_control(widget: &impl IsA<gtk::Widget>, name: impl Fn() -> String + 'static) {
+    let weak = widget.upcast_ref::<gtk::Widget>().downgrade();
+    l10n::bind_slot(
+        widget.upcast_ref::<gtk::Widget>(),
+        "accessible-label",
+        move || {
+            if let Some(widget) = weak.upgrade() {
+                let name = name();
+                widget.reset_relation(gtk::AccessibleRelation::LabelledBy);
+                widget.update_property(&[gtk::accessible::Property::Label(&name)]);
+                #[cfg(test)]
+                spoken::record(&widget, Some(name), None);
+            }
+        },
+    );
+}
+
+/// `name_control` for a dropdown, re-applied when the choice changes, since the
+/// dropdown re-labels itself from the selected item.
+pub(super) fn name_dropdown(dropdown: &gtk::DropDown, name: impl Fn() -> String + 'static) {
+    let name = std::rc::Rc::new(name);
+    let for_language = name.clone();
+    name_control(dropdown, move || for_language());
+    dropdown.connect_selected_notify(move |dropdown| {
+        let name = name();
+        dropdown.reset_relation(gtk::AccessibleRelation::LabelledBy);
+        dropdown.update_property(&[gtk::accessible::Property::Label(&name)]);
+        #[cfg(test)]
+        spoken::record(dropdown.upcast_ref(), Some(name), None);
+    });
+}
+
+/// An explicit accessible description, kept in the current language. GTK
+/// otherwise derives one (a switch's `described-by` row text reached screen
+/// readers empty).
+pub(super) fn describe_control(
+    widget: &impl IsA<gtk::Widget>,
+    description: impl Fn() -> String + 'static,
+) {
+    let weak = widget.upcast_ref::<gtk::Widget>().downgrade();
+    l10n::bind_slot(
+        widget.upcast_ref::<gtk::Widget>(),
+        "accessible-description",
+        move || {
+            if let Some(widget) = weak.upgrade() {
+                let description = description();
+                widget.reset_relation(gtk::AccessibleRelation::DescribedBy);
+                widget.update_property(&[gtk::accessible::Property::Description(&description)]);
+                #[cfg(test)]
+                spoken::record(&widget, None, Some(description));
+            }
+        },
+    );
+}
+
+/// Tooltip `reason` while the control is off, `normal` (if any) while it is on.
+pub(super) fn explain_when_off(
+    widget: &impl IsA<gtk::Widget>,
+    reason: &'static str,
+    normal: Option<&'static str>,
+) {
+    let apply = move |widget: &gtk::Widget| {
+        let source = if widget.is_sensitive() {
+            normal
+        } else {
+            Some(reason)
+        };
+        widget.set_tooltip_text(source.map(crate::i18n::lookup).as_deref());
+    };
+    widget
+        .upcast_ref::<gtk::Widget>()
+        .connect_sensitive_notify(apply);
+    let weak = widget.upcast_ref::<gtk::Widget>().downgrade();
+    l10n::bind_slot(
+        widget.upcast_ref::<gtk::Widget>(),
+        "tooltip-when-off",
+        move || {
+            if let Some(widget) = weak.upgrade() {
+                apply(&widget);
+            }
+        },
+    );
+}
+
+/// GTK centers a dropdown's list under the control, so one near a window edge
+/// opens past it. Line the list up with the control's edge on the side nearer
+/// the window edge, so it grows toward the middle of the window.
+pub(super) fn keep_dropdown_popup_inside(dropdown: &gtk::DropDown) {
+    let mut child = dropdown.first_child();
+    while let Some(widget) = child {
+        if let Some(popover) = widget.downcast_ref::<gtk::Popover>() {
+            popover.connect_show(|popover| {
+                let Some(anchor) = popover.parent() else {
+                    return;
+                };
+                let Some(root) = anchor.root().and_downcast::<gtk::Window>() else {
+                    return;
+                };
+                if let Some(bounds) = anchor.compute_bounds(&root) {
+                    popover.set_halign(popup_side(
+                        bounds.x() as i32,
+                        bounds.width() as i32,
+                        root.width(),
+                    ));
+                }
+            });
+        }
+        child = widget.next_sibling();
+    }
+}
+
+/// End-align a popup whose control sits in the window's right half.
+fn popup_side(left: i32, width: i32, window_width: i32) -> gtk::Align {
+    if (left + width / 2) * 2 > window_width {
+        gtk::Align::End
+    } else {
+        gtk::Align::Start
+    }
+}
+
+/// What `name_control` and `describe_control` last gave a widget, since GTK
+/// has no getter for accessible properties.
+#[cfg(test)]
+pub(super) mod spoken {
+    use super::*;
+    use std::{cell::RefCell, collections::HashMap};
+
+    thread_local! {
+        static SPOKEN: RefCell<HashMap<usize, (Option<String>, Option<String>)>> =
+            RefCell::new(HashMap::new());
+    }
+
+    fn key(widget: &gtk::Widget) -> usize {
+        gtk::glib::translate::ToGlibPtr::<*mut gtk::ffi::GtkWidget>::to_glib_none(widget).0 as usize
+    }
+
+    pub(in crate::linux_native) fn record(
+        widget: &gtk::Widget,
+        name: Option<String>,
+        description: Option<String>,
+    ) {
+        SPOKEN.with(|spoken| {
+            let mut spoken = spoken.borrow_mut();
+            let entry = spoken.entry(key(widget)).or_default();
+            if name.is_some() {
+                entry.0 = name;
+            }
+            if description.is_some() {
+                entry.1 = description;
+            }
+        });
+    }
+
+    /// The accessible name and description last set on `widget`.
+    pub(in crate::linux_native) fn of(
+        widget: &impl IsA<gtk::Widget>,
+    ) -> (Option<String>, Option<String>) {
+        SPOKEN.with(|spoken| {
+            spoken
+                .borrow()
+                .get(&key(widget.upcast_ref()))
+                .cloned()
+                .unwrap_or_default()
+        })
+    }
+}
+
 fn show_toast(widget: &impl IsA<gtk::Widget>, message: &str) -> bool {
     let Some(root) = widget.root() else {
         return false;
@@ -14851,6 +15037,42 @@ fn state_card_formatted(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dropdown_popups_grow_toward_the_middle_of_the_window() {
+        // A control in the right half lines its list up with its right edge.
+        assert_eq!(super::popup_side(330, 140, 480), gtk::Align::End);
+        assert_eq!(super::popup_side(1000, 160, 1200), gtk::Align::End);
+        // One in the left half keeps the list from opening past the left edge.
+        assert_eq!(super::popup_side(10, 140, 480), gtk::Align::Start);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn keep_on_this_machine_only_shows_only_while_signed_in_to_sync() {
+        let _data = crate::registry::DataDirTestEnv::new("sync-keep-local");
+        adw::init().unwrap();
+        crate::i18n::set_language("en").unwrap();
+        let server: crate::registry::ServerEntry = serde_json::from_value(serde_json::json!({
+            "id": "tools", "name": "Tools", "transport": "stdio",
+            "command": "npx", "args": [], "env": []
+        }))
+        .unwrap();
+        // Signed out: there is no sync to keep it out of, so no choice (D116).
+        let fields = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        assert!(super::sync_local_choice(&fields, &server, false).is_none());
+        assert!(fields.first_child().is_none());
+        // Signed in: the choice and what it does.
+        let fields = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let local = super::sync_local_choice(&fields, &server, true).unwrap();
+        assert!(local.is_sensitive());
+        assert_eq!(local.label().as_deref(), Some("Keep on this machine only"));
+        assert_eq!(
+            fields.first_child().as_ref(),
+            Some(local.upcast_ref::<gtk::Widget>())
+        );
+        assert!(local.next_sibling().is_some_and(|c| c.is::<gtk::Label>()));
+    }
+
     #[test]
     fn t3_settings_watch_polls_only_while_t3_code_settings_exist() {
         let mut watch = super::T3SettingsWatch::default();

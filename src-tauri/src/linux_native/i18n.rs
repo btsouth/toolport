@@ -611,6 +611,28 @@ pub(super) fn on_language_change(object: &impl IsA<glib::Object>, callback: impl
     );
 }
 
+/// Run `apply` now and after each language change for as long as `object`
+/// lives. Each `slot` holds one binding per object, so an accessible name and
+/// an accessible description set this way keep each other.
+pub(super) fn bind_slot(
+    object: &impl IsA<glib::Object>,
+    slot: &'static str,
+    apply: impl Fn() + 'static,
+) {
+    let weak = object.as_ref().downgrade();
+    register(
+        object,
+        slot,
+        Rc::new(move || {
+            if weak.upgrade().is_none() {
+                return false;
+            }
+            apply();
+            true
+        }),
+    );
+}
+
 /// Run on the GTK main thread after the shared language revision changes.
 pub(super) fn refresh_bindings() {
     // Invoke outside RefCell borrows: GTK property notifications may rebind text.

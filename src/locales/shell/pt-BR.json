@@ -280,5 +280,11 @@
   "Keep English": "Manter inglês",
   "Skills and rules each agent loads, and where they live": "As habilidades e regras que cada agente carrega e onde ficam",
   "Back to servers": "Voltar aos servidores",
-  "Add a config folder for a client Toolport did not find on its own": "Adicionar uma pasta de configuração de um cliente que o Toolport não encontrou automaticamente"
+  "Add a config folder for a client Toolport did not find on its own": "Adicionar uma pasta de configuração de um cliente que o Toolport não encontrou automaticamente",
+  "Enter an access set name.": "Insira um nome para o conjunto de acesso.",
+  "Delete {name}?": "Excluir {name}?",
+  "Clients and project folders that use it will see no servers until you choose another access set.": "Clientes e pastas de projeto que o usam não verão nenhum servidor até você escolher outro conjunto de acesso.",
+  "Keep at least one access set.": "Mantenha pelo menos um conjunto de acesso.",
+  "This is the default access set. Choose another default before deleting it.": "Este é o conjunto de acesso padrão. Escolha outro padrão antes de excluí-lo.",
+  "Default access still uses this set's tool rules, so it cannot be deleted.": "O acesso padrão ainda usa as regras de ferramentas deste conjunto, então ele não pode ser excluído."
 }

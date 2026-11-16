@@ -329,7 +329,7 @@ impl SettingsPage {
         protection.add_css_class("toolport-switch-group");
         capabilities.append(&code_row);
         let (pii_row, pii_redaction) = setting_switch_row(
-            msg("Pseudonymize PII"),
+            msg("Hide personal data from the model"),
             msg("Replace detected personal values before results reach the model."),
         );
         protection.append(&pii_row);
@@ -384,7 +384,7 @@ impl SettingsPage {
         desktop.add_css_class("toolport-settings-group");
         let (launch_row, launch_at_login) = setting_switch_row(
             msg("Launch at login"),
-            msg("Start Toolport hidden so approvals and notifications remain available."),
+            msg("Start Toolport in the tray when you sign in, so it can hold tool calls for approval even before you open it"),
         );
         let stale_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         stale_row.add_css_class("toolport-setting-row");
@@ -538,12 +538,12 @@ impl SettingsPage {
         let endpoint_button = l10n::button("Start");
         endpoint_button.add_css_class("suggested-action");
         let endpoint_actions = action_wrap();
+        // Copy URL, Copy token and Show token appear only while there is an
+        // address and a token to act on, as in React (D104).
         let copy_endpoint = l10n::button("Copy URL");
         copy_endpoint.add_css_class("toolport-secondary-action");
-        copy_endpoint.set_sensitive(false);
         let copy_endpoint_token = l10n::button("Copy token");
         copy_endpoint_token.add_css_class("toolport-secondary-action");
-        copy_endpoint_token.set_sensitive(false);
         copy_endpoint_token
             .set_tooltip_text(Some(&tr("Copy the private administrator bearer token")));
         let reveal_endpoint_token = source_button(
@@ -551,13 +551,19 @@ impl SettingsPage {
             gtk::ToggleButton::with_label("Show token"),
         );
         reveal_endpoint_token.add_css_class("toolport-secondary-action");
-        reveal_endpoint_token.set_sensitive(false);
         reveal_endpoint_token.set_tooltip_text(Some(&tr(
             "Reveal the administrator bearer token on screen; hide it again with the same button",
         )));
         endpoint_actions.insert(&copy_endpoint, -1);
         endpoint_actions.insert(&copy_endpoint_token, -1);
         endpoint_actions.insert(&reveal_endpoint_token, -1);
+        for action in [
+            copy_endpoint.upcast_ref::<gtk::Widget>(),
+            copy_endpoint_token.upcast_ref(),
+            reveal_endpoint_token.upcast_ref(),
+        ] {
+            show_endpoint_action(action, false);
+        }
         let endpoint_retry = l10n::button("Retry");
         endpoint_retry.add_css_class("suggested-action");
         endpoint_retry.set_visible(false);
@@ -694,6 +700,10 @@ l10n::bind_dialog_heading(&error_dialog, msg("Could not start data removal"));
         let language_picker = gtk::DropDown::new(None::<gtk::StringList>, gtk::Expression::NONE);
         super::quiet_tooltips::guard_dropdown(&language_picker);
         l10n::bind_language_choices(&language_picker);
+        language_picker.set_widget_name("settings:language");
+        // Its list opens toward the middle of the window, not past its edge (D47).
+        super::keep_dropdown_popup_inside(&language_picker);
+        super::name_dropdown(&language_picker, || tr("Language"));
         let choice = crate::i18n::language();
         let selected = crate::ui_settings::LANGUAGES
             .iter()
@@ -1222,11 +1232,16 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
             .width_chars(22)
             .build();
         l10n::bind_placeholder(&name, msg("Access set name"));
+        name.update_property(&[gtk::accessible::Property::Label(&tr("Access set name"))]);
         let add = l10n::button("Create access set");
+        let reason = explain_access_creation(&name, &add);
         let page = self.clone();
         let entry = name.clone();
         let create = move || {
             let name = entry.text().to_string();
+            if name.trim().is_empty() {
+                return;
+            }
             page.mutate_access(move || crate::registry_controller::create_profile(&name));
         };
         let on_click = create.clone();
@@ -1234,10 +1249,14 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
         name.connect_activate(move |_| create());
         creator.append(&name);
         creator.append(&add);
+        let creation = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        creation.set_valign(gtk::Align::Center);
+        creation.append(&creator);
+        creation.append(&reason);
         self.access_list.append(&settings_heading_with_action(
             msg("Access sets"),
             msg("Narrow enabled servers and tools per client. Servers that are off are hidden everywhere."),
-            &creator,
+            &creation,
         ));
 
         let defaults = access_group();
@@ -1354,18 +1373,39 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
             delete.set_valign(gtk::Align::Center);
             delete.set_tooltip_text(Some(&tr("Delete access set")));
             delete.update_property(&[gtk::accessible::Property::Label(&tr("Delete access set"))]);
-            delete.set_sensitive(
-                registry.profiles.len() > 1
-                    && Some(&profile.id) != registry.default_access_profile_id.as_ref()
-                    && Some(&profile.id) != registry.default_access_context_id.as_ref(),
+            let blocked = delete_access_blocked(
+                registry.profiles.len(),
+                Some(&profile.id) == registry.default_access_profile_id.as_ref(),
+                Some(&profile.id) == registry.default_access_context_id.as_ref(),
             );
+            delete.set_sensitive(blocked.is_none());
+            if let Some(reason) = blocked {
+                // Say why it is off, on hover and to assistive technology.
+                l10n::bind_tooltip(&delete, reason);
+                super::describe_control(&delete, move || lookup(reason));
+            }
             let (pid, page) = (profile.id.clone(), self.clone());
-            delete.connect_clicked(move |_| {
-                let pid = pid.clone();
-                page.mutate_access(move || crate::registry_controller::delete_profile(&pid));
+            let set_name = profile.name.clone();
+            delete.connect_clicked(move |button| {
+                let (pid, page) = (pid.clone(), page.clone());
+                confirm_delete_access_set(button, &set_name, move || {
+                    let pid = pid.clone();
+                    page.mutate_access(move || crate::registry_controller::delete_profile(&pid));
+                });
             });
             head.append(&delete);
             card.append(&head);
+            if let Some(reason) = blocked {
+                // A disabled button cannot be hovered or focused; say why in
+                // the card, as React does (D50).
+                let line = gtk::Label::builder()
+                    .xalign(0.0)
+                    .wrap(true)
+                    .css_classes(["toolport-muted", "caption", "toolport-setting-row"])
+                    .build();
+                l10n::bind_label(&line, reason);
+                card.append(&line);
+            }
             for server in &servers {
                 let included = profile.enabled_server_ids.contains(&server.id);
                 let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
@@ -1456,7 +1496,13 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
             match gtk::gio::spawn_blocking(operation).await {
-                Ok(Ok(registry)) => page.render_access_sets(registry),
+                Ok(Ok(registry)) => {
+                    // An error from an earlier attempt no longer applies (D48).
+                    if page.feedback.has_css_class("error") {
+                        page.set_status("");
+                    }
+                    page.render_access_sets(registry)
+                }
                 Ok(Err(error)) => page.show_error(&error),
                 Err(_) => page.show_error(&tr("The access update stopped unexpectedly")),
             }
@@ -1756,11 +1802,11 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
             l10n::bind_button(&self.endpoint_button, msg("Stop"));
             self.endpoint_button.remove_css_class("suggested-action");
             self.endpoint_button.add_css_class("toolport-destructive");
-            self.copy_endpoint.set_sensitive(true);
+            show_endpoint_action(self.copy_endpoint.upcast_ref(), true);
             // The token buttons wait until the token can be read.
             let token = status.token.is_some();
-            self.copy_endpoint_token.set_sensitive(token);
-            self.reveal_endpoint_token.set_sensitive(token);
+            show_endpoint_action(self.copy_endpoint_token.upcast_ref(), token);
+            show_endpoint_action(self.reveal_endpoint_token.upcast_ref(), token);
             if !token {
                 self.reveal_endpoint_token.set_active(false);
             }
@@ -1796,9 +1842,13 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
                 self.endpoint_button.add_css_class("suggested-action");
                 self.endpoint_retry.set_visible(false);
             }
-            self.copy_endpoint.set_sensitive(false);
-            self.copy_endpoint_token.set_sensitive(false);
-            self.reveal_endpoint_token.set_sensitive(false);
+            for action in [
+                self.copy_endpoint.upcast_ref::<gtk::Widget>(),
+                self.copy_endpoint_token.upcast_ref(),
+                self.reveal_endpoint_token.upcast_ref(),
+            ] {
+                show_endpoint_action(action, false);
+            }
             self.reveal_endpoint_token.set_active(false);
             self.endpoint_token_value.set_label("");
             self.endpoint_token_value.set_visible(false);
@@ -2058,7 +2108,10 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
                 .await;
                 page.begin_mutation();
                 match result {
-                    Ok(Ok(_)) => {}
+                    // The button hides with the kept note; focus moves to the
+                    // level now in force, whose card describes the standard
+                    // protections (D105).
+                    Ok(Ok(_)) => page.focus_safety_level(level),
                     Ok(Err(error)) => page.show_error(&error),
                     Err(_) => page.show_error(&tr("the safety update stopped unexpectedly")),
                 }
@@ -2238,6 +2291,12 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
                 });
                 gtk::glib::Propagation::Stop
             });
+    }
+
+    fn focus_safety_level(&self, level: crate::registry::SafetyLevel) {
+        if let Some(card) = self.safety_cards.get(level as usize) {
+            card.grab_focus();
+        }
     }
 
     pub(super) fn select_page(&self, index: usize) {
@@ -3407,6 +3466,86 @@ fn settings_heading_with_action(
     row
 }
 
+/// Create access set needs a name. Until it has one the button is off, its
+/// tooltip says why, and a line under it says so for everyone (D48). Returns
+/// that line.
+fn explain_access_creation(name: &gtk::Entry, add: &gtk::Button) -> gtk::Label {
+    const NEEDS_NAME: &str = msg("Enter an access set name.");
+    let reason = l10n::label(NEEDS_NAME);
+    reason.set_xalign(0.0);
+    reason.set_wrap(true);
+    reason.add_css_class("toolport-muted");
+    reason.add_css_class("caption");
+    for widget in [name.upcast_ref::<gtk::Widget>(), add.upcast_ref()] {
+        widget.update_relation(&[gtk::accessible::Relation::DescribedBy(&[
+            reason.upcast_ref()
+        ])]);
+    }
+    super::explain_when_off(add, NEEDS_NAME, None);
+    let update = {
+        let (add, reason) = (add.clone(), reason.clone());
+        move |name: &gtk::Entry| {
+            let named = !name.text().trim().is_empty();
+            add.set_sensitive(named);
+            reason.set_visible(!named);
+        }
+    };
+    update(name);
+    name.connect_changed(update);
+    reason
+}
+
+/// Why an access set cannot be deleted, matching the checks that turn its
+/// Delete button off. React shows the same reason (D50).
+fn delete_access_blocked(
+    sets: usize,
+    is_default: bool,
+    holds_default_rules: bool,
+) -> Option<&'static str> {
+    if sets <= 1 {
+        Some(msg("Keep at least one access set."))
+    } else if is_default {
+        Some(msg(
+            "This is the default access set. Choose another default before deleting it.",
+        ))
+    } else if holds_default_rules {
+        Some(msg(
+            "Default access still uses this set's tool rules, so it cannot be deleted.",
+        ))
+    } else {
+        None
+    }
+}
+
+/// Deleting an access set asks first, in React's words; nothing changes until
+/// Delete access set. Cancel is the default and Esc closes it (D50).
+fn confirm_delete_access_set(anchor: &gtk::Button, name: &str, delete: impl Fn() + 'static) {
+    const BODY: &str = msg("Clients and project folders that use it will see no servers until you choose another access set.");
+    let parent = anchor.root().and_downcast::<gtk::Window>();
+    #[allow(deprecated)]
+    let dialog = adw::MessageDialog::new(
+        parent.as_ref(),
+        Some(&trf("Delete {name}?", &[("name", name)])),
+        Some(&lookup(BODY)),
+    );
+    l10n::bind_formatted_dialog_heading(&dialog, msg("Delete {name}?"), &[("name", name)]);
+    l10n::bind_dialog_body(&dialog, BODY);
+    dialog.add_response("cancel", &tr("Cancel"));
+    l10n::bind_dialog_response(&dialog, "cancel", msg("Cancel"));
+    dialog.add_response("delete", &tr("Delete access set"));
+    l10n::bind_dialog_response(&dialog, "delete", msg("Delete access set"));
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(None, move |dialog, response| {
+        if response == "delete" {
+            delete();
+        }
+        dialog.close();
+    });
+    dialog.present();
+}
+
 /// A framed group of access rows: the default, or one access set and its servers.
 fn access_group() -> gtk::Box {
     let group = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -3559,8 +3698,21 @@ fn setting_switch_row(title: &'static str, description: &'static str) -> (gtk::B
     ));
     row.append(&copy);
     let toggle = gtk::Switch::builder().valign(gtk::Align::Center).build();
+    // The row's title names the switch and its description describes it, as
+    // text: a `described-by` relation reached screen readers empty (D61, F21).
+    super::name_control(&toggle, move || lookup(title));
+    super::describe_control(&toggle, move || lookup(description));
     row.append(&toggle);
     (row, toggle)
+}
+
+/// Show or hide one of the endpoint's actions together with the flow-box
+/// slot that holds it, so a hidden action leaves no gap.
+fn show_endpoint_action(action: &gtk::Widget, shown: bool) {
+    action.set_visible(shown);
+    if let Some(slot) = action.parent().and_downcast::<gtk::FlowBoxChild>() {
+        slot.set_visible(shown);
+    }
 }
 
 fn http_access_choice(
@@ -3727,10 +3879,27 @@ mod tests {
                 Some("synthetic-fixture-token".into()),
             )
         };
+        // Nothing to copy or show while the endpoint is off, so the actions
+        // are hidden rather than left off with no reason (D104).
+        let shown = |page: &SettingsPage| {
+            [
+                page.copy_endpoint.upcast_ref::<gtk::Widget>(),
+                page.copy_endpoint_token.upcast_ref(),
+                page.reveal_endpoint_token.upcast_ref(),
+            ]
+            .map(|action| {
+                action.is_visible()
+                    && action
+                        .parent()
+                        .is_some_and(|slot| slot.is_visible() && slot.is::<gtk::FlowBoxChild>())
+            })
+        };
         assert_action(false, "Start");
+        assert_eq!(shown(&page), [false; 3]);
         page.render_endpoint(stopped());
         assert_action(false, "Start");
         assert!(!page.endpoint_retry.is_visible());
+        assert_eq!(shown(&page), [false; 3]);
         // Left on, waiting for the keyring: still on, so the main action turns
         // it off; Retry beside it may ask to unlock.
         let mut locked = stopped();
@@ -3748,22 +3917,18 @@ mod tests {
         page.render_endpoint(running());
         assert_action(true, "Stop");
         assert!(!page.endpoint_retry.is_visible());
-        assert!(
-            page.copy_endpoint_token.is_sensitive() && page.reveal_endpoint_token.is_sensitive()
-        );
-        // Show token and Copy token stay off while locked, and until the
+        assert_eq!(shown(&page), [true; 3]);
+        // Show token and Copy token stay hidden while locked, and until the
         // token can be read.
         let mut locked = stopped();
         locked.keyring_locked = true;
         page.render_endpoint(locked);
-        assert!(
-            !page.copy_endpoint_token.is_sensitive() && !page.reveal_endpoint_token.is_sensitive()
-        );
+        assert_eq!(shown(&page), [false; 3]);
         page.render_endpoint(crate::http_bridge::HttpBridgeStatus::new(Some(54321), None));
-        assert!(
-            !page.copy_endpoint_token.is_sensitive() && !page.reveal_endpoint_token.is_sensitive()
-        );
+        assert_eq!(shown(&page), [true, false, false]);
         assert!(!page.reveal_endpoint_token.is_active());
+        page.render_endpoint(stopped());
+        assert_eq!(shown(&page), [false; 3]);
         page.render_endpoint(running());
         crate::i18n::set_language("fr").unwrap();
         l10n::refresh_bindings();
@@ -3882,6 +4047,292 @@ mod tests {
             .filter(|w| w.has_css_class("toolport-switch-group"))
             .count();
         assert_eq!(groups, 3);
+    }
+
+    fn descendants(widget: &gtk::Widget) -> Vec<gtk::Widget> {
+        let mut out = vec![widget.clone()];
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            out.extend(descendants(&current));
+            child = current.next_sibling();
+        }
+        out
+    }
+
+    /// Run the main loop until `done` holds, failing after five seconds.
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let context = gtk::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            while context.iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn settle() {
+        let context = gtk::glib::MainContext::default();
+        for _ in 0..10 {
+            while context.iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn fixture_page(width: i32, page_index: usize) -> (SettingsPage, gtk::Window) {
+        adw::init().unwrap();
+        crate::i18n::set_language("en").unwrap();
+        let page = SettingsPage::new(
+            super::super::http_bridge::BridgeController::default(),
+            crate::approval_broker::start_native(),
+        );
+        page.select_page(page_index);
+        let window = gtk::Window::builder()
+            .default_width(width)
+            .default_height(700)
+            .child(&page.root)
+            .build();
+        window.present();
+        settle();
+        (page, window)
+    }
+
+    fn visible_dialog() -> Option<adw::MessageDialog> {
+        gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<adw::MessageDialog>().ok())
+            .find(|dialog| dialog.is_visible())
+    }
+
+    #[test]
+    fn a_blocked_access_set_delete_says_why() {
+        assert_eq!(
+            delete_access_blocked(1, true, true),
+            Some("Keep at least one access set.")
+        );
+        assert_eq!(
+            delete_access_blocked(3, true, false),
+            Some("This is the default access set. Choose another default before deleting it.")
+        );
+        assert_eq!(
+            delete_access_blocked(3, false, true),
+            Some("Default access still uses this set's tool rules, so it cannot be deleted.")
+        );
+        assert_eq!(delete_access_blocked(3, false, false), None);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn access_set_create_explains_a_missing_name_and_delete_asks_first() {
+        let _data = crate::registry::DataDirTestEnv::new("access-create-delete");
+        let registry: crate::registry::Registry = serde_json::from_value(serde_json::json!({
+            "version": 3,
+            "servers": [{"id": "github", "name": "GitHub", "transport": "stdio", "enabled": true}],
+            "profiles": [
+                {"id": "default", "name": "Default", "enabledServerIds": ["github"]},
+                {"id": "work", "name": "Work", "enabledServerIds": []}
+            ],
+            "defaultAccessProfileId": "default"
+        }))
+        .unwrap();
+        crate::registry::save(&registry).unwrap();
+        let (page, window) = fixture_page(1024, 3);
+        page.render_access_sets(crate::registry::load().unwrap());
+        let widgets = || descendants(page.access_list.upcast_ref());
+        let entry = widgets()
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::Entry>().ok())
+            .unwrap();
+        let create = widgets()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .find(|b| b.label().as_deref() == Some("Create access set"))
+            .unwrap();
+        let reason = widgets()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .find(|l| l.label() == "Enter an access set name.")
+            .expect("a visible line says a name is needed (D48)");
+        assert!(!create.is_sensitive() && reason.get_visible());
+        assert_eq!(
+            create.tooltip_text().as_deref(),
+            Some("Enter an access set name.")
+        );
+        entry.set_text("   ");
+        assert!(!create.is_sensitive() && reason.get_visible());
+        entry.set_text("Team");
+        assert!(create.is_sensitive() && !reason.get_visible());
+        assert!(create.tooltip_text().is_none());
+        // An earlier error stops applying once a create succeeds (D48).
+        page.show_error("Fixture failure");
+        create.emit_clicked();
+        wait_until("the set is created", || {
+            crate::registry::load().unwrap().profiles.len() == 3
+                && !page.feedback.has_css_class("error")
+        });
+        assert!(!page.feedback.label().contains("Fixture failure"));
+
+        // The default set cannot be deleted, and its card says why (D50).
+        let labels: Vec<String> = widgets()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .filter(|l| l.is_visible())
+            .map(|l| l.label().to_string())
+            .collect();
+        assert!(labels.contains(
+            &"This is the default access set. Choose another default before deleting it."
+                .to_string()
+        ));
+        let deletes: Vec<gtk::Button> = widgets()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .filter(|b| b.icon_name().as_deref() == Some("user-trash-symbolic"))
+            .collect();
+        assert_eq!(deletes.len(), 3);
+        assert!(!deletes[0].is_sensitive());
+        assert_eq!(
+            deletes[0].tooltip_text().as_deref(),
+            Some("This is the default access set. Choose another default before deleting it.")
+        );
+        // Deleting asks first; Cancel, the default and Esc's answer, keeps it.
+        deletes[1].emit_clicked();
+        settle();
+        let dialog = visible_dialog().expect("delete asks first");
+        assert_eq!(dialog.heading().as_deref(), Some("Delete Work?"));
+        assert_eq!(
+            dialog.body().as_str(),
+            "Clients and project folders that use it will see no servers until you choose another access set."
+        );
+        assert_eq!(dialog.default_response().as_deref(), Some("cancel"));
+        assert_eq!(dialog.close_response().as_str(), "cancel");
+        assert_eq!(
+            dialog.response_label("delete").as_str(),
+            "Delete access set"
+        );
+        assert_eq!(
+            dialog.response_appearance("delete"),
+            adw::ResponseAppearance::Destructive
+        );
+        dialog.response("cancel");
+        settle();
+        assert_eq!(crate::registry::load().unwrap().profiles.len(), 3);
+        deletes[1].emit_clicked();
+        settle();
+        visible_dialog().unwrap().response("delete");
+        wait_until("the set is deleted", || {
+            let profiles = crate::registry::load().unwrap().profiles;
+            profiles.len() == 2 && profiles.iter().all(|p| p.id != "work")
+        });
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn every_settings_switch_is_named_and_described_by_its_row() {
+        let _data = crate::registry::DataDirTestEnv::new("settings-switch-names");
+        crate::registry::save(&crate::registry::Registry::default()).unwrap();
+        let (page, window) = fixture_page(1024, 0);
+        let switches: Vec<gtk::Switch> = descendants(&page.root.clone().upcast())
+            .into_iter()
+            .filter(|w| !w.is_ancestor(&page.access_list))
+            .filter_map(|w| w.downcast::<gtk::Switch>().ok())
+            .collect();
+        let mut names = Vec::new();
+        for switch in &switches {
+            let (name, description) = super::super::spoken::of(switch);
+            let name = name
+                .filter(|n| !n.is_empty())
+                .expect("every switch is named");
+            assert!(
+                description.is_some_and(|d| !d.is_empty()),
+                "{name} has no description"
+            );
+            names.push(name);
+        }
+        for expected in [
+            "Launch at login",
+            "Hide personal data from the model",
+            "Live request/response inspection",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "{expected} in {names:?}"
+            );
+        }
+        let (_, launch) = super::super::spoken::of(&page.launch_at_login);
+        assert_eq!(
+            launch.as_deref(),
+            Some("Start Toolport in the tray when you sign in, so it can hold tool calls for approval even before you open it")
+        );
+        // The names follow the language.
+        crate::i18n::set_language("fr").unwrap();
+        l10n::refresh_bindings();
+        let (name, _) = super::super::spoken::of(&page.launch_at_login);
+        assert_eq!(name, Some(crate::i18n::tr("Launch at login")));
+        assert_ne!(name.as_deref(), Some("Launch at login"));
+        crate::i18n::set_language("en").unwrap();
+        l10n::refresh_bindings();
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn the_language_list_opens_inside_a_narrow_window_and_is_named() {
+        let _data = crate::registry::DataDirTestEnv::new("settings-language-popup");
+        crate::registry::save(&crate::registry::Registry::default()).unwrap();
+        let (page, window) = fixture_page(480, 0);
+        let picker = descendants(&page.root.clone().upcast())
+            .into_iter()
+            .find(|w| w.widget_name() == "settings:language")
+            .and_downcast::<gtk::DropDown>()
+            .unwrap();
+        assert_eq!(
+            super::super::spoken::of(&picker).0.as_deref(),
+            Some("Language")
+        );
+        let popover = descendants(picker.upcast_ref())
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::Popover>().ok())
+            .unwrap();
+        popover.popup();
+        settle();
+        // The control sits at the window's right edge, so its list lines up
+        // with that edge and grows toward the middle (D47).
+        assert_eq!(popover.halign(), gtk::Align::End);
+        popover.popdown();
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn use_standard_level_keeps_focus_on_the_level_in_force() {
+        let _data = crate::registry::DataDirTestEnv::new("settings-use-standard");
+        let registry = crate::registry::Registry {
+            safety_level: Some(crate::registry::SafetyLevel::Ask),
+            kept_v1_safety: Some(crate::registry::KeptV1Safety {
+                hold_untrusted: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        crate::registry::save(&registry).unwrap();
+        let (page, window) = fixture_page(1024, 2);
+        page.render_settings(crate::registry_controller::essential_settings().unwrap());
+        assert!(page.safety_kept.get_visible());
+        assert_eq!(
+            page.safety_kept_reset.label().as_deref(),
+            Some("Use standard Ask")
+        );
+        page.safety_kept_reset.grab_focus();
+        page.safety_kept_reset.emit_clicked();
+        wait_until("the kept protections are dropped", || {
+            crate::registry::load().unwrap().kept_v1_safety.is_none()
+                && !page.safety_kept.get_visible()
+        });
+        settle();
+        // Focus is on the Ask card, not lost with the hidden button (D105).
+        let focus = gtk::prelude::GtkWindowExt::focus(&window).expect("something has focus");
+        assert_eq!(focus, page.safety_cards[1].clone().upcast::<gtk::Widget>());
+        window.close();
     }
 
     #[test]

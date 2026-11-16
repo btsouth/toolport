@@ -280,5 +280,11 @@
   "Keep English": "保留英文",
   "Skills and rules each agent loads, and where they live": "每個智慧體載入的技能與規則，以及它們的儲存位置",
   "Back to servers": "返回伺服器",
-  "Add a config folder for a client Toolport did not find on its own": "為 Toolport 未自動找到的用戶端新增設定資料夾"
+  "Add a config folder for a client Toolport did not find on its own": "為 Toolport 未自動找到的用戶端新增設定資料夾",
+  "Enter an access set name.": "請輸入存取集名稱。",
+  "Delete {name}?": "刪除{name}？",
+  "Clients and project folders that use it will see no servers until you choose another access set.": "使用它的用戶端和專案資料夾將看不到任何伺服器，直到你選擇另一個存取集。",
+  "Keep at least one access set.": "請至少保留一個存取集。",
+  "This is the default access set. Choose another default before deleting it.": "這是預設存取集。刪除前請先選擇另一個預設存取集。",
+  "Default access still uses this set's tool rules, so it cannot be deleted.": "預設存取仍在使用此存取集的工具規則，因此無法刪除。"
 }

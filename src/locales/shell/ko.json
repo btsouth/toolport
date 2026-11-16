@@ -280,5 +280,11 @@
   "Keep English": "영어 유지",
   "Skills and rules each agent loads, and where they live": "각 에이전트가 불러오는 스킬과 규칙, 그리고 저장 위치",
   "Back to servers": "서버로 돌아가기",
-  "Add a config folder for a client Toolport did not find on its own": "Toolport가 자동으로 찾지 못한 클라이언트의 설정 폴더 추가"
+  "Add a config folder for a client Toolport did not find on its own": "Toolport가 자동으로 찾지 못한 클라이언트의 설정 폴더 추가",
+  "Enter an access set name.": "액세스 세트 이름을 입력하세요.",
+  "Delete {name}?": "{name}을(를) 삭제하시겠습니까?",
+  "Clients and project folders that use it will see no servers until you choose another access set.": "이 세트를 사용하는 클라이언트와 프로젝트 폴더는 다른 액세스 세트를 선택할 때까지 서버가 보이지 않습니다.",
+  "Keep at least one access set.": "액세스 세트를 하나 이상 유지하세요.",
+  "This is the default access set. Choose another default before deleting it.": "기본 액세스 세트입니다. 삭제하기 전에 다른 기본값을 선택하세요.",
+  "Default access still uses this set's tool rules, so it cannot be deleted.": "기본 액세스가 아직 이 세트의 도구 규칙을 사용하므로 삭제할 수 없습니다."
 }

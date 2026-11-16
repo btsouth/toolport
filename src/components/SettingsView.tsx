@@ -1,8 +1,16 @@
-import { getLocale, translate } from "@/lib/i18n";
+import { getLocale, msg, translate } from "@/lib/i18n";
 import { LANGUAGES, resolveLocale, type LanguageChoice, useI18n } from "@/lib/i18n";
 import { type SettingsSubpage, SETTINGS_PAGES } from "@/lib/settingsPages";
 import { toast } from "sonner";
-import { useCallback, useEffect, useMemo, useState, useRef, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useState,
+  useRef,
+  type ReactNode,
+} from "react";
 import {
   Activity,
   Braces,
@@ -29,6 +37,7 @@ import {
 import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
 import { toastError } from "@/lib/toast";
 import { QuarantineDefinition } from "@/components/QuarantineDefinition";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import {
   Dialog,
   DialogContent,
@@ -354,11 +363,14 @@ function AccessSetCreator({
 }) {
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
+  const reasonId = useId();
+  const named = !!name.trim();
   return (
     <form
-      className="flex gap-2"
+      className="flex flex-wrap gap-2"
       onSubmit={async (event) => {
         event.preventDefault();
+        if (!named) return;
         setBusy(true);
         try {
           onRegistryChange(await createProfile(name));
@@ -372,16 +384,47 @@ function AccessSetCreator({
     >
       <input
         aria-label={translate("Access set name")}
+        aria-describedby={named ? undefined : reasonId}
         placeholder={translate("Access set name")}
         value={name}
         onChange={(e) => setName(e.target.value)}
         className="h-8 w-56 min-w-0 rounded-md border border-input bg-transparent px-2 text-sm focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none"
       />
-      <Button variant="outline" disabled={busy || !name.trim()} type="submit">
+      <Button
+        variant="outline"
+        disabled={busy || !named}
+        aria-describedby={named ? undefined : reasonId}
+        title={named ? undefined : translate("Enter an access set name.")}
+        type="submit"
+      >
         {translate("Create access set")}
       </Button>
+      {!named && (
+        <p id={reasonId} className="w-full text-meta text-muted-foreground">
+          {translate("Enter an access set name.")}
+        </p>
+      )}
     </form>
   );
+}
+
+/** Why an access set cannot be deleted, matching the checks that turn its
+ * Delete button off. The GTK shell shows the same reason. */
+function deleteAccessBlocked(
+  sets: number,
+  isDefault: boolean,
+  holdsDefaultRules: boolean,
+) {
+  if (sets <= 1) return msg("Keep at least one access set.");
+  if (isDefault)
+    return msg(
+      "This is the default access set. Choose another default before deleting it.",
+    );
+  if (holdsDefaultRules)
+    return msg(
+      "Default access still uses this set's tool rules, so it cannot be deleted.",
+    );
+  return null;
 }
 
 interface Props {
@@ -769,11 +812,21 @@ export function SettingsView({
   }, [registry]);
   const keptSummary = keptSafetySummary(registry?.keptV1Safety);
   const levelLabel = { off: t("Off"), ask: t("Ask"), strict: t("Strict") } as const;
+  // The level a finished "Use standard" leaves focus on, once its radio is on
+  // again: the button hides with the kept note (D105).
+  const safetyRadios = useRef<Partial<Record<string, HTMLInputElement | null>>>({});
+  const safetyFocus = useRef<string | null>(null);
+  useEffect(() => {
+    if (safetyBusy || !safetyFocus.current) return;
+    safetyRadios.current[safetyFocus.current]?.focus();
+    safetyFocus.current = null;
+  }, [safetyBusy]);
   // Picking a level, even the current one, also drops protections kept from 1.x.
-  async function chooseSafety(level: "off" | "ask" | "strict") {
+  async function chooseSafety(level: "off" | "ask" | "strict", focusAfter = false) {
     setSafetyBusy(true);
     try {
       const updated = await setSafetyLevel(level);
+      if (focusAfter) safetyFocus.current = level;
       const reconciled = latestRegistry.current
         ? {
             ...latestRegistry.current,
@@ -1419,6 +1472,9 @@ export function SettingsView({
                       safetyLevels.indexOf(level) < safetyLevels.indexOf(teamFloor)
                     }
                     onChange={() => void chooseSafety(level)}
+                    ref={(radio) => {
+                      safetyRadios.current[level] = radio;
+                    }}
                     className="accent-primary"
                   />
                 </span>
@@ -1467,7 +1523,7 @@ export function SettingsView({
                 size="sm"
                 variant="outline"
                 disabled={safetyBusy}
-                onClick={() => chooseSafety(effectiveLevel)}
+                onClick={() => chooseSafety(effectiveLevel, true)}
               >
                 {t("Use standard {level}", { level: levelLabel[effectiveLevel] })}
               </Button>
@@ -1725,6 +1781,11 @@ export function SettingsView({
                     serverName.has(id),
                   ).length;
                   const active = p.id === registry?.defaultAccessProfileId;
+                  const blocked = deleteAccessBlocked(
+                    profiles.length,
+                    active,
+                    p.id === registry?.defaultAccessContextId,
+                  );
                   return (
                     <div key={p.id} className="toolport-list">
                       <div className="flex items-center gap-2 border-b border-border px-4 py-3 last:border-b-0">
@@ -1734,27 +1795,42 @@ export function SettingsView({
                           {count}{" "}
                           {count === 1 ? translate("server") : translate("servers")}
                         </span>
-                        <Button
-                          variant="ghost"
-                          size="icon-sm"
-                          aria-label={translate("Delete access set")}
-                          title={translate("Delete access set")}
-                          disabled={
-                            profiles.length <= 1 ||
-                            p.id === registry?.defaultAccessProfileId ||
-                            p.id === registry?.defaultAccessContextId
+                        <ConfirmDialog
+                          trigger={
+                            <Button
+                              variant="ghost"
+                              size="icon-sm"
+                              aria-label={translate("Delete access set")}
+                              title={
+                                blocked
+                                  ? translate(blocked)
+                                  : translate("Delete access set")
+                              }
+                              disabled={!!blocked}
+                            >
+                              <Trash2 />
+                            </Button>
                           }
-                          onClick={async () => {
+                          title={translate("Delete {name}?", { name: p.name })}
+                          description={translate(
+                            "Clients and project folders that use it will see no servers until you choose another access set.",
+                          )}
+                          confirmLabel={translate("Delete access set")}
+                          destructive
+                          onConfirm={async () => {
                             try {
                               onRegistryChange(await deleteProfile(p.id));
                             } catch (e) {
                               toastError(`${e}`);
                             }
                           }}
-                        >
-                          <Trash2 />
-                        </Button>
+                        />
                       </div>
+                      {blocked && (
+                        <p className="border-b border-border px-4 py-2 text-meta text-muted-foreground last:border-b-0">
+                          {translate(blocked)}
+                        </p>
+                      )}
                       {registry && (
                         <ProfileToolScope
                           profile={p}

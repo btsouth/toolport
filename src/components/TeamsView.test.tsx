@@ -610,6 +610,21 @@ describe("Sync setup", () => {
     );
     expect(changed).toHaveBeenCalledWith(registry);
   });
+  it("needs both the URL and the code before signing in with a code", async () => {
+    render(<TeamsView registry={noTeam} onRegistryChange={vi.fn()} />);
+    await userEvent.click(screen.getByText("Use a manual code"));
+    const signIn = screen.getByRole("button", { name: "Sign in with code" });
+    const reason = "Enter the sync service URL and manual code";
+    expect(signIn).toBeDisabled();
+    expect(signIn).toHaveAccessibleDescription(reason);
+    await userEvent.type(screen.getByLabelText("Manual code"), "fixture-code");
+    expect(signIn).toBeEnabled();
+    expect(screen.queryByText(reason)).not.toBeInTheDocument();
+    await userEvent.clear(screen.getByLabelText("Sync service URL"));
+    expect(signIn).toBeDisabled();
+    expect(screen.getByText(reason)).toBeInTheDocument();
+    expect(api.teamConnect).not.toHaveBeenCalled();
+  });
   it("refuses a plaintext public service before transmitting the code", async () => {
     render(<TeamsView registry={noTeam} onRegistryChange={vi.fn()} />);
     await userEvent.click(screen.getByText("Use a manual code"));

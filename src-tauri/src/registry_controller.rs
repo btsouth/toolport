@@ -1233,10 +1233,10 @@ pub fn apply_delete_profile(registry: &mut Registry, profile_id: &str) -> Result
 }
 
 pub fn create_profile(name: &str) -> Result<Registry, String> {
+    // The same check and words as the React shell's path through
+    // `apply_create_profile`: an access set, not a profile (D48).
+    registry::validate_access_set_name(name)?;
     let name = name.trim();
-    if name.is_empty() {
-        return Err("give the profile a name".into());
-    }
     let (registry, ()) = registry::update(|registry| apply_create_profile(registry, name))?;
     Ok(registry)
 }
@@ -5272,6 +5272,17 @@ API_KEY = "synthetic-first-origin"
             assert!(apply_create_profile(&mut reg, name).is_err());
         }
         assert_eq!(reg.profiles.len(), 1);
+    }
+
+    #[test]
+    fn a_blank_access_set_name_is_refused_in_access_set_words() {
+        // Refused before the registry is read, so no data directory is needed.
+        for name in ["", "   "] {
+            assert_eq!(
+                create_profile(name).unwrap_err(),
+                "Give the access set a name"
+            );
+        }
     }
 
     #[test]

@@ -280,5 +280,11 @@
   "Keep English": "Keep English",
   "Skills and rules each agent loads, and where they live": "Skills and rules each agent loads, and where they live",
   "Back to servers": "Back to servers",
-  "Add a config folder for a client Toolport did not find on its own": "Add a config folder for a client Toolport did not find on its own"
+  "Add a config folder for a client Toolport did not find on its own": "Add a config folder for a client Toolport did not find on its own",
+  "Enter an access set name.": "Enter an access set name.",
+  "Delete {name}?": "Delete {name}?",
+  "Clients and project folders that use it will see no servers until you choose another access set.": "Clients and project folders that use it will see no servers until you choose another access set.",
+  "Keep at least one access set.": "Keep at least one access set.",
+  "This is the default access set. Choose another default before deleting it.": "This is the default access set. Choose another default before deleting it.",
+  "Default access still uses this set's tool rules, so it cannot be deleted.": "Default access still uses this set's tool rules, so it cannot be deleted."
 }
