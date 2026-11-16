@@ -66,6 +66,8 @@ export function ShareDialog({ trigger, onImported }: Props) {
   const [debouncedName, setDebouncedName] = useState(name);
   const [debouncedDescription, setDebouncedDescription] = useState(description);
   const [paste, setPaste] = useState("");
+  // A paste that could not be read: shown under the field, as in GTK.
+  const [pasteError, setPasteError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [busyAction, setBusyAction] = useState<
     "preview-paste" | "preview-file" | "import" | null
@@ -180,6 +182,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
       setBusyAction(null);
       if (next) {
         setPaste("");
+        setPasteError(null);
         setCopied(false);
         setPreview(null);
         setPendingJson("");
@@ -277,13 +280,13 @@ export function ShareDialog({ trigger, onImported }: Props) {
         setImportSelection(new Set(items.filter((i) => i.isNew).map((i) => i.name)));
       } catch (e) {
         if (request !== previewRequest.current) return;
-        // A failed paste says what to do first; the parser detail follows, as in GTK.
+        // A failed paste is an error on its field: what to do first, then the
+        // parser detail, under the field as in GTK.
         if (pasted)
-          toastError(
-            t(
+          setPasteError(
+            `${t(
               "Couldn't read the pasted setup. Check that you copied all of it, then try again.",
-            ),
-            { description: String(e) },
+            )}\n\n${String(e)}`,
           );
         else toastError(t("Couldn't read that setup: {value1}", { value1: String(e) }));
       } finally {
@@ -614,27 +617,10 @@ export function ShareDialog({ trigger, onImported }: Props) {
                 rows={5}
                 className="resize-none font-mono text-meta"
               />
-              {/* Disabled buttons take no pointer events, so the row carries the reason too. */}
-              <div className="flex flex-wrap gap-2" title={noShareReason}>
-                <Button
-                  size="sm"
-                  className="h-8"
-                  onClick={createLink}
-                  disabled={shareActionDisabled}
-                  title={noShareReason}
-                >
-                  {linking ? (
-                    <>
-                      <Loader2 className="size-3.5 animate-spin" />
-                      {t(" Creating link… ")}
-                    </>
-                  ) : (
-                    <>
-                      <Link2 className="size-3.5" />
-                      {t(" Create share link ")}
-                    </>
-                  )}
-                </Button>
+              {/* One right-aligned row as in GTK's footer: the exports, then the one
+                  primary. Disabled buttons take no pointer events, so the row carries
+                  the reason too, and it shows as a line by the buttons. */}
+              <div className="flex flex-wrap justify-end gap-2" title={noShareReason}>
                 <Button
                   size="sm"
                   variant="outline"
@@ -675,7 +661,31 @@ export function ShareDialog({ trigger, onImported }: Props) {
                     </>
                   )}
                 </Button>
+                <Button
+                  size="sm"
+                  className="h-8"
+                  onClick={createLink}
+                  disabled={shareActionDisabled}
+                  title={noShareReason}
+                >
+                  {linking ? (
+                    <>
+                      <Loader2 className="size-3.5 animate-spin" />
+                      {t(" Creating link… ")}
+                    </>
+                  ) : (
+                    <>
+                      <Link2 className="size-3.5" />
+                      {t(" Create share link ")}
+                    </>
+                  )}
+                </Button>
               </div>
+              {noShareReason && (
+                <p className="text-right text-[13px] text-muted-foreground">
+                  {noShareReason}
+                </p>
+              )}
               {shareLink && (
                 <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-2.5 py-1.5">
                   <Link2 className="size-3.5 shrink-0 text-success" />
@@ -702,27 +712,25 @@ export function ShareDialog({ trigger, onImported }: Props) {
                 placeholder={t("Paste a shared setup here")}
                 aria-label={t("Paste a shared setup")}
                 value={paste}
-                onChange={(e) => setPaste(e.target.value)}
+                onChange={(e) => {
+                  setPaste(e.target.value);
+                  setPasteError(null);
+                }}
+                aria-invalid={pasteError ? true : undefined}
+                aria-describedby={pasteError ? "share-paste-error" : undefined}
                 rows={5}
                 className="resize-none font-mono text-meta"
               />
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  onClick={() => startPreview(paste, "preview-paste", undefined, true)}
-                  disabled={busyAction !== null || !paste.trim()}
+              {pasteError && (
+                <p
+                  id="share-paste-error"
+                  role="alert"
+                  className="whitespace-pre-wrap break-words text-[13px] text-destructive"
                 >
-                  {busyAction === "preview-paste" ? (
-                    <>
-                      <Loader2 className="size-4 animate-spin" />
-                      {t("Reviewing… ")}
-                    </>
-                  ) : (
-                    <>
-                      <Upload className="size-4" />
-                      {t("Review and import ")}
-                    </>
-                  )}
-                </Button>
+                  {pasteError}
+                </p>
+              )}
+              <div className="flex flex-wrap justify-end gap-2">
                 <Button
                   variant="outline"
                   onClick={loadFromFile}
@@ -737,6 +745,22 @@ export function ShareDialog({ trigger, onImported }: Props) {
                     <>
                       <FileUp className="size-4" />
                       {t("Load from file ")}
+                    </>
+                  )}
+                </Button>
+                <Button
+                  onClick={() => startPreview(paste, "preview-paste", undefined, true)}
+                  disabled={busyAction !== null || !paste.trim()}
+                >
+                  {busyAction === "preview-paste" ? (
+                    <>
+                      <Loader2 className="size-4 animate-spin" />
+                      {t("Reviewing… ")}
+                    </>
+                  ) : (
+                    <>
+                      <Upload className="size-4" />
+                      {t("Review and import ")}
                     </>
                   )}
                 </Button>

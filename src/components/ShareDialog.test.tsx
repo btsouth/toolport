@@ -277,7 +277,17 @@ describe("ShareDialog share links", () => {
     const create = await screen.findByRole("button", { name: /create share link/i });
     await waitFor(() => expect(create).toBeEnabled());
     expect(create).not.toHaveAttribute("title");
+    // One right-aligned row, as GTK's footer: the exports, then the primary.
+    const row = create.parentElement!;
+    expect(row).toHaveClass("justify-end");
+    expect(
+      Array.from(row.querySelectorAll("button")).map((b) => b.textContent?.trim()),
+    ).toEqual(["Copy", "Save to file", "Create share link"]);
+    const reason = "Select at least one server to share.";
+    expect(screen.queryByText(reason, { selector: "p" })).toBeNull();
     await userEvent.click(screen.getByRole("button", { name: "None" }));
+    // The reason is a line by the buttons, not only a tooltip.
+    expect(screen.getByText(reason, { selector: "p" })).toBeVisible();
     for (const name of [/create share link/i, /^copy$/i, /save to file/i]) {
       const button = screen.getByRole("button", { name });
       expect(button).toBeDisabled();
@@ -299,16 +309,25 @@ describe("ShareDialog share links", () => {
     fireEvent.change(screen.getByLabelText("Paste a shared setup"), {
       target: { value: "{x" },
     });
-    await userEvent.click(screen.getByRole("button", { name: /review and import/i }));
-    await waitFor(() =>
-      expect(mocks.toastError).toHaveBeenCalledWith(
-        "Couldn't read the pasted setup. Check that you copied all of it, then try again.",
-        {
-          description:
-            "That doesn't look like a Toolport setup: expected ident at line 1 column 2",
-        },
-      ),
+    const review = screen.getByRole("button", { name: /review and import/i });
+    // Load from file, then the one primary, at the right as in GTK.
+    expect(review.parentElement).toHaveClass("justify-end");
+    expect(review.parentElement!.lastElementChild).toBe(review);
+    await userEvent.click(review);
+    // An error on the field shows under it, not as a toast.
+    const error = await screen.findByRole("alert");
+    expect(error).toHaveTextContent(
+      "Couldn't read the pasted setup. Check that you copied all of it, then try again.",
     );
+    expect(error).toHaveTextContent(
+      "That doesn't look like a Toolport setup: expected ident at line 1 column 2",
+    );
+    const field = screen.getByLabelText("Paste a shared setup");
+    expect(field).toHaveAttribute("aria-describedby", error.id);
+    expect(field.nextElementSibling).toBe(error);
+    expect(mocks.toastError).not.toHaveBeenCalled();
+    fireEvent.change(field, { target: { value: "{}" } });
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("starts both choosers in Downloads and offers every file after setup files", async () => {

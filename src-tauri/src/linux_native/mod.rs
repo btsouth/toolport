@@ -10438,7 +10438,7 @@ fn share_setup_loaded(page: ServerPage, servers: Vec<(String, String)>) {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let header = adw::HeaderBar::new();
     let done = l10n::button("Done");
-    done.add_css_class("toolport-secondary-action");
+    done.add_css_class("flat");
     root.append(&header);
     let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
     body.add_css_class("toolport-editor-body");
@@ -10523,34 +10523,44 @@ fn share_setup_loaded(page: ServerPage, servers: Vec<(String, String)>) {
         .propagate_natural_height(true)
         .build();
     body.append(&list_scroller);
-    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    actions.set_halign(gtk::Align::End);
     let copy_json = l10n::button("Copy JSON");
     copy_json.add_css_class("toolport-secondary-action");
     let save_file = l10n::button("Save to file…");
     save_file.add_css_class("toolport-secondary-action");
     let copy_link = l10n::button("Copy share link");
     copy_link.add_css_class("suggested-action");
-    actions.append(&copy_json);
-    actions.append(&save_file);
-    actions.append(&copy_link);
-    // The actions and their result stay pinned under the scroller; a result
-    // inside it pushed the buttons below the footer (D23).
+    // One right-aligned footer, as every dialog has: Done, the secondary
+    // exports, then the one primary. It and the result line above it stay
+    // pinned under the scroller; a result inside it pushed the buttons below
+    // the footer (D23).
+    let footer = dialog_footer(&[&done, &copy_json, &save_file, &copy_link]);
+    footer.set_widget_name("toolport-share-actions");
+    let reason = gtk::Label::builder()
+        .halign(gtk::Align::End)
+        .xalign(1.0)
+        .wrap(true)
+        .visible(false)
+        .css_classes(["toolport-inline-reason"])
+        .build();
     let action_area = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    action_area.set_widget_name("toolport-share-actions");
     action_area.set_margin_start(20);
     action_area.set_margin_end(20);
     action_area.set_margin_top(8);
-    action_area.set_margin_bottom(8);
     action_area.append(&feedback);
-    action_area.append(&actions);
+    action_area.append(&reason);
     // With nothing checked there is nothing to share: say so on the buttons
     // instead of failing after the click.
     {
         let buttons = [copy_json.clone(), save_file.clone(), copy_link.clone()];
         let state = checks.clone();
+        let reason = reason.clone();
         let update = std::rc::Rc::new(move || {
             let any = state.iter().any(|(_, check)| check.is_active());
+            // The reason shows by the buttons, not only in a tooltip.
+            reason.set_visible(!any);
+            if !any {
+                l10n::bind_text(&reason, "Select at least one server to share.");
+            }
             for button in &buttons {
                 button.set_sensitive(any);
                 button.set_tooltip_text(
@@ -10578,7 +10588,7 @@ fn share_setup_loaded(page: ServerPage, servers: Vec<(String, String)>) {
         .build();
     root.append(&scroller);
     root.append(&action_area);
-    root.append(&dialog_footer(&[&done]));
+    root.append(&footer);
     close_on_escape(&window);
     window.set_content(Some(&root));
 
@@ -10832,9 +10842,8 @@ fn open_paste_import(page: ServerPage) {
         .xalign(0.0)
         .wrap(true)
         .visible(false)
-        .css_classes(["toolport-feedback", "error"])
+        .css_classes(["toolport-inline-error"])
         .build();
-    body.append(&feedback);
     let editor = gtk::TextView::new();
     editor.set_monospace(true);
     editor.set_wrap_mode(gtk::WrapMode::WordChar);
@@ -10854,6 +10863,18 @@ fn open_paste_import(page: ServerPage) {
         .build();
     editor_scroll.add_css_class("toolport-text-area");
     body.append(&editor_scroll);
+    // A failed review is an error on this field: it shows under it, is read
+    // with it, and goes once the text changes.
+    body.append(&feedback);
+    editor.update_relation(&[gtk::accessible::Relation::DescribedBy(&[
+        feedback.upcast_ref()
+    ])]);
+    {
+        let feedback = feedback.clone();
+        editor
+            .buffer()
+            .connect_changed(move |_| feedback.set_visible(false));
+    }
     // Nothing to review until something is pasted; explain instead of letting
     // the parser report an end-of-input error.
     let explain_review = {
@@ -25463,6 +25484,33 @@ mod setup_import_share_tests {
         editor.buffer().set_text("{");
         assert!(review.is_sensitive());
         assert_eq!(review.tooltip_text(), None);
+        // A setup that cannot be read is an error under the field, not a card
+        // above it, and it goes once the text changes.
+        review.emit_clicked();
+        let error = widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>().cloned())
+            .find(|l| l.has_css_class("toolport-inline-error"))
+            .expect("an inline error label");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !error.is_visible() {
+            assert!(std::time::Instant::now() < deadline, "no paste error");
+            gtk::glib::MainContext::default().iteration(true);
+        }
+        assert!(error.label().starts_with(
+            "Couldn't read the pasted setup. Check that you copied all of it, then try again."
+        ));
+        let field = editor.ancestor(gtk::ScrolledWindow::static_type()).unwrap();
+        assert_eq!(
+            error.prev_sibling(),
+            Some(field),
+            "the error sits under the field"
+        );
+        assert!(!widgets
+            .iter()
+            .any(|w| w.has_css_class("toolport-feedback") && w.is_visible()));
+        editor.buffer().set_text("{}");
+        assert!(!error.is_visible());
         window.close();
     }
 
@@ -25490,37 +25538,63 @@ mod setup_import_share_tests {
                 .collect::<Vec<_>>(),
             vec!["Stripe (stripe)", "Stripe (stripe-2)"]
         );
-        let actions = widgets
+        let footer = widgets
             .iter()
             .find(|w| w.widget_name() == "toolport-share-actions")
             .unwrap();
         assert!(
-            actions
+            footer
                 .ancestor(gtk::ScrolledWindow::static_type())
                 .is_none(),
             "the actions sit outside the scroller"
         );
-        let buttons = descendants(actions)
+        assert!(footer.has_css_class("toolport-dialog-footer"));
+        // One right-aligned footer: Done, then the exports, then the primary.
+        let all = descendants(footer)
             .into_iter()
             .filter_map(|w| w.downcast::<gtk::Button>().ok())
             .filter(|b| b.label().is_some())
             .collect::<Vec<_>>();
-        assert_eq!(buttons.len(), 3);
+        assert_eq!(
+            all.iter()
+                .map(|b| b.label().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            ["Done", "Copy JSON", "Save to file…", "Copy share link"]
+        );
+        assert!(all[0].has_css_class("flat"));
+        assert!(all[1..3]
+            .iter()
+            .all(|b| b.has_css_class("toolport-secondary-action")));
+        assert!(all[3].has_css_class("suggested-action"));
+        let buttons = &all[1..];
+        let reason = widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>().cloned())
+            .find(|l| l.has_css_class("toolport-inline-reason"))
+            .unwrap();
         assert!(buttons.iter().all(|b| b.is_sensitive()));
+        assert!(!reason.is_visible());
         for check in &checks {
             check.set_active(false);
         }
-        for button in &buttons {
+        for button in buttons {
             assert!(!button.is_sensitive());
             assert_eq!(
                 button.tooltip_text().as_deref(),
                 Some("Select at least one server to share.")
             );
         }
+        // The reason shows by the buttons too, not only in a tooltip.
+        assert!(reason.is_visible());
+        assert_eq!(reason.label(), "Select at least one server to share.");
+        assert!(reason
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .is_none());
         checks[1].set_active(true);
         assert!(buttons
             .iter()
             .all(|b| b.is_sensitive() && b.tooltip_text().is_none()));
+        assert!(!reason.is_visible());
         window.close();
     }
 
