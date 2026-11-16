@@ -16,6 +16,8 @@ import {
   httpBridgeStatus,
   isAutostartEnabled,
   retryHttpBridge,
+  startHttpBridge,
+  stopHttpBridge,
   listServerTools,
   listQuarantined,
   releaseQuarantine,
@@ -55,6 +57,8 @@ vi.mock("@/lib/api", async (importOriginal) => {
     stopStaleGateways: vi.fn(),
     httpBridgeStatus: vi.fn(actual.httpBridgeStatus),
     retryHttpBridge: vi.fn(),
+    startHttpBridge: vi.fn(),
+    stopHttpBridge: vi.fn(),
   };
 });
 
@@ -284,12 +288,40 @@ describe("SettingsView HTTP endpoint", () => {
     expect(
       screen.getByText(/Unlock your keyring, then choose Retry\./),
     ).toBeInTheDocument();
+    // Still on: the switch shows the saved setting, not whether it runs yet.
+    expect(screen.getByRole("switch", { name: /Open WebUI/ })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
     expect(retryHttpBridge).not.toHaveBeenCalled();
 
     await user.click(screen.getByRole("button", { name: "Retry" }));
 
     expect(await screen.findByText("http://localhost:8765")).toBeInTheDocument();
     expect(retryHttpBridge).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Keyring locked")).not.toBeInTheDocument();
+  });
+});
+
+describe("SettingsView HTTP endpoint waiting for the keyring", () => {
+  it("turns it off from the switch, without starting it", async () => {
+    const stopped = { running: false, port: null, url: null, token: null };
+    vi.mocked(httpBridgeStatus).mockResolvedValueOnce({
+      ...stopped,
+      keyringLocked: true,
+    });
+    vi.mocked(stopHttpBridge).mockResolvedValueOnce({ ...stopped, keyringLocked: false });
+    const user = userEvent.setup();
+    renderSettings("connections");
+
+    const toggle = await screen.findByRole("switch", { name: /Open WebUI/ });
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    await user.click(toggle);
+
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
+    expect(stopHttpBridge).toHaveBeenCalledTimes(1);
+    expect(startHttpBridge).not.toHaveBeenCalled();
+    expect(retryHttpBridge).not.toHaveBeenCalled();
     expect(screen.queryByText("Keyring locked")).not.toBeInTheDocument();
   });
 });

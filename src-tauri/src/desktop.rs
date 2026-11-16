@@ -3723,23 +3723,33 @@ fn stop_http_bridge_with(
 #[tauri::command]
 async fn stop_http_bridge(app: AppHandle) -> Result<HttpBridgeStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let _lifecycle = HTTP_BRIDGE_LIFECYCLE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let registry = app.state::<RegistryState>();
-        clear_update_http_bridge_intent()?;
-        write_registry(registry.inner(), |reg| {
-            reg.http_bridge_enabled = false;
-            Ok(())
-        })?;
         let state = app.state::<HttpBridgeState>();
-        let mut bridge = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        stop_http_bridge_with(&mut bridge, std::process::Child::kill)
+        stop_persisted_http_bridge(state.inner(), registry.inner())
     })
     .await
     .map_err(|error| format!("HTTP endpoint task failed: {error}"))?
+}
+
+/// Turn the endpoint off and forget the user's intent. One waiting for the
+/// keyring is on too: this clears its saved setting and ends the wait, without
+/// reading the keyring, so an unlock never starts it.
+fn stop_persisted_http_bridge(
+    state: &HttpBridgeState,
+    registry: &RegistryState,
+) -> Result<HttpBridgeStatus, String> {
+    let _lifecycle = HTTP_BRIDGE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    clear_update_http_bridge_intent()?;
+    write_registry(registry, |reg| {
+        reg.http_bridge_enabled = false;
+        Ok(())
+    })?;
+    let mut bridge = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    stop_http_bridge_with(&mut bridge, std::process::Child::kill)
 }
 
 /// At start: bring back an endpoint the user left on. Never asks to unlock
@@ -5113,6 +5123,38 @@ mod tests {
             });
             assert!(prompts.is_empty(), "{prompts:?}");
             assert_eq!(restored, Some(Ok(false)));
+            assert!(!crate::http_bridge::status(&state).running);
+        });
+    }
+
+    /// Failure mode: an endpoint waiting for the keyring showed as off, and
+    /// its switch started it instead of turning it off; the saved setting
+    /// stayed on and the first unlock started it.
+    #[test]
+    fn turning_off_an_endpoint_that_waits_for_the_keyring_clears_it_for_good() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            registry::save(&Registry {
+                http_bridge_enabled: true,
+                http_bridge_port: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+            let state = HttpBridgeState::default();
+            let registry_state = Mutex::new(registry::load().unwrap());
+            let prompts = crate::secrets::locked_store::prompts_during(|| {
+                assert_eq!(restore_persisted_http_bridge(&state), Ok(false));
+                assert!(crate::http_bridge::status(&state).keyring_locked);
+                let stopped = stop_persisted_http_bridge(&state, &registry_state).unwrap();
+                assert!(!stopped.running && !stopped.keyring_locked, "{stopped:?}");
+            });
+            assert!(
+                prompts.is_empty(),
+                "turning it off read the keyring: {prompts:?}"
+            );
+            assert!(!registry::load().unwrap().http_bridge_enabled);
+            assert!(!crate::http_bridge::waiting_for_keyring(&state));
+            // A late restore (the waiter after an unlock) keeps it off.
+            assert_eq!(restore_persisted_http_bridge(&state), Ok(false));
             assert!(!crate::http_bridge::status(&state).running);
         });
     }

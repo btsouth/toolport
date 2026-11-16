@@ -299,6 +299,29 @@ pub fn kill_on_exit(state: &HttpBridgeState) {
 
 #[cfg(test)]
 mod tests {
+    /// Turning a held endpoint off ends its wait: the first unlock after it
+    /// never starts it.
+    #[test]
+    fn turning_off_a_held_endpoint_ends_its_wait_for_an_unlock() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let state = std::sync::Arc::new(super::HttpBridgeState::default());
+            let (restored, restores) = std::sync::mpsc::channel();
+            let prompts = crate::secrets::locked_store::prompts_during(|| {
+                assert!(super::hold_for_keyring(&state));
+                let waiting = state.clone();
+                super::restore_after_unlock(
+                    move || super::waiting_for_keyring(&waiting),
+                    move || restored.send(()).unwrap(),
+                );
+                super::stop(&state).unwrap();
+            });
+            assert!(prompts.is_empty(), "{prompts:?}");
+            assert!(!super::status(&state).keyring_locked);
+            let late = restores.recv_timeout(super::KEYRING_POLL * 2);
+            assert!(late.is_err(), "restored after it was turned off");
+        });
+    }
+
     /// An endpoint held at start shows as locked, not stopped, until it is
     /// turned off, and its restore runs on the first unlock, never before.
     #[test]

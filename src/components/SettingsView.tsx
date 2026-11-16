@@ -1902,8 +1902,10 @@ export function SettingsView({
                   )}
                 </span>
               </span>
+              {/* The saved setting: an endpoint waiting for the keyring is on,
+                  and turning it off here clears it without reading the keyring. */}
               <Switch
-                checked={!!bridge?.running}
+                checked={!!bridge?.running || bridgeLocked}
                 onCheckedChange={toggleBridge}
                 disabled={bridgeBusy}
               />

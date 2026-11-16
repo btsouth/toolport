@@ -53,6 +53,9 @@ pub(super) struct SettingsPage {
     launch_at_login: gtk::Switch,
     endpoint_status: gtk::Label,
     endpoint_button: gtk::Button,
+    /// Retry for an endpoint left on while the keyring is locked; the main
+    /// button still turns it off.
+    endpoint_retry: gtk::Button,
     /// A timer is re-reading a keyring-locked endpoint until it starts.
     endpoint_watch: Rc<Cell<bool>>,
     copy_endpoint: gtk::Button,
@@ -543,6 +546,10 @@ impl SettingsPage {
         endpoint_actions.insert(&copy_endpoint, -1);
         endpoint_actions.insert(&copy_endpoint_token, -1);
         endpoint_actions.insert(&reveal_endpoint_token, -1);
+        let endpoint_retry = l10n::button("Retry");
+        endpoint_retry.add_css_class("suggested-action");
+        endpoint_retry.set_visible(false);
+        endpoint_actions.insert(&endpoint_retry, -1);
         endpoint_actions.insert(&endpoint_button, -1);
         endpoint.append(&endpoint_actions);
         let endpoint_token_value = gtk::Label::builder()
@@ -862,6 +869,7 @@ l10n::bind_dialog_heading(&error_dialog, msg("Could not start data removal"));
             launch_at_login,
             endpoint_status,
             endpoint_button,
+            endpoint_retry,
             endpoint_watch: Rc::new(Cell::new(false)),
             copy_endpoint: copy_endpoint.clone(),
             copy_endpoint_token: copy_endpoint_token.clone(),
@@ -927,6 +935,10 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
         settings_page
             .endpoint_button
             .connect_clicked(move |_| page_for_endpoint.toggle_endpoint());
+        let page_for_endpoint_retry = settings_page.clone();
+        settings_page
+            .endpoint_retry
+            .connect_clicked(move |_| page_for_endpoint_retry.retry_endpoint());
         let page_for_http_client = settings_page.clone();
         settings_page
             .add_http_client
@@ -1089,13 +1101,23 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
         settings_page
     }
 
+    /// The main button turns the endpoint on or off. One left on that waits for
+    /// the keyring is on: Stop clears the saved setting and ends the wait,
+    /// without reading the keyring.
     fn toggle_endpoint(&self) {
-        self.endpoint_button.set_sensitive(false);
         let current = self.bridge.status();
-        let running = current.running;
-        // Retry on an endpoint left on while the keyring was locked: the user
-        // asked, so this one may ask to unlock it.
-        let retry = current.keyring_locked;
+        self.run_endpoint(current.running || current.keyring_locked, false);
+    }
+
+    /// Retry on an endpoint left on while the keyring was locked: the user
+    /// asked, so this one may ask to unlock it.
+    fn retry_endpoint(&self) {
+        self.run_endpoint(false, true);
+    }
+
+    fn run_endpoint(&self, running: bool, retry: bool) {
+        self.endpoint_button.set_sensitive(false);
+        self.endpoint_retry.set_sensitive(false);
         l10n::bind_label(
             &self.feedback,
             if running {
@@ -1118,6 +1140,7 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
             })
             .await;
             page.endpoint_button.set_sensitive(true);
+            page.endpoint_retry.set_sensitive(true);
             match result {
                 Ok(Ok(status)) => {
                     page.render_endpoint(status);
@@ -1681,8 +1704,11 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
                 self.endpoint_token_value.set_visible(true);
             }
             self.add_http_client.set_sensitive(true);
+            self.endpoint_retry.set_visible(false);
         } else {
             if status.keyring_locked {
+                // Still on (saved), waiting for the keyring: Stop turns it off,
+                // Retry may ask to unlock.
                 l10n::bind_label_with(&self.endpoint_status, || {
                     format!(
                         "{} · {}",
@@ -1690,16 +1716,20 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
                         tr("Unlock your keyring, then choose Retry.")
                     )
                 });
-                l10n::bind_button(&self.endpoint_button, msg("Retry"));
+                l10n::bind_button(&self.endpoint_button, msg("Stop"));
+                self.endpoint_button.remove_css_class("suggested-action");
+                self.endpoint_button.add_css_class("toolport-destructive");
+                self.endpoint_retry.set_visible(true);
                 self.watch_locked_endpoint();
             } else {
                 // Bound, so it replaces the locked text's binding too.
                 l10n::bind_label(&self.endpoint_status, msg("Stopped"));
                 l10n::bind_button(&self.endpoint_button, msg("Start"));
+                self.endpoint_button
+                    .remove_css_class("toolport-destructive");
+                self.endpoint_button.add_css_class("suggested-action");
+                self.endpoint_retry.set_visible(false);
             }
-            self.endpoint_button
-                .remove_css_class("toolport-destructive");
-            self.endpoint_button.add_css_class("suggested-action");
             self.copy_endpoint.set_sensitive(false);
             self.copy_endpoint_token.set_sensitive(false);
             self.reveal_endpoint_token.set_sensitive(false);

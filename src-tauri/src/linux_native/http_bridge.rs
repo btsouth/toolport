@@ -22,6 +22,11 @@ impl BridgeController {
     /// unlock the keyring: while it is locked the endpoint shows as locked
     /// and starts on the first unlock, or on the user's Retry.
     pub fn restore(&self) -> Result<bool, String> {
+        // Under the lifecycle lock, so a Stop that turned the endpoint off
+        // while it waited is seen here and never undone.
+        let _lifecycle = LIFECYCLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let registry = crate::registry::load()?;
         if !registry.http_bridge_enabled {
             return Ok(false);
@@ -42,20 +47,34 @@ impl BridgeController {
             );
             return Ok(false);
         }
-        self.start(registry.http_bridge_port)?;
+        self.start_locked(registry.http_bridge_port)?;
         Ok(true)
     }
 
     /// The user's Retry on a locked endpoint: may ask to unlock the keyring.
     pub fn retry_restore(&self) -> Result<crate::http_bridge::HttpBridgeStatus, String> {
+        let _lifecycle = LIFECYCLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let registry = crate::registry::load()?;
-        self.start(registry.http_bridge_port)
+        if !registry.http_bridge_enabled {
+            // Turned off meanwhile.
+            return Ok(self.status());
+        }
+        self.start_locked(registry.http_bridge_port)
     }
 
     pub fn start(&self, port: Option<u16>) -> Result<crate::http_bridge::HttpBridgeStatus, String> {
         let _lifecycle = LIFECYCLE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.start_locked(port)
+    }
+
+    fn start_locked(
+        &self,
+        port: Option<u16>,
+    ) -> Result<crate::http_bridge::HttpBridgeStatus, String> {
         let was_running = crate::http_bridge::status(&self.state).running;
         let token = crate::secrets::get_secret_result(VAULT_SERVER, VAULT_KEY)?;
         let status = crate::http_bridge::start_with_token_at(&self.state, port, token)?;
@@ -190,6 +209,38 @@ mod tests {
             assert!(!bridge.status().running);
             // End its wait for an unlock inside this test's data dir.
             crate::http_bridge::stop(&bridge.state).unwrap();
+        });
+    }
+
+    /// Failure mode: an endpoint waiting for the keyring could not be turned
+    /// off; its saved setting stayed on and the first unlock started it.
+    #[test]
+    fn stopping_an_endpoint_that_waits_for_the_keyring_turns_it_off_for_good() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            crate::registry::save(&crate::registry::Registry {
+                http_bridge_enabled: true,
+                http_bridge_port: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+            let bridge = super::BridgeController::default();
+            let prompts = crate::secrets::locked_store::prompts_during(|| {
+                assert_eq!(bridge.restore(), Ok(false));
+                assert!(bridge.status().keyring_locked);
+                let stopped = bridge.stop().unwrap();
+                assert!(!stopped.running && !stopped.keyring_locked, "{stopped:?}");
+            });
+            assert!(
+                prompts.is_empty(),
+                "turning it off read the keyring: {prompts:?}"
+            );
+            assert!(!crate::registry::load().unwrap().http_bridge_enabled);
+            // Unlocked now: the waiter's next poll must not bring it back, and
+            // a late restore keeps it off.
+            std::thread::sleep(crate::http_bridge::KEYRING_POLL * 2);
+            assert!(!bridge.status().running);
+            assert_eq!(bridge.restore(), Ok(false));
+            assert!(!crate::registry::load().unwrap().http_bridge_enabled);
         });
     }
 }
