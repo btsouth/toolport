@@ -1053,6 +1053,20 @@ button.toolport-activity-filter {{
 }}
 .toolport-gateway-flow flowboxchild {{ padding: 0; }}
 
+/* React's plain <details> disclosure in the connect dialogs: no border or fill, a regular
+   weight title with a hover tint, the content under it. */
+expander.toolport-disclosure {{ padding: 0; border: none; background: none; }}
+expander.toolport-disclosure > title {{
+  min-height: 0;
+  padding: 2px 4px;
+  margin: 0 -4px;
+  border-radius: 6px;
+  font-weight: 400;
+}}
+expander.toolport-disclosure > title:hover {{ background-color: alpha(@toolport_fg, 0.06); }}
+expander.toolport-disclosure.small > title,
+.toolport-disclosure-text {{ font-size: 13px; }}
+
 .toolport-details-expander {{
   padding: 11px 14px;
   border: 1px solid @toolport_border;
