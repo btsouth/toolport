@@ -271,21 +271,37 @@ pub fn probe_health_bounded(server: &ServerEntry) -> ProbeResult {
 }
 
 /// One keyring check for a round of health checks, made by the first one
-/// that needs it: one search, not one per server competing for the store.
+/// that needs it: which servers keep a locked value in the store, read once,
+/// not once per server competing for the store.
 #[derive(Clone, Default)]
-pub struct KeyringCheck(std::sync::Arc<std::sync::OnceLock<bool>>);
+pub struct KeyringCheck(
+    std::sync::Arc<std::sync::OnceLock<Option<std::collections::HashSet<String>>>>,
+);
 
 impl KeyringCheck {
-    fn would_prompt(&self, check: impl FnOnce() -> bool) -> bool {
-        *self.0.get_or_init(check)
+    /// Whether this server keeps a locked value; unknown counts as locked.
+    fn locked(
+        &self,
+        server: &ServerEntry,
+        check: impl FnOnce() -> Option<std::collections::HashSet<String>>,
+    ) -> bool {
+        match self.0.get_or_init(check) {
+            None => true,
+            Some(owners) => {
+                owners.contains(&server.id)
+                    || crate::local_auth::owner(&server.id)
+                        .is_ok_and(|owner| owners.contains(&owner))
+            }
+        }
     }
 }
 
 /// [`probe_health_bounded`] sharing its round's keyring check.
 pub fn probe_health_checked(server: &ServerEntry, check: &KeyringCheck) -> ProbeResult {
-    // One search that asks nothing: while a Toolport item is locked, any read
-    // of a stored value could raise the unlock prompt.
-    if keeps_values_in_store(server) && check.would_prompt(secrets::store_would_prompt) {
+    // Property reads that ask nothing: a read of this server's locked value
+    // could raise the unlock prompt. A server with nothing stored is checked
+    // even while the default collection stays locked.
+    if keeps_values_in_store(server) && check.locked(server, secrets::owners_with_locked_values) {
         return ProbeResult {
             server_id: server.id.clone(),
             ok: false,
@@ -497,6 +513,46 @@ mod tests {
         }
     }
 
+    /// Failure mode: with the default collection locked all session and no
+    /// Toolport value in it, every remote server showed "Keyring locked";
+    /// 2.3.5 checked them. Only a server with a locked stored value waits.
+    #[test]
+    fn a_locked_default_collection_holds_only_servers_with_stored_values() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut remote = server();
+            remote.id = "no-auth".into();
+            remote.transport = "http".into();
+            remote.url = Some("http://127.0.0.1:1/mcp".into());
+            let mut plain = server();
+            plain.id = "plain".into();
+            plain.command = Some("/bin/false".into());
+            let mut stored = server();
+            stored.id = "stored".into();
+            stored.command = Some("/bin/false".into());
+            stored.env = vec![crate::registry::EnvVar {
+                key: "API_KEY".into(),
+                value: None,
+                secret: true,
+                unknown_fields: Default::default(),
+            }];
+            let mut results = Vec::new();
+            let prompts = crate::secrets::locked_store::locked_values_during(&["stored"], || {
+                assert!(
+                    crate::secrets::store_would_prompt(),
+                    "the default is locked"
+                );
+                let check = KeyringCheck::default();
+                for server in [&remote, &plain, &stored] {
+                    results.push(probe_health_checked(server, &check));
+                }
+            });
+            assert!(prompts.is_empty(), "{prompts:?}");
+            assert!(!results[0].keyring_locked, "{:?}", results[0]);
+            assert!(!results[1].keyring_locked, "{:?}", results[1]);
+            assert!(results[2].keyring_locked, "{:?}", results[2]);
+        });
+    }
+
     /// A round of health checks makes one keyring check, not one per server.
     #[test]
     fn a_round_of_health_checks_checks_the_keyring_once() {
@@ -507,9 +563,9 @@ mod tests {
                 let check = check.clone();
                 let calls = &calls;
                 scope.spawn(move || {
-                    check.would_prompt(|| {
+                    check.locked(&server(), || {
                         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        true
+                        None
                     })
                 });
             }

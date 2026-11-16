@@ -1141,6 +1141,62 @@ mod platform {
         }
     }
 
+    /// Owners with a locked Toolport value in any collection, from property
+    /// reads alone (collections, their items, each item's attributes and
+    /// `Locked`): no search, so KeePassXC opens no dialog, and no unlock.
+    /// `None`: unknown (busy, timed out, a failed read).
+    pub fn owners_with_locked_values() -> Option<std::collections::HashSet<String>> {
+        let read = || {
+            let found = with_backup_service(|service| {
+                let failed = |error: dbus_secret_service::Error| classify(&error);
+                let mut owners = std::collections::HashSet::new();
+                for collection in service.get_all_collections().map_err(failed)? {
+                    for item in collection.get_all_items().map_err(failed)? {
+                        let attributes = item.get_attributes().map_err(failed)?;
+                        if attributes.get("service").map(String::as_str) != Some(SERVICE) {
+                            continue;
+                        }
+                        let owner = attributes
+                            .get("username")
+                            .and_then(|account| account.split_once("::"))
+                            .map(|(owner, _)| owner.to_string());
+                        if let Some(owner) = owner {
+                            if item.is_locked().map_err(failed)? {
+                                owners.insert(owner);
+                            }
+                        }
+                    }
+                }
+                Ok(owners)
+            });
+            let no_service = BACKUP_BATCH.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .is_some_and(|batch| batch.service.is_none() && batch.failure.is_some())
+            });
+            match found {
+                Ok(owners) => Some(owners),
+                // Nothing to read from, so nothing to ask for either.
+                Err(_) if no_service => Some(Default::default()),
+                Err(_) => None,
+            }
+        };
+        if BACKUP_BATCH.with(|slot| slot.borrow().is_some()) {
+            read()
+        } else {
+            with_backup_batch(|| {
+                BACKUP_BATCH.with(|slot| {
+                    if let Some(batch) = slot.borrow_mut().as_mut() {
+                        batch.deadline = batch
+                            .deadline
+                            .min(std::time::Instant::now() + STORE_CHECK_TIMEOUT);
+                    }
+                });
+                read()
+            })
+        }
+    }
+
     fn read_backup_item<T>(
         unlocked: usize,
         locked: usize,
@@ -2000,6 +2056,31 @@ pub fn store_would_prompt() -> bool {
     }
 }
 
+/// Which servers (vault owners) keep a locked value in the store, without a
+/// search or an unlock: a health check skips only those, so a server with
+/// nothing stored is checked even while the default collection stays
+/// locked. `None`: unknown; treat every server that may read the store as
+/// locked. The encrypted file, macOS and Windows never ask: none.
+pub fn owners_with_locked_values() -> Option<std::collections::HashSet<String>> {
+    if locked_store::locked() {
+        return None;
+    }
+    if locked_store::collection_locked() {
+        return Some(locked_store::locked_owners());
+    }
+    if file::active() {
+        return Some(Default::default());
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        platform::owners_with_locked_values()
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        Some(Default::default())
+    }
+}
+
 /// [`get_secret_result`] for work nobody asked for: never asks to unlock the
 /// store, and a locked one is an error. Registers what it reads, the same way.
 pub fn get_secret_without_prompt(server_id: &str, key: &str) -> Result<Option<String>, String> {
@@ -2045,6 +2126,8 @@ pub mod locked_store {
     #[cfg(any(test, feature = "test-support"))]
     static COLLECTION_LOCKED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+    #[cfg(any(test, feature = "test-support"))]
+    static LOCKED_OWNERS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
     /// Run `f` with the store locked; every `server/key` read that would have
     /// asked to unlock it, in order.
@@ -2097,6 +2180,38 @@ pub mod locked_store {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
+    }
+
+    /// [`write_prompts_during`] with these owners' values in the store,
+    /// locked.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn locked_values_during(owners: &[&str], f: impl FnOnce()) -> Vec<String> {
+        *LOCKED_OWNERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            owners.iter().map(|owner| owner.to_string()).collect();
+        let prompts = write_prompts_during(f);
+        LOCKED_OWNERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        prompts
+    }
+
+    pub(crate) fn locked_owners() -> std::collections::HashSet<String> {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            LOCKED_OWNERS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .cloned()
+                .collect()
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            Default::default()
+        }
     }
 
     pub(crate) fn collection_locked() -> bool {
