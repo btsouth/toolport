@@ -5684,6 +5684,17 @@ pub struct RepointOutcome {
     pub extra_claude_failed: Vec<(PathBuf, String)>,
 }
 
+/// The name a client is shown with, or its id when it is unknown.
+pub(crate) fn client_display_name(client_id: &str) -> String {
+    find_def(client_id).map_or_else(
+        || client_id.to_string(),
+        |def| {
+            def.location
+                .map_or_else(|| def.name.to_string(), |location| location.name)
+        },
+    )
+}
+
 fn find_def(client_id: &str) -> Option<ClientDef> {
     if let Some(def) = defs().into_iter().find(|d| d.id == client_id) {
         return Some(def);
@@ -6039,8 +6050,89 @@ fn backup_file_named(
             path,
         )?,
     )?;
-    prune_backups(&dir, backup_name);
+    if !attempt::created(&dest, &dir, backup_name) {
+        prune_backups(&dir, backup_name);
+    }
     Ok(Some(dest))
+}
+
+/// A Disconnect try that may be refused for a locked keyring and then asked
+/// again after one unlock. While a try runs, the backups it writes are
+/// recorded and older generations are not pruned yet, so a refused try can be
+/// undone exactly: remove what it created, and nothing old was lost.
+pub(crate) mod attempt {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    #[derive(Default)]
+    pub(crate) struct Attempt {
+        created: Vec<PathBuf>,
+        prunes: Vec<(PathBuf, String)>,
+    }
+
+    thread_local! {
+        static CURRENT: RefCell<Option<Attempt>> = const { RefCell::new(None) };
+    }
+
+    /// Run `f` as a recorded try.
+    pub(crate) fn recorded<T>(f: impl FnOnce() -> T) -> (T, Attempt) {
+        struct Take;
+        impl Drop for Take {
+            fn drop(&mut self) {
+                CURRENT.with(|slot| slot.borrow_mut().take());
+            }
+        }
+        CURRENT.with(|slot| *slot.borrow_mut() = Some(Attempt::default()));
+        let take = Take;
+        let value = f();
+        let attempt = CURRENT
+            .with(|slot| slot.borrow_mut().take())
+            .unwrap_or_default();
+        drop(take);
+        (value, attempt)
+    }
+
+    /// Inside a recorded try, note a backup it wrote; true when its pruning
+    /// waits for the try to finish.
+    pub(super) fn created(path: &Path, dir: &Path, name: &str) -> bool {
+        CURRENT.with(|slot| {
+            slot.borrow_mut().as_mut().is_some_and(|attempt| {
+                attempt.created.push(path.to_path_buf());
+                attempt.prunes.push((dir.to_path_buf(), name.to_string()));
+                true
+            })
+        })
+    }
+
+    impl Attempt {
+        /// The try went through: prune as it would have.
+        pub(crate) fn keep(self) {
+            for (dir, name) in self.prunes {
+                super::prune_backups(&dir, &name);
+            }
+        }
+
+        /// The try was refused before it changed the client config or the
+        /// registry: remove exactly the backups it wrote, under the client
+        /// config lock.
+        pub(crate) fn undo(self) -> Result<(), String> {
+            if self.created.is_empty() {
+                return Ok(());
+            }
+            let data = crate::registry::conduit_dir().ok_or("Could not resolve data dir")?;
+            let _lock = crate::registry::lock_at(&data.join("client-config-mutation"))?;
+            for path in self.created {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!("Could not remove {}: {error}", path.display()))
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Secondary Claude configs all share the `.claude.json` basename and client id.
@@ -12447,6 +12539,52 @@ mod tests {
     /// SOU-433: config backups carry a live Shared HTTP bearer, so the directory
     /// must not grow forever. Prune keeps the newest generations of the file it was
     /// called for, and never touches a differently-named config's backups.
+    /// F3 and F4: a recorded Disconnect try prunes nothing while it runs; undo
+    /// removes exactly the backups it wrote, so every old generation and any
+    /// file another writer added meanwhile survive; keep prunes as usual.
+    #[test]
+    fn a_recorded_try_is_undone_exactly_and_prunes_only_when_kept() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let dir = backup_dir("cursor").unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            let config = crate::registry::conduit_dir().unwrap().join("mcp.json");
+            std::fs::write(&config, r#"{"mcpServers":{}}"#).unwrap();
+            for stamp in 1..=5 {
+                std::fs::write(dir.join(format!("{stamp}000000000000-mcp.json")), "{}").unwrap();
+            }
+            let files = || {
+                let mut files: Vec<(PathBuf, Vec<u8>)> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .flatten()
+                    .map(|entry| (entry.path(), std::fs::read(entry.path()).unwrap()))
+                    .collect();
+                files.sort();
+                files
+            };
+            let before = files();
+            let ((), attempt) = attempt::recorded(|| {
+                backup_file("cursor", &config).unwrap();
+                backup_file("cursor", &config).unwrap();
+            });
+            assert_eq!(files().len(), 7, "nothing pruned during the try");
+            std::fs::write(dir.join("9000000000000-mcp.json"), "another writer").unwrap();
+            attempt.undo().unwrap();
+            let mut expected = before.clone();
+            expected.push((
+                dir.join("9000000000000-mcp.json"),
+                b"another writer".to_vec(),
+            ));
+            expected.sort();
+            assert_eq!(files(), expected);
+            std::fs::remove_file(dir.join("9000000000000-mcp.json")).unwrap();
+            let ((), attempt) = attempt::recorded(|| {
+                backup_file("cursor", &config).unwrap();
+            });
+            attempt.keep();
+            assert_eq!(files().len(), CONFIG_BACKUP_GENERATIONS);
+        });
+    }
+
     #[test]
     fn prune_backups_bounds_generations_per_config_file() {
         let dir = std::env::temp_dir().join(format!("toolport-bk-{}", std::process::id()));

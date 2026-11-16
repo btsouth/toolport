@@ -549,5 +549,6 @@
   "Toolport cannot read its record of the servers it moved from {client} into Toolport. Without it, Disconnect cannot put those servers back in the client config. Discard deletes only this record. The servers stay in Toolport; to use one in {client} without Toolport, add it there again.\n\nThe client config will not change.": "Toolport は {client} から Toolport に移動したサーバーの記録を読み取れません。この記録がないと、切断してもそれらのサーバーをクライアントの設定に戻せません。破棄するとこの記録だけが削除されます。サーバーは Toolport に残ります。Toolport を使わずに {client} で使うには、そこにもう一度追加してください。\n\nクライアントの設定は変更されません。",
   "Toolport's damaged record of the servers it moved from {client} was deleted. The servers stay in Toolport, and the client config was not changed.": "{client} から移動したサーバーについての Toolport の破損した記録を削除しました。サーバーは Toolport に残り、クライアントの設定は変更されていません。",
   "Toolport kept the toolport entry you edited. Remove it by hand if you uninstall Toolport.": "Toolport は、あなたが編集した toolport エントリをそのまま残しました。Toolport をアンインストールする場合は、手動で削除してください。",
-  "Keyring locked. Nothing was restored. Unlock your keyring, then choose Retry.": "キーリングがロックされています。何も復元されませんでした。キーリングのロックを解除してから「再試行」を選択してください。"
+  "Keyring locked. Nothing was restored. Unlock your keyring, then choose Retry.": "キーリングがロックされています。何も復元されませんでした。キーリングのロックを解除してから「再試行」を選択してください。",
+  "Unlock your keyring to disconnect {client}.": "{client} の接続を解除するには、キーリングのロックを解除してください。"
 }

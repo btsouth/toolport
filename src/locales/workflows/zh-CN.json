@@ -549,5 +549,6 @@
   "Toolport cannot read its record of the servers it moved from {client} into Toolport. Without it, Disconnect cannot put those servers back in the client config. Discard deletes only this record. The servers stay in Toolport; to use one in {client} without Toolport, add it there again.\n\nThe client config will not change.": "Toolport 无法读取它从 {client} 移入 Toolport 的服务器记录。没有这份记录，断开连接时就无法把这些服务器放回客户端配置。丢弃只会删除这份记录。这些服务器仍保留在 Toolport 中；如需在不使用 Toolport 的情况下在 {client} 中使用，请在那里重新添加。\n\n客户端配置不会改变。",
   "Toolport's damaged record of the servers it moved from {client} was deleted. The servers stay in Toolport, and the client config was not changed.": "Toolport 关于从 {client} 移出的服务器的损坏记录已删除。这些服务器仍保留在 Toolport 中，客户端配置未被更改。",
   "Toolport kept the toolport entry you edited. Remove it by hand if you uninstall Toolport.": "Toolport 保留了你编辑过的 toolport 条目。如果卸载 Toolport，请手动删除它。",
-  "Keyring locked. Nothing was restored. Unlock your keyring, then choose Retry.": "密钥环已锁定。没有恢复任何内容。请解锁密钥环，然后选择“重试”。"
+  "Keyring locked. Nothing was restored. Unlock your keyring, then choose Retry.": "密钥环已锁定。没有恢复任何内容。请解锁密钥环，然后选择“重试”。",
+  "Unlock your keyring to disconnect {client}.": "请解锁密钥环以断开 {client}。"
 }
