@@ -285,7 +285,6 @@ arch_conf="$arch_workdir/pacman.conf"
 cat > "$arch_shim/pacman-key" <<EOF
 #!/usr/bin/env bash
 printf 'pacman-key %s\n' "\$*" >> "$arch_shim/pacman-key.log"
-if [ "\${1:-}" = --list-secret-keys ]; then echo 'sec   rsa4096'; fi
 EOF
 cat > "$arch_shim/sudo" <<'EOF'
 #!/usr/bin/env bash
@@ -360,6 +359,45 @@ else
   echo "  FAIL: pacman.conf gained a duplicate [toolport] section"; fail=$((fail + 1))
 fi
 if grep -q -- '--init' "$arch_shim/pacman-key.log"; then pass=$((pass+1)); else fail=$((fail+1)); fi
+# A keyring that already exists (the shim answers --list-keys) is left alone.
+if grep -q -- '--populate' "$arch_shim/pacman-key.log"; then
+  echo "  FAIL: populated a keyring that already existed"; fail=$((fail + 1))
+else
+  echo "  ok: existing keyring not repopulated"; pass=$((pass + 1))
+fi
+# No keyring at all: --list-keys fails, so after --init the script must add the
+# distribution keys, or pacman rejects every official package as unknown trust.
+cat > "$arch_shim/pacman-key" <<EOF
+#!/usr/bin/env bash
+printf 'pacman-key %s\n' "\$*" >> "$arch_shim/pacman-key.log"
+[ "\${1:-}" = --list-keys ] && exit 1
+exit 0
+EOF
+: > "$arch_shim/pacman-key.log"
+set +e
+result="$(PATH="$arch_shim:$PATH" HOME="$arch_home" TOOLPORT_OS_RELEASE="$arch_shim/os-release-arch" TOOLPORT_PACMAN_CONF="$arch_conf" TOOLPORT_REPO_KEY_ID="DEADBEEFDEADBEEF" bash "$INSTALL_SH" 2>&1)"
+rc=$?
+set -e
+init_line="$(grep -n -- '--init' "$arch_shim/pacman-key.log" | head -1 | cut -d: -f1 || true)"
+populate_line="$(grep -n -- '--populate' "$arch_shim/pacman-key.log" | head -1 | cut -d: -f1 || true)"
+if [ "$rc" = 0 ] && [ -n "$init_line" ] && [ -n "$populate_line" ] && [ "$init_line" -lt "$populate_line" ]; then
+  echo "  ok: a new keyring is populated after --init"; pass=$((pass + 1))
+else
+  echo "  FAIL: a new keyring was not populated after --init (rc=$rc): $(tr '\n' ';' < "$arch_shim/pacman-key.log")"; fail=$((fail + 1))
+fi
+# pacman still rejecting signatures must say what to run, not a generic failure.
+cat > "$arch_shim/pacman" <<'EOF'
+#!/usr/bin/env bash
+echo "error: core: signature from \"Arch Builder\" is unknown trust"
+echo "error: failed to commit transaction (invalid or corrupted package (PGP signature))"
+exit 1
+EOF
+set +e
+result="$(PATH="$arch_shim:$PATH" HOME="$arch_home" TOOLPORT_OS_RELEASE="$arch_shim/os-release-arch" TOOLPORT_PACMAN_CONF="$arch_conf" TOOLPORT_REPO_KEY_ID="DEADBEEFDEADBEEF" bash "$INSTALL_SH" 2>&1)"
+rc=$?
+set -e
+check "signature failure says to populate the keyring" "Run: sudo pacman-key --populate" "$result"
+if [ "$rc" != 0 ]; then pass=$((pass+1)); else echo "  FAIL: signature failure exited 0"; fail=$((fail+1)); fi
 printf '#!/bin/sh\nexit 1\n' > "$arch_shim/pacman-key"
 set +e
 result="$(PATH="$arch_shim:$PATH" HOME="$arch_home" TOOLPORT_OS_RELEASE="$arch_shim/os-release-arch" TOOLPORT_PACMAN_CONF="$arch_conf" bash "$INSTALL_SH" 2>&1)"
