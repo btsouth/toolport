@@ -684,70 +684,129 @@ fn v1_shared_http_entry(
     })
 }
 
-/// The name of Toolport's entry in `text` when that whole entry, every field, is the one
-/// v1.24.x wrote for this client's Shared HTTP connection from the record v1 kept in the
-/// registry. Anything else, including an unreadable registry or file, proves nothing and
-/// gets `None`, so the entry is kept as the user's.
-fn legacy_shared_http_entry(client_id: &str, format: Format, text: &str) -> Option<String> {
-    let root = mutation::value(format, Some(text)).ok()?;
+/// Toolport's entry where v1.24.x put it, with its name: the format's server map, and
+/// for OpenCode `mcp` itself (v1 never wrote `mcp.servers`), even in a file that now
+/// also has OpenCode 2.x's `mcp.servers` map.
+fn v1_slot(format: Format, root: &Value) -> Option<(String, Value)> {
     let mut servers = root.get(key(format))?;
-    if let Some(inner) = nested_in(format, &root) {
+    if let Some(inner) = nested(format) {
         servers = servers.get(inner)?;
     }
     let servers = servers.as_object()?;
     let name = owned_gateway_name(servers.keys().map(String::as_str))?;
-    let entry = servers.get(name)?;
-    let registry = crate::registry_controller::registry_for_disconnect().ok()?;
-    let record = registry.client_managed_entries.get(client_id)?;
-    (v1_shared_http_entry(client_id, format, record, entry).as_ref() == Some(entry))
-        .then(|| name.to_owned())
+    Some((name.to_owned(), servers.get(name)?.clone()))
 }
 
-/// After a 2.x Connect, a v1 Shared HTTP Connect and then this upgrade, v1's entry
-/// differs from this record's last write, so undo would keep it as a hand edit. It is
-/// the entry Toolport wrote: treat it as the last write so undo removes it.
+fn v1_slot_mut(format: Format, root: &mut Value) -> Option<&mut serde_json::Map<String, Value>> {
+    let mut servers = root.get_mut(key(format))?;
+    if let Some(inner) = nested(format) {
+        servers = servers.get_mut(inner)?;
+    }
+    servers.as_object_mut()
+}
+
+/// What v1's Shared HTTP connection left in the registry: its ownership record and the
+/// hash of its token from the `client:<id>` row. An unreadable registry, or no record
+/// or row, is no proof.
+fn v1_proof(client_id: &str) -> Option<(ManagedEntry, String)> {
+    let registry = crate::registry_controller::registry_for_disconnect().ok()?;
+    let record = registry.client_managed_entries.get(client_id)?.clone();
+    let row = format!("client:{client_id}");
+    let hash = registry
+        .http_clients
+        .iter()
+        .find(|http| http.id == row)?
+        .token_sha256
+        .clone();
+    Some((record, hash))
+}
+
+/// The token in the one place v1 put it.
+fn v1_token(entry: &Value) -> Option<&str> {
+    match entry.get("args") {
+        Some(args) => args
+            .get(4)?
+            .as_str()?
+            .strip_prefix("Authorization: Bearer "),
+        None => entry
+            .get("headers")?
+            .get("Authorization")?
+            .as_str()?
+            .strip_prefix("Bearer "),
+    }
+}
+
+/// Whether `entry` is, every field and the token too, the one v1.24.x wrote for this
+/// client's Shared HTTP connection. Anything else is kept as the user's.
+fn is_v1_entry(
+    client_id: &str,
+    format: Format,
+    proof: &(ManagedEntry, String),
+    entry: &Value,
+) -> bool {
+    v1_shared_http_entry(client_id, format, &proof.0, entry).as_ref() == Some(entry)
+        && v1_token(entry).is_some_and(|token| crate::registry::sha256_hex(token) == proof.1)
+}
+
+/// Whether `text` holds v1's Shared HTTP entry. A file that can't be read proves nothing.
+fn legacy_shared_http_entry(client_id: &str, format: Format, text: &str) -> bool {
+    let Some((_, entry)) = mutation::value(format, Some(text))
+        .ok()
+        .and_then(|root| v1_slot(format, &root))
+    else {
+        return false;
+    };
+    v1_proof(client_id).is_some_and(|proof| is_v1_entry(client_id, format, &proof, &entry))
+}
+
+/// After a 2.x Connect, a v1 Shared HTTP Connect and then this upgrade, v1's entry is not
+/// this record's last write, so undo would keep it as a hand edit. Two places hold it:
+/// the current file, or the baseline, when a later 2.x write (Codex's launch repair)
+/// rebased it there. Where it is proved to be v1's, the current entry is treated as the
+/// last write and the baseline drops it, so undo removes it. Says whether it did.
 fn adopt_legacy_shared_http(
     client_id: &str,
     format: Format,
-    current: Option<&str>,
-    key: &str,
-    inner_key: Option<&str>,
     written: &Value,
+    before: &mut Value,
     latest: &mut Value,
-) -> Result<(), String> {
-    let servers = |root: &Value| {
-        let map = root.get(key)?;
-        match inner_key {
-            Some(inner) => map.get(inner),
-            None => Some(map),
+) -> bool {
+    let written = |name: &str| {
+        let mut servers = written.get(key(format))?;
+        if let Some(inner) = nested(format) {
+            servers = servers.get(inner)?;
         }
-        .and_then(Value::as_object)
-        .cloned()
+        servers.get(name).cloned()
     };
-    let (Some(text), Some(mut map)) = (current, servers(latest)) else {
-        return Ok(());
+    let mut proof = None;
+    let mut proved = |entry: &Value| {
+        proof
+            .get_or_insert_with(|| v1_proof(client_id))
+            .as_ref()
+            .is_some_and(|proof| is_v1_entry(client_id, format, proof, entry))
     };
-    let written = servers(written).unwrap_or_default();
-    let changed = owned_gateway_name(map.keys().map(String::as_str))
-        .is_some_and(|name| map.get(name) != written.get(name));
-    if !changed {
-        return Ok(());
+    let mut adopted = false;
+    if let Some((name, entry)) = v1_slot(format, latest) {
+        let last = written(&name);
+        if last.as_ref() != Some(&entry) && proved(&entry) {
+            if let Some(servers) = v1_slot_mut(format, latest) {
+                match last {
+                    Some(last) => servers.insert(name, last),
+                    None => servers.remove(&name),
+                };
+                adopted = true;
+            }
+        }
     }
-    let Some(name) = legacy_shared_http_entry(client_id, format, text) else {
-        return Ok(());
-    };
-    match written.get(&name) {
-        Some(entry) => map.insert(name, entry.clone()),
-        None => map.remove(&name),
-    };
-    let mut slot = latest.get_mut(key);
-    if let Some(inner) = inner_key {
-        slot = slot.and_then(|value| value.get_mut(inner));
+    if let Some((name, entry)) = v1_slot(format, before) {
+        if written(&name).as_ref() != Some(&entry) && proved(&entry) {
+            if let Some(servers) = v1_slot_mut(format, before) {
+                servers.remove(&name);
+                adopted = true;
+            }
+        }
     }
-    if let Some(slot) = slot {
-        *slot = Value::Object(map);
-    }
-    Ok(())
+    adopted
 }
 
 pub(super) fn released(client_id: &str, path: &Path) -> Result<bool, String> {
@@ -791,7 +850,30 @@ pub(super) fn toml_prefix_provenance(
     Ok(Some((original, written)))
 }
 
+/// [`apply_adopting`] without the adoption flag, for tests.
+#[cfg(test)]
 pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool, String> {
+    apply_inner(client_id, format, path, &mut false)
+}
+
+/// [`apply`], also saying whether it took a Shared HTTP entry v1 wrote as Toolport's, so
+/// the caller puts back the servers v1's Move into gateway took out of the file.
+pub(super) fn apply_adopting(
+    client_id: &str,
+    format: Format,
+    path: &Path,
+) -> Result<(bool, bool), String> {
+    let mut adopted = false;
+    let handled = apply_inner(client_id, format, path, &mut adopted)?;
+    Ok((handled, adopted))
+}
+
+fn apply_inner(
+    client_id: &str,
+    format: Format,
+    path: &Path,
+    adopted: &mut bool,
+) -> Result<bool, String> {
     let Some(record) = load(client_id, path)? else {
         return Ok(false);
     };
@@ -806,8 +888,7 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
     let legacy_since_disconnect = record.disconnected
         && current
             .as_deref()
-            .and_then(|text| legacy_shared_http_entry(client_id, format, text))
-            .is_some();
+            .is_some_and(|text| legacy_shared_http_entry(client_id, format, text));
     if record.disconnected
         && record.original.is_none()
         && record.vault_recovery.is_none()
@@ -959,15 +1040,7 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
         named_list(&mut written, key)?;
         named_list(&mut latest, key)?;
     }
-    adopt_legacy_shared_http(
-        client_id,
-        format,
-        current.as_deref(),
-        key,
-        inner_key,
-        &written,
-        &mut latest,
-    )?;
+    *adopted |= adopt_legacy_shared_http(client_id, format, &written, &mut before, &mut latest);
     let restored = undo(
         before.get(key),
         written.get(key),

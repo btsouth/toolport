@@ -168,11 +168,12 @@ pub(super) fn restore_path(
         if !restore::pending_values(id, path)? {
             backup_file(id, path)?;
         }
-        if !restore::apply(id, format, path)? {
+        let (handled, adopted) = restore::apply_adopting(id, format, path)?;
+        if !handled {
             restore::check_legacy_gateway(format, path, managed)?;
             moved::restore(id, format, path)?;
             edit_format(format, path, None, true)?;
-        } else if restore::needs_moved(id, path)? {
+        } else if adopted || restore::needs_moved(id, path)? {
             moved::restore(id, format, path)?;
         }
         let revision = mutation::read(path)
