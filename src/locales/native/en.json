@@ -1214,5 +1214,6 @@
   "Use stdio, http or sse after -t.": "Use stdio, http or sse after -t.",
   "Add a value for {value0} before saving. The pasted config did not include it.": "Add a value for {value0} before saving. The pasted config did not include it.",
   "Use each variable name once. Rename or remove the second {value0}.": "Use each variable name once. Rename or remove the second {value0}.",
-  "Remote servers don't read environment variables, so Toolport would send {value0} to this server as its bearer token. Remove it, or name it Authorization if it is this server's token.": "Remote servers don't read environment variables, so Toolport would send {value0} to this server as its bearer token. Remove it, or name it Authorization if it is this server's token."
+  "Remote servers don't read environment variables, so Toolport would send {value0} to this server as its bearer token. Remove it, or name it Authorization if it is this server's token.": "Remote servers don't read environment variables, so Toolport would send {value0} to this server as its bearer token. Remove it, or name it Authorization if it is this server's token.",
+  "Remote servers have no environment. When this server has no other token, Toolport sends the first stored value to it as its bearer token.": "Remote servers have no environment. When this server has no other token, Toolport sends the first stored value to it as its bearer token."
 }

@@ -12489,7 +12489,7 @@ fn open_server_editor_prefilled(
                     set_exact_args(&args_for_fill, &exact_args_for_fill, &first.args);
                     url_for_fill.set_text(first.url.as_deref().unwrap_or(""));
                     cwd_for_fill.set_text("");
-                    env_for_fill.fill(&first.env);
+                    env_for_fill.fill(&first.env, first.transport != "stdio");
                     // The rows take the values now, so the save-first note does not apply.
                     credentials_for_fill.set_visible(first.env.is_empty());
                     // Re-rendered on a language change, like the error below.
@@ -13564,6 +13564,9 @@ fn section_heading(title: &'static str, subtitle: &'static str) -> gtk::Box {
 #[derive(Clone)]
 struct PastedEnvSection {
     section: gtk::Box,
+    /// What the rows are for: a stdio server's variables, or a remote server's
+    /// token, since remote servers have no environment.
+    caption: gtk::Label,
     list: gtk::Box,
     notice: gtk::Label,
     rows: std::rc::Rc<std::cell::RefCell<Vec<PastedEnvRow>>>,
@@ -13577,6 +13580,7 @@ struct PastedEnvSection {
 /// dialog would leave the widgets and the pasted values alive.
 struct WeakPastedEnvSection {
     section: gtk::glib::WeakRef<gtk::Box>,
+    caption: gtk::glib::WeakRef<gtk::Label>,
     list: gtk::glib::WeakRef<gtk::Box>,
     notice: gtk::glib::WeakRef<gtk::Label>,
     rows: std::rc::Weak<std::cell::RefCell<Vec<PastedEnvRow>>>,
@@ -13587,6 +13591,7 @@ impl WeakPastedEnvSection {
     fn upgrade(&self) -> Option<PastedEnvSection> {
         Some(PastedEnvSection {
             section: self.section.upgrade()?,
+            caption: self.caption.upgrade()?,
             list: self.list.upgrade()?,
             notice: self.notice.upgrade()?,
             rows: self.rows.upgrade()?,
@@ -13669,20 +13674,13 @@ fn pasted_env_section() -> PastedEnvSection {
         l10n::bind_label(&widget, "Environment variables");
         widget
     });
-    heading.append(&{
-        let widget = gtk::Label::builder()
-            .halign(gtk::Align::Fill)
-            .xalign(0.0)
-            .wrap(true)
-            .css_classes(["toolport-muted", "caption"])
-            .build();
-        l10n::bind_formatted_label(
-            &widget,
-            "API keys and other secrets the server needs (e.g.{value1}{value2}). Values are stored in your OS keychain, never in the config.",
-            &[("value1", " "), ("value2", "RESEND_API_KEY")],
-        );
-        widget
-    });
+    let caption = gtk::Label::builder()
+        .halign(gtk::Align::Fill)
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["toolport-muted", "caption"])
+        .build();
+    heading.append(&caption);
     section.append(&heading);
     let notice = gtk::Label::builder()
         .halign(gtk::Align::Fill)
@@ -13694,19 +13692,23 @@ fn pasted_env_section() -> PastedEnvSection {
     section.append(&notice);
     let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
     section.append(&list);
-    PastedEnvSection {
+    let section = PastedEnvSection {
         section,
+        caption,
         list,
         notice,
         rows: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
         missing: std::rc::Rc::new(std::cell::RefCell::new(Default::default())),
-    }
+    };
+    section.set_remote(false);
+    section
 }
 
 impl PastedEnvSection {
     fn downgrade(&self) -> WeakPastedEnvSection {
         WeakPastedEnvSection {
             section: self.section.downgrade(),
+            caption: self.caption.downgrade(),
             list: self.list.downgrade(),
             notice: self.notice.downgrade(),
             rows: std::rc::Rc::downgrade(&self.rows),
@@ -13739,9 +13741,26 @@ impl PastedEnvSection {
         }
     }
 
+    /// Say what the rows are for: the same captions as the React dialog.
+    fn set_remote(&self, remote: bool) {
+        if remote {
+            l10n::bind_label(
+                &self.caption,
+                "Remote servers have no environment. When this server has no other token, Toolport sends the first stored value to it as its bearer token.",
+            );
+        } else {
+            l10n::bind_formatted_label(
+                &self.caption,
+                "API keys and other secrets the server needs (e.g.{value1}{value2}). Values are stored in your OS keychain, never in the config.",
+                &[("value1", " "), ("value2", "RESEND_API_KEY")],
+            );
+        }
+    }
+
     /// Replace the rows with a new paste's values.
-    fn fill(&self, env: &[crate::clients::SnippetEnvVar]) {
+    fn fill(&self, env: &[crate::clients::SnippetEnvVar], remote: bool) {
         self.clear();
+        self.set_remote(remote);
         *self.missing.borrow_mut() = env
             .iter()
             .filter(|var| var.value.as_deref().is_none_or(str::is_empty))
@@ -14603,20 +14622,23 @@ mod tests {
         shell.append(&cancel);
         window.set_child(Some(&shell));
         section.release_on_close(&window);
-        section.fill(&[
-            crate::clients::SnippetEnvVar {
-                key: "API_KEY".into(),
-                value: Some("sk-live-SECRET42".into()),
-            },
-            crate::clients::SnippetEnvVar {
-                key: "TOKEN".into(),
-                value: None,
-            },
-            crate::clients::SnippetEnvVar {
-                key: "REGION".into(),
-                value: Some("eu".into()),
-            },
-        ]);
+        section.fill(
+            &[
+                crate::clients::SnippetEnvVar {
+                    key: "API_KEY".into(),
+                    value: Some("sk-live-SECRET42".into()),
+                },
+                crate::clients::SnippetEnvVar {
+                    key: "TOKEN".into(),
+                    value: None,
+                },
+                crate::clients::SnippetEnvVar {
+                    key: "REGION".into(),
+                    value: Some("eu".into()),
+                },
+            ],
+            false,
+        );
         window.present();
         // Use every handler once: rename, type, toggle and remove.
         let (rows, value, key, removed) = {
@@ -14666,6 +14688,28 @@ mod tests {
         );
     }
 
+    /// A remote paste's rows are its token: the caption says so instead of
+    /// asking for API keys, as the React dialog does.
+    #[test]
+    #[ignore = "requires GTK; explicitly run in the isolated omabox session"]
+    fn a_remote_paste_says_its_rows_are_the_token() {
+        gtk::init().expect("this regression runs inside omabox");
+        let section = pasted_env_section();
+        assert!(section.caption.label().starts_with("API keys"));
+        let token = [crate::clients::SnippetEnvVar {
+            key: "Authorization".into(),
+            value: None,
+        }];
+        section.fill(&token, true);
+        assert_eq!(
+            section.caption.label(),
+            "Remote servers have no environment. When this server has no other token, Toolport sends the first stored value to it as its bearer token."
+        );
+        section.fill(&token, false);
+        assert!(section.caption.label().starts_with("API keys"));
+        section.clear();
+    }
+
     /// The pasted rows offer what the React dialog's rows do, in its order:
     /// key source and password manager reference for a keychain value, "Same on
     /// every machine" for a plain one, and the same defaults.
@@ -14681,12 +14725,15 @@ mod tests {
             key: key.into(),
             value: value.map(Into::into),
         };
-        section.fill(&[
-            var("API_KEY", Some("sk-live-SECRET42")),
-            var("REGION", Some("eu")),
-            var("NODE_OPTIONS", Some("--max-old-space-size=4096")),
-            var("TOKEN", None),
-        ]);
+        section.fill(
+            &[
+                var("API_KEY", Some("sk-live-SECRET42")),
+                var("REGION", Some("eu")),
+                var("NODE_OPTIONS", Some("--max-old-space-size=4096")),
+                var("TOKEN", None),
+            ],
+            false,
+        );
         window.present();
         let rows = section.rows.borrow().clone();
         let [api, region, node, token] = [0, 1, 2, 3].map(|i| rows[i].clone());

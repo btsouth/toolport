@@ -5688,7 +5688,12 @@ API_KEY = "synthetic-first-origin"
                 Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0)
             })
             .unwrap();
-            assert_eq!(saved().env.len(), 1, "{:?}", saved().env);
+            let keys: Vec<_> = saved().env.into_iter().map(|e| e.key).collect();
+            assert_eq!(
+                keys,
+                ["MY_MCP_TOKEN", crate::secrets::HTTP_AUTH_KEY],
+                "nothing else was declared"
+            );
         });
     }
 

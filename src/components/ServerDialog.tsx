@@ -448,6 +448,31 @@ export function ServerDialog({
     errors.push(message);
     visibleErrors.push(message);
   }
+  // Remote servers have no environment, and Toolport would send a variable to
+  // one as its bearer token. Rows the saved remote server already had stay
+  // (older tokens and imports), and Authorization is saved as the bearer token.
+  // The backend refuses the same with the same sentence, as GTK shows it.
+  const keptRemoteKeys = new Set(
+    initial && initial.transport !== "stdio" ? initial.env.map((e) => e.key) : [],
+  );
+  const typedRemoteKey = isStdio
+    ? undefined
+    : envRows
+        .map((r) => r.key.trim())
+        .find(
+          (key) =>
+            key !== "" &&
+            key.toLowerCase() !== "authorization" &&
+            !keptRemoteKeys.has(key),
+        );
+  if (typedRemoteKey) {
+    const message = t(
+      "Remote servers don't read environment variables, so Toolport would send {value0} to this server as its bearer token. Remove it, or name it Authorization if it is this server's token.",
+      { value0: typedRemoteKey },
+    );
+    errors.push(message);
+    visibleErrors.push(message);
+  }
   const ownName = editing
     ? (initial?.name ?? partialEdit?.name)?.trim().toLowerCase()
     : undefined;
@@ -949,157 +974,169 @@ export function ServerDialog({
             />
           </div>
 
-          <div className="flex flex-col gap-2">
-            <Label>{t("Environment variables")}</Label>
-            <p className="-mt-1 text-meta text-muted-foreground">
-              <Trans
-                message={
-                  "API keys and other secrets the server needs (e.g.{value1}{value2}). Values are stored in your OS keychain, never in the config."
-                }
-                values={{
-                  value1: " ",
-                  value2: <code className="font-mono">{t("RESEND_API_KEY")}</code>,
-                }}
-              />
-            </p>
-            {missingPasted.length > 0 && (
-              <p role="status" className="text-meta text-warning">
-                {t(
-                  "Add a value for {value0} before saving. The pasted config did not include it.",
-                  { value0: missingPasted.join(", ") },
-                )}
-              </p>
-            )}
-            {envRows.map((row, i) => (
-              <div key={i} className="flex flex-wrap items-center gap-2">
-                <Input
-                  placeholder={t("ENV_NAME")}
-                  className="font-mono"
-                  value={row.key}
-                  onChange={(e) => setEnvRow(i, "key", e.target.value)}
-                />
-                {row.secret !== false && (
-                  <select
-                    aria-label={t("Key source for {value1}", {
-                      value1: row.key || "variable",
-                    })}
-                    className="rounded border bg-background p-1 text-xs"
-                    value={row.source ? "reference" : "paste"}
-                    onChange={(e) =>
-                      setEnvRows((rows) =>
-                        rows.map((r, j) =>
-                          j === i
-                            ? {
-                                ...r,
-                                value: "",
-                                source:
-                                  e.target.value === "reference"
-                                    ? { ref: "op://Engineering/Docs/key" }
-                                    : undefined,
-                              }
-                            : r,
-                        ),
-                      )
+          {/* A remote server has no environment: the section shows only the
+              rows it already has, and none can be added. */}
+          {(isStdio || envRows.length > 0) && (
+            <div className="flex flex-col gap-2">
+              <Label>{t("Environment variables")}</Label>
+              <p className="-mt-1 text-meta text-muted-foreground">
+                {isStdio ? (
+                  <Trans
+                    message={
+                      "API keys and other secrets the server needs (e.g.{value1}{value2}). Values are stored in your OS keychain, never in the config."
                     }
-                  >
-                    <option value="paste">{t("Paste a key")}</option>
-                    <option value="reference">{t("From a password manager")}</option>
-                  </select>
-                )}
-                {row.source ? (
-                  <SecretReferenceField
-                    serverId={currentEditId ?? ""}
-                    value={row.source.ref}
-                    onChange={(ref) =>
-                      setEnvRows((rows) =>
-                        rows.map((r, j) => (j === i ? { ...r, source: { ref } } : r)),
-                      )
-                    }
+                    values={{
+                      value1: " ",
+                      value2: <code className="font-mono">{t("RESEND_API_KEY")}</code>,
+                    }}
                   />
                 ) : (
-                  <Input
-                    type={row.secret === false ? "text" : "password"}
-                    placeholder={
-                      initial?.env.some((e) => e.key === row.key)
-                        ? t("•••• (saved)")
-                        : t("value")
-                    }
-                    value={row.value}
-                    onChange={(e) => setEnvRow(i, "value", e.target.value)}
-                  />
+                  t(
+                    "Remote servers have no environment. When this server has no other token, Toolport sends the first stored value to it as its bearer token.",
+                  )
                 )}
-                <label className="flex shrink-0 items-center gap-1 text-meta">
-                  <input
-                    type="checkbox"
-                    aria-label={t("Keep {value1} in keychain", {
-                      value1: row.key || "variable",
-                    })}
-                    checked={row.secret !== false}
-                    onChange={(e) =>
-                      setEnvRows((rows) =>
-                        rows.map((r, j) =>
-                          j === i
-                            ? {
-                                ...r,
-                                secret: e.target.checked,
-                                source: e.target.checked ? r.source : undefined,
-                              }
-                            : r,
-                        ),
-                      )
-                    }
+              </p>
+              {missingPasted.length > 0 && (
+                <p role="status" className="text-meta text-warning">
+                  {t(
+                    "Add a value for {value0} before saving. The pasted config did not include it.",
+                    { value0: missingPasted.join(", ") },
+                  )}
+                </p>
+              )}
+              {envRows.map((row, i) => (
+                <div key={i} className="flex flex-wrap items-center gap-2">
+                  <Input
+                    placeholder={t("ENV_NAME")}
+                    className="font-mono"
+                    value={row.key}
+                    onChange={(e) => setEnvRow(i, "key", e.target.value)}
                   />
-                  {t("Keychain")}
-                </label>
-                {row.secret === false && (
-                  <label
-                    className="flex shrink-0 items-center gap-1 text-meta"
-                    title={
-                      riskySyncEnv(row.key)
-                        ? t(
-                            "This variable changes how programs run, so it always stays on this machine.",
-                          )
-                        : undefined
-                    }
-                  >
-                    <input
-                      type="checkbox"
-                      disabled={riskySyncEnv(row.key)}
-                      checked={envRowSyncs(row, editing ? (initial?.env ?? []) : [])}
+                  {row.secret !== false && (
+                    <select
+                      aria-label={t("Key source for {value1}", {
+                        value1: row.key || "variable",
+                      })}
+                      className="rounded border bg-background p-1 text-xs"
+                      value={row.source ? "reference" : "paste"}
                       onChange={(e) =>
                         setEnvRows((rows) =>
                           rows.map((r, j) =>
-                            j === i ? { ...r, portable: e.target.checked } : r,
+                            j === i
+                              ? {
+                                  ...r,
+                                  value: "",
+                                  source:
+                                    e.target.value === "reference"
+                                      ? { ref: "op://Engineering/Docs/key" }
+                                      : undefined,
+                                }
+                              : r,
                           ),
                         )
                       }
-                    />{" "}
-                    {t("Same on every machine")}
+                    >
+                      <option value="paste">{t("Paste a key")}</option>
+                      <option value="reference">{t("From a password manager")}</option>
+                    </select>
+                  )}
+                  {row.source ? (
+                    <SecretReferenceField
+                      serverId={currentEditId ?? ""}
+                      value={row.source.ref}
+                      onChange={(ref) =>
+                        setEnvRows((rows) =>
+                          rows.map((r, j) => (j === i ? { ...r, source: { ref } } : r)),
+                        )
+                      }
+                    />
+                  ) : (
+                    <Input
+                      type={row.secret === false ? "text" : "password"}
+                      placeholder={
+                        initial?.env.some((e) => e.key === row.key)
+                          ? t("•••• (saved)")
+                          : t("value")
+                      }
+                      value={row.value}
+                      onChange={(e) => setEnvRow(i, "value", e.target.value)}
+                    />
+                  )}
+                  <label className="flex shrink-0 items-center gap-1 text-meta">
+                    <input
+                      type="checkbox"
+                      aria-label={t("Keep {value1} in keychain", {
+                        value1: row.key || "variable",
+                      })}
+                      checked={row.secret !== false}
+                      onChange={(e) =>
+                        setEnvRows((rows) =>
+                          rows.map((r, j) =>
+                            j === i
+                              ? {
+                                  ...r,
+                                  secret: e.target.checked,
+                                  source: e.target.checked ? r.source : undefined,
+                                }
+                              : r,
+                          ),
+                        )
+                      }
+                    />
+                    {t("Keychain")}
                   </label>
-                )}
+                  {row.secret === false && (
+                    <label
+                      className="flex shrink-0 items-center gap-1 text-meta"
+                      title={
+                        riskySyncEnv(row.key)
+                          ? t(
+                              "This variable changes how programs run, so it always stays on this machine.",
+                            )
+                          : undefined
+                      }
+                    >
+                      <input
+                        type="checkbox"
+                        disabled={riskySyncEnv(row.key)}
+                        checked={envRowSyncs(row, editing ? (initial?.env ?? []) : [])}
+                        onChange={(e) =>
+                          setEnvRows((rows) =>
+                            rows.map((r, j) =>
+                              j === i ? { ...r, portable: e.target.checked } : r,
+                            ),
+                          )
+                        }
+                      />{" "}
+                      {t("Same on every machine")}
+                    </label>
+                  )}
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="size-8 shrink-0 text-muted-foreground hover:text-destructive"
+                    aria-label={t("Remove variable")}
+                    onClick={() => removeEnvRow(i)}
+                  >
+                    <X className="size-4" />
+                  </Button>
+                </div>
+              ))}
+              {isStdio && (
                 <Button
-                  size="icon"
-                  variant="ghost"
-                  className="size-8 shrink-0 text-muted-foreground hover:text-destructive"
-                  aria-label={t("Remove variable")}
-                  onClick={() => removeEnvRow(i)}
+                  variant="outline"
+                  size="sm"
+                  className="self-start"
+                  onClick={addEnvRow}
                 >
-                  <X className="size-4" />
+                  <Trans
+                    message={"{value1}Add variable"}
+                    values={{ value1: <Plus className="size-4" /> }}
+                  />
                 </Button>
-              </div>
-            ))}
-            <Button
-              variant="outline"
-              size="sm"
-              className="self-start"
-              onClick={addEnvRow}
-            >
-              <Trans
-                message={"{value1}Add variable"}
-                values={{ value1: <Plus className="size-4" /> }}
-              />
-            </Button>
-          </div>
+              )}
+            </div>
+          )}
 
           {(visibleErrors.length > 0 ||
             duplicateName ||

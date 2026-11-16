@@ -1214,5 +1214,6 @@
   "Use stdio, http or sse after -t.": "请在 -t 之后使用 stdio、http 或 sse。",
   "Add a value for {value0} before saving. The pasted config did not include it.": "保存前请为 {value0} 添加值。粘贴的配置中没有包含它。",
   "Use each variable name once. Rename or remove the second {value0}.": "每个变量名只能使用一次。请重命名或删除第二个 {value0}。",
-  "Remote servers don't read environment variables, so Toolport would send {value0} to this server as its bearer token. Remove it, or name it Authorization if it is this server's token.": "远程服务器不读取环境变量，因此 Toolport 会把 {value0} 作为 Bearer 令牌发送给此服务器。请删除它；如果它就是此服务器的令牌，请将其命名为 Authorization。"
+  "Remote servers don't read environment variables, so Toolport would send {value0} to this server as its bearer token. Remove it, or name it Authorization if it is this server's token.": "远程服务器不读取环境变量，因此 Toolport 会把 {value0} 作为 Bearer 令牌发送给此服务器。请删除它；如果它就是此服务器的令牌，请将其命名为 Authorization。",
+  "Remote servers have no environment. When this server has no other token, Toolport sends the first stored value to it as its bearer token.": "远程服务器没有环境。如果此服务器没有其他令牌，Toolport 会把第一个保存的值作为 Bearer 令牌发送给它。"
 }

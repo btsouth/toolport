@@ -338,6 +338,76 @@ describe("ServerDialog", () => {
     );
   });
 
+  it("never offers variables on a remote server, and keeps the ones it has", async () => {
+    const refusal =
+      "Remote servers don't read environment variables, so Toolport would send API_KEY to this server as its bearer token. Remove it, or name it Authorization if it is this server's token.";
+    const note =
+      "Remote servers have no environment. When this server has no other token, Toolport sends the first stored value to it as its bearer token.";
+    const user = userEvent.setup();
+    // A new remote server has no Environment variables section.
+    const { unmount } = render(
+      <ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />,
+    );
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    expect(screen.getByRole("button", { name: "Add variable" })).toBeVisible();
+    await user.click(screen.getByLabelText("Transport"));
+    await user.click(screen.getByRole("option", { name: "http (remote)" }));
+    expect(screen.queryByText("Environment variables")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Add variable" }),
+    ).not.toBeInTheDocument();
+    unmount();
+
+    // A remote server that already keeps its token in a variable shows it,
+    // says what it is, and saves.
+    const legacy: ServerEntry = {
+      id: "remote",
+      name: "Remote",
+      transport: "http",
+      command: null,
+      args: [],
+      env: [{ key: "MY_MCP_TOKEN", value: null, secret: true }],
+      url: "https://mcp.example.com/mcp",
+      source: "manual",
+    };
+    const second = render(
+      <ServerDialog autoOpen editId="remote" initial={legacy} onSaved={vi.fn()} />,
+    );
+    expect(screen.getByDisplayValue("MY_MCP_TOKEN")).toBeVisible();
+    expect(screen.getByText(note)).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Add variable" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(refusal.replace("API_KEY", "MY_MCP_TOKEN")),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    second.unmount();
+
+    // A stdio server's variable does not come along to http.
+    const local: ServerEntry = {
+      id: "local",
+      name: "Local",
+      transport: "stdio",
+      command: "local-server",
+      args: [],
+      env: [{ key: "API_KEY", value: "plain", secret: false }],
+      url: null,
+      source: "manual",
+    };
+    render(<ServerDialog autoOpen editId="local" initial={local} onSaved={vi.fn()} />);
+    await user.click(screen.getByLabelText("Transport"));
+    await user.click(screen.getByRole("option", { name: "http (remote)" }));
+    await user.type(screen.getByLabelText("URL"), "https://mcp.example.com/mcp");
+    expect(screen.getByText(refusal)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    const key = screen.getByDisplayValue("API_KEY");
+    await user.clear(key);
+    await user.type(key, "Authorization");
+    expect(screen.queryByText(refusal)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+  });
+
   it("saves the startup timeout in milliseconds", async () => {
     const initial: ServerEntry = {
       id: "remote",

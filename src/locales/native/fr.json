@@ -1214,5 +1214,6 @@
   "Use stdio, http or sse after -t.": "Utilisez stdio, http ou sse après -t.",
   "Add a value for {value0} before saving. The pasted config did not include it.": "Ajoutez une valeur pour {value0} avant d’enregistrer. La configuration collée ne la contenait pas.",
   "Use each variable name once. Rename or remove the second {value0}.": "Utilisez chaque nom de variable une seule fois. Renommez ou supprimez le second {value0}.",
-  "Remote servers don't read environment variables, so Toolport would send {value0} to this server as its bearer token. Remove it, or name it Authorization if it is this server's token.": "Les serveurs distants ne lisent pas les variables d'environnement : Toolport enverrait donc {value0} à ce serveur comme jeton bearer. Supprimez-la, ou nommez-la Authorization s'il s'agit du jeton de ce serveur."
+  "Remote servers don't read environment variables, so Toolport would send {value0} to this server as its bearer token. Remove it, or name it Authorization if it is this server's token.": "Les serveurs distants ne lisent pas les variables d'environnement : Toolport enverrait donc {value0} à ce serveur comme jeton bearer. Supprimez-la, ou nommez-la Authorization s'il s'agit du jeton de ce serveur.",
+  "Remote servers have no environment. When this server has no other token, Toolport sends the first stored value to it as its bearer token.": "Les serveurs distants n'ont pas d'environnement. Si ce serveur n'a pas d'autre jeton, Toolport lui envoie la première valeur enregistrée comme jeton bearer."
 }

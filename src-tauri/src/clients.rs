@@ -3977,11 +3977,35 @@ pub fn parse_snippet_for_user(content: &str) -> Result<Vec<ParsedSnippetServer>,
     if let Err(error) = claude_add::parse(content.trim()) {
         return Err(SnippetError(SnippetErrorKind::Command(error)));
     }
-    let servers =
+    let mut servers =
         parse_snippet_formats(content).map_err(|_| SnippetError(SnippetErrorKind::Unreadable))?;
-    match refused_header(&servers) {
-        Some(error) => Err(SnippetError(SnippetErrorKind::Command(error))),
-        None => Ok(servers),
+    if let Some(error) = refused_header(&servers) {
+        return Err(SnippetError(SnippetErrorKind::Command(error)));
+    }
+    // One server fills the editor; several go to the review, which imports them.
+    if let [server] = servers.as_mut_slice() {
+        name_the_bearer_row(server);
+    }
+    Ok(servers)
+}
+
+/// The editor saves a remote server's `Authorization` row as its bearer token
+/// and refuses any other variable there, since Toolport would send it as the
+/// token. A remote paste reaching this point has no plain variables, so a row
+/// without a value is its `bearerTokenEnvVar`: the token, named as one.
+fn name_the_bearer_row(server: &mut ParsedSnippetServer) {
+    if server.transport == "stdio"
+        || server
+            .env
+            .iter()
+            .any(|row| row.key.eq_ignore_ascii_case("authorization"))
+    {
+        return;
+    }
+    if let [row] = server.env.as_mut_slice() {
+        if row.value.is_none() {
+            row.key = "Authorization".into();
+        }
     }
 }
 
@@ -16707,6 +16731,33 @@ command = "npx"
         let root = std::env::temp_dir().join(format!("toolport-qwen-home-{}", std::process::id()));
         let _restore = EnvRestore::set("QWEN_HOME", &root);
         assert_eq!(qwen_code_path(), Some(root.join("settings.json")));
+    }
+
+    /// A single pasted Kimi server fills the editor with its token named
+    /// Authorization, which the editor saves as the bearer token. Several go to
+    /// the review, which imports the variable as the client config names it.
+    #[test]
+    fn a_pasted_bearer_token_variable_fills_the_editor_as_authorization() {
+        let one = r#"{"mcpServers":{"authed":{"url":"https://mcp.example.com/mcp","bearerTokenEnvVar":"MY_MCP_TOKEN"}}}"#;
+        let server = parse_snippet_for_user(one).unwrap().remove(0);
+        assert_eq!(server.env.len(), 1);
+        assert_eq!(server.env[0].key, "Authorization");
+        assert!(server.env[0].value.is_none());
+        let two = r#"{"mcpServers":{
+            "authed":{"url":"https://mcp.example.com/mcp","bearerTokenEnvVar":"MY_MCP_TOKEN"},
+            "local":{"command":"npx","args":["x"]}}}"#;
+        let servers = parse_snippet_for_user(two).unwrap();
+        let authed = servers.iter().find(|s| s.name == "authed").unwrap();
+        assert_eq!(authed.env[0].key, "MY_MCP_TOKEN");
+        let header = r#"{"mcpServers":{"h":{"url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer abc"},"bearerTokenEnvVar":"MY_MCP_TOKEN"}}}"#;
+        let server = parse_snippet_for_user(header).unwrap().remove(0);
+        assert_eq!(server.env[0].key, "Authorization");
+        assert_eq!(
+            server.env.len(),
+            2,
+            "a header keeps its own row: {:?}",
+            server.env.iter().map(|e| &e.key).collect::<Vec<_>>()
+        );
     }
 
     #[test]

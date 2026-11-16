@@ -359,7 +359,8 @@ jobs:
             quiet_tooltips::tests::dropdowns_split_buttons_and_popovers_silence_tooltips_while_open \
             tests::pasted_rows_are_freed_when_the_dialog_closes \
             tests::pasted_arguments_survive_the_gtk_box \
-            tests::pasted_rows_offer_the_react_choices
+            tests::pasted_rows_offer_the_react_choices \
+            tests::a_remote_paste_says_its_rows_are_the_token
           do
             xvfb-run -a dbus-run-session -- cargo test \
               --manifest-path src-tauri/Cargo.toml --no-default-features \
