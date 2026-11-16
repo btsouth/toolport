@@ -1132,5 +1132,6 @@
   "Connected {connected} of {total} T3 Code instance.": "已连接 {connected}/{total} 个 T3 Code 实例。",
   "Connected {connected} of {total} T3 Code instances.": "已连接 {connected}/{total} 个 T3 Code 实例。",
   "Not connected: {names}.": "未连接：{names}。",
-  "Skip": "跳过"
+  "Skip": "跳过",
+  "No servers moved, so your agent has no new tools.": "没有移动任何服务器，因此你的智能体没有新工具。"
 }

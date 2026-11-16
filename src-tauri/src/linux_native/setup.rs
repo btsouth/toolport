@@ -12,6 +12,29 @@ pub(super) struct Completion {
     /// What the connect could not finish tidying up (an old token left in the keychain),
     /// shown under the servers as React shows them.
     pub warnings: Vec<String>,
+    /// Set for a client connect: its result page then shows what React's does (the
+    /// restart line naming the client, "What your agent sees" even when nothing
+    /// moved, and Details with the config and backup).
+    pub connect: Option<ConnectResult>,
+}
+
+/// What a client connect's result page needs beyond the servers and tools.
+#[derive(Default)]
+pub(super) struct ConnectResult {
+    pub client: String,
+    pub config_path: String,
+}
+
+/// The connect review's lede, React's sentence: what happens to the selected entries,
+/// and that a customized Toolport entry is replaced when it is.
+pub(super) fn connect_review_lede(force: bool) -> &'static str {
+    if force {
+        crate::i18n::msg(
+            "Selected entries move into Toolport after verification. This replaces the customized Toolport entry.",
+        )
+    } else {
+        crate::i18n::msg("Selected entries move into Toolport after verification.")
+    }
 }
 impl From<String> for Completion {
     fn from(message: String) -> Self {
@@ -41,6 +64,17 @@ fn middle_ellipsize(widget: &gtk::Widget, text: &str) {
         child = widget.next_sibling();
         middle_ellipsize(&widget, text);
     }
+}
+
+/// When the backup file was written, in the user's local time.
+fn backup_date(backup: &str) -> Option<String> {
+    std::fs::metadata(backup)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|t| gtk::glib::DateTime::from_unix_local(t.as_secs() as i64).ok())
+        .and_then(|t| t.format("%e %B %Y, %H:%M").ok())
+        .map(|s| s.trim().to_string())
 }
 
 fn details_expander(title: &str) -> (gtk::Expander, gtk::Box) {
@@ -176,6 +210,7 @@ pub(super) fn review(
         items,
         disclosure,
         None,
+        None,
         confirm_label,
         require_credentials,
         action,
@@ -231,13 +266,15 @@ pub(super) fn gateway_settings_card(sentence: &str, lines: &str) -> gtk::Box {
     card
 }
 
-/// [`review`] with a notice shown under the lede, before the user confirms.
+/// [`review`] with its own lede (a source string; `None` keeps the generic one) and a
+/// notice shown under it, before the user confirms.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn review_with_notice(
     parent: &gtk::Window,
     title: &str,
     items: Vec<SetupItem>,
     disclosure: &str,
+    lede: Option<&'static str>,
     notice: Option<(String, String)>,
     confirm_label: &'static str,
     require_credentials: bool,
@@ -309,6 +346,9 @@ pub(super) fn review_with_notice(
             if busy.get() {
                 gtk::glib::Propagation::Stop
             } else {
+        let source = lede.unwrap_or(crate::i18n::msg(
+            "Review the selected servers before continuing.",
+        ));
                 gtk::glib::Propagation::Proceed
             }
         });
@@ -349,14 +389,15 @@ pub(super) fn review_with_notice(
         widget.add_css_class("warning");
         widget
     } else {
+        let source = lede.unwrap_or(crate::i18n::msg(
+            "Review the selected servers before continuing.",
+        ));
         let widget = gtk::Label::builder()
-            .label(crate::i18n::tr(
-                "Review the selected servers before continuing.",
-            ))
+            .label(crate::i18n::lookup(source))
             .xalign(0.0)
             .wrap(true)
             .build();
-        l10n::bind_label(&widget, "Review the selected servers before continuing.");
+        l10n::bind_label(&widget, source);
         widget
     };
     body.append(&lede);
@@ -867,8 +908,20 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                         Some(line) => body.insert_child_after(&status, Some(line)),
                         None => body.prepend(&status),
                     }
-                    if let Some((_, description)) = outcome.message.split_once(". ") {
+                    let next_step = match &outcome.connect {
+                        // React's line, naming the client.
+                        Some(connect) => Some(crate::i18n::trf(
+                            "Restart {client} to load Toolport.",
+                            &[("client", &connect.client)],
+                        )),
+                        None => outcome
+                            .message
+                            .split_once(". ")
+                            .map(|(_, description)| description.to_string()),
+                    };
+                    if let Some(description) = next_step {
                         let next_step = gtk::Label::builder().label(description).wrap(true).build();
+                        next_step.set_widget_name("toolport-setup-next-step");
                         body.insert_child_after(&next_step, Some(&status));
                     }
                     let results = gtk::ListBox::new();
@@ -893,6 +946,7 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                         results.append(&row);
                     }
                     body.append(&results);
+                    results.set_visible(results.first_child().is_some());
                     for warning in &outcome.warnings {
                         let label = gtk::Label::builder()
                             .label(warning)
@@ -904,29 +958,71 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                         label.add_css_class("dim-label");
                         body.append(&label);
                     }
-                    if !outcome.tools.is_empty() {
+                    // A connect always says what the agent sees, as React's result does,
+                    // including when nothing moved.
+                    if !outcome.tools.is_empty() || outcome.connect.is_some() {
                         let (agent, content) =
                             details_expander(&crate::i18n::tr("What your agent sees"));
-                        for tool in outcome.tools {
-                            let row = adw::ActionRow::builder()
-                                .title(tool["name"].as_str().unwrap_or("Tool"))
+                        agent.set_widget_name("toolport-setup-agent-sees");
+                        if outcome.tools.is_empty() {
+                            let none = gtk::Label::builder()
+                                .label(crate::i18n::tr(
+                                    "No servers moved, so your agent has no new tools.",
+                                ))
+                                .xalign(0.0)
+                                .wrap(true)
                                 .build();
-                            content.append(&row);
+                            none.add_css_class("toolport-muted");
+                            content.append(&none);
+                        }
+                        for tool in outcome.tools {
+                            let name = gtk::Label::builder()
+                                .label(tool["name"].as_str().unwrap_or("Tool"))
+                                .xalign(0.0)
+                                .wrap(true)
+                                .selectable(true)
+                                .build();
+                            name.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+                            name.add_css_class("monospace");
+                            content.append(&name);
                         }
                         body.append(&agent);
                     }
-                    if let Some(backup) = outcome.backup {
+                    if let Some(connect) = &outcome.connect {
+                        // React's Details: the config, then the backup when one was saved.
                         let (detail, content) = details_expander(&crate::i18n::tr("Details"));
-                        let date = std::fs::metadata(&backup)
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .and_then(|t| {
-                                gtk::glib::DateTime::from_unix_local(t.as_secs() as i64).ok()
-                            })
-                            .and_then(|t| t.format("%e %B %Y, %H:%M").ok())
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| "saved".into());
+                        detail.set_widget_name("toolport-setup-details");
+                        let mut lines = vec![crate::i18n::trf(
+                            "Config: {path}",
+                            &[("path", &connect.config_path)],
+                        )];
+                        if let Some(backup) = &outcome.backup {
+                            lines.push(
+                                backup_date(backup)
+                                    .map(|date| {
+                                        crate::i18n::trf(
+                                            "Backup saved {value0}",
+                                            &[("value0", &date)],
+                                        )
+                                    })
+                                    .unwrap_or_else(|| crate::i18n::tr("Backup saved")),
+                            );
+                            lines.push(crate::i18n::trf("Backup: {path}", &[("path", backup)]));
+                        }
+                        for line in lines {
+                            let label = gtk::Label::builder()
+                                .label(line)
+                                .xalign(0.0)
+                                .wrap(true)
+                                .selectable(true)
+                                .build();
+                            label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+                            content.append(&label);
+                        }
+                        body.append(&detail);
+                    } else if let Some(backup) = outcome.backup {
+                        let (detail, content) = details_expander(&crate::i18n::tr("Details"));
+                        let date = backup_date(&backup).unwrap_or_else(|| "saved".into());
                         let label = {
                             let widget = gtk::Label::builder()
                                 .label("")
@@ -1058,6 +1154,7 @@ pub(super) fn connect_step(
                     &review_title(&client_name),
                     preview.items,
                     &disclosure,
+                    Some(connect_review_lede(force)),
                     notice,
                     crate::i18n::msg("Connect to Toolport"),
                     true,
@@ -1085,8 +1182,12 @@ pub(super) fn connect_step(
                             ),
                             servers: outcome.servers,
                             tools: outcome.tools,
-                            backup: outcome.result.outcome.backup,
-                            warnings: outcome.result.outcome.warnings,
+                            backup: outcome.result.outcome.backup.clone(),
+                            warnings: outcome.result.outcome.warnings.clone(),
+                            connect: Some(ConnectResult {
+                                client: client_name.clone(),
+                                config_path: outcome.result.outcome.path.clone(),
+                            }),
                         })
                     },
                     move || finished(),
@@ -1124,6 +1225,7 @@ pub(super) fn connect_step(
                     &unreadable_review_title(&client_name),
                     Vec::new(),
                     &error,
+                    None,
                     None,
                     crate::i18n::msg("Retry"),
                     false,
@@ -1306,6 +1408,7 @@ mod tests {
             Vec::new(),
             "Fixture",
             None,
+            None,
             "Connect",
             true,
             move |_, _, _| {
@@ -1418,6 +1521,7 @@ mod tests {
             "Slow step",
             Vec::new(),
             "Fixture",
+            None,
             None,
             "Connect",
             true,
@@ -1584,6 +1688,111 @@ mod tests {
         );
     }
 
+    /// The connect review and its result page say what React's do: the same lede, the
+    /// restart line naming the client, "What your agent sees" even when nothing moved,
+    /// warnings, and Details with the config path.
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn connect_review_and_result_match_react() {
+        adw::init().unwrap();
+        let parent = gtk::Window::new();
+        review_with_notice(
+            &parent,
+            "Connect parity fixture",
+            Vec::new(),
+            "Fixture",
+            Some(connect_review_lede(false)),
+            None,
+            "Connect",
+            true,
+            |_, _, _| {
+                Ok(Completion {
+                    message: "Claude Code connected. Restart it to load Toolport.".into(),
+                    warnings: vec![
+                        "Other servers were not verified during this connection: a".into()
+                    ],
+                    connect: Some(ConnectResult {
+                        client: "Claude Code".into(),
+                        config_path: "/home/test/.claude.json".into(),
+                    }),
+                    ..Completion::default()
+                })
+            },
+            || {},
+            None,
+            Step::default(),
+        );
+        let window = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .find(|w| w.title().as_deref() == Some("Connect parity fixture"))
+            .unwrap();
+        let labels = |window: &gtk::Window| {
+            descendants(window.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Label>().ok())
+                .filter(|l| l.is_visible() && l.parent().is_some_and(|p| p.is_visible()))
+                .map(|l| l.text().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(labels(&window)
+            .iter()
+            .any(|t| t == "Selected entries move into Toolport after verification."));
+        assert!(!labels(&window)
+            .iter()
+            .any(|t| t == "Review the selected servers before continuing."));
+        let connect = descendants(window.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .find(|b| b.label().as_deref() == Some("Connect"))
+            .unwrap();
+        connect.emit_clicked();
+        let context = gtk::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while connect.label().as_deref() != Some("Done") && std::time::Instant::now() < deadline {
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+        assert_eq!(connect.label().as_deref(), Some("Done"));
+        let shown = labels(&window);
+        assert!(
+            shown
+                .iter()
+                .any(|t| t == "Restart Claude Code to load Toolport."),
+            "{shown:?}"
+        );
+        assert!(shown
+            .iter()
+            .any(|t| t == "Other servers were not verified during this connection: a"));
+        let expander = |name: &str| {
+            descendants(window.upcast_ref())
+                .into_iter()
+                .find(|w| w.widget_name() == name)
+                .and_then(|w| w.downcast::<gtk::Expander>().ok())
+                .unwrap_or_else(|| panic!("{name} is on the result page"))
+        };
+        let agent = expander("toolport-setup-agent-sees");
+        assert!(agent.is_visible());
+        assert_eq!(agent.label().as_deref(), Some("What your agent sees"));
+        let inside = |expander: &gtk::Expander| {
+            descendants(expander.child().unwrap().upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Label>().ok())
+                .map(|l| l.text().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            inside(&agent),
+            vec!["No servers moved, so your agent has no new tools.".to_string()]
+        );
+        let details = expander("toolport-setup-details");
+        assert_eq!(
+            inside(&details),
+            vec!["Config: /home/test/.claude.json".to_string()]
+        );
+        window.close();
+    }
+
     #[test]
     #[ignore = "requires isolated GTK display"]
     fn connected_page_drops_the_gateway_settings_notice() {
@@ -1594,6 +1803,7 @@ mod tests {
             "Notice success fixture",
             Vec::new(),
             "Fixture",
+            None,
             gateway_settings_notice("Codex", &["tool_timeout_sec = 600".into()]),
             "Connect",
             true,
@@ -2056,6 +2266,7 @@ mod tests {
                     ],
                     backup: None,
                     warnings: Vec::new(),
+                    connect: None,
                 })
             },
             || {},

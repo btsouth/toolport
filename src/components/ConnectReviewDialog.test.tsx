@@ -109,6 +109,36 @@ it("shows downstream tool counts and only Done on success", async () => {
   expect(screen.getByRole("button", { name: "Done" })).toBeVisible();
 });
 
+it("says what the agent sees when nothing moved, as GTK does", async () => {
+  api.migrateClient.mockResolvedValue({
+    registry: { servers: [] },
+    outcome: { path: "/fixture/config", backup: null, warnings: [] },
+    tools: [],
+    servers: [],
+  });
+  render(
+    <ConnectReviewDialog
+      clientId="fixture"
+      clientName="Fixture"
+      onClose={vi.fn()}
+      onConnected={vi.fn()}
+    />,
+  );
+  expect(
+    await screen.findByText("Selected entries move into Toolport after verification."),
+  ).toBeVisible();
+  await userEvent.click(screen.getByRole("button", { name: "Connect to Toolport" }));
+  expect(await screen.findByText("Restart Fixture to load Toolport.")).toBeVisible();
+  // No empty server list is drawn.
+  expect(screen.queryByRole("list")).not.toBeInTheDocument();
+  await userEvent.click(screen.getByText("What your agent sees"));
+  expect(
+    screen.getByText("No servers moved, so your agent has no new tools."),
+  ).toBeVisible();
+  await userEvent.click(screen.getByText("Details"));
+  expect(screen.getByText("Config: /fixture/config")).toBeVisible();
+});
+
 it("shows the Codex settings Toolport will add before connecting", async () => {
   api.previewClientSetup.mockResolvedValue({
     configPath: "/fixture/config.toml",
