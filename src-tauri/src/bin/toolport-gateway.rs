@@ -12917,17 +12917,30 @@ fn watch_tick(
         host.invalidate_root_views();
         host.invalidate_tool_scope_views();
     }
-    // A value learned since the last tick may sit in lists screened before it.
-    // Then every connected server's lists are fetched again, as if each had
-    // announced a change: only that re-screens the raw definitions and keeps
-    // their aliases routable. One refresh per tick, however many values came.
+    // A value learned since the last tick may sit in lists screened before it,
+    // in the host router or a folder's own launch. Then every connected
+    // server's lists are fetched again, as if each had announced a change: only
+    // that re-screens the raw definitions and keeps their aliases routable. One
+    // refresh per tick, however many values came.
     let redaction = conduit_lib::secret_redact::generation();
     let rescreen = if host.redaction_seen.swap(redaction, Ordering::SeqCst) != redaction {
         let live = router
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        if lists_hold_unscreened_values(&live) {
+        // The folder launches' lists live in the root pool, not the host
+        // router; `refresh_rooted_catalogs` below refetches each launch once.
+        let rooted: Vec<Arc<Router>> = host
+            .root_launch_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .views
+            .values()
+            .cloned()
+            .collect();
+        if lists_hold_unscreened_values(&live)
+            || rooted.iter().any(|view| lists_hold_unscreened_values(view))
+        {
             downstream::change::TOOLS | downstream::change::RESOURCES | downstream::change::PROMPTS
         } else {
             0
