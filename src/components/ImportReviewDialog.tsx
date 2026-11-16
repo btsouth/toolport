@@ -286,9 +286,10 @@ function ImportReviewContent({
                                   : t("Found")}
                           </p>
                         )}
+                        {/* Which entries are being checked; the working spinner is on
+                            the confirm button only (spec §11). */}
                         {busy && isSelected && (
-                          <p role="status" className="mt-1 flex gap-2 text-meta">
-                            <Loader2 className="size-3 animate-spin" />
+                          <p className="mt-1 text-meta">
                             {t("Checking {name}...", { name: item.name })}
                           </p>
                         )}
@@ -443,16 +444,22 @@ function ImportReviewContent({
             busy || missingRequired.length > 0 || (!allowEmpty && selectedCount === 0)
           }
         >
-          <Check className="size-4" />
-          {confirmLabel ??
-            (selectedCount === 0
-              ? t("Select a server")
-              : t(
-                  selectedCount === 1
-                    ? "Import {count} server"
-                    : "Import {count} servers",
-                  { count: selectedCount },
-                ))}
+          {busy ? (
+            <Loader2 className="size-4 animate-spin" />
+          ) : (
+            <Check className="size-4" />
+          )}
+          {busy
+            ? t("Checking…")
+            : (confirmLabel ??
+              (selectedCount === 0
+                ? t("Select a server")
+                : t(
+                    selectedCount === 1
+                      ? "Import {count} server"
+                      : "Import {count} servers",
+                    { count: selectedCount },
+                  )))}
         </Button>
       </DialogFooter>
     </DialogContent>

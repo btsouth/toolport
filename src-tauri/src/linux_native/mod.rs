@@ -2746,6 +2746,8 @@ struct ClientPage {
     /// A client's notice on its detail page: client id, title, text (React's
     /// `restartNotice`).
     detail_notice: std::rc::Rc<std::cell::RefCell<Option<(String, String, String)>>>,
+    /// A refused action on a client's detail page, shown as a danger callout (spec §11).
+    detail_error: std::rc::Rc<std::cell::RefCell<Option<DetailError>>>,
     /// The restart reminder on the list after a row's Connect, as React shows it on the
     /// client it connected.
     list_notice: gtk::Box,
@@ -2844,6 +2846,7 @@ impl ClientPage {
             details,
             detail_clients: Default::default(),
             detail_notice: Default::default(),
+            detail_error: Default::default(),
             list_notice,
             error_client: Default::default(),
             recoveries: Default::default(),
@@ -3423,12 +3426,31 @@ impl ClientPage {
 
     /// A refused client action. It stays until that client's recovery state
     /// changes ([`Self::clear_client_error`]) or another message replaces it.
+    #[cfg(test)]
     fn show_client_error(&self, client_id: &str, error: &str) {
-        self.show_error_line(error);
+        self.show_client_action_error(client_id, error, "", error, None);
+    }
+
+    /// A refused Connect or Disconnect: the page's error line, and on the client's
+    /// details a danger callout with `title`, `cause` and Retry when `retry` is given.
+    fn show_client_action_error(
+        &self,
+        client_id: &str,
+        title: &str,
+        cause: &str,
+        line: &str,
+        retry: Option<std::rc::Rc<dyn Fn()>>,
+    ) {
+        self.show_error_line(line);
         // Keyed by the client the action was for, not whichever client is
         // open now: the user may have selected another one meanwhile.
-        *self.detail_notice.borrow_mut() =
-            Some((client_id.to_string(), error.into(), String::new()));
+        self.take_detail_notice_for(client_id);
+        *self.detail_error.borrow_mut() = Some(DetailError {
+            client_id: client_id.to_string(),
+            title: title.to_string(),
+            cause: cause.to_string(),
+            retry,
+        });
         *self.error_client.borrow_mut() = Some(client_id.to_string());
         if self.details.selected.borrow().as_deref() == Some(client_id) {
             self.refresh_open_detail();
@@ -3443,6 +3465,14 @@ impl ClientPage {
             self.cancel_feedback_timer();
             self.feedback.set_visible(false);
         }
+        let stale = self.take_detail_notice_for(client_id) | self.take_detail_error_for(client_id);
+        if stale && self.details.selected.borrow().as_deref() == Some(client_id) {
+            self.refresh_open_detail();
+        }
+    }
+
+    /// Drops `client_id`'s notice; true when there was one.
+    fn take_detail_notice_for(&self, client_id: &str) -> bool {
         let stale = self
             .detail_notice
             .borrow()
@@ -3450,16 +3480,33 @@ impl ClientPage {
             .is_some_and(|(id, _, _)| id == client_id);
         if stale {
             self.detail_notice.borrow_mut().take();
-            if self.details.selected.borrow().as_deref() == Some(client_id) {
-                self.refresh_open_detail();
-            }
         }
+        stale
+    }
+
+    /// Drops `client_id`'s error callout; true when there was one.
+    fn take_detail_error_for(&self, client_id: &str) -> bool {
+        let stale = self
+            .detail_error
+            .borrow()
+            .as_ref()
+            .is_some_and(|error| error.client_id == client_id);
+        if stale {
+            self.detail_error.borrow_mut().take();
+        }
+        stale
     }
 
     fn show_error(&self, error: &str) {
         let selected = self.details.selected.borrow().clone();
         if let Some(id) = selected {
-            *self.detail_notice.borrow_mut() = Some((id, error.into(), String::new()));
+            self.take_detail_notice_for(&id);
+            *self.detail_error.borrow_mut() = Some(DetailError {
+                client_id: id,
+                title: error.into(),
+                cause: String::new(),
+                retry: None,
+            });
             self.refresh_open_detail();
         }
         self.show_error_line(error);
@@ -4287,6 +4334,26 @@ fn run_client_mutation(
     let client_id_for_error = client.id.clone();
     let client_name = client.name.clone();
     let button = button.clone();
+    // Retry from the danger callout runs the same action again.
+    let retry: std::rc::Rc<dyn Fn()> = {
+        let (client, profile, button, page) = (
+            client.clone(),
+            profile.clone(),
+            button.clone(),
+            page.clone(),
+        );
+        std::rc::Rc::new(move || {
+            page.take_detail_error_for(&client.id);
+            run_client_mutation(
+                &client,
+                connect,
+                force,
+                profile.clone(),
+                &button,
+                page.clone(),
+            );
+        })
+    };
     gtk::glib::spawn_future_local(async move {
         let result = gtk::gio::spawn_blocking(move || {
             if connect {
@@ -4364,7 +4431,21 @@ fn run_client_mutation(
                 }
             }
             Ok(Err(error)) => {
-                page.show_client_error(&client_id_for_error, &format!("{client_name}: {error}"))
+                let title = crate::i18n::trf(
+                    if connect {
+                        "Couldn't connect {client}"
+                    } else {
+                        "Couldn't disconnect {client}"
+                    },
+                    &[("client", &client_name)],
+                );
+                page.show_client_action_error(
+                    &client_id_for_error,
+                    &title,
+                    &error,
+                    &format!("{client_name}: {error}"),
+                    Some(retry),
+                )
             }
             Err(_) => page.show_error(&crate::i18n::trf(
                 "{value0}: the operation stopped",
@@ -14412,7 +14493,7 @@ fn state_action(card: &gtk::Box, label: &'static str, action: impl Fn() + 'stati
 }
 
 /// Three skeleton rows announced as a status with `label`, matching React's SkeletonRows.
-fn skeleton_rows(label: &'static str) -> gtk::Box {
+pub(super) fn skeleton_rows(label: &'static str) -> gtk::Box {
     let group = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .accessible_role(gtk::AccessibleRole::Status)
@@ -14489,12 +14570,54 @@ fn error_callout_with(
     tertiary_action: impl Fn() + 'static,
     retry: impl Fn() + 'static,
 ) -> gtk::Box {
+    let heading = l10n::label(title);
+    let card = error_callout_parts(
+        heading,
+        detail,
+        tertiary,
+        tertiary_action,
+        Some(Box::new(retry)),
+    );
+    l10n::bind_accessible_label(&card, title);
+    card
+}
+
+/// A danger callout (spec §11) for a failure whose title is already translated, such as
+/// a refused Connect naming its client: the cause in one line, View log, and Retry when
+/// the action can run again.
+pub(super) fn action_error_callout(
+    title: &str,
+    cause: &str,
+    retry: Option<std::rc::Rc<dyn Fn()>>,
+) -> gtk::Box {
+    let heading = gtk::Label::new(Some(title));
+    let detail = gtk::Label::new(Some(cause));
+    detail.set_visible(!cause.is_empty());
+    let card = error_callout_parts(
+        heading,
+        detail,
+        crate::i18n::msg("View log"),
+        || {
+            let _ = crate::diagnostics_controller::open_gateway_log();
+        },
+        retry.map(|retry| Box::new(move || retry()) as Box<dyn Fn()>),
+    );
+    card.update_property(&[gtk::accessible::Property::Label(title)]);
+    card
+}
+
+fn error_callout_parts(
+    heading: gtk::Label,
+    detail: gtk::Label,
+    tertiary: &'static str,
+    tertiary_action: impl Fn() + 'static,
+    retry: Option<Box<dyn Fn()>>,
+) -> gtk::Box {
     // Announced like React's role="alert" ErrorCallout.
     let card = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .accessible_role(gtk::AccessibleRole::Alert)
         .build();
-    l10n::bind_accessible_label(&card, title);
     card.update_property(&[gtk::accessible::Property::Description(&detail.text())]);
     card.add_css_class("toolport-error-callout");
     let layout = gtk::Box::new(gtk::Orientation::Horizontal, 12);
@@ -14506,7 +14629,6 @@ fn error_callout_with(
     layout.append(&icon);
     let copy = gtk::Box::new(gtk::Orientation::Vertical, 4);
     copy.set_hexpand(true);
-    let heading = l10n::label(title);
     heading.set_xalign(0.0);
     heading.set_wrap(true);
     heading.add_css_class("heading");
@@ -14523,10 +14645,12 @@ fn error_callout_with(
     log.add_css_class("flat");
     log.connect_clicked(move |_| tertiary_action());
     actions.append(&log);
-    let button = l10n::button(crate::i18n::msg("Retry"));
-    button.add_css_class("toolport-secondary-action");
-    button.connect_clicked(move |_| retry());
-    actions.append(&button);
+    if let Some(retry) = retry {
+        let button = l10n::button(crate::i18n::msg("Retry"));
+        button.add_css_class("toolport-secondary-action");
+        button.connect_clicked(move |_| retry());
+        actions.append(&button);
+    }
     layout.append(&actions);
     let bin = adw::BreakpointBin::builder()
         .width_request(280)
@@ -14550,6 +14674,15 @@ fn error_callout_with(
     frame.set_width_request(320);
     card.append(&frame);
     card
+}
+
+/// A refused action shown on a client's details as a danger callout.
+#[derive(Clone)]
+pub(super) struct DetailError {
+    pub(super) client_id: String,
+    pub(super) title: String,
+    pub(super) cause: String,
+    pub(super) retry: Option<std::rc::Rc<dyn Fn()>>,
 }
 
 fn state_card(icon_name: &str, title: &'static str, body: &'static str, error: bool) -> gtk::Box {
@@ -14626,6 +14759,65 @@ mod tests {
         // Removed again: rescan once, then stop polling.
         assert!(watch.observe(None));
         assert!(!watch.polls());
+    }
+
+    /// Spec §11: a refused Connect or Disconnect on client details is a danger callout with
+    /// the cause, View log and Retry, and Retry runs the action again.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn a_refused_action_is_a_danger_callout_with_retry() {
+        adw::init().unwrap();
+        fn all(widget: &gtk::Widget) -> Vec<gtk::Widget> {
+            let mut out = vec![widget.clone()];
+            let mut child = widget.first_child();
+            while let Some(next) = child {
+                child = next.next_sibling();
+                out.extend(all(&next));
+            }
+            out
+        }
+        let retried = std::rc::Rc::new(std::cell::Cell::new(0));
+        let callout = {
+            let retried = retried.clone();
+            super::action_error_callout(
+                "Couldn't connect Cursor",
+                "the config is read-only",
+                Some(std::rc::Rc::new(move || retried.set(retried.get() + 1))),
+            )
+        };
+        assert!(callout.has_css_class("toolport-error-callout"));
+        assert_eq!(callout.accessible_role(), gtk::AccessibleRole::Alert);
+        let widgets = all(callout.upcast_ref());
+        let texts = widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .map(|l| l.text().to_string())
+            .collect::<Vec<_>>();
+        assert!(texts.contains(&"Couldn't connect Cursor".to_string()));
+        assert!(texts.contains(&"the config is read-only".to_string()));
+        let buttons = widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Button>())
+            .cloned()
+            .collect::<Vec<_>>();
+        let labels = buttons
+            .iter()
+            .map(|b| b.label().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["View log", "Retry"]);
+        assert!(buttons[0].has_css_class("flat"), "View log is tertiary");
+        assert!(
+            buttons[1].has_css_class("toolport-secondary-action"),
+            "Retry is secondary"
+        );
+        buttons[1].emit_clicked();
+        assert_eq!(retried.get(), 1);
+        // Without an action to repeat there is no Retry.
+        let plain = super::action_error_callout("Could not load client types.", "", None);
+        assert!(!all(plain.upcast_ref())
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Button>())
+            .any(|b| b.label().as_deref() == Some("Retry")));
     }
 
     #[test]

@@ -345,6 +345,8 @@
   "Couldn't clear activity: {value1}": "Impossible d'effacer l'activité : {value1}",
   "Couldn't clear override: {value0}": "Impossible d'effacer la dérogation : {value0}",
   "Couldn't connect.": "Impossible de se connecter.",
+  "Couldn't connect {client}": "Impossible de connecter {client}",
+  "Couldn't disconnect {client}": "Impossible de déconnecter {client}",
   "Couldn't copy to clipboard": "Impossible de copier dans le presse-papiers",
   "Couldn't copy; select the text and copy it manually.": "Copie impossible ; sélectionnez le texte et copiez-le manuellement.",
   "Couldn't export the log: {value1}": "Impossible d'exporter le journal : {value1}",

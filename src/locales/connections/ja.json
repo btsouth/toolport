@@ -345,6 +345,8 @@
   "Couldn't clear activity: {value1}": "アクティビティをクリアできませんでした: {value1}",
   "Couldn't clear override: {value0}": "オーバーライドをクリアできませんでした: {value0}",
   "Couldn't connect.": "接続できませんでした。",
+  "Couldn't connect {client}": "{client} を接続できませんでした",
+  "Couldn't disconnect {client}": "{client} を切断できませんでした",
   "Couldn't copy to clipboard": "クリップボードにコピーできませんでした",
   "Couldn't copy; select the text and copy it manually.": "コピーできませんでした。テキストを選択して手動でコピーしてください。",
   "Couldn't export the log: {value1}": "ログをエクスポートできませんでした: {value1}",

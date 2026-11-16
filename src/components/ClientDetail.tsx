@@ -382,11 +382,8 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         try {
           outcome = await uninstallGateway(client.id);
         } catch (refused) {
-          // Same inline error line and wording as the GTK shell.
-          setActionError({
-            clientId: client.id,
-            text: `${client.name}: ${String(refused)}`,
-          });
+          // Shown as the error callout, with the same wording as the GTK shell.
+          setActionError({ clientId: client.id, text: String(refused) });
           return;
         }
         // The disconnect already committed, even if loading notices later fails.
@@ -705,12 +702,13 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       )}
 
       {shownActionError && (
-        <p
-          role="alert"
-          className="select-text break-words toolport-alert border-destructive bg-destructive/8 px-3 py-2 text-sm text-destructive"
-        >
-          {shownActionError}
-        </p>
+        <ErrorCallout
+          className="select-text"
+          title={t("Couldn't disconnect {client}", { client: client.name })}
+          cause={shownActionError}
+          retrying={busy}
+          onRetry={() => void toggleInstall()}
+        />
       )}
 
       {showRestartNotice && (

@@ -345,6 +345,8 @@
   "Couldn't clear activity: {value1}": "无法清除活动：{value1}",
   "Couldn't clear override: {value0}": "无法清除覆盖：{value0}",
   "Couldn't connect.": "无法连接。",
+  "Couldn't connect {client}": "无法连接 {client}",
+  "Couldn't disconnect {client}": "无法断开 {client} 的连接",
   "Couldn't copy to clipboard": "无法复制到剪贴板",
   "Couldn't copy; select the text and copy it manually.": "无法复制。请选择文本并手动复制。",
   "Couldn't export the log: {value1}": "无法导出日志：{value1}",

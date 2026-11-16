@@ -1846,15 +1846,17 @@ mod tab_order_tests {
         // user opened another client before it failed.
         *page.details.selected.borrow_mut() = Some("codex".into());
         page.show_client_error("cursor", "Cursor: could not read its move record");
+        // A danger callout (spec §11), not an info notice.
+        assert!(page.detail_notice.borrow().is_none());
         assert_eq!(
-            page.detail_notice
+            page.detail_error
                 .borrow()
                 .as_ref()
-                .map(|(id, _, _)| id.clone()),
+                .map(|error| error.client_id.clone()),
             Some("cursor".to_string())
         );
         page.set_recovery_result("cursor", "Cursor: record deleted.".into(), true);
-        assert!(page.detail_notice.borrow().is_none());
+        assert!(page.detail_error.borrow().is_none());
         page.details.selected.borrow_mut().take();
         window.destroy();
     }

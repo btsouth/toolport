@@ -970,7 +970,7 @@ it("refreshes the committed disconnect even when recovery notices cannot be read
   expect(toastError).not.toHaveBeenCalled();
 });
 
-it("shows a refused disconnect inline with the client name, as GTK does", async () => {
+it("shows a refused disconnect as the danger callout, with Retry and View log", async () => {
   uninstallGateway.mockRejectedValue(
     "could not read /fixture/moved-servers.json: This recovery file is malformed.",
   );
@@ -987,11 +987,33 @@ it("shows a refused disconnect inline with the client name, as GTK does", async 
     within(screen.getByRole("dialog")).getByRole("button", { name: "Disconnect" }),
   );
   const alert = await screen.findByRole("alert");
-  expect(alert).toHaveTextContent(
-    /^.+: could not read \/fixture\/moved-servers\.json: This recovery file is malformed\.$/,
+  expect(alert).toHaveAttribute("data-slot", "status-card");
+  expect(alert).toHaveAttribute("data-variant", "danger");
+  expect(alert).not.toHaveClass("toolport-alert");
+  expect(alert).toHaveTextContent("Couldn't disconnect Claude Desktop");
+  expect(
+    within(alert).getByText(
+      "could not read /fixture/moved-servers.json: This recovery file is malformed.",
+    ),
+  ).toBeVisible();
+  expect(within(alert).getByRole("button", { name: "View log" })).toHaveAttribute(
+    "data-variant",
+    "ghost",
   );
   expect(screen.queryByText("Still connected until restart")).not.toBeInTheDocument();
   expect(toastError).not.toHaveBeenCalled();
+  // Retry repeats the disconnect that failed.
+  uninstallGateway.mockResolvedValue({
+    path: "/fixture/config",
+    restored: [],
+    warnings: [],
+  });
+  const retry = within(alert).getByRole("button", { name: "Retry" });
+  expect(retry).toHaveAttribute("data-variant", "outline");
+  await userEvent.click(retry);
+  await waitFor(() => expect(uninstallGateway).toHaveBeenCalledTimes(2));
+  expect(await screen.findByText("Still connected until restart")).toBeVisible();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
 
 it("clears a refused disconnect once that client's recovery succeeds, as GTK does", async () => {
@@ -1042,10 +1064,13 @@ it("clears a refused disconnect once that client's recovery succeeds, as GTK doe
   await userEvent.click(
     within(screen.getByRole("dialog")).getByRole("button", { name: "Disconnect" }),
   );
-  expect(await screen.findByRole("alert")).toHaveTextContent(
-    "Claude Desktop: could not read its move record",
-  );
-  await userEvent.click(await screen.findByRole("button", { name: "Retry" }));
+  const failed = await screen.findByRole("alert");
+  expect(failed).toHaveTextContent("could not read its move record");
+  // The recovery card's Retry, not the failed disconnect's.
+  const recoveryRetry = (await screen.findAllByRole("button", { name: "Retry" })).find(
+    (button) => !failed.contains(button),
+  )!;
+  await userEvent.click(recoveryRetry);
   await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
 });
 

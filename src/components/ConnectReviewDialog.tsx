@@ -1,6 +1,6 @@
 import { translate, useI18n } from "@/lib/i18n";
 import { useEffect, useRef, useState } from "react";
-import { Check, Loader2 } from "lucide-react";
+import { Check } from "lucide-react";
 import { migrateClient, previewClientSetup } from "@/lib/api";
 import type { ClientSetupReview, MigrateResult, Registry } from "@/lib/types";
 import { GatewaySettingsNotice } from "./GatewaySettingsNotice";
@@ -10,6 +10,8 @@ import {
   ImportReviewDialog,
   pathText,
 } from "./ImportReviewDialog";
+import { SkeletonRows } from "./ui/skeleton";
+import { ErrorCallout } from "./ui/status-card";
 import {
   Dialog,
   DialogContent,
@@ -182,26 +184,18 @@ export function ConnectReviewDialog({
               </details>
             </div>
           ) : error ? (
-            <>
-              <p role="alert" className="text-warning">
-                {error}
-              </p>
-              <DialogFooter>
-                <Button
-                  onClick={() => {
-                    setError("");
-                    setAttempt(attempt + 1);
-                  }}
-                >
-                  {t("Retry")}
-                </Button>
-              </DialogFooter>
-            </>
+            // Spec §11: the danger callout in place of the content.
+            <ErrorCallout
+              title={t("Couldn't read config")}
+              cause={error}
+              onRetry={() => {
+                setError("");
+                setAttempt(attempt + 1);
+              }}
+            />
           ) : (
-            <p>
-              <Loader2 className="inline size-4 animate-spin" />{" "}
-              {t("Reading client config...")}
-            </p>
+            // Spec §11: nothing for 300ms, then three skeleton rows.
+            <SkeletonRows label={t("Reading client config...")} />
           )}
           {result && (
             <DialogFooter>
@@ -227,9 +221,7 @@ export function ConnectReviewDialog({
         <GatewaySettingsNotice clientName={clientName} lines={review.gatewaySettings} />
       }
       title={t("Review and connect {value0}", { value0: clientName })}
-      confirmLabel={
-        busy ? t("Checking gateway...") : error ? t("Retry") : t("Connect to Toolport")
-      }
+      confirmLabel={error ? t("Retry") : t("Connect to Toolport")}
       description={
         force
           ? t(

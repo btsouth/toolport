@@ -1,5 +1,5 @@
 import { beforeEach, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import { useState } from "react";
 import userEvent from "@testing-library/user-event";
 import { ConnectReviewDialog } from "./ConnectReviewDialog";
@@ -144,7 +144,7 @@ it("puts Done in the right-aligned footer and dates the backup without seconds",
   expect(screen.getByText(`Backup saved ${expected}`)).toBeInTheDocument();
 });
 
-it("puts Retry in the footer after a failed check", async () => {
+it("shows a failed check as the danger callout with Retry and View log", async () => {
   api.previewClientSetup.mockRejectedValueOnce(new Error("config unreadable"));
   render(
     <ConnectReviewDialog
@@ -154,9 +154,20 @@ it("puts Retry in the footer after a failed check", async () => {
       onConnected={vi.fn()}
     />,
   );
-  expect(await screen.findByRole("alert")).toHaveTextContent("config unreadable");
-  const retry = screen.getByRole("button", { name: "Retry" });
-  expect(retry.closest('[data-slot="dialog-footer"]')).not.toBeNull();
+  const alert = await screen.findByRole("alert");
+  expect(alert).toHaveAttribute("data-slot", "status-card");
+  expect(alert).toHaveAttribute("data-variant", "danger");
+  expect(alert).toHaveTextContent("Couldn't read config");
+  expect(alert).toHaveTextContent("config unreadable");
+  expect(within(alert).getByRole("button", { name: "View log" })).toHaveAttribute(
+    "data-variant",
+    "ghost",
+  );
+  const retry = within(alert).getByRole("button", { name: "Retry" });
+  expect(retry).toHaveAttribute("data-variant", "outline");
+  expect(
+    screen.queryByText("config unreadable", { selector: ".text-warning" }),
+  ).toBeNull();
   await userEvent.click(retry);
   expect(await screen.findByRole("button", { name: /one/ })).toBeVisible();
 });
@@ -296,15 +307,32 @@ it("keeps focus in the dialog and turns Close off while the check runs", async (
   await screen.findByRole("button", { name: /one/ });
   const connect = screen.getByRole("button", { name: "Connect to Toolport" });
   await userEvent.click(connect);
-  expect(
-    await screen.findByRole("button", { name: "Checking gateway..." }),
-  ).toBeDisabled();
+  expect(await screen.findByRole("button", { name: "Checking…" })).toBeDisabled();
   const dialog = screen.getByRole("dialog");
   expect(dialog).toHaveFocus();
   expect(screen.getByRole("button", { name: "Close" })).toBeDisabled();
   expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
   await userEvent.keyboard("{Escape}");
   expect(screen.getByRole("dialog")).toBeInTheDocument();
+});
+
+it("shows nothing for 300ms while reading the config, then three skeleton rows", async () => {
+  api.previewClientSetup.mockReturnValue(new Promise(() => {}));
+  render(
+    <ConnectReviewDialog
+      clientId="fixture"
+      clientName="Fixture"
+      onClose={vi.fn()}
+      onConnected={vi.fn()}
+    />,
+  );
+  const dialog = screen.getByRole("dialog");
+  expect(dialog.querySelector(".animate-spin")).toBeNull();
+  const loading = screen.getByRole("status", { name: "Reading client config..." });
+  expect(loading).toHaveAttribute("data-slot", "skeleton-rows");
+  expect(loading).toHaveClass("invisible");
+  await waitFor(() => expect(loading).not.toHaveClass("invisible"));
+  expect(loading.querySelectorAll(":scope > div")).toHaveLength(3);
 });
 
 it("sizes both connect dialogs 512px with 17/600 titles, chevron folds and mono paths", async () => {

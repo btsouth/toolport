@@ -345,6 +345,8 @@
   "Couldn't clear activity: {value1}": "Não foi possível limpar a atividade: {value1}",
   "Couldn't clear override: {value0}": "Não foi possível limpar a substituição: {value0}",
   "Couldn't connect.": "Não foi possível conectar.",
+  "Couldn't connect {client}": "Não foi possível conectar {client}",
+  "Couldn't disconnect {client}": "Não foi possível desconectar {client}",
   "Couldn't copy to clipboard": "Não foi possível copiar para a área de transferência",
   "Couldn't copy; select the text and copy it manually.": "Não foi possível copiar; selecione o texto e copie manualmente.",
   "Couldn't export the log: {value1}": "Não foi possível exportar o log: {value1}",

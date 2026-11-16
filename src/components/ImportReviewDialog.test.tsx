@@ -549,4 +549,14 @@ describe("ImportReviewDialog spec details", () => {
     expect(screen.queryByRole("heading", { name: "Calendar credentials" })).toBeNull();
     expect(screen.getByText("Ready for connection")).toBeInTheDocument();
   });
+
+  it("puts the only spinner on the working confirm button", () => {
+    renderDialog({ busy: true, confirmLabel: "Connect to Toolport" });
+    const confirm = screen.getByRole("button", { name: "Checking…" });
+    expect(confirm).toBeDisabled();
+    expect(confirm.querySelector(".animate-spin")).not.toBeNull();
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.querySelectorAll(".animate-spin")).toHaveLength(1);
+    expect(screen.getByText("Checking stripe...")).toBeVisible();
+  });
 });

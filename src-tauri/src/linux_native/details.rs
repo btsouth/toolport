@@ -541,6 +541,18 @@ pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
         ));
     }
     page.append_recoveries(&body, Some(&client.id));
+    if let Some(error) = page
+        .detail_error
+        .borrow()
+        .as_ref()
+        .filter(|error| error.client_id == client.id)
+    {
+        body.append(&super::action_error_callout(
+            &error.title,
+            &error.cause,
+            error.retry.clone(),
+        ));
+    }
     if let Some((id, title, notice)) = page.detail_notice.borrow().as_ref() {
         if id == &client.id {
             let p = page.clone();

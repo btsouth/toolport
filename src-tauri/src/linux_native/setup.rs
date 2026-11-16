@@ -61,6 +61,25 @@ const REVIEW_WIDTH: i32 = 512;
 /// The tallest the review's body grows before it scrolls.
 const REVIEW_MAX_BODY_HEIGHT: i32 = 600;
 
+/// The confirm while a check runs: a spinner and "Checking…", insensitive. Spec §11 keeps
+/// spinners inside the button that is working.
+fn show_working(button: &gtk::Button) {
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    content.set_halign(gtk::Align::Center);
+    let spinner = gtk::Spinner::new();
+    spinner.start();
+    content.append(&spinner);
+    content.append(&l10n::label(crate::i18n::msg("Checking…")));
+    button.set_child(Some(&content));
+    button.set_sensitive(false);
+}
+
+/// Puts `label` back on a button `show_working` changed.
+fn end_working(button: &gtk::Button, label: &'static str) {
+    button.set_child(None::<&gtk::Widget>);
+    l10n::bind_text(button, label);
+}
+
 /// Asks for one credential value in a sheet with the spec §5 footer (Cancel, then "Use for
 /// connection"), in place of a message dialog with a response strip. Esc cancels.
 fn credential_prompt(
@@ -608,9 +627,6 @@ pub(super) fn review_with_notice(
         }
         tag.add_css_class("dim-label");
         row.add_suffix(&tag);
-        let spinner = gtk::Spinner::new();
-        spinner.set_visible(false);
-        row.add_suffix(&spinner);
         let state = if !item.credentials.is_empty() {
             let found = item.credentials.iter().all(|env| env.present);
             let required_found = item
@@ -805,7 +821,6 @@ pub(super) fn review_with_notice(
         selected.push((
             check,
             unsupported,
-            spinner,
             item.key,
             item.name,
             row_error,
@@ -892,8 +907,8 @@ pub(super) fn review_with_notice(
         }
         let chosen = selected
             .iter()
-            .filter(|(check, _, _, _, _, _, _)| check.is_active())
-            .map(|(_, _, _, key, _, _, _)| key.clone())
+            .filter(|(check, _, _, _, _, _)| check.is_active())
+            .map(|(_, _, key, _, _, _)| key.clone())
             .collect::<Vec<_>>();
         let mut choices =
             std::collections::BTreeMap::<String, std::collections::BTreeMap<String, bool>>::new();
@@ -908,15 +923,18 @@ pub(super) fn review_with_notice(
         busy.set(true);
         button.set_sensitive(false);
         cancel.set_sensitive(false);
-        for (check, _row, spinner, _, _, row_error, error_chip) in selected.iter() {
-            row_error.set_visible(false);
+        for (check, _row, _, name, row_error, error_chip) in selected.iter() {
             error_chip.set_visible(false);
             check.set_sensitive(false);
-            spinner.set_visible(check.is_active());
-            spinner.set_spinning(check.is_active());
+            // Plain text under each entry being checked, as React's review shows; the
+            // spinner stays in the confirm.
+            row_error.remove_css_class("toolport-inline-error");
+            row_error.add_css_class("toolport-muted");
+            row_error.set_label(&crate::i18n::trf("Checking {name}...", &[("name", name)]));
+            row_error.set_visible(check.is_active());
         }
-        l10n::bind_text(&feedback, "Checking selected servers...");
-        feedback.set_visible(true);
+        // The confirm is the working button: the only place a spinner shows (spec §11).
+        show_working(button);
         let (action, finished, selected, busy, completed) = (
             action.clone(),
             finished.clone(),
@@ -943,18 +961,19 @@ pub(super) fn review_with_notice(
             for (name, key, choice) in credential_choices.iter() {
                 choice.set_sensitive(
                     !key.starts_with("__")
-                        && selected.iter().any(|(_, unsupported, _, _, server, _, _)| {
+                        && selected.iter().any(|(_, unsupported, _, server, _, _)| {
                             server == name && !unsupported
                         }),
                 );
             }
             cancel.set_sensitive(true);
             button.set_sensitive(true);
-            for (check, unsupported, spinner, _, _, row_error, _) in selected.iter() {
+            end_working(&button, confirm_label);
+            for (check, unsupported, _, _, row_error, _) in selected.iter() {
                 row_error.set_visible(false);
+                row_error.remove_css_class("toolport-muted");
+                row_error.add_css_class("toolport-inline-error");
                 check.set_sensitive(!unsupported);
-                spinner.set_spinning(false);
-                spinner.set_visible(false);
             }
             match result {
                 Ok(Ok(outcome)) => {
@@ -1148,7 +1167,7 @@ pub(super) fn review_with_notice(
                     l10n::bind_text(&button, "Retry");
                     refresh_confirm();
                     let mut has_row_error = false;
-                    for (_, _, _, _, name, row_error, error_chip) in selected.iter() {
+                    for (_, _, _, name, row_error, error_chip) in selected.iter() {
                         if error.contains(name) {
                             has_row_error = true;
                             error_chip.set_visible(true);
@@ -1182,19 +1201,86 @@ pub(super) fn connect(
     finished: impl Fn() + 'static,
     credential_page: Option<super::ServerPage>,
 ) {
+    connect_with(
+        parent,
+        client_id,
+        profile,
+        force,
+        std::rc::Rc::new(finished),
+        credential_page,
+    );
+}
+
+fn connect_with(
+    parent: &gtk::Window,
+    client_id: String,
+    profile: Option<String>,
+    force: bool,
+    finished: std::rc::Rc<dyn Fn()>,
+    credential_page: Option<super::ServerPage>,
+) {
     let parent = parent.clone();
     gtk::glib::spawn_future_local(async move {
         let id = client_id.clone();
-        let preview = gtk::gio::spawn_blocking(move || {
-            (
-                crate::registry_controller::preview_client_setup(&id),
-                review_client_name(&id),
-            )
-        })
-        .await
-        .map(|(preview, name)| preview.map(|preview| (preview, name)));
+        let client_name = gtk::gio::spawn_blocking(move || review_client_name(&id))
+            .await
+            .unwrap_or_else(|_| crate::i18n::tr("Client"));
+        let title = connect_review_title(&client_name);
+        // The loading and error sheets are titled as React's are.
+        let sheet_title = crate::i18n::trf("Connect {value0}", &[("value0", &client_name)]);
+        // Spec §11 Loading: nothing for the first 300ms, then the review's sheet with
+        // three skeleton rows until the preview is ready. Cancel there drops the review.
+        let cancelled = std::rc::Rc::new(std::cell::Cell::new(false));
+        let loading = std::rc::Rc::new(std::cell::RefCell::new(None::<adw::Window>));
+        let timer = std::rc::Rc::new(std::cell::Cell::new(None::<gtk::glib::SourceId>));
+        timer.set(Some({
+            let (parent, title, cancelled, loading, timer) = (
+                parent.clone(),
+                sheet_title.clone(),
+                cancelled.clone(),
+                loading.clone(),
+                timer.clone(),
+            );
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+                timer.take();
+                *loading.borrow_mut() = Some(loading_sheet(&parent, &title, cancelled));
+            })
+        }));
+        let id = client_id.clone();
+        let preview =
+            gtk::gio::spawn_blocking(move || crate::registry_controller::preview_client_setup(&id))
+                .await;
+        if let Some(pending) = timer.take() {
+            pending.remove();
+        }
+        if let Some(sheet) = loading.borrow_mut().take() {
+            sheet.close();
+        }
+        if cancelled.get() {
+            return;
+        }
+        // Retry from the error callout runs the whole review again.
+        let retry: std::rc::Rc<dyn Fn()> = {
+            let (parent, client_id, profile, finished, credential_page) = (
+                parent.clone(),
+                client_id.clone(),
+                profile.clone(),
+                finished.clone(),
+                credential_page.clone(),
+            );
+            std::rc::Rc::new(move || {
+                connect_with(
+                    &parent,
+                    client_id.clone(),
+                    profile.clone(),
+                    force,
+                    finished.clone(),
+                    credential_page.clone(),
+                )
+            })
+        };
         match preview {
-            Ok(Ok((preview, client_name))) => {
+            Ok(Ok(preview)) => {
                 let disclosure = crate::i18n::trf(
                     if force {
                         crate::i18n::msg("Config: {value0}\nBackup directory: {value1}\nSelected entries move after gateway verification. Unchecked entries and plugin servers stay in place. This replaces the customized Toolport entry.")
@@ -1209,7 +1295,7 @@ pub(super) fn connect(
                 let notice = gateway_settings_notice(&client_name, &preview.gateway_settings);
                 review_with_notice(
                     &parent,
-                    &connect_review_title(&client_name),
+                    &title,
                     preview.items,
                     &disclosure,
                     Some(connect_review_lede(force)),
@@ -1241,34 +1327,105 @@ pub(super) fn connect(
                             }),
                         })
                     },
-                    finished,
+                    move || finished(),
                     credential_page,
                 );
             }
-            Ok(Err(error)) => review(
-                &parent,
-                &crate::i18n::tr("Could not review setup"),
-                Vec::new(),
-                &error,
-                crate::i18n::msg("Close"),
-                false,
-                |_, _, _| Err(crate::i18n::tr("Fix the client config and retry.")),
-                || {},
-                None,
-            ),
-            Err(_) => review(
-                &parent,
-                &crate::i18n::tr("Could not review setup"),
-                Vec::new(),
-                &crate::i18n::tr("Client review stopped."),
-                crate::i18n::msg("Close"),
-                false,
-                |_, _, _| Err(crate::i18n::tr("Retry from Clients.")),
-                || {},
-                None,
-            ),
+            Ok(Err(error)) => {
+                error_sheet(&parent, &sheet_title, &error, retry);
+            }
+            Err(_) => {
+                error_sheet(
+                    &parent,
+                    &sheet_title,
+                    &crate::i18n::tr("Client review stopped."),
+                    retry,
+                );
+            }
         }
     });
+}
+
+/// A small sheet for the review's other states, as React's: its dialog header (left
+/// title and a close button) over `content`. Esc closes it.
+fn state_sheet(parent: &gtk::Window, title: &str, content: &gtk::Widget) -> adw::Window {
+    let sheet = adw::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title(title)
+        .default_width(REVIEW_WIDTH)
+        .default_height(-1)
+        .build();
+    let heading = gtk::Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .build();
+    let (header, _) = dialog_header(&sheet, &heading);
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    body.set_margin_top(12);
+    body.set_margin_bottom(24);
+    body.set_margin_start(24);
+    body.set_margin_end(24);
+    body.append(content);
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.append(&header);
+    root.append(&body);
+    sheet.set_content(Some(&root));
+    super::close_on_escape(&sheet);
+    sheet
+}
+
+/// The review while its preview loads: three skeleton rows. Closing it drops the review.
+fn loading_sheet(
+    parent: &gtk::Window,
+    title: &str,
+    cancelled: std::rc::Rc<std::cell::Cell<bool>>,
+) -> adw::Window {
+    let rows = super::skeleton_rows(crate::i18n::msg("Checking…"));
+    // The sheet itself only opens after 300ms, so the rows show at once.
+    rows.set_opacity(1.0);
+    let sheet = state_sheet(parent, title, rows.upcast_ref());
+    sheet.set_widget_name("toolport-setup-loading");
+    // Closing it any way but by the preview finishing drops the review.
+    sheet.connect_close_request(move |_| {
+        cancelled.set(true);
+        gtk::glib::Propagation::Proceed
+    });
+    sheet.present();
+    sheet
+}
+
+/// A review that could not start: the spec §11 danger callout with the cause, View log
+/// and Retry.
+fn error_sheet(
+    parent: &gtk::Window,
+    title: &str,
+    cause: &str,
+    retry: std::rc::Rc<dyn Fn()>,
+) -> adw::Window {
+    let holder = std::rc::Rc::new(std::cell::RefCell::new(
+        None::<gtk::glib::WeakRef<adw::Window>>,
+    ));
+    let callout = super::action_error_callout(
+        &crate::i18n::tr("Couldn't read config"),
+        cause,
+        Some({
+            let holder = holder.clone();
+            std::rc::Rc::new(move || {
+                if let Some(sheet) = holder.borrow().as_ref().and_then(|weak| weak.upgrade()) {
+                    sheet.close();
+                }
+                retry();
+            })
+        }),
+    );
+    let sheet = state_sheet(parent, title, callout.upcast_ref());
+    sheet.set_widget_name("toolport-setup-error");
+    *holder.borrow_mut() = Some(sheet.downgrade());
+    sheet.present();
+    sheet
 }
 
 #[cfg(test)]
@@ -2143,6 +2300,28 @@ mod tests {
         gtk::glib::MainLoop::new(None, false).run();
     }
 
+    /// Spec §11: the confirm is the only working control while a check runs. It shows a
+    /// spinner and "Checking…", then its own label again.
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn the_confirm_is_the_working_button() {
+        adw::init().unwrap();
+        let button = l10n::button("Connect to Toolport");
+        show_working(&button);
+        assert!(!button.is_sensitive());
+        let inside = descendants(button.upcast_ref());
+        assert!(inside.iter().any(|w| w.is::<gtk::Spinner>()));
+        assert!(inside
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .any(|l| l.text() == "Checking…"));
+        end_working(&button, "Connect to Toolport");
+        assert_eq!(button.label().as_deref(), Some("Connect to Toolport"));
+        assert!(!descendants(button.upcast_ref())
+            .iter()
+            .any(|w| w.is::<gtk::Spinner>()));
+    }
+
     /// Spec §5: the credential prompt is a sheet with a right-aligned footer, Cancel then
     /// "Use for connection", not a message dialog's response strip.
     #[test]
@@ -2210,5 +2389,78 @@ mod tests {
         assert_eq!(saved.borrow().as_deref(), Some("secret-value"));
         assert!(!prompt.is_visible(), "saving closes the sheet");
         owner.destroy();
+    }
+
+    /// Spec §11: a review that can't start is a danger callout with the cause, View log
+    /// and Retry, and Retry runs the review again; a slow preview shows skeleton rows, and
+    /// closing them drops the review. Both are titled and closed as React's are.
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn review_waits_and_failures_follow_the_spec() {
+        adw::init().unwrap();
+        let parent = gtk::Window::new();
+        let retried = std::rc::Rc::new(std::cell::Cell::new(0));
+        let sheet = {
+            let retried = retried.clone();
+            error_sheet(
+                &parent,
+                "Connect Cursor",
+                "expected value at line 1 column 3",
+                std::rc::Rc::new(move || retried.set(retried.get() + 1)),
+            )
+        };
+        let widgets = descendants(sheet.upcast_ref());
+        let callout = widgets
+            .iter()
+            .find(|w| w.has_css_class("toolport-error-callout"))
+            .expect("a danger callout");
+        assert_eq!(callout.accessible_role(), gtk::AccessibleRole::Alert);
+        let texts = descendants(callout)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .map(|l| l.text().to_string())
+            .collect::<Vec<_>>();
+        assert!(texts.contains(&"Couldn't read config".to_string()));
+        assert!(texts.contains(&"expected value at line 1 column 3".to_string()));
+        let close_button = |widgets: &[gtk::Widget]| {
+            assert!(!widgets
+                .iter()
+                .any(|w| w.has_css_class("toolport-dialog-footer")));
+            widgets
+                .iter()
+                .filter_map(|w| w.downcast_ref::<gtk::Button>())
+                .find(|b| b.icon_name().as_deref() == Some("window-close-symbolic"))
+                .expect("the header's close button")
+                .clone()
+        };
+        close_button(&widgets);
+        assert!(widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .any(|l| l.text() == "Connect Cursor" && l.has_css_class("toolport-dialog-title")));
+        let retry = descendants(callout)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .find(|b| b.label().as_deref() == Some("Retry"))
+            .unwrap();
+        retry.emit_clicked();
+        assert_eq!(retried.get(), 1);
+        assert!(!sheet.is_visible(), "Retry replaces the sheet");
+
+        let cancelled = std::rc::Rc::new(std::cell::Cell::new(false));
+        let loading = loading_sheet(&parent, "Connect Cursor", cancelled.clone());
+        let widgets = descendants(loading.upcast_ref());
+        let skeleton = widgets
+            .iter()
+            .find(|w| w.has_css_class("toolport-skeleton-group"))
+            .expect("skeleton rows");
+        assert_eq!(skeleton.opacity(), 1.0, "the sheet itself waited 300ms");
+        assert!(
+            !widgets.iter().any(|w| w.is::<gtk::Spinner>()),
+            "no spinner"
+        );
+        close_button(&widgets).emit_clicked();
+        assert!(cancelled.get(), "closing drops the review");
+        parent.destroy();
     }
 }

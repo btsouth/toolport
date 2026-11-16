@@ -345,6 +345,8 @@
   "Couldn't clear activity: {value1}": "Aktivität konnte nicht gelöscht werden: {value1}",
   "Couldn't clear override: {value0}": "Überschreibung konnte nicht gelöscht werden: {value0}",
   "Couldn't connect.": "Es konnte keine Verbindung hergestellt werden.",
+  "Couldn't connect {client}": "{client} konnte nicht verbunden werden",
+  "Couldn't disconnect {client}": "Die Verbindung zu {client} konnte nicht getrennt werden",
   "Couldn't copy to clipboard": "Kopieren in die Zwischenablage fehlgeschlagen",
   "Couldn't copy; select the text and copy it manually.": "Kopieren fehlgeschlagen; markiere den Text und kopiere ihn manuell.",
   "Couldn't export the log: {value1}": "Das Protokoll konnte nicht exportiert werden: {value1}",

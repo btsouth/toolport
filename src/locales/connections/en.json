@@ -345,6 +345,8 @@
   "Couldn't clear activity: {value1}": "Couldn't clear activity: {value1}",
   "Couldn't clear override: {value0}": "Couldn't clear override: {value0}",
   "Couldn't connect.": "Couldn't connect.",
+  "Couldn't connect {client}": "Couldn't connect {client}",
+  "Couldn't disconnect {client}": "Couldn't disconnect {client}",
   "Couldn't copy to clipboard": "Couldn't copy to clipboard",
   "Couldn't copy; select the text and copy it manually.": "Couldn't copy; select the text and copy it manually.",
   "Couldn't export the log: {value1}": "Couldn't export the log: {value1}",
