@@ -556,8 +556,18 @@ fn insert_action(actions: &gtk::FlowBox, button: &gtk::Button) {
 }
 
 impl ClientPage {
+    /// Lists from the recovery files only; it never contacts the credential
+    /// store, so it is safe on the UI thread.
     pub(super) fn reload_recoveries(&self) {
-        match crate::clients::recovery::list() {
+        self.set_recoveries(crate::clients::recovery::list());
+    }
+
+    /// Show rows the client scan already listed on its worker thread.
+    pub(super) fn set_recoveries(
+        &self,
+        rows: Result<Vec<crate::clients::recovery::ClientRecovery>, String>,
+    ) {
+        match rows {
             Ok(records) => *self.recoveries.borrow_mut() = records,
             Err(error) => self.show_error(&error),
         }
@@ -1070,6 +1080,28 @@ impl ClientPage {
 
 #[cfg(test)]
 mod tests {
+    /// F5: the recovery card's labels re-read their text on the GTK main
+    /// thread. With a locked keyring that must make no credential-store call,
+    /// so it can never wait on (or raise) an unlock prompt.
+    #[test]
+    fn card_labels_read_their_text_without_the_credential_store() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let card =
+                crate::clients::recovery::locked_card_fixture("cursor", &data.join("gtk.json"));
+            let mut texts = Vec::new();
+            let calls = crate::clients::backup_vault::fake::locked_store(
+                crate::clients::backup_vault::Unlock::StillLocked,
+                || {
+                    texts.push(current_text(&card.id, |r| &r.message, "fallback"));
+                    texts.push(current_text(&card.id, |r| &r.instructions, "fallback"));
+                },
+            );
+            assert_eq!(calls, Vec::<String>::new(), "card text made store calls");
+            assert_eq!(texts, vec![card.message.clone(), card.instructions.clone()]);
+        });
+    }
+
     #[test]
     #[ignore = "requires an isolated GTK desktop"]
     fn nested_recovery_lists_keep_their_bounded_content_height() {

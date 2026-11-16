@@ -1,0 +1,295 @@
+//! Every credential-store call client recovery makes goes through here.
+//!
+//! Reads use `secrets::backup_secret_status`, which never asks for an unlock.
+//! Writes go through the ordinary store, which does ask on Linux when the
+//! keyring is locked, so work nobody asked for (the start-up client refresh, a
+//! page listing) runs inside [`noninteractive`] and refuses a write to a locked
+//! keyring instead. The one place an unlock prompt is wanted is
+//! [`request_unlock`], called only from a user's Retry.
+use crate::secrets::BackupSecretError;
+use std::cell::Cell;
+
+thread_local! {
+    static NONINTERACTIVE: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Run `f` with every store write in it refused while the keyring is locked.
+pub(crate) fn noninteractive<T>(f: impl FnOnce() -> T) -> T {
+    struct Leave;
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            NONINTERACTIVE.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+    NONINTERACTIVE.with(|depth| depth.set(depth.get() + 1));
+    let _leave = Leave;
+    f()
+}
+
+fn is_noninteractive() -> bool {
+    NONINTERACTIVE.with(|depth| depth.get() > 0)
+}
+
+/// The error text a locked keyring leaves on a failed recovery or refresh.
+pub(crate) fn locked_error() -> String {
+    BackupSecretError::Locked.to_string()
+}
+
+/// True when `error` came from a locked keyring rather than a real failure.
+pub(crate) fn is_locked_error(error: &str) -> bool {
+    error.contains(&locked_error())
+}
+
+pub(crate) fn status(server: &str, key: &str) -> Result<Option<String>, BackupSecretError> {
+    #[cfg(test)]
+    if let Some(state) = fake::read(server, key) {
+        return state;
+    }
+    crate::secrets::backup_secret_status(server, key)
+}
+
+pub(crate) fn read(server: &str, key: &str) -> Result<Option<String>, String> {
+    #[cfg(test)]
+    if let Some(state) = fake::read(server, key) {
+        return state.map_err(|error| error.to_string());
+    }
+    crate::secrets::get_backup_secret_result(server, key)
+}
+
+pub(crate) fn write(server: &str, key: &str, value: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(result) = fake::write(server, key, is_noninteractive()) {
+        return result;
+    }
+    if is_noninteractive() && store_locked() {
+        return Err(locked_error());
+    }
+    crate::secrets::set_backup_secret(server, key, value)
+}
+
+pub(crate) fn delete(server: &str, key: &str, discard_all: bool) -> Result<(), BackupSecretError> {
+    #[cfg(test)]
+    if let Some(result) = fake::delete(server, key) {
+        return result;
+    }
+    crate::secrets::delete_backup_secret_copies_status(server, key, discard_all)
+}
+
+/// Whether the keyring a new item would go to is locked, without asking to
+/// unlock it. Only Linux's Secret Service prompts on a write; other stores
+/// answer for themselves.
+pub(crate) fn store_locked() -> bool {
+    #[cfg(test)]
+    if let Some(locked) = fake::locked() {
+        return locked;
+    }
+    if !uses_secret_service() {
+        return false;
+    }
+    secret_service::default_locked().unwrap_or(false)
+}
+
+/// Linux keeps saved copies in the Secret Service unless the encrypted file
+/// vault is in use (`TOOLPORT_SECRET_KEY`, as `secrets` decides it).
+fn uses_secret_service() -> bool {
+    cfg!(target_os = "linux")
+        && crate::brand::env_var("TOOLPORT_SECRET_KEY", "CONDUIT_SECRET_KEY")
+            .is_none_or(|key| key.is_empty())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unlock {
+    /// Nothing was locked, or the user unlocked it.
+    Open,
+    /// The prompt was cancelled or failed; the keyring is still locked.
+    StillLocked,
+}
+
+/// Ask the desktop to unlock the keyring. Blocks while its prompt is open, so
+/// call it off the UI thread, and only for an action the user chose.
+pub(crate) fn request_unlock() -> Unlock {
+    #[cfg(test)]
+    if let Some(answer) = fake::unlock() {
+        return answer;
+    }
+    if !uses_secret_service() {
+        return Unlock::Open;
+    }
+    match secret_service::unlock() {
+        Ok(()) if !store_locked() => Unlock::Open,
+        _ => Unlock::StillLocked,
+    }
+}
+
+/// After a user unlocked the keyring, finish the client refreshes start-up
+/// deferred while it was locked, off the caller's thread.
+pub(crate) fn after_unlock() {
+    #[cfg(test)]
+    if fake::record("refresh deferred client configs") {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("toolport-client-refresh".into())
+        .spawn(|| {
+            super::refresh_stale_client_configs();
+        });
+}
+
+#[cfg(target_os = "linux")]
+mod secret_service {
+    use dbus_secret_service::{EncryptionType, SecretService};
+
+    /// How long a Retry waits on the unlock prompt before giving up on it.
+    const PROMPT_SECONDS: u64 = 300;
+    /// Service attribute the vault stores Toolport's items under.
+    const SERVICE: &str = "conduit-mcp";
+
+    /// A plain session: no secret crosses it and no DH negotiation runs, so it
+    /// cannot race the encrypted sessions `secrets` serializes. The file lock
+    /// still keeps it from overlapping the gateway's session setup.
+    fn connect(prompt_seconds: u64) -> Option<SecretService> {
+        let _across_processes = crate::registry::conduit_dir().and_then(|dir| {
+            crate::registry::lock_at_for(
+                &dir.join("secret-service"),
+                std::time::Duration::from_millis(2500),
+            )
+            .ok()
+        });
+        SecretService::connect_with_max_prompt_timeout(EncryptionType::Plain, prompt_seconds).ok()
+    }
+
+    /// Reads the Locked property only; never asks for an unlock.
+    pub(super) fn default_locked() -> Option<bool> {
+        let service = connect(0)?;
+        let collection = service.get_default_collection().ok()?;
+        collection.is_locked().ok()
+    }
+
+    pub(super) fn unlock() -> Result<(), ()> {
+        let service = connect(PROMPT_SECONDS).ok_or(())?;
+        if let Ok(collection) = service.get_default_collection() {
+            if collection.is_locked().map_err(|_| ())? {
+                collection.unlock().map_err(|_| ())?;
+            }
+        }
+        // Saved copies can also sit in another collection.
+        let found = service
+            .search_items(std::collections::HashMap::from([("service", SERVICE)]))
+            .map_err(|_| ())?;
+        if !found.locked.is_empty() {
+            service
+                .unlock_all(&found.locked.iter().collect::<Vec<_>>())
+                .map_err(|_| ())?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod secret_service {
+    pub(super) fn default_locked() -> Option<bool> {
+        None
+    }
+    pub(super) fn unlock() -> Result<(), ()> {
+        Ok(())
+    }
+}
+
+/// A locked keyring for tests. Inside [`fake::locked_store`] reads answer
+/// `Locked` without touching the store, writes fail as a locked store would
+/// (and say whether they would have prompted), and every call is recorded.
+#[cfg(test)]
+pub(crate) mod fake {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct Store {
+        locked: bool,
+        unlock_answer: Option<Unlock>,
+        calls: Vec<String>,
+    }
+    thread_local! {
+        static STORE: RefCell<Option<Store>> = const { RefCell::new(None) };
+    }
+
+    fn with<T>(f: impl FnOnce(&mut Store) -> T) -> Option<T> {
+        STORE.with(|slot| slot.borrow_mut().as_mut().map(f))
+    }
+
+    /// Runs `test` against a locked store; `unlock` is what the unlock prompt
+    /// answers (`Open` unlocks the fake). Returns the calls made.
+    pub(crate) fn locked_store(unlock: Unlock, test: impl FnOnce()) -> Vec<String> {
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                STORE.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        STORE.with(|slot| {
+            *slot.borrow_mut() = Some(Store {
+                locked: true,
+                unlock_answer: Some(unlock),
+                calls: Vec::new(),
+            })
+        });
+        let _clear = Clear;
+        test();
+        with(|store| std::mem::take(&mut store.calls)).unwrap_or_default()
+    }
+
+    pub(super) fn read(
+        _server: &str,
+        key: &str,
+    ) -> Option<Result<Option<String>, BackupSecretError>> {
+        with(|store| {
+            store.calls.push(format!("read {key}"));
+            store.locked.then_some(Err(BackupSecretError::Locked))
+        })
+        .flatten()
+    }
+
+    pub(super) fn write(_server: &str, key: &str, quiet: bool) -> Option<Result<(), String>> {
+        with(|store| {
+            if !store.locked {
+                store.calls.push(format!("write {key}"));
+                return None;
+            }
+            if quiet {
+                store.calls.push(format!("refused write {key}"));
+            } else {
+                // A real write to a locked Secret Service raises the prompt.
+                store.calls.push(format!("prompting write {key}"));
+            }
+            Some(Err(locked_error()))
+        })
+        .flatten()
+    }
+
+    pub(super) fn delete(_server: &str, key: &str) -> Option<Result<(), BackupSecretError>> {
+        with(|store| {
+            store.calls.push(format!("delete {key}"));
+            store.locked.then_some(Err(BackupSecretError::Locked))
+        })
+        .flatten()
+    }
+
+    pub(super) fn record(call: &str) -> bool {
+        with(|store| store.calls.push(call.into())).is_some()
+    }
+
+    pub(super) fn locked() -> Option<bool> {
+        with(|store| store.locked)
+    }
+
+    pub(super) fn unlock() -> Option<Unlock> {
+        with(|store| {
+            store.calls.push("unlock prompt".into());
+            let answer = store.unlock_answer.unwrap_or(Unlock::StillLocked);
+            if answer == Unlock::Open {
+                store.locked = false;
+            }
+            answer
+        })
+    }
+}

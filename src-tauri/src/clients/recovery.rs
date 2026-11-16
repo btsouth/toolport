@@ -735,12 +735,49 @@ pub struct RecoveryAttempt {
     pub message: String,
     pub pending: Option<ClientRecovery>,
 }
+const STILL_LOCKED: &str = crate::i18n::msg(
+    "Your keyring is still locked, so nothing was restored. Unlock it and choose Retry again.",
+);
+/// Shared Retry result when the keyring stayed locked, in every shell.
+pub fn still_locked_message() -> String {
+    crate::i18n::format_message(STILL_LOCKED, &[])
+}
+/// Retry is the one recovery action that asks to unlock the keyring: the user
+/// chose it, and it runs on a worker thread in both shells. A cancelled or
+/// failed prompt is reported in plain words, never as a tally of zeros.
 pub fn retry_with_report(id: &str) -> Result<RecoveryAttempt, String> {
     let before = find(id)?.notice;
+    let mut unlocked = false;
+    if before.can_discard && before.can_retry && backup_vault::store_locked() {
+        match backup_vault::request_unlock() {
+            backup_vault::Unlock::StillLocked => {
+                let pending = list()?.into_iter().find(|r| r.id == before.id);
+                return Ok(RecoveryAttempt {
+                    remaining: pending.as_ref().map_or(0, |r| r.missing.len()),
+                    message: still_locked_message(),
+                    restored: 0,
+                    accounted: 0,
+                    id: before.id,
+                    client_id: before.client_id,
+                    client_name: before.client_name,
+                    pending,
+                });
+            }
+            backup_vault::Unlock::Open => unlocked = true,
+        }
+    }
     let pending = retry(id)?;
+    if unlocked {
+        // Client refreshes start-up deferred for the locked keyring can run now.
+        backup_vault::after_unlock();
+    }
     let remaining = pending.as_ref().map_or(0, |r| r.missing.len());
     let (restored, accounted) = recovery_values::progress();
-    let message = progress_message(&before.client_name, restored, accounted, remaining);
+    let message = if restored + accounted == 0 && remaining > 0 && backup_vault::store_locked() {
+        still_locked_message()
+    } else {
+        progress_message(&before.client_name, restored, accounted, remaining)
+    };
     Ok(RecoveryAttempt {
         id: before.id,
         client_id: before.client_id,
@@ -811,6 +848,37 @@ pub fn safe_action_error(id: &str, error: &str) -> String {
     crate::i18n::tr("Recovery could not finish. Check the client config and credential-store access, then choose Retry. The recovery record is kept.")
 }
 
+/// A disconnected client whose saved value sits in a vault that is now out of
+/// reach, plus the vaulted move record "Move into gateway" leaves beside it:
+/// the Clients page lists both after a Disconnect with a locked keyring.
+#[cfg(test)]
+pub(crate) fn locked_card_fixture(client: &str, path: &Path) -> ClientRecovery {
+    let original = "{\n \"mcpServers\":{\"native\":{\"command\":\"echo\",\"env\":{\"API_KEY\":\"sk-recovery-state-fixture\"}}}\n}\n";
+    std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+    crate::secrets::set_secret("native", "API_KEY", "sk-recovery-state-fixture").unwrap();
+    backup_storage::register("native", "API_KEY", "sk-recovery-state-fixture");
+    std::fs::write(path, original).unwrap();
+    mutation::run(client, path, Format::JsonMcpServers, || {
+        backup_file(client, path)?;
+        moved::record(client, Format::JsonMcpServers, path)?;
+        write_format(Format::JsonMcpServers, path, &[], true)
+    })
+    .unwrap();
+    backup_storage::clear();
+    std::env::set_var("TOOLPORT_SECRET_KEY", "locked-state-fixture");
+    disconnect::restore_path(client, path, Format::JsonMcpServers, None).unwrap();
+    let record = backup_dir(client).unwrap().join(moved::RECORD_NAME);
+    let raw = std::fs::read_to_string(&record).expect("the move record outlives the Disconnect");
+    assert!(
+        raw.contains("toolportBackupVersion") && !raw.contains("sk-recovery-state-fixture"),
+        "the move record is sealed in the vault"
+    );
+    list()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.path == path.to_string_lossy())
+        .unwrap()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1075,6 +1143,81 @@ mod tests {
             assert_eq!(done.restored, 1);
             assert_eq!(done.remaining, 0);
             assert!(done.pending.is_none());
+        });
+    }
+
+    /// F5: drawing the Clients page lists recovery cards. With the keyring
+    /// locked that must make no credential-store call at all (a read waited on
+    /// a prompt another thread held and froze the GTK window), and the card
+    /// still says what is missing and why.
+    #[test]
+    fn listing_recovery_cards_never_touches_the_credential_store() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let card = locked_card_fixture("cursor", &data.join("listed.json"));
+            let mut rows = Vec::new();
+            let calls = backup_vault::fake::locked_store(backup_vault::Unlock::StillLocked, || {
+                rows = list().unwrap();
+            });
+            assert_eq!(calls, Vec::<String>::new(), "listing made store calls");
+            let listed = rows.iter().find(|r| r.id == card.id).unwrap();
+            assert_eq!(listed.message, card.message);
+            assert!(listed.message.starts_with("Cursor is disconnected."));
+            assert_eq!(listed.value_lines, card.value_lines);
+            assert_eq!(listed.instructions, card.instructions);
+            assert!(listed.can_retry && listed.error.is_none());
+            // The sealed move record is healthy, not a damaged-file card.
+            assert!(!rows
+                .iter()
+                .any(|r| r.backup_path.ends_with(moved::RECORD_NAME)));
+        });
+    }
+
+    /// F6: Retry is the one place an unlock prompt is wanted. It asks, and when
+    /// the keyring stays locked it says so in plain words instead of a tally.
+    #[test]
+    fn retry_asks_to_unlock_and_says_plainly_when_the_keyring_stays_locked() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let data = crate::registry::conduit_dir().unwrap();
+            let path = data.join("retry.json");
+            let card = locked_card_fixture("cursor", &path);
+            let template = std::fs::read(&path).unwrap();
+            // Unlocking makes the saved copies readable again.
+            std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
+
+            let mut outcome = None;
+            let calls = backup_vault::fake::locked_store(backup_vault::Unlock::StillLocked, || {
+                outcome = Some(retry_with_report(&card.id).unwrap());
+            });
+            assert_eq!(calls.first().map(String::as_str), Some("unlock prompt"));
+            let still = outcome.take().unwrap();
+            assert_eq!(
+                still.message,
+                "Your keyring is still locked, so nothing was restored. Unlock it and choose Retry again."
+            );
+            assert_eq!(still.message, still_locked_message());
+            assert_eq!(
+                (still.restored, still.accounted, still.remaining),
+                (0, 0, 1)
+            );
+            assert_eq!(
+                still.pending.as_ref().map(|r| r.id.as_str()),
+                Some(card.id.as_str())
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), template, "nothing written");
+
+            let calls = backup_vault::fake::locked_store(backup_vault::Unlock::Open, || {
+                outcome = Some(retry_with_report(&card.id).unwrap());
+            });
+            assert_eq!(calls.first().map(String::as_str), Some("unlock prompt"));
+            assert!(calls.iter().any(|c| c == "refresh deferred client configs"));
+            let done = outcome.unwrap();
+            assert!(done.pending.is_none());
+            assert_eq!((done.restored, done.remaining), (1, 0));
+            assert!(done.message.starts_with("Cursor: values put back: 1;"));
+            assert!(std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("sk-recovery-state-fixture"));
         });
     }
 }

@@ -507,6 +507,9 @@ pub(super) struct ClientSnapshot {
     pub(super) profiles: Vec<ProfileView>,
     pub(super) sessions: Vec<serde_json::Value>,
     pub(super) sessions_error: bool,
+    /// Recovery cards read on the scan's worker thread. `None` lists them when
+    /// drawn; the listing never contacts the credential store either way.
+    pub(super) recoveries: Option<Result<Vec<crate::clients::recovery::ClientRecovery>, String>>,
 }
 
 fn default_access_display_label(registry: &Registry) -> String {
@@ -634,6 +637,7 @@ pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
         profiles: client_access_options(&registry),
         sessions,
         sessions_error,
+        recoveries: Some(crate::clients::recovery::list()),
     })
 }
 

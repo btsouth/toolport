@@ -548,5 +548,6 @@
   "Discard the unreadable record of servers moved from {client}?": "{client}에서 옮긴 서버의 읽을 수 없는 기록을 버릴까요?",
   "Toolport cannot read its record of the servers it moved from {client} into Toolport. Without it, Disconnect cannot put those servers back in the client config. Discard deletes only this record. The servers stay in Toolport; to use one in {client} without Toolport, add it there again.\n\nThe client config will not change.": "Toolport가 {client}에서 Toolport로 옮긴 서버 기록을 읽을 수 없습니다. 이 기록이 없으면 연결 해제 시 해당 서버를 클라이언트 설정에 되돌릴 수 없습니다. 버리기는 이 기록만 삭제합니다. 서버는 Toolport에 남아 있으며, Toolport 없이 {client}에서 사용하려면 그곳에 다시 추가하세요.\n\n클라이언트 설정은 바뀌지 않습니다.",
   "Toolport's damaged record of the servers it moved from {client} was deleted. The servers stay in Toolport, and the client config was not changed.": "{client}에서 옮긴 서버에 대한 Toolport의 손상된 기록을 삭제했습니다. 서버는 Toolport에 남아 있으며 클라이언트 설정은 바뀌지 않았습니다.",
-  "Toolport kept the toolport entry you edited. Remove it by hand if you uninstall Toolport.": "Toolport는 직접 편집한 toolport 항목을 그대로 두었습니다. Toolport를 제거하면 이 항목을 직접 삭제하세요."
+  "Toolport kept the toolport entry you edited. Remove it by hand if you uninstall Toolport.": "Toolport는 직접 편집한 toolport 항목을 그대로 두었습니다. Toolport를 제거하면 이 항목을 직접 삭제하세요.",
+  "Your keyring is still locked, so nothing was restored. Unlock it and choose Retry again.": "키링이 아직 잠겨 있어 아무것도 복원되지 않았습니다. 잠금을 해제한 다음 다시 시도를 한 번 더 선택하세요."
 }

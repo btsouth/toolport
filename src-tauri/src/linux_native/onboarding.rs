@@ -1280,6 +1280,7 @@ mod tests {
             profiles: Vec::new(),
             sessions: Vec::new(),
             sessions_error: false,
+            recoveries: None,
         };
         assert!(should_offer(&registry, &empty));
 
@@ -1311,6 +1312,7 @@ mod tests {
             profiles: Vec::new(),
             sessions: Vec::new(),
             sessions_error: false,
+            recoveries: None,
         };
         assert!(!should_offer(&registry, &connected));
 

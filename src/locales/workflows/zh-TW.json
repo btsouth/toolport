@@ -548,5 +548,6 @@
   "Discard the unreadable record of servers moved from {client}?": "要捨棄從 {client} 移出的伺服器的無法讀取記錄嗎？",
   "Toolport cannot read its record of the servers it moved from {client} into Toolport. Without it, Disconnect cannot put those servers back in the client config. Discard deletes only this record. The servers stay in Toolport; to use one in {client} without Toolport, add it there again.\n\nThe client config will not change.": "Toolport 無法讀取它從 {client} 移入 Toolport 的伺服器記錄。沒有這份記錄，中斷連線時就無法把這些伺服器放回用戶端設定。捨棄只會刪除這份記錄。這些伺服器仍保留在 Toolport 中；若要在不使用 Toolport 的情況下於 {client} 使用，請在那裡重新加入。\n\n用戶端設定不會改變。",
   "Toolport's damaged record of the servers it moved from {client} was deleted. The servers stay in Toolport, and the client config was not changed.": "Toolport 關於從 {client} 移出之伺服器的損壞記錄已刪除。這些伺服器仍保留在 Toolport 中，用戶端設定未變更。",
-  "Toolport kept the toolport entry you edited. Remove it by hand if you uninstall Toolport.": "Toolport 保留了你編輯過的 toolport 項目。如果解除安裝 Toolport，請手動刪除它。"
+  "Toolport kept the toolport entry you edited. Remove it by hand if you uninstall Toolport.": "Toolport 保留了你編輯過的 toolport 項目。如果解除安裝 Toolport，請手動刪除它。",
+  "Your keyring is still locked, so nothing was restored. Unlock it and choose Retry again.": "你的金鑰圈仍處於鎖定狀態，因此沒有還原任何內容。請先解鎖，然後再次選擇「重試」。"
 }
