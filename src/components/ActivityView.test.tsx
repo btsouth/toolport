@@ -125,10 +125,46 @@ it("p10c shows approval outcomes without treating them as call errors", async ()
   );
   expect(screen.getByText("errors (50%)").parentElement).toHaveTextContent(/1\s*errors/);
   for (const [, label] of outcomes) expect(screen.getByText(label)).toBeInTheDocument();
+  // Approvals are rows but not calls, so the shown rows are counted as entries.
+  expect(screen.getByText(/2 calls recorded on this computer/)).toHaveTextContent(
+    `2 calls recorded on this computer. Showing the latest ${outcomes.length + initialLog.length} entries.`,
+  );
   await user.click(screen.getByRole("button", { name: /errors only/i }));
   expect(screen.getByText("merge_pr")).toBeInTheDocument();
   for (const [, label] of outcomes)
     expect(screen.queryByText(label)).not.toBeInTheDocument();
+  expect(screen.getByText(/2 calls recorded on this computer/)).toHaveTextContent(
+    `2 calls recorded on this computer. Showing 1 matching entry from the latest ${outcomes.length + initialLog.length}.`,
+  );
+});
+
+it("counts Activity rows as entries in singular and plural", async () => {
+  getAuditLog.mockResolvedValue([entry(), entry({ ts: 1700000003000 })]);
+  getAuditStats.mockResolvedValue({ total: 2, errors: 0, errorRate: 0, servers: [] });
+  const view = render(<ActivityView refreshKey={0} registry={null} />);
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  const toggle = await screen.findByRole("button", { name: /recent calls/i });
+  expect(screen.getByText(/2 calls recorded on this computer/)).toHaveTextContent(
+    "2 calls recorded on this computer. Latest 2 entries available.",
+  );
+  await user.click(toggle);
+  await user.click(screen.getByRole("button", { name: /errors only/i }));
+  expect(screen.getByText(/2 calls recorded on this computer/)).toHaveTextContent(
+    "2 calls recorded on this computer. Showing 0 matching entries from the latest 2.",
+  );
+  expect(screen.getByText("No errors in the latest 2 entries.")).toBeInTheDocument();
+  view.unmount();
+
+  getAuditLog.mockResolvedValue([entry()]);
+  getAuditStats.mockResolvedValue({ total: 1, errors: 0, errorRate: 0, servers: [] });
+  render(<ActivityView refreshKey={0} registry={null} />);
+  const single = await screen.findByRole("button", { name: /recent calls/i });
+  expect(screen.getByText(/1 call recorded on this computer/)).toHaveTextContent(
+    "1 call recorded on this computer. Latest entry available.",
+  );
+  await user.click(single);
+  await user.click(screen.getByRole("button", { name: /errors only/i }));
+  expect(screen.getByText("No errors in the latest entry.")).toBeInTheDocument();
 });
 
 it("p10c shows an approval-only history even when no tools ran", async () => {
@@ -515,7 +551,7 @@ describe("ActivityView recent calls", () => {
       expect.stringContaining("before reaching the model"),
     );
     expect(screen.getByText(/5,225 calls recorded/)).toHaveTextContent(
-      "Showing the latest 1.",
+      "Showing the latest entry.",
     );
     expect(screen.getByRole("button", { name: "Export" })).toHaveAttribute("title");
     fireEvent.click(screen.getByRole("button", { name: "Clear" }));
