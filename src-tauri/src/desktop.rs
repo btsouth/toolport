@@ -7263,6 +7263,57 @@ mod tests {
         });
     }
 
+    /// A server that already has a token keeps it when an edit's new token is
+    /// stored and the registry write then fails: the keychain is put back to
+    /// the previous token, not just cleared.
+    #[test]
+    fn a_failed_edit_puts_the_previous_token_back() {
+        let _generation = GEN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _hooks = REVOKE_HOOK_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_revoke_hooks();
+        crate::secrets::tests::with_isolated_vault(|| {
+            let entry: ServerEntry = serde_json::from_value(serde_json::json!({
+                "id": "", "name": "remote", "transport": "http",
+                "url": "https://example.com/mcp", "args": [], "env": [],
+            }))
+            .unwrap();
+            let (_, id) = registry::update(|r| Ok(r.add_server(entry))).unwrap();
+            crate::registry_controller::set_server_secret(&id, "Authorization", "tok-previous")
+                .unwrap();
+            let state: RegistryState = Mutex::new(registry::load().unwrap());
+            let file = || std::fs::read_to_string(registry::registry_path().unwrap()).unwrap();
+            let slot =
+                || crate::secrets::get_secret_result(&id, crate::secrets::HTTP_AUTH_KEY).unwrap();
+            let mut edit = registry::load()
+                .unwrap()
+                .servers
+                .into_iter()
+                .find(|s| s.id == id)
+                .unwrap();
+            edit.env.push(crate::registry::EnvVar {
+                key: "Authorization".into(),
+                value: Some("Bearer tok-new".into()),
+                secret: false,
+                unknown_fields: Default::default(),
+            });
+            let before = file();
+
+            fail_next_registry_write();
+            let refused = update_server_in_app(&state, edit.clone());
+            clear_revoke_hooks();
+            assert!(refused.is_err(), "{refused:?}");
+            assert_eq!(file(), before);
+            assert_eq!(slot().as_deref(), Some("tok-previous"));
+
+            update_server_in_app(&state, edit).unwrap();
+            assert_eq!(slot().as_deref(), Some("tok-new"));
+        });
+    }
+
     // ----- React Disconnect goes through the registry controller -------------
     //
     // `disconnect_client_in_app` is the body of the `uninstall_gateway` command.
