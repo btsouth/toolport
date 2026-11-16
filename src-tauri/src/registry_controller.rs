@@ -2390,6 +2390,13 @@ pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String
                 .as_ref()
                 .map(|import| import.skipped_env().to_vec())
                 .unwrap_or_default();
+            // Variables left out are not credentials of the imported server.
+            let env_keys = s
+                .env_keys
+                .iter()
+                .filter(|key| !skipped_env.contains(key))
+                .cloned()
+                .collect();
             let (credentials, unsupported) = match prepared {
                 Ok(import) => (
                     import
@@ -2428,7 +2435,7 @@ pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String
                 }),
                 args: crate::import_credentials::shown_args(&s.args),
                 url: s.url.as_deref().map(crate::import_credentials::shown_url),
-                env_keys: s.env_keys.clone(),
+                env_keys,
                 is_new: !registry
                     .servers
                     .iter()
