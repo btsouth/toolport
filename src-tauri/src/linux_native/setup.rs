@@ -346,9 +346,9 @@ pub(super) fn review_with_notice(
             if busy.get() {
                 gtk::glib::Propagation::Stop
             } else {
-        let source = lede.unwrap_or(crate::i18n::msg(
-            "Review the selected servers before continuing.",
-        ));
+                let source = lede.unwrap_or(crate::i18n::msg(
+                    "Review the selected servers before continuing.",
+                ));
                 gtk::glib::Propagation::Proceed
             }
         });
@@ -724,7 +724,13 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
     content.append(&path);
     details.set_visible(!unreadable);
     rows.set_visible(!unreadable);
-    body.append(&details);
+    details.set_widget_name("toolport-setup-review-details");
+    // Under the lede and any notice, above the entries, where React's review has it.
+    let above = notice
+        .as_ref()
+        .map(|card| card.clone().upcast::<gtk::Widget>())
+        .unwrap_or_else(|| lede.clone().upcast());
+    body.insert_child_after(&details, Some(&above));
     let feedback = gtk::Label::builder()
         .xalign(0.0)
         .wrap(true)
@@ -1741,6 +1747,26 @@ mod tests {
         assert!(!labels(&window)
             .iter()
             .any(|t| t == "Review the selected servers before continuing."));
+        // Details sits right under the lede, above the entries, as in React.
+        let review_details = descendants(window.upcast_ref())
+            .into_iter()
+            .find(|w| w.widget_name() == "toolport-setup-review-details")
+            .unwrap();
+        let before = review_details
+            .prev_sibling()
+            .and_downcast::<gtk::Label>()
+            .unwrap();
+        assert_eq!(
+            before.text(),
+            "Selected entries move into Toolport after verification."
+        );
+        assert!(review_details
+            .next_sibling()
+            .is_some_and(|w| w.is::<gtk::ListBox>()));
+        assert_eq!(
+            review_title("Claude Code"),
+            "Review and connect Claude Code"
+        );
         let connect = descendants(window.upcast_ref())
             .into_iter()
             .filter_map(|w| w.downcast::<gtk::Button>().ok())
