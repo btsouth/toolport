@@ -378,7 +378,7 @@ function ImportReviewContent({
           {reason}
         </p>
       ))}
-      <DialogFooter className="justify-between">
+      <DialogFooter>
         <Button
           ref={cancelRef}
           variant="ghost"

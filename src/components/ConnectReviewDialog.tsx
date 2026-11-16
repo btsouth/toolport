@@ -5,7 +5,14 @@ import { migrateClient, previewClientSetup } from "@/lib/api";
 import type { ClientSetupReview, MigrateResult, Registry } from "@/lib/types";
 import { GatewaySettingsNotice } from "./GatewaySettingsNotice";
 import { disclosureSummary, ImportReviewDialog } from "./ImportReviewDialog";
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "./ui/dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "./ui/dialog";
+import { fmtTs } from "@/lib/utils";
 import { Button } from "./ui/button";
 
 export function ConnectReviewDialog({
@@ -23,7 +30,7 @@ export function ConnectReviewDialog({
   onClose: () => void;
   onConnected: (registry: Registry) => void;
 }) {
-  const { t, locale } = useI18n();
+  const { t } = useI18n();
   // The dialog renders without a Radix trigger and swaps between its loading,
   // review and result views, so Radix cannot return focus on its own. Remember
   // the control that opened it and return there once the whole flow closes.
@@ -160,9 +167,7 @@ export function ConnectReviewDialog({
                     <p>
                       {result.backupDate
                         ? t("Backup saved {value0}", {
-                            value0: new Date(result.backupDate * 1000).toLocaleString(
-                              locale,
-                            ),
+                            value0: fmtTs(result.backupDate * 1000, "dateTime"),
                           })
                         : t("Backup saved")}
                     </p>
@@ -172,27 +177,33 @@ export function ConnectReviewDialog({
                   </>
                 )}
               </details>
-              <Button onClick={close}>{t("Done")}</Button>
             </div>
           ) : error ? (
             <>
               <p role="alert" className="text-warning">
                 {error}
               </p>
-              <Button
-                onClick={() => {
-                  setError("");
-                  setAttempt(attempt + 1);
-                }}
-              >
-                {t("Retry")}
-              </Button>
+              <DialogFooter>
+                <Button
+                  onClick={() => {
+                    setError("");
+                    setAttempt(attempt + 1);
+                  }}
+                >
+                  {t("Retry")}
+                </Button>
+              </DialogFooter>
             </>
           ) : (
             <p>
               <Loader2 className="inline size-4 animate-spin" />{" "}
               {t("Reading client config...")}
             </p>
+          )}
+          {result && (
+            <DialogFooter>
+              <Button onClick={close}>{t("Done")}</Button>
+            </DialogFooter>
           )}
         </DialogContent>
       </Dialog>

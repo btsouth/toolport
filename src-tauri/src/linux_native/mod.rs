@@ -3547,18 +3547,29 @@ impl ClientPage {
     }
 }
 
-/// React's client notice (`ClientDetail`'s restart reminder): an info bar with the
-/// refresh icon, a bold title, optional text, and a dismiss button.
+/// React's client notice (`ClientDetail`'s restart reminder): a spec §10 info card, with a
+/// muted 32px tile holding the refresh icon, a 14/600 title, optional detail, and a flat
+/// Dismiss. Info has no status bar. Below 560px Dismiss moves under the detail.
 pub(super) fn restart_notice(title: &str, text: &str, on_dismiss: impl Fn() + 'static) -> gtk::Box {
-    let notice = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let notice = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .accessible_role(gtk::AccessibleRole::Status)
+        .build();
     notice.set_widget_name("toolport-restart-notice");
-    notice.add_css_class("toolport-feedback");
+    notice.add_css_class("toolport-status-card");
     notice.add_css_class("info");
+    notice.update_property(&[
+        gtk::accessible::Property::Label(title),
+        gtk::accessible::Property::Description(text),
+    ]);
+    let layout = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     let icon = gtk::Image::from_icon_name("view-refresh-symbolic");
+    icon.set_pixel_size(16);
+    icon.set_size_request(32, 32);
     icon.set_valign(gtk::Align::Start);
-    icon.set_margin_top(2);
-    notice.append(&icon);
-    let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    icon.add_css_class("toolport-status-tile");
+    layout.append(&icon);
+    let copy = gtk::Box::new(gtk::Orientation::Vertical, 4);
     copy.set_hexpand(true);
     let heading = gtk::Label::builder()
         .label(title)
@@ -3567,7 +3578,7 @@ pub(super) fn restart_notice(title: &str, text: &str, on_dismiss: impl Fn() + 's
         .wrap_mode(gtk::pango::WrapMode::WordChar)
         .selectable(true)
         .build();
-    heading.add_css_class("heading");
+    heading.add_css_class("toolport-status-title");
     copy.append(&heading);
     if !text.is_empty() {
         let body = gtk::Label::builder()
@@ -3578,12 +3589,14 @@ pub(super) fn restart_notice(title: &str, text: &str, on_dismiss: impl Fn() + 's
             .selectable(true)
             .build();
         body.add_css_class("toolport-muted");
+        body.add_css_class("toolport-status-detail");
         copy.append(&body);
     }
-    notice.append(&copy);
-    let dismiss = header_icon_button("window-close-symbolic");
-    dismiss.set_valign(gtk::Align::Start);
-    l10n::bind_tooltip(&dismiss, "Dismiss restart reminder");
+    layout.append(&copy);
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.set_valign(gtk::Align::Start);
+    let dismiss = l10n::button("Dismiss");
+    dismiss.add_css_class("flat");
     let weak = notice.downgrade();
     dismiss.connect_clicked(move |_| {
         if let Some(notice) = weak.upgrade() {
@@ -3591,7 +3604,30 @@ pub(super) fn restart_notice(title: &str, text: &str, on_dismiss: impl Fn() + 's
         }
         on_dismiss();
     });
-    notice.append(&dismiss);
+    actions.append(&dismiss);
+    layout.append(&actions);
+    let bin = adw::BreakpointBin::builder()
+        .width_request(280)
+        .height_request(1)
+        .build();
+    bin.set_child(Some(&layout));
+    let breakpoint =
+        adw::Breakpoint::new(adw::BreakpointCondition::parse("max-width: 560px").unwrap());
+    let (wide, narrow, buttons) = (layout.clone(), copy.clone(), actions.clone());
+    breakpoint.connect_apply(move |_| {
+        wide.remove(&buttons);
+        buttons.set_margin_top(8);
+        narrow.append(&buttons);
+    });
+    let (wide, narrow, buttons) = (layout.clone(), copy.clone(), actions.clone());
+    breakpoint.connect_unapply(move |_| {
+        narrow.remove(&buttons);
+        buttons.set_margin_top(0);
+        wide.append(&buttons);
+    });
+    bin.add_breakpoint(breakpoint);
+    let frame = skills::IssueFrame::new(&bin, &layout);
+    notice.append(&frame);
     notice
 }
 
@@ -16197,24 +16233,30 @@ mod tests {
             ),
             || {},
         );
-        assert!(notice.has_css_class("toolport-feedback"));
+        // Spec §10: an info status card, announced as a status, with no status bar.
+        assert!(notice.has_css_class("toolport-status-card"));
         assert!(notice.has_css_class("info"));
+        assert!(!notice.has_css_class("toolport-feedback"));
+        assert_eq!(notice.accessible_role(), gtk::AccessibleRole::Status);
+        let tile = fixture_descendants(notice.upcast_ref())
+            .into_iter()
+            .find(|w| w.has_css_class("toolport-status-tile"))
+            .expect("32px icon tile");
+        assert_eq!(tile.width_request(), 32);
         let labels = fixture_descendants(notice.upcast_ref())
             .into_iter()
             .filter_map(|w| w.downcast::<gtk::Label>().ok())
             .collect::<Vec<_>>();
         assert_eq!(labels[0].text(), "Not live yet");
-        assert!(labels[0].has_css_class("heading"));
+        assert!(labels[0].has_css_class("toolport-status-title"));
         assert_eq!(labels[1].text(), "Restart Cursor so it loads Toolport.");
         let dismiss = fixture_descendants(notice.upcast_ref())
             .into_iter()
             .filter_map(|w| w.downcast::<gtk::Button>().ok())
             .next()
             .unwrap();
-        assert_eq!(
-            dismiss.tooltip_text().as_deref(),
-            Some("Dismiss restart reminder")
-        );
+        assert_eq!(dismiss.label().as_deref(), Some("Dismiss"));
+        assert!(dismiss.has_css_class("flat"));
 
         let app = adw::Application::builder()
             .application_id("com.tsout.Toolport.RestartNoticeFixture")
@@ -16250,7 +16292,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             shown,
-            vec!["Not live yet", "Restart Cursor so it loads Toolport."]
+            vec![
+                "Not live yet",
+                "Restart Cursor so it loads Toolport.",
+                "Dismiss"
+            ]
         );
         fixture_descendants(page.list_notice.upcast_ref())
             .into_iter()

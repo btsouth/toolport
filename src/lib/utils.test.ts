@@ -1,4 +1,15 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+
+// Lets a test pin the display locale without loading the language runtime.
+const localeOverride = vi.hoisted(() => ({ value: null as string | null }));
+vi.mock("./i18n", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./i18n")>();
+  return {
+    ...actual,
+    getLocale: () =>
+      (localeOverride.value ?? actual.getLocale()) as ReturnType<typeof actual.getLocale>,
+  };
+});
 import {
   fmtBytes,
   fmtDollars,
@@ -181,6 +192,20 @@ describe("fmtTs", () => {
 
   it("formats date-only timestamps", () => {
     expect(fmtTs(timestamp, "date")).toBe(new Date(timestamp).toLocaleDateString());
+  });
+
+  it("formats a full date and time without seconds, as GTK reproduces it", () => {
+    // Built from local fields so the expectation holds in any time zone.
+    const backup = new Date(2026, 10, 16, 1, 4, 37).getTime();
+    try {
+      localeOverride.value = "en";
+      // ICU may put a narrow no-break space before AM.
+      expect(fmtTs(backup, "dateTime").replace(/\s/g, " ")).toBe("11/16/2026, 1:04 AM");
+      localeOverride.value = "de";
+      expect(fmtTs(backup, "dateTime")).toBe("16.11.2026, 1:04");
+    } finally {
+      localeOverride.value = null;
+    }
   });
 
   it("formats month-and-day timestamps without a year", () => {

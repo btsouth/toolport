@@ -836,6 +836,51 @@ it("shows disconnect and restart feedback once inline without a duplicate toast"
   expect(toastError).not.toHaveBeenCalled();
 });
 
+it("shows the restart reminder as an info card with a Dismiss button", async () => {
+  uninstallGateway.mockResolvedValue({
+    path: "/fixture/config",
+    restored: [],
+    warnings: [],
+  });
+  render(
+    <ClientDetail
+      client={client({ gatewayInstalled: true, entryState: "managed" })}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  await userEvent.click(screen.getByRole("button", { name: "Disconnect" }));
+  await userEvent.click(
+    within(screen.getByRole("dialog")).getByRole("button", { name: "Disconnect" }),
+  );
+  const notice = await screen.findByRole("status");
+  expect(notice).toHaveAttribute("data-slot", "status-card");
+  expect(notice).toHaveAttribute("data-variant", "info");
+  expect(notice).not.toHaveClass("toolport-alert");
+  const dismiss = within(notice).getByRole("button", { name: "Dismiss" });
+  expect(dismiss).toHaveAttribute("data-variant", "ghost");
+  await userEvent.click(dismiss);
+  expect(screen.queryByText("Still connected until restart")).not.toBeInTheDocument();
+});
+
+it("lets the Discovery mode select show its whole label and wrap under its text", () => {
+  render(
+    <ClientDetail
+      client={client()}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  const trigger = screen.getByRole("combobox", { name: "Discovery mode" });
+  expect(trigger).not.toHaveClass("w-44");
+  expect(trigger).toHaveClass("w-auto", "max-w-full");
+  const row = trigger.parentElement!;
+  expect(row).toHaveClass("flex", "flex-wrap");
+  expect(row.firstElementChild).toHaveClass("min-w-[min(15rem,100%)]", "flex-1");
+});
+
 it("keeps a keychain warning next to the recovery notice after disconnect", async () => {
   const recovery = "Cursor needs a missing value restored.";
   uninstallGateway.mockResolvedValue({

@@ -360,6 +360,9 @@ fn bound_dropdown(control: &gtk::DropDown) {
     control.set_list_factory(Some(&checked_list_factory()));
 }
 
+/// The widest a dropdown's open list asks for a choice before wrapping it, in characters.
+const LIST_LABEL_CHARS: usize = 30;
+
 /// The open list of a dropdown with its own button factory: each choice in full,
 /// with a check mark on the current one, as GTK's default list and the Language
 /// dropdown show.
@@ -388,6 +391,9 @@ pub(super) fn checked_list_factory() -> gtk::SignalListItemFactory {
         let check = row.last_child().unwrap();
         let value = item.item().and_downcast::<gtk::StringObject>().unwrap();
         label.set_label(&value.string());
+        // GTK opens the list at the button's width; ask for each choice's own width, up
+        // to LIST_LABEL_CHARS, so a short button ("Auto") still shows whole words.
+        label.set_width_chars(value.string().chars().count().min(LIST_LABEL_CHARS) as i32);
         check.set_opacity(if item.is_selected() { 1.0 } else { 0.0 });
     });
     factory
@@ -1102,6 +1108,58 @@ mod tests {
     }
 
     use super::*;
+    /// GTK opens a dropdown's list at the button's width. A short choice on the button
+    /// ("Auto") must not squeeze the longer choices into broken words in the open list.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn open_list_keeps_whole_words_under_a_short_button() {
+        let _app = app();
+        let choices = [
+            "Auto",
+            "Lazy · search",
+            "Grouped · per-server",
+            "Full · every tool",
+        ];
+        let control = gtk::DropDown::from_strings(&choices);
+        bound_dropdown(&control);
+        control.set_halign(gtk::Align::Start);
+        let window = gtk::Window::builder()
+            .default_width(480)
+            .default_height(600)
+            .child(&control)
+            .build();
+        window.present();
+        let context = gtk::glib::MainContext::default();
+        let settle = || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                while context.pending() {
+                    context.iteration(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        settle();
+        control.activate();
+        settle();
+        let labels = widgets(control.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .filter(|l| l.is_mapped() && choices[1..].contains(&l.text().as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(labels.len(), 3, "the open list shows the longer choices");
+        for label in labels {
+            let (one_line, _) = label.create_pango_layout(Some(&label.text())).pixel_size();
+            assert!(
+                label.width() >= one_line,
+                "{} is {}px wide, needs {one_line}px on one line",
+                label.text(),
+                label.width()
+            );
+        }
+        window.close();
+    }
+
     #[test]
     fn b5_import_selection_rejects_other_profiles_and_changed_definitions() {
         let server = crate::clients::McpServer {

@@ -11,7 +11,6 @@ import {
   Puzzle,
   RefreshCw,
   TriangleAlert,
-  X,
 } from "lucide-react";
 import {
   importServers,
@@ -35,7 +34,7 @@ import {
 } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { ErrorCallout } from "@/components/ui/status-card";
+import { ErrorCallout, StatusCard } from "@/components/ui/status-card";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 
@@ -702,29 +701,29 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       )}
 
       {showRestartNotice && (
-        <div
+        <StatusCard
           role="status"
-          className="flex select-text items-start gap-2 toolport-alert border-info bg-info/8 px-3 py-2 text-sm text-info"
-        >
-          <RefreshCw className="mt-0.5 size-4 shrink-0" />
-          <div className="min-w-0 flex-1">
-            <p className="font-semibold">{showRestartNotice.title}</p>
-            <p className="mt-0.5 break-words text-meta">{showRestartNotice.text}</p>
-          </div>
-          <button
-            type="button"
-            onClick={() => setRestartNotice(null)}
-            aria-label={t("Dismiss restart reminder")}
-            className="rounded p-0.5 text-info transition-colors hover:bg-info/10 hover:text-info focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-info"
-          >
-            <X className="size-3.5" />
-          </button>
-        </div>
+          variant="info"
+          className="select-text"
+          icon={<RefreshCw />}
+          title={showRestartNotice.title}
+          detail={showRestartNotice.text}
+          actions={
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => setRestartNotice(null)}
+            >
+              {t("Dismiss")}
+            </Button>
+          }
+        />
       )}
 
       {!customized && (
-        <div className="flex items-center justify-between gap-3 rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
-          <div className="min-w-0">
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
+          <div className="min-w-[min(15rem,100%)] flex-1">
             <div className="text-meta font-medium text-foreground">
               {translate("Discovery mode")}
               {!clientMode && (
@@ -744,7 +743,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             <SelectTrigger
               size="sm"
               aria-label={translate("Discovery mode")}
-              className="w-44 shrink-0"
+              className="w-auto max-w-full"
               disabled={busy || !!client.error}
             >
               <SelectValue />

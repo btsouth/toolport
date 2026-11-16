@@ -54,30 +54,108 @@ impl From<&str> for Completion {
     }
 }
 
-fn middle_ellipsize(widget: &gtk::Widget, text: &str) {
-    if let Some(label) = widget.downcast_ref::<gtk::Label>() {
-        if label.text() == text {
-            label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-            label.set_single_line_mode(true);
-            label.set_tooltip_text(Some(text));
+/// The inside of a review entry's toggle, laid out as React's `ImportRow`: a 12px square
+/// dot, the name over its command, then the labels on the right.
+/// Commands up to this length wrap in a review entry; longer ones keep both ends, as
+/// React's ImportRow does.
+const REVIEW_COMMAND_WRAP_CHARS: usize = 72;
+
+struct ReviewItem {
+    subtitle: gtk::Label,
+    suffixes: gtk::Box,
+    check: gtk::ToggleButton,
+    name: String,
+}
+
+impl ReviewItem {
+    fn new(check: &gtk::ToggleButton, name: &str, command: &str) -> Self {
+        // React's ImportRow: the dot, the name and the status on one line, then the
+        // command on its own line across the whole entry.
+        let entry = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        dot.add_css_class("toolport-select-dot");
+        dot.set_valign(gtk::Align::Center);
+        dot.set_widget_name("toolport-select-dot");
+        line.append(&dot);
+        let title = gtk::Label::builder()
+            .label(name)
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        title.add_css_class("toolport-review-name");
+        line.append(&title);
+        let suffixes = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        suffixes.set_valign(gtk::Align::Center);
+        line.append(&suffixes);
+        entry.append(&line);
+        let subtitle = gtk::Label::builder().label(command).xalign(0.0).build();
+        if command.chars().count() > REVIEW_COMMAND_WRAP_CHARS {
+            // Like React, a long command keeps both ends; hover shows it in full.
+            subtitle.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+            subtitle.set_single_line_mode(true);
+        } else {
+            subtitle.set_wrap(true);
+            subtitle.set_wrap_mode(gtk::pango::WrapMode::WordChar);
         }
+        subtitle.set_tooltip_text(Some(command));
+        subtitle.add_css_class("monospace");
+        subtitle.add_css_class("dim-label");
+        subtitle.add_css_class("toolport-review-command");
+        entry.append(&subtitle);
+        check.set_child(Some(&entry));
+        let item = Self {
+            subtitle,
+            suffixes,
+            check: check.clone(),
+            name: name.to_string(),
+        };
+        item.describe();
+        item
     }
-    let mut child = widget.first_child();
-    while let Some(widget) = child {
-        child = widget.next_sibling();
-        middle_ellipsize(&widget, text);
+
+    fn add_suffix(&self, widget: &impl IsA<gtk::Widget>) {
+        self.suffixes.append(widget);
+    }
+
+    fn set_subtitle(&self, text: &str) {
+        // A sentence (why the entry can't move) reads in full.
+        self.subtitle.set_label(text);
+        self.subtitle.set_ellipsize(gtk::pango::EllipsizeMode::None);
+        self.subtitle.set_single_line_mode(false);
+        self.subtitle.set_wrap(true);
+        self.subtitle.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        self.describe();
+    }
+
+    /// The name is the button's accessible name and the command its description, as a
+    /// screen reader reads React's button text; the toggle itself reports pressed.
+    fn describe(&self) {
+        self.check.update_property(&[
+            gtk::accessible::Property::Label(&self.name),
+            gtk::accessible::Property::Description(&self.subtitle.label()),
+        ]);
     }
 }
 
-/// When the backup file was written, in the user's local time.
+/// When the backup file was written, in local time and the app language, as React writes
+/// it (`fmtTs(ms, "dateTime")`).
 fn backup_date(backup: &str) -> Option<String> {
     std::fs::metadata(backup)
         .ok()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .and_then(|t| gtk::glib::DateTime::from_unix_local(t.as_secs() as i64).ok())
-        .and_then(|t| t.format("%e %B %Y, %H:%M").ok())
-        .map(|s| s.trim().to_string())
+        .map(|t| {
+            crate::i18n::format_date_time(
+                t.year(),
+                t.month() as u32,
+                t.day_of_month() as u32,
+                t.hour() as u32,
+                t.minute() as u32,
+            )
+        })
 }
 
 fn details_expander(title: &str) -> (gtk::Expander, gtk::Box) {
@@ -200,10 +278,45 @@ pub(super) fn review_with_notice(
         .default_height(540)
         .build();
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let header = adw::HeaderBar::new();
-    header.set_show_start_title_buttons(false);
-    header.set_show_end_title_buttons(false);
+    // React's dialog header: the title on the left and a close button on the right, in
+    // place of a centred header bar title. The row still moves the window.
+    let heading = gtk::Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .hexpand(true)
+        .build();
+    heading.set_widget_name("toolport-setup-title");
+    heading.add_css_class("toolport-dialog-title");
+    heading.set_accessible_role(gtk::AccessibleRole::Heading);
+    let close = super::header_icon_button("window-close-symbolic");
+    close.set_valign(gtk::Align::Start);
+    close.set_widget_name("toolport-setup-close");
+    l10n::bind_tooltip(&close, "Close");
+    close.update_property(&[gtk::accessible::Property::Label(&crate::i18n::tr("Close"))]);
+    let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    title_row.set_margin_top(16);
+    title_row.set_margin_start(24);
+    title_row.set_margin_end(12);
+    title_row.append(&heading);
+    title_row.append(&close);
+    let header = gtk::WindowHandle::new();
+    header.set_child(Some(&title_row));
+    {
+        let dialog = dialog.downgrade();
+        close.connect_clicked(move |_| {
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
+        });
+    }
     let cancel = l10n::button("Cancel");
+    // Close is off while a check runs, as Cancel is and as React's close button is.
+    cancel
+        .bind_property("sensitive", &close, "sensitive")
+        .sync_create()
+        .build();
     // Keep action dispatch on the source key, independent of its translated label.
     let confirm = l10n::button(confirm_label);
     confirm.set_widget_name("toolport-setup-confirm");
@@ -211,7 +324,7 @@ pub(super) fn review_with_notice(
     cancel.add_css_class("flat");
     root.append(&header);
     let body = gtk::Box::new(gtk::Orientation::Vertical, 16);
-    body.set_margin_top(24);
+    body.set_margin_top(12);
     body.set_margin_bottom(24);
     body.set_margin_start(24);
     body.set_margin_end(24);
@@ -232,9 +345,9 @@ pub(super) fn review_with_notice(
     if let Some(card) = &notice {
         body.append(card);
     }
-    let rows = gtk::ListBox::new();
-    rows.set_selection_mode(gtk::SelectionMode::None);
-    rows.add_css_class("boxed-list");
+    // React's review: one bordered toggle per entry, stacked with a small gap.
+    let rows = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    rows.set_widget_name("toolport-setup-review-entries");
     let mut selected = Vec::new();
     let mut credential_choices = Vec::new();
     let credential_inputs =
@@ -244,7 +357,7 @@ pub(super) fn review_with_notice(
         >::new()));
     let busy = std::rc::Rc::new(std::cell::Cell::new(false));
     let required_fields = std::rc::Rc::new(std::cell::RefCell::new(Vec::<(
-        gtk::glib::WeakRef<gtk::CheckButton>,
+        gtk::glib::WeakRef<gtk::ToggleButton>,
         String,
         Vec<crate::registry_controller::CredentialReview>,
     )>::new()));
@@ -308,19 +421,23 @@ pub(super) fn review_with_notice(
         let command = item
             .command
             .as_ref()
-            .map(|c| format!("{c} {}", item.args.join(" ")))
+            .map(|c| {
+                format!("{c} {}", item.args.join(" "))
+                    .trim_end()
+                    .to_string()
+            })
             .or(item.url.clone())
             .unwrap_or_else(|| crate::i18n::tr("Needs an endpoint URL"));
-        let row = adw::ActionRow::builder()
-            .title(&item.name)
-            .subtitle(&command)
+        // React's review item: the whole entry is one toggle button with a square dot,
+        // the name and its command, and the labels on the right. Space and Enter toggle
+        // it; screen readers hear its name, command and pressed state.
+        let unsupported = item.unsupported.is_some();
+        let check = gtk::ToggleButton::builder()
+            .active(!unsupported)
+            .hexpand(true)
             .build();
-        row.set_subtitle_lines(1);
-        middle_ellipsize(row.upcast_ref(), &command);
-        let check = gtk::CheckButton::builder()
-            .active(item.unsupported.is_none())
-            .valign(gtk::Align::Center)
-            .build();
+        check.add_css_class("toolport-review-item");
+        let row = ReviewItem::new(&check, &item.name, &command);
         required_fields.borrow_mut().push((
             check.downgrade(),
             item.name.clone(),
@@ -328,9 +445,7 @@ pub(super) fn review_with_notice(
         ));
         let refresh = refresh_confirm.clone();
         check.connect_toggled(move |_| refresh());
-        row.add_prefix(&check);
-        check.set_sensitive(item.unsupported.is_none());
-        row.set_activatable_widget(Some(&check));
+        check.set_sensitive(!unsupported);
         let (settings, content) = details_expander(&crate::i18n::trf(
             "{value0} credentials and settings",
             &[("value0", &item.name.to_string())],
@@ -517,7 +632,7 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
         error_chip.set_valign(gtk::Align::Center);
         error_chip.set_visible(false);
         row.add_suffix(&error_chip);
-        rows.append(&row);
+        rows.append(&check);
         let row_error = gtk::Label::builder()
             .wrap(true)
             .xalign(0.0)
@@ -532,7 +647,13 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
             rows.append(&settings);
         }
         selected.push((
-            check, row, spinner, item.key, item.name, row_error, error_chip,
+            check,
+            unsupported,
+            spinner,
+            item.key,
+            item.name,
+            row_error,
+            error_chip,
         ));
     }
     body.append(&rows);
@@ -603,6 +724,7 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
     let finished = std::rc::Rc::new(finished);
     let completed = std::rc::Rc::new(std::cell::Cell::new(false));
     let closing = dialog.clone();
+    let titled = dialog.clone();
     confirm.connect_clicked(move |button| {
         if completed.get() {
             closing.close();
@@ -644,6 +766,7 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
         );
         let credential_choices = credential_choices.clone();
         let refresh_confirm = refresh_confirm.clone();
+        let (heading, dialog) = (heading.clone(), titled.clone());
         let (feedback, button, cancel, body, rows, details, lede, notice) = (
             feedback.clone(),
             button.clone(),
@@ -660,22 +783,16 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
             for (name, key, choice) in credential_choices.iter() {
                 choice.set_sensitive(
                     !key.starts_with("__")
-                        && selected.iter().any(|(_, row, _, _, server, _, _)| {
-                            server == name
-                                && !row
-                                    .subtitle()
-                                    .is_some_and(|text| text.starts_with("Unsupported:"))
+                        && selected.iter().any(|(_, unsupported, _, _, server, _, _)| {
+                            server == name && !unsupported
                         }),
                 );
             }
             cancel.set_sensitive(true);
             button.set_sensitive(true);
-            for (check, row, spinner, _, _, row_error, _) in selected.iter() {
+            for (check, unsupported, spinner, _, _, row_error, _) in selected.iter() {
                 row_error.set_visible(false);
-                check.set_sensitive(
-                    !row.subtitle()
-                        .is_some_and(|text| text.starts_with("Unsupported:")),
-                );
+                check.set_sensitive(!unsupported);
                 spinner.set_spinning(false);
                 spinner.set_visible(false);
             }
@@ -693,20 +810,22 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                         notice.set_visible(false);
                     }
                     feedback.set_visible(false);
-                    let status = adw::StatusPage::builder()
-                        // GTK's built-in check icon; emblem-ok is missing from
-                        // some themes and rendered as a grey missing-image page.
-                        .icon_name("object-select-symbolic")
-                        .title(
-                            outcome
-                                .message
-                                .split_once(". ")
-                                .map_or(outcome.message.as_str(), |(title, _)| title),
-                        )
-                        .build();
-                    status.add_css_class("compact");
-                    status.add_css_class("toolport-success");
-                    status.set_vexpand(false);
+                    // React's result: the title on the left says what happened, a
+                    // centred check under it, then the text on the left.
+                    let done_title = outcome
+                        .message
+                        .split_once(". ")
+                        .map_or(outcome.message.as_str(), |(title, _)| title)
+                        .to_string();
+                    heading.set_label(&done_title);
+                    dialog.set_title(Some(&done_title));
+                    // GTK's built-in check icon; emblem-ok is missing from some themes.
+                    let status = gtk::Image::from_icon_name("object-select-symbolic");
+                    status.set_pixel_size(40);
+                    status.set_halign(gtk::Align::Center);
+                    status.set_widget_name("toolport-setup-success-icon");
+                    status.add_css_class("toolport-success-icon");
+                    status.set_accessible_role(gtk::AccessibleRole::Presentation);
                     body.prepend(&status);
                     let next_step = match &outcome.connect {
                         // React's line, naming the client.
@@ -720,7 +839,11 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                             .map(|(_, description)| description.to_string()),
                     };
                     if let Some(description) = next_step {
-                        let next_step = gtk::Label::builder().label(description).wrap(true).build();
+                        let next_step = gtk::Label::builder()
+                            .label(description)
+                            .xalign(0.0)
+                            .wrap(true)
+                            .build();
                         next_step.set_widget_name("toolport-setup-next-step");
                         body.insert_child_after(&next_step, Some(&status));
                     }
@@ -1145,16 +1268,39 @@ mod tests {
         );
         assert!(review_details
             .next_sibling()
-            .is_some_and(|w| w.is::<gtk::ListBox>()));
+            .is_some_and(|w| w.widget_name() == "toolport-setup-review-entries"));
         assert_eq!(
             connect_review_title("Claude Code"),
             "Review and connect Claude Code"
         );
+        // React's header: the title on the left, a close button, no header bar.
+        let named = |name: &str| {
+            descendants(window.upcast_ref())
+                .into_iter()
+                .find(|w| w.widget_name() == name)
+                .unwrap_or_else(|| panic!("{name} is in the window"))
+        };
+        assert!(!descendants(window.upcast_ref())
+            .iter()
+            .any(|w| w.is::<adw::HeaderBar>()));
+        let heading = named("toolport-setup-title")
+            .downcast::<gtk::Label>()
+            .unwrap();
+        assert_eq!(heading.text(), "Connect parity fixture");
+        assert_eq!(heading.xalign(), 0.0);
+        assert!(named("toolport-setup-close").is_sensitive());
         let connect = descendants(window.upcast_ref())
             .into_iter()
             .filter_map(|w| w.downcast::<gtk::Button>().ok())
             .find(|b| b.label().as_deref() == Some("Connect"))
             .unwrap();
+        // Spec section 5: Cancel then the confirm, together at the right of a footer.
+        let cancel = connect
+            .prev_sibling()
+            .and_downcast::<gtk::Button>()
+            .unwrap();
+        assert_eq!(cancel.label().as_deref(), Some("Cancel"));
+        assert!(connect.next_sibling().is_none());
         connect.emit_clicked();
         let context = gtk::glib::MainContext::default();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1163,6 +1309,20 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(connect.label().as_deref(), Some("Done"));
+        // React's result: the title on the left says what happened, with a centred check
+        // and left-aligned text; Done stays in the right of the footer.
+        assert_eq!(heading.text(), "Claude Code connected");
+        assert!(!descendants(window.upcast_ref())
+            .iter()
+            .any(|w| w.is::<adw::StatusPage>()));
+        let icon = named("toolport-setup-success-icon");
+        assert_eq!(icon.halign(), gtk::Align::Center);
+        let next = named("toolport-setup-next-step")
+            .downcast::<gtk::Label>()
+            .unwrap();
+        assert_eq!(next.xalign(), 0.0);
+        assert!(connect.next_sibling().is_none());
+        assert!(!cancel.is_visible());
         let shown = labels(&window);
         assert!(
             shown
@@ -1421,6 +1581,97 @@ mod tests {
         window.close();
     }
 
+    /// Each entry is one toggle like React's review button: a square dot that fills when
+    /// selected, the name and command read by screen readers, the pressed state on the
+    /// toggle, and an unsupported entry off and not pressable.
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn review_entries_are_dot_toggles_like_react() {
+        adw::init().unwrap();
+        let parent = gtk::Window::new();
+        let item = |key: &str, unsupported: Option<&str>| SetupItem {
+            key: key.into(),
+            name: key.into(),
+            transport: "stdio".into(),
+            command: Some(format!("/usr/bin/{key}")),
+            args: Vec::new(),
+            url: None,
+            env_keys: Vec::new(),
+            is_new: true,
+            credentials: Vec::new(),
+            unsupported: unsupported.map(str::to_string),
+            updates: Vec::new(),
+        };
+        review(
+            &parent,
+            "Toggle fixture",
+            vec![item("notes", None), item("legacy", Some("SSE"))],
+            "Fixture",
+            "Connect",
+            true,
+            |_, _, _| Err("fixture".into()),
+            || {},
+            None,
+        );
+        let window = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .find(|w| w.title().as_deref() == Some("Toggle fixture"))
+            .unwrap();
+        let widgets = descendants(window.upcast_ref());
+        assert!(!widgets.iter().any(|w| w.is::<gtk::CheckButton>()));
+        let toggles = widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::ToggleButton>())
+            .filter(|t| t.has_css_class("toolport-review-item"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(toggles.len(), 2);
+        let (notes, legacy) = (&toggles[0], &toggles[1]);
+        assert_eq!(notes.accessible_role(), gtk::AccessibleRole::ToggleButton);
+        assert!(notes.is_focusable());
+        assert!(notes.is_active() && notes.is_sensitive());
+        assert!(descendants(notes.upcast_ref())
+            .iter()
+            .any(|w| w.has_css_class("toolport-select-dot")));
+        // The Error chip stays hidden until a check fails.
+        let labels = descendants(notes.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .filter(|l| l.is_visible())
+            .collect::<Vec<_>>();
+        let texts = labels
+            .iter()
+            .map(|l| l.text().to_string())
+            .collect::<Vec<_>>();
+        // React's ImportRow: the name and its status on the dot's line, the command on
+        // its own line under them, wrapping when short enough.
+        assert_eq!(texts, ["notes", "New", "/usr/bin/notes"]);
+        let (name, command) = (&labels[0], &labels[2]);
+        assert!(name.has_css_class("toolport-review-name"));
+        let dot_line = name.parent().unwrap();
+        assert!(dot_line
+            .first_child()
+            .is_some_and(|w| w.has_css_class("toolport-select-dot")));
+        assert_eq!(
+            command.parent().unwrap().first_child().as_ref(),
+            Some(&dot_line)
+        );
+        assert!(command.wraps() && command.has_css_class("monospace"));
+        assert_eq!(command.tooltip_text().as_deref(), Some("/usr/bin/notes"));
+        // Pressing it deselects it, as React's button does.
+        notes.emit_clicked();
+        assert!(!notes.is_active());
+        notes.emit_clicked();
+        assert!(notes.is_active());
+        assert!(!legacy.is_active() && !legacy.is_sensitive());
+        assert!(descendants(legacy.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .any(|l| l.text() == "Unsupported: SSE"));
+        window.close();
+    }
+
     #[test]
     #[ignore = "requires isolated GTK display"]
     fn reviewed_missing_value_and_existing_update_are_explicit() {
@@ -1472,8 +1723,8 @@ mod tests {
             .any(|l| l.text() == "Enter PAT or deselect One"));
         let selected = widgets
             .iter()
-            .filter_map(|w| w.downcast_ref::<gtk::CheckButton>())
-            .find(|check| check.label().is_none())
+            .filter_map(|w| w.downcast_ref::<gtk::ToggleButton>())
+            .find(|toggle| toggle.has_css_class("toolport-review-item"))
             .unwrap();
         selected.set_active(false);
         assert!(confirm.is_sensitive());

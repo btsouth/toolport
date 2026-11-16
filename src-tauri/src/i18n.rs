@@ -281,6 +281,48 @@ fn group_digits_for(locale: &str, value: usize) -> String {
     out
 }
 
+/// A local date and time, as the React app writes it with `fmtTs(ms, "dateTime")`
+/// (`toLocaleString(locale, {year, month, day: numeric, hour: numeric, minute: 2-digit})`):
+/// 11/16/2026, 1:04 AM in English, 16.11.2026, 1:04 in German.
+pub fn format_date_time(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> String {
+    format_date_time_for(locale(), year, month, day, hour, minute)
+}
+
+fn format_date_time_for(
+    locale: &str,
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+) -> String {
+    // 12-hour clocks show 12 for midnight and noon.
+    let h12 = match hour % 12 {
+        0 => 12,
+        h => h,
+    };
+    let am = hour < 12;
+    match locale {
+        "de" => format!("{day}.{month}.{year}, {hour}:{minute:02}"),
+        "es" => format!("{day}/{month}/{year}, {hour}:{minute:02}"),
+        "fr" => format!("{day:02}/{month:02}/{year} {hour}:{minute:02}"),
+        "pt-BR" => format!("{day:02}/{month:02}/{year}, {hour}:{minute:02}"),
+        "ja" | "zh-CN" => format!("{year}/{month}/{day} {hour}:{minute:02}"),
+        "ko" => format!(
+            "{year}. {month}. {day}. {} {h12}:{minute:02}",
+            if am { "오전" } else { "오후" }
+        ),
+        "zh-TW" => format!(
+            "{year}/{month}/{day} {}{h12}:{minute:02}",
+            if am { "上午" } else { "下午" }
+        ),
+        _ => format!(
+            "{month}/{day}/{year}, {h12}:{minute:02} {}",
+            if am { "AM" } else { "PM" }
+        ),
+    }
+}
+
 pub fn revision() -> u64 {
     REVISION.load(Ordering::Acquire)
 }
@@ -346,6 +388,69 @@ mod tests {
         assert_eq!(super::group_digits_for("fr", 1536), "1\u{202f}536");
         assert_eq!(super::group_digits_for("ja", 999), "999");
         assert_eq!(super::group_digits_for("en", 1234567), "1,234,567");
+    }
+
+    /// The same text the React app's `fmtTs(ms, "dateTime")` gives in each language
+    /// (Node's ICU, checked for 2026-11-16 01:04, 2026-01-05 13:30, 2026-12-31 00:00).
+    #[test]
+    fn dates_read_like_the_react_app() {
+        let f = super::format_date_time_for;
+        let cases = [
+            (
+                "en",
+                "11/16/2026, 1:04 AM",
+                "1/5/2026, 1:30 PM",
+                "12/31/2026, 12:00 AM",
+            ),
+            (
+                "de",
+                "16.11.2026, 1:04",
+                "5.1.2026, 13:30",
+                "31.12.2026, 0:00",
+            ),
+            (
+                "es",
+                "16/11/2026, 1:04",
+                "5/1/2026, 13:30",
+                "31/12/2026, 0:00",
+            ),
+            (
+                "fr",
+                "16/11/2026 1:04",
+                "05/01/2026 13:30",
+                "31/12/2026 0:00",
+            ),
+            ("ja", "2026/11/16 1:04", "2026/1/5 13:30", "2026/12/31 0:00"),
+            (
+                "ko",
+                "2026. 11. 16. 오전 1:04",
+                "2026. 1. 5. 오후 1:30",
+                "2026. 12. 31. 오전 12:00",
+            ),
+            (
+                "pt-BR",
+                "16/11/2026, 1:04",
+                "05/01/2026, 13:30",
+                "31/12/2026, 0:00",
+            ),
+            (
+                "zh-CN",
+                "2026/11/16 1:04",
+                "2026/1/5 13:30",
+                "2026/12/31 0:00",
+            ),
+            (
+                "zh-TW",
+                "2026/11/16 上午1:04",
+                "2026/1/5 下午1:30",
+                "2026/12/31 上午12:00",
+            ),
+        ];
+        for (locale, a, b, c) in cases {
+            assert_eq!(f(locale, 2026, 11, 16, 1, 4), a, "{locale}");
+            assert_eq!(f(locale, 2026, 1, 5, 13, 30), b, "{locale}");
+            assert_eq!(f(locale, 2026, 12, 31, 0, 0), c, "{locale}");
+        }
     }
 
     use super::*;
