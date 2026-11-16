@@ -228,9 +228,7 @@ pub fn open_in_default_app(path: &std::path::Path) -> Result<(), String> {
     let program = "xdg-open";
     let mut command = std::process::Command::new(program);
     crate::hostenv::strip_bundled_env(&mut command);
-    command
-        .arg(path)
-        .spawn()
+    crate::hostenv::spawn_reaped(command.arg(path))
         .map(|_| ())
         .map_err(|error| format!("could not open {}: {error}", path.display()))
 }
@@ -246,9 +244,7 @@ fn open_directory(directory: std::path::PathBuf, what: &str) -> Result<(), Strin
     let program = "xdg-open";
     let mut command = std::process::Command::new(program);
     crate::hostenv::strip_bundled_env(&mut command);
-    command
-        .arg(directory)
-        .spawn()
+    crate::hostenv::spawn_reaped(command.arg(directory))
         .map_err(|error| format!("could not open the {what}: {error}"))?;
     Ok(())
 }
