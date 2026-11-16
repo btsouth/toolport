@@ -10013,9 +10013,20 @@ pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> Repoin
 /// The start-up refresh again, after the user unlocked the keyring for a
 /// recovery Retry: clients deferred while it was locked are written now.
 pub fn refresh_stale_client_configs() -> RepointOutcome {
-    let managed = crate::registry::load()
-        .map(|registry| registry.client_managed_entries)
-        .unwrap_or_default();
+    // Without the ownership records an entry's edits cannot be told apart from
+    // Toolport's own, so nothing is rewritten: the clients keep waiting.
+    let managed = match crate::registry::load() {
+        Ok(registry) => registry.client_managed_entries,
+        Err(error) => {
+            crate::gatewaylog::append(&format!(
+                "toolport: client config refresh after keyring unlock skipped; the registry could not be read: {error}"
+            ));
+            return RepointOutcome {
+                deferred: vec!["client configs (registry unreadable)".into()],
+                ..RepointOutcome::default()
+            };
+        }
+    };
     let outcome = repoint_stale_gateways(&managed);
     if !outcome.repointed.is_empty() {
         if let Err(error) = crate::gateway_publish::persist_repointed_ownership(&outcome.repointed)
@@ -10631,6 +10642,14 @@ fn repoint_other_claude_configs_in(
                 eprintln!("{msg}");
                 crate::gatewaylog::append(&msg);
                 outcome.extra_claude_repointed.push(path);
+            }
+            // The backup the write needs waits for the keyring: retried with
+            // the other clients waiting for it, not reported as failed.
+            Err(error) if backup_vault::is_locked_error(&error) => {
+                outcome.deferred.push(format!(
+                    "secondary Claude Code config at {}",
+                    path.display()
+                ));
             }
             Err(error) => {
                 let msg = format!(

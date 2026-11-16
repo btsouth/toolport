@@ -555,6 +555,18 @@ fn insert_action(actions: &gtk::FlowBox, button: &gtk::Button) {
     }
 }
 
+/// Rescan client rows after a Retry that refreshed waiting client configs,
+/// and after a failed one, which may have refreshed them before it failed.
+fn rescan_after_retry<E>(
+    result: &Result<Result<crate::clients::recovery::RecoveryAttempt, String>, E>,
+) -> bool {
+    match result {
+        Ok(Ok(attempt)) => attempt.refreshed,
+        Ok(Err(_)) => true,
+        Err(_) => false,
+    }
+}
+
 impl ClientPage {
     /// Lists from the recovery files only; it never contacts the credential
     /// store, so it is safe on the UI thread.
@@ -790,8 +802,7 @@ impl ClientPage {
             page.recovery_feedback
                 .borrow_mut()
                 .retain(|(id, _)| id != &record.id);
-            // Deferred client refreshes ran: show the rewritten client rows.
-            let rescan = matches!(&result, Ok(Ok(result)) if result.refreshed);
+            let rescan = rescan_after_retry(&result);
             match result {
                 Ok(Ok(result)) if result.pending.is_none() => {
                     page.set_recovery_result(&record.client_id, result.message, true);
@@ -1077,6 +1088,28 @@ impl ClientPage {
 
 #[cfg(test)]
 mod tests {
+    /// A failed Retry may already have refreshed waiting client configs, so
+    /// the client rows are rescanned then too.
+    #[test]
+    fn a_failed_retry_still_rescans_client_rows() {
+        let attempt = |refreshed| crate::clients::recovery::RecoveryAttempt {
+            id: "r".into(),
+            client_id: "cursor".into(),
+            client_name: "Cursor".into(),
+            restored: 0,
+            accounted: 0,
+            remaining: 1,
+            message: String::new(),
+            pending: None,
+            refreshed,
+        };
+        let ok = |a| -> Result<Result<_, String>, ()> { Ok(Ok(a)) };
+        assert!(rescan_after_retry(&ok(attempt(true))));
+        assert!(!rescan_after_retry(&ok(attempt(false))));
+        assert!(rescan_after_retry::<()>(&Ok(Err("restore failed".into()))));
+        assert!(!rescan_after_retry::<()>(&Err(())));
+    }
+
     /// F5: the recovery card's labels re-read their text on the GTK main
     /// thread. With a locked keyring that must make no credential-store call,
     /// so it can never wait on (or raise) an unlock prompt.

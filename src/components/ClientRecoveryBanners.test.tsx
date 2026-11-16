@@ -56,6 +56,7 @@ function result(pending: ClientRecovery | null = null) {
     remaining: pending ? 1 : 0,
     message: `Cursor: saved values restored: ${pending ? 0 : 1}; already resolved or removed: 0; still missing: ${pending ? 1 : 0}.`,
     pending,
+    refreshed: false,
   };
 }
 
@@ -137,6 +138,16 @@ it("keeps the recovery visible when retry is still locked", async () => {
   );
   expect(screen.getByRole("region")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+});
+
+it("reloads client rows when a still pending Retry refreshed waiting client configs", async () => {
+  api.retryClientRecovery.mockResolvedValue({ ...result(recovery()), refreshed: true });
+  const onRecovered = vi.fn();
+  render(<ClientRecoveryBanners refreshKey="initial" onRecovered={onRecovered} />);
+  await userEvent.click(await screen.findByRole("button", { name: "Retry" }));
+  expect(await screen.findByRole("status")).toHaveTextContent("still missing: 1.");
+  expect(screen.getByRole("region")).toBeInTheDocument();
+  expect(onRecovered).toHaveBeenCalledOnce();
 });
 
 it("requires an informed dismissal and keeps the receipt discoverable after remount", async () => {

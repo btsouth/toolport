@@ -1001,6 +1001,7 @@ it("clears a refused disconnect once that client's recovery succeeds, as GTK doe
     remaining: 0,
     message: "Claude Desktop: saved values restored: 1.",
     pending: null,
+    refreshed: false,
   });
   render(
     <ClientDetail

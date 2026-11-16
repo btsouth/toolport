@@ -191,6 +191,8 @@ pub(crate) fn refresh_deferred() -> bool {
     }
     #[cfg(test)]
     if fake::record("refresh deferred client configs") {
+        // A real refresh can restore other clients, which resets progress.
+        super::recovery_values::reset_progress();
         return true;
     }
     let Ok(_one) = REFRESHING.try_lock() else {

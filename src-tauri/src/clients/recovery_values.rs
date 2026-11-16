@@ -294,6 +294,19 @@ fn spans(format: Format, text: &str) -> Result<Vec<Span>, String> {
 }
 /// Names on the way to every string in `text` that holds `marker`: object keys
 /// and entry `name` fields, so the config entries a saved value sits under.
+/// Fields that make an object a server entry in any client format.
+const ENTRY_FIELDS: &[&str] = &[
+    "command",
+    "url",
+    "serverUrl",
+    "httpUrl",
+    "type",
+    "transport",
+    "args",
+    "env",
+    "headers",
+];
+
 fn marker_owners(format: Format, text: &str, marker: &str) -> Result<Vec<String>, String> {
     fn walk(
         value: &serde_json::Value,
@@ -320,9 +333,18 @@ fn marker_owners(format: Format, text: &str, marker: &str) -> Result<Vec<String>
                     path.push(name.to_string());
                 }
                 for (key, item) in map {
-                    path.push(key.clone());
+                    // Only a server entry names an owner: structural keys such
+                    // as `env`, `headers` or `mcpServers` never do.
+                    let entry = item.as_object().is_some_and(|fields| {
+                        ENTRY_FIELDS.iter().any(|field| fields.contains_key(*field))
+                    });
+                    if entry {
+                        path.push(key.clone());
+                    }
                     walk(item, marker, path, out);
-                    path.pop();
+                    if entry {
+                        path.pop();
+                    }
                 }
                 if named.is_some() {
                     path.pop();
@@ -527,6 +549,15 @@ mod tests {
         assert_eq!(
             owned(Format::YamlMcpServersList, Some(named), &refs),
             vec![1, 2]
+        );
+        // A structural key (`env`) is never an owner, even when a server has that id.
+        let env = reference("env");
+        let structural = [(&env, m), (&a, m)];
+        let weather =
+            r#"{"mcpServers":{"weather":{"env":{"API_KEY":"TOOLPORT_MISSING_CREDENTIAL_0"}}}}"#;
+        assert_eq!(
+            owned(Format::JsonMcpServers, Some(weather), &structural),
+            vec![1]
         );
         // No entry holds it (or the config is gone): the first listed keeps it.
         assert_eq!(owned(Format::JsonMcpServers, None, &refs), vec![0, 2]);

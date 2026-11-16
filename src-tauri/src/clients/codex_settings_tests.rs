@@ -533,6 +533,28 @@ fn repeated_start_up_passes_start_one_backup_upgrade_waiter() {
     });
 }
 
+/// CodeRabbit (Major): with the registry unreadable, the ownership records are
+/// unknown, so the post-unlock refresh rewrites nothing and keeps waiting.
+#[test]
+fn an_unreadable_registry_stops_the_unlock_refresh() {
+    crate::secrets::tests::with_isolated_vault(|| {
+        let dir = crate::registry::conduit_dir().unwrap();
+        let _env_lock = env_test_lock();
+        let _client_env = isolated_client_env(&dir);
+        let _home = TestHome::set(&dir);
+        let registry = crate::registry::resolved_path().unwrap();
+        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        std::fs::write(&registry, "{ not a registry").unwrap();
+        let outcome = refresh_stale_client_configs();
+        assert!(outcome.repointed.is_empty() && outcome.failed.is_empty());
+        assert!(!outcome.deferred.is_empty(), "{:?}", outcome.deferred);
+        assert_eq!(
+            std::fs::read_to_string(&registry).unwrap(),
+            "{ not a registry"
+        );
+    });
+}
+
 /// F1: the log names what the pass was doing; the same path is a refresh.
 #[test]
 fn refresh_failures_do_not_claim_a_repoint_onto_the_same_path() {

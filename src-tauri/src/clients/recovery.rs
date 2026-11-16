@@ -765,7 +765,6 @@ pub struct RecoveryAttempt {
     pub pending: Option<ClientRecovery>,
     /// Client configs start-up put off for the keyring were refreshed during
     /// this Retry; the shell rescans its client rows.
-    #[serde(skip)]
     pub refreshed: bool,
 }
 const STILL_LOCKED: &str = crate::i18n::msg(
