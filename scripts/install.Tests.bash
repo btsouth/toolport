@@ -396,7 +396,8 @@ set +e
 result="$(PATH="$arch_shim:$PATH" HOME="$arch_home" TOOLPORT_OS_RELEASE="$arch_shim/os-release-arch" TOOLPORT_PACMAN_CONF="$arch_conf" TOOLPORT_REPO_KEY_ID="DEADBEEFDEADBEEF" bash "$INSTALL_SH" 2>&1)"
 rc=$?
 set -e
-check "signature failure says to populate the keyring" "Run: sudo pacman-key --populate" "$result"
+check "signature failure suggests populating the keyring" "If your keyring is new or missing keys, run: sudo pacman-key --populate" "$result"
+check "signature failure suggests a retry for a damaged download" "If a download was damaged, pacman has removed it: run this installer again." "$result"
 if [ "$rc" != 0 ]; then pass=$((pass+1)); else echo "  FAIL: signature failure exited 0"; fail=$((fail+1)); fi
 printf '#!/bin/sh\nexit 1\n' > "$arch_shim/pacman-key"
 set +e

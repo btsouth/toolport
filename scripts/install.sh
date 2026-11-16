@@ -397,9 +397,12 @@ install_arch_repo() {
   pacman_log="$tmp/pacman.log"
   if ! $sudo pacman -Syu --noconfirm toolport 2>&1 | tee "$pacman_log"; then
     if grep -qiE 'unknown trust|PGP signature|signature from|key .* could not be looked up' "$pacman_log"; then
-      err "pacman rejected package signatures: your pacman keyring is missing your distribution's keys." \
-        "Run: sudo pacman-key --populate" \
-        "Then retry this installer."
+      # Either the keyring lacks the distribution keys or a download was damaged.
+      # With --noconfirm pacman already deleted a corrupted file from its cache,
+      # so a plain retry downloads it again.
+      err "pacman rejected a package signature." \
+        "If your keyring is new or missing keys, run: sudo pacman-key --populate" \
+        "If a download was damaged, pacman has removed it: run this installer again."
     fi
     err "pacman could not install toolport. Check the output above."
   fi
