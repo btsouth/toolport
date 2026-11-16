@@ -3,6 +3,7 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import userEvent from "@testing-library/user-event";
 import { ClientDetail } from "./ClientDetail";
+import { setLanguage } from "@/lib/i18n";
 import {
   importServers,
   previewImportServers,
@@ -20,6 +21,8 @@ const toastSuccess = vi.fn();
 const toastError = vi.fn();
 
 vi.mock("@/lib/api", () => ({
+  getUiLanguage: vi.fn().mockResolvedValue("en"),
+  setUiLanguage: vi.fn().mockResolvedValue(undefined),
   listClientRecoveries: vi.fn().mockResolvedValue([]),
   retryClientRecovery: vi.fn(),
   dismissClientRecovery: vi.fn(),
@@ -779,6 +782,28 @@ it("shows Remove location disabled with why while T3 Code still uses the folder"
   await user.click(remove);
   expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it("keeps the disabled Remove location's name and reason in the current language", async () => {
+  render(
+    <TooltipProvider>
+      <ClientDetail
+        client={client({ id: "codex@t3-0123456789abcdef", locationKeptByT3Code: true })}
+        registry={emptyRegistry()}
+        onChanged={vi.fn()}
+        onRegistryChange={vi.fn()}
+      />
+    </TooltipProvider>,
+  );
+  await act(() => setLanguage("fr"));
+  try {
+    const remove = screen.getByRole("button", { name: "Supprimer l'emplacement" });
+    expect(remove).toHaveAccessibleDescription(
+      "T3 Code utilise encore ce dossier. Retirez-le d'abord des paramètres des fournisseurs de T3 Code.",
+    );
+  } finally {
+    await act(() => setLanguage("en"));
+  }
 });
 
 it("shows disconnect and restart feedback once inline without a duplicate toast", async () => {

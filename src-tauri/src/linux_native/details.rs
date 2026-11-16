@@ -1203,6 +1203,34 @@ mod tests {
         assert_eq!(detail.len(), 1, "the details show Remove location");
         assert!(!detail[0].is_sensitive());
         assert_eq!(detail[0].tooltip_text().as_deref(), Some(reason.as_str()));
+        // Screen readers get the name and the reason, and both follow a language change
+        // in the list row and in the details, like the tooltip.
+        let source =
+            "T3 Code still uses this folder. Remove it from T3 Code's provider settings first.";
+        let spoken = |button: &gtk::Button| l10n::accessible_text(button).unwrap();
+        for button in [&row[0], &detail[0]] {
+            assert_eq!(
+                spoken(button),
+                (
+                    "Remove location Claude Code".to_string(),
+                    Some(source.to_string())
+                )
+            );
+        }
+        crate::i18n::set_language("fr").unwrap();
+        l10n::refresh_bindings();
+        let french = crate::i18n::tr(source);
+        assert_ne!(french, source, "the reason has a French translation");
+        for button in [&row[0], &detail[0]] {
+            assert_eq!(button.tooltip_text().as_deref(), Some(french.as_str()));
+            assert_eq!(spoken(button).1.as_deref(), Some(french.as_str()));
+            assert_eq!(
+                spoken(button).0,
+                crate::i18n::trf("Remove location {value0}", &[("value0", "Claude Code")])
+            );
+        }
+        crate::i18n::set_language("en").unwrap();
+        l10n::refresh_bindings();
         window.close();
     }
 

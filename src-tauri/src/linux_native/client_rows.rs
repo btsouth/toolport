@@ -462,7 +462,6 @@ pub(super) fn remove_location_button(client: &state::ClientView, page: ClientPag
     remove.add_css_class("flat");
     remove.set_valign(gtk::Align::Center);
     remove.set_sensitive(!client.config_error && !client.location_kept_by_t3_code);
-    let label = crate::i18n::trf("Remove location {value0}", &[("value0", &client.name)]);
     let kept = client.location_kept_by_t3_code;
     // What it does, or why it is disabled.
     remove.set_tooltip_text(Some(&crate::i18n::tr(if kept {
@@ -478,12 +477,18 @@ pub(super) fn remove_location_button(client: &state::ClientView, page: ClientPag
             "Remove location"
         },
     );
-    remove.update_property(&[gtk::accessible::Property::Label(&label)]);
-    if kept {
-        remove.update_property(&[gtk::accessible::Property::Description(&crate::i18n::tr(
-            "T3 Code still uses this folder. Remove it from T3 Code's provider settings first.",
-        ))]);
-    }
+    // Both follow language changes, like the tooltip.
+    let name = client.name.clone();
+    l10n::bind_accessible_with(&remove, move || {
+        (
+            crate::i18n::trf("Remove location {value0}", &[("value0", &name)]),
+            kept.then(|| {
+                crate::i18n::tr(
+                    "T3 Code still uses this folder. Remove it from T3 Code's provider settings first.",
+                )
+            }),
+        )
+    });
     let id = client.id.clone();
     remove.connect_clicked(move |_| {
         let Some(parent) = page.root.root().and_downcast::<gtk::Window>() else {

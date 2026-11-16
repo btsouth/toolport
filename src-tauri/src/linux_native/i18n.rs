@@ -261,6 +261,55 @@ pub(super) fn bind_accessible_label(widget: &impl IsA<gtk::Accessible>, source: 
     );
 }
 
+/// The accessible name and, when there is one, the description read by screen readers,
+/// both kept in the current language. `text` is called again after each language change.
+pub(super) fn bind_accessible_with(
+    widget: &impl IsA<gtk::Accessible>,
+    text: impl Fn() -> (String, Option<String>) + 'static,
+) {
+    let weak = widget.as_ref().downgrade();
+    register(
+        widget.as_ref(),
+        "accessible-label-description",
+        Rc::new(move || {
+            let Some(widget) = weak.upgrade() else {
+                return false;
+            };
+            let (label, description) = text();
+            widget.update_property(&[gtk::accessible::Property::Label(&label)]);
+            match &description {
+                Some(description) => {
+                    widget.update_property(&[gtk::accessible::Property::Description(description)])
+                }
+                None => widget.reset_property(gtk::AccessibleProperty::Description),
+            }
+            #[cfg(test)]
+            ACCESSIBLE_TEXT.with(|texts| {
+                texts
+                    .borrow_mut()
+                    .insert(widget.as_ptr() as usize, (label, description))
+            });
+            true
+        }),
+    );
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What [`bind_accessible_with`] last set, since GTK has no getter for it.
+    static ACCESSIBLE_TEXT: RefCell<HashMap<usize, (String, Option<String>)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// The accessible name and description [`bind_accessible_with`] last set on `widget`.
+#[cfg(test)]
+pub(super) fn accessible_text(
+    widget: &impl IsA<gtk::Accessible>,
+) -> Option<(String, Option<String>)> {
+    let key = widget.as_ref().as_ptr() as usize;
+    ACCESSIBLE_TEXT.with(|texts| texts.borrow().get(&key).cloned())
+}
+
 pub(super) fn bind_window_title(window: &impl IsA<gtk::Window>, source: &'static str) {
     let weak = window.as_ref().downgrade();
     register(
