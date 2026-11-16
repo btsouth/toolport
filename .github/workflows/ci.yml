@@ -362,7 +362,8 @@ jobs:
             tests::pasted_rows_offer_the_react_choices \
             tests::a_remote_paste_says_its_rows_are_the_token \
             tests::a_remote_variable_turns_save_and_test_off_up_front \
-            tests::credentials_offer_no_new_variable_for_a_remote_server
+            tests::credentials_offer_no_new_variable_for_a_remote_server \
+            tests::a_switch_to_http_says_the_values_are_the_token
           do
             xvfb-run -a dbus-run-session -- cargo test \
               --manifest-path src-tauri/Cargo.toml --no-default-features \

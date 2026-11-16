@@ -12374,7 +12374,7 @@ fn open_server_editor_prefilled(
             .borrow()
             .as_ref()
             .is_some_and(|snapshot| snapshot.personal_sync);
-        let (section, rows, add) = plain_env_section(
+        let (section, rows, add, caption) = plain_env_section(
             server
                 .as_ref()
                 .map(|server| server.plain_env.as_slice())
@@ -12383,7 +12383,7 @@ fn open_server_editor_prefilled(
             &rows_changed,
         );
         form.append(&section);
-        (section, rows, add)
+        (section, rows, add, caption)
     });
 
     let credentials = gtk::Label::builder()
@@ -12553,16 +12553,17 @@ fn open_server_editor_prefilled(
     let url_row_for_transport = url_row.clone();
     let env_section = plain_env
         .as_ref()
-        .map(|(section, _, add)| (section.clone(), add.clone()));
+        .map(|(section, _, add, caption)| (section.clone(), add.clone(), caption.clone()));
     // A remote server has no environment, but variables a stdio server had
     // stay in view after a switch, so they can be removed before saving.
     let had_plain = server
         .as_ref()
         .is_some_and(|server| !server.plain_env.is_empty());
     // A remote server takes no new variables.
-    if let Some((section, add)) = &env_section {
+    if let Some((section, add, caption)) = &env_section {
         section.set_visible(transport.selected() == 0 || had_plain);
         add.set_visible(transport.selected() == 0);
+        set_plain_env_caption(caption, transport.selected() != 0);
     }
     transport.connect_selected_notify(move |transport| {
         update_editor_transport(
@@ -12572,12 +12573,13 @@ fn open_server_editor_prefilled(
             &cwd_row_for_transport,
             &url_row_for_transport,
         );
-        if let Some((section, add)) = &env_section {
+        if let Some((section, add, caption)) = &env_section {
             section.set_visible(transport.selected() == 0 || had_plain);
             add.set_visible(transport.selected() == 0);
+            set_plain_env_caption(caption, transport.selected() != 0);
         }
     });
-    let plain_env = plain_env.map(|(_, rows, _)| rows);
+    let plain_env = plain_env.map(|(_, rows, _, _)| rows);
 
     let clamp = adw::Clamp::builder()
         .maximum_size(680)
@@ -13464,6 +13466,7 @@ fn editor_timeout_ms(text: &str) -> Result<Option<u64>, String> {
 
 /// An action set after the widgets it needs exist.
 type LateAction = std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>>;
+type WeakLateAction = std::rc::Weak<std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>>;
 
 /// The exact arguments behind the one-per-line box, until the user edits it.
 type ExactArgs = std::rc::Rc<std::cell::RefCell<Option<Vec<String>>>>;
@@ -13659,7 +13662,7 @@ struct PastedEnvSection {
 struct WeakPastedEnvSection {
     section: gtk::glib::WeakRef<gtk::Box>,
     caption: gtk::glib::WeakRef<gtk::Label>,
-    changed: std::rc::Weak<std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>>,
+    changed: WeakLateAction,
     list: gtk::glib::WeakRef<gtk::Box>,
     notice: gtk::glib::WeakRef<gtk::Label>,
     rows: std::rc::Weak<std::cell::RefCell<Vec<PastedEnvRow>>>,
@@ -14137,10 +14140,15 @@ fn plain_env_section(
     values: &[state::PlainEnvView],
     personal: bool,
     changed: &LateAction,
-) -> (gtk::Box, PlainEnvRows, gtk::Button) {
+) -> (gtk::Box, PlainEnvRows, gtk::Button, gtk::Label) {
     let section = gtk::Box::new(gtk::Orientation::Vertical, 8);
     section.add_css_class("toolport-form-section");
-    section.append(&section_heading(crate::i18n::msg("Environment"), crate::i18n::msg("Plain settings the command reads, such as a region or a feature flag. Keys and tokens belong in Credentials.")));
+    let heading = section_heading(crate::i18n::msg("Environment"), crate::i18n::msg("Plain settings the command reads, such as a region or a feature flag. Keys and tokens belong in Credentials."));
+    let caption = heading
+        .last_child()
+        .and_downcast::<gtk::Label>()
+        .expect("a section heading ends with its caption");
+    section.append(&heading);
     let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
     section.append(&list);
     let rows: PlainEnvRows = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -14164,7 +14172,20 @@ fn plain_env_section(
         key.grab_focus();
     });
     section.append(&add);
-    (section, rows, add)
+    (section, rows, add, caption)
+}
+
+/// The plain values' caption for the selected transport: a remote server's
+/// values are sent as its token, the same note React shows.
+fn set_plain_env_caption(caption: &gtk::Label, remote: bool) {
+    l10n::bind_label(
+        caption,
+        if remote {
+            crate::i18n::msg("Remote servers have no environment. When this server has no other token, Toolport sends the first stored value to it as its bearer token.")
+        } else {
+            crate::i18n::msg("Plain settings the command reads, such as a region or a feature flag. Keys and tokens belong in Credentials.")
+        },
+    );
 }
 
 /// Run a hook set once its target exists, such as the editor's field checks.
@@ -17710,6 +17731,89 @@ mod tests {
         key.set_text("Authorization");
         assert!(!shown.is_visible());
         assert!(save.is_sensitive() && test.is_sensitive());
+        editor.close();
+        parent.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn a_switch_to_http_says_the_values_are_the_token() {
+        use super::*;
+        adw::init().unwrap();
+        let _data = crate::registry::DataDirTestEnv::new("gtk-switch-caption");
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.SwitchCaption")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gtk::gio::Cancellable::NONE).unwrap();
+        let parent = adw::ApplicationWindow::builder().application(&app).build();
+        let (content, page, _) = build_content(&app, crate::approval_broker::start_native());
+        parent.set_content(Some(&content));
+        parent.present();
+        let server = state::ServerView {
+            id: "local".into(),
+            name: "Local tool".into(),
+            origin_label: "Personal".into(),
+            transport: "stdio".into(),
+            transport_id: "stdio".into(),
+            command: Some("npx".into()),
+            args: vec![],
+            launch: None,
+            url: None,
+            cwd: None,
+            inherit_env: false,
+            hide_prompts: false,
+            secret_keys: vec![],
+            plain_env: vec![state::PlainEnvView {
+                key: "API_KEY".into(),
+                value: "plain-value".into(),
+                portable: None,
+            }],
+            secret_references: Default::default(),
+            client_credentials: None,
+            enabled: false,
+            requires_review: false,
+            team_route_removed: false,
+            probe_fingerprint: 1,
+        };
+        let editor =
+            open_server_editor_prefilled(Some(server), Some("local".into()), page, None).unwrap();
+        fn widgets(widget: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+            out.push(widget.clone());
+            let mut child = widget.first_child();
+            while let Some(node) = child {
+                child = node.next_sibling();
+                widgets(&node, out);
+            }
+        }
+        let all = || {
+            let mut all = Vec::new();
+            widgets(editor.upcast_ref(), &mut all);
+            all
+        };
+        let local = "Plain settings the command reads, such as a region or a feature flag. Keys and tokens belong in Credentials.";
+        let remote = "Remote servers have no environment. When this server has no other token, Toolport sends the first stored value to it as its bearer token.";
+        let caption = all()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .find(|l| l.label() == local)
+            .expect("a stdio server's values say what they are for");
+        let add = all()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .find(|b| b.label().as_deref() == Some("Add value"))
+            .unwrap();
+        assert!(add.is_visible());
+        let transport = all()
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::DropDown>().ok())
+            .unwrap();
+        transport.set_selected(1);
+        assert_eq!(caption.label(), remote);
+        assert!(caption.is_visible() && !add.is_visible());
+        transport.set_selected(0);
+        assert_eq!(caption.label(), local);
+        assert!(add.is_visible());
         editor.close();
         parent.close();
     }

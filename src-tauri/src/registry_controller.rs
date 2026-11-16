@@ -5826,7 +5826,8 @@ API_KEY = "synthetic-first-origin"
             ..Default::default()
         };
         let url = Some("https://example.com/mcp");
-        let refusal = editor_remote_env_refusal(None, "http", None, url, None, &[typed.clone()]);
+        let refusal =
+            editor_remote_env_refusal(None, "http", None, url, None, std::slice::from_ref(&typed));
         assert!(refusal.unwrap().contains("RESEND_API_KEY"));
         assert!(
             editor_remote_env_refusal(None, "stdio", Some("npx"), None, None, &[typed]).is_none()
