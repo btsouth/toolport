@@ -2638,6 +2638,87 @@ pub fn disconnect_client(client_id: &str) -> Result<ClientMutationResult, String
     })
 }
 
+/// Disconnect one client the user chose in the app. If the keyring is locked
+/// and the recovery files need it, this asks to unlock once (call it off the
+/// UI thread); Remove from all clients, purge and the CLI use
+/// [`disconnect_client`], which never asks.
+pub fn disconnect_client_asking_to_unlock(client_id: &str) -> Result<ClientMutationResult, String> {
+    disconnect_client_with_unlock(client_id, update_registry_on_disk, || {
+        crate::secrets::delete_secret(CLIENT_HTTP_VAULT_SERVER, client_id)
+    })
+}
+
+/// [`disconnect_client_with`] for a Disconnect the user chose: the first try
+/// never prompts. Refused only because the keyring is locked, before the
+/// client config or the registry changed, it removes exactly the backups that
+/// try wrote, asks to unlock once and tries again. If the keyring stays locked
+/// it refuses and leaves everything as it was.
+pub(crate) fn disconnect_client_with_unlock(
+    client_id: &str,
+    update_registry: impl FnOnce(&dyn Fn(&mut Registry)) -> Result<Registry, String>,
+    revoke: impl FnOnce() -> Result<(), String>,
+) -> Result<ClientMutationResult, String> {
+    let mut update_registry = Some(update_registry);
+    let mut revoke = Some(revoke);
+    let (first, attempt) = clients::attempt::recorded(|| {
+        clients::backup_vault::noninteractive(|| {
+            disconnect_try(client_id, &mut update_registry, &mut revoke)
+        })
+    });
+    match first {
+        Err(error)
+            if clients::backup_vault::is_locked_error(&error)
+                && update_registry.is_some()
+                && revoke.is_some() =>
+        {
+            attempt.undo()?;
+            match clients::backup_vault::request_unlock() {
+                clients::backup_vault::Unlock::Open => {
+                    disconnect_try(client_id, &mut update_registry, &mut revoke)
+                }
+                clients::backup_vault::Unlock::StillLocked => Err(unlock_to_disconnect(client_id)),
+            }
+        }
+        other => {
+            attempt.keep();
+            other
+        }
+    }
+}
+
+/// One Disconnect try. The callbacks are taken only when used, so a try
+/// refused before the registry write can run again with them.
+fn disconnect_try<U, R>(
+    client_id: &str,
+    update_registry: &mut Option<U>,
+    revoke: &mut Option<R>,
+) -> Result<ClientMutationResult, String>
+where
+    U: FnOnce(&dyn Fn(&mut Registry)) -> Result<Registry, String>,
+    R: FnOnce() -> Result<(), String>,
+{
+    disconnect_client_with(
+        client_id,
+        |apply: &dyn Fn(&mut Registry)| match update_registry.take() {
+            Some(update) => update(apply),
+            None => Err("Disconnect already wrote the registry".into()),
+        },
+        // The user asked for this delete; it may prompt like any other.
+        || match revoke.take() {
+            Some(revoke) => clients::backup_vault::interactive(revoke),
+            None => Ok(()),
+        },
+    )
+}
+
+/// Disconnect's answer when the keyring stayed locked.
+pub(crate) fn unlock_to_disconnect(client_id: &str) -> String {
+    crate::i18n::trf(
+        "Unlock your keyring to disconnect {client}.",
+        &[("client", &clients::client_display_name(client_id))],
+    )
+}
+
 fn disconnect_client_with_revocation(
     client_id: &str,
     revoke: impl FnOnce() -> Result<(), String>,
@@ -6427,6 +6508,216 @@ API_KEY = "synthetic-first-origin"
         assert_eq!(snapshot["exactEligible"], false);
         disconnect_client("claude-code").unwrap();
         assert_eq!(json_file(&fixture.claude())["session"], 2);
+    }
+
+    /// Every file under the data dir and the client config, byte for byte.
+    fn locked_disconnect_snapshot(fixture: &MoveFixture) -> Vec<(PathBuf, Vec<u8>)> {
+        fn walk(dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if !path.extension().is_some_and(|ext| ext == "lock") {
+                    out.push((path.clone(), std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        let mut out = vec![(fixture.claude(), std::fs::read(fixture.claude()).unwrap())];
+        walk(&fixture.root.join("data"), &mut out);
+        out.sort();
+        out
+    }
+
+    const LEGACY_VALUE: &str = "wx-legacy-fixture-value";
+    const NEW_VALUE: &str = "mercury-new-fixture-value";
+
+    /// F23: Claude Code connected by 2.3.5, so its recovery files hold
+    /// WEATHER_API_KEY in plain text; since then Toolport stores that value
+    /// as a secret. With `new_secret`, the user also flagged PLANET secret and
+    /// set a new value for it in the client. The backup folder already holds
+    /// five old generations of the config.
+    fn locked_disconnect_fixture(new_secret: bool) -> (MoveFixture, String) {
+        let fixture = MoveFixture::new(&Registry::default());
+        let original = format!(
+            r#"{{"mcpServers":{{"weather":{{"command":"echo","env":{{"WEATHER_API_KEY":"{LEGACY_VALUE}"}}}}}}}}"#
+        );
+        std::fs::write(fixture.claude(), &original).unwrap();
+        let backups = fixture.root.join("data/backups/claude-code");
+        std::fs::create_dir_all(&backups).unwrap();
+        let name = fixture
+            .claude()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        for stamp in 1..=5 {
+            std::fs::write(backups.join(format!("{stamp}000000000000-{name}")), "{}").unwrap();
+        }
+        // Nothing is known secret yet, so nothing is sealed, as in 2.3.5.
+        clients::install_gateway("claude-code", None).unwrap();
+        assert!(std::fs::read_dir(&backups).unwrap().flatten().any(|entry| {
+            std::fs::read_to_string(entry.path()).is_ok_and(|raw| raw.contains(LEGACY_VALUE))
+        }));
+        registry::update(|registry| {
+            let mut env = vec![serde_json::json!({"key":"WEATHER_API_KEY","secret":true})];
+            if new_secret {
+                env.push(serde_json::json!({"key":"PLANET","secret":true}));
+            }
+            registry.servers.push(
+                serde_json::from_value(serde_json::json!({
+                    "id":"weather","name":"Weather","transport":"stdio","env":env
+                }))
+                .unwrap(),
+            );
+            Ok(())
+        })
+        .unwrap();
+        crate::secrets::set_secret("weather", "WEATHER_API_KEY", LEGACY_VALUE).unwrap();
+        if new_secret {
+            crate::secrets::set_secret("weather", "PLANET", NEW_VALUE).unwrap();
+            let mut config = json_file(&fixture.claude());
+            config["mcpServers"]["planet"] = serde_json::json!({
+                "command":"echo","env":{"PLANET":NEW_VALUE}
+            });
+            std::fs::write(fixture.claude(), config.to_string()).unwrap();
+        }
+        (fixture, original)
+    }
+
+    fn generations(fixture: &MoveFixture) -> usize {
+        let name = fixture
+            .claude()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        std::fs::read_dir(fixture.root.join("data/backups/claude-code"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(&format!("-{name}"))
+            })
+            .count()
+    }
+
+    fn unlock_prompts(calls: &[String]) -> usize {
+        calls.iter().filter(|call| *call == "unlock prompt").count()
+    }
+
+    /// F23: a Disconnect the user chose while the keyring is locked asks to
+    /// unlock once, then disconnects through the sealed path and restores the
+    /// original. On main it failed with "Saved credential recovery: Locked".
+    #[test]
+    fn locked_disconnect_of_a_2_3_5_client_asks_once_then_restores() {
+        let (fixture, original) = locked_disconnect_fixture(false);
+        let mut result = None;
+        let calls =
+            clients::backup_vault::fake::locked_store(clients::backup_vault::Unlock::Open, || {
+                result = Some(disconnect_client_asking_to_unlock("claude-code"))
+            });
+        result.unwrap().unwrap();
+        assert_eq!(unlock_prompts(&calls), 1, "{calls:?}");
+        assert!(
+            !calls.iter().any(|call| call.starts_with("prompting")),
+            "{calls:?}"
+        );
+        assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
+    }
+
+    /// A new secret: after the one unlock the Disconnect finishes and the
+    /// value is sealed, in no file in plain text.
+    #[test]
+    fn locked_disconnect_with_a_new_secret_seals_it_after_one_unlock() {
+        let (fixture, _) = locked_disconnect_fixture(true);
+        let mut result = None;
+        let calls =
+            clients::backup_vault::fake::locked_store(clients::backup_vault::Unlock::Open, || {
+                result = Some(disconnect_client_asking_to_unlock("claude-code"))
+            });
+        result.unwrap().unwrap();
+        assert_eq!(unlock_prompts(&calls), 1, "{calls:?}");
+        let plain: Vec<_> = locked_disconnect_snapshot(&fixture)
+            .into_iter()
+            .filter(|(path, raw)| {
+                *path != fixture.claude() && String::from_utf8_lossy(raw).contains(NEW_VALUE)
+            })
+            .map(|(path, _)| path)
+            .collect();
+        assert!(plain.is_empty(), "{plain:?}");
+        assert!(!json_file(&fixture.claude())["mcpServers"]
+            .as_object()
+            .unwrap()
+            .contains_key(clients::GATEWAY_ENTRY_NAME));
+    }
+
+    /// Cancel: the line says what to do, and the config, the registry and
+    /// every backup file (all five old generations too) are unchanged byte
+    /// for byte.
+    #[test]
+    fn locked_disconnect_cancel_changes_nothing() {
+        for new_secret in [false, true] {
+            let (fixture, _) = locked_disconnect_fixture(new_secret);
+            let before = locked_disconnect_snapshot(&fixture);
+            let kept = generations(&fixture);
+            let mut result = None;
+            let calls = clients::backup_vault::fake::locked_store(
+                clients::backup_vault::Unlock::StillLocked,
+                || result = Some(disconnect_client_asking_to_unlock("claude-code")),
+            );
+            assert_eq!(
+                result.unwrap().unwrap_err(),
+                "Unlock your keyring to disconnect Claude Code."
+            );
+            assert_eq!(unlock_prompts(&calls), 1, "{calls:?}");
+            assert!(
+                !calls.iter().any(|call| call.starts_with("prompting")),
+                "{calls:?}"
+            );
+            assert_eq!(generations(&fixture), kept);
+            assert!(
+                locked_disconnect_snapshot(&fixture) == before,
+                "new_secret={new_secret}"
+            );
+            drop(fixture);
+        }
+    }
+
+    /// Remove from all clients, purge and `--disconnect-all` never ask to
+    /// unlock: a locked client fails at once, as on main.
+    #[test]
+    fn bulk_and_cli_disconnect_never_ask_to_unlock() {
+        let (fixture, _) = locked_disconnect_fixture(false);
+        let mut single = None;
+        let mut all = None;
+        let calls =
+            clients::backup_vault::fake::locked_store(clients::backup_vault::Unlock::Open, || {
+                single = Some(disconnect_client("claude-code"));
+                all = Some(clients::disconnect_all(false));
+                // Purge runs the same per-client Disconnect.
+                let _ = clients::disconnect_all_for_purge(false);
+            });
+        assert_eq!(unlock_prompts(&calls), 0, "{calls:?}");
+        let error = single.unwrap().unwrap_err();
+        assert!(clients::backup_vault::is_locked_error(&error), "{error}");
+        let results = all.unwrap().unwrap();
+        let claude = results
+            .iter()
+            .find(|result| result.client_id == "claude-code")
+            .unwrap();
+        assert!(
+            claude
+                .error
+                .as_deref()
+                .is_some_and(clients::backup_vault::is_locked_error),
+            "{results:?}"
+        );
+        assert!(json_file(&fixture.claude())["mcpServers"]
+            .as_object()
+            .unwrap()
+            .contains_key(clients::GATEWAY_ENTRY_NAME));
     }
 
     #[test]

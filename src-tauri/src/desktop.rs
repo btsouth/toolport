@@ -661,7 +661,7 @@ async fn uninstall_gateway(
 }
 
 /// The body of [`uninstall_gateway`]: the GTK shell's Disconnect
-/// ([`crate::registry_controller::disconnect_client`]) with this app's registry
+/// ([`crate::registry_controller::disconnect_client_asking_to_unlock`]) with this app's registry
 /// writer, so the in-memory registry follows the write and a failed write rolls
 /// the client config back. The vault delete is injected for tests.
 fn disconnect_client_in_app(
@@ -669,7 +669,7 @@ fn disconnect_client_in_app(
     client_id: &str,
     delete_vaulted_token: impl FnOnce(&str, &str) -> Result<(), String>,
 ) -> Result<clients::WriteOutcome, String> {
-    crate::registry_controller::disconnect_client_with(
+    crate::registry_controller::disconnect_client_with_unlock(
         client_id,
         |apply| {
             let (registry, ()) = write_registry(state, |registry| {

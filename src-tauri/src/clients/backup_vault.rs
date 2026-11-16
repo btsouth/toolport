@@ -37,6 +37,18 @@ pub(crate) fn locked_error() -> String {
 }
 
 /// True when `error` came from a locked keyring rather than a real failure.
+/// Undo any enclosing [`noninteractive`] for `f`, a step the user asked for.
+pub(crate) fn interactive<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NONINTERACTIVE.with(|depth| depth.set(self.0));
+        }
+    }
+    let _restore = Restore(NONINTERACTIVE.with(|depth| depth.replace(0)));
+    crate::secrets::with_prompts(f)
+}
+
 pub(crate) fn is_locked_error(error: &str) -> bool {
     // The store's own refusal of a background write while it would ask.
     const STORE_WAITS: &str = "the keyring is locked; this background write waits for it";

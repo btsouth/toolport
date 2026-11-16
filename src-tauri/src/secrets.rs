@@ -2335,6 +2335,19 @@ pub fn without_prompts<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Undo any enclosing [`without_prompts`] for `f`: the step it runs is one the
+/// user asked for and may prompt as usual.
+pub fn with_prompts<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(u32);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WITHOUT_PROMPTS.with(|depth| depth.set(self.0));
+        }
+    }
+    let _restore = Restore(WITHOUT_PROMPTS.with(|depth| depth.replace(0)));
+    f()
+}
+
 fn prompts_allowed() -> bool {
     WITHOUT_PROMPTS.with(|depth| depth.get() == 0)
 }

@@ -4235,7 +4235,7 @@ fn run_client_mutation(
                     force,
                 )
             } else {
-                crate::registry_controller::disconnect_client(&client_id)
+                crate::registry_controller::disconnect_client_asking_to_unlock(&client_id)
             }
         })
         .await;
