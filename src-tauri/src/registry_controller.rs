@@ -4797,11 +4797,77 @@ API_KEY = "synthetic-first-origin"
         crate::import_credentials::transaction(|writes| {
             import.transfer_into("one", writes, false)?;
             assert!(try_acquire_auth_lock(&path)?.is_none());
+            assert_eq!(writes.owner_pins_held(), 1);
             writes.release_locks();
             assert!(try_acquire_auth_lock(&path)?.is_some());
+            // The pin stays, so verification and rollback resolve the same
+            // keychain names as the writes did.
+            assert_eq!(writes.owner_pins_held(), 1);
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn a_failed_setup_verification_frees_the_lock_and_rolls_back_under_it() {
+        let mut previous = Registry::default();
+        let mut a = server("a");
+        a.command = Some("a".into());
+        a.env.push(crate::registry::EnvVar {
+            key: "PAT".into(),
+            value: None,
+            secret: true,
+            unknown_fields: Default::default(),
+        });
+        previous.add_server(a);
+        let fixture = MoveFixture::new(&previous);
+        crate::secrets::set_secret("a", "PAT", "old").unwrap();
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"a":{"command":"a","env":{"PAT":"new"}}}}"#,
+        )
+        .unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        let path = auth_lock_path("a").unwrap();
+        let held = std::time::Duration::from_millis(1500);
+        let mut other = None;
+        let error = migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["a".into()],
+            &review.revision,
+            |_, _, _, _| {
+                // Verification runs without the lock, so other edits go ahead.
+                assert!(try_acquire_auth_lock(&path).unwrap().is_some());
+                // Another process takes it before the rollback below.
+                let (taken, wait) = std::sync::mpsc::channel();
+                let path = path.clone();
+                other = Some(std::thread::spawn(move || {
+                    let lock = try_acquire_auth_lock(&path).unwrap().unwrap();
+                    taken.send(()).unwrap();
+                    std::thread::sleep(held);
+                    drop(lock);
+                }));
+                wait.recv().unwrap();
+                Err("Launch failed".into())
+            },
+        )
+        .unwrap_err();
+        let finished = std::time::Instant::now();
+        other.unwrap().join().unwrap();
+        assert!(error.contains("Launch failed"), "{error}");
+        // The rollback waited for the other process's lock.
+        assert!(
+            finished.elapsed() < std::time::Duration::from_millis(200),
+            "the rollback finished before the other process let go"
+        );
+        assert_eq!(
+            crate::secrets::get_vault_secret_result("a", "PAT")
+                .unwrap()
+                .as_deref(),
+            Some("old")
+        );
     }
 
     #[test]

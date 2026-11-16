@@ -123,6 +123,9 @@ pub(crate) struct VaultWrites {
     receipts: Vec<(String, String, Option<String>, Option<String>)>,
     auth_locks: std::collections::BTreeMap<String, crate::registry_controller::AuthMutationLock>,
     owner_pins: std::collections::BTreeMap<String, Option<crate::local_auth::OwnerPin>>,
+    /// Owners whose locks were released after the commit, locked again for a
+    /// rollback.
+    released: Vec<String>,
 }
 impl VaultWrites {
     pub(crate) fn write(&mut self, id: &str, key: &str, value: &str) -> Result<(), String> {
@@ -134,10 +137,16 @@ impl VaultWrites {
         Ok(())
     }
     /// Lets other credential edits proceed once the registry commit that
-    /// needed the locks is done. Rollback stays available.
+    /// needed the locks is done. Rollback stays available and takes the
+    /// locks again. The owner pins stay, so verification and rollback use
+    /// the keychain names resolved before the commit.
     pub(crate) fn release_locks(&mut self) {
-        self.auth_locks.clear();
-        self.owner_pins.clear();
+        self.released
+            .extend(std::mem::take(&mut self.auth_locks).into_keys());
+    }
+    #[cfg(test)]
+    pub(crate) fn owner_pins_held(&self) -> usize {
+        self.owner_pins.len()
     }
     pub(crate) fn keep(&mut self) {
         self.receipts.clear();
@@ -146,6 +155,17 @@ impl VaultWrites {
         self.receipts.retain(|(id, _, _, _)| !retained.contains(id));
     }
     fn rollback(&mut self) -> Result<(), String> {
+        // Restore under the locks again, so a value another process writes
+        // meanwhile is not overwritten between the compare and the restore.
+        for owner in std::mem::take(&mut self.released) {
+            if let std::collections::btree_map::Entry::Vacant(slot) =
+                self.auth_locks.entry(owner.clone())
+            {
+                let lock = crate::registry_controller::acquire_auth_owner_lock(&owner)
+                    .map_err(|error| format!("{error} Imported credential values were kept."))?;
+                slot.insert(lock);
+            }
+        }
         let mut failed = false;
         for (id, key, previous, written) in self.receipts.drain(..).rev() {
             match secrets::get_vault_secret_result(&id, &key) {
