@@ -6965,11 +6965,23 @@ fn savings_title(loads: u64) -> &'static str {
 }
 
 fn activity_count_summary(total: usize, visible: usize, recent: usize, filtered: bool) -> String {
+    activity_count_summary_in(crate::i18n::group_digits, total, visible, recent, filtered)
+}
+
+/// [`activity_count_summary`] with the counts grouped by `group`: the current language's
+/// grouping (1.000 in German), as React's `toLocaleString` writes them.
+fn activity_count_summary_in(
+    group: impl Fn(usize) -> String,
+    total: usize,
+    visible: usize,
+    recent: usize,
+    filtered: bool,
+) -> String {
     // The total counts tool calls; the list also holds approvals and Toolport's own
     // searches, so the shown rows are "entries", never "calls". React's Activity view
     // uses the same sentences.
-    let visible_text = grouped_number(visible as u64).to_string();
-    let recent_text = grouped_number(recent as u64).to_string();
+    let visible_text = group(visible);
+    let recent_text = group(recent);
     let shown = if filtered && visible == 1 {
         crate::i18n::trf(
             "Showing 1 matching entry from the latest {value1}.",
@@ -6999,10 +7011,7 @@ fn activity_count_summary(total: usize, visible: usize, recent: usize, filtered:
         } else {
             crate::i18n::msg("{value0} calls recorded on this computer. {value2}")
         },
-        &[
-            ("value0", &grouped_number(total as u64).to_string()),
-            ("value2", &shown.to_string()),
-        ],
+        &[("value0", &group(total)), ("value2", &shown.to_string())],
     )
 }
 
@@ -17836,6 +17845,12 @@ mod tests {
         assert_eq!(
             activity_count_summary(5225, 0, 5, true),
             "5,225 calls recorded on this computer. Showing 0 matching entries from the latest 5."
+        );
+        // Grouped as the current language groups digits, as React's toLocaleString does.
+        let german = |value| crate::i18n::group_digits_for("de", value);
+        assert_eq!(
+            activity_count_summary_in(german, 5225, 1500, 2000, false),
+            "5.225 calls recorded on this computer. Showing 1.500 of the latest 2.000 entries."
         );
         assert_eq!(
             activity_count_summary(5225, 1_000, 1_000, false),
