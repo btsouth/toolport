@@ -1513,6 +1513,9 @@ fn show_call_result(page: &ServerToolsPanel, value: serde_json::Value) {
 /// `renderResult`: text blocks as written, other blocks as JSON, and the whole
 /// result as JSON when it has no content.
 fn render_tool_result(value: &serde_json::Value) -> String {
+    let mut value = value.clone();
+    strip_provenance(&mut value);
+    let value = &value;
     let blocks = value
         .get("content")
         .and_then(serde_json::Value::as_array)
@@ -1532,7 +1535,26 @@ fn render_tool_result(value: &serde_json::Value) -> String {
         .join("\n")
 }
 
-fn show_output(page: &ServerToolsPanel, title: &str, value: serde_json::Value) {
+/// Remove Toolport's provenance label from every `_meta` in a result, keeping
+/// the server's own `_meta` fields. React's `renderResult` does the same.
+fn strip_provenance(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(serde_json::Value::Object(meta)) = object.get_mut("_meta") {
+                meta.remove("app.toolport/provenance");
+                if meta.is_empty() {
+                    object.remove("_meta");
+                }
+            }
+            object.values_mut().for_each(strip_provenance);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(strip_provenance),
+        _ => {}
+    }
+}
+
+fn show_output(page: &ServerToolsPanel, title: &str, mut value: serde_json::Value) {
+    strip_provenance(&mut value);
     let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
     show_text(page, title, text);
 }
@@ -1614,6 +1636,24 @@ mod tests {
         // No content: the whole result, as React shows it.
         let empty = serde_json::json!({"content": [], "structuredContent": {"n": 1}});
         assert!(render_tool_result(&empty).contains("structuredContent"));
+        // Provenance goes from every block and the fallback; the server's own
+        // `_meta` fields stay.
+        let labelled =
+            serde_json::json!({"app.toolport/provenance": {"trust": "untrusted"}, "own": 7});
+        let mixed = serde_json::json!({
+            "content": [
+                {"type": "image", "data": "AAA", "_meta": labelled},
+                {"type": "resource", "resource": {"uri": "a:b", "_meta": meta}},
+            ],
+        });
+        let text = render_tool_result(&mixed);
+        assert!(!text.contains("provenance"), "{text}");
+        assert!(text.contains("\"own\": 7"), "{text}");
+        assert!(!text.contains("\"_meta\": {}"), "{text}");
+        let fallback = serde_json::json!({"_meta": labelled, "content": []});
+        let text = render_tool_result(&fallback);
+        assert!(!text.contains("provenance"), "{text}");
+        assert!(text.contains("\"own\": 7"), "{text}");
     }
 
     #[test]
@@ -1720,14 +1760,11 @@ mod tests {
             release.send(()).unwrap();
             wait_until(|| returned.load(Ordering::SeqCst));
             if dismissal == "success" {
-                wait_until(|| window("Tools result").is_some());
-                window("Tools result").unwrap().close();
+                wait_until(|| window("Result").is_some());
+                window("Result").unwrap().close();
             } else {
                 pump(std::time::Duration::from_millis(250));
-                assert!(
-                    window("Tools result").is_none(),
-                    "late result after {dismissal}"
-                );
+                assert!(window("Result").is_none(), "late result after {dismissal}");
             }
         }
         parent.close();

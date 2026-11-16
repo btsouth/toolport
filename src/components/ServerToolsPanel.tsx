@@ -226,12 +226,40 @@ function coerce(v: unknown, schema: JsonSchemaProp): unknown {
 }
 
 /** Render the result content blocks as readable text. */
+const PROVENANCE_KEY = "app.toolport/provenance";
+
+/** Toolport's provenance label, removed from every `_meta`; the server's own
+ * `_meta` fields stay. GTK's result view does the same. */
+function withoutProvenance(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutProvenance);
+  if (value === null || typeof value !== "object") return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (
+      key === "_meta" &&
+      item !== null &&
+      typeof item === "object" &&
+      !Array.isArray(item)
+    ) {
+      const meta = Object.fromEntries(
+        Object.entries(item).filter(([name]) => name !== PROVENANCE_KEY),
+      );
+      if (Object.keys(meta).length > 0) out[key] = withoutProvenance(meta);
+    } else {
+      out[key] = withoutProvenance(item);
+    }
+  }
+  return out;
+}
+
 function renderResult(result: ToolCallResult): string {
   const blocks = result.content ?? [];
-  if (blocks.length === 0) return JSON.stringify(result, null, 2);
+  if (blocks.length === 0) return JSON.stringify(withoutProvenance(result), null, 2);
   return blocks
     .map((b) =>
-      b.type === "text" && b.text != null ? b.text : JSON.stringify(b, null, 2),
+      b.type === "text" && b.text != null
+        ? b.text
+        : JSON.stringify(withoutProvenance(b), null, 2),
     )
     .join("\n");
 }
@@ -360,7 +388,8 @@ function CopyButton({ text }: { text: string }) {
 
 /** A raw MCP result rendered as pretty JSON (or text), with a copy button. */
 function ResultBlock({ title, value }: { title: string; value: unknown }) {
-  const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  const text =
+    typeof value === "string" ? value : JSON.stringify(withoutProvenance(value), null, 2);
   return (
     <div className="flex flex-col gap-2">
       <div className="flex items-center gap-2">

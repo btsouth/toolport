@@ -96,6 +96,45 @@ describe("server Tools panel", () => {
     expect(await screen.findByText("Record found")).toBeVisible();
   });
 
+  it("shows a result without Toolport's provenance, keeping the server's own _meta", async () => {
+    const labelled = { "app.toolport/provenance": { trust: "untrusted" }, own: 7 };
+    api.callTool.mockResolvedValue({
+      _meta: labelled,
+      content: [
+        { type: "text", text: "Record found", _meta: labelled },
+        { type: "image", data: "AAA", mimeType: "image/png", _meta: labelled },
+        {
+          type: "resource",
+          resource: { uri: "a:b", _meta: { "app.toolport/provenance": {} } },
+        },
+      ],
+    });
+    render(
+      <ServerToolsPanel
+        serverId="alpha"
+        registry={registry}
+        onRegistryChange={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /Read a record/ }));
+    fireEvent.change(screen.getByLabelText(/id/), { target: { value: "42" } });
+    fireEvent.click(screen.getByRole("button", { name: "Call tool" }));
+    const shown = await screen.findByText(/Record found/);
+    const text = shown.textContent ?? "";
+    expect(text).toContain("image/png");
+    expect(text).toContain('"own": 7');
+    expect(text).not.toContain("provenance");
+    expect(text).not.toContain('"_meta": {}');
+
+    api.callTool.mockResolvedValue({ _meta: labelled, content: [] });
+    fireEvent.click(screen.getByRole("button", { name: "Call tool" }));
+    await waitFor(() =>
+      expect(screen.queryByText(/Record found/)).not.toBeInTheDocument(),
+    );
+    const fallback = screen.getByText(/"own": 7/).textContent ?? "";
+    expect(fallback).not.toContain("provenance");
+  });
+
   it("refreshes quarantine state when the default access changes", async () => {
     const view = render(
       <ServerToolsPanel
