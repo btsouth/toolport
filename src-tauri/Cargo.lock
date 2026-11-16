@@ -946,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "conduit"
-version = "2.3.6"
+version = "2.3.7"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
