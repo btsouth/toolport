@@ -1305,11 +1305,46 @@ button.toolport-catalog-action {{
 .toolport-status-detail {{ font-size: 13px; }}
 .toolport-error-callout {{ background: @toolport_card; border: 1px solid @toolport_border; border-left: 3px solid @toolport_error; border-radius: 12px; padding: 16px; }}
 .toolport-error-tile {{ background: alpha(@toolport_error, 0.12); color: @toolport_error; border-radius: 8px; }}
+/* Spec §10 status card. Info has no status bar; the others add a 3px start bar. */
+.toolport-status-card {{ background: @toolport_card; border: 1px solid @toolport_border; border-radius: 12px; padding: 16px; }}
+.toolport-status-card .toolport-status-tile {{ border-radius: 8px; }}
+.toolport-status-card.info .toolport-status-tile {{ background: alpha(@toolport_fg, 0.06); color: @toolport_text_secondary; }}
+.toolport-status-title {{ font-size: 14px; font-weight: 600; }}
+.toolport-status-detail {{ font-size: 13px; }}
 .toolport-inline-error {{ font-size: 13px; color: @toolport_error; }}
 .toolport-skeleton-group {{ background: @toolport_card; border: 1px solid @toolport_border; border-radius: 12px; }}
 .toolport-skeleton {{ min-height: 24px; margin: 16px; border-radius: 8px; background: alpha(@toolport_fg, 0.06); }}
 toast {{ background: @toolport_raised; color: @toolport_fg; border: 1px solid @toolport_border; border-radius: 12px; }}
 statuspage.toolport-success image.icon {{ color: @toolport_success; opacity: 1; }}
+/* Review and connect: React's dialog title (20px, 600) and its success check. */
+.toolport-dialog-title {{ font-size: 20px; font-weight: 600; }}
+image.toolport-success-icon {{ color: @toolport_success; opacity: 1; }}
+/* React's review item: the whole row is the toggle, with a 12px round dot that fills
+   green when selected and a green ring around the selected row. */
+button.toolport-review-item {{
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid @toolport_border;
+  background: transparent;
+  box-shadow: none;
+}}
+button.toolport-review-item:hover {{ background: alpha(@toolport_fg, 0.04); }}
+button.toolport-review-item:checked {{ background: transparent; border-color: alpha(@toolport_success, 0.6); }}
+button.toolport-review-item:checked:hover {{ background: alpha(@toolport_fg, 0.04); }}
+.toolport-select-dot {{
+  min-width: 12px;
+  min-height: 12px;
+  border-radius: 999px;
+  border: 1px solid @toolport_text_secondary;
+}}
+/* Button text is bold by default; React's entry text is regular with a medium name. */
+button.toolport-review-item label {{ font-weight: 400; }}
+button.toolport-review-item label.toolport-review-name {{ font-size: 14px; font-weight: 500; }}
+button.toolport-review-item label.toolport-review-command {{ font-size: 13px; }}
+button.toolport-review-item:checked .toolport-select-dot {{
+  background: @toolport_success;
+  border-color: @toolport_success;
+}}
 
 .toolport-native .title-2 {{ font-size: 22px; font-weight: 600; }}
 .toolport-native .title-3 {{ font-size: 17px; font-weight: 600; }}

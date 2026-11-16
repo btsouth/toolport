@@ -12,6 +12,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "./ui/dialog";
+import { fmtTs } from "@/lib/utils";
 import { Button } from "./ui/button";
 
 export function ConnectReviewDialog({
@@ -53,7 +54,7 @@ export function ConnectReviewDialog({
    * quiet. */
   onKeyringLocked?: () => void;
 }) {
-  const { t, locale } = useI18n();
+  const { t } = useI18n();
   // The dialog renders without a Radix trigger and swaps between its loading,
   // review and result views, so Radix cannot return focus on its own. Remember
   // the control that opened it and return there once the whole flow closes.
@@ -244,9 +245,7 @@ export function ConnectReviewDialog({
                     <p>
                       {result.backupDate
                         ? t("Backup saved {value0}", {
-                            value0: new Date(result.backupDate * 1000).toLocaleString(
-                              locale,
-                            ),
+                            value0: fmtTs(result.backupDate * 1000, "dateTime"),
                           })
                         : t("Backup saved")}
                     </p>

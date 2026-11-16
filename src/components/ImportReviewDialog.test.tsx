@@ -195,6 +195,20 @@ describe("ImportReviewDialog", () => {
     expect(onConfirm.mock.calls[0][0]).not.toContain("b");
   });
 
+  it("puts Cancel then the confirm together in the right-aligned footer", () => {
+    renderDialog();
+    const cancel = screen.getByRole("button", { name: "Cancel" });
+    const confirm = screen.getByRole("button", { name: /Import 3 servers/ });
+    const footer = cancel.closest('[data-slot="dialog-footer"]');
+    expect(footer).not.toBeNull();
+    expect(footer).toHaveClass("justify-end");
+    expect(footer).not.toHaveClass("justify-between");
+    expect(confirm.closest('[data-slot="dialog-footer"]')).toBe(footer);
+    expect(
+      cancel.compareDocumentPosition(confirm) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
   it("disables import when nothing is selected", async () => {
     renderDialog();
     for (const name of ["stripe", "linear", "shellsrv"]) {
