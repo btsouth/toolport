@@ -2612,7 +2612,7 @@ impl ServerPage {
             let server_id = ticket.server_id.clone();
             let id_for_probe = server_id.clone();
             let result = gtk::gio::spawn_blocking(move || {
-                crate::server_runtime::probe_registered(&id_for_probe)
+                crate::server_runtime::probe_health_registered(&id_for_probe)
             })
             .await;
             let probe = match result {

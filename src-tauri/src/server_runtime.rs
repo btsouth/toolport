@@ -248,18 +248,34 @@ pub fn probe_one_bounded(server: &ServerEntry) -> ProbeResult {
         })
 }
 
+/// Test Connection for a saved server: a user action, so it may ask to unlock
+/// the store.
 pub fn probe_registered(server_id: &str) -> Result<ProbeResult, String> {
+    Ok(probe_one_bounded(&registered_server(server_id)?))
+}
+
+/// The health check a shell runs on its own: at start, after a change, when a
+/// page comes back. Nobody asked for it, so it must not ask to unlock the store.
+pub fn probe_health_bounded(server: &ServerEntry) -> ProbeResult {
+    probe_one_bounded(server)
+}
+
+/// [`probe_health_bounded`] for a saved server.
+pub fn probe_health_registered(server_id: &str) -> Result<ProbeResult, String> {
+    Ok(probe_health_bounded(&registered_server(server_id)?))
+}
+
+fn registered_server(server_id: &str) -> Result<ServerEntry, String> {
     let path = crate::registry::resolved_path().ok_or("could not resolve the registry path")?;
     let contents = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read the registry: {error}"))?;
     let registry = crate::registry::parse_registry_contents(&contents)
         .map_err(|error| format!("could not parse the registry: {error}"))?;
-    let server = registry
+    registry
         .servers
         .into_iter()
         .find(|server| server.id == server_id)
-        .ok_or_else(|| format!("server '{server_id}' not found"))?;
-    Ok(probe_one_bounded(&server))
+        .ok_or_else(|| format!("server '{server_id}' not found"))
 }
 
 /// The servers the Servers page shows as on. Default access only limits what

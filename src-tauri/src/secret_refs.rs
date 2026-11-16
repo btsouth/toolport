@@ -1414,12 +1414,21 @@ mod tests {
     /// role's) read the vault of every server, so a locked keyring could raise
     /// an unlock prompt at start, or hold a gateway start on an unanswered one,
     /// for credentials the process did not need.
+    ///
+    /// The whole start, not only the preload: with the store locked, a log
+    /// scrub left pending by an earlier start and enabled servers that keep
+    /// values in the vault, nothing a shell or the daemon does on its own
+    /// before the user acts may read a stored value the way that asks to
+    /// unlock it. The GTK Servers page checks every enabled server as soon as
+    /// it renders, and the Tauri window does the same on load: those checks
+    /// say the keyring is locked instead.
     #[test]
     fn no_startup_preload_reads_a_vault_value() {
         crate::secrets::tests::with_isolated_vault(|| {
             let registry = crate::registry::Registry {
                 servers: serde_json::from_value(serde_json::json!([
                     {"id":"pre-on","name":"On","enabled":true,"source":"fixture","transport":"stdio","command":"node","args":[],"inheritEnv":false,"env":[{"key":"ON_TOKEN","secret":true}]},
+                    {"id":"pre-remote","name":"Remote","enabled":true,"source":"fixture","transport":"http","url":"https://remote.example.invalid/mcp","args":[],"inheritEnv":false,"env":[]},
                     {"id":"pre-off","name":"Off","enabled":false,"source":"fixture","transport":"stdio","command":"node","args":[],"inheritEnv":false,"env":[{"key":"OFF_TOKEN","secret":true}]},
                     {"id":"pre-inline","name":"Inline","enabled":true,"source":"fixture","transport":"stdio","command":"node","args":[],"inheritEnv":false,"env":[{"key":"INLINE_TOKEN","value":"pre-inline-value-6Tz1","secret":true}]}
                 ]))
@@ -1433,6 +1442,35 @@ mod tests {
                 crate::secret_redact::redact_text("got pre-inline-value-6Tz1"),
                 "got [secret:INLINE_TOKEN]"
             );
+
+            let dir = crate::registry::conduit_dir().unwrap();
+            std::fs::write(dir.join("daemon.log"), "token pre-inline-value-6Tz1\n").unwrap();
+            std::fs::write(dir.join(crate::secret_redact::SCRUB_PENDING_FILE), "").unwrap();
+            let vaulted = ["pre-on", "pre-remote"];
+            let mut checks = Vec::new();
+            let prompts = crate::secrets::locked_store::prompts_during(|| {
+                super::preload_inline_secrets();
+                // The scrub an earlier start left pending.
+                let _ = crate::secret_redact::scrub_data_dir(&dir);
+                // The daemon's retired-value cleanup.
+                let _ = crate::secrets::retry_retired_scrubs();
+                // GTK: the Servers page's first check of each enabled server.
+                // Tauri: the window's first `probe_servers`.
+                for server in crate::server_runtime::enabled_servers(&registry) {
+                    if vaulted.contains(&server.id.as_str()) {
+                        checks.push(
+                            crate::server_runtime::probe_health_registered(&server.id).unwrap(),
+                        );
+                        checks.push(crate::server_runtime::probe_health_bounded(&server));
+                    }
+                }
+            });
+            assert!(prompts.is_empty(), "{prompts:?}");
+            assert_eq!(checks.len(), 4);
+            for check in &checks {
+                assert!(!check.ok, "{check:?}");
+                assert_eq!(check.failure_label(), "Keyring locked", "{check:?}");
+            }
         });
     }
 

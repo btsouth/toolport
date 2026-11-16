@@ -34,7 +34,7 @@ use crate::remote;
 use crate::savings;
 use crate::searchtrace;
 use crate::secrets;
-use crate::server_runtime::{probe_one, probe_one_bounded, ProbeResult};
+use crate::server_runtime::{probe_one, ProbeResult};
 use crate::teams;
 use crate::vendors;
 
@@ -1319,7 +1319,7 @@ async fn probe_servers(
             .map(|s| {
                 let app = app.clone();
                 std::thread::spawn(move || {
-                    let result = probe_one_bounded(&s);
+                    let result = crate::server_runtime::probe_health_bounded(&s);
                     let _ = app.emit("server-probed", &result);
                     result
                 })
@@ -5276,7 +5276,7 @@ mod tests {
         let mut server = plain_server("bogus", "Bogus");
         server.command = Some("toolport-no-such-binary-xyz".into());
         let start = std::time::Instant::now();
-        let r = probe_one_bounded(&server);
+        let r = crate::server_runtime::probe_one_bounded(&server);
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "a fast failure must not wait on the timeout"

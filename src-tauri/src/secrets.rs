@@ -1869,10 +1869,70 @@ fn get_secret_result_raw(server_id: &str, key: &str) -> Result<Option<String>, S
 fn read_stored(server_id: &str, key: &str) -> Result<Option<String>, String> {
     if let Some(v) = env_secret_override(key) {
         Ok(Some(v))
+    } else if locked_store::locked() {
+        Err(locked_store::prompted(server_id, key))
     } else if file::active() {
         file::get_secret_result(server_id, key)
     } else {
         platform::get_secret_result(server_id, key)
+    }
+}
+
+/// Test support: a store that is locked, so every read that would ask the user
+/// to unlock it is recorded (and fails) instead. Reads that never prompt see a
+/// locked store. Process-wide: hold the data-directory test lock around it.
+pub mod locked_store {
+    #[cfg(any(test, feature = "test-support"))]
+    static LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    #[cfg(any(test, feature = "test-support"))]
+    static PROMPTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Run `f` with the store locked; every `server/key` read that would have
+    /// asked to unlock it, in order.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn prompts_during(f: impl FnOnce()) -> Vec<String> {
+        use std::sync::atomic::Ordering;
+        struct Unlock;
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                LOCKED.store(false, Ordering::SeqCst);
+            }
+        }
+        PROMPTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        LOCKED.store(true, Ordering::SeqCst);
+        let unlock = Unlock;
+        f();
+        drop(unlock);
+        std::mem::take(
+            &mut *PROMPTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    pub(crate) fn locked() -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            LOCKED.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            false
+        }
+    }
+
+    /// Record a read that would have prompted; its error.
+    pub(crate) fn prompted(server_id: &str, key: &str) -> String {
+        #[cfg(any(test, feature = "test-support"))]
+        PROMPTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(format!("{server_id}/{key}"));
+        let _ = (server_id, key);
+        "keyring locked".to_string()
     }
 }
 
@@ -1911,7 +1971,9 @@ pub(crate) fn has_own_credentials(server: &crate::registry::ServerEntry) -> Resu
         "__oauth_cc_state__",
     ]);
     for key in keys {
-        let value = if file::active() {
+        let value = if locked_store::locked() {
+            Err(locked_store::prompted(&server.id, key))
+        } else if file::active() {
             file::get_secret_result(&server.id, key)
         } else {
             platform::get_secret_result(&server.id, key)
@@ -1944,7 +2006,9 @@ pub fn get_vault_secret_result(server_id: &str, key: &str) -> Result<Option<Stri
     }
     let owner = crate::local_auth::owner(server_id)?;
     let server_id = owner.as_str();
-    let value = if file::active() {
+    let value = if locked_store::locked() {
+        Err(locked_store::prompted(server_id, key))
+    } else if file::active() {
         file::get_secret_result(server_id, key)
     } else {
         platform::get_secret_result(server_id, key)
@@ -2036,6 +2100,10 @@ pub(crate) fn backup_secret_status(
         return Err(BackupSecretError::AccessDenied);
     }
     let owner = crate::local_auth::owner(server_id).map_err(|_| BackupSecretError::AccessDenied)?;
+    // These reads never ask to unlock the store: a locked one says so.
+    if locked_store::locked() {
+        return Err(BackupSecretError::Locked);
+    }
     if file::active() {
         return file::get_secret_result(owner.as_str(), key)
             .map_err(|_| BackupSecretError::Unavailable);
