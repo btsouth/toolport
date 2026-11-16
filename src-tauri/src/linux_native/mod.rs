@@ -16553,7 +16553,6 @@ mod tests {
         *page.pending_batch.borrow_mut() = Some(client_rows::T3BatchOutcome {
             stopped: true,
             rows: vec!["aider".into(), "codex".into()],
-            connected: vec!["aider".into()],
             keyboard: true,
         });
         page.render(snapshot(vec![
@@ -16612,7 +16611,6 @@ mod tests {
         *page.pending_batch.borrow_mut() = Some(client_rows::T3BatchOutcome {
             stopped: false,
             rows: vec!["codex".into()],
-            connected: vec!["codex".into()],
             keyboard: false,
         });
         page.render(snapshot(vec![
@@ -16651,7 +16649,6 @@ mod tests {
         page.end_t3_code_batch(client_rows::T3BatchOutcome {
             stopped: true,
             rows: vec!["aider".into(), "codex".into()],
-            connected: vec!["aider".into()],
             keyboard: false,
         });
         page.scanning.set(false);

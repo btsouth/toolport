@@ -418,19 +418,18 @@ export function connectAllOutcome(
   notConnectedIds: string[],
 ): { connected: number; total: number; notConnected: string[]; leftOut: string[] } {
   const byId = (id: string) => clients.find((client) => client.id === id);
-  // A row the rescan shows connected counts as connected, even when its step reported a
-  // failure after the connect took effect.
-  // As the row shows it: a customized entry still needs a reset, so it is not connected.
+  // The rescan decides, as the row shows it: connected when its entry is Toolport's and
+  // not customized, whatever the step reported (a connect that took effect but reported
+  // a failure counts; one undone since does not).
   const connectedNow = (id: string) => {
     const client = byId(id);
     return client?.gatewayInstalled === true && client.entryState !== "customized";
   };
-  const connectedRows = [...connectedIds, ...notConnectedIds.filter(connectedNow)];
-  const connected = connectedRows.reduce(
-    (sum, id) => sum + t3CodeEnabledNames(byId(id)).length,
-    0,
-  );
-  const notConnected = notConnectedIds
+  const rows = [...connectedIds, ...notConnectedIds];
+  const connected = rows
+    .filter(connectedNow)
+    .reduce((sum, id) => sum + t3CodeEnabledNames(byId(id)).length, 0);
+  const notConnected = rows
     .filter((id) => !connectedNow(id))
     .flatMap((id) => t3CodeEnabledNames(byId(id)));
   const batchIds = new Set([...connectedIds, ...notConnectedIds]);

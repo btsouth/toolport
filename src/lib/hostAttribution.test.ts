@@ -414,6 +414,7 @@ describe("connectAllOutcome", () => {
       client({
         id: "claude",
         name: "Claude Code (claude_personal)",
+        gatewayInstalled: true,
         t3Code: [use("Claude Personal")],
       }),
       client({

@@ -2,7 +2,7 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DetectedClient, McpServer, T3CodeOther } from "@/lib/types";
-import { useRef, useState } from "react";
+import { type ComponentProps, useRef, useState } from "react";
 import { ClientsView, type ConnectAllCard, type T3CodeSeen } from "./ClientsView";
 import {
   getClientSessions,
@@ -61,6 +61,27 @@ async function connectAllSummary(tone: "success" | "warning" | "info") {
     summary.querySelector('[data-slot="status-card-title"]')?.textContent ?? "";
   const detail = summary.querySelector('[data-slot="status-card-detail"]')?.textContent;
   return [title, detail].filter(Boolean).join(" ");
+}
+/** ClientsView whose rescan (`onChanged`) shows a row connected once a connect for it
+ * succeeded, as the app's scan would: Connect all's summary counts what the rescan shows. */
+function Batch(props: ComponentProps<typeof ClientsView>) {
+  const [rows, setRows] = useState(props.clients);
+  const onChanged = async () => {
+    const mock = vi.mocked(migrateClient).mock;
+    const settled = await Promise.allSettled(mock.results.map((result) => result.value));
+    const connected = new Set(
+      mock.calls
+        .filter((_, index) => settled[index]?.status === "fulfilled")
+        .map((call) => call[0]),
+    );
+    setRows((current) =>
+      current.map((row) =>
+        connected.has(row.id) ? { ...row, gatewayInstalled: true } : row,
+      ),
+    );
+    await props.onChanged?.();
+  };
+  return <ClientsView {...props} clients={rows} onChanged={onChanged} />;
 }
 beforeEach(() => {
   visibility.value = true;
@@ -1188,7 +1209,7 @@ describe("ClientsView", () => {
       mockConnect();
       const onChanged = vi.fn(async () => {});
       render(
-        <ClientsView
+        <Batch
           clients={[
             client({ id: "zed", name: "Zed", t3Code: [on("Two")] }),
             client({ id: "codex", name: "Codex", t3Code: [on("One"), on("Home")] }),
@@ -1226,7 +1247,7 @@ describe("ClientsView", () => {
     it("names the rows it left out in a summary that stays", async () => {
       mockConnect();
       render(
-        <ClientsView
+        <Batch
           clients={[
             client({ id: "codex", name: "Codex", t3Code: [on("One")] }),
             client({
@@ -1257,7 +1278,7 @@ describe("ClientsView", () => {
       mockConnect();
       const onChanged = vi.fn(async () => {});
       render(
-        <ClientsView
+        <Batch
           clients={[
             client({ id: "codex", name: "Codex", t3Code: [on("One")] }),
             client({ id: "zed", name: "Zed", t3Code: [on("Two")] }),
@@ -1297,7 +1318,7 @@ describe("ClientsView", () => {
     it("stops on Escape from a step's success screen", async () => {
       mockConnect();
       render(
-        <ClientsView
+        <Batch
           clients={[
             client({ id: "aider", name: "Aider", t3Code: [on("One")] }),
             client({ id: "codex", name: "Codex", t3Code: [on("Two")] }),
@@ -1329,7 +1350,7 @@ describe("ClientsView", () => {
         .mockRejectedValueOnce("Permission denied")
         .mockRejectedValueOnce("Permission denied");
       render(
-        <ClientsView
+        <Batch
           clients={[
             client({ id: "aider", name: "Aider", t3Code: [on("One")] }),
             client({ id: "codex", name: "Codex", t3Code: [on("Two"), on("Three")] }),
@@ -1377,7 +1398,7 @@ describe("ClientsView", () => {
         } as never)
         .mockRejectedValueOnce("Launch failed");
       render(
-        <ClientsView
+        <Batch
           clients={[
             client({ id: "aider", name: "Aider", t3Code: [on("One")] }),
             client({ id: "codex", name: "Codex", t3Code: [on("Two")] }),
@@ -1589,7 +1610,7 @@ describe("ClientsView", () => {
           <>
             <button onClick={() => setShown(!shown)}>toggle page</button>
             {shown && (
-              <ClientsView
+              <Batch
                 clients={[client({ id: "aider", name: "Aider", t3Code: [on("One")] })]}
                 registry={null}
                 onSelectClient={vi.fn()}
@@ -1607,18 +1628,24 @@ describe("ClientsView", () => {
         await screen.findByRole("button", { name: "Connect to Toolport" }),
       );
       await userEvent.click(await screen.findByRole("button", { name: "Done" }));
-      expect(await connectAllSummary("success")).toBe("Connected 1 of 1 T3 Code instance.");
+      expect(await connectAllSummary("success")).toBe(
+        "Connected 1 of 1 T3 Code instance.",
+      );
       // A client's details open (the page unmounts) and close again.
       await userEvent.click(screen.getByText("toggle page"));
       await userEvent.click(screen.getByText("toggle page"));
-      expect(await connectAllSummary("success")).toBe("Connected 1 of 1 T3 Code instance.");
+      expect(await connectAllSummary("success")).toBe(
+        "Connected 1 of 1 T3 Code instance.",
+      );
       await userEvent.click(screen.getByRole("button", { name: "Dismiss" }));
       expect(screen.queryByTestId("connect-all-summary")).not.toBeInTheDocument();
     });
 
     it("ignores a keyring answer that comes after its step closed", async () => {
       mockConnect();
-      vi.mocked(previewClientSetup).mockRejectedValueOnce("Saved credential recovery: Locked");
+      vi.mocked(previewClientSetup).mockRejectedValueOnce(
+        "Saved credential recovery: Locked",
+      );
       let answer: (locked: boolean) => void = () => {};
       vi.mocked(keyringLockedAfter).mockImplementationOnce(
         () =>
@@ -1669,7 +1696,7 @@ describe("ClientsView", () => {
         }))
         .mockRejectedValueOnce("unreadable");
       render(
-        <ClientsView
+        <Batch
           clients={[
             client({ id: "aider", name: "Aider", t3Code: [on("One")] }),
             client({ id: "codex", name: "Codex", t3Code: [on("Two")] }),

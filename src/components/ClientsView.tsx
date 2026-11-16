@@ -692,7 +692,7 @@ export function ClientsView({
     // On the page until dismissed, as GTK shows it and as Clients keeps its restart
     // reminder: a toast fades before a long list of what was not connected is read.
     setAllSummary({ title, detail, tone });
-  }, [summaryDue, clients]);
+  }, [summaryDue, clients, setAllSummary]);
   // When the batch closes, focus goes back to Connect all, or to the T3 Code card once
   // the button is gone, never to the page start.
   const connectAllButton = useRef<HTMLButtonElement>(null);

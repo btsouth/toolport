@@ -1069,8 +1069,6 @@ fn connect_t3_code_targets(page: ClientPage, targets: Vec<state::ClientView>) {
     struct Batch {
         page: ClientPage,
         targets: Vec<state::ClientView>,
-        /// Ids of the rows connected so far.
-        connected: std::cell::RefCell<Vec<String>>,
         /// Set once a step fails with the keyring still locked: later steps don't ask.
         keyring_quiet: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
@@ -1083,7 +1081,6 @@ fn connect_t3_code_targets(page: ClientPage, targets: Vec<state::ClientView>) {
                 .iter()
                 .map(|client| client.id.clone())
                 .collect(),
-            connected: batch.connected.borrow().clone(),
             keyboard,
         });
     }
@@ -1100,7 +1097,6 @@ fn connect_t3_code_targets(page: ClientPage, targets: Vec<state::ClientView>) {
         // Named from the row as it was when Connect all started, as React's steps are.
         let line_client = client.clone();
         let next = batch.clone();
-        let id = client.id.clone();
         let last = index + 1 == total;
         super::setup::connect_step(
             &parent,
@@ -1116,15 +1112,9 @@ fn connect_t3_code_targets(page: ClientPage, targets: Vec<state::ClientView>) {
                 })),
                 more: !last,
                 closed: Some(std::rc::Rc::new(move |end, keyboard| match end {
-                    super::setup::StepEnd::Completed => {
-                        next.connected.borrow_mut().push(id.clone());
-                        run(next.clone(), index + 1, keyboard);
-                    }
+                    super::setup::StepEnd::Completed => run(next.clone(), index + 1, keyboard),
                     // Escape on a success screen: this row is connected, the rest wait.
-                    super::setup::StepEnd::CompletedAndStopped => {
-                        next.connected.borrow_mut().push(id.clone());
-                        finish(&next, !last, keyboard);
-                    }
+                    super::setup::StepEnd::CompletedAndStopped => finish(&next, !last, keyboard),
                     super::setup::StepEnd::Skipped => run(next.clone(), index + 1, keyboard),
                     super::setup::StepEnd::Stopped => finish(&next, true, keyboard),
                 })),
@@ -1137,7 +1127,6 @@ fn connect_t3_code_targets(page: ClientPage, targets: Vec<state::ClientView>) {
         std::rc::Rc::new(Batch {
             page,
             targets,
-            connected: Default::default(),
             keyring_quiet: Default::default(),
         }),
         0,
@@ -1191,8 +1180,6 @@ pub(super) struct T3BatchOutcome {
     pub(super) stopped: bool,
     /// Every row the batch held, in step order.
     pub(super) rows: Vec<String>,
-    /// The rows it connected.
-    pub(super) connected: Vec<String>,
     /// The keyboard ended the batch, so the control that gets focus shows its ring.
     pub(super) keyboard: bool,
 }
@@ -1252,13 +1239,13 @@ pub(super) fn t3_code_batch_result(
             .map(|instance| instance.display_name.clone())
             .collect::<Vec<_>>()
     };
-    // A row the scan shows connected counts as connected, even when its step reported a
-    // failure after the connect took effect.
+    // The scan decides, as the row shows it: connected only when its state is Connected
+    // (not customized), whatever the step reported. React's `connectAllOutcome` does the
+    // same.
     let connected_now = |id: &String| {
-        outcome.connected.contains(id)
-            || clients.iter().any(|client| {
-                &client.id == id && client.gateway_state == state::ClientGatewayState::Connected
-            })
+        clients.iter().any(|client| {
+            &client.id == id && client.gateway_state == state::ClientGatewayState::Connected
+        })
     };
     let connected = outcome
         .rows
@@ -2022,7 +2009,6 @@ mod tests {
             rows: ["claude", "opencode", "cursor", "gone"]
                 .map(String::from)
                 .to_vec(),
-            connected: vec!["claude".into()],
             keyboard: false,
         };
         assert_eq!(
@@ -2035,7 +2021,6 @@ mod tests {
         );
         let all = T3BatchOutcome {
             rows: vec!["claude".into()],
-            connected: vec!["claude".into()],
             ..T3BatchOutcome::default()
         };
         assert_eq!(
@@ -2075,6 +2060,22 @@ mod tests {
                 "Connected 1 of 1 T3 Code instance.".into(),
                 String::new(),
                 StatusTone::Success
+            )
+        );
+        // The scan decides: a row whose entry was customized since, or that is no longer
+        // connected, is not counted, whatever its step reported.
+        let mut customized = client("claude", Customized);
+        customized.t3_code = vec![instance("Claude Personal", true)];
+        let reported = T3BatchOutcome {
+            rows: vec!["claude".into(), "opencode".into()],
+            ..T3BatchOutcome::default()
+        };
+        assert_eq!(
+            t3_code_batch_result(&[customized, clients[1].clone()], &reported),
+            (
+                "Connected 0 of 2 T3 Code instances.".into(),
+                "Not connected: Claude Personal, OpenCode Go.".into(),
+                StatusTone::Warning
             )
         );
         // Every batch row gone or off by the end: a neutral card, not a green 0 of 0.
