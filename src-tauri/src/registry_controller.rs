@@ -20,6 +20,12 @@ pub struct ClientImportCandidate {
     pub url: Option<String>,
     pub credentials: Vec<CredentialReview>,
     pub unsupported: Option<String>,
+    /// The client's own name for the server when `name`, the name it is saved under,
+    /// differs from it (`github` saved as `github (2)`).
+    pub source_name: Option<String>,
+    /// [`import_connection_key`]: which detected server this is, since two servers
+    /// whose secrets differ can show the same redacted command or URL.
+    pub connection: String,
 }
 
 const AUTH_LOCK_LEASE_SECS: u64 = 180;
@@ -468,57 +474,155 @@ pub(crate) fn server_from_detected(server: &clients::McpServer, client_id: &str)
     }
 }
 
-pub(crate) fn servers_to_import(
+/// An opaque id for a connection, stable for this process. The connection can hold a
+/// secret (a token in a URL or argument), so the hash is salted per process and the
+/// id reveals nothing that could be checked against a guess.
+pub(crate) fn import_connection_key(server: &ServerEntry) -> String {
+    static SALT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let salt = SALT.get_or_init(|| {
+        let mut bytes = [0u8; 16];
+        getrandom::getrandom(&mut bytes).expect("CSPRNG unavailable");
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    });
+    format!(
+        "connection:{}",
+        registry::sha256_hex(&format!(
+            "{salt}\n{}",
+            clients::connection_key(
+                &server.transport,
+                server.command.as_deref(),
+                &server.args,
+                server.url.as_deref()
+            )
+        ))
+    )
+}
+
+/// What the reviewed import key binds: the connection and the name it is saved under,
+/// so a name that shifts between review and import is refused instead of applied to
+/// another server.
+pub(crate) fn import_review_key(server: &ServerEntry, name: &str) -> String {
+    format!(
+        "{}:{}",
+        import_connection_key(server),
+        registry::sha256_hex(name)
+    )
+}
+
+/// Whether identity may be confirmed through the vault. Detection (client lists and
+/// counts) never reads it; only a review the user opened, or its import, may.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Confirm {
+    VaultFree,
+    WithVault,
+}
+
+/// A client server Import may offer: its entry, why its identity is unconfirmed (if
+/// so), and the name it is saved under.
+pub(crate) struct ImportCandidate {
+    pub(crate) entry: ServerEntry,
+    pub(crate) unknown: Option<String>,
+    pub(crate) name: String,
+}
+
+/// Client servers Import may offer, deduped by connection, minus those already in
+/// Toolport under the one identity rule (`existing_connection`). An entry whose
+/// identity cannot be confirmed is kept with its reason, so review shows it as
+/// unsupported instead of hiding it or counting it as new. New entries get their
+/// own name, or `name (2)` and so on when an existing server or an earlier pick
+/// uses it.
+pub(crate) fn import_candidates(
     detected: &[clients::DetectedClient],
     existing: &Registry,
-) -> Vec<ServerEntry> {
+    confirm: Confirm,
+) -> Vec<ImportCandidate> {
     let mut picked = Vec::new();
-    let mut import_keys = existing
+    let mut import_keys = std::collections::HashSet::new();
+    let mut names = existing
         .servers
         .iter()
-        .map(|server| {
-            clients::import_dedupe_key(&server.name, server.command.as_deref(), &server.args)
-        })
-        .collect::<std::collections::HashSet<_>>();
+        .map(|s| s.name.clone())
+        .collect::<Vec<_>>();
     for client in detected {
         for server in client.servers.iter().chain(client.plugin_servers.iter()) {
             let entry = server_from_detected(server, &client.id);
-            if clients::is_gateway_server(&entry) {
+            if clients::is_gateway_server(&entry)
+                || !import_keys.insert(import_connection_key(&entry))
+            {
                 continue;
             }
-            let key =
-                clients::import_dedupe_key(&entry.name, entry.command.as_deref(), &entry.args);
-            if import_keys.insert(key) {
-                picked.push(entry);
-            }
+            let unknown = match existing_connection(existing, client, server, confirm) {
+                ConnectionState::Existing(_) => continue,
+                ConnectionState::New => None,
+                ConnectionState::Unknown(reason) => Some(reason),
+            };
+            let name = if unknown.is_none() {
+                let name = clients::distinct_import_name(&entry.name, &names);
+                names.push(name.clone());
+                name
+            } else {
+                entry.name.clone()
+            };
+            picked.push(ImportCandidate {
+                entry,
+                unknown,
+                name,
+            });
         }
     }
     picked
 }
 
+#[cfg(test)]
+pub(crate) fn servers_to_import(
+    detected: &[clients::DetectedClient],
+    existing: &Registry,
+) -> Vec<ServerEntry> {
+    import_candidates(detected, existing, Confirm::WithVault)
+        .into_iter()
+        .filter(|c| c.unknown.is_none())
+        .map(|c| c.entry)
+        .collect()
+}
+
+/// The reviewed servers to import, each with the name it is saved under. A key that
+/// no longer matches a server under its reviewed name is left out; callers refuse.
 pub(crate) fn selected_servers_to_import(
     detected: &[clients::DetectedClient],
     existing: &Registry,
     selected: Option<&std::collections::HashSet<String>>,
-) -> Result<Vec<ServerEntry>, String> {
-    let picked = servers_to_import(detected, existing)
+) -> Result<Vec<(ServerEntry, String)>, String> {
+    let candidates = import_candidates(detected, existing, Confirm::WithVault);
+    // A reviewed server whose saved name shifted since review (another server took
+    // it) is refused, so no reviewed choice or value lands on a different server.
+    if let Some(keys) = selected {
+        let reviewed = keys
+            .iter()
+            .filter_map(|key| key.rsplit_once(':'))
+            .collect::<std::collections::HashMap<_, _>>();
+        if candidates.iter().any(|c| {
+            c.unknown.is_none()
+                && reviewed
+                    .get(import_connection_key(&c.entry).as_str())
+                    .is_some_and(|name| *name != registry::sha256_hex(&c.name))
+        }) {
+            return Err("Server changed. Refresh the client and review again.".into());
+        }
+    }
+    let picked = candidates
         .into_iter()
-        .filter(|server| {
-            selected.is_none_or(|keys| {
-                keys.contains(&clients::import_dedupe_key(
-                    &server.name,
-                    server.command.as_deref(),
-                    &server.args,
-                ))
-            })
+        .filter(|c| {
+            c.unknown.is_none()
+                && selected.is_none_or(|keys| keys.contains(&import_review_key(&c.entry, &c.name)))
         })
+        .map(|c| (c.entry, c.name))
         .collect::<Vec<_>>();
     for client in detected {
         let source = format!("imported:{}", client.id);
         let names = picked
             .iter()
-            .filter(|server| server.source.as_deref() == Some(source.as_str()))
-            .map(|server| server.name.clone())
+            .filter(|(server, _)| server.source.as_deref() == Some(source.as_str()))
+            .map(|(server, _)| server.name.clone())
             .collect::<Vec<_>>();
         if !names.is_empty() {
             clients::validate_client_import(client, &names, false)?;
@@ -532,6 +636,7 @@ pub(crate) fn selected_servers_to_import(
 fn scoped_import_key(
     client_id: &str,
     server: &ServerEntry,
+    name: &str,
     definition: Option<&serde_json::Value>,
 ) -> Result<String, String> {
     let reviewed = serde_json::to_string(&(server, definition)).map_err(|e| e.to_string())?;
@@ -539,7 +644,7 @@ fn scoped_import_key(
         "client-import:{}",
         serde_json::to_string(&(
             client_id,
-            clients::import_dedupe_key(&server.name, server.command.as_deref(), &server.args),
+            import_review_key(server, name),
             registry::sha256_hex(&reviewed)
         ))
         .map_err(|e| e.to_string())?
@@ -565,62 +670,320 @@ fn preview_client_imports_scoped(
             return Err("Missing import client".into());
         }
     }
-    servers_to_import(&detected, &registry)
+    import_candidates(&detected, &registry, Confirm::WithVault)
         .into_iter()
-        .map(|server| {
-            let client = detected
-                .iter()
-                .find(|client| {
-                    server.source.as_deref() == Some(format!("imported:{}", client.id).as_str())
+        .map(
+            |ImportCandidate {
+                 entry: server,
+                 unknown,
+                 name,
+             }| {
+                let client = detected
+                    .iter()
+                    .find(|client| {
+                        server.source.as_deref() == Some(format!("imported:{}", client.id).as_str())
+                    })
+                    .ok_or("Missing import client")?;
+                let definition = clients::import_definition(client, &server.name)?;
+                let key = if client_id.is_some() {
+                    scoped_import_key(&client.id, &server, &name, definition.as_ref())?
+                } else {
+                    import_review_key(&server, &name)
+                };
+                let prepared = match unknown {
+                    Some(reason) => Err(reason),
+                    None => crate::import_credentials::Import::prepare(
+                        server.clone(),
+                        definition.as_ref(),
+                    ),
+                };
+                let (credentials, unsupported) = match prepared {
+                    Ok(import) => (
+                        import
+                            .review_credentials()
+                            .into_iter()
+                            .map(|(key, secret, present, required)| CredentialReview {
+                                key,
+                                secret,
+                                present,
+                                required,
+                            })
+                            .collect(),
+                        None,
+                    ),
+                    Err(error) => (Vec::new(), Some(error)),
+                };
+                Ok(ClientImportCandidate {
+                    client_id: client.id.clone(),
+                    credentials,
+                    unsupported,
+                    key,
+                    source_name: (name != server.name).then(|| server.name.clone()),
+                    connection: import_connection_key(&server),
+                    name,
+                    transport: server.transport,
+                    command: server.command.map(|c| {
+                        if registry::arg_looks_secret(&c) {
+                            "<command>".into()
+                        } else {
+                            c
+                        }
+                    }),
+                    args: crate::import_credentials::shown_args(&server.args),
+                    url: server
+                        .url
+                        .as_deref()
+                        .map(crate::import_credentials::shown_url),
                 })
-                .ok_or("Missing import client")?;
-            let definition = clients::import_definition(client, &server.name)?;
-            let key = if client_id.is_some() {
-                scoped_import_key(&client.id, &server, definition.as_ref())?
-            } else {
-                clients::import_dedupe_key(&server.name, server.command.as_deref(), &server.args)
-            };
-            let (credentials, unsupported) = match crate::import_credentials::Import::prepare(
-                server.clone(),
-                definition.as_ref(),
-            ) {
-                Ok(import) => (
-                    import
-                        .review_credentials()
-                        .into_iter()
-                        .map(|(key, secret, present, required)| CredentialReview {
-                            key,
-                            secret,
-                            present,
-                            required,
-                        })
-                        .collect(),
-                    None,
-                ),
-                Err(error) => (Vec::new(), Some(error)),
-            };
-            Ok(ClientImportCandidate {
-                client_id: client.id.clone(),
-                credentials,
-                unsupported,
-                key,
-                name: server.name,
-                transport: server.transport,
-                command: server.command.map(|c| {
-                    if registry::arg_looks_secret(&c) {
-                        "<command>".into()
-                    } else {
-                        c
-                    }
-                }),
-                args: crate::import_credentials::shown_args(&server.args),
-                url: server
-                    .url
-                    .as_deref()
-                    .map(crate::import_credentials::shown_url),
-            })
-        })
+            },
+        )
         .collect::<Result<Vec<_>, String>>()
+}
+
+fn unresolved_connection(source_name: &str, existing: &str) -> String {
+    format!(
+        "Could not compare {source_name} with {existing}, which is missing a required value. Finish {existing} under Servers, then review again. Client config unchanged."
+    )
+}
+
+/// Existing servers that can be the same connection as a detected client server, found
+/// without the vault: the same raw connection key, or, for a client entry carrying a
+/// secret in its URL or args, the redacted key an import stores (`shown_url`,
+/// `<launch-input>` args). Only these are confirmed with `Import::matches`, so listing
+/// clients reads the vault only when a stored secret-bearing server could match.
+fn connection_candidates<'a>(
+    registry: &'a Registry,
+    detected: &clients::McpServer,
+) -> Vec<&'a ServerEntry> {
+    let raw = detected_connection(detected);
+    let shown_url = detected
+        .url
+        .as_deref()
+        .map(crate::import_credentials::shown_url);
+    let redacted = clients::connection_key(
+        &detected.transport,
+        detected.command.as_deref(),
+        &crate::import_credentials::shown_args(&detected.args),
+        shown_url.as_deref(),
+    );
+    registry
+        .servers
+        .iter()
+        .filter(|existing| {
+            // Launch bindings say exactly which parts of a stored stdio argv are known;
+            // a redacted or raw key must not override a known fragment that differs.
+            if existing.transport == "stdio"
+                && existing
+                    .launch
+                    .as_ref()
+                    .is_some_and(|launch| !launch.bindings.is_empty())
+            {
+                return launch_bound_candidate(existing, detected);
+            }
+            let key = clients::connection_key(
+                &existing.transport,
+                existing.command.as_deref(),
+                &existing.args,
+                existing.url.as_deref(),
+            );
+            key == raw || (redacted != raw && key == redacted)
+        })
+        .collect()
+}
+
+/// A stored stdio server whose argv holds launch-bound placeholders (a catalog
+/// Filesystem entry stores `<launch-input>` for its allowed directory) can be the same
+/// connection as a client's literal argv. Each bound argument becomes a pattern of
+/// known fragments (literals and non-secret inputs, resolved exactly as
+/// `launch_inputs::resolve_args_with` does, without the vault) and unknown parts
+/// (secret or referenced inputs, or a required value that is missing). The server is
+/// kept for confirmation by `Import::matches` only when every argument fits its
+/// pattern, so a known fragment that differs rules it out without reading the vault.
+fn launch_bound_candidate(existing: &ServerEntry, detected: &clients::McpServer) -> bool {
+    launch_bound_match(existing, detected).is_some()
+}
+
+/// `None` when `existing` cannot be the connection; `Some(true)` when every argument is
+/// known without the vault and matches exactly, so no vault read can change the answer.
+fn launch_bound_match(existing: &ServerEntry, detected: &clients::McpServer) -> Option<bool> {
+    let launch = existing
+        .launch
+        .as_ref()
+        .filter(|launch| !launch.bindings.is_empty())?;
+    if existing.transport != "stdio"
+        || detected.transport != "stdio"
+        || existing.command != detected.command
+        || existing.args.len() != detected.args.len()
+    {
+        return None;
+    }
+    // `None` is an unknown part.
+    let mut patterns = existing
+        .args
+        .iter()
+        .map(|arg| vec![Some(arg.clone())])
+        .collect::<Vec<_>>();
+    for binding in &launch.bindings {
+        let slot = patterns.get_mut(binding.index)?;
+        let mut pattern = Vec::new();
+        for part in &binding.parts {
+            match part {
+                registry::ArgPart::Literal { value, .. } => pattern.push(Some(value.clone())),
+                registry::ArgPart::Input { key, .. } => {
+                    let input = launch.inputs.iter().find(|input| &input.key == key)?;
+                    let referenced = crate::secret_refs::source(&input.unknown_fields)
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    if input.secret || referenced {
+                        pattern.push(None);
+                        continue;
+                    }
+                    // Mirrors the resolver: a blank value is missing; a missing optional
+                    // input is empty; a missing required one cannot be resolved.
+                    match input.value.as_deref().filter(|v| !v.trim().is_empty()) {
+                        Some(value) => pattern.push(Some(value.to_string())),
+                        None if input.required => pattern.push(None),
+                        None => pattern.push(Some(String::new())),
+                    }
+                }
+            }
+        }
+        *slot = pattern;
+    }
+    patterns
+        .iter()
+        .zip(&detected.args)
+        .all(|(pattern, actual)| fragments_match(pattern, actual))
+        .then(|| patterns.iter().flatten().all(Option::is_some))
+}
+
+/// Whether `actual` is the known fragments in order, with each unknown part matching
+/// any text (including none). Adjacent known fragments join into one exact chunk; the
+/// first chunk anchors the start, the last the end, and the chunks between are found
+/// leftmost in order, which is exact for patterns whose only wildcard is "any text".
+fn fragments_match(pattern: &[Option<String>], actual: &str) -> bool {
+    let mut chunks = vec![String::new()];
+    for part in pattern {
+        match part {
+            Some(known) => chunks.last_mut().unwrap().push_str(known),
+            None => chunks.push(String::new()),
+        }
+    }
+    if chunks.len() == 1 {
+        return chunks[0] == actual;
+    }
+    let (first, rest) = chunks.split_first().unwrap();
+    let (last, middle) = rest.split_last().unwrap();
+    let Some(mut remaining) = actual.strip_prefix(first.as_str()) else {
+        return false;
+    };
+    let Some(trimmed) = remaining.strip_suffix(last.as_str()) else {
+        return false;
+    };
+    remaining = trimmed;
+    for chunk in middle {
+        let Some(at) = remaining.find(chunk.as_str()) else {
+            return false;
+        };
+        remaining = &remaining[at + chunk.len()..];
+    }
+    true
+}
+
+/// How import candidates and client counts see a detected client server under the one
+/// identity rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConnectionState {
+    /// No existing server has this connection: importable.
+    New,
+    /// This existing server id has the same connection: already in Toolport.
+    Existing(String),
+    /// Identity could not be confirmed (for example a vaulted value is missing). Neither
+    /// importable nor managed; the reason is shown in review.
+    Unknown(String),
+}
+
+pub(crate) fn existing_connection(
+    registry: &Registry,
+    client: &clients::DetectedClient,
+    detected: &clients::McpServer,
+    confirm: Confirm,
+) -> ConnectionState {
+    let candidates = connection_candidates(registry, detected);
+    if candidates.is_empty() {
+        return ConnectionState::New;
+    }
+    // A raw-equal server without vault references resolves to exactly its stored args
+    // and URL, which is what `Import::matches` would conclude; skip reading the client
+    // config and the vault for the common already-imported case.
+    let raw = detected_connection(detected);
+    if let Some(existing) = candidates.iter().find(|existing| {
+        !crate::import_credentials::has_imported_url(existing)
+            && existing
+                .launch
+                .as_ref()
+                .is_none_or(|launch| launch.bindings.is_empty())
+            && clients::connection_key(
+                &existing.transport,
+                existing.command.as_deref(),
+                &existing.args,
+                existing.url.as_deref(),
+            ) == raw
+    }) {
+        return ConnectionState::Existing(existing.id.clone());
+    }
+    if confirm == Confirm::VaultFree {
+        // A launch-bound server whose arguments are all known matches without the vault.
+        if let Some(existing) = candidates
+            .iter()
+            .find(|existing| launch_bound_match(existing, detected) == Some(true))
+        {
+            return ConnectionState::Existing(existing.id.clone());
+        }
+        // Only the vault could tell; detection never reads it. Review confirms.
+        return ConnectionState::Unknown(format!(
+            "Review {} to compare it with {}, whose saved values are in the keychain.",
+            detected.name, candidates[0].name
+        ));
+    }
+    let import = clients::import_definition(client, &detected.name).and_then(|definition| {
+        crate::import_credentials::Import::prepare(
+            server_from_detected(detected, &client.id),
+            definition.as_ref(),
+        )
+    });
+    let import = match import {
+        Ok(import) => import,
+        // The plain raw match was handled above. Every remaining candidate needs vault
+        // or launch resolution, which needs a prepared import: unknown, never assumed.
+        Err(error) => return ConnectionState::Unknown(error),
+    };
+    let mut unresolved = None;
+    for existing in candidates {
+        match import.matches(existing) {
+            Ok(true) => return ConnectionState::Existing(existing.id.clone()),
+            Ok(false) => {}
+            Err(_) => {
+                unresolved.get_or_insert(existing.name.clone());
+            }
+        }
+    }
+    match unresolved {
+        Some(name) => ConnectionState::Unknown(unresolved_connection(&detected.name, &name)),
+        None => ConnectionState::New,
+    }
+}
+
+/// The raw native connection of a detected client server. Two reviewed entries with the
+/// same connection would land on one server and overwrite each other's settings.
+fn detected_connection(server: &clients::McpServer) -> String {
+    clients::connection_key(
+        &server.transport,
+        server.command.as_deref(),
+        &server.args,
+        server.url.as_deref(),
+    )
 }
 
 fn registry_matches(left: &Registry, right: &Registry) -> Result<bool, String> {
@@ -705,7 +1068,7 @@ pub fn import_client_servers_inputs(
         return Err("Server changed. Refresh the client and review again.".into());
     }
     let mut prepared = Vec::new();
-    for entry in servers {
+    for (entry, name) in servers {
         let client_id = entry
             .source
             .as_deref()
@@ -717,17 +1080,24 @@ pub fn import_client_servers_inputs(
             .ok_or("Missing import client")?;
         let definition = clients::import_definition(client, &entry.name)?;
         if !scoped.is_empty()
-            && !reviewed.contains(&scoped_import_key(client_id, &entry, definition.as_ref())?)
+            && !reviewed.contains(&scoped_import_key(
+                client_id,
+                &entry,
+                &name,
+                definition.as_ref(),
+            )?)
         {
             return Err("Server changed. Refresh the client and review again.".into());
         }
-        let name = entry.name.clone();
+        // Reviews show and key each server by the name it is saved under, which its
+        // review key binds.
         match crate::import_credentials::Import::prepare_with_choices(
             entry,
             definition.as_ref(),
             choices.get(&name),
         ) {
             Ok(mut import) => {
+                import.entry.name = name.clone();
                 if let Some(values) = inputs.get(&name) {
                     import.supply(values)?;
                 }
@@ -4568,6 +4938,479 @@ API_KEY = "synthetic-first-origin"
         assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
     }
 
+    /// The Import all key of a stdio server with no args.
+    fn stdio_key(command: &str, name: &str) -> String {
+        let mut entry = server(name);
+        entry.command = Some(command.into());
+        import_review_key(&entry, name)
+    }
+
+    fn detected_client(id: &str) -> clients::DetectedClient {
+        clients::detect_clients()
+            .into_iter()
+            .find(|client| client.id == id)
+            .unwrap()
+    }
+
+    fn names(servers: Vec<clients::McpServer>) -> Vec<String> {
+        servers.into_iter().map(|server| server.name).collect()
+    }
+
+    #[test]
+    fn same_name_different_connections_import_under_distinct_names() {
+        let mut previous = Registry::default();
+        let mut github = server("github");
+        github.command = Some("npx".into());
+        github.args = vec!["-y".into(), "@modelcontextprotocol/server-github".into()];
+        previous.add_server(github);
+        let fixture = MoveFixture::new(&previous);
+        let before = read_registry_exact().unwrap().servers;
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"github":{"type":"http","url":"https://api.githubcopilot.com/mcp/"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.codex(),
+            "[mcp_servers.github]\ncommand = \"npx\"\nargs = [\"-y\", \"@acme/github-mcp\"]\n",
+        )
+        .unwrap();
+        let registry = read_registry_exact().unwrap();
+        let (claude, codex) = (detected_client("claude-code"), detected_client("codex"));
+        let remote = clients::importable_servers(&claude, &registry);
+        assert_eq!(names(remote.clone()), ["github (2)"]);
+        assert_eq!(
+            remote[0].url.as_deref(),
+            Some("https://api.githubcopilot.com/mcp/")
+        );
+        assert_eq!(
+            names(clients::importable_servers(&codex, &registry)),
+            ["github (2)"]
+        );
+        assert!(clients::managed_server_names(&claude, &registry).is_empty());
+
+        // Import all offers both, each under its own saved name.
+        let review = preview_client_imports().unwrap();
+        let mut shown = review
+            .iter()
+            .map(|item| (item.name.as_str(), item.source_name.as_deref()))
+            .collect::<Vec<_>>();
+        shown.sort();
+        assert_eq!(
+            shown,
+            [
+                ("github (2)", Some("github")),
+                ("github (3)", Some("github"))
+            ]
+        );
+        let (_, added) =
+            import_client_servers(review.iter().map(|item| item.key.clone()).collect()).unwrap();
+        assert_eq!(added, 2);
+        let saved = read_registry_exact().unwrap();
+        let mut saved_names = saved
+            .servers
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>();
+        saved_names.sort();
+        assert_eq!(saved_names, ["github", "github (2)", "github (3)"]);
+        assert_eq!(saved.servers[0], before[0]);
+        for client in [&claude, &codex] {
+            assert!(clients::importable_servers(client, &saved).is_empty());
+            assert_eq!(clients::managed_server_names(client, &saved), ["github"]);
+        }
+        assert!(preview_client_imports().unwrap().is_empty());
+    }
+
+    #[test]
+    fn servers_whose_secrets_redact_alike_keep_their_own_ids() {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{
+                "personal":{"type":"http","url":"https://example.test/mcp?token=synthetic-a"},
+                "work":{"type":"http","url":"https://example.test/mcp?token=synthetic-b"},
+                "arg-a":{"command":"arg-cmd","args":["--api-key=synthetic-a"]},
+                "arg-b":{"command":"arg-cmd","args":["--api-key=synthetic-b"]}}}"#,
+        )
+        .unwrap();
+        let client = detected_client("claude-code");
+        let registry = read_registry_exact().unwrap();
+        let detected = clients::importable_server_slots(&client, &registry)
+            .into_iter()
+            .map(|(_, server, id)| (server.name, id))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let review = preview_client_imports_for("claude-code").unwrap();
+        assert_eq!(review.len(), 4);
+        for item in &review {
+            // The id never holds the secret, and each row has its own.
+            assert!(!item.connection.contains("synthetic"));
+            assert_eq!(detected[&item.name], item.connection);
+        }
+        // Salted: not a plain hash someone could check a guessed token against.
+        let personal = review.iter().find(|i| i.name == "personal").unwrap();
+        let plain = clients::connection_key(
+            "http",
+            None,
+            &[],
+            Some("https://example.test/mcp?token=synthetic-a"),
+        );
+        assert_ne!(
+            personal.connection,
+            format!("connection:{}", registry::sha256_hex(&plain))
+        );
+        let ids = review
+            .iter()
+            .map(|item| &item.connection)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 4);
+        let (_, added) =
+            import_client_servers(review.iter().map(|item| item.key.clone()).collect()).unwrap();
+        assert_eq!(added, 4);
+    }
+
+    #[test]
+    fn a_saved_name_that_shifts_after_review_is_refused() {
+        let mut previous = Registry::default();
+        previous.add_server(server("github"));
+        let fixture = MoveFixture::new(&previous);
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"github":{"type":"http","url":"https://api.githubcopilot.com/mcp/"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.codex(),
+            "[mcp_servers.github]\ncommand = \"acme-github\"\n[mcp_servers.github.env]\nGITHUB_TOKEN = \"synthetic-token\"\n",
+        )
+        .unwrap();
+        let token_choice = |name: &str| {
+            std::collections::BTreeMap::from([(
+                name.to_string(),
+                std::collections::BTreeMap::from([("GITHUB_TOKEN".to_string(), false)]),
+            )])
+        };
+        let codex_name = |items: &[ClientImportCandidate]| {
+            items
+                .iter()
+                .find(|item| item.client_id == "codex")
+                .unwrap()
+                .name
+                .clone()
+        };
+        let bulk = preview_client_imports().unwrap();
+        let scoped = preview_client_imports_for("codex").unwrap();
+        // An unrelated server takes a reviewed name before the import.
+        registry::update(|r| {
+            let mut taken = server("taken");
+            taken.name = "github (2)".into();
+            r.add_server(taken);
+            Ok(())
+        })
+        .unwrap();
+        let before = read_registry_exact().unwrap();
+        let vault = fixture.root.join("data");
+        let files = || {
+            let mut all = std::fs::read_dir(&vault)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.is_file())
+                .map(|p| (p.clone(), std::fs::read(p).unwrap()))
+                .collect::<Vec<_>>();
+            all.sort();
+            all
+        };
+        let vault_before = files();
+        for (items, keys) in [
+            (
+                &bulk,
+                bulk.iter().map(|i| i.key.clone()).collect::<Vec<_>>(),
+            ),
+            (&scoped, scoped.iter().map(|i| i.key.clone()).collect()),
+        ] {
+            let error = import_client_servers_inputs(
+                keys,
+                &token_choice(&codex_name(items)),
+                &Default::default(),
+            )
+            .unwrap_err();
+            assert!(error.contains("Server changed"), "{error}");
+            assert_eq!(read_registry_exact().unwrap().servers, before.servers);
+            assert_eq!(files(), vault_before);
+        }
+        // Reviewed again, the choice lands on the server it was made for.
+        let bulk = preview_client_imports().unwrap();
+        let name = codex_name(&bulk);
+        let (registry, added) = import_client_servers_inputs(
+            bulk.iter().map(|i| i.key.clone()).collect(),
+            &token_choice(&name),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(added, 2);
+        let codex = registry.servers.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(codex.command.as_deref(), Some("acme-github"));
+        assert!(codex
+            .env
+            .iter()
+            .any(|e| e.key == "GITHUB_TOKEN" && !e.secret && e.value.is_some()));
+    }
+
+    #[test]
+    fn client_import_saves_and_keys_choices_by_the_shown_name() {
+        let mut previous = Registry::default();
+        previous.add_server(server("github"));
+        let fixture = MoveFixture::new(&previous);
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"github":{"command":"npx","args":["-y","@acme/github-mcp"],"env":{"GITHUB_TOKEN":"synthetic-token"}}}}"#,
+        )
+        .unwrap();
+        let review = preview_client_imports_for("claude-code").unwrap();
+        assert_eq!(review.len(), 1);
+        assert_eq!(review[0].name, "github (2)");
+        assert_eq!(review[0].source_name.as_deref(), Some("github"));
+        let choices = std::collections::BTreeMap::from([(
+            "github (2)".into(),
+            std::collections::BTreeMap::from([("GITHUB_TOKEN".into(), false)]),
+        )]);
+        let (registry, added) = import_client_servers_inputs(
+            vec![review[0].key.clone()],
+            &choices,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(added, 1);
+        let imported = registry
+            .servers
+            .iter()
+            .find(|s| s.source.as_deref() == Some("imported:claude-code"))
+            .unwrap();
+        assert_eq!(imported.name, "github (2)");
+        assert!(imported.env.iter().any(|env| env.key == "GITHUB_TOKEN"
+            && !env.secret
+            && env.value.as_deref() == Some("synthetic-token")));
+    }
+
+    #[test]
+    fn imported_secret_bearing_servers_are_not_offered_again() {
+        let fixture = MoveFixture::new(&Registry::default());
+        // Import the secret-bearing entries first, so the registry holds only their
+        // redacted URL or `<launch-input>` arg plus vault values.
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{
+                "url-same":{"type":"http","url":"https://same.invalid/mcp?token=synthetic-a"},
+                "url-unknown":{"type":"http","url":"https://unknown.invalid/mcp?token=synthetic-u"},
+                "arg-same":{"command":"arg-cmd","args":["--api-key=synthetic-arg-a"]}}}"#,
+        )
+        .unwrap();
+        let keys = preview_client_imports_for("claude-code")
+            .unwrap()
+            .into_iter()
+            .map(|item| item.key)
+            .collect::<Vec<_>>();
+        assert_eq!(import_client_servers(keys).unwrap().1, 3);
+        let imported = read_registry_exact().unwrap();
+        let find = |name: &str| imported.servers.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(find("arg-same").args, ["<launch-input>"]);
+        let unknown = find("url-unknown");
+        assert_eq!(unknown.url.as_deref(), Some("https://unknown.invalid/mcp"));
+        crate::secrets::delete_secret(&unknown.id, crate::secrets::IMPORTED_URL_KEY).unwrap();
+
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{
+                "new-one":{"command":"new-cmd"},
+                "url-same":{"type":"http","url":"https://same.invalid/mcp?token=synthetic-a"},
+                "url-changed":{"type":"http","url":"https://same.invalid/mcp?token=synthetic-b"},
+                "url-unknown":{"type":"http","url":"https://unknown.invalid/mcp?token=synthetic-u"},
+                "arg-same":{"command":"arg-cmd","args":["--api-key=synthetic-arg-a"]}}}"#,
+        )
+        .unwrap();
+        let registry = read_registry_exact().unwrap();
+        let client = detected_client("claude-code");
+        let unknown = client
+            .servers
+            .iter()
+            .find(|s| s.name == "url-unknown")
+            .unwrap();
+        assert!(matches!(
+            existing_connection(&registry, &client, unknown, Confirm::WithVault),
+            ConnectionState::Unknown(_)
+        ));
+        // Detection never reads the vault: what only the vault could confirm is neither
+        // offered nor claimed as in Toolport.
+        let ((importable, managed), reads) = crate::secrets::tests::vault_reads_during(|| {
+            (
+                names(clients::importable_servers(&client, &registry)),
+                clients::managed_server_names(&client, &registry),
+            )
+        });
+        assert_eq!(reads, Vec::<String>::new());
+        assert_eq!(importable, ["new-one"]);
+        assert!(managed.is_empty());
+        for name in ["url-same", "arg-same", "url-changed"] {
+            let server = client.servers.iter().find(|s| s.name == name).unwrap();
+            assert!(matches!(
+                existing_connection(&registry, &client, server, Confirm::VaultFree),
+                ConnectionState::Unknown(_)
+            ));
+        }
+        // The review the user opens confirms them through the vault.
+        for name in ["url-same", "arg-same"] {
+            let server = client.servers.iter().find(|s| s.name == name).unwrap();
+            assert!(matches!(
+                existing_connection(&registry, &client, server, Confirm::WithVault),
+                ConnectionState::Existing(_)
+            ));
+        }
+        // Review lists what is new, and shows the unconfirmed one as unsupported.
+        let review = preview_client_imports_for("claude-code").unwrap();
+        let mut new = review
+            .iter()
+            .filter(|item| item.unsupported.is_none())
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>();
+        new.sort();
+        assert_eq!(new, ["new-one", "url-changed"]);
+        let unsupported = review
+            .iter()
+            .filter(|item| item.unsupported.is_some())
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(unsupported, ["url-unknown"]);
+    }
+
+    fn add_catalog_server(name: &str, edit: impl FnOnce(&mut ServerEntry)) -> ServerEntry {
+        let entry = crate::catalog::search_curated(&name.to_lowercase())
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .unwrap();
+        add_catalog_entry(entry).unwrap();
+        registry::update(|r| {
+            let server = r.servers.iter_mut().find(|s| s.name == name).unwrap();
+            edit(server);
+            Ok(server.clone())
+        })
+        .unwrap()
+        .1
+    }
+
+    fn launch_input<'a>(
+        server: &'a mut ServerEntry,
+        key: &str,
+    ) -> &'a mut crate::registry::LaunchInput {
+        server
+            .launch
+            .as_mut()
+            .unwrap()
+            .inputs
+            .iter_mut()
+            .find(|input| input.key == key)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_catalog_launch_bound_server_is_already_in_toolport() {
+        let fixture = MoveFixture::new(&Registry::default());
+        let stored = add_catalog_server("Filesystem", |server| {
+            launch_input(server, "ALLOWED_DIRECTORY").value = Some("/tmp".into());
+        });
+        assert_eq!(stored.args[2], "<launch-input>");
+        let mut argv = stored.args.clone();
+        argv[2] = "/tmp".into();
+        // A different name on purpose: identity is the connection, not the name.
+        std::fs::write(
+            fixture.claude(),
+            serde_json::json!({"mcpServers":{"files":{"command": stored.command, "args": argv}}})
+                .to_string(),
+        )
+        .unwrap();
+        let registry = read_registry_exact().unwrap();
+        let client = detected_client("claude-code");
+        assert_eq!(
+            existing_connection(&registry, &client, &client.servers[0], Confirm::VaultFree),
+            ConnectionState::Existing(stored.id.clone())
+        );
+        assert!(clients::importable_servers(&client, &registry).is_empty());
+        assert_eq!(clients::managed_server_names(&client, &registry), ["files"]);
+        assert!(preview_client_imports_for("claude-code")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_different_known_fragment_rules_out_a_secret_bound_server_without_the_vault() {
+        let fixture = MoveFixture::new(&Registry::default());
+        // Twilio binds one argument as ACCOUNT_SID/API_KEY:API_SECRET. Only the SID is
+        // stored; both secrets are missing from the vault.
+        let stored = add_catalog_server("Twilio", |server| {
+            launch_input(server, "TWILIO_ACCOUNT_SID").value = Some("AC111".into());
+        });
+        let bound = |sid: &str| {
+            let mut argv = stored.args.clone();
+            argv[2] = format!("{sid}/SKsynthetic:synthetic-secret");
+            argv
+        };
+        std::fs::write(
+            fixture.claude(),
+            serde_json::json!({"mcpServers":{"twilio":{
+                "command": stored.command,
+                "args": bound("AC222"),
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let registry = read_registry_exact().unwrap();
+        let client = detected_client("claude-code");
+        // A different SID is a different connection: never a candidate, so the missing
+        // secrets are never read and nothing is refused.
+        assert!(connection_candidates(&registry, &client.servers[0]).is_empty());
+        assert_eq!(
+            existing_connection(&registry, &client, &client.servers[0], Confirm::WithVault),
+            ConnectionState::New
+        );
+        assert_eq!(clients::importable_servers(&client, &registry).len(), 1);
+        // The same SID keeps it as a candidate; its secrets decide, and they are missing.
+        let mut same = client.servers[0].clone();
+        same.args = bound("AC111");
+        assert_eq!(connection_candidates(&registry, &same).len(), 1);
+        assert!(matches!(
+            existing_connection(&registry, &client, &same, Confirm::WithVault),
+            ConnectionState::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn fragments_match_known_chunks_in_order_with_any_text_between() {
+        let known = |s: &str| Some(s.to_string());
+        let twilio = [known("AC111"), known("/"), None, known(":"), None];
+        assert!(fragments_match(&twilio, "AC111/SK1:secret"));
+        assert!(fragments_match(&twilio, "AC111/:"));
+        assert!(!fragments_match(&twilio, "AC222/SK1:secret"));
+        assert!(!fragments_match(&twilio, "AC111/SK1"));
+        let ends = [known("ab"), None, known("ba")];
+        assert!(fragments_match(&ends, "ab-ba"));
+        assert!(!fragments_match(&ends, "aba"));
+        let middle = [None, known("a"), None, known("b"), None];
+        assert!(fragments_match(&middle, "xaxbx"));
+        assert!(!fragments_match(&middle, "ba"));
+        assert!(fragments_match(&[known("/tmp")], "/tmp"));
+        assert!(!fragments_match(&[known("/tmp")], "/tmp/x"));
+        assert!(fragments_match(&[None], ""));
+    }
+
+    #[test]
+    fn distinct_import_names_skip_every_taken_name() {
+        let taken = ["GitHub".to_string(), "github (2)".to_string()];
+        assert_eq!(
+            clients::distinct_import_name("github", &taken),
+            "github (3)"
+        );
+        assert_eq!(clients::distinct_import_name("linear", &taken), "linear");
+    }
+
     #[test]
     fn reviewed_new_import_never_uses_an_orphan_credential() {
         let fixture = MoveFixture::new(&Registry::default());
@@ -5259,7 +6102,7 @@ API_KEY = "synthetic-first-origin"
         let fixture = MoveFixture::new(&Registry::default());
         let original = r#"{"mcpServers":{"one":{"command":"fixture","env":{"PAT":"synthetic-native-pat","PORT":3000}}}}"#;
         std::fs::write(fixture.claude(), original).unwrap();
-        let (registry, count) = import_client_servers(vec!["name:one".into()]).unwrap();
+        let (registry, count) = import_client_servers(vec![stdio_key("fixture", "one")]).unwrap();
         assert_eq!(count, 1);
         let entry = &registry.servers[0];
         assert!(entry.enabled);
@@ -5290,7 +6133,12 @@ API_KEY = "synthetic-first-origin"
                 .contains("synthetic-native-pat")
         );
         assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
-        assert_eq!(import_client_servers(vec!["name:one".into()]).unwrap().1, 0);
+        assert_eq!(
+            import_client_servers(vec![stdio_key("fixture", "one")])
+                .unwrap()
+                .1,
+            0
+        );
         let before = preview_client_setup("claude-code").unwrap();
         std::fs::write(fixture.root.join("data/secrets.enc"), "unreadable-vault").unwrap();
         let error = migrate_client_reviewed_with(
@@ -5326,7 +6174,7 @@ API_KEY = "synthetic-first-origin"
         assert!(error.contains("needs credentials"));
         assert!(!error.contains("Keychain unavailable"));
         assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
-        let (registry, _) = import_client_servers(vec!["name:one".into()]).unwrap();
+        let (registry, _) = import_client_servers(vec![stdio_key("fixture", "one")]).unwrap();
         assert!(!registry.servers[0].enabled);
         assert!(registry.servers[0].env[0].value.is_none());
     }
@@ -5981,12 +6829,13 @@ API_KEY = "synthetic-first-origin"
     fn zcode_import_preview_stays_available_and_selected_safe_servers_can_import() {
         let fixture = ZCodeImportFixture::new(serde_json::json!({
             "unsupported":{"command":"node", "cwd":"/srv/work"},
-            "supported":{"command":"node"}
+            "supported":{"command":"supported-node"}
         }));
         let mut unrelated = fixture.client.clone();
         unrelated.id = "cursor".into();
         unrelated.servers.truncate(1);
         unrelated.servers[0].name = "other-client".into();
+        unrelated.servers[0].command = Some("other-node".into());
         let detected = [fixture.client.clone(), unrelated];
         let mut registry = Registry::default();
         assert_eq!(servers_to_import(&detected, &registry).len(), 3);
@@ -5994,11 +6843,13 @@ API_KEY = "synthetic-first-origin"
             .unwrap_err()
             .contains("'cwd'"));
         assert!(registry.servers.is_empty());
-        let selected =
-            std::collections::HashSet::from(["name:supported".into(), "name:other-client".into()]);
+        let selected = std::collections::HashSet::from([
+            stdio_key("supported-node", "supported"),
+            stdio_key("other-node", "other-client"),
+        ]);
         let servers = selected_servers_to_import(&detected, &registry, Some(&selected)).unwrap();
         assert_eq!(servers.len(), 2);
-        for entry in servers {
+        for (entry, _) in servers {
             registry.add_server(entry);
         }
         assert_eq!(registry.servers.len(), 2);
@@ -6009,14 +6860,14 @@ API_KEY = "synthetic-first-origin"
     fn zcode_client_import_keeps_disabled_entries_disabled_including_legacy_false() {
         let fixture = ZCodeImportFixture::new(serde_json::json!({
             "disabled":{"command":"node", "enabled":false, "enable":true},
-            "legacy-disabled":{"command":"node", "enabled":true, "enable":false}
+            "legacy-disabled":{"command":"legacy-node", "enabled":true, "enable":false}
         }));
         let mut registry = Registry::default();
         for entry in
             selected_servers_to_import(std::slice::from_ref(&fixture.client), &registry, None)
                 .unwrap()
         {
-            registry.add_server(entry);
+            registry.add_server(entry.0);
         }
         assert_eq!(registry.servers.len(), 2);
         assert!(registry.enabled_servers().is_empty());

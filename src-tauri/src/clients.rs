@@ -4296,6 +4296,108 @@ fn name_from_invocation(command: &str, args: &[String]) -> String {
     command_stem(command)
 }
 
+/// Connection identity for import. Display names and credentials do not identify
+/// an endpoint. Keep transports distinct and compare commands/argv or URLs exactly.
+pub fn connection_key(
+    transport: &str,
+    command: Option<&str>,
+    args: &[String],
+    url: Option<&str>,
+) -> String {
+    if transport == "stdio" {
+        serde_json::to_string(&(transport, command, args)).expect("serializable identity")
+    } else {
+        serde_json::to_string(&(transport, url)).expect("serializable identity")
+    }
+}
+
+/// Lowercased names of the client's servers already in Toolport under the one identity
+/// rule (`registry_controller::existing_connection`). A server whose identity cannot be
+/// confirmed is neither managed nor importable.
+pub fn managed_server_names(
+    client: &DetectedClient,
+    registry: &crate::registry::Registry,
+) -> Vec<String> {
+    client
+        .servers
+        .iter()
+        .chain(&client.plugin_servers)
+        .filter(|s| {
+            matches!(
+                crate::registry_controller::existing_connection(
+                    registry,
+                    client,
+                    s,
+                    crate::registry_controller::Confirm::VaultFree
+                ),
+                crate::registry_controller::ConnectionState::Existing(_)
+            )
+        })
+        .map(|s| s.name.to_lowercase())
+        .collect()
+}
+
+/// The client's servers Import would add, deduped by connection and named as they
+/// would be saved (`github (2)` beside an unrelated `github`). Each is paired with its
+/// index in `servers` followed by `plugin_servers`. Only servers that are certainly new
+/// count: an unconfirmed identity is not claimed as importable. The last field is the
+/// opaque connection id the import review carries for the same server.
+pub fn importable_server_slots(
+    client: &DetectedClient,
+    registry: &crate::registry::Registry,
+) -> Vec<(usize, McpServer, String)> {
+    use crate::registry_controller::{import_connection_key, server_from_detected};
+    // Detection never reads the vault: a server only it could confirm is left out.
+    let names = crate::registry_controller::import_candidates(
+        std::slice::from_ref(client),
+        registry,
+        crate::registry_controller::Confirm::VaultFree,
+    )
+    .into_iter()
+    .filter(|c| c.unknown.is_none())
+    .map(|c| (import_connection_key(&c.entry), c.name))
+    .collect::<std::collections::HashMap<_, _>>();
+    let mut seen = std::collections::HashSet::new();
+    client
+        .servers
+        .iter()
+        .chain(&client.plugin_servers)
+        .enumerate()
+        .filter_map(|(index, server)| {
+            let key = import_connection_key(&server_from_detected(server, &client.id));
+            if !seen.insert(key.clone()) {
+                return None;
+            }
+            let mut server = server.clone();
+            server.name = names.get(&key)?.clone();
+            Some((index, server, key))
+        })
+        .collect()
+}
+
+/// [`importable_server_slots`] without the indices.
+pub fn importable_servers(
+    client: &DetectedClient,
+    registry: &crate::registry::Registry,
+) -> Vec<McpServer> {
+    importable_server_slots(client, registry)
+        .into_iter()
+        .map(|(_, server, _)| server)
+        .collect()
+}
+
+/// `name`, or `name (2)`, `name (3)` and so on, whichever no name in `names` already
+/// uses (ignoring ASCII case).
+pub fn distinct_import_name(name: &str, names: &[String]) -> String {
+    let mut candidate = name.to_owned();
+    let mut suffix = 2;
+    while names.iter().any(|n| n.eq_ignore_ascii_case(&candidate)) {
+        candidate = format!("{name} ({suffix})");
+        suffix += 1;
+    }
+    candidate
+}
+
 /// Key an imported server for bulk-import dedupe. The friendly display name
 /// intentionally drops a package scope, so keying on it alone collapses
 /// `@acme/mcp-weather` and `@other/mcp-weather` (both name "weather") during

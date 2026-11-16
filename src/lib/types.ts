@@ -60,6 +60,13 @@ export interface DetectedClient {
   claudeProfile?: ClaudeProfile;
   /** T3 Code instances that run this client as a provider. Omitted when none. */
   t3Code?: T3CodeUse[];
+  /** What Import would add under the backend's connection identity rule, each named
+   * as it would be saved (`github (2)` beside an unrelated `github`). */
+  importableServers?: McpServer[];
+  /** Connection keys of `importableServers`, comparable across clients. */
+  importableKeys?: string[];
+  /** Lowercased names of this client's servers already in Toolport. */
+  managedServerNames?: string[];
 }
 
 /** A T3 Code instance that uses a client row (src-tauri/src/clients/t3code.rs). */
@@ -475,6 +482,10 @@ export interface ImportItem {
   /** False if a server with this name is already present (import skips it). */
   isNew: boolean;
   updates?: string[];
+  /** The client's own name when `name`, the name the import saves, differs. */
+  sourceName?: string;
+  /** Opaque connection id matching `DetectedClient.importableKeys`. */
+  connection?: string;
 }
 
 export interface CatalogSearch {
@@ -880,11 +891,14 @@ export function hasLegacyBearerArgv(server: McpServer): boolean {
 
 /** Servers a client has (config + plugins) that Toolport doesn't manage yet.
  * These are the only client-side entries worth surfacing - they're import
- * candidates. Toolport's own gateway entry is never importable. */
+ * candidates. Toolport's own gateway entry is never importable. Detection sends
+ * them from the backend, which matches connections rather than names; the name
+ * match below only serves clients without that field (test fixtures). */
 export function importableServers(
   client: DetectedClient,
   registry: Registry | null,
 ): McpServer[] {
+  if (client.importableServers) return client.importableServers;
   const have = new Set((registry?.servers ?? []).map((s) => s.name.toLowerCase()));
   return [...client.servers, ...client.pluginServers].filter(
     (server) =>

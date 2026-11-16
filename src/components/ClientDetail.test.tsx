@@ -195,6 +195,161 @@ it("uses bulk review storage choices and leaves unsupported servers unchecked", 
   );
 });
 
+it("lists backend import candidates by connection, not by registry name", async () => {
+  const remote = {
+    name: "github",
+    transport: "http" as const,
+    command: null,
+    args: [],
+    envKeys: [],
+    url: "https://api.githubcopilot.com/mcp/",
+  };
+  const notes = {
+    ...remote,
+    name: "notes",
+    transport: "stdio" as const,
+    command: "notes-mcp",
+    url: null,
+  };
+  const linear = { ...notes, name: "linear", command: "linear-mcp" };
+  const registry = {
+    ...emptyRegistry(),
+    servers: [{ name: "github" }, { name: "my-notes" }, { name: "linear" }],
+  } as unknown as Registry;
+  vi.mocked(previewImportServers).mockResolvedValue([
+    {
+      ...remote,
+      name: "github (2)",
+      sourceName: "github",
+      key: "remote",
+      connection: "connection:remote",
+      isNew: true,
+    },
+    {
+      ...linear,
+      name: "linear (2)",
+      sourceName: "linear",
+      key: "linear",
+      connection: "connection:linear",
+      isNew: true,
+    },
+  ]);
+  vi.mocked(importServers).mockResolvedValue(emptyRegistry());
+  const onChanged = vi.fn();
+  render(
+    <ClientDetail
+      client={client({
+        servers: [remote, notes],
+        pluginServers: [linear],
+        importableServers: [
+          { ...remote, name: "github (2)" },
+          { ...linear, name: "linear (2)" },
+        ],
+        importableKeys: ["connection:remote", "connection:linear"],
+        managedServerNames: ["notes"],
+      })}
+      registry={registry}
+      onChanged={onChanged}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  const card = (name: string) =>
+    screen.getByText(name, { selector: "span.font-medium" }).closest("[data-slot=card]")!;
+  expect(
+    within(card("github (2)") as HTMLElement).getByRole("button", { name: /Import/ }),
+  ).toBeEnabled();
+  expect(within(card("linear (2)") as HTMLElement).getByText("plugin")).toBeVisible();
+  expect(within(card("notes") as HTMLElement).getByText(/in Toolport/)).toBeVisible();
+  expect(screen.queryByText("github", { selector: "span.font-medium" })).toBeNull();
+  await userEvent.click(screen.getByRole("button", { name: "Import all (2)" }));
+  expect(
+    within(await screen.findByRole("dialog")).getByText("github (2)", {
+      selector: "span.font-medium",
+    }),
+  ).toBeVisible();
+  await userEvent.click(screen.getByRole("button", { name: "Import 2 servers" }));
+  await waitFor(() => expect(importServers).toHaveBeenCalledWith(["remote", "linear"]));
+  expect(onChanged).toHaveBeenCalled();
+});
+
+it("reviews the row's own server when two servers redact alike", async () => {
+  const twin = (name: string) => ({
+    name,
+    transport: "http" as const,
+    command: null,
+    args: [],
+    envKeys: [],
+    url: "https://example.test/mcp",
+  });
+  vi.mocked(previewImportServers).mockResolvedValue([
+    { ...twin("personal"), key: "key-personal", connection: "c:a", isNew: true },
+    { ...twin("work"), key: "key-work", connection: "c:b", isNew: true },
+  ]);
+  vi.mocked(importServers).mockResolvedValue(emptyRegistry());
+  render(
+    <ClientDetail
+      client={client({
+        servers: [twin("personal"), twin("work")],
+        importableServers: [twin("personal"), twin("work")],
+        importableKeys: ["c:a", "c:b"],
+        managedServerNames: [],
+      })}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  const work = screen
+    .getByText("work", { selector: "span.font-medium" })
+    .closest("[data-slot=card]") as HTMLElement;
+  await userEvent.click(within(work).getByRole("button", { name: /Import/ }));
+  await userEvent.click(await screen.findByRole("button", { name: "Import 1 server" }));
+  await waitFor(() => expect(importServers).toHaveBeenCalledWith(["key-work"]));
+  await userEvent.click(screen.getByRole("button", { name: "Import all (2)" }));
+  await userEvent.click(await screen.findByRole("button", { name: "Import 2 servers" }));
+  await waitFor(() =>
+    expect(importServers).toHaveBeenLastCalledWith(["key-personal", "key-work"]),
+  );
+});
+
+it("shows a refused import inside the review that is still open", async () => {
+  const server = {
+    name: "github",
+    transport: "stdio" as const,
+    command: "npx",
+    args: ["-y", "@acme/github-mcp"],
+    envKeys: [],
+    url: null,
+  };
+  vi.mocked(previewImportServers).mockResolvedValue([
+    { ...server, key: "k:github", connection: "c:a", isNew: true, sourceName: "github" },
+  ]);
+  vi.mocked(importServers).mockRejectedValue(
+    "Server changed. Refresh the client and review again.",
+  );
+  render(
+    <ClientDetail
+      client={client({
+        servers: [server],
+        importableServers: [server],
+        importableKeys: ["c:a"],
+        managedServerNames: [],
+      })}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  await userEvent.click(screen.getByRole("button", { name: "Import all (1)" }));
+  await userEvent.click(await screen.findByRole("button", { name: "Import 1 server" }));
+  const dialog = await screen.findByRole("dialog");
+  expect(
+    await within(dialog).findByText(
+      "Server changed. Refresh the client and review again.",
+    ),
+  ).toBeVisible();
+});
+
 describe("ClientDetail detection errors", () => {
   it("shows the client error in the main panel", () => {
     render(
