@@ -103,6 +103,24 @@ fn note_keyring(flag: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, er
     }
 }
 
+/// Whether a step's first Connect follows the batch's keyring flag (and so may be quiet)
+/// rather than being a Retry the user chose. A review that asked to unlock and was
+/// dismissed was the run's one ask: the flag is set, so this step's Connect is quiet too,
+/// even on a step the user retried. Outside a batch nothing changes.
+fn first_connect_follows_batch(
+    flag: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    retried: bool,
+    review_asked: bool,
+) -> bool {
+    match flag {
+        Some(flag) if review_asked => {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+        _ => !retried,
+    }
+}
+
 /// How a batch step ended from what happened in its window.
 pub(super) fn step_end(completed: bool, advanced: bool, skipped: bool) -> StepEnd {
     match (completed, advanced, skipped) {
@@ -1008,9 +1026,7 @@ pub(super) fn connect_step(
         let flag = step.keyring_quiet.clone();
         let quiet = quiet_try(&flag, step.retried);
         let preview = gtk::gio::spawn_blocking(move || {
-            let review = crate::registry_controller::connect_step(quiet, || {
-                crate::registry_controller::preview_client_setup(&id)
-            });
+            let review = crate::registry_controller::preview_step(&id, quiet);
             if let Err(error) = &review {
                 note_keyring(&flag, error);
             }
@@ -1034,7 +1050,9 @@ pub(super) fn connect_step(
                 // The step's first connect follows the batch's keyring flag; a Retry the
                 // user chooses may ask.
                 let flag = step.keyring_quiet.clone();
-                let first = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(!step.retried));
+                let first = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                    first_connect_follows_batch(&flag, step.retried, preview.keyring_asked),
+                ));
                 review_with_notice(
                     &parent,
                     &review_title(&client_name),
@@ -1142,6 +1160,38 @@ mod tests {
         );
         assert!(quiet_try(&flag, false), "later steps don't ask");
         assert!(!quiet_try(&flag, true), "a Retry may ask");
+    }
+
+    /// A step's review asked to unlock and the ask was dismissed: that step's Connect is
+    /// quiet (no second ask in the same step), the rest of the batch too, and a Retry the
+    /// user chooses may ask again. A single Connect outside a batch is unchanged.
+    #[test]
+    fn a_review_that_asked_keeps_its_steps_connect_quiet() {
+        let flag = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
+        let first = first_connect_follows_batch(&flag, false, true);
+        assert!(
+            quiet_try(&flag, !first),
+            "the step's Connect does not ask again"
+        );
+        assert!(quiet_try(&flag, false), "later steps stay quiet");
+        assert!(!quiet_try(&flag, true), "a Retry may ask");
+        // The review of a step the user retried asked: its Connect still does not ask.
+        let flag = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
+        let first = first_connect_follows_batch(&flag, true, true);
+        assert!(quiet_try(&flag, !first));
+        // No ask at review: the step's Connect may ask, as before.
+        let flag = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
+        let first = first_connect_follows_batch(&flag, false, false);
+        assert!(!quiet_try(&flag, !first));
+        // A single Connect: never quiet, whatever the review did.
+        let first = first_connect_follows_batch(&None, false, true);
+        assert!(!quiet_try(&None, !first));
     }
 
     /// A T3 Code home the page lists before it is saved is named in the connect review as

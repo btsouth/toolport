@@ -368,3 +368,32 @@ it("offers Skip, Retry and Cancel in the footer when a step's config can't be re
   await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
   expect(close).toHaveBeenLastCalledWith(false, false);
 });
+it("leaves a single Connect asking as before when its review asked", async () => {
+  api.previewClientSetup.mockResolvedValue({
+    configPath: "/fixture/config",
+    backupDir: "/fixture/backups",
+    revision: "reviewed",
+    items: [],
+    keyringAsked: true,
+  });
+  api.migrateClient.mockRejectedValue(new Error("Keychain unavailable."));
+  render(
+    <ConnectReviewDialog
+      clientId="fixture"
+      clientName="Fixture"
+      onClose={vi.fn()}
+      onConnected={vi.fn()}
+    />,
+  );
+  await userEvent.click(
+    await screen.findByRole("button", { name: "Connect to Toolport" }),
+  );
+  // Outside Connect all the click is the user's own and is not made quiet.
+  expect(api.migrateClient).toHaveBeenCalledWith(
+    "fixture",
+    undefined,
+    undefined,
+    [],
+    "reviewed",
+  );
+});

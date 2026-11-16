@@ -110,7 +110,14 @@ export function ConnectReviewDialog({
     const quiet = quietFirst.current && attempt === 0;
     (quiet ? previewClientSetup(clientId, true) : previewClientSetup(clientId))
       .then((r) => {
-        if (active) setReview(r);
+        if (!active) return;
+        // In a batch, a review that asked to unlock and was dismissed was the run's one
+        // ask: this step's Connect is quiet too, and the rest of the run. Retry may ask.
+        if (r.keyringAsked && onKeyringLocked) {
+          quietFirst.current = true;
+          onKeyringLocked();
+        }
+        setReview(r);
       })
       .catch(async (e) => {
         if (!active) return;

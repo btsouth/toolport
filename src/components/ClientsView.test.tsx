@@ -1424,6 +1424,49 @@ describe("ClientsView", () => {
       expect(migrateClient).toHaveBeenCalledTimes(2);
     });
 
+    it("does not ask again in a step whose review already asked (F25)", async () => {
+      mockConnect();
+      // The first step's review asked to unlock and the ask was dismissed.
+      vi.mocked(previewClientSetup).mockImplementationOnce(async (id) => ({
+        configPath: `/fixture/${id}`,
+        backupDir: "/fixture/backups",
+        revision: `rev-${id}`,
+        items: [],
+        keyringAsked: true,
+      }));
+      vi.mocked(migrateClient).mockRejectedValueOnce(
+        "Unlock your keyring, then choose Retry.",
+      );
+      render(
+        <ClientsView
+          clients={[
+            client({ id: "aider", name: "Aider", t3Code: [on("One")] }),
+            client({ id: "codex", name: "Codex", t3Code: [on("Two")] }),
+          ]}
+          registry={null}
+          onSelectClient={vi.fn()}
+          onChanged={vi.fn(async () => {})}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Connect all" }));
+      expect(previewClientSetup).toHaveBeenLastCalledWith("aider");
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Connect to Toolport" }),
+      );
+      // The step's Connect is quiet: no second ask in the same step.
+      expect(vi.mocked(migrateClient).mock.calls[0].at(-1)).toBe(true);
+      expect(
+        await screen.findByText("Unlock your keyring, then choose Retry."),
+      ).toBeVisible();
+      // Retry is the user's own choice and may ask once.
+      await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await userEvent.click(await screen.findByRole("button", { name: "Next" }));
+      expect(vi.mocked(migrateClient).mock.calls[1]).toHaveLength(5);
+      // The rest of the run is quiet.
+      expect(await screen.findByText("Review and connect Codex")).toBeVisible();
+      expect(previewClientSetup).toHaveBeenLastCalledWith("codex", true);
+    });
+
     it("asks about a locked keyring at most once in a run", async () => {
       mockConnect();
       vi.mocked(migrateClient)

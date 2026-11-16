@@ -101,9 +101,14 @@ client's config first, then writes the new one in a single step. A row that fail
 way leaves its config exactly as it was, with nothing of it added to Toolport, and the
 rows connected before it stay connected, each with its own backup.
 
-If your keyring is locked, the first row that needs it asks you to unlock it once. If
-you don't, that row fails, and the rows after it don't ask again: one that needs the
+If your keyring is locked, Connect all asks you to unlock it at most once: when the
+first row that reads it opens its review, or when you connect that row. If you don't
+unlock it, that row fails, and nothing after it asks again: a row that needs the
 keyring says to unlock it and choose **Retry**, and **Retry** may ask once more.
+
+A row that was connected to Toolport before and later disconnected keeps saved
+recovery values in the keyring. Unlock your keyring before you connect such a row:
+while it is locked, connecting it fails without asking.
 
 When the batch ends, a summary says how many instances it connected. If any were
 skipped, failed or not reached, or a row needs attention first, it names them and
