@@ -331,12 +331,76 @@ pub fn probe_health_registered(
     Ok(probe_health_checked(&registered_server(server_id)?, check))
 }
 
+/// Servers whose health check found the keyring locked (or busy), for
+/// [`recheck_locked_once_open`]. One thread runs at a time; each round's
+/// list replaces the one before.
+pub struct LockedRecheck {
+    servers: Vec<ServerEntry>,
+    round: u64,
+    running: bool,
+}
+
+impl Default for LockedRecheck {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LockedRecheck {
+    pub const fn new() -> Self {
+        Self {
+            servers: Vec::new(),
+            round: 0,
+            running: false,
+        }
+    }
+
+    /// A finished round's locked servers (a round checks every enabled
+    /// server). True: start the recheck thread, none runs yet.
+    pub fn replace(&mut self, locked: Vec<ServerEntry>) -> bool {
+        self.servers = locked;
+        self.round += 1;
+        let start = !self.running && !self.servers.is_empty();
+        self.running |= start;
+        start
+    }
+
+    /// The thread could not start.
+    pub fn stopped(&mut self) {
+        self.running = false;
+    }
+
+    /// The list to check with its round, or `None`: nothing left, so the
+    /// thread ends.
+    fn next(&mut self) -> Option<(u64, Vec<ServerEntry>)> {
+        if self.servers.is_empty() {
+            self.running = false;
+            return None;
+        }
+        Some((self.round, self.servers.clone()))
+    }
+
+    /// Keep what is still locked. A list a newer round put in place while
+    /// this one was checked stands as it is.
+    fn settle(&mut self, round: u64, results: &[ProbeResult]) {
+        if round != self.round {
+            return;
+        }
+        self.servers.retain(|server| {
+            results
+                .iter()
+                .find(|result| result.server_id == server.id)
+                .is_none_or(|result| result.keyring_locked)
+        });
+    }
+}
+
 /// Servers whose health check found the keyring locked (or busy), checked
 /// again without asking each time a poll finds it open, until none is
-/// locked. Nothing else checks them again while the page stays open. Callers
-/// add to `locked` and start this only when it was empty.
+/// locked. Nothing else checks them again while the page stays open. Start
+/// it only when [`LockedRecheck::replace`] says so.
 pub fn recheck_locked_once_open(
-    locked: &std::sync::Mutex<Vec<ServerEntry>>,
+    locked: &std::sync::Mutex<LockedRecheck>,
     poll: Duration,
     report: impl Fn(&ProbeResult) + Sync,
 ) {
@@ -347,32 +411,25 @@ pub fn recheck_locked_once_open(
     };
     loop {
         std::thread::sleep(poll);
-        if queue().is_empty() {
+        if queue().next().is_none() {
             return;
         }
         if secrets::store_would_prompt() {
             continue;
         }
-        let round = queue().clone();
+        let Some((round, servers)) = queue().next() else {
+            return;
+        };
         let check = KeyringCheck::default();
         let results: Vec<ProbeResult> = std::thread::scope(|scope| {
-            let handles: Vec<_> = round
+            let handles: Vec<_> = servers
                 .iter()
                 .map(|server| scope.spawn(|| probe_health_checked(server, &check)))
                 .collect();
             handles.into_iter().filter_map(|h| h.join().ok()).collect()
         });
         results.iter().for_each(&report);
-        let mut queue = queue();
-        queue.retain(|server| {
-            results
-                .iter()
-                .find(|result| result.server_id == server.id)
-                .is_none_or(|result| result.keyring_locked)
-        });
-        if queue.is_empty() {
-            return;
-        }
+        queue().settle(round, &results);
     }
 }
 
@@ -460,6 +517,48 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    /// Failure mode: a round that marked rows locked while the recheck was
+    /// probing lost them to the recheck's cleanup, and a round soon after
+    /// the list emptied started a second recheck thread.
+    #[test]
+    fn a_newer_round_keeps_its_locked_rows_and_one_recheck_runs() {
+        let named = |id: &str| ServerEntry {
+            id: id.into(),
+            ..server()
+        };
+        let open = |id: &str| ProbeResult {
+            server_id: id.into(),
+            ok: true,
+            tool_count: 1,
+            error: None,
+            auth_required: false,
+            failure: None,
+            auth_target: None,
+            keyring_locked: false,
+        };
+        let mut queue = LockedRecheck::new();
+        assert!(
+            queue.replace(vec![named("a")]),
+            "the first starts the thread"
+        );
+        let (round, _) = queue.next().unwrap();
+        // While it probes "a", a newer round finds "a" and "b" locked.
+        assert!(!queue.replace(vec![named("a"), named("b")]), "one thread");
+        queue.settle(round, &[open("a")]);
+        assert_eq!(queue.servers.len(), 2, "the newer round's rows stay");
+        // A round that empties the list, then one that fills it again
+        // before the thread's next tick: still one thread.
+        assert!(!queue.replace(Vec::new()));
+        assert!(!queue.replace(vec![named("c")]));
+        let (round, _) = queue.next().unwrap();
+        queue.settle(round, &[open("c")]);
+        assert!(queue.next().is_none() && !queue.running);
+        assert!(
+            queue.replace(vec![named("d")]),
+            "ended: the next starts one"
+        );
+    }
+
     /// Failure mode: a row that showed "Keyring locked" (a locked or busy
     /// keyring) kept it after the keyring opened, until a Refresh.
     #[test]
@@ -468,7 +567,8 @@ mod tests {
             let mut remote = server();
             remote.transport = "http".into();
             remote.url = Some("http://127.0.0.1:1/mcp".into());
-            let locked = std::sync::Mutex::new(vec![remote]);
+            let locked = std::sync::Mutex::new(LockedRecheck::new());
+            assert!(locked.lock().unwrap().replace(vec![remote]));
             let (sender, results) = std::sync::mpsc::channel();
             let sender = std::sync::Mutex::new(sender);
             std::thread::scope(|scope| {
@@ -489,7 +589,8 @@ mod tests {
                 assert_eq!(result.server_id, "probe");
                 assert!(!result.keyring_locked, "{result:?}");
             });
-            assert!(locked.lock().unwrap().is_empty());
+            let queue = locked.lock().unwrap();
+            assert!(queue.servers.is_empty() && !queue.running);
         });
     }
 

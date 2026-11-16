@@ -1348,7 +1348,8 @@ async fn probe_servers(
 
 /// Servers whose last check found the keyring locked, for
 /// [`crate::server_runtime::recheck_locked_once_open`].
-static LOCKED_SERVERS: Mutex<Vec<crate::registry::ServerEntry>> = Mutex::new(Vec::new());
+static LOCKED_SERVERS: Mutex<crate::server_runtime::LockedRecheck> =
+    Mutex::new(crate::server_runtime::LockedRecheck::new());
 
 /// A row shows "Keyring locked" until something checks it again, and the
 /// keyring may only have been busy: check those rows again (never asking) on
@@ -1358,25 +1359,24 @@ fn recheck_locked_servers(
     servers: &[crate::registry::ServerEntry],
     results: &[ProbeResult],
 ) {
-    let mut locked = LOCKED_SERVERS
+    let locked = servers
+        .iter()
+        .filter(|server| {
+            results
+                .iter()
+                .any(|result| result.server_id == server.id && result.keyring_locked)
+        })
+        .cloned()
+        .collect();
+    let start = LOCKED_SERVERS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let idle = locked.is_empty();
-    // A round checks every enabled server: its locked ones are the list.
-    locked.clear();
-    for server in servers {
-        if results
-            .iter()
-            .any(|result| result.server_id == server.id && result.keyring_locked)
-        {
-            locked.push(server.clone());
-        }
-    }
-    if !idle || locked.is_empty() {
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .replace(locked);
+    if !start {
         return;
     }
     let app = app.clone();
-    let _ = std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("toolport-locked-recheck".into())
         .spawn(move || {
             crate::server_runtime::recheck_locked_once_open(
@@ -1387,6 +1387,12 @@ fn recheck_locked_servers(
                 },
             )
         });
+    if spawned.is_err() {
+        LOCKED_SERVERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stopped();
+    }
 }
 
 /// List the tools one server exposes (raw MCP tool objects: name, description,
@@ -3873,6 +3879,8 @@ fn restore_saved_http_bridge(state: &HttpBridgeState, may_prompt: bool) -> Resul
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let registry = registry::load()?;
     if !registry.http_bridge_enabled {
+        // Turned off between an attempt and its wait: no wait left to show.
+        crate::http_bridge::mark_waiting(state, false);
         return Ok(false);
     }
     if crate::http_bridge::status(state).running {
@@ -5341,6 +5349,23 @@ mod tests {
                 Some("minted-test-token")
             );
             crate::http_bridge::mark_waiting(&state, false);
+        });
+    }
+
+    /// Failure mode: a Stop between a failed attempt and its wait left the
+    /// wait set with the setting off; the desktop restore read that as held,
+    /// so it showed "Keyring locked" and polled for good.
+    #[test]
+    fn a_desktop_restore_that_finds_it_off_clears_the_wait() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            registry::save(&Registry::default()).unwrap();
+            let state = HttpBridgeState::default();
+            crate::http_bridge::mark_waiting(&state, true);
+            assert_eq!(
+                restore_http_bridge_once(&state),
+                crate::http_bridge::Restore::Off
+            );
+            assert!(!crate::http_bridge::status(&state).keyring_locked);
         });
     }
 
