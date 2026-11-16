@@ -67,7 +67,10 @@ fn main() {
         for (k, v) in &set {
             secret_redact::register("bench", k, v);
         }
-        std::thread::sleep(Duration::from_millis(200) + build * 3);
+        assert!(
+            secret_redact::wait_for_main_build(Duration::from_secs(120)),
+            "the warm-up build did not finish"
+        );
         let stop = Arc::new(AtomicBool::new(false));
         let worst = Arc::new(AtomicU64::new(0));
         let reader = {
@@ -89,8 +92,12 @@ fn main() {
             secret_redact::redact_text("got sk-one-more-registered-value-9QzX")
                 .contains("[secret:ONE_MORE]")
         );
-        // Span the background rebuild this registration started.
-        std::thread::sleep(Duration::from_millis(100) + build * 3);
+        // Span the background rebuild this registration started: until it has
+        // finished, not for a guessed time.
+        assert!(
+            secret_redact::wait_for_main_build(Duration::from_secs(120)),
+            "the rebuild did not finish"
+        );
         stop.store(true, Ordering::Relaxed);
         reader.join().unwrap();
         println!(
