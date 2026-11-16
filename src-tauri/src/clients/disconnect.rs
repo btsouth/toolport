@@ -477,6 +477,70 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&registry).unwrap(), "broken");
     }
 
+    /// Greptile P1 on #1370: with a corrupt registry, purge restores from the client's own
+    /// records. An edited Toolport entry takes the merge path, which asks the registry
+    /// whether the entry is v1's; a registry it can't read proves nothing, so the restore
+    /// goes on: the moved server comes back and the edited entry stays.
+    #[test]
+    fn purge_with_a_corrupt_registry_restores_a_client_whose_entry_was_edited() {
+        let env = crate::registry::DataDirTestEnv::new("purge_corrupt_registry_edited_entry");
+        let _env_lock = env_test_lock();
+        let path = env.dir.join("client.json");
+        std::fs::write(&path, r#"{"mcpServers":{"native":{"command":"native"}}}"#).unwrap();
+        let entry: ServerEntry = serde_json::from_value(serde_json::json!({"id":"toolport", "name":"toolport", "transport":"stdio", "command":"/fixture/toolport-gateway"})).unwrap();
+        mutation::run("claude-code", &path, Format::JsonMcpServers, || {
+            moved::record("claude-code", Format::JsonMcpServers, &path)?;
+            write_format(
+                Format::JsonMcpServers,
+                &path,
+                std::slice::from_ref(&entry),
+                true,
+            )
+        })
+        .unwrap();
+        let mut edited = parse_json_value(&read_config_file(&path).unwrap()).unwrap();
+        assert!(edited["mcpServers"].get("native").is_none());
+        edited["mcpServers"]["toolport"]["args"] = serde_json::json!(["--custom"]);
+        std::fs::write(&path, edited.to_string()).unwrap();
+        let registry = env.dir.join("registry.json");
+        std::fs::write(&registry, "broken").unwrap();
+        let servers = parse_client_content(
+            Format::JsonMcpServers,
+            &std::fs::read_to_string(&path).unwrap(),
+        )
+        .unwrap();
+        let client = DetectedClient {
+            id: "claude-code".into(),
+            name: "Claude Code".into(),
+            uses_connectors: false,
+            discovery: discovery::capabilities("claude-code"),
+            config_path: path.to_string_lossy().into_owned(),
+            config_exists: true,
+            app_present: true,
+            servers,
+            plugin_servers: Vec::new(),
+            gateway_installed: true,
+            entry_state: GatewayEntryState::Customized,
+            error: None,
+            claude_profile: None,
+            t3_code: Vec::new(),
+            location_removable: false,
+            location_kept_by_t3_code: false,
+        };
+        let results = all_with_clients(false, true, || vec![client]).unwrap();
+        assert!(results.iter().all(|row| row.error.is_none()), "{results:?}");
+        let after = parse_json_value(&read_config_file(&path).unwrap()).unwrap();
+        assert_eq!(
+            after["mcpServers"]["native"],
+            serde_json::json!({"command": "native"})
+        );
+        assert_eq!(
+            after["mcpServers"]["toolport"]["args"],
+            serde_json::json!(["--custom"])
+        );
+        assert_eq!(std::fs::read_to_string(&registry).unwrap(), "broken");
+    }
+
     #[test]
     fn purge_corrupt_registry_snapshot_restore_preserves_native_bytes() {
         let env = crate::registry::DataDirTestEnv::new("purge_global_disconnect");

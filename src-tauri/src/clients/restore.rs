@@ -618,33 +618,89 @@ pub(super) fn check_legacy_gateway(
     Ok(())
 }
 
-/// The name of Toolport's entry in `text` when it is one v1.24.x wrote for its Shared
-/// HTTP connection: a URL entry or the `npx mcp-remote` bridge, which no 2.x build writes,
-/// matching the Shared HTTP record v1 kept in the registry. An entry that differs from
-/// that record is a hand edit and gets `None`.
-fn legacy_shared_http_entry(
+/// The whole entry v1.24.x wrote for `client_id`'s Shared HTTP connection, rebuilt from
+/// the record v1 kept in the registry. The bearer v1 never stored is taken from
+/// `current`, and only from the one place v1 put it. `None` for a record or client v1 did
+/// not write this way: such an entry is never proved to be Toolport's.
+fn v1_shared_http_entry(
     client_id: &str,
     format: Format,
-    text: &str,
-) -> Result<Option<String>, String> {
-    let servers = parse_client_content(format, text)?;
-    let Some(name) =
-        owned_gateway_name(servers.iter().map(|server| server.name.as_str())).map(str::to_owned)
-    else {
-        return Ok(None);
+    record: &ManagedEntry,
+    current: &Value,
+) -> Option<Value> {
+    if !record.transport.eq_ignore_ascii_case("sharedHttp") {
+        return None;
+    }
+    let url = record.url.as_deref()?;
+    let bearer = |value: Option<&Value>, prefix: &str| {
+        value
+            .and_then(Value::as_str)
+            .filter(|value| {
+                value
+                    .strip_prefix(prefix)
+                    .is_some_and(|token| !token.trim().is_empty())
+            })
+            .map(str::to_owned)
     };
-    let registry = crate::registry_controller::registry_for_disconnect()?;
-    let Some(record) = registry
-        .client_managed_entries
-        .get(client_id)
-        .filter(|record| record.transport.eq_ignore_ascii_case("sharedHttp"))
-    else {
-        return Ok(None);
-    };
-    Ok(servers
+    if record.command == "npx" {
+        // `npx -y mcp-remote URL --header "Authorization: Bearer T"`, nothing else, for
+        // the clients v1 bridged (`client_uses_mcp_remote_bridge`).
+        let bridged = matches!(
+            format,
+            Format::JsonMcpServers | Format::JsonCursorMcpServers | Format::TomlMcpServers
+        ) && client_id != "devin-cli";
+        if !bridged || !record.env.is_empty() || record.args != ["-y", "mcp-remote", url] {
+            return None;
+        }
+        let auth = bearer(current.get("args")?.get(4), "Authorization: Bearer ")?;
+        return Some(serde_json::json!({
+            "command": "npx",
+            "args": ["-y", "mcp-remote", url, "--header", auth],
+        }));
+    }
+    if !record.command.is_empty() || !record.args.is_empty() {
+        return None;
+    }
+    let mut headers: serde_json::Map<String, Value> = record
+        .env
         .iter()
-        .any(|server| server.name == name && managed_matches_detected(server, record))
-        .then_some(name))
+        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+        .collect();
+    let auth = bearer(current.get("headers")?.get("Authorization"), "Bearer ")?;
+    headers.insert("Authorization".into(), Value::String(auth));
+    Some(match format {
+        // entry_to_json's native remote, for Devin CLI and VS Code's `servers`.
+        Format::JsonMcpServers if client_id == "devin-cli" => {
+            serde_json::json!({"url": url, "type": "http", "headers": headers})
+        }
+        Format::JsonServers => serde_json::json!({"url": url, "type": "http", "headers": headers}),
+        Format::JsonCopilotMcpServers => {
+            serde_json::json!({"url": url, "type": "http", "headers": headers, "tools": ["*"]})
+        }
+        Format::JsonOpenCodeMcp => {
+            serde_json::json!({"enabled": true, "type": "remote", "url": url, "headers": headers})
+        }
+        _ => return None,
+    })
+}
+
+/// The name of Toolport's entry in `text` when that whole entry, every field, is the one
+/// v1.24.x wrote for this client's Shared HTTP connection from the record v1 kept in the
+/// registry. Anything else, including an unreadable registry or file, proves nothing and
+/// gets `None`, so the entry is kept as the user's.
+fn legacy_shared_http_entry(client_id: &str, format: Format, text: &str) -> Option<String> {
+    let root = mutation::value(format, Some(text)).ok()?;
+    let mut servers = root.get(key(format))?;
+    if let Some(inner) = nested_in(format, &root) {
+        servers = servers.get(inner)?;
+    }
+    let servers = servers.as_object()?;
+    let name = owned_gateway_name(servers.keys().map(String::as_str))?;
+    let entry = servers.get(name)?;
+    let registry = crate::registry_controller::registry_for_disconnect().ok()?;
+    let record = registry.client_managed_entries.get(client_id)?;
+    (v1_shared_http_entry(client_id, format, record, entry).as_ref() == Some(entry))
+        .then(|| name.to_owned())
 }
 
 /// After a 2.x Connect, a v1 Shared HTTP Connect and then this upgrade, v1's entry
@@ -677,7 +733,7 @@ fn adopt_legacy_shared_http(
     if !changed {
         return Ok(());
     }
-    let Some(name) = legacy_shared_http_entry(client_id, format, text)? else {
+    let Some(name) = legacy_shared_http_entry(client_id, format, text) else {
         return Ok(());
     };
     match written.get(&name) {
@@ -750,9 +806,7 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
     let legacy_since_disconnect = record.disconnected
         && current
             .as_deref()
-            .map(|text| legacy_shared_http_entry(client_id, format, text))
-            .transpose()?
-            .flatten()
+            .and_then(|text| legacy_shared_http_entry(client_id, format, text))
             .is_some();
     if record.disconnected
         && record.original.is_none()

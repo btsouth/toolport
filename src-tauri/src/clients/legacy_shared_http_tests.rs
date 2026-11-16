@@ -65,17 +65,12 @@ fn original_text(id: &str) -> String {
 fn with_legacy(id: &str, entry: &serde_json::Value) -> String {
     match servers_key(id) {
         None => {
-            let args = entry["args"]
-                .as_array()
+            let mut root: toml::Table = original_text(id).parse().unwrap();
+            root["mcp_servers"]
+                .as_table_mut()
                 .unwrap()
-                .iter()
-                .map(|arg| format!("{:?}", arg.as_str().unwrap()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "{}\n[mcp_servers.toolport]\ncommand = \"npx\"\nargs = [{args}]\n",
-                original_text(id)
-            )
+                .insert("toolport".into(), toml::Value::try_from(entry).unwrap());
+            toml::to_string(&root).unwrap()
         }
         Some(key) => {
             let mut root: serde_json::Value = serde_json::from_str(&original_text(id)).unwrap();
@@ -83,6 +78,68 @@ fn with_legacy(id: &str, entry: &serde_json::Value) -> String {
             serde_json::to_string_pretty(&root).unwrap()
         }
     }
+}
+
+fn is_bridge(id: &str) -> bool {
+    !matches!(
+        id,
+        "devin-cli" | "vscode" | "github-copilot-cli" | "opencode"
+    )
+}
+
+type Edit = (&'static str, fn(&mut serde_json::Value));
+
+/// Hand edits of v1's entry for `id`: the URL, a field no record keeps (added or
+/// changed), and every field v1 wrote for that shape.
+fn edits(id: &str) -> Vec<Edit> {
+    let mut edits: Vec<Edit> = vec![
+        ("url", |entry| {
+            let url = "http://127.0.0.1:9999/mcp";
+            match entry.get_mut("args") {
+                Some(args) => args[2] = url.into(),
+                None => entry["url"] = url.into(),
+            }
+        }),
+        ("an added field", |entry| entry["timeout"] = 30.into()),
+    ];
+    if is_bridge(id) {
+        edits.push(("an added argument", |entry| {
+            entry["args"].as_array_mut().unwrap().push("--debug".into())
+        }));
+        edits.push(("an added header argument", |entry| {
+            let args = entry["args"].as_array_mut().unwrap();
+            args.push("--header".into());
+            args.push("X-Team: tools".into());
+        }));
+        edits.push(("added env", |entry| {
+            entry["env"] = serde_json::json!({"DEBUG": "1"})
+        }));
+        edits.push(("the command", |entry| entry["command"] = "bunx".into()));
+    } else {
+        edits.push(("an added header", |entry| {
+            entry["headers"]["X-Team"] = "tools".into()
+        }));
+        edits.push(("a removed header", |entry| {
+            entry["headers"]
+                .as_object_mut()
+                .unwrap()
+                .remove("TOOLPORT_CLIENT_ID");
+        }));
+        edits.push(("the type", |entry| entry["type"] = "sse".into()));
+    }
+    match id {
+        "github-copilot-cli" => {
+            edits.push(("tools", |entry| {
+                entry["tools"] = serde_json::json!(["read_file"])
+            }));
+            edits.push(("tools removed", |entry| {
+                entry.as_object_mut().unwrap().remove("tools");
+            }));
+        }
+        "opencode" => edits.push(("enabled", |entry| entry["enabled"] = false.into())),
+        _ => {}
+    }
+    edits
 }
 
 fn same_config(id: &str, left: &str, right: &str) -> bool {
@@ -121,15 +178,26 @@ enum Before {
 
 const BEFORE: [Before; 3] = [Before::Nothing, Before::Connected, Before::Disconnected];
 
-/// Runs one client. `edited` changes v1's URL by hand.
+/// How the test disconnects: the client's own Disconnect, or Remove from all clients.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Via {
+    Disconnect,
+    RemoveFromAll,
+}
+
+/// Runs one client. `edit` changes v1's entry by hand before Disconnect.
 fn disconnect_legacy(
     id: &str,
     before: Before,
-    edited: bool,
-) -> (String, Result<WriteOutcome, String>) {
+    edit: Option<fn(&mut serde_json::Value)>,
+    via: Via,
+) -> (String, String, Result<Vec<String>, String>) {
     let data = crate::registry::DataDirTestEnv::new(&format!("f20-{id}"));
     let _env_lock = env_test_lock();
     let _client_env = isolated_client_env(&data.dir);
+    // Remove from all clients revokes a Shared HTTP token through the secrets store;
+    // the file backend keeps that inside the test data directory.
+    let _secrets = EnvRestore::set("TOOLPORT_SECRET_KEY", Path::new("f20-test-key"));
     let home = data.dir.join("home");
     std::fs::create_dir_all(&home).unwrap();
     let _home = TestHome::set(&home);
@@ -153,27 +221,36 @@ fn disconnect_legacy(
             &original_text(id)
         ));
     }
-    let (entry, record) = legacy_entry(
-        id,
-        if edited {
-            "http://127.0.0.1:9999/mcp"
-        } else {
-            URL
-        },
-    );
-    std::fs::write(&path, with_legacy(id, &entry)).unwrap();
+    let (mut entry, record) = legacy_entry(id, URL);
+    if let Some(edit) = edit {
+        edit(&mut entry);
+    }
+    let written = with_legacy(id, &entry);
+    std::fs::write(&path, &written).unwrap();
     crate::registry::update(|registry| {
         registry.set_client_managed_entry(id, record);
         Ok(())
     })
     .unwrap();
-    let outcome = uninstall_gateway(id);
-    (read_config_file(&path).unwrap(), outcome)
+    let outcome = match via {
+        Via::Disconnect => uninstall_gateway(id).map(|outcome| outcome.warnings),
+        Via::RemoveFromAll => {
+            let rows = disconnect_all(false).unwrap();
+            let row = rows
+                .into_iter()
+                .find(|row| row.client_id == id)
+                .unwrap_or_else(|| panic!("{id}: Remove from all clients skipped it"));
+            match row.error {
+                Some(error) => Err(error),
+                None => Ok(row.warnings),
+            }
+        }
+    };
+    (read_config_file(&path).unwrap(), written, outcome)
 }
 
-fn kept_as_edited(outcome: &WriteOutcome) -> bool {
-    outcome
-        .warnings
+fn kept_as_edited(warnings: &[String]) -> bool {
+    warnings
         .iter()
         .any(|warning| warning.contains("kept the toolport entry you edited"))
 }
@@ -182,38 +259,68 @@ fn kept_as_edited(outcome: &WriteOutcome) -> bool {
 fn disconnect_removes_each_v1_shared_http_shape_and_restores_the_original() {
     for id in CLIENTS {
         for before in BEFORE {
-            let (after, outcome) = disconnect_legacy(id, before, false);
-            let outcome = outcome.unwrap_or_else(|error| panic!("{id}: {error}"));
+            let (after, _, outcome) = disconnect_legacy(id, before, None, Via::Disconnect);
+            let warnings = outcome.unwrap_or_else(|error| panic!("{id}: {error}"));
             assert!(
                 same_config(id, &after, &original_text(id)),
                 "{id} ({before:?}) left:\n{after}"
             );
-            assert!(!kept_as_edited(&outcome), "{id}: {:?}", outcome.warnings);
+            assert!(!kept_as_edited(&warnings), "{id}: {warnings:?}");
         }
     }
 }
 
+/// Greptile P1 on #1370: the match must cover the whole entry. Each field v1 wrote, and
+/// one it never wrote, changed by hand keeps the entry when Disconnect has a 2.x record
+/// to undo against (the adoption paths). Without a record the old ownership check runs
+/// unchanged, so only the URL edit is checked there.
 #[test]
 fn a_v1_shared_http_entry_edited_by_hand_is_kept_and_reported() {
     for id in CLIENTS {
-        for before in BEFORE {
-            let (entry, _) = legacy_entry(id, "http://127.0.0.1:9999/mcp");
-            let expected = with_legacy(id, &entry);
-            let (after, outcome) = disconnect_legacy(id, before, true);
-            assert!(
-                same_config(id, &after, &expected),
-                "{id} ({before:?}) changed:\n{after}"
-            );
-            match outcome {
-                Ok(outcome) => {
-                    assert!(kept_as_edited(&outcome), "{id}: {:?}", outcome.warnings)
+        for (what, edit) in edits(id) {
+            for before in BEFORE {
+                if before == Before::Nothing && what != "url" {
+                    continue;
                 }
-                // Without a record of its own, Disconnect refuses and changes nothing.
-                Err(error) => assert!(
-                    before != Before::Connected && error.contains("customized legacy gateway"),
-                    "{id}: {error}"
-                ),
+                let (after, written, outcome) =
+                    disconnect_legacy(id, before, Some(edit), Via::Disconnect);
+                assert!(
+                    same_config(id, &after, &written),
+                    "{id}, {what} ({before:?}) changed:\n{after}"
+                );
+                match outcome {
+                    Ok(warnings) => {
+                        assert!(kept_as_edited(&warnings), "{id}, {what}: {warnings:?}")
+                    }
+                    // Without a record of its own, Disconnect refuses and changes nothing.
+                    Err(error) => assert!(
+                        before == Before::Nothing && error.contains("customized legacy gateway"),
+                        "{id}, {what} ({before:?}): {error}"
+                    ),
+                }
             }
         }
+    }
+}
+
+/// Remove from all clients goes through the same restore: v1's entry is removed and the
+/// original put back; an edited one is kept and reported.
+#[test]
+fn remove_from_all_clients_removes_v1_entries_and_keeps_edited_ones() {
+    for id in CLIENTS {
+        let (after, _, outcome) =
+            disconnect_legacy(id, Before::Connected, None, Via::RemoveFromAll);
+        let warnings = outcome.unwrap_or_else(|error| panic!("{id}: {error}"));
+        assert!(
+            same_config(id, &after, &original_text(id)),
+            "{id} left:\n{after}"
+        );
+        assert!(!kept_as_edited(&warnings), "{id}: {warnings:?}");
+        let (_, edit) = edits(id)[1];
+        let (after, written, outcome) =
+            disconnect_legacy(id, Before::Connected, Some(edit), Via::RemoveFromAll);
+        assert!(same_config(id, &after, &written), "{id} changed:\n{after}");
+        let warnings = outcome.unwrap_or_else(|error| panic!("{id}: {error}"));
+        assert!(kept_as_edited(&warnings), "{id}: {warnings:?}");
     }
 }
