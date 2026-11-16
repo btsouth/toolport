@@ -130,7 +130,7 @@ describe("RegistryServerRow status accessibility", () => {
     ["Checking connection", true, undefined],
     ["Ready, 2 tools", true, health({ ok: true, toolCount: 2 })],
     ["Needs sign-in", true, health({ authRequired: true })],
-    ["connection refused", true, health({ error: "connection refused" })],
+    ["Connection failed", true, health({ error: "connection refused" })],
   ] as const)("announces %s", (label, enabled, result) => {
     const view = renderRow(enabled, result);
 

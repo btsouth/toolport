@@ -516,10 +516,14 @@ it("shows a migrated default without rewriting the client and explicitly applies
     />,
   );
   expect(screen.getByRole("combobox", { name: "Access" })).toHaveTextContent(
-    /^Default access$/,
+    /^Default access \(from Settings\)$/,
   );
   expect(installGateway).not.toHaveBeenCalled();
   await userEvent.click(screen.getByRole("combobox", { name: "Access" }));
+  // The default and the set named "Default" read as two different choices.
+  expect(
+    (await screen.findAllByRole("option")).map((option) => option.textContent),
+  ).toEqual(["Default access (from Settings)", "All enabled servers", "Default"]);
   await userEvent.click(
     await screen.findByRole("option", { name: "All enabled servers" }),
   );

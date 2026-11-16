@@ -333,6 +333,10 @@ pub(super) fn update_server_log(page: &ServerPage, server_id: &str, error: Optio
     }
 }
 
+/// Room on a dropdown's button before its label ends in "…": enough for the
+/// longest translation of "Default access (from Settings)".
+const DROPDOWN_LABEL_CHARS: i32 = 40;
+
 fn bound_dropdown(control: &gtk::DropDown) {
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(|_, item| {
@@ -340,7 +344,7 @@ fn bound_dropdown(control: &gtk::DropDown) {
         item.set_child(Some(
             &gtk::Label::builder()
                 .ellipsize(gtk::pango::EllipsizeMode::End)
-                .max_width_chars(24)
+                .max_width_chars(DROPDOWN_LABEL_CHARS)
                 .xalign(0.0)
                 .build(),
         ));
@@ -353,6 +357,40 @@ fn bound_dropdown(control: &gtk::DropDown) {
         label.set_tooltip_text(Some(&value.string()));
     });
     control.set_factory(Some(&factory));
+    control.set_list_factory(Some(&checked_list_factory()));
+}
+
+/// The open list of a dropdown with its own button factory: each choice in full,
+/// with a check mark on the current one, as GTK's default list and the Language
+/// dropdown show.
+pub(super) fn checked_list_factory() -> gtk::SignalListItemFactory {
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup(|_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let label = gtk::Label::builder().xalign(0.0).hexpand(true).build();
+        client_rows::wrap_row_text(&label);
+        let check = gtk::Image::from_icon_name("object-select-symbolic");
+        row.append(&label);
+        row.append(&check);
+        item.set_child(Some(&row));
+        let shown = check.downgrade();
+        item.connect_selected_notify(move |item| {
+            if let Some(check) = shown.upgrade() {
+                check.set_opacity(if item.is_selected() { 1.0 } else { 0.0 });
+            }
+        });
+    });
+    factory.connect_bind(|_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+        let row = item.child().unwrap();
+        let label = row.first_child().and_downcast::<gtk::Label>().unwrap();
+        let check = row.last_child().unwrap();
+        let value = item.item().and_downcast::<gtk::StringObject>().unwrap();
+        label.set_label(&value.string());
+        check.set_opacity(if item.is_selected() { 1.0 } else { 0.0 });
+    });
+    factory
 }
 
 pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
@@ -374,7 +412,9 @@ pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
     } else if let Some(profile) = &client.claude_profile {
         info.append(&text(&profile.folder, true));
     }
-    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    // Flows onto more lines in a narrow window, so the access menu keeps its
+    // label instead of being squeezed to "Default access (from Sett…".
+    let actions = page_header::ActionFlow::new();
     actions.set_valign(gtk::Align::Center);
     let connected = client.gateway_state == state::ClientGatewayState::Connected;
     let customized = client.gateway_state == state::ClientGatewayState::Customized;
@@ -1049,6 +1089,27 @@ fn review_imports(page: &ClientPage, keys: Vec<ImportSelection>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dropdown_buttons_fit_every_translation_of_the_default_access_choice() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/locales/connections");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let strings: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let label = strings["Default access (from Settings)"].as_str().unwrap();
+            let chars = i32::try_from(label.chars().count()).unwrap();
+            assert!(
+                chars <= super::DROPDOWN_LABEL_CHARS,
+                "{}: \"{label}\" is cut to \"…\"",
+                path.display()
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 9);
+    }
+
     use super::*;
     #[test]
     fn b5_import_selection_rejects_other_profiles_and_changed_definitions() {
@@ -1287,11 +1348,21 @@ mod tests {
         );
         let active = page.details.stack.child_by_name("detail").unwrap();
         let controls = widgets(&active);
-        assert!(controls
+        let connect = controls
             .iter()
             .filter_map(|w| w.downcast_ref::<gtk::Button>())
             .find(|b| b.label().as_deref() == Some("Connect to Toolport"))
-            .is_some_and(|b| !b.is_sensitive()));
+            .unwrap();
+        assert!(!connect.is_sensitive());
+        // The access controls wrap rather than needing all of their width on one line.
+        let row = connect.parent().unwrap();
+        let mut needed = 0;
+        let mut child = row.first_child();
+        while let Some(widget) = child {
+            needed += widget.measure(gtk::Orientation::Horizontal, -1).0;
+            child = widget.next_sibling();
+        }
+        assert!(row.measure(gtk::Orientation::Horizontal, -1).0 < needed);
         assert!(controls
             .iter()
             .filter_map(|w| w.downcast_ref::<gtk::DropDown>())

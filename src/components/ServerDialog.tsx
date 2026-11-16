@@ -1,5 +1,6 @@
 import { translate, useI18n, Trans } from "@/lib/i18n";
 import { envRowSyncs } from "@/lib/envRowSyncs";
+import { errorHeadline } from "@/lib/errors";
 import { secretReferenceReview } from "@/lib/secretRefs";
 import { SecretReferenceField } from "@/components/SecretReferenceField";
 import { useRef, useState, type ReactNode } from "react";
@@ -458,7 +459,9 @@ export function ServerDialog({
             ? t("Reachable, but needs credentials: {value1}", {
                 value1: r.error || t("Authentication required"),
               })
-            : (r.error ?? t("Couldn't connect.")),
+            : r.error
+              ? t("Connection failed: {value0}", { value0: errorHeadline(r.error) })
+              : t("Couldn't connect."),
         });
       }
     } catch (e) {

@@ -119,11 +119,13 @@ fn ago(timestamp_ms: u64) -> String {
     )
 }
 
-/// The one-line detail under a client's name, and the fuller text for its tooltip.
+/// The detail under a client's name, and what its tooltip adds to it (empty for none).
 fn client_detail(client: &state::ClientView, style: RowStyle) -> (String, String) {
     if client.config_error {
-        let text = crate::i18n::tr("Configuration could not be read safely");
-        return (text.clone(), text);
+        return (
+            crate::i18n::tr("Configuration could not be read safely"),
+            String::new(),
+        );
     }
     let connected = client.gateway_state == state::ClientGatewayState::Connected;
     let mut parts = Vec::new();
@@ -182,11 +184,13 @@ fn client_detail(client: &state::ClientView, style: RowStyle) -> (String, String
         tooltip.push(full);
     }
     let text = parts.join(" · ");
-    let tooltip = if tooltip.is_empty() {
-        text.clone()
-    } else {
-        format!("{text}\n{}", tooltip.join("\n"))
-    };
+    // Only what the line does not already say: a tooltip that repeats the
+    // visible text is noise (it wraps, so nothing is cut off).
+    let tooltip = tooltip
+        .into_iter()
+        .filter(|full| !text.contains(full.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
     (text, tooltip)
 }
 
@@ -218,7 +222,7 @@ pub(super) fn status_badge(client: &state::ClientView) -> gtk::Label {
 }
 
 /// The width a row's logo and text keep before its controls wrap below them.
-const ROW_MIN_TEXT: i32 = 220;
+pub(super) const ROW_MIN_TEXT: i32 = 220;
 
 /// "Used by T3 Code: Work, Personal (off)": every T3 Code instance that runs this client.
 /// "T3 Code" is a product name and stays as is in every language.
@@ -264,6 +268,9 @@ pub(super) fn wrap_row_text(label: &gtk::Label) {
     label.set_single_line_mode(false);
     label.set_wrap(true);
     label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    // Ask for one line's width: by default a WordChar label asks for its
+    // minimum, so a chip got split ("Unrea-chable") with room to spare.
+    label.set_natural_wrap_mode(gtk::NaturalWrapMode::None);
     label.set_xalign(0.0);
     if label.has_css_class("toolport-badge") {
         // A pill on one line, a rounded box over several.
@@ -788,6 +795,25 @@ mod caption_tests {
         let (text, _) = client_detail(&client, RowStyle::Line);
         assert!(text.contains("3 other servers"), "{text}");
         assert!(!text.contains("to import"), "{text}");
+        // A tooltip only says what the line does not: Auto's summary is the
+        // whole sentence, so it gets none; the other modes add the Full note.
+        client.id = "claude-code".into();
+        client.discovery_mode = Some("auto".into());
+        let (text, tooltip) = client_detail(&client, RowStyle::Line);
+        assert!(text.contains("Auto: "), "{text}");
+        assert_eq!(tooltip, "", "{text}");
+        client.discovery_mode = Some("lazy".into());
+        let (text, tooltip) = client_detail(&client, RowStyle::Line);
+        assert!(
+            !tooltip.is_empty() && !text.contains(&tooltip),
+            "{text} / {tooltip}"
+        );
+        assert!(tooltip.contains("Full mode"), "{tooltip}");
+        // A line with nothing more to say has no tooltip.
+        client.gateway_state = state::ClientGatewayState::Disconnected;
+        assert_eq!(client_detail(&client, RowStyle::Line).1, "");
+        client.config_error = true;
+        assert_eq!(client_detail(&client, RowStyle::Line).1, "");
     }
 }
 

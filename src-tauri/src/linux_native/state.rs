@@ -522,8 +522,10 @@ fn default_access_display_label(registry: &Registry) -> String {
         .and_then(|id| registry.profiles.iter().find(|profile| profile.id == id))
         .map(|profile| profile.name.as_str())
         .filter(|name| !name.trim().eq_ignore_ascii_case("default"));
+    // "Default access" next to a set named "Default" reads as the same
+    // choice, so the unnamed label says where the default comes from.
     name.map(|name| trf("Default access ({name})", &[("name", name)]))
-        .unwrap_or_else(|| tr("Default access"))
+        .unwrap_or_else(|| tr("Default access (from Settings)"))
 }
 
 fn client_access_label(registry: &Registry, scope: Option<&str>) -> String {
@@ -1161,18 +1163,28 @@ mod tests {
     #[test]
     fn client_access_labels_show_migrated_default_all_and_missing_sets() {
         let mut registry = Registry::default();
-        assert_eq!(client_access_label(&registry, None), "Default access");
+        assert_eq!(
+            client_access_label(&registry, None),
+            "Default access (from Settings)"
+        );
         registry.default_access_profile_id = Some("default".into());
-        // The migrated set is named "Default", which would only repeat itself.
-        assert_eq!(client_access_label(&registry, None), "Default access");
+        // The migrated set is named "Default": "Default access" beside it would
+        // read as the same choice, so the label says where it comes from.
+        assert_eq!(
+            client_access_label(&registry, None),
+            "Default access (from Settings)"
+        );
         let options = client_access_options(&registry);
         assert_eq!(options[0].id, "");
-        assert_eq!(options[0].name, "Default access");
+        assert_eq!(options[0].name, "Default access (from Settings)");
         assert_eq!(options[1].id, "@all-enabled");
         registry.default_access_profile_id = None;
         registry.default_access_context_id = Some("default".into());
         registry.default_access_legacy_policy = true;
-        assert_eq!(client_access_label(&registry, Some("")), "Default access");
+        assert_eq!(
+            client_access_label(&registry, Some("")),
+            "Default access (from Settings)"
+        );
         assert_eq!(
             client_access_label(&registry, Some(crate::registry::ALL_ENABLED_ACCESS)),
             "All enabled servers"

@@ -1,6 +1,5 @@
 import { translate } from "./i18n";
 import type { ProbeResult } from "./types";
-import { errorHeadline } from "./errors";
 
 export function serverFailureLabel(health: ProbeResult): string {
   if (health.authRequired)
@@ -27,7 +26,15 @@ export function serverFailureLabel(health: ProbeResult): string {
       return translate("Rate limited");
     case "cancelled":
       return translate("Check cancelled");
-    default:
-      return health.error ? errorHeadline(health.error) : translate("Connection failed");
+    default: {
+      // Older and local launch errors carry no transport code. Short words, as
+      // the GTK app's failure_label gives; the full headline is in the tooltip.
+      const raw = health.error ?? "";
+      if (raw.includes("exited") || raw.includes("EOF") || raw.includes("closed stdout"))
+        return translate("Server stopped");
+      if (raw.includes("No such file") || raw.includes("not found"))
+        return translate("Command or file not found");
+      return translate("Connection failed");
+    }
   }
 }
