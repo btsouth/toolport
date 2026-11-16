@@ -4031,7 +4031,7 @@ fn client_reset_label(client: &state::ClientView) -> &'static str {
     if client.legacy_bearer_argv {
         crate::i18n::msg("Migrate to stdio")
     } else {
-        crate::i18n::msg("Reset and connect")
+        crate::i18n::msg("Reset to default")
     }
 }
 
@@ -4046,13 +4046,13 @@ fn confirm_client_reset(client: &state::ClientView, button: gtk::Button, page: C
         return;
     };
     #[allow(deprecated)]
-    let dialog = adw::MessageDialog::new(Some(&parent), Some(&crate::i18n::trf(if client.legacy_bearer_argv { crate::i18n::msg("Migrate {value1}'s Toolport entry?") } else { crate::i18n::msg("Reset {value1}'s Toolport entry?") }, &[("value1", &client.name.to_string())])), Some(&crate::i18n::tr("Toolport backs up the config before replacing its gateway entry with the standard stdio command. Customized commands, arguments and headers will be replaced; review those changes before confirming. Other client settings and MCP servers are preserved. Restart the client afterward.")));
+    let dialog = adw::MessageDialog::new(Some(&parent), Some(&crate::i18n::trf(if client.legacy_bearer_argv { crate::i18n::msg("Migrate {value1}'s Toolport entry?") } else { crate::i18n::msg("Reset {value1} to the default Toolport gateway?") }, &[("value1", &client.name.to_string())])), Some(&crate::i18n::tr("Toolport backs up the config before replacing its gateway entry with the standard stdio command. Customized commands, arguments and headers will be replaced; review those changes before confirming. Other client settings and MCP servers are preserved. Restart the client afterward.")));
     l10n::bind_formatted_dialog_heading(
         &dialog,
         if client.legacy_bearer_argv {
             crate::i18n::msg("Migrate {value1}'s Toolport entry?")
         } else {
-            crate::i18n::msg("Reset {value1}'s Toolport entry?")
+            crate::i18n::msg("Reset {value1} to the default Toolport gateway?")
         },
         &[("value1", &client.name.to_string())],
     );
@@ -16187,7 +16187,7 @@ mod tests {
                     }
                     state::ClientGatewayState::Customized => {
                         let badge = first.downcast::<gtk::Label>().unwrap();
-                        assert_eq!(badge.text(), "Customized");
+                        assert_eq!(badge.text(), "Custom configuration");
                     }
                     state::ClientGatewayState::Connected => {
                         let badge = first.downcast::<gtk::Label>().unwrap();
@@ -16370,7 +16370,7 @@ mod tests {
         assert_eq!(client_reset_label(&client), "Migrate to stdio");
         client.legacy_bearer_argv = false;
         assert!(client_needs_reset_action(&client));
-        assert_eq!(client_reset_label(&client), "Reset and connect");
+        assert_eq!(client_reset_label(&client), "Reset to default");
         client.scope_id = Some(registry.all_access_id());
         let scope = client_reset_scope(&client);
         crate::registry_controller::apply_client_stdio_update(

@@ -2306,7 +2306,9 @@ mod tests {
                     path: "/fixture/edited-client.json".into(),
                     dry_run: false,
                     error: None,
-                    warnings: vec!["kept your edited toolport entry".into()],
+                    warnings: vec![
+                        "Toolport kept the toolport entry you edited. Remove it by hand if you uninstall Toolport.".into(),
+                    ],
                 }])
             },
             |_| panic!("connection remains"),

@@ -618,6 +618,197 @@ pub(super) fn check_legacy_gateway(
     Ok(())
 }
 
+/// The whole entry v1.24.x wrote for `client_id`'s Shared HTTP connection, rebuilt from
+/// the record v1 kept in the registry. The bearer v1 never stored is taken from
+/// `current`, and only from the one place v1 put it. `None` for a record or client v1 did
+/// not write this way: such an entry is never proved to be Toolport's.
+fn v1_shared_http_entry(
+    client_id: &str,
+    format: Format,
+    record: &ManagedEntry,
+    current: &Value,
+) -> Option<Value> {
+    if !record.transport.eq_ignore_ascii_case("sharedHttp") {
+        return None;
+    }
+    let url = record.url.as_deref()?;
+    let bearer = |value: Option<&Value>, prefix: &str| {
+        value
+            .and_then(Value::as_str)
+            .filter(|value| {
+                value
+                    .strip_prefix(prefix)
+                    .is_some_and(|token| !token.trim().is_empty())
+            })
+            .map(str::to_owned)
+    };
+    if record.command == "npx" {
+        // `npx -y mcp-remote URL --header "Authorization: Bearer T"`, nothing else, for
+        // the clients v1 bridged (`client_uses_mcp_remote_bridge`).
+        let bridged = matches!(
+            format,
+            Format::JsonMcpServers | Format::JsonCursorMcpServers | Format::TomlMcpServers
+        ) && client_id != "devin-cli";
+        if !bridged || !record.env.is_empty() || record.args != ["-y", "mcp-remote", url] {
+            return None;
+        }
+        let auth = bearer(current.get("args")?.get(4), "Authorization: Bearer ")?;
+        return Some(serde_json::json!({
+            "command": "npx",
+            "args": ["-y", "mcp-remote", url, "--header", auth],
+        }));
+    }
+    if !record.command.is_empty() || !record.args.is_empty() {
+        return None;
+    }
+    let mut headers: serde_json::Map<String, Value> = record
+        .env
+        .iter()
+        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+        .collect();
+    let auth = bearer(current.get("headers")?.get("Authorization"), "Bearer ")?;
+    headers.insert("Authorization".into(), Value::String(auth));
+    Some(match format {
+        // entry_to_json's native remote, for Devin CLI and VS Code's `servers`.
+        Format::JsonMcpServers if client_id == "devin-cli" => {
+            serde_json::json!({"url": url, "type": "http", "headers": headers})
+        }
+        Format::JsonServers => serde_json::json!({"url": url, "type": "http", "headers": headers}),
+        Format::JsonCopilotMcpServers => {
+            serde_json::json!({"url": url, "type": "http", "headers": headers, "tools": ["*"]})
+        }
+        Format::JsonOpenCodeMcp => {
+            serde_json::json!({"enabled": true, "type": "remote", "url": url, "headers": headers})
+        }
+        _ => return None,
+    })
+}
+
+/// Toolport's entry where v1.24.x put it, with its name: the format's server map, and
+/// for OpenCode `mcp` itself (v1 never wrote `mcp.servers`), even in a file that now
+/// also has OpenCode 2.x's `mcp.servers` map.
+fn v1_slot(format: Format, root: &Value) -> Option<(String, Value)> {
+    let mut servers = root.get(key(format))?;
+    if let Some(inner) = nested(format) {
+        servers = servers.get(inner)?;
+    }
+    let servers = servers.as_object()?;
+    let name = owned_gateway_name(servers.keys().map(String::as_str))?;
+    Some((name.to_owned(), servers.get(name)?.clone()))
+}
+
+fn v1_slot_mut(format: Format, root: &mut Value) -> Option<&mut serde_json::Map<String, Value>> {
+    let mut servers = root.get_mut(key(format))?;
+    if let Some(inner) = nested(format) {
+        servers = servers.get_mut(inner)?;
+    }
+    servers.as_object_mut()
+}
+
+/// What v1's Shared HTTP connection left in the registry: its ownership record and the
+/// hash of its token from the `client:<id>` row. An unreadable registry, or no record
+/// or row, is no proof.
+fn v1_proof(client_id: &str) -> Option<(ManagedEntry, String)> {
+    let registry = crate::registry_controller::registry_for_disconnect().ok()?;
+    let record = registry.client_managed_entries.get(client_id)?.clone();
+    let row = format!("client:{client_id}");
+    let hash = registry
+        .http_clients
+        .iter()
+        .find(|http| http.id == row)?
+        .token_sha256
+        .clone();
+    Some((record, hash))
+}
+
+/// The token in the one place v1 put it.
+fn v1_token(entry: &Value) -> Option<&str> {
+    match entry.get("args") {
+        Some(args) => args
+            .get(4)?
+            .as_str()?
+            .strip_prefix("Authorization: Bearer "),
+        None => entry
+            .get("headers")?
+            .get("Authorization")?
+            .as_str()?
+            .strip_prefix("Bearer "),
+    }
+}
+
+/// Whether `entry` is, every field and the token too, the one v1.24.x wrote for this
+/// client's Shared HTTP connection. Anything else is kept as the user's.
+fn is_v1_entry(
+    client_id: &str,
+    format: Format,
+    proof: &(ManagedEntry, String),
+    entry: &Value,
+) -> bool {
+    v1_shared_http_entry(client_id, format, &proof.0, entry).as_ref() == Some(entry)
+        && v1_token(entry).is_some_and(|token| crate::registry::sha256_hex(token) == proof.1)
+}
+
+/// Whether `text` holds v1's Shared HTTP entry. A file that can't be read proves nothing.
+fn legacy_shared_http_entry(client_id: &str, format: Format, text: &str) -> bool {
+    let Some((_, entry)) = mutation::value(format, Some(text))
+        .ok()
+        .and_then(|root| v1_slot(format, &root))
+    else {
+        return false;
+    };
+    v1_proof(client_id).is_some_and(|proof| is_v1_entry(client_id, format, &proof, &entry))
+}
+
+/// After a 2.x Connect, a v1 Shared HTTP Connect and then this upgrade, v1's entry is not
+/// this record's last write, so undo would keep it as a hand edit. Two places hold it:
+/// the current file, or the baseline, when a later 2.x write (Codex's launch repair)
+/// rebased it there. Where it is proved to be v1's, the current entry is treated as the
+/// last write and the baseline drops it, so undo removes it. Says whether it did.
+fn adopt_legacy_shared_http(
+    client_id: &str,
+    format: Format,
+    written: &Value,
+    before: &mut Value,
+    latest: &mut Value,
+) -> bool {
+    let written = |name: &str| {
+        let mut servers = written.get(key(format))?;
+        if let Some(inner) = nested(format) {
+            servers = servers.get(inner)?;
+        }
+        servers.get(name).cloned()
+    };
+    let mut proof = None;
+    let mut proved = |entry: &Value| {
+        proof
+            .get_or_insert_with(|| v1_proof(client_id))
+            .as_ref()
+            .is_some_and(|proof| is_v1_entry(client_id, format, proof, entry))
+    };
+    let mut adopted = false;
+    if let Some((name, entry)) = v1_slot(format, latest) {
+        let last = written(&name);
+        if last.as_ref() != Some(&entry) && proved(&entry) {
+            if let Some(servers) = v1_slot_mut(format, latest) {
+                match last {
+                    Some(last) => servers.insert(name, last),
+                    None => servers.remove(&name),
+                };
+                adopted = true;
+            }
+        }
+    }
+    if let Some((name, entry)) = v1_slot(format, before) {
+        if written(&name).as_ref() != Some(&entry) && proved(&entry) {
+            if let Some(servers) = v1_slot_mut(format, before) {
+                servers.remove(&name);
+                adopted = true;
+            }
+        }
+    }
+    adopted
+}
+
 pub(super) fn released(client_id: &str, path: &Path) -> Result<bool, String> {
     Ok(load(client_id, path)?
         .is_some_and(|record| record.disconnected && record.disconnect_before.is_none()))
@@ -659,7 +850,30 @@ pub(super) fn toml_prefix_provenance(
     Ok(Some((original, written)))
 }
 
+/// [`apply_adopting`] without the adoption flag, for tests.
+#[cfg(test)]
 pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool, String> {
+    apply_inner(client_id, format, path, &mut false)
+}
+
+/// [`apply`], also saying whether it took a Shared HTTP entry v1 wrote as Toolport's, so
+/// the caller puts back the servers v1's Move into gateway took out of the file.
+pub(super) fn apply_adopting(
+    client_id: &str,
+    format: Format,
+    path: &Path,
+) -> Result<(bool, bool), String> {
+    let mut adopted = false;
+    let handled = apply_inner(client_id, format, path, &mut adopted)?;
+    Ok((handled, adopted))
+}
+
+fn apply_inner(
+    client_id: &str,
+    format: Format,
+    path: &Path,
+    adopted: &mut bool,
+) -> Result<bool, String> {
     let Some(record) = load(client_id, path)? else {
         return Ok(false);
     };
@@ -669,12 +883,18 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
     } else {
         None
     };
+    // Toolport already took its entry out. An entry v1 wrote for Shared HTTP since then
+    // is still Toolport's: the caller's plain Disconnect removes it.
+    let legacy_since_disconnect = record.disconnected
+        && current
+            .as_deref()
+            .is_some_and(|text| legacy_shared_http_entry(client_id, format, text));
     if record.disconnected
         && record.original.is_none()
         && record.vault_recovery.is_none()
         && record.disconnect_before.is_none()
     {
-        return Ok(true);
+        return Ok(!legacy_since_disconnect);
     }
     if record.disconnected {
         let receipt = record_path(client_id, path)?;
@@ -719,7 +939,7 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
             return Ok(true);
         }
         if record.disconnect_before.is_none() {
-            return Ok(true);
+            return Ok(!legacy_since_disconnect);
         }
     }
     if record.disconnected
@@ -820,6 +1040,7 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
         named_list(&mut written, key)?;
         named_list(&mut latest, key)?;
     }
+    *adopted |= adopt_legacy_shared_http(client_id, format, &written, &mut before, &mut latest);
     let restored = undo(
         before.get(key),
         written.get(key),

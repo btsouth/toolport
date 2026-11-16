@@ -44,6 +44,8 @@ pub use locations::{
 #[cfg(test)]
 mod gateway_path_tests;
 pub use t3code::{revision as t3_code_revision, T3CodeUse};
+#[cfg(test)]
+mod legacy_shared_http_tests;
 mod moved;
 mod mutation;
 #[cfg(test)]
@@ -5643,7 +5645,9 @@ fn disconnect_warnings(format: Format, path: &Path) -> Result<Vec<String>, Strin
             server.name.eq_ignore_ascii_case(GATEWAY_ENTRY_NAME) || detected_is_gateway(server)
         });
     Ok(if kept {
-        vec!["kept your edited toolport entry; remove it by hand if you uninstall".into()]
+        vec![crate::i18n::tr(
+            "Toolport kept the toolport entry you edited. Remove it by hand if you uninstall Toolport.",
+        )]
     } else {
         Vec::new()
     })
@@ -9576,8 +9580,10 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
     // one could only delete a config that existed before this operation.
     let backup = backup_file(client_id, &path)?;
     let mut restored_names = moved::missing_names(client_id, def.format, &path)?;
-    if restore::apply(client_id, def.format, &path)? {
-        if restore::needs_moved(client_id, &path)? {
+    let (handled, adopted) = restore::apply_adopting(client_id, def.format, &path)?;
+    if handled {
+        // v1's Move into gateway took servers out beside its Shared HTTP entry.
+        if adopted || restore::needs_moved(client_id, &path)? {
             moved::restore(client_id, def.format, &path)?;
         }
         let restored = read_client(&def).servers;
