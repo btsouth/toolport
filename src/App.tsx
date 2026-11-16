@@ -233,8 +233,10 @@ function App() {
   const [starSurface, setStarSurface] = useState<StarSurface>(null);
   const lastProbeRef = useRef(0);
   const probeFlightRef = useRef(createSingleFlight<ProbeResult[]>());
-  // Set by a Refresh or Retry the user chose: the next probe may ask to unlock
-  // the keyring. The window's own probes never do.
+  // Set by a Refresh or Retry the user chose: the next probe flight to start may
+  // ask to unlock the keyring. The window's own probes never do. It stays set
+  // until a flight starts, so a request queued behind an automatic probe, or
+  // coalesced with others, keeps the user's choice.
   const interactiveProbeRef = useRef(false);
   const takeInteractive = () => {
     const interactive = interactiveProbeRef.current;
@@ -269,8 +271,9 @@ function App() {
   // Registry/auth mutations need a probe that starts after any older snapshot.
   // Multiple mutations during one active probe share a single trailing run.
   const reprobeAfterMutation = useCallback(
-    (): Promise<ProbeResult[]> =>
-      probeFlightRef.current.runAfterCurrent(async () => {
+    (interactive = false): Promise<ProbeResult[]> => {
+      if (interactive) interactiveProbeRef.current = true;
+      return probeFlightRef.current.runAfterCurrent(async () => {
         lastProbeRef.current = Date.now();
         setProbing(true);
         try {
@@ -284,15 +287,16 @@ function App() {
         } finally {
           setProbing(false);
         }
-      }),
+      });
+    },
     [],
   );
 
   // A row's Retry: the user asked, so it may ask to unlock the keyring.
-  const retryProbe = useCallback((): Promise<ProbeResult[]> => {
-    interactiveProbeRef.current = true;
-    return reprobeAfterMutation();
-  }, [reprobeAfterMutation]);
+  const retryProbe = useCallback(
+    (): Promise<ProbeResult[]> => reprobeAfterMutation(true),
+    [reprobeAfterMutation],
+  );
 
   const applyRegistryChange = useCallback(
     (next: Registry) => {
@@ -356,9 +360,10 @@ function App() {
 
   // `announce` is set by the manual Refresh button: it waits for the health probe
   // and reports a summary toast. The silent path (initial load, focus refresh)
-  // fires the probe without blocking or toasting.
+  // fires the probe without blocking or toasting. `interactive`: the user asked
+  // (Refresh, Ctrl+R), so its probe may ask to unlock the keyring.
   const load = useCallback(
-    async (announce = false) => {
+    async (announce = false, interactive = announce) => {
       setLoading(true);
       setError(null);
       setDetailError(null);
@@ -402,7 +407,7 @@ function App() {
         setActivityKey((k) => k + 1);
         if (announce) {
           try {
-            const results = await reprobeAfterMutation();
+            const results = await reprobeAfterMutation(interactive);
             if (results.length > 0) {
               const up = results.filter((r) => r.ok).length;
               toast.success(
@@ -417,6 +422,8 @@ function App() {
           } catch {
             toast.warning(translate("Refreshed, but couldn't check server health"));
           }
+        } else if (interactive) {
+          void reprobeAfterMutation(true).catch(() => {});
         } else {
           void reprobe().catch(() => {});
         }
@@ -448,7 +455,7 @@ function App() {
     setCheckingClientRecoveries(true);
     const focused = document.activeElement as HTMLElement | null;
     try {
-      await Promise.all([requestClientRecoveryScan(), load(false)]);
+      await Promise.all([requestClientRecoveryScan(), load(false, true)]);
     } catch (cause: unknown) {
       toastError(
         typeof cause === "string"
@@ -1249,8 +1256,7 @@ function App() {
                 size="sm"
                 className="shrink-0"
                 onClick={() => {
-                  interactiveProbeRef.current = true;
-                  void reprobe().catch(() => {});
+                  void reprobeAfterMutation(true).catch(() => {});
                 }}
                 disabled={probing}
               >
