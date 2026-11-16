@@ -1213,5 +1213,6 @@
   "Use an http:// or https:// URL for a remote server.": "원격 서버에는 http:// 또는 https:// URL을 사용하세요.",
   "Use stdio, http or sse after -t.": "-t 뒤에는 stdio, http, sse 중 하나를 쓰세요.",
   "Add a value for {value0} before saving. The pasted config did not include it.": "저장하기 전에 {value0} 값을 추가하세요. 붙여 넣은 구성에 포함되어 있지 않았습니다.",
-  "Use each variable name once. Rename or remove the second {value0}.": "변수 이름은 한 번만 사용하세요. 두 번째 {value0}의 이름을 바꾸거나 지우세요."
+  "Use each variable name once. Rename or remove the second {value0}.": "변수 이름은 한 번만 사용하세요. 두 번째 {value0}의 이름을 바꾸거나 지우세요.",
+  "Remote servers don't read environment variables, so Toolport would send {value0} to this server as its bearer token. Remove it, or name it Authorization if it is this server's token.": "원격 서버는 환경 변수를 읽지 않으므로 Toolport가 {value0}을(를) 이 서버의 Bearer 토큰으로 보내게 됩니다. 삭제하거나, 이 서버의 토큰이라면 이름을 Authorization으로 바꾸세요."
 }

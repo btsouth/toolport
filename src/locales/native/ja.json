@@ -1213,5 +1213,6 @@
   "Use an http:// or https:// URL for a remote server.": "リモートサーバーには http:// または https:// の URL を使ってください。",
   "Use stdio, http or sse after -t.": "-t の後ろには stdio、http、sse のいずれかを指定してください。",
   "Add a value for {value0} before saving. The pasted config did not include it.": "保存する前に {value0} の値を追加してください。貼り付けた設定には含まれていませんでした。",
-  "Use each variable name once. Rename or remove the second {value0}.": "変数名はそれぞれ 1 回だけ使ってください。2 つ目の {value0} の名前を変えるか、削除してください。"
+  "Use each variable name once. Rename or remove the second {value0}.": "変数名はそれぞれ 1 回だけ使ってください。2 つ目の {value0} の名前を変えるか、削除してください。",
+  "Remote servers don't read environment variables, so Toolport would send {value0} to this server as its bearer token. Remove it, or name it Authorization if it is this server's token.": "リモートサーバーは環境変数を読み取らないため、Toolport は {value0} をこのサーバーへの Bearer トークンとして送信してしまいます。削除するか、このサーバーのトークンであれば名前を Authorization にしてください。"
 }

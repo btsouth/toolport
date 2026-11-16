@@ -1213,5 +1213,6 @@
   "Use an http:// or https:// URL for a remote server.": "Use una URL http:// o https:// para un servidor remoto.",
   "Use stdio, http or sse after -t.": "Use stdio, http o sse después de -t.",
   "Add a value for {value0} before saving. The pasted config did not include it.": "Añada un valor para {value0} antes de guardar. La configuración pegada no lo incluía.",
-  "Use each variable name once. Rename or remove the second {value0}.": "Use cada nombre de variable una sola vez. Cambie el nombre del segundo {value0} o quítelo."
+  "Use each variable name once. Rename or remove the second {value0}.": "Use cada nombre de variable una sola vez. Cambie el nombre del segundo {value0} o quítelo.",
+  "Remote servers don't read environment variables, so Toolport would send {value0} to this server as its bearer token. Remove it, or name it Authorization if it is this server's token.": "Los servidores remotos no leen variables de entorno, así que Toolport enviaría {value0} a este servidor como su token bearer. Quítala o llámala Authorization si es el token de este servidor."
 }

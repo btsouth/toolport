@@ -732,8 +732,57 @@ pub fn import_client_servers_inputs(
     })
 }
 
+/// Remote servers have no environment, and Toolport sends a secret env row on
+/// one as its bearer token (`remote::first_vaulted_secret`). So a save never
+/// adds a row the user typed there. Kept: rows the saved entry already had as a
+/// remote server (older manual tokens and `bearer_token_env_var` imports), the
+/// bearer slot, header rows, and an Authorization row, which saving maps to the
+/// bearer slot.
+pub fn refuse_new_remote_env(
+    previous: Option<&ServerEntry>,
+    next: &ServerEntry,
+) -> Result<(), String> {
+    if next.transport == "stdio" {
+        return Ok(());
+    }
+    let kept = |key: &str| {
+        previous.is_some_and(|previous| {
+            previous.transport != "stdio" && previous.env.iter().any(|e| e.key == key)
+        })
+    };
+    let header = |key: &str| {
+        next.unknown_fields
+            .get("headerKeys")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|headers| headers.iter().any(|h| h["key"] == key || h["env"] == key))
+    };
+    let typed = next.env.iter().find(|env| {
+        let key = env.key.as_str();
+        !(key == crate::secrets::HTTP_AUTH_KEY
+            || key == crate::secrets::IMPORTED_URL_KEY
+            || key.eq_ignore_ascii_case("authorization")
+            || kept(key)
+            || header(key))
+    });
+    match typed {
+        Some(env) => Err(remote_env_refusal(&env.key)),
+        None => Ok(()),
+    }
+}
+
+fn remote_env_refusal(key: &str) -> String {
+    crate::i18n::trf(
+        "Remote servers don't read environment variables, so Toolport would send {value0} to this server as its bearer token. Remove it, or name it Authorization if it is this server's token.",
+        &[("value0", key)],
+    )
+}
+
 pub fn apply_update_entry(registry: &mut Registry, entry: ServerEntry) -> Result<(), String> {
     crate::secret_refs::validate_server(&entry).map_err(|e| e.to_string())?;
+    refuse_new_remote_env(
+        registry.servers.iter().find(|server| server.id == entry.id),
+        &entry,
+    )?;
     if let Some(launch) = &entry.launch {
         launch.validate(&entry.args, true)?;
     }
@@ -784,6 +833,7 @@ pub fn apply_remove_server(registry: &mut Registry, server_id: &str) -> Result<(
 }
 
 pub fn add_reviewed_entry(entry: ServerEntry) -> Result<(Registry, String), String> {
+    refuse_new_remote_env(None, &entry)?;
     let env = entry
         .env
         .iter()
@@ -1254,16 +1304,21 @@ pub fn update_server_fields_and_env(
     env: Option<Vec<PlainEnvEdit>>,
 ) -> Result<Registry, String> {
     let (registry, ()) = registry::update(|registry| {
+        let previous = registry
+            .servers
+            .iter()
+            .find(|server| server.id == server_id)
+            .cloned();
         apply_update_server_fields(registry, server_id, fields)?;
+        let server = registry
+            .servers
+            .iter_mut()
+            .find(|server| server.id == server_id)
+            .ok_or_else(|| format!("No server with id '{server_id}'"))?;
         if let Some(env) = env {
-            let server = registry
-                .servers
-                .iter_mut()
-                .find(|server| server.id == server_id)
-                .ok_or_else(|| format!("No server with id '{server_id}'"))?;
             apply_plain_env(server, env)?;
         }
-        Ok(())
+        refuse_new_remote_env(previous.as_ref(), server)
     })?;
     Ok(registry)
 }
@@ -3008,6 +3063,17 @@ pub fn apply_secret_declaration(
         .iter_mut()
         .find(|server| server.id == server_id)
         .ok_or_else(|| format!("No server with id '{server_id}'"))?;
+    // A new key on a remote server would become its bearer token.
+    if !server.env.iter().any(|entry| entry.key == key) {
+        let mut declared = server.clone();
+        declared.env.push(crate::registry::EnvVar {
+            key: key.to_string(),
+            value: None,
+            secret: true,
+            unknown_fields: Default::default(),
+        });
+        refuse_new_remote_env(Some(server), &declared)?;
+    }
     if let Some(overrides) = server
         .unknown_fields
         .get_mut("memberSecretRefs")
@@ -5490,6 +5556,170 @@ API_KEY = "synthetic-first-origin"
                 assert!(!sent.is_empty(), "{path:?}");
                 assert!(sent.iter().all(|v| v == "Bearer abc"), "{path:?}: {sent:?}");
             }
+        });
+    }
+
+    /// A variable typed onto a remote server, the way a stdio server takes an API
+    /// key, must never reach that server. Remote servers have no environment, and
+    /// Toolport used to send the first such value as the bearer token.
+    #[test]
+    fn a_typed_variable_on_a_remote_server_is_never_sent_to_it() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            for path in [AddPath::React, AddPath::Gtk] {
+                let endpoint = HeaderEndpoint::new();
+                let name = format!("typed-{path:?}");
+                let mut remote = fields(&name, "http");
+                remote.url = Some(endpoint.url.clone());
+                let saved = match path {
+                    AddPath::Gtk => add_server_with_rows(
+                        remote,
+                        vec![ValueRow {
+                            key: "RESEND_API_KEY".into(),
+                            value: "re_live_typed".into(),
+                            secret: true,
+                            ..Default::default()
+                        }],
+                    )
+                    .map(|_| ()),
+                    AddPath::React => entry_from_fields(remote).and_then(|mut entry| {
+                        entry.env = vec![registry::EnvVar {
+                            key: "RESEND_API_KEY".into(),
+                            value: None,
+                            secret: true,
+                            unknown_fields: Default::default(),
+                        }];
+                        let (_, id) = add_reviewed_entry(entry)?;
+                        set_server_secret_with(&id, "RESEND_API_KEY", "re_live_typed", |id, key| {
+                            Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0)
+                        })
+                        .map(|_| ())
+                    }),
+                };
+                if let Some(server) = registry::load()
+                    .unwrap()
+                    .servers
+                    .into_iter()
+                    .find(|s| s.name == name)
+                {
+                    let _ = crate::remote::connect_remote(&server);
+                }
+                let sent = endpoint.values("Authorization");
+                assert!(
+                    sent.iter().all(|v| !v.contains("re_live_typed")),
+                    "{path:?} sent the variable as {sent:?} (save: {saved:?})"
+                );
+                assert_eq!(
+                    saved.unwrap_err(),
+                    "Remote servers don't read environment variables, so Toolport would send RESEND_API_KEY to this server as its bearer token. Remove it, or name it Authorization if it is this server's token.",
+                    "{path:?}"
+                );
+                assert!(crate::secrets::get_secret_result(&name, "RESEND_API_KEY")
+                    .unwrap()
+                    .is_none());
+            }
+        });
+    }
+
+    /// An older remote entry that keeps its token in an env row, as a manual
+    /// token or a `bearer_token_env_var` import does, still sends it and can be
+    /// edited. Only rows it did not have are refused.
+    #[test]
+    fn a_remote_server_keeps_the_env_token_it_already_had() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let endpoint = HeaderEndpoint::new();
+            let mut remote = fields("legacy", "http");
+            remote.url = Some(endpoint.url.clone());
+            let mut entry = entry_from_fields(remote).unwrap();
+            entry.env = vec![registry::EnvVar {
+                key: "MY_MCP_TOKEN".into(),
+                value: None,
+                secret: true,
+                unknown_fields: Default::default(),
+            }];
+            let (_, id) = registry::update(|r| Ok(apply_add_entry(r, entry))).unwrap();
+            crate::secrets::set_secret(&id, "MY_MCP_TOKEN", "kept-token").unwrap();
+            let saved = || {
+                registry::load()
+                    .unwrap()
+                    .servers
+                    .into_iter()
+                    .find(|s| s.id == id)
+                    .unwrap()
+            };
+            crate::remote::connect_remote(&saved()).unwrap();
+            assert!(endpoint
+                .values("Authorization")
+                .iter()
+                .all(|v| v == "Bearer kept-token"));
+
+            // Editing it in either shell keeps the row.
+            let mut edited = saved();
+            edited.name = "legacy renamed".into();
+            registry::update(|r| apply_update_entry(r, edited.clone())).unwrap();
+            let mut gtk = fields("legacy renamed again", "http");
+            gtk.url = Some(endpoint.url.clone());
+            update_server_fields_and_env(&id, gtk, None).unwrap();
+            set_server_secret_with(&id, "MY_MCP_TOKEN", "newer-token", |id, key| {
+                Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0)
+            })
+            .unwrap();
+
+            // A new row is refused, through an edit or the Credentials page.
+            let mut added = saved();
+            added.env.push(registry::EnvVar {
+                key: "OTHER_KEY".into(),
+                value: None,
+                secret: true,
+                unknown_fields: Default::default(),
+            });
+            assert!(registry::update(|r| apply_update_entry(r, added.clone()))
+                .unwrap_err()
+                .contains("OTHER_KEY"));
+            assert!(set_server_secret_with(&id, "OTHER_KEY", "x", |id, key| {
+                Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0)
+            })
+            .unwrap_err()
+            .contains("OTHER_KEY"));
+            assert!(crate::secrets::get_secret_result(&id, "OTHER_KEY")
+                .unwrap()
+                .is_none());
+            // The bearer slot and Authorization still work.
+            set_server_secret_with(&id, "Authorization", "Bearer typed", |id, key| {
+                Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0)
+            })
+            .unwrap();
+            assert_eq!(saved().env.len(), 1, "{:?}", saved().env);
+        });
+    }
+
+    /// A stdio server's variables don't carry over to a switch to http: the
+    /// save says to remove them first.
+    #[test]
+    fn a_switch_to_http_refuses_the_stdio_variables() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut entry = entry_from_fields(fields("switch", "stdio")).unwrap();
+            entry.env = vec![registry::EnvVar {
+                key: "API_KEY".into(),
+                value: Some("plain".into()),
+                secret: false,
+                unknown_fields: Default::default(),
+            }];
+            let (_, id) = add_reviewed_entry(entry).unwrap();
+            let error =
+                update_server_fields_and_env(&id, fields("switch", "http"), None).unwrap_err();
+            assert!(error.contains("API_KEY"), "{error}");
+            let mut react = registry::load()
+                .unwrap()
+                .servers
+                .into_iter()
+                .find(|s| s.id == id)
+                .unwrap();
+            react.transport = "http".into();
+            react.command = None;
+            react.url = Some("https://example.com/mcp".into());
+            assert!(registry::update(|r| apply_update_entry(r, react.clone())).is_err());
+            react.env.clear();
+            registry::update(|r| apply_update_entry(r, react.clone())).unwrap();
         });
     }
 
