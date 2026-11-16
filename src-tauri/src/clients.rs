@@ -3708,6 +3708,9 @@ pub struct ParsedSnippetServer {
     /// and a vaulted one would go out as its bearer token, so it is refused.
     #[serde(skip)]
     pub plain_env: bool,
+    /// Kimi's `bearerTokenEnvVar`: the env row that is the server's token.
+    #[serde(skip)]
+    pub bearer_env: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3756,6 +3759,11 @@ fn json_server_with_values(name: &str, def: &serde_json::Value) -> ParsedSnippet
     // (the value never sits in the file). Surface the var NAME as a value-less
     // env key so import vaults the token and remote connects send it as
     // `Authorization: Bearer` (see `remote::first_vaulted_secret`).
+    let bearer_env = def
+        .get("bearerTokenEnvVar")
+        .and_then(|v| v.as_str())
+        .filter(|var| !var.is_empty())
+        .map(String::from);
     if let Some(var) = def.get("bearerTokenEnvVar").and_then(|v| v.as_str()) {
         if !var.is_empty() && !env.iter().any(|e| e.key == var) {
             env.push(SnippetEnvVar {
@@ -3778,6 +3786,7 @@ fn json_server_with_values(name: &str, def: &serde_json::Value) -> ParsedSnippet
         env,
         unsupported_headers,
         plain_env,
+        bearer_env,
     }
 }
 
@@ -4395,6 +4404,7 @@ fn parse_toml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                 env,
                 unsupported_headers,
                 plain_env,
+                bearer_env: None,
             }
         })
         .collect();
@@ -4474,6 +4484,7 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                     env,
                     unsupported_headers,
                     plain_env,
+                    bearer_env: None,
                 })
             })
             .collect();
@@ -4524,6 +4535,7 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                     env,
                     unsupported_headers,
                     plain_env,
+                    bearer_env: None,
                 })
             })
             .collect();
@@ -4584,6 +4596,7 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                     env,
                     unsupported_headers,
                     plain_env,
+                    bearer_env: None,
                 })
             })
             .collect();
@@ -4804,6 +4817,7 @@ fn opencode_server_with_values(
         env,
         unsupported_headers,
         plain_env,
+        bearer_env: None,
     }))
 }
 

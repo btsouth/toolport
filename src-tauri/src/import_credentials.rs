@@ -8,6 +8,26 @@ use serde::{Serialize, Serializer};
 const VAULT_FAILURE: &str =
     "Keychain unavailable. Unlock it and retry importing. Client config unchanged.";
 
+/// Rows a remote server may carry although it has no environment: the bearer
+/// slot, the imported URL unless it is a reference (only a reference is ever
+/// sent as a token), an Authorization row (saved as the bearer token) and
+/// header rows. Saves and imports keep the same rows.
+pub(crate) fn remote_row_allowed(
+    entry: &registry::ServerEntry,
+    key: &str,
+    reference: bool,
+) -> bool {
+    let header = entry
+        .unknown_fields
+        .get("headerKeys")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|headers| headers.iter().any(|h| h["key"] == key || h["env"] == key));
+    key == crate::secrets::HTTP_AUTH_KEY
+        || (key == crate::secrets::IMPORTED_URL_KEY && !reference)
+        || key.eq_ignore_ascii_case("authorization")
+        || header
+}
+
 pub(crate) fn provided(value: &str) -> bool {
     let value = value.trim();
     static PLACEHOLDER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
@@ -447,21 +467,22 @@ impl Import {
             // env row to one as its bearer token. Only Authorization and the
             // client's bearer token variable are tokens; other variables are
             // left out and named in the review.
-            let token =
-                |key: &str| key.eq_ignore_ascii_case("authorization") || bearer_env.contains(key);
-            for key in values
+            let token = |key: &str, reference: bool| {
+                bearer_env.contains(key) || remote_row_allowed(&entry, key, reference)
+            };
+            for (key, reference) in values
                 .iter()
-                .map(|(key, _)| key)
-                .chain(plain.iter().map(|env| &env.key))
-                .chain(references.iter().map(|env| &env.key))
+                .map(|(key, _)| (key, false))
+                .chain(plain.iter().map(|env| (&env.key, false)))
+                .chain(references.iter().map(|env| (&env.key, true)))
             {
-                if !token(key) && !skipped.contains(key) {
+                if !token(key, reference) && !skipped.contains(key) {
                     skipped.push(key.clone());
                 }
             }
-            values.retain(|(key, _)| token(key));
-            plain.retain(|env| token(&env.key));
-            references.retain(|env| token(&env.key));
+            values.retain(|(key, _)| token(key, false));
+            plain.retain(|env| token(&env.key, false));
+            references.retain(|env| token(&env.key, true));
             // Arbitrary header schemes have no equivalent in Toolport's bearer
             // transport. Refuse the cutover instead of silently dropping them.
             if let Some(definition) = definition {

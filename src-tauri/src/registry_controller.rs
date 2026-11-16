@@ -767,22 +767,12 @@ pub fn refuse_new_remote_env(
                     .any(|e| e.key == row.key && (sendable(e) || !sendable(row)))
         })
     };
-    let header = |key: &str| {
-        next.unknown_fields
-            .get("headerKeys")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|headers| headers.iter().any(|h| h["key"] == key || h["env"] == key))
-    };
     let typed = next.env.iter().find(|env| {
-        let key = env.key.as_str();
-        // The imported URL is never sent as a token unless it is a reference.
-        let imported_url =
-            key == crate::secrets::IMPORTED_URL_KEY && !env.unknown_fields.contains_key("source");
-        !(key == crate::secrets::HTTP_AUTH_KEY
-            || imported_url
-            || key.eq_ignore_ascii_case("authorization")
-            || kept(env)
-            || header(key))
+        !(crate::import_credentials::remote_row_allowed(
+            next,
+            &env.key,
+            env.unknown_fields.contains_key("source"),
+        ) || kept(env))
     });
     match typed {
         Some(env) => Err(remote_env_refusal(&env.key)),
@@ -1386,7 +1376,14 @@ pub fn add_snippet_servers_inputs(
             inherit_env: None,
             hide_prompts: None,
         })?;
-        let definition = serde_json::json!({"env": server.env.into_iter().map(|e| (e.key,e.value.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null))).collect::<serde_json::Map<_,_>>()});
+        // Kimi's bearer token variable stays the token, as in a client import.
+        let bearer = server
+            .bearer_env
+            .filter(|var| server.env.iter().any(|e| &e.key == var));
+        let mut definition = serde_json::json!({"env": server.env.into_iter().map(|e| (e.key,e.value.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null))).collect::<serde_json::Map<_,_>>()});
+        if let Some(var) = bearer {
+            definition["bearerTokenEnvVar"] = serde_json::Value::String(var);
+        }
         let choice = choices.get(&entry.name);
         imports.push(crate::import_credentials::Import::prepare_with_choices(
             entry,
