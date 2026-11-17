@@ -9175,15 +9175,20 @@ fn data_dir_pin_is_stale(
     stored_command: &str,
     config_text: Option<&str>,
 ) -> bool {
-    let (Some(current), Some(text)) = (pinned_data_dir(client_id), config_text) else {
-        return false;
-    };
-    if !command_is_gateway_binary(stored_command) {
+    // Only location rows carry a pin; read the entry before resolving the data folder.
+    if !client_id.contains('@') || !command_is_gateway_binary(stored_command) {
         return false;
     }
-    format()
-        .and_then(|format| entry_env_value(format, text, entry_name, DATA_DIR_ENV))
-        .is_some_and(|pinned| pinned != current)
+    // Entries without the key anywhere in the file need no parse or location lookup.
+    let Some(pinned) = config_text
+        .filter(|text| text.contains(DATA_DIR_ENV))
+        .and_then(|text| {
+            format().and_then(|format| entry_env_value(format, text, entry_name, DATA_DIR_ENV))
+        })
+    else {
+        return false;
+    };
+    pinned_data_dir(client_id).is_some_and(|current| pinned != current)
 }
 
 /// The string value of `key` in the environment of the entry named `name`, read from
