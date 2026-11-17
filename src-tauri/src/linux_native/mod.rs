@@ -18145,12 +18145,25 @@ mod tests {
                 widgets(&node, out);
             }
         }
-        for (label, editing, by_cancel) in [
-            ("add, Cancel", false, true),
-            ("add, closed", false, false),
-            ("edit, Cancel", true, true),
-            ("edit, closed", true, false),
+        for (label, editing, by_cancel, personal) in [
+            ("add, Cancel", false, true, false),
+            ("add, closed", false, false, false),
+            ("edit, Cancel", true, true, false),
+            ("edit, closed", true, false, false),
+            // With personal sync on, each plain value row gets its "This
+            // machine only" box and the handlers that keep it current.
+            ("edit with sync, Cancel", true, true, true),
+            ("edit with sync, closed", true, false, true),
         ] {
+            *page.last_snapshot.borrow_mut() = Some(state::RegistrySnapshot {
+                servers: vec![server.clone()],
+                profiles: Vec::new(),
+                enabled_count: 0,
+                profile_count: 1,
+                active_profile_id: "default".into(),
+                paired: false,
+                personal_sync: personal,
+            });
             let editor = if editing {
                 open_server_editor_prefilled(
                     Some(server.clone()),
@@ -18171,6 +18184,16 @@ mod tests {
                     .map(|w| (w.type_().name().to_string(), w.downgrade()))
                     .collect()
             };
+            if personal {
+                let mut all = Vec::new();
+                widgets(editor.upcast_ref(), &mut all);
+                assert!(
+                    all.iter()
+                        .filter_map(|w| w.downcast_ref::<gtk::CheckButton>())
+                        .any(|c| c.label().as_deref() == Some("This machine only")),
+                    "{label}: the plain value row has no \"This machine only\" box"
+                );
+            }
             if by_cancel {
                 let mut all = Vec::new();
                 widgets(editor.upcast_ref(), &mut all);
