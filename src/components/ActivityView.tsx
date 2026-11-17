@@ -1018,10 +1018,9 @@ export function TelemetryNotice({
 
 function StatsPanel({ stats }: { stats: AuditStats }) {
   const { t: tr, locale } = useI18n();
-  // The three summary cards are the glanceable health check and stay visible; the full
-  // per-server table (can be 20+ rows) collapses by default so it stops being a wall
-  // below the security lane. It's one tap when you actually want the breakdown.
-  const [tableOpen, setTableOpen] = useState(false);
+  // The per-server table is part of the page's main content, so it starts open (as in
+  // GTK); one tap folds it away.
+  const [tableOpen, setTableOpen] = useState(true);
   if (stats.total === 0) return null;
   const errPct = fmtPercent(stats.errorRate, { floorNonZero: stats.errors > 0 });
   // Surface how many servers have errors on the collapsed toggle: the aggregate error % can
@@ -1897,7 +1896,8 @@ export function ActivityView({
   const [security, setSecurity] = useState<SecurityEvent[]>([]);
   const [securityLoadStatus, setSecurityLoadStatus] = useState<LoadStatus>("loading");
   const [dismissed, setDismissed] = useState<Set<string>>(loadDismissed);
-  const [logOpen, setLogOpen] = useState(false);
+  // The call list is the page's main content: open by default, as in GTK.
+  const [logOpen, setLogOpen] = useState(true);
   // Distinguish a load FAILURE (gateway unreachable / audit log unreadable) from a
   // genuinely empty log: both leave `entries` empty, but only one is an error. Without
   // this, a first-run backend failure renders the friendly "No tool calls yet" state

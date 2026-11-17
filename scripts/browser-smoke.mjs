@@ -400,7 +400,11 @@ try {
   await approval.getByRole("button", { name: "Deny", exact: true }).click();
   await expect(approval).toHaveCount(0);
   await page.getByRole("button", { name: "Activity", exact: true }).click();
-  await page.getByRole("button", { name: /recent calls/i }).click();
+  // The call list starts open.
+  await expect(page.getByRole("button", { name: /recent calls/i })).toHaveAttribute(
+    "aria-expanded",
+    "true",
+  );
   await expect(page.getByText("team_slack", { exact: true }).first()).toBeVisible();
   for (const label of [
     "Approved",
@@ -659,7 +663,10 @@ try {
     groupedClients.getByText(/60 calls today.*Last saw 1,711 tools/),
   ).toBeVisible();
   await page.getByRole("button", { name: "Activity", exact: true }).click();
-  await page.getByRole("button", { name: /Recent calls and approvals/ }).click();
+  // The call list starts open.
+  await expect(
+    page.getByRole("button", { name: /Recent calls and approvals/ }),
+  ).toHaveAttribute("aria-expanded", "true");
   for (const label of [
     "Searched tools",
     "Looked up a tool",
@@ -689,7 +696,9 @@ try {
   await page.getByRole("button", { name: /^Discovery/ }).click();
   await expect(page.getByText(/GitHub issues/)).toBeVisible();
   await page.screenshot({ path: path.join(output, "discovery-after-r2.png") });
-  await page.getByRole("button", { name: /^Per-server breakdown/ }).click();
+  await expect(
+    page.getByRole("button", { name: /^Per-server breakdown/ }),
+  ).toHaveAttribute("aria-expanded", "true");
   await page.screenshot({ path: path.join(output, "server-stats-after-r2.png") });
   await page.getByRole("button", { name: "Clear", exact: true }).click();
   await expect(page.getByRole("dialog")).toContainText("Clear retained activity?");

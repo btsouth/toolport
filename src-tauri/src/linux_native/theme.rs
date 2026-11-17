@@ -1108,11 +1108,83 @@ button.toolport-activity-row-button {{
   color: @toolport_error;
 }}
 
+/* The weight `.toolport-native button` gives would make a whole row bold. */
+.toolport-native button.toolport-activity-row-button {{
+  font-weight: normal;
+}}
+
+/* React's savings banner: a green leading bar over a green tint, the number in green. */
+.toolport-savings-card {{
+  padding: 16px;
+  border-left: 3px solid @toolport_success;
+  border-radius: 0 12px 12px 0;
+  background-color: alpha(@toolport_success, 0.08);
+}}
+
+.toolport-savings-title {{
+  color: @toolport_text_secondary;
+  font-weight: 500;
+}}
+
+.toolport-native button.toolport-savings-share {{
+  min-height: 26px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: normal;
+  color: @toolport_text_secondary;
+}}
+
+.toolport-savings-value {{
+  color: @toolport_success;
+  font-size: 30px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}}
+
+/* Stat tile numbers (spec 9): 22px, weight 600. */
+.toolport-native label.toolport-summary-value {{
+  font-size: 22px;
+  font-weight: 600;
+}}
+
+/* Tiles line up with the cards above: no flow box child inset. */
+.toolport-summary > flowboxchild {{
+  padding: 0;
+}}
+
+/* Errors only: plain text, and red while on, as React's toggle. */
+.toolport-native button.toolport-activity-filter {{
+  font-weight: normal;
+}}
+
+.toolport-native button.toolport-activity-filter:checked {{
+  color: @toolport_error;
+  background-color: alpha(@toolport_error, 0.10);
+  border-color: alpha(@toolport_error, 0.5);
+}}
+
+/* Remove in a row menu is red text; a fill only on hover, like the other items. */
+.toolport-action-menu button.toolport-destructive {{
+  padding: 0 10px;
+  background-color: transparent;
+}}
+
+.toolport-action-menu button.toolport-destructive:hover {{
+  background-color: alpha(@toolport_error, 0.10);
+}}
+
 .toolport-row-group .toolport-card.toolport-stat-header {{
   min-height: 0;
   padding-top: 8px;
   padding-bottom: 8px;
   background-color: alpha(@toolport_fg, 0.03);
+}}
+
+/* Server rows: one line each, as in React's table. */
+.toolport-row-group .toolport-card.toolport-stat-server {{
+  min-height: 0;
+  padding-top: 8px;
+  padding-bottom: 8px;
 }}
 
 .toolport-settings-parent {{ font-weight: 600; }}

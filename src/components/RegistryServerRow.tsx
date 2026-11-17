@@ -497,7 +497,8 @@ export function RegistryServerRow({
                   <MoreHorizontal className="size-4" />
                 </Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" onClick={stop}>
+              {/* As wide as its longest item: no item wraps onto two lines. */}
+              <DropdownMenuContent align="end" className="w-max" onClick={stop}>
                 <DropdownMenuItem onSelect={() => void testConnection()}>
                   {t("Test connection")}
                 </DropdownMenuItem>

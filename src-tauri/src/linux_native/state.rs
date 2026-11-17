@@ -170,7 +170,7 @@ impl ActivitySnapshot {
                         .get("error")
                         .and_then(serde_json::Value::as_str)
                         .filter(|value| !value.is_empty())
-                        .map(activity_error_summary),
+                        .map(activity_error_text),
                     pii_replaced: entry.get("piiReplaced").and_then(serde_json::Value::as_u64),
                     pii_incomplete: entry
                         .get("piiIncomplete")
@@ -294,19 +294,16 @@ pub(super) fn format_token_count(tokens: u64) -> String {
     }
 }
 
-fn activity_error_summary(error: &str) -> String {
-    const MAX_CHARS: usize = 180;
-    let readable = serde_json::from_str::<serde_json::Value>(error)
+/// A failed call's error, read out of a JSON body when it is one. The whole
+/// text: the expanded row wraps it, as React shows `error` in full (the audit
+/// log already bounds its length).
+fn activity_error_text(error: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(error)
         .ok()
         .and_then(|value| activity_error_message(&value).map(str::to_string))
-        .unwrap_or_else(|| error.to_string());
-    let collapsed = readable.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= MAX_CHARS {
-        return collapsed;
-    }
-    let mut summary = collapsed.chars().take(MAX_CHARS).collect::<String>();
-    summary.push('…');
-    summary
+        .unwrap_or_else(|| error.to_string())
+        .trim()
+        .to_string()
 }
 
 fn activity_error_message(value: &serde_json::Value) -> Option<&str> {
@@ -1575,15 +1572,14 @@ mod tests {
     }
 
     #[test]
-    fn activity_errors_are_single_line_and_bounded_for_cards() {
+    fn activity_errors_keep_their_whole_text_for_the_expanded_row() {
         let error = format!("first line\n{}", "private-ish detail ".repeat(30));
-        let summary = activity_error_summary(&error);
+        let text = activity_error_text(&error);
 
-        assert!(!summary.contains('\n'));
-        assert!(summary.chars().count() <= 181);
-        assert!(summary.ends_with('…'));
+        assert_eq!(text, error.trim());
+        assert!(!text.ends_with('…'));
         assert_eq!(
-            activity_error_summary(r#"{"errors":[{"message":"Authentication error"}]}"#),
+            activity_error_text(r#"{"errors":[{"message":"Authentication error"}]}"#),
             "Authentication error"
         );
     }

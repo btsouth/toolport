@@ -2300,11 +2300,12 @@ impl ServerPage {
                 }
             }
             state::RegistryState::FirstRun => {
+                // A new user who skipped setup has no registry file yet: the
+                // same empty list as an empty registry, as React shows.
                 self.clear_server_list();
                 *self.last_snapshot.borrow_mut() = None;
                 self.reset_summary();
-                l10n::bind_text(&self.section_title, "Servers");
-                self.list.append(&self.empty_servers(crate::i18n::msg("Toolport is ready for setup"), crate::i18n::msg("Use Add server for a custom endpoint or open Catalog for a curated starting point. Valid servers turn on. Missing setup inputs stay off.")));
+                self.show_no_servers();
             }
             state::RegistryState::Unavailable(cause) => {
                 self.clear_server_list();
@@ -2335,6 +2336,20 @@ impl ServerPage {
                 ));
             }
         }
+    }
+
+    /// The empty list, with or without a registry file yet. The empty state is
+    /// the whole list, as in React: no group heading.
+    fn show_no_servers(&self) {
+        self.server_count.set_visible(false);
+        self.show_posture(None);
+        self.section_title.set_visible(false);
+        self.list.append(&self.empty_servers(
+            crate::i18n::msg("No servers yet"),
+            crate::i18n::msg(
+                "Connect a local command or a remote endpoint once; every client gets it.",
+            ),
+        ));
     }
 
     fn empty_servers(&self, title: &'static str, body: &'static str) -> gtk::Box {
@@ -2416,17 +2431,8 @@ impl ServerPage {
         self.off_heading.borrow_mut().take();
         l10n::bind_text(&self.section_title, "Servers");
         if snapshot.servers.is_empty() {
-            self.server_count.set_visible(false);
             self.clear_server_list();
-            self.show_posture(None);
-            // The empty state is the whole list, as in React: no group heading.
-            self.section_title.set_visible(false);
-            self.list.append(&self.empty_servers(
-                crate::i18n::msg("No servers yet"),
-                crate::i18n::msg(
-                    "Connect a local command or a remote endpoint once; every client gets it.",
-                ),
-            ));
+            self.show_no_servers();
             return;
         }
         self.section_title.set_visible(true);
@@ -4829,29 +4835,45 @@ impl ActivityPage {
         security_list.set_focusable(true);
         page.append(&security_list);
 
-        // Savings, when React shows them.
+        // Savings, when React shows them: a card with a green leading bar, its
+        // number in green, then Share and how it is measured, as React's banner.
         let savings_banner = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        savings_banner.add_css_class("toolport-card");
+        savings_banner.add_css_class("toolport-savings-card");
         savings_banner.set_visible(false);
-        let savings_header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let savings_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let savings_icon = gtk::Image::from_icon_name("starred-symbolic");
+        savings_icon.add_css_class("success");
+        savings_header.append(&savings_icon);
         let savings_title = gtk::Label::builder()
             .halign(gtk::Align::Start)
             .hexpand(true)
-            .css_classes(["heading"])
+            .css_classes(["toolport-savings-title"])
             .build();
         savings_header.append(&savings_title);
-        let savings_share = l10n::button("Share");
+        let savings_share = {
+            let button = gtk::Button::new();
+            let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            content.append(
+                &gtk::Image::builder()
+                    .icon_name("emblem-shared-symbolic")
+                    .pixel_size(14)
+                    .build(),
+            );
+            content.append(&l10n::label("Share"));
+            button.set_child(Some(&content));
+            button
+        };
         savings_share.add_css_class("toolport-secondary-action");
-        savings_share.set_valign(gtk::Align::Center);
+        savings_share.add_css_class("toolport-savings-share");
+        savings_share.set_halign(gtk::Align::Start);
         savings_share.set_tooltip_text(Some(&crate::i18n::tr(
             "Copy a shareable savings line to the clipboard",
         )));
-        savings_header.append(&savings_share);
         savings_banner.append(&savings_header);
         let savings_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         let savings_value = gtk::Label::builder()
             .halign(gtk::Align::Start)
-            .css_classes(["title-2"])
+            .css_classes(["toolport-savings-value"])
             .build();
         savings_row.append(&savings_value);
         let savings_unit = {
@@ -4860,6 +4882,7 @@ impl ActivityPage {
                     "tokens of tool definitions kept out of agent context",
                 ))
                 .halign(gtk::Align::Fill)
+                .hexpand(true)
                 .xalign(0.0)
                 .valign(gtk::Align::End)
                 .wrap(true)
@@ -4891,6 +4914,7 @@ impl ActivityPage {
             .css_classes(["toolport-muted", "caption"])
             .build();
         savings_banner.append(&savings_old_estimate);
+        savings_banner.append(&savings_share);
         let savings_counting = {
             let widget = gtk::Expander::builder()
                 .expanded(false)
@@ -4949,7 +4973,7 @@ impl ActivityPage {
         let identity_list = gtk::Box::new(gtk::Orientation::Vertical, 10);
         identity_panel.append(&identity_list);
         let identity_expander = activity_panel(
-            "fingerprint-symbolic",
+            "auth-fingerprint-symbolic",
             crate::i18n::msg("Tool identities"),
             &identity_count,
             crate::i18n::msg("What each model-visible tool name actually maps to: its source server and profiles, the pinned definition fingerprint drift detection checks against, and when it was first seen or last changed. Prefixing helps the model pick a tool; this helps you verify what crossed the boundary."),
@@ -5029,12 +5053,13 @@ impl ActivityPage {
         stats_hint.add_css_class("caption");
         stats_table.append(&stats_hint);
         let stats_expander = gtk::Expander::new(None);
+        stats_expander.set_expanded(true);
         stats_expander.set_label_widget(Some(&stats_title));
         stats_expander.set_child(Some(&stats_table));
         stats_box.append(&stats_expander);
         page.append(&stats_box);
 
-        // Recent calls and approvals: collapsed, with its count line shown either way.
+        // Recent calls and approvals: open, with its count line shown either way.
         let recent_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
         recent_box.set_visible(false);
         let recent_title = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -5049,8 +5074,8 @@ impl ActivityPage {
         recent_content.set_margin_top(8);
         let filter_count = activity_count_label();
         recent_content.append(&filter_count);
-        // Wraps below 480 px instead of widening the page.
-        let filter_row = wrapping_actions();
+        // A plain row, as React's: the filters, then Filtered at the right end.
+        let filter_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let filter_server = gtk::DropDown::from_strings(&[&crate::i18n::tr("All servers")]);
         quiet_tooltips::guard_dropdown(&filter_server);
         filter_server.add_css_class("toolport-input");
@@ -5084,26 +5109,27 @@ impl ActivityPage {
         });
         filter_server.set_factory(Some(&factory));
         filter_server.set_list_factory(Some(&details::checked_list_factory()));
-        filter_row.insert(&filter_server, -1);
+        filter_row.append(&filter_server);
         let errors_only = gtk::ToggleButton::new();
         l10n::bind_button(errors_only.upcast_ref(), "Errors only");
         errors_only.add_css_class("toolport-secondary-action");
         errors_only.add_css_class("toolport-activity-filter");
         errors_only.set_valign(gtk::Align::Center);
-        filter_row.insert(&errors_only, -1);
+        filter_row.append(&errors_only);
         let filtered_label = l10n::label("Filtered");
         filtered_label.set_hexpand(true);
         filtered_label.set_halign(gtk::Align::End);
         filtered_label.set_visible(false);
         filtered_label.add_css_class("toolport-muted");
         filtered_label.add_css_class("caption");
-        filter_row.insert(&filtered_label, -1);
+        filter_row.append(&filtered_label);
         recent_content.append(&filter_row);
         // Holds the call rows as one row group, or a single state card.
         let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
         list.set_overflow(gtk::Overflow::Hidden);
         recent_content.append(&list);
         let recent_expander = gtk::Expander::new(None);
+        recent_expander.set_expanded(true);
         recent_expander.set_label_widget(Some(&recent_title));
         recent_expander.set_child(Some(&recent_content));
         recent_box.append(&recent_expander);
@@ -6560,6 +6586,10 @@ fn activity_count_label() -> gtk::Label {
 /// A panel's heading line: icon, name and an optional count badge.
 fn activity_panel_title(icon: &str, source: &'static str, count: Option<&gtk::Label>) -> gtk::Box {
     let title = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    // Clear of an expander's arrow, which sits right before the title.
+    if count.is_some() {
+        title.set_margin_start(6);
+    }
     let image = gtk::Image::from_icon_name(icon);
     image.add_css_class("toolport-muted");
     title.append(&image);
@@ -8449,15 +8479,23 @@ fn stat_cells(stat: &serde_json::Value) -> [String; 4] {
 }
 
 fn stat_line(name: &impl IsA<gtk::Widget>, cells: &[gtk::Label]) -> gtk::Box {
-    let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    // Equal columns, the server spanning two, so every row and the header line
+    // up and the numbers spread across the table as in React's.
+    let grid = gtk::Grid::builder()
+        .column_homogeneous(true)
+        .column_spacing(8)
+        .hexpand(true)
+        .build();
     name.set_hexpand(true);
-    line.append(name);
-    for cell in cells {
+    grid.attach(name, 0, 0, 2, 1);
+    for (column, cell) in (2..).zip(cells) {
         cell.set_size_request(STAT_COLUMN_WIDTH, -1);
         cell.set_xalign(1.0);
         cell.add_css_class("toolport-stat-metrics");
-        line.append(cell);
+        grid.attach(cell, column, 0, 1, 1);
     }
+    line.append(&grid);
     line
 }
 
@@ -8545,6 +8583,7 @@ fn server_stat_row(
     };
     let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
     card.add_css_class("toolport-card");
+    card.add_css_class("toolport-stat-server");
     let tools = stat
         .get("tools")
         .and_then(serde_json::Value::as_array)
@@ -10749,7 +10788,7 @@ fn summary_item(value: &str, label: &'static str) -> (gtk::Box, gtk::Label) {
     let value = gtk::Label::builder()
         .label(value)
         .halign(gtk::Align::Start)
-        .css_classes(["title-3"])
+        .css_classes(["title-3", "toolport-summary-value"])
         .build();
     item.append(&value);
     item.append(&{
@@ -11692,6 +11731,19 @@ l10n::bind_dialog_response(&dialog, "enable", "Enable");
         trailing.append(&toggle);
     }
     let actions = server_actions(server, page, true);
+    // Text items, as React's row menu and the header menu; the details page's
+    // action buttons keep their icons.
+    let mut item = actions.first_child();
+    while let Some(button) = item {
+        if let Some(icon) = button
+            .first_child()
+            .and_then(|row| row.first_child())
+            .filter(|icon| icon.is::<gtk::Image>())
+        {
+            icon.set_visible(false);
+        }
+        item = button.next_sibling();
+    }
     let popover = gtk::Popover::new();
     popover.add_css_class("toolport-action-menu");
     popover.add_css_class("toolport-menu");
@@ -11731,7 +11783,7 @@ l10n::bind_dialog_response(&dialog, "enable", "Enable");
         scroll.set_max_content_height((room - 32).max(64));
     });
     let menu = gtk::MenuButton::builder()
-        .icon_name("view-more-symbolic")
+        .icon_name("view-more-horizontal-symbolic")
         .tooltip_text(crate::i18n::trf(
             "Actions for {value0}",
             &[("value0", &server.name.to_string())],
@@ -11786,6 +11838,13 @@ fn server_actions(server: &state::ServerView, page: ServerPage, include_details:
     let server_for_test = server.clone();
     let page_for_test = page.clone();
     test.connect_clicked(move |button| {
+        // From the row menu, the menu closes as it does for every other item.
+        if let Some(menu) = button
+            .ancestor(gtk::Popover::static_type())
+            .and_downcast::<gtk::Popover>()
+        {
+            menu.popdown();
+        }
         test_server_connection(&server_for_test, button, page_for_test.clone());
     });
     actions.append(&test);
