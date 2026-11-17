@@ -129,7 +129,7 @@ fn find_class(root: &gtk::Widget, class: &str) -> Option<gtk::Widget> {
     None
 }
 
-fn find_named(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
+pub(super) fn find_named(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
     if root.widget_name() == name {
         return Some(root.clone());
     }
@@ -1588,16 +1588,7 @@ mod tests {
                 .filter_map(|w| w.downcast_ref::<gtk::Label>())
                 .any(|l| l.text() == "Old credential failure")
         );
-        let editor = adw::Window::new();
-        finish_credential_update(
-            Ok(Ok(registry)),
-            "b5-credential",
-            &page,
-            &editor,
-            &gtk::Label::new(None),
-            &gtk::Button::new(),
-            "Updated",
-        );
+        finish_credential_update(Ok(Ok(registry)), "b5-credential", &page).unwrap();
         assert!(
             page.health.borrow().is_checking("b5-credential"),
             "credential completion schedules a probe even with an identical registry"
