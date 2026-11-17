@@ -78,8 +78,21 @@ export function withParity<P>(
       if (found.error !== undefined) throw new Error(found.error);
       return structuredClone(found.result);
     }
-    log.calls.push({ cmd: command, args, source: "fixture" });
-    const result = handler(command, payload);
+    const call: ParityLog["calls"][number] = { cmd: command, args, source: "fixture" };
+    log.calls.push(call);
+    let result: unknown;
+    try {
+      result = handler(command, payload);
+    } catch (error) {
+      // The default fixture throws for commands it does not implement: that is
+      // a missing answer, which must fail the run even if the screen recovers.
+      if (
+        error instanceof Error &&
+        error.message.startsWith("Unimplemented fixture command")
+      )
+        call.source = "missing";
+      throw error;
+    }
     if (result instanceof Promise) {
       log.pending += 1;
       const done = () => {

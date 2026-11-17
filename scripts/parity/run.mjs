@@ -150,12 +150,21 @@ function runGtkTest(testName, extraEnv) {
         cwd: path.join(root, "src-tauri"),
         env: { ...gtkEnv, ...extraEnv },
         stdio: ["ignore", "pipe", "pipe"],
+        // Its own process group, so the deadline stops dbus-run-session and
+        // the GTK test too, not only xvfb-run.
+        detached: true,
       },
     );
     let output = "";
     child.stdout.on("data", (chunk) => (output += chunk));
     child.stderr.on("data", (chunk) => (output += chunk));
-    const timer = setTimeout(() => child.kill("SIGKILL"), 120_000);
+    const timer = setTimeout(() => {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
+    }, 120_000);
     child.on("close", (status) => {
       clearTimeout(timer);
       resolve({ ok: status === 0 && /test result: ok\. 1 passed/.test(output), output });
@@ -333,12 +342,15 @@ const report = {
   stale,
   problems,
 };
-const text = formatReport(report);
+// Problems go into the saved report too: the file is what gets fetched and
+// read, and it must not look clean when the run was not.
+const text =
+  formatReport(report) +
+  (problems.length
+    ? `\n\nThe parity tool could not finish cleanly:\n- ${problems.join("\n- ")}`
+    : "");
 await writeFile(path.join(out, "report.json"), JSON.stringify(report, null, 2));
 await writeFile(path.join(out, "report.txt"), `${text}\n`);
 console.log(text);
-if (problems.length) {
-  console.log(`\nThe parity tool could not finish cleanly:\n- ${problems.join("\n- ")}`);
-}
 say(`\nReport: ${path.relative(root, path.join(out, "report.txt"))} (and report.json)`);
 process.exit(problems.length ? 1 : 0);

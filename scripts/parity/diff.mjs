@@ -113,6 +113,16 @@ function hunkEntries(base, gtkRun, reactRun) {
       gtk: node.value,
       react: other.value,
     });
+    // A renamed switch: still compare whether it is on, or a known label
+    // difference would hide a state difference.
+    if (node.on !== undefined && other.on !== undefined && node.on !== other.on)
+      out.push({
+        ...base,
+        type: "state",
+        kind: node.kind,
+        gtk: `${node.value}: ${node.on ? "on" : "off"}`,
+        react: `${other.value}: ${other.on ? "on" : "off"}`,
+      });
     // A renamed menu: still compare what is in it.
     if (node.kind === "menu") {
       const { onlyGtk, onlyReact } = itemDiff(node.items, other.items);

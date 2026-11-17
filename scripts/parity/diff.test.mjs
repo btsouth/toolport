@@ -105,6 +105,28 @@ test("a renamed menu still has its items compared", () => {
   );
 });
 
+test("a renamed switch still has its state compared", () => {
+  const opposite = diffNodes(
+    [{ region: "row:a", kind: "switch", value: "Disable A", on: true }],
+    [{ region: "row:a", kind: "switch", value: "Toggle A", on: false }],
+  );
+  assert.deepEqual(
+    opposite.map((entry) => [entry.type, entry.gtk, entry.react]),
+    [
+      ["changed", "Disable A", "Toggle A"],
+      ["state", "Disable A: on", "Toggle A: off"],
+    ],
+  );
+  const same = diffNodes(
+    [{ region: "row:a", kind: "switch", value: "Disable A", on: true }],
+    [{ region: "row:a", kind: "switch", value: "Toggle A", on: true }],
+  );
+  assert.deepEqual(
+    same.map((entry) => entry.type),
+    ["changed"],
+  );
+});
+
 test("identical extractions have no differences", () => {
   const nodes = [
     text("Servers", "header"),
