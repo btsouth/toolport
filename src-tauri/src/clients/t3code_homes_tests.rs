@@ -470,3 +470,99 @@ fn a_deleted_grok_or_pi_home_stays_deleted() {
             .all(|(id, _)| !row.id.contains(id.as_str())));
     }
 }
+
+/// Connect `id`, let `edit` change Toolport's entry the way the provider does, then
+/// Disconnect: the entry leaves and the file is as it was before Connect, byte for byte.
+fn provider_edit_then_disconnect(id: &str, path: &Path, edit: impl FnOnce(&str) -> String) {
+    let original = read(path);
+    install_gateway_for(id, None, None).unwrap();
+    let edited = edit(&read(path));
+    assert_ne!(edited, read(path), "the edit changed nothing");
+    std::fs::write(path, &edited).unwrap();
+    assert_eq!(
+        detect_client(id).unwrap().entry_state,
+        GatewayEntryState::Managed
+    );
+    let outcome = uninstall_gateway(id).unwrap();
+    assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+    assert_eq!(read(path), original);
+}
+
+#[test]
+fn a_setting_pi_saves_straight_after_connect_leaves_with_the_entry() {
+    let fx = Fixture::new("t3-homes-pi-direct");
+    let path = fx.folder("pi").join("mcp.json");
+    std::fs::write(
+        &path,
+        "{\n  \"autoEnableCodemode\": true,\n  \"mcpServers\": {}\n}\n",
+    )
+    .unwrap();
+    let row = fx.row("pi");
+    // Connect, Pi turns Toolport off, Disconnect: no Toolport rewrite in between.
+    provider_edit_then_disconnect(&row.id, &path, |text| {
+        let mut doc: serde_json::Value = serde_json::from_str(text).unwrap();
+        doc["mcpServers"]["toolport"]["enabled"] = serde_json::json!(false);
+        serde_json::to_string_pretty(&doc).unwrap()
+    });
+}
+
+#[test]
+fn a_nested_pi_setting_changed_after_a_rewrite_leaves_with_the_entry() {
+    let fx = Fixture::new("t3-homes-pi-nested");
+    let path = fx.folder("pi").join("mcp.json");
+    let original = "{\n  \"autoEnableCodemode\": true,\n  \"mcpServers\": {}\n}\n";
+    std::fs::write(&path, original).unwrap();
+    let row = fx.row("pi");
+    install_gateway_for(&row.id, None, None).unwrap();
+    let mut doc = json(&path);
+    doc["mcpServers"]["toolport"]["toolExposure"] =
+        serde_json::json!({"toolport_search_tools": "direct"});
+    std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+    // An access change rewrites the entry and carries Pi's setting.
+    install_gateway_for(&row.id, None, None).unwrap();
+    let mut doc = json(&path);
+    assert_eq!(
+        doc["mcpServers"]["toolport"]["toolExposure"]["toolport_search_tools"],
+        "direct"
+    );
+    // Pi changes one tool's exposure in place.
+    doc["mcpServers"]["toolport"]["toolExposure"]["toolport_search_tools"] =
+        serde_json::json!("codemode");
+    std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+    let outcome = uninstall_gateway(&row.id).unwrap();
+    assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+    assert_eq!(read(&path), original);
+}
+
+#[test]
+fn the_ordinary_pi_row_drops_its_settings_with_the_entry_too() {
+    let fx = Fixture::new("t3-homes-pi-main");
+    let folder = fx.home.join(".pi/agent");
+    std::fs::create_dir_all(&folder).unwrap();
+    let path = folder.join("mcp.json");
+    std::fs::write(&path, "{\n  \"mcpServers\": {}\n}\n").unwrap();
+    provider_edit_then_disconnect("pi", &path, |text| {
+        let mut doc: serde_json::Value = serde_json::from_str(text).unwrap();
+        doc["mcpServers"]["toolport"]["enabled"] = serde_json::json!(false);
+        doc["mcpServers"]["toolport"]["toolExposure"] =
+            serde_json::json!({"toolport_search_tools": "direct"});
+        serde_json::to_string_pretty(&doc).unwrap()
+    });
+}
+
+#[test]
+fn connecting_through_the_review_keeps_pis_settings() {
+    let fx = Fixture::new("t3-homes-pi-review");
+    let path = fx.folder("pi").join("mcp.json");
+    let row = fx.row("pi");
+    install_gateway_for(&row.id, None, None).unwrap();
+    let mut doc = json(&path);
+    doc["mcpServers"]["toolport"]["enabled"] = serde_json::json!(false);
+    doc["mcpServers"]["toolport"]["exposure"] = serde_json::json!("direct");
+    std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+    let revision = setup_revision(&row.id).unwrap();
+    migrate_reviewed(&row.id, None, &[], &revision, || Ok(())).unwrap();
+    let after = json(&path);
+    assert_eq!(after["mcpServers"]["toolport"]["enabled"], false);
+    assert_eq!(after["mcpServers"]["toolport"]["exposure"], "direct");
+}

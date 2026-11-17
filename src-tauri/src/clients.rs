@@ -492,10 +492,10 @@ impl CodexValue {
     }
 }
 
-/// Codex, including a Codex home added as a location (`codex@<key>`).
 /// Keys a client itself saves into a server's entry, which it edits in place: Pi's
 /// `enabled` switch and how its tools are exposed and kept running. A rewrite of
-/// Toolport's entry keeps them, and they never make the entry count as changed by hand.
+/// Toolport's entry keeps them, they never make the entry count as changed by hand,
+/// and Disconnect takes them out with the entry.
 fn client_entry_settings(client_id: &str) -> &'static [&'static str] {
     match client_id.split('@').next().unwrap_or(client_id) {
         "pi" => &[
@@ -545,6 +545,7 @@ fn with_client_settings(
     entry
 }
 
+/// Codex, including a Codex home added as a location (`codex@<key>`).
 fn is_codex_client(client_id: &str) -> bool {
     client_id == "codex" || client_id.starts_with("codex@")
 }
@@ -10048,7 +10049,13 @@ pub(crate) fn migrate_reviewed(
             let backup = backup_file(client_id, &path)?;
             moved::record_selected(client_id, def.format, &path, names)?;
             moved::remove_selected(def.format, &path, names)?;
-            let entry = gateway_entry(profile, client_id)?;
+            // Settings the client saved in the entry it replaces stay, as on Connect.
+            let entry = with_client_settings(
+                client_id,
+                def.format,
+                &path,
+                &gateway_entry(profile, client_id)?,
+            );
             edit_format(
                 def.format,
                 &path,
