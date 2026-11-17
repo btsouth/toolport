@@ -99,6 +99,9 @@ describe("Servers header catalog entry point", () => {
 describe("Servers empty state import count", () => {
   it("counts distinct connections across clients, not names", async () => {
     getRegistry.mockResolvedValue({ ...registryWithServer(), servers: [] });
+    // No servers and no connected client would open the first-run wizard. It loads
+    // lazily, so it could open over the import review and hide it.
+    localStorage.setItem("toolport.onboarded", "1");
     const github = (url: string) => ({
       name: "github",
       transport: "http",
@@ -145,11 +148,7 @@ describe("Servers empty state import count", () => {
     importServers.mockResolvedValue(registryWithServer());
     const scans = detectClients.mock.calls.length;
     await userEvent.click(importButton);
-    // The review renders after its preview resolves; a loaded runner can take
-    // longer than the default second to get there, so wait as long as it needs.
-    await userEvent.click(
-      await screen.findByRole("button", { name: "Import 1 server" }, { timeout: 5000 }),
-    );
+    await userEvent.click(await screen.findByRole("button", { name: "Import 1 server" }));
     await waitFor(() => expect(importServers).toHaveBeenCalledWith(["connection:a"]));
     await waitFor(() => expect(detectClients.mock.calls.length).toBeGreaterThan(scans));
   });
