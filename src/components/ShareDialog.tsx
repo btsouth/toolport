@@ -791,7 +791,7 @@ async function setupFolder(): Promise<string | undefined> {
 }
 
 /** Chip labels: the name, plus the id when another server has the same name. */
-export function shareCheckLabels(servers: { id: string; name: string }[]): string[] {
+function shareCheckLabels(servers: { id: string; name: string }[]): string[] {
   return servers.map((s) =>
     servers.filter((other) => other.name === s.name).length > 1
       ? `${s.name} (${s.id})`
