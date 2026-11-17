@@ -113,16 +113,24 @@ else
   fail "$ASSET contains Toolport.app" "volume has: $(ls "$MNT" | tr '\n' ' ')"
 fi
 # The README tells users to drag the app to Applications: the dmg must offer
-# the drag target (scripts/macos-build-dmg.sh).
+# the drag target (scripts/macos-build-dmg.sh). Releases before 2.3.6 had no
+# such layout, so the previous release is only noted, never failed, on it.
+layout_check() {
+  if [[ -n "${PREVIOUS_TAG:-}" && "$TAG" == "$PREVIOUS_TAG" ]]; then
+    untested "$1" "the previous release ($TAG) is not under test: $2"
+  else
+    fail "$1" "$2"
+  fi
+}
 if [[ "$(readlink "$MNT/Applications")" == /Applications ]]; then
   pass "$ASSET has an Applications shortcut"
 else
-  fail "$ASSET has an Applications shortcut" "absent: the dmg window shows only Toolport.app, with no drag target"
+  layout_check "$ASSET has an Applications shortcut" "absent: the dmg window shows only Toolport.app, with no drag target"
 fi
 if [[ -f "$MNT/.background/background.tiff" ]]; then
   pass "$ASSET has its drag-to-install background"
 else
-  fail "$ASSET has its drag-to-install background" "no .background/background.tiff"
+  layout_check "$ASSET has its drag-to-install background" "no .background/background.tiff"
 fi
 
 if [[ $INSTALL -eq 1 ]]; then

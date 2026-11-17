@@ -4,6 +4,7 @@
 usage:
   clients.py seed <home> <manifest.json>
   clients.py check <home> <manifest.json> <entries-dir> [--not-connected] [--registry=<registry.json>]
+                    [--previous=<tag>]
   clients.py restored <home> <manifest.json>
   clients.py unchanged <home> <before-manifest.json>
 
@@ -475,7 +476,105 @@ def check(home, manifest_path, entries_dir, expect_connected=True, registry=None
     return rows
 
 
-def compare(home, manifest_path, label):
+# The repairs an upgrade to 2.3.7 makes to Toolport's own entry on its first start.
+# Each is allowed only when the new file shows it, and nothing else may change:
+# - the `type` these clients document as required, added when it is missing (#1340);
+# - the gateway path written in canonical form (#1340);
+# - Codex only: the gateway settings Toolport writes when the user has not set them
+#   or an alias for them (`CODEX_GATEWAY_SETTINGS` in clients.rs, #1336), with
+#   exactly the values Toolport writes;
+# - `TOOLPORT_ATTRIBUTION_ID` set to the client's own id, added to the entry's env
+#   when Toolport rewrites the entry (#1104).
+REPAIRED_TYPES = {"cursor": "stdio", "vscode": "stdio", "github-copilot-cli": "local"}
+ATTRIBUTION_ID = "TOOLPORT_ATTRIBUTION_ID"
+CODEX_SETTINGS = [
+    ("supports_parallel_tool_calls", (), True),
+    ("startup_timeout_sec", ("startup_timeout_ms",), 75),
+    ("tool_timeout_sec", (), 600),
+]
+
+
+def comments(fmt, text):
+    """The comments in a TOML or JSONC file, in order, which parsing drops."""
+    if fmt.startswith("toml"):
+        marks = ("#",)
+    elif fmt.startswith("jsonc"):
+        marks = ("//", "/*")
+    else:
+        return []
+    found = []
+    for line in text.splitlines():
+        quoted = escaped = False
+        for i, ch in enumerate(line):
+            if escaped:
+                escaped = False
+            elif ch == "\\" and quoted:
+                escaped = True
+            elif ch == '"':
+                quoted = not quoted
+            elif not quoted and line.startswith(marks, i):
+                found.append(line[i:].strip())
+                break
+    return found
+
+
+def upgrade_repairs(cid, before_path, after_path):
+    """The repairs that turn the config at before_path into the one at after_path,
+    or None when anything else changed (or either file cannot be read)."""
+    import copy
+
+    client = BY_ID.get(cid)
+    if client is None or client["format"] not in USER_TABLES:
+        return None
+    try:
+        before, after = load(client, before_path), load(client, after_path)
+        with open(before_path, encoding="utf-8") as f, open(after_path, encoding="utf-8") as g:
+            # Parsing drops comments; the user's must all still be there.
+            if comments(client["format"], f.read()) != comments(client["format"], g.read()):
+                return None
+    except Exception:
+        return None
+    table = USER_TABLES[client["format"]]
+    expected = copy.deepcopy(before)
+    entry = ((expected or {}).get(table) or {}).get("toolport")
+    new = ((after or {}).get(table) or {}).get("toolport") if isinstance(after, dict) else None
+    if not isinstance(entry, dict) or not isinstance(new, dict):
+        return None
+    repairs = []
+    kind = REPAIRED_TYPES.get(cid)
+    if kind and "type" not in entry and new.get("type") == kind:
+        entry["type"] = kind
+        repairs.append(f'added type "{kind}"')
+    command = entry.get("command")
+    if (
+        isinstance(command, str)
+        and os.path.isabs(command)
+        and os.path.normpath(command) != command
+        and new.get("command") == os.path.normpath(command)
+    ):
+        entry["command"] = os.path.normpath(command)
+        repairs.append(f"gateway path made canonical ({entry['command']})")
+    if client["format"] == "toml-codex":
+        for key, aliases, value in CODEX_SETTINGS:
+            if any(k in entry for k in (key, *aliases)) or key not in new:
+                continue
+            if new[key] == value and type(new[key]) is type(value):
+                entry[key] = value
+                repairs.append(f"{key} = {str(value).lower()} added")
+    env, new_env = entry.get("env"), new.get("env")
+    if (
+        isinstance(new_env, dict)
+        and new_env.get(ATTRIBUTION_ID) == cid
+        and (env is None or (isinstance(env, dict) and ATTRIBUTION_ID not in env))
+    ):
+        entry.setdefault("env", {})[ATTRIBUTION_ID] = cid
+        repairs.append(f"{ATTRIBUTION_ID} added")
+    if not repairs or expected != after:
+        return None
+    return repairs
+
+
+def compare(home, manifest_path, label, allow_upgrade_repairs=False):
     with open(manifest_path, encoding="utf-8") as f:
         manifest = json.load(f)
     originals = os.path.splitext(manifest_path)[0] + "-originals"
@@ -502,10 +601,19 @@ def compare(home, manifest_path, label):
             except OSError as e:
                 rows.append(row("clients", "FAIL", f"{name} {label}", f"{path} differs; no diff: {e}"))
                 continue
+            repairs = upgrade_repairs(cid, os.path.join(originals, cid), path) if allow_upgrade_repairs else None
+            if repairs:
+                rows.append(row("clients", "PASS", f"{name} {label}", "only Toolport's entry was repaired: " + "; ".join(repairs)))
+                continue
             import difflib
 
             diff = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), "before", "after", n=0))
-            rows.append(row("clients", "FAIL", f"{name} {label}", f"{path} differs: {diff[:300]}"))
+            # The detail is cut short; keep the whole changed file with the evidence.
+            kept = os.path.splitext(manifest_path)[0] + "-changed"
+            os.makedirs(kept, exist_ok=True)
+            shutil.copyfile(path, os.path.join(kept, cid))
+            detail = f"{path} differs (whole file: {os.path.basename(kept)}/{cid}): {diff[:300]}"
+            rows.append(row("clients", "FAIL", f"{name} {label}", detail))
     return rows
 
 
@@ -525,6 +633,19 @@ def snapshot(manifest_path, out_path):
     return []
 
 
+def as_previous_release(rows, tag):
+    """The previous release only sets up an upgrade and is not under test: what
+    it gets wrong is noted as UNTESTED, never a FAIL. Tool calls through the
+    entries it wrote are checked separately and still fail."""
+    out = []
+    for r in rows:
+        area, status, check_name, detail = (r.split("\t", 3) + ["", "", "", ""])[:4]
+        if status == "FAIL":
+            r = row(area, "UNTESTED", check_name, f"the previous release ({tag}) is not under test: {detail}")
+        out.append(r)
+    return out
+
+
 def main(argv):
     if len(argv) < 4:
         print(__doc__, file=sys.stderr)
@@ -538,12 +659,15 @@ def main(argv):
             return 2
         reg = next((a.split("=", 1)[1] for a in argv if a.startswith("--registry=")), None)
         rows = check(home, manifest, argv[4], "--not-connected" not in argv, reg)
+        previous = next((a.split("=", 1)[1] for a in argv if a.startswith("--previous=")), None)
+        if previous:
+            rows = as_previous_release(rows, previous)
     elif cmd == "restored":
         rows = compare(home, manifest, "config restored byte-exact")
     elif cmd == "unchanged":
-        rows = compare(home, manifest, "config untouched by the upgrade")
+        rows = compare(home, manifest, "config untouched by the upgrade", allow_upgrade_repairs=True)
     elif cmd == "updated":
-        rows = compare(home, manifest, "config untouched by the in-app update")
+        rows = compare(home, manifest, "config untouched by the in-app update", allow_upgrade_repairs=True)
     elif cmd == "snapshot":
         rows = snapshot(manifest, argv[4] if len(argv) > 4 else manifest)
     else:
