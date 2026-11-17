@@ -56,6 +56,8 @@ impl From<&str> for Completion {
 /// React's dialog width (`sm:max-w-lg`), for the review, its result and its prompts.
 const REVIEW_WIDTH: i32 = 512;
 
+/// The room a dialog leaves around it in the window it opens over, 16px each side, as
+/// React's `max-w-[calc(100%-2rem)]` and `max-h-[calc(100dvh-2rem)]`.
 const DIALOG_MARGIN: i32 = 32;
 
 /// A dialog's width as React sizes it: `width`, but never wider than the window it
@@ -67,101 +69,112 @@ fn dialog_width(parent: &impl IsA<gtk::Window>, width: i32) -> i32 {
         _ => width,
     }
 }
+/// The tallest the review's body grows before it scrolls when the window it opens over
+/// has no size yet.
+const REVIEW_MAX_BODY_HEIGHT: i32 = 600;
+/// The least the review's body keeps in a window too short for it, about one server
+/// row; the dialog then runs past the window rather than show no body at all.
+const REVIEW_MIN_BODY_HEIGHT: i32 = 72;
 
-fn track_review_bounds(
+/// Keeps the review inside the window it opens over, as React's dialog is with
+/// `max-h-[calc(100dvh-2rem)]`, and follows that window as it is resized. GTK has no
+/// such cap: a dialog window takes its content's natural height, however tall.
+///
+/// The cap goes on the body's scroller: the window's height less the margin, header
+/// and footer. While the server list shows, the viewport gives the body only that
+/// height and the body's box takes the shortfall from the list, the one child that
+/// can shrink (labels and folds need their full height), so only the list scrolls. Without the list (a review that could not be read, the result page) the
+/// viewport gives the body its natural height and the whole body scrolls: at minimum
+/// heights a result page taller than the window would squeeze its rows.
+fn fit_review_to_parent(
+    parent: &gtk::Window,
+    content: &adw::Clamp,
+    scroller: &gtk::ScrolledWindow,
+    list: &gtk::ScrolledWindow,
+) {
+    let width = dialog_width(parent, REVIEW_WIDTH);
+    content.set_maximum_size(width);
+    content.set_tightening_threshold(width);
+    if let Some(root) = content.child() {
+        root.set_width_request(width);
+    }
+    if let Some(viewport) = scroller.child().and_downcast::<gtk::Viewport>() {
+        viewport.set_vscroll_policy(if list.get_visible() {
+            gtk::ScrollablePolicy::Minimum
+        } else {
+            gtk::ScrollablePolicy::Natural
+        });
+    }
+    let natural = |widget: &gtk::Widget| widget.measure(gtk::Orientation::Vertical, width).1;
+    let height = match parent.height() {
+        height if height > 0 => height,
+        _ => parent.default_height(),
+    };
+    let body_height = match content.child() {
+        Some(root) if height > 0 => {
+            let header_and_footer = natural(&root) - natural(scroller.upcast_ref());
+            height - DIALOG_MARGIN - header_and_footer
+        }
+        _ => REVIEW_MAX_BODY_HEIGHT,
+    };
+    scroller.set_max_content_height(body_height.max(REVIEW_MIN_BODY_HEIGHT));
+}
+
+/// Refits the review with [`fit_review_to_parent`] whenever the window it opens over
+/// changes size, until the review closes. The returned function refits it at once,
+/// for changes to the review itself such as its result page.
+fn track_parent_size(
     parent: &gtk::Window,
     dialog: &adw::Window,
-    entries: &gtk::ScrolledWindow,
-    details: &gtk::Expander,
-    notes: &[&gtk::Widget],
+    content: &adw::Clamp,
+    scroller: &gtk::ScrolledWindow,
+    list: &gtk::ScrolledWindow,
 ) -> std::rc::Rc<dyn Fn()> {
-    let (pw, dw, ew) = (parent.downgrade(), dialog.downgrade(), entries.downgrade());
-    let sync: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
-        let _ = (|| -> Option<()> {
-            let (p, d, e) = (pw.upgrade()?, dw.upgrade()?, ew.upgrade()?);
-            let clamp: adw::Clamp = d.content()?.downcast().ok()?;
-            let root: gtk::Box = clamp.child()?.downcast().ok()?;
-            let scroller: gtk::ScrolledWindow =
-                root.first_child()?.next_sibling()?.downcast().ok()?;
-            let body: gtk::Box = e.parent()?.downcast().ok()?;
-            let w = dialog_width(&p, REVIEW_WIDTH);
-            clamp.set_maximum_size(w);
-            clamp.set_tightening_threshold(w);
-            root.set_width_request(w);
-            let ph = match p.height() {
-                h if h > 0 => h,
-                _ => p.default_height(),
-            };
-            let max_h = match ph {
-                h if h > 0 => (h - DIALOG_MARGIN).max(160),
-                _ => 600,
-            };
-            let mv = |x: &gtk::Widget, fw: i32| x.measure(gtk::Orientation::Vertical, fw).1;
-            let cap =
-                (max_h - 2 - mv(&root.first_child()?, w) - mv(&root.last_child()?, w)).max(72);
-            scroller.set_max_content_height(cap);
-            if !e.is_visible() {
-                return Some(());
-            }
-            let (iw, mut n, mut oh, mut cur) = ((w - 48).max(1), 0, 0, body.first_child());
-            while let Some(c) = cur {
-                cur = c.next_sibling();
-                if c.is_visible() {
-                    n += 1;
-                    if c != e {
-                        let mut h = mv(&c, iw);
-                        if let Some(ex) = c.downcast_ref::<gtk::Expander>() {
-                            if ex.is_expanded() {
-                                let t = ex
-                                    .label_widget()
-                                    .and_then(|l| l.parent())
-                                    .map_or(0, |x| mv(&x, iw));
-                                h = h.max(t + ex.child().map_or(0, |x| mv(&x, iw)));
-                            }
-                        }
-                        oh += h;
-                    }
-                }
-            }
-            e.set_max_content_height((cap - 36 - (n - 1).max(0) * 16 - oh).max(48));
-            Some(())
-        })();
+    let (window, content, scroller, list) = (
+        parent.downgrade(),
+        content.downgrade(),
+        scroller.downgrade(),
+        list.downgrade(),
+    );
+    let fit: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+        if let (Some(parent), Some(content), Some(scroller), Some(list)) = (
+            window.upgrade(),
+            content.upgrade(),
+            scroller.upgrade(),
+            list.upgrade(),
+        ) {
+            fit_review_to_parent(&parent, &content, &scroller, &list);
+        }
     });
-    sync();
-    let po: gtk::glib::Object = parent.clone().upcast();
-    let mut watched = vec![
-        (details.clone().upcast(), "expanded"),
-        (po.clone(), "default-width"),
-        (po, "default-height"),
+    fit();
+    let mut sizes: Vec<(gtk::glib::Object, &str)> = vec![
+        (parent.clone().upcast(), "default-width"),
+        (parent.clone().upcast(), "default-height"),
     ];
-    for w in notes {
-        let o: gtk::glib::Object = (*w).clone().upcast();
-        watched.push((o.clone(), "visible"));
-        if w.is::<gtk::Label>() {
-            watched.push((o, "label"));
-        }
+    // A tiled or user-resized window changes its surface, not its default size.
+    if let Some(surface) = parent.surface() {
+        sizes.push((surface.clone().upcast(), "width"));
+        sizes.push((surface.upcast(), "height"));
     }
-    if let Some(s) = parent.surface().map(|s| s.upcast::<gtk::glib::Object>()) {
-        watched.extend([(s.clone(), "width"), (s, "height")]);
-    }
-    let ids = std::cell::RefCell::new(Vec::with_capacity(watched.len()));
-    for (obj, prop) in watched {
-        let s = sync.clone();
-        let id = obj.connect_notify_local(Some(prop), move |_, _| {
-            s();
-            let s2 = s.clone();
-            gtk::glib::idle_add_local_once(move || s2());
-        });
-        ids.borrow_mut().push((obj, id));
-    }
-    let s = sync.clone();
-    dialog.connect_realize(move |_| s());
+    let handlers: Vec<_> = sizes
+        .into_iter()
+        .map(|(object, property)| {
+            let fit = fit.clone();
+            // The new size reaches the window's allocation on its next layout.
+            let id = object.connect_notify_local(Some(property), move |_, _| {
+                let fit = fit.clone();
+                gtk::glib::idle_add_local_once(move || fit());
+            });
+            (object, id)
+        })
+        .collect();
+    let handlers = std::cell::RefCell::new(handlers);
     dialog.connect_destroy(move |_| {
-        for (o, id) in ids.borrow_mut().drain(..) {
-            o.disconnect(id);
+        for (object, id) in handlers.borrow_mut().drain(..) {
+            object.disconnect(id);
         }
     });
-    sync
+    fit
 }
 
 /// A credential counts once it has more than spaces, as React's prompt and the review's
@@ -1173,6 +1186,8 @@ pub(super) fn review_with_notice(
     scroller.set_widget_name("toolport-setup-scroller");
     root.append(&scroller);
     root.append(&super::dialog_footer(&[&cancel, &skip, &confirm]));
+    // React's 512px width, capped to a narrow window: never narrower than that, and
+    // long lines wrap instead of widening it.
     let width = dialog_width(parent, REVIEW_WIDTH);
     root.set_width_request(width);
     let clamp = adw::Clamp::builder()
@@ -1181,12 +1196,7 @@ pub(super) fn review_with_notice(
         .child(&root)
         .build();
     dialog.set_content(Some(&clamp));
-    let notes = [
-        missing_reason.upcast_ref(),
-        feedback.upcast_ref(),
-        skip.upcast_ref(),
-    ];
-    let sync_bounds = track_review_bounds(parent, &dialog, &entries, &details, &notes);
+    let refit = track_parent_size(parent, &dialog, &clamp, &scroller, &entries);
     {
         let (closing, skipped) = (dialog.clone(), skipped.clone());
         skip.connect_clicked(move |_| {
@@ -1297,7 +1307,7 @@ pub(super) fn review_with_notice(
             notice.clone(),
         );
         let (shown, keyboard, step_line) = (shown.clone(), keyboard.clone(), step_line.clone());
-        let (entries, sync_bounds) = (entries.clone(), sync_bounds.clone());
+        let (entries, refit) = (entries.clone(), refit.clone());
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || action(chosen, choices, inputs)).await;
             busy.set(false);
@@ -1512,7 +1522,7 @@ pub(super) fn review_with_notice(
                     // Return activates Next or Done without first tabbing through the
                     // results; the button was disabled while the step ran, which dropped
                     // focus and its ring.
-                    sync_bounds();
+                    refit();
                     focus_with_ring(&shown, &button, keyboard.get());
                     finished();
                 }
@@ -3214,7 +3224,22 @@ mod tests {
             "Config: /c\nBackup: /b",
             "Connect",
             true,
-            |_, _, _| Err("x".into()),
+            |_, _, _| {
+                Ok(Completion {
+                    servers: (0..40)
+                        .map(|i| crate::registry_controller::SetupServerResult {
+                            name: format!("srv-{i:02}"),
+                            tool_count: 3,
+                            credential_state: "none".into(),
+                        })
+                        .collect(),
+                    connect: Some(ConnectResult {
+                        client: "Claude Code".into(),
+                        config_path: "/c".into(),
+                    }),
+                    ..Completion::default()
+                })
+            },
             || {},
             None,
         );
@@ -3273,6 +3298,22 @@ mod tests {
         parent.set_default_size(480, 500);
         wait_for(&|| parent.height() <= 520 && win.height() <= parent.height() - 32);
         assert!(win.height() <= parent.height() - 32 && footer_ok());
+        // A result page taller than the window scrolls as a whole, at full heights:
+        // its check and lines are not squeezed to fit.
+        confirm.emit_clicked();
+        wait_for(&|| confirm.label().as_deref() == Some("Done"));
+        let unsqueezed = |name: &str| {
+            let widget = descendants(win.upcast_ref())
+                .into_iter()
+                .find(|w| w.widget_name() == name)
+                .unwrap();
+            widget.height() >= widget.measure(gtk::Orientation::Vertical, widget.width()).1
+        };
+        wait_for(&|| outer.vadjustment().upper() > outer.vadjustment().page_size());
+        assert!(win.height() <= parent.height() - 32 && footer_ok());
+        assert!(outer.vadjustment().upper() > outer.vadjustment().page_size());
+        assert!(unsqueezed("toolport-setup-success-icon"));
+        assert!(unsqueezed("toolport-setup-next-step"));
         win.close();
         parent.close();
     }
