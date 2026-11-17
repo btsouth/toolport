@@ -282,5 +282,6 @@
   "Back to servers": "返回服务器",
   "Add a config folder for a client Toolport did not find on its own": "为 Toolport 未自动找到的客户端添加配置文件夹",
   "Check servers again": "再次检查服务器",
-  "Connect a local command or a remote endpoint once; every client gets it.": "只需连接一次本地命令或远程端点，所有客户端都能使用。"
+  "Connect a local command or a remote endpoint once; every client gets it.": "只需连接一次本地命令或远程端点，所有客户端都能使用。",
+  "Per-server breakdown": "按服务器明细"
 }

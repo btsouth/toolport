@@ -282,5 +282,6 @@
   "Back to servers": "サーバーに戻る",
   "Add a config folder for a client Toolport did not find on its own": "Toolport が自動検出できなかったクライアントの設定フォルダーを追加",
   "Check servers again": "サーバーを再度確認します",
-  "Connect a local command or a remote endpoint once; every client gets it.": "ローカル コマンドまたはリモート エンドポイントを一度接続すれば、すべてのクライアントで使えます。"
+  "Connect a local command or a remote endpoint once; every client gets it.": "ローカル コマンドまたはリモート エンドポイントを一度接続すれば、すべてのクライアントで使えます。",
+  "Per-server breakdown": "サーバー別の内訳"
 }

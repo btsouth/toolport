@@ -282,5 +282,6 @@
   "Back to servers": "Zurück zu den Servern",
   "Add a config folder for a client Toolport did not find on its own": "Einen Konfigurationsordner für einen Client hinzufügen, den Toolport nicht automatisch gefunden hat",
   "Check servers again": "Server erneut prüfen",
-  "Connect a local command or a remote endpoint once; every client gets it.": "Verbinden Sie einen lokalen Befehl oder einen Remote-Endpunkt einmal; jeder Client erhält ihn."
+  "Connect a local command or a remote endpoint once; every client gets it.": "Verbinden Sie einen lokalen Befehl oder einen Remote-Endpunkt einmal; jeder Client erhält ihn.",
+  "Per-server breakdown": "Aufschlüsselung je Server"
 }
