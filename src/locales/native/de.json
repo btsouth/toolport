@@ -1212,5 +1212,6 @@
   "Showing {value0} matching entries from the latest {value1}.": "Zeigt {value0} passende Einträge aus den neuesten {value1}.",
   "Showing {value0} of the latest {value1} entries.": "Zeigt {value0} der neuesten {value1} Einträge.",
   "Showing 1 matching entry from the latest {value1}.": "Zeigt 1 passenden Eintrag aus den neuesten {value1}.",
-  "Show all {value0} entries": "Alle {value0} Einträge anzeigen"
+  "Show all {value0} entries": "Alle {value0} Einträge anzeigen",
+  "Per-server breakdown": "Aufschlüsselung je Server"
 }

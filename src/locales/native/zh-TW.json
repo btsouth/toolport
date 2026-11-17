@@ -1212,5 +1212,6 @@
   "Showing {value0} matching entries from the latest {value1}.": "顯示最新 {value1} 筆記錄中符合的 {value0} 筆。",
   "Showing {value0} of the latest {value1} entries.": "顯示最新 {value1} 筆記錄中的 {value0} 筆。",
   "Showing 1 matching entry from the latest {value1}.": "顯示最新 {value1} 筆記錄中符合的 1 筆。",
-  "Show all {value0} entries": "顯示全部 {value0} 筆記錄"
+  "Show all {value0} entries": "顯示全部 {value0} 筆記錄",
+  "Per-server breakdown": "各伺服器明細"
 }

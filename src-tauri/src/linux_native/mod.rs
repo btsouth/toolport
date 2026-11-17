@@ -4654,31 +4654,48 @@ fn reconcile_rows<T: Clone + PartialEq>(
     }
 }
 
-const RECENT_CALL_PREVIEW_LIMIT: usize = 10;
-
+/// The Activity page, laid out like React's `ActivityView`: notices, protection,
+/// savings and the reference panels (Discovery, Tool identities, Live inspector)
+/// first, then the audit log's state, the stats and the Recent calls disclosure.
 #[derive(Clone)]
 struct ActivityPage {
     app: adw::Application,
     root: gtk::Box,
     scroller: gtk::ScrolledWindow,
+    /// The call rows, inside the Recent calls disclosure.
     list: gtk::Box,
-    security_status: gtk::Button,
-    security_status_icon: gtk::Image,
-    security_status_title: gtk::Label,
-    security_status_detail: gtk::Label,
+    /// The audit log's loading, error, stale and empty states.
+    audit_state: gtk::Box,
+    /// Protection: tool changes, security notices, the resting card or a load notice.
     security_list: gtk::Box,
-    security_expander: gtk::Expander,
-    diagnostics_expander: gtk::Expander,
-    stats_list: gtk::Box,
-    identity_list: gtk::Box,
+    discovery_plain: gtk::Box,
+    discovery_plain_text: gtk::Label,
+    discovery_expander: gtk::Expander,
+    discovery_count: gtk::Label,
     search_list: gtk::Box,
+    discovery_error: gtk::Box,
+    identity_expander: gtk::Expander,
+    identity_count: gtk::Label,
+    identity_list: gtk::Box,
+    identity_error: gtk::Box,
+    inspect_expander: gtk::Expander,
+    inspect_count: gtk::Label,
     inspect_list: gtk::Box,
     feedback: gtk::Label,
     telemetry_feedback: gtk::Label,
+    revision_notice: gtk::Label,
+    stats_box: gtk::Box,
     call_count: gtk::Label,
-    success_rate: gtk::Label,
-    average_latency: gtk::Label,
-    tokens_saved: gtk::Label,
+    error_count: gtk::Label,
+    error_caption: gtk::Label,
+    server_count: gtk::Label,
+    stats_server_count: gtk::Label,
+    stats_error_badge: gtk::Label,
+    stats_list: gtk::Box,
+    recent_box: gtk::Box,
+    recent_expander: gtk::Expander,
+    recent_latest: gtk::Label,
+    recent_summary: gtk::Label,
     refresh_button: gtk::Button,
     clear_button: gtk::Button,
     loading: std::rc::Rc<std::cell::Cell<bool>>,
@@ -4698,8 +4715,7 @@ struct ActivityPage {
     filter_server_options: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
     errors_only: gtk::ToggleButton,
     filter_count: gtk::Label,
-    show_more_calls: gtk::Button,
-    show_all_recent: std::rc::Rc<std::cell::Cell<bool>>,
+    filtered_label: gtk::Label,
     identity_search: gtk::SearchEntry,
     updating_filters: std::rc::Rc<std::cell::Cell<bool>>,
     savings_banner: gtk::Box,
@@ -4729,7 +4745,10 @@ impl ActivityPage {
         );
         let clear_button = header_button("user-trash-symbolic", crate::i18n::msg("Clear"));
         clear_button.add_css_class("toolport-destructive");
-        l10n::bind_tooltip(&clear_button, "Clear retained activity");
+        l10n::bind_tooltip(
+            &clear_button,
+            "Delete all retained activity kept on this device",
+        );
         let refresh_button = header_icon_button("view-refresh-symbolic");
         l10n::bind_tooltip(&refresh_button, "Refresh activity");
         let export_button = gtk::MenuButton::builder()
@@ -4739,7 +4758,10 @@ impl ActivityPage {
             .build();
         let export_label = l10n::label("Export");
         export_button.set_child(Some(&export_label));
-        l10n::bind_tooltip(&export_button, "Export activity");
+        l10n::bind_tooltip(
+            &export_button,
+            "Export the full activity log to a file (CSV or JSON)",
+        );
         let export_menu = toolport_menu_popover();
         let export_actions = gtk::Box::new(gtk::Orientation::Vertical, 4);
         export_actions.set_margin_top(6);
@@ -4763,13 +4785,14 @@ impl ActivityPage {
             .vexpand(true)
             .build();
         let page = page_body(14);
+        // Export, clear and share results; hidden until one of them reports.
         let feedback = gtk::Label::builder()
             .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
+            .visible(false)
             .css_classes(["toolport-feedback"])
             .build();
-        l10n::bind_text(&feedback, "Loading retained activity…");
         page.append(&feedback);
         let telemetry_feedback = gtk::Label::builder()
             .halign(gtk::Align::Start)
@@ -4779,67 +4802,26 @@ impl ActivityPage {
             .css_classes(["toolport-feedback"])
             .build();
         page.append(&telemetry_feedback);
+        let revision_notice = gtk::Label::builder()
+            .halign(gtk::Align::Fill)
+            .xalign(0.0)
+            .wrap(true)
+            .visible(false)
+            .css_classes(["toolport-feedback", "error"])
+            .build();
+        l10n::bind_label(
+            &revision_notice,
+            "Activity change checks are unavailable. Displayed activity may be stale.",
+        );
+        page.append(&revision_notice);
 
-        let summary = gtk::FlowBox::new();
-        summary.add_css_class("toolport-summary");
-        summary.set_column_spacing(10);
-        summary.set_row_spacing(10);
-        summary.set_min_children_per_line(1);
-        summary.set_max_children_per_line(4);
-        summary.set_homogeneous(true);
-        summary.set_selection_mode(gtk::SelectionMode::None);
-        let mut values = Vec::new();
-        for (value, label) in [
-            ("…", crate::i18n::msg("Calls recorded")),
-            ("…", crate::i18n::msg("Success rate")),
-            ("…", crate::i18n::msg("Average latency")),
-            ("…", crate::i18n::msg("Tokens saved")),
-        ] {
-            let (item, value) = summary_item(value, label);
-            values.push(value);
-            summary.insert(&item, -1);
-        }
-        page.append(&summary);
+        // Protection, as React's security lane: tool changes, notices, then the
+        // resting card when nothing needs review.
+        let security_list = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        security_list.set_focusable(true);
+        page.append(&security_list);
 
-        let security_status = gtk::Button::new();
-        security_status.add_css_class("toolport-security-status");
-        l10n::bind_tooltip(&security_status, "Review tool changes");
-        let security_status_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        let security_status_icon = gtk::Image::from_icon_name("security-high-symbolic");
-        security_status_icon.add_css_class("toolport-security-status-icon");
-        security_status_row.append(&security_status_icon);
-        let security_status_copy = gtk::Box::new(gtk::Orientation::Vertical, 1);
-        security_status_copy.set_hexpand(true);
-        let security_status_title = {
-            let widget = gtk::Label::builder()
-                .label(crate::i18n::tr("Checking protection…"))
-                .halign(gtk::Align::Start)
-                .xalign(0.0)
-                .css_classes(["heading"])
-                .build();
-            l10n::bind_label(&widget, "Checking protection…");
-            widget
-        };
-        security_status_copy.append(&security_status_title);
-        let security_status_detail = {
-            let widget = gtk::Label::builder()
-                .label(crate::i18n::tr("Loading saved review state."))
-                .halign(gtk::Align::Start)
-                .xalign(0.0)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .css_classes(["toolport-muted", "caption"])
-                .build();
-            l10n::bind_label(&widget, "Loading saved review state.");
-            widget
-        };
-        security_status_copy.append(&security_status_detail);
-        security_status_row.append(&security_status_copy);
-        security_status_row.append(&gtk::Image::from_icon_name("go-next-symbolic"));
-        security_status.set_child(Some(&security_status_row));
-        page.append(&security_status);
-
-        let performance = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        performance.set_margin_top(10);
+        // Savings, when React shows them.
         let savings_banner = gtk::Box::new(gtk::Orientation::Vertical, 6);
         savings_banner.add_css_class("toolport-card");
         savings_banner.set_visible(false);
@@ -4910,29 +4892,155 @@ impl ActivityPage {
             widget
         };
         savings_banner.append(&savings_counting);
-        performance.append(&savings_banner);
+        page.append(&savings_banner);
 
-        performance.append(&{
-            let widget = gtk::Label::builder()
-                .label(crate::i18n::tr("Per-server performance"))
-                .halign(gtk::Align::Start)
-                .css_classes(["heading"])
+        // Discovery: a plain card while nothing detailed was recorded, else a
+        // collapsed list of searches.
+        let discovery_plain = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        discovery_plain.add_css_class("toolport-card");
+        discovery_plain.set_visible(false);
+        discovery_plain.append(&activity_panel_title(
+            "edit-find-symbolic",
+            crate::i18n::msg("Discovery"),
+            None,
+        ));
+        let discovery_plain_text = gtk::Label::builder()
+            .halign(gtk::Align::Fill)
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["toolport-muted"])
+            .build();
+        discovery_plain.append(&discovery_plain_text);
+        page.append(&discovery_plain);
+        let discovery_count = gtk::Label::new(None);
+        let search_list = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        let discovery_expander = activity_panel(
+            "edit-find-symbolic",
+            crate::i18n::msg("Discovery"),
+            &discovery_count,
+            crate::i18n::msg("What the model searched for and what Toolport handed back. Each search returns matching tool schemas. Match counts and returned text bytes are exact at Toolport's MCP boundary; token figures are estimates. Local and bounded: tool names only, never arguments or results."),
+            &search_list,
+        );
+        page.append(&discovery_expander);
+        let discovery_error = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        page.append(&discovery_error);
+
+        // Tool identities: hidden until the gateway pinned a baseline.
+        let identity_count = gtk::Label::new(None);
+        let identity_panel = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        let identity_search = {
+            let widget = gtk::SearchEntry::builder()
+                .placeholder_text(crate::i18n::tr("Filter by server or tool name…"))
+                .css_classes(["toolport-search"])
                 .build();
-            l10n::bind_label(&widget, "Per-server performance");
+            l10n::bind_placeholder(&widget, "Filter by server or tool name…");
             widget
-        });
-        let stats_list = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        performance.append(&stats_list);
-        page.append(&{
-            let widget = gtk::Label::builder()
-                .label(crate::i18n::tr("Recent calls and approvals"))
-                .halign(gtk::Align::Start)
-                .css_classes(["heading"])
-                .build();
-            l10n::bind_label(&widget, "Recent calls and approvals");
-            widget
-        });
-        let filter_row = wrapping_actions();
+        };
+        identity_panel.append(&identity_search);
+        let identity_list = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        identity_panel.append(&identity_list);
+        let identity_expander = activity_panel(
+            "fingerprint-symbolic",
+            crate::i18n::msg("Tool identities"),
+            &identity_count,
+            crate::i18n::msg("What each model-visible tool name actually maps to: its source server and profiles, the pinned definition fingerprint drift detection checks against, and when it was first seen or last changed. Prefixing helps the model pick a tool; this helps you verify what crossed the boundary."),
+            &identity_panel,
+        );
+        page.append(&identity_expander);
+        let identity_error = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        page.append(&identity_error);
+
+        // Live inspector: only while live inspection is on, open by default.
+        let inspect_count = gtk::Label::new(None);
+        let inspect_list = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        let inspect_expander = activity_panel(
+            "utilities-system-monitor-symbolic",
+            crate::i18n::msg("Live inspector"),
+            &inspect_count,
+            crate::i18n::msg("Ephemeral, local, opt-in. While live inspection is on, Toolport keeps the last 50 tool calls' arguments and results here so you can inspect them. This buffer is separate from the audit log, never leaves your machine, and clears when you turn inspection off or restart the gateway."),
+            &inspect_list,
+        );
+        inspect_expander.set_expanded(true);
+        page.append(&inspect_expander);
+
+        // The audit log's own state: loading, unreadable, stale or empty.
+        let audit_state = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        page.append(&audit_state);
+
+        // Stats: three tiles and the per-server breakdown.
+        let stats_box = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        stats_box.set_visible(false);
+        let summary = gtk::FlowBox::new();
+        summary.add_css_class("toolport-summary");
+        summary.set_column_spacing(10);
+        summary.set_row_spacing(10);
+        summary.set_min_children_per_line(1);
+        summary.set_max_children_per_line(3);
+        summary.set_homogeneous(true);
+        summary.set_selection_mode(gtk::SelectionMode::None);
+        let (calls_item, call_count) = summary_item("", crate::i18n::msg("calls recorded"));
+        summary.insert(&calls_item, -1);
+        let (errors_item, error_count) = summary_item("", crate::i18n::msg("calls recorded"));
+        let error_caption = errors_item
+            .last_child()
+            .and_downcast::<gtk::Label>()
+            .expect("a summary caption");
+        summary.insert(&errors_item, -1);
+        let (servers_item, server_count) = summary_item("", crate::i18n::msg("servers used"));
+        summary.insert(&servers_item, -1);
+        stats_box.append(&summary);
+        let stats_title = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let stats_heading = l10n::label("Per-server breakdown");
+        stats_heading.add_css_class("heading");
+        stats_title.append(&stats_heading);
+        let stats_server_count = gtk::Label::builder()
+            .css_classes(["toolport-muted", "caption"])
+            .build();
+        stats_title.append(&stats_server_count);
+        let stats_error_badge = gtk::Label::builder()
+            .valign(gtk::Align::Center)
+            .css_classes(["toolport-badge", "error"])
+            .visible(false)
+            .build();
+        stats_title.append(&stats_error_badge);
+        let stats_table = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        stats_table.set_margin_top(8);
+        let table = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        table.add_css_class("toolport-row-group");
+        table.set_overflow(gtk::Overflow::Hidden);
+        table.append(&server_stat_header());
+        let stats_list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        table.append(&stats_list);
+        stats_table.append(&table);
+        let stats_hint = l10n::label("Click a server to see its per-tool breakdown.");
+        stats_hint.set_xalign(0.0);
+        stats_hint.set_wrap(true);
+        stats_hint.set_margin_top(8);
+        stats_hint.add_css_class("toolport-muted");
+        stats_hint.add_css_class("caption");
+        stats_table.append(&stats_hint);
+        let stats_expander = gtk::Expander::new(None);
+        stats_expander.set_label_widget(Some(&stats_title));
+        stats_expander.set_child(Some(&stats_table));
+        stats_box.append(&stats_expander);
+        page.append(&stats_box);
+
+        // Recent calls and approvals: collapsed, with its count line shown either way.
+        let recent_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        recent_box.set_visible(false);
+        let recent_title = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let recent_heading = l10n::label("Recent calls and approvals");
+        recent_heading.add_css_class("heading");
+        recent_title.append(&recent_heading);
+        let recent_latest = gtk::Label::builder()
+            .css_classes(["toolport-muted", "caption"])
+            .build();
+        recent_title.append(&recent_latest);
+        let recent_content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        recent_content.set_margin_top(8);
+        let filter_count = activity_count_label();
+        recent_content.append(&filter_count);
+        let filter_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let filter_server = gtk::DropDown::from_strings(&[&crate::i18n::tr("All servers")]);
         quiet_tooltips::guard_dropdown(&filter_server);
         filter_server.add_css_class("toolport-input");
@@ -4966,144 +5074,34 @@ impl ActivityPage {
         });
         filter_server.set_factory(Some(&factory));
         filter_server.set_list_factory(Some(&details::checked_list_factory()));
-        filter_row.insert(&filter_server, -1);
+        filter_row.append(&filter_server);
         let errors_only = gtk::ToggleButton::new();
         l10n::bind_button(errors_only.upcast_ref(), "Errors only");
         errors_only.add_css_class("toolport-secondary-action");
         errors_only.add_css_class("toolport-activity-filter");
         errors_only.set_valign(gtk::Align::Center);
-        filter_row.insert(&errors_only, -1);
-        let filter_count = gtk::Label::builder()
-            .halign(gtk::Align::Fill)
-            .xalign(0.0)
-            .wrap(true)
-            .css_classes(["toolport-muted", "caption"])
-            .build();
-        page.append(&filter_row);
-        page.append(&filter_count);
+        filter_row.append(&errors_only);
+        let filtered_label = l10n::label("Filtered");
+        filtered_label.set_hexpand(true);
+        filtered_label.set_halign(gtk::Align::End);
+        filtered_label.set_visible(false);
+        filtered_label.add_css_class("toolport-muted");
+        filtered_label.add_css_class("caption");
+        filter_row.append(&filtered_label);
+        recent_content.append(&filter_row);
         // Holds the call rows as one row group, or a single state card.
         let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
         list.set_overflow(gtk::Overflow::Hidden);
-        page.append(&list);
-        let show_more_calls = l10n::button("Show more events");
-        show_more_calls.add_css_class("toolport-secondary-action");
-        show_more_calls.set_halign(gtk::Align::Center);
-        show_more_calls.set_visible(false);
-        page.append(&show_more_calls);
+        recent_content.append(&list);
+        let recent_expander = gtk::Expander::new(None);
+        recent_expander.set_label_widget(Some(&recent_title));
+        recent_expander.set_child(Some(&recent_content));
+        recent_box.append(&recent_expander);
+        // React keeps the count line under the heading while the list is closed.
+        let recent_summary = activity_count_label();
+        recent_box.append(&recent_summary);
+        page.append(&recent_box);
 
-        let performance_expander = {
-            let widget = gtk::Expander::new(None);
-            widget.set_label_widget(Some(&l10n::label("Performance and savings")));
-            widget
-        };
-        performance_expander.add_css_class("toolport-details-expander");
-        performance_expander.set_child(Some(&performance));
-        page.append(&performance_expander);
-
-        let diagnostics = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        diagnostics.set_margin_top(10);
-        diagnostics.append(&{
-            let widget = gtk::Label::builder()
-                .label(crate::i18n::tr(
-                    "Review protection history or inspect the gateway's technical records.",
-                ))
-                .halign(gtk::Align::Fill)
-                .xalign(0.0)
-                .wrap(true)
-                .css_classes(["toolport-muted"])
-                .build();
-            l10n::bind_label(
-                &widget,
-                "Review protection history or inspect the gateway's technical records.",
-            );
-            widget
-        });
-        let security = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        security.set_margin_top(8);
-        security.append(&{
-            let widget = gtk::Label::builder()
-                .label(crate::i18n::tr(
-                    "Review changes to your servers and their tools.",
-                ))
-                .halign(gtk::Align::Fill)
-                .xalign(0.0)
-                .wrap(true)
-                .css_classes(["toolport-muted", "caption"])
-                .build();
-            l10n::bind_label(&widget, "Review changes to your servers and their tools.");
-            widget
-        });
-        let security_list = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        security.append(&security_list);
-        let security_expander = {
-            let widget = gtk::Expander::new(None);
-            widget.set_label_widget(Some(&l10n::label("Protection history")));
-            widget
-        };
-        security_expander.add_css_class("toolport-card");
-        security_expander.set_child(Some(&security));
-        diagnostics.append(&security_expander);
-
-        let technical = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        technical.set_margin_top(8);
-        technical.append(&{
-            let widget = gtk::Label::builder()
-                .label(crate::i18n::tr("Tool identities"))
-                .halign(gtk::Align::Start)
-                .css_classes(["heading"])
-                .build();
-            l10n::bind_label(&widget, "Tool identities");
-            widget
-        });
-        let identity_search = {
-            let widget = gtk::SearchEntry::builder()
-                .placeholder_text(crate::i18n::tr("Filter tools or servers"))
-                .css_classes(["toolport-search"])
-                .build();
-            l10n::bind_placeholder(&widget, "Filter tools or servers");
-            widget
-        };
-        technical.append(&identity_search);
-        let identity_list = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        technical.append(&identity_list);
-        technical.append(&{
-            let widget = gtk::Label::builder()
-                .label(crate::i18n::tr("Discovery traces"))
-                .halign(gtk::Align::Start)
-                .css_classes(["heading"])
-                .build();
-            l10n::bind_label(&widget, "Discovery traces");
-            widget
-        });
-        let search_list = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        technical.append(&search_list);
-        technical.append(&{
-            let widget = gtk::Label::builder()
-                .label(crate::i18n::tr("Live inspector"))
-                .halign(gtk::Align::Start)
-                .css_classes(["heading"])
-                .build();
-            l10n::bind_label(&widget, "Live inspector");
-            widget
-        });
-        let inspect_list = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        technical.append(&inspect_list);
-        let technical_expander = {
-            let widget = gtk::Expander::new(None);
-            widget.set_label_widget(Some(&l10n::label("Technical records")));
-            widget
-        };
-        technical_expander.add_css_class("toolport-card");
-        technical_expander.set_child(Some(&technical));
-        diagnostics.append(&technical_expander);
-        let diagnostics_expander = {
-            let widget = gtk::Expander::new(None);
-            widget.set_label_widget(Some(&l10n::label("Security and diagnostics")));
-            widget
-        };
-        diagnostics_expander.add_css_class("toolport-details-expander");
-        diagnostics_expander.set_child(Some(&diagnostics));
-        page.append(&diagnostics_expander);
         scroller.set_child(Some(&page));
         root.append(&scroller);
 
@@ -5112,23 +5110,36 @@ impl ActivityPage {
             root,
             scroller,
             list,
-            security_status,
-            security_status_icon,
-            security_status_title,
-            security_status_detail,
-            stats_list,
+            audit_state,
             security_list,
-            security_expander,
-            diagnostics_expander,
-            identity_list,
+            discovery_plain,
+            discovery_plain_text,
+            discovery_expander,
+            discovery_count,
             search_list,
+            discovery_error,
+            identity_expander,
+            identity_count,
+            identity_list,
+            identity_error,
+            inspect_expander,
+            inspect_count,
             inspect_list,
             feedback,
             telemetry_feedback,
-            call_count: values.remove(0),
-            success_rate: values.remove(0),
-            average_latency: values.remove(0),
-            tokens_saved: values.remove(0),
+            revision_notice,
+            stats_box,
+            call_count,
+            error_count,
+            error_caption,
+            server_count,
+            stats_server_count,
+            stats_error_badge,
+            stats_list,
+            recent_box,
+            recent_expander,
+            recent_latest,
+            recent_summary,
             refresh_button,
             clear_button,
             loading: std::rc::Rc::new(std::cell::Cell::new(false)),
@@ -5147,8 +5158,7 @@ impl ActivityPage {
             ])),
             errors_only,
             filter_count,
-            show_more_calls,
-            show_all_recent: std::rc::Rc::new(std::cell::Cell::new(false)),
+            filtered_label,
             identity_search,
             updating_filters: std::rc::Rc::new(std::cell::Cell::new(false)),
             savings_banner,
@@ -5170,6 +5180,7 @@ impl ActivityPage {
                 std::cell::RefCell::new(load_security_dismissed()),
             ),
         };
+        activity_page.show_loading();
         let page_for_share = activity_page.clone();
         savings_share.connect_clicked(move |_| {
             let (tokens, loads, searches, bytes) = page_for_share
@@ -5194,6 +5205,7 @@ impl ActivityPage {
                     .set_label(&crate::i18n::tr("Savings copied, paste them anywhere."));
                 page_for_share.feedback.remove_css_class("error");
                 page_for_share.feedback.add_css_class("success");
+                page_for_share.feedback.set_visible(true);
             }
         });
         let page_for_refresh = activity_page.clone();
@@ -5214,21 +5226,14 @@ impl ActivityPage {
                 page_for_errors.render_recent();
             }
         });
-        let page_for_more = activity_page.clone();
-        activity_page.show_more_calls.connect_clicked(move |_| {
-            page_for_more
-                .show_all_recent
-                .set(!page_for_more.show_all_recent.get());
-            page_for_more.render_recent();
-        });
+        let page_for_recent = activity_page.clone();
+        activity_page
+            .recent_expander
+            .connect_expanded_notify(move |_| page_for_recent.render_recent_summary());
         let page_for_identity_search = activity_page.clone();
         activity_page
             .identity_search
             .connect_search_changed(move |_| page_for_identity_search.render_identities());
-        let page_for_security = activity_page.clone();
-        activity_page
-            .security_status
-            .connect_clicked(move |_| page_for_security.reveal_security());
         let page_for_clear = activity_page.clone();
         activity_page
             .clear_button
@@ -5244,11 +5249,19 @@ impl ActivityPage {
         let Some(parent) = self.app.active_window() else {
             return;
         };
+        // One format per menu item, so the save dialog offers only that format.
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some(&format.to_uppercase()));
+        filter.add_suffix(format);
+        let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
         let dialog = gtk::FileDialog::builder()
-            .title(crate::i18n::tr("Export activity"))
+            .title(crate::i18n::tr("Export activity log"))
             .modal(true)
             .accept_label(crate::i18n::tr("Export"))
             .initial_name(format!("toolport-activity.{format}"))
+            .filters(&filters)
+            .default_filter(&filter)
             .build();
         set_file_dialog_folder(&dialog);
         let page = self.clone();
@@ -5257,13 +5270,14 @@ impl ActivityPage {
                 return;
             };
             let Some(path) = file.path() else {
-                page.show_error(&crate::i18n::tr(
+                page.show_feedback_error(&crate::i18n::tr(
                     "the selected destination does not have a local path",
                 ));
                 return;
             };
             page.feedback
                 .set_label(&crate::i18n::tr("Exporting retained activity…"));
+            page.feedback.set_visible(true);
             let page = page.clone();
             gtk::glib::spawn_future_local(async move {
                 let result = gtk::gio::spawn_blocking(move || {
@@ -5279,9 +5293,14 @@ impl ActivityPage {
                         );
                         page.feedback.remove_css_class("error");
                         page.feedback.add_css_class("success");
+                        page.feedback.set_visible(true);
                     }
-                    Ok(Err(error)) => page.show_error(&error),
-                    Err(_) => page.show_error(&crate::i18n::tr("the export stopped unexpectedly")),
+                    Ok(Err(error)) => page.show_feedback_error(&crate::i18n::trf(
+                        "Couldn't export the log: {value1}",
+                        &[("value1", &error)],
+                    )),
+                    Err(_) => page
+                        .show_feedback_error(&crate::i18n::tr("the export stopped unexpectedly")),
                 }
             });
         });
@@ -5319,6 +5338,30 @@ impl ActivityPage {
         self.root.connect_unmap(move |_| page.release_rows());
     }
 
+    /// The first-load state, as React shows it before any read returns.
+    fn show_loading(&self) {
+        clear_box(&self.security_list);
+        self.security_list.append(
+            &activity_status_card(
+                StatusTone::Info,
+                crate::i18n::msg("Checking protection status…"),
+                "",
+            )
+            .root,
+        );
+        clear_box(&self.audit_state);
+        self.audit_state
+            .append(&skeleton_rows(crate::i18n::msg("Loading activity…")));
+        self.stats_box.set_visible(false);
+        self.recent_box.set_visible(false);
+        self.discovery_plain.set_visible(false);
+        self.discovery_expander.set_visible(false);
+        self.identity_expander.set_visible(false);
+        self.inspect_expander.set_visible(false);
+        clear_box(&self.discovery_error);
+        clear_box(&self.identity_error);
+    }
+
     fn release_rows(&self) {
         crate::observability_controller::release_activity_revision();
         self.revision.borrow_mut().take();
@@ -5337,30 +5380,15 @@ impl ActivityPage {
             &self.search_list,
             &self.inspect_list,
         ] {
-            while let Some(child) = list.first_child() {
-                list.remove(&child);
-            }
+            clear_box(list);
         }
-        self.feedback
-            .set_label(&crate::i18n::tr("Loading retained activity…"));
-        self.feedback.set_visible(true);
-        self.security_status_title
-            .set_label(&crate::i18n::tr("Checking protection…"));
-        self.security_status_detail
-            .set_label(&crate::i18n::tr("Loading saved review state."));
-        self.security_status.remove_css_class("attention");
-        self.security_status.remove_css_class("review");
-        for value in [
-            &self.call_count,
-            &self.success_rate,
-            &self.average_latency,
-            &self.tokens_saved,
-        ] {
-            value.set_label("…");
-        }
+        self.feedback.set_label("");
+        self.feedback.set_visible(false);
         self.savings_banner.set_visible(false);
         self.telemetry_feedback.set_label("");
         self.telemetry_feedback.set_visible(false);
+        self.revision_notice.set_visible(false);
+        self.show_loading();
     }
 
     fn refresh_health(&self) {
@@ -5444,15 +5472,12 @@ impl ActivityPage {
     }
 
     fn render_activity_notices(&self, health: &[String]) {
-        let mut notices = health.to_vec();
-        if let Some(error) = self.revision_error.borrow().as_ref() {
-            notices.push(crate::i18n::trf(
-                "Activity change checks are unavailable. Displayed activity may be stale. {value0}",
-                &[("value0", &error.to_string())],
-            ));
-        }
-        self.telemetry_feedback.set_label(&notices.join("\n"));
-        self.telemetry_feedback.set_visible(!notices.is_empty());
+        self.telemetry_feedback.set_label(&health.join("\n"));
+        self.telemetry_feedback.set_visible(!health.is_empty());
+        // React's sentence, with the cause one hover away.
+        let error = self.revision_error.borrow().clone();
+        self.revision_notice.set_tooltip_text(error.as_deref());
+        self.revision_notice.set_visible(error.is_some());
     }
 
     fn refresh_quietly(&self) {
@@ -5471,12 +5496,7 @@ impl ActivityPage {
             return;
         }
         if self.last_snapshot.borrow().is_none() {
-            self.list.remove_css_class("toolport-row-group");
-            while let Some(child) = self.list.first_child() {
-                self.list.remove(&child);
-            }
-            self.list
-                .append(&skeleton_rows(crate::i18n::msg("Loading activity…")));
+            self.show_loading();
         }
         if announce || self.last_snapshot.borrow().is_none() {
             self.refresh_button.set_sensitive(false);
@@ -5528,7 +5548,34 @@ impl ActivityPage {
         });
     }
 
-    fn render(&self, snapshot: state::ActivitySnapshot) {
+    /// Keep the last rows a panel read successfully when its newest read failed,
+    /// marked stale, as React does: a failed refresh is never an all-clear.
+    fn keep_last_known(&self, snapshot: &mut state::ActivitySnapshot) {
+        let previous = self.last_snapshot.borrow();
+        let Some(previous) = previous.as_ref() else {
+            return;
+        };
+        if snapshot.audit_error.is_some()
+            && (previous.audit_error.is_none() || previous.audit_stale)
+        {
+            snapshot.recent = previous.recent.clone();
+            snapshot.call_count = previous.call_count;
+            snapshot.error_count = previous.error_count;
+            snapshot.average_duration_ms = previous.average_duration_ms;
+            snapshot.server_stats = previous.server_stats.clone();
+            snapshot.audit_stale = true;
+        }
+        if snapshot.security_error.is_some()
+            && (previous.security_error.is_none() || previous.security_stale)
+        {
+            snapshot.security_events = previous.security_events.clone();
+            snapshot.security_stale = true;
+        }
+    }
+
+    fn render(&self, mut snapshot: state::ActivitySnapshot) {
+        self.keep_last_known(&mut snapshot);
+        let searches = |snapshot: &state::ActivitySnapshot| activity_search_count(&snapshot.recent);
         let (security_changed, identities_changed, traces_changed, inspect_changed) = {
             let previous = self.last_snapshot.borrow();
             let previous = previous.as_ref();
@@ -5536,7 +5583,8 @@ impl ActivityPage {
                 activity_section_changed(
                     previous.map(|snapshot| snapshot.security_events.as_slice()),
                     &snapshot.security_events,
-                ),
+                ) || previous.map(|snapshot| (&snapshot.security_error, snapshot.security_stale))
+                    != Some((&snapshot.security_error, snapshot.security_stale)),
                 activity_section_changed(
                     previous.map(|snapshot| snapshot.tool_identities.as_slice()),
                     &snapshot.tool_identities,
@@ -5545,59 +5593,15 @@ impl ActivityPage {
                 activity_section_changed(
                     previous.map(|snapshot| snapshot.search_traces.as_slice()),
                     &snapshot.search_traces,
-                ) || previous.is_some_and(|previous| {
-                    previous
-                        .recent
-                        .iter()
-                        .any(|row| row.internal && row.tool == "search")
-                        != snapshot
-                            .recent
-                            .iter()
-                            .any(|row| row.internal && row.tool == "search")
-                }),
+                ) || previous.map(|snapshot| (&snapshot.search_traces_error, searches(snapshot)))
+                    != Some((&snapshot.search_traces_error, searches(&snapshot))),
                 activity_section_changed(
                     previous.map(|snapshot| snapshot.inspect_calls.as_slice()),
                     &snapshot.inspect_calls,
-                ),
+                ) || previous.map(|snapshot| (&snapshot.inspect_error, snapshot.live_inspect))
+                    != Some((&snapshot.inspect_error, snapshot.live_inspect)),
             )
         };
-        if traces_changed {
-            while let Some(child) = self.search_list.first_child() {
-                self.search_list.remove(&child);
-            }
-        }
-        if inspect_changed {
-            while let Some(child) = self.inspect_list.first_child() {
-                self.inspect_list.remove(&child);
-            }
-        }
-        self.call_count.set_label(&snapshot.call_count.to_string());
-        // Do not evaluate the numerator when there are no calls.
-        #[allow(clippy::manual_checked_ops)]
-        let success_rate = if snapshot.call_count == 0 {
-            "–".to_string()
-        } else {
-            format!(
-                "{}%",
-                (snapshot.call_count - snapshot.error_count) * 100 / snapshot.call_count
-            )
-        };
-        self.success_rate.set_label(&success_rate);
-        self.average_latency.set_label(
-            &snapshot
-                .average_duration_ms
-                .map(format_duration)
-                .unwrap_or_else(|| "–".to_string()),
-        );
-        self.tokens_saved
-            .set_label(&if snapshot.savings_tokenized_loads > 0 {
-                format_saved_tokens(snapshot.tokens_saved)
-            } else {
-                crate::i18n::tr("Not measured").to_string()
-            });
-        self.tokens_saved.set_tooltip_text(Some(
-            &crate::i18n::tr("One full catalog baseline per session minus all catalog and search responses, counted with cl100k_base. Unverifiable history excluded; not a billing figure."),
-        ));
         self.feedback.set_label("");
         self.feedback.remove_css_class("error");
         self.feedback.remove_css_class("success");
@@ -5605,6 +5609,7 @@ impl ActivityPage {
         self.render_activity_notices(&snapshot.telemetry_notices);
         self.clear_button.set_sensitive(
             snapshot.call_count > 0
+                || !snapshot.recent.is_empty()
                 || snapshot.savings_list_loads > 0
                 || snapshot.savings_historical_loads > 0
                 || snapshot.savings_discovery_count > 0
@@ -5635,83 +5640,20 @@ impl ActivityPage {
         }
 
         *self.last_snapshot.borrow_mut() = Some(snapshot);
-        self.render_recent();
-        if identities_changed {
-            self.render_identities();
-        }
-        self.render_savings();
         if security_changed {
             self.render_security();
         }
-        let snapshot = self
-            .last_snapshot
-            .borrow()
-            .clone()
-            .expect("the snapshot was stored above");
-
-        if snapshot.server_stats.is_empty() {
-            self.stat_rows.borrow_mut().clear();
-            while let Some(child) = self.stats_list.first_child() {
-                self.stats_list.remove(&child);
-            }
-            self.expanded_stat_servers.borrow_mut().clear();
-            self.server_stat_order.borrow_mut().clear();
-            self.stats_list
-                .append(&empty_activity_source_label(crate::i18n::msg(
-                    "Per-server statistics appear once calls are retained.",
-                )));
-        } else {
-            let mut stats = snapshot.server_stats.clone();
-            let current_servers = stats.iter().map(stat_server_name).collect::<Vec<_>>();
-            let positions = {
-                let mut order = self.server_stat_order.borrow_mut();
-                order.retain(|server| current_servers.contains(server));
-                for server in current_servers {
-                    if !order.contains(&server) {
-                        order.push(server);
-                    }
-                }
-                order
-                    .iter()
-                    .enumerate()
-                    .map(|(index, server)| (server.clone(), index))
-                    .collect::<std::collections::HashMap<_, _>>()
-            };
-            stats.sort_by_key(|stat| {
-                positions
-                    .get(&stat_server_name(stat))
-                    .copied()
-                    .unwrap_or(usize::MAX)
-            });
-            reconcile_rows(&self.stats_list, &self.stat_rows, &stats, |stat| {
-                server_stat_row(stat, self.expanded_stat_servers.clone()).upcast()
-            });
-        }
+        self.render_savings();
         if traces_changed {
-            if snapshot.search_traces.is_empty() {
-                self.search_list.append(&empty_activity_source_label(if snapshot.recent.iter().any(|row| row.internal && row.tool == "search") { crate::i18n::msg("Recent activity includes tool searches; detailed search records are not available.") } else { crate::i18n::msg("Nothing searched yet.") }));
-            } else {
-                for trace in &snapshot.search_traces {
-                    self.search_list.append(&search_trace_card(
-                        trace,
-                        self.expanded_activity_rows.clone(),
-                    ));
-                }
-            }
+            self.render_discovery();
+        }
+        if identities_changed {
+            self.render_identities();
         }
         if inspect_changed {
-            if snapshot.inspect_calls.is_empty() {
-                self.inspect_list
-                    .append(&empty_activity_source_label(crate::i18n::msg(
-                        "Live inspection is off or has not captured a call.",
-                    )));
-            } else {
-                for capture in &snapshot.inspect_calls {
-                    self.inspect_list
-                        .append(&inspect_card(capture, self.expanded_activity_rows.clone()));
-                }
-            }
+            self.render_inspector();
         }
+        self.render_audit();
     }
 
     fn render_security(&self) {
@@ -5719,18 +5661,33 @@ impl ActivityPage {
         let Some(snapshot) = borrowed.as_ref() else {
             return;
         };
-        while let Some(child) = self.security_list.first_child() {
-            self.security_list.remove(&child);
-        }
-        if snapshot.security_events.is_empty() {
-            self.set_security_status(&[]);
-            self.security_expander
-                .set_label(Some(&crate::i18n::tr("Protection history · Clear")));
-            self.security_list
-                .append(&empty_activity_source_label(crate::i18n::msg(
-                    "No tool changes or suspicious content to review.",
-                )));
-            return;
+        clear_box(&self.security_list);
+        if snapshot.security_error.is_some() {
+            // Unknown is never an all-clear: say so, keep any last-known findings.
+            let card = if snapshot.security_stale {
+                activity_status_card(
+                    StatusTone::Warning,
+                    crate::i18n::msg("Security status may be out of date."),
+                    crate::i18n::msg("Showing the last security events Toolport read successfully; the latest check failed."),
+                )
+            } else {
+                activity_status_card(
+                    StatusTone::Warning,
+                    crate::i18n::msg("Couldn't verify protection status."),
+                    crate::i18n::msg(
+                        "Toolport couldn't read security events, so this is not an all-clear.",
+                    ),
+                )
+            };
+            if let Some(error) = &snapshot.security_error {
+                card.detail.set_tooltip_text(Some(error));
+            }
+            let page = self.clone();
+            activity_card_action(&card, crate::i18n::msg("Retry"), move || page.refresh());
+            self.security_list.append(&card.root);
+            if !snapshot.security_stale {
+                return;
+            }
         }
         let live: Vec<serde_json::Value> = {
             let dismissed = self.security_dismissed.borrow();
@@ -5739,33 +5696,12 @@ impl ActivityPage {
                 .filter(|event| !security_event_is_dismissed(event, &dismissed))
                 .collect()
         };
-        if live.is_empty() {
-            self.set_security_status(&[]);
-            self.security_expander
-                .set_label(Some(&crate::i18n::tr("Protection history · Reviewed")));
-            // The calm "you're protected" state: a protection the user never
-            // sees builds no trust.
-            self.security_list.append(&empty_activity_source_label(crate::i18n::msg("Protection active. Toolport is watching tool definitions and results. Nothing needs your attention right now.")));
-            return;
-        }
         let (older, live): (Vec<_>, Vec<_>) = live
             .into_iter()
             .partition(|event| event["historical"] == true);
-        self.set_security_status(&live);
+        // The loud lane: tool changes to review, then findings that need a person.
         let groups = crate::integrity::group_tool_changes(&live);
-        self.security_expander
-            .set_label(Some(&if groups.is_empty() {
-                crate::i18n::tr("Protection history · Security notices").to_string()
-            } else {
-                crate::i18n::trf(
-                    if groups.len() == 1 {
-                        crate::i18n::msg("Protection history · {value0} server update")
-                    } else {
-                        crate::i18n::msg("Protection history · {value0} server updates")
-                    },
-                    &[("value0", &format!("{}", groups.len()))],
-                )
-            }));
+        let has_changes = !groups.is_empty();
         for group in groups {
             self.security_list
                 .append(&tool_change_group_card(&group, self.clone()));
@@ -5792,14 +5728,83 @@ impl ActivityPage {
             history.set_child(Some(&rows));
             self.security_list.append(&history);
         }
-        for (event, count) in crate::integrity::collapse_security_by_identity(
-            &live
-                .into_iter()
-                .filter(|event| event["type"] != "tool_drift")
-                .collect::<Vec<_>>(),
-        ) {
-            self.security_list
-                .append(&security_notice_card(&event, count, self.clone()));
+        let (high, info): (Vec<_>, Vec<_>) = live
+            .into_iter()
+            .filter(|event| event["type"] != "tool_drift")
+            .partition(security_event_needs_attention);
+        if !high.is_empty() {
+            let collapsed = crate::integrity::collapse_security_by_identity(&high);
+            let count = gtk::Label::new(Some(&collapsed.len().to_string()));
+            let rows = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            for (event, count) in collapsed.into_iter().take(10) {
+                rows.append(&security_notice_card(&event, count, self.clone()));
+            }
+            let notices = activity_panel(
+                "security-low-symbolic",
+                crate::i18n::msg("Tool security notices"),
+                &count,
+                crate::i18n::msg("A tool changed after you approved it, a tool's definition contains instruction-like content, or a tool returned data that looks like injected instructions. Usually benign, but it's how rug pulls, tool poisoning, and agentjacking work, so Toolport flags it (and labels suspicious tool output as data). Dismiss the ones you've reviewed."),
+                &rows,
+            );
+            bind_activity_expander(
+                &notices,
+                "panel:security-notices".into(),
+                self.expanded_activity_rows.clone(),
+                !self
+                    .expanded_activity_rows
+                    .borrow()
+                    .contains("panel:security-notices-closed"),
+            );
+            let expanded_rows = self.expanded_activity_rows.clone();
+            notices.connect_expanded_notify(move |notices| {
+                remember_activity_expansion(
+                    &mut expanded_rows.borrow_mut(),
+                    "panel:security-notices-closed",
+                    !notices.is_expanded(),
+                );
+            });
+            self.security_list.append(&notices);
+        } else if snapshot.security_error.is_none() && !has_changes {
+            // A protection the user never sees builds no trust.
+            self.security_list.append(
+                &activity_status_card(
+                    StatusTone::Success,
+                    crate::i18n::msg("Protection active."),
+                    crate::i18n::msg("Toolport is watching tool definitions and results. Nothing needs your attention right now."),
+                )
+                .root,
+            );
+        }
+        if !info.is_empty() {
+            let count = gtk::Label::new(Some(&info.len().to_string()));
+            let rows = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            for event in info.iter().take(20) {
+                rows.append(&security_notice_card(event, 1, self.clone()));
+            }
+            let quiet = activity_panel(
+                "document-open-recent-symbolic",
+                crate::i18n::msg("New & changed tools"),
+                &count,
+                crate::i18n::msg("New tools first seen, and benign, non-destructive changes to tools you've already approved (vendors revise beta tools server-side). Kept for the record, not flagged as a risk, the approval and destructive-tool gates still guard every call. Dismiss any you've reviewed."),
+                &rows,
+            );
+            quiet.set_hexpand(true);
+            bind_activity_expander(
+                &quiet,
+                "panel:quiet-drift".into(),
+                self.expanded_activity_rows.clone(),
+                false,
+            );
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            line.append(&quiet);
+            let dismiss_all = l10n::button("Dismiss all");
+            dismiss_all.add_css_class("flat");
+            dismiss_all.set_valign(gtk::Align::Start);
+            let page = self.clone();
+            let keys = info.iter().map(security_dismissal_key).collect::<Vec<_>>();
+            dismiss_all.connect_clicked(move |_| page.dismiss_security(keys.clone()));
+            line.append(&dismiss_all);
+            self.security_list.append(&line);
         }
     }
 
@@ -5834,70 +5839,20 @@ impl ActivityPage {
                     page.dismiss_security(keys);
                     page.refresh();
                 }
-                Ok(Err(error)) => page.show_error(&crate::i18n::trf(
+                Ok(Err(error)) => page.show_feedback_error(&crate::i18n::trf(
                     "could not accept changes: {value0}",
                     &[("value0", &error.to_string())],
                 )),
-                Err(_) => {
-                    page.show_error(&crate::i18n::tr("accepting changes stopped unexpectedly"))
-                }
+                Err(_) => page.show_feedback_error(&crate::i18n::tr(
+                    "accepting changes stopped unexpectedly",
+                )),
             }
         });
     }
 
-    fn set_security_status(&self, important: &[serde_json::Value]) {
-        self.security_status.remove_css_class("attention");
-        self.security_status.remove_css_class("review");
-        self.security_status_icon.remove_css_class("review");
-        self.security_status_icon.remove_css_class("attention");
-        if important.is_empty() {
-            self.security_status_title
-                .set_label(&crate::i18n::tr("Protection active"));
-            self.security_status_detail
-                .set_label(&crate::i18n::tr("No changes need review."));
-            self.security_status.set_tooltip_text(Some(&crate::i18n::tr(
-                "Open security and diagnostic history",
-            )));
-            return;
-        }
-        if important
-            .iter()
-            .any(|event| event["blocked"] == true || event["type"] == "result_injection_blocked")
-        {
-            self.security_status.add_css_class("attention");
-            self.security_status_icon.add_css_class("attention");
-        } else {
-            self.security_status.add_css_class("review");
-            self.security_status_icon.add_css_class("review");
-        }
-        let groups = crate::integrity::group_tool_changes(important);
-        let incidents = security_attention_incidents(important);
-        let collapsed = crate::integrity::collapse_security_by_identity(&incidents);
-        let count = groups.len()
-            + collapsed
-                .iter()
-                .filter(|(event, _)| event["type"] != "tool_drift")
-                .count();
-        l10n::bind_formatted_label(
-            &self.security_status_title,
-            if count == 1 {
-                crate::i18n::msg("{value0} update to review")
-            } else {
-                crate::i18n::msg("{value0} updates to review")
-            },
-            &[("value0", &format!("{}", count))],
-        );
-        self.security_status_detail
-            .set_label(&crate::i18n::lookup(security_status_detail(important)));
-        self.security_status.set_tooltip_text(Some(&crate::i18n::tr(
-            "Review changes in Protection history",
-        )));
-    }
-
+    /// Bring the protection lane into view (the sidebar's security alert).
     fn reveal_security(&self) {
-        self.diagnostics_expander.set_expanded(true);
-        self.security_expander.set_expanded(true);
-        let target = self.security_expander.clone();
+        let target = self.security_list.clone();
         let scroller = self.scroller.clone();
         gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(180), move || {
             target.grab_focus();
@@ -6035,6 +5990,227 @@ impl ActivityPage {
         self.savings_detail.set_label(&detail);
     }
 
+    fn render_discovery(&self) {
+        let borrowed = self.last_snapshot.borrow();
+        let Some(snapshot) = borrowed.as_ref() else {
+            return;
+        };
+        clear_box(&self.search_list);
+        clear_box(&self.discovery_error);
+        self.discovery_plain.set_visible(false);
+        self.discovery_expander.set_visible(false);
+        if snapshot.search_traces_error.is_some() {
+            let page = self.clone();
+            self.discovery_error.append(&activity_panel_error(
+                crate::i18n::msg("Discovery"),
+                move || page.refresh(),
+            ));
+            return;
+        }
+        if snapshot.search_traces.is_empty() {
+            let searches = activity_search_count(&snapshot.recent);
+            if searches > 0 {
+                l10n::bind_formatted_label(
+                    &self.discovery_plain_text,
+                    "{count} searches in recent activity; detailed search records are not available.",
+                    &[("count", &crate::i18n::group_digits(searches))],
+                );
+            } else {
+                l10n::bind_label(&self.discovery_plain_text, "Nothing searched yet.");
+            }
+            self.discovery_plain.set_visible(true);
+            return;
+        }
+        self.discovery_count
+            .set_label(&crate::i18n::group_digits(snapshot.search_traces.len()));
+        for trace in &snapshot.search_traces {
+            self.search_list.append(&search_trace_card(
+                trace,
+                self.expanded_activity_rows.clone(),
+            ));
+        }
+        self.discovery_expander.set_visible(true);
+    }
+
+    fn render_inspector(&self) {
+        let borrowed = self.last_snapshot.borrow();
+        let Some(snapshot) = borrowed.as_ref() else {
+            return;
+        };
+        clear_box(&self.inspect_list);
+        self.inspect_expander.set_visible(snapshot.live_inspect);
+        if !snapshot.live_inspect {
+            return;
+        }
+        self.inspect_count
+            .set_label(&crate::i18n::group_digits(snapshot.inspect_calls.len()));
+        if snapshot.inspect_error.is_some() {
+            let page = self.clone();
+            self.inspect_list.append(&activity_panel_error(
+                crate::i18n::msg("Live inspector"),
+                move || page.refresh(),
+            ));
+        } else if snapshot.inspect_calls.is_empty() {
+            self.inspect_list
+                .append(&empty_activity_source_label(crate::i18n::msg(
+                    "No calls captured yet. Run a tool through Toolport and it'll show here.",
+                )));
+        } else {
+            for capture in &snapshot.inspect_calls {
+                self.inspect_list
+                    .append(&inspect_card(capture, self.expanded_activity_rows.clone()));
+            }
+        }
+    }
+
+    /// The audit log's part of the page: its error, stale or empty state, the
+    /// stats and the Recent calls disclosure.
+    fn render_audit(&self) {
+        let borrowed = self.last_snapshot.borrow();
+        let Some(snapshot) = borrowed.as_ref() else {
+            return;
+        };
+        clear_box(&self.audit_state);
+        let hide_log = || {
+            self.stats_box.set_visible(false);
+            self.recent_box.set_visible(false);
+            self.clear_recent_rows();
+        };
+        if let (Some(error), false) = (&snapshot.audit_error, snapshot.audit_stale) {
+            // Not an empty log: the real cause, with Retry and View log.
+            let page = self.clone();
+            self.audit_state.append(&error_callout(
+                crate::i18n::msg("Couldn't load activity"),
+                error,
+                move || page.refresh(),
+            ));
+            hide_log();
+            return;
+        }
+        if snapshot.audit_stale && snapshot.recent.is_empty() {
+            let card = activity_status_card(
+                StatusTone::Warning,
+                crate::i18n::msg("No current activity status"),
+                crate::i18n::msg("The last successful read found no calls, but the latest refresh failed, so Toolport can't verify that the log is still empty."),
+            );
+            let page = self.clone();
+            activity_card_action(&card, crate::i18n::msg("Retry"), move || page.refresh());
+            self.audit_state.append(&card.root);
+            hide_log();
+            return;
+        }
+        if snapshot.audit_stale {
+            let card = activity_status_card(
+                StatusTone::Warning,
+                crate::i18n::msg("Activity may be out of date."),
+                crate::i18n::msg(
+                    "Showing the last calls Toolport read successfully; the latest refresh failed.",
+                ),
+            );
+            let page = self.clone();
+            activity_card_action(&card, crate::i18n::msg("Retry"), move || page.refresh());
+            self.audit_state.append(&card.root);
+        }
+        if snapshot.recent.is_empty() {
+            let card = state_card(
+                "view-list-symbolic",
+                crate::i18n::msg("No activity yet"),
+                crate::i18n::msg("Calls and approval outcomes appear here. Call totals and error rates count tools that ran."),
+                false,
+            );
+            let page = self.clone();
+            state_action(&card, crate::i18n::msg("Refresh"), move || page.refresh());
+            self.audit_state.append(&card);
+            hide_log();
+            return;
+        }
+        drop(borrowed);
+        self.render_stats();
+        self.recent_box.set_visible(true);
+        self.render_recent();
+    }
+
+    fn render_stats(&self) {
+        let borrowed = self.last_snapshot.borrow();
+        let Some(snapshot) = borrowed.as_ref() else {
+            return;
+        };
+        // React reads stats with the log; a failed read leaves them out.
+        let shown = snapshot.call_count > 0 && !snapshot.audit_stale;
+        self.stats_box.set_visible(shown);
+        if !shown {
+            return;
+        }
+        self.call_count
+            .set_label(&crate::i18n::group_digits(snapshot.call_count));
+        self.error_count
+            .set_label(&crate::i18n::group_digits(snapshot.error_count));
+        if snapshot.error_count > 0 {
+            self.error_count.add_css_class("error");
+        } else {
+            self.error_count.remove_css_class("error");
+        }
+        l10n::bind_formatted_label(
+            &self.error_caption,
+            "errors ({value1})",
+            &[(
+                "value1",
+                &format_percent(
+                    snapshot.error_count as f64 / snapshot.call_count as f64,
+                    snapshot.error_count > 0,
+                ),
+            )],
+        );
+        let servers = snapshot.server_stats.len();
+        self.server_count
+            .set_label(&crate::i18n::group_digits(servers));
+        l10n::bind_formatted_label(
+            &self.stats_server_count,
+            if servers == 1 {
+                crate::i18n::msg("{count} server")
+            } else {
+                crate::i18n::msg("{count} servers")
+            },
+            &[("count", &servers.to_string())],
+        );
+        let with_errors = snapshot
+            .server_stats
+            .iter()
+            .filter(|stat| stat["errors"].as_u64().unwrap_or(0) > 0)
+            .count();
+        self.stats_error_badge.set_visible(with_errors > 0);
+        l10n::bind_formatted_label(
+            &self.stats_error_badge,
+            "{value1} with errors",
+            &[("value1", &with_errors.to_string())],
+        );
+        let mut stats = snapshot.server_stats.clone();
+        let current_servers = stats.iter().map(stat_server_name).collect::<Vec<_>>();
+        let positions = {
+            let mut order = self.server_stat_order.borrow_mut();
+            order.retain(|server| current_servers.contains(server));
+            for server in current_servers {
+                if !order.contains(&server) {
+                    order.push(server);
+                }
+            }
+            order
+                .iter()
+                .enumerate()
+                .map(|(index, server)| (server.clone(), index))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        stats.sort_by_key(|stat| {
+            positions
+                .get(&stat_server_name(stat))
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+        reconcile_rows(&self.stats_list, &self.stat_rows, &stats, |stat| {
+            server_stat_row(stat, self.expanded_stat_servers.clone()).upcast()
+        });
+    }
+
     /// The server the filter dropdown currently points at, or `None` for all.
     fn selected_filter_server(&self) -> Option<String> {
         let selected = self.filter_server.selected();
@@ -6048,93 +6224,106 @@ impl ActivityPage {
             .map(|item| item.string().to_string())
     }
 
+    /// The count line under the Recent calls heading, in React's words, for the
+    /// disclosure's current state.
+    fn render_recent_summary(&self) {
+        let borrowed = self.last_snapshot.borrow();
+        let Some(snapshot) = borrowed.as_ref() else {
+            return;
+        };
+        let open = self.recent_expander.is_expanded();
+        let server = self.selected_filter_server();
+        let visible = filter_calls(
+            &snapshot.recent,
+            server.as_deref(),
+            self.errors_only.is_active(),
+        )
+        .len();
+        let total = (!snapshot.audit_stale).then_some(snapshot.call_count);
+        let recent = snapshot.recent.len();
+        let label = if open {
+            &self.filter_count
+        } else {
+            &self.recent_summary
+        };
+        l10n::bind_label_with(label, move || {
+            activity_count_summary(total, visible, recent, open)
+        });
+        self.filter_count.set_visible(open);
+        self.recent_summary.set_visible(!open);
+    }
+
     fn render_recent(&self) {
         let borrowed = self.last_snapshot.borrow();
         let Some(snapshot) = borrowed.as_ref() else {
             return;
         };
-        if snapshot.recent.is_empty() {
-            self.clear_recent_rows();
-            self.filter_count.set_label("");
-            self.show_more_calls.set_visible(false);
-            let card = state_card(
-                "view-list-symbolic",
-                crate::i18n::msg("No activity yet"),
-                crate::i18n::msg("Calls and approval outcomes will appear here with their timing."),
-                false,
-            );
-            let page = self.clone();
-            state_action(&card, crate::i18n::msg("Refresh"), move || page.refresh());
-            self.list.append(&card);
-            return;
-        }
+        l10n::bind_formatted_label(
+            &self.recent_latest,
+            "latest {count}",
+            &[("count", &snapshot.recent.len().to_string())],
+        );
         let server = self.selected_filter_server();
         let errors_only = self.errors_only.is_active();
+        self.filtered_label
+            .set_visible(server.is_some() || errors_only);
         let filtered = filter_calls(&snapshot.recent, server.as_deref(), errors_only);
+        let recent = snapshot.recent.len();
+        self.render_recent_summary();
         if filtered.is_empty() {
             self.clear_recent_rows();
-            self.filter_count.set_label(&activity_count_summary(
-                snapshot.call_count,
-                0,
-                snapshot.recent.len(),
-                true,
-            ));
-            self.show_more_calls.set_visible(false);
             let card = state_card(
                 "edit-find-symbolic",
-                crate::i18n::msg("No matching activity"),
-                crate::i18n::msg("Nothing saved matches the current filter."),
+                crate::i18n::msg("No calls match this filter."),
+                "",
                 false,
             );
+            if let Some(body) = card.last_child() {
+                body.set_visible(false);
+            }
+            if errors_only && server.is_none() {
+                if let Some(title) = card
+                    .first_child()
+                    .and_then(|icon| icon.next_sibling())
+                    .and_downcast::<gtk::Label>()
+                {
+                    if recent == 1 {
+                        l10n::bind_label(&title, "No errors in the latest entry.");
+                    } else {
+                        l10n::bind_formatted_label(
+                            &title,
+                            "No errors in the latest {count} entries.",
+                            &[("count", &crate::i18n::group_digits(recent))],
+                        );
+                    }
+                }
+            }
             let page = self.clone();
             state_action(&card, crate::i18n::msg("Clear filter"), move || {
+                page.updating_filters.set(true);
                 page.filter_server.set_selected(0);
                 page.errors_only.set_active(false);
+                page.updating_filters.set(false);
                 page.render_recent();
             });
             self.list.append(&card);
             return;
         }
-        let match_count = filtered.len();
-        let visible_count = if self.show_all_recent.get() {
-            match_count
-        } else {
-            match_count.min(RECENT_CALL_PREVIEW_LIMIT)
-        };
-        self.filter_count.set_label(&activity_count_summary(
-            snapshot.call_count,
-            visible_count,
-            snapshot.recent.len(),
-            match_count != snapshot.recent.len(),
-        ));
-        self.show_more_calls
-            .set_visible(match_count > RECENT_CALL_PREVIEW_LIMIT);
-        let show_more_label = if self.show_all_recent.get() {
-            crate::i18n::tr("Show fewer").to_string()
-        } else {
-            crate::i18n::trf(
-                "Show all {value0} entries",
-                &[("value0", &format!("{}", match_count))],
-            )
-        };
-        self.show_more_calls.set_label(&show_more_label);
-        let visible = filtered
-            .into_iter()
-            .take(visible_count)
-            .cloned()
-            .collect::<Vec<_>>();
+        let visible = filtered.into_iter().cloned().collect::<Vec<_>>();
+        if self.recent_rows.borrow().is_empty() {
+            clear_box(&self.list);
+        }
         self.list.add_css_class("toolport-row-group");
+        let expanded = self.expanded_activity_rows.clone();
         reconcile_rows(&self.list, &self.recent_rows, &visible, |row| {
-            activity_card(row).upcast()
+            activity_card(row, expanded.clone()).upcast()
         });
     }
 
     fn clear_recent_rows(&self) {
         self.recent_rows.borrow_mut().clear();
         self.list.remove_css_class("toolport-row-group");
-        while let Some(child) = self.list.first_child() {
-            self.list.remove(&child);
-        }
+        clear_box(&self.list);
     }
 
     fn render_identities(&self) {
@@ -6142,54 +6331,59 @@ impl ActivityPage {
         let Some(snapshot) = borrowed.as_ref() else {
             return;
         };
-        while let Some(child) = self.identity_list.first_child() {
-            self.identity_list.remove(&child);
-        }
-        if let Some(error) = &snapshot.tool_identities_error {
-            let message = empty_activity_label(&crate::i18n::trf(
-                "Tool identities are unavailable: {value0}",
-                &[("value0", &error.to_string())],
-            ));
-            message.remove_css_class("toolport-muted");
-            message.add_css_class("error");
-            self.identity_list.append(&message);
+        clear_box(&self.identity_list);
+        clear_box(&self.identity_error);
+        if snapshot.tool_identities_error.is_some() {
+            self.identity_expander.set_visible(false);
+            let page = self.clone();
+            let card =
+                activity_panel_error(crate::i18n::msg("Tool identities"), move || page.refresh());
+            if let Some(error) = &snapshot.tool_identities_error {
+                card.set_tooltip_text(Some(error));
+            }
+            self.identity_error.append(&card);
             return;
         }
+        // Hidden until the gateway has pinned a baseline, as in React.
+        self.identity_expander
+            .set_visible(!snapshot.tool_identities.is_empty());
         if snapshot.tool_identities.is_empty() {
-            self.identity_list.append(&empty_activity_source_label(crate::i18n::msg("No tool baselines pinned yet. Identities appear after a client lists tools through the gateway.")));
             return;
         }
-        let query = self.identity_search.text().to_lowercase();
+        self.identity_count
+            .set_label(&crate::i18n::group_digits(snapshot.tool_identities.len()));
+        let query = self.identity_search.text().trim().to_lowercase();
         let filtered = filter_tool_identities(&snapshot.tool_identities, &query);
         if filtered.is_empty() {
-            self.identity_list
-                .append(&empty_activity_source_label(crate::i18n::msg(
-                    "No pinned tool matches the filter.",
-                )));
+            let message = empty_activity_label("");
+            let text = self.identity_search.text().to_string();
+            l10n::bind_formatted_label(
+                &message,
+                "No server or tool matches \"{value1}\".",
+                &[("value1", &text)],
+            );
+            message.set_justify(gtk::Justification::Center);
+            message.set_xalign(0.5);
+            self.identity_list.append(&message);
             return;
         }
         let groups = state::group_tool_identities(&filtered);
         if !query.is_empty() {
-            self.identity_list
-                .append(&empty_activity_label(&crate::i18n::trf(
-                    if filtered.len() == 1 {
-                        if groups.len() == 1 {
-                            crate::i18n::msg("{value0} tool in {value2} server")
-                        } else {
-                            crate::i18n::msg("{value0} tool in {value2} servers")
-                        }
-                    } else {
-                        if groups.len() == 1 {
-                            crate::i18n::msg("{value0} tools in {value2} server")
-                        } else {
-                            crate::i18n::msg("{value0} tools in {value2} servers")
-                        }
-                    },
-                    &[
-                        ("value0", &format!("{}", filtered.len())),
-                        ("value2", &format!("{}", groups.len())),
-                    ],
-                )));
+            let line = empty_activity_label("");
+            l10n::bind_formatted_label(
+                &line,
+                match (filtered.len() == 1, groups.len() == 1) {
+                    (true, true) => crate::i18n::msg("{value1} tool in {value3}  server"),
+                    (true, false) => crate::i18n::msg("{value1} tool in {value3}  servers"),
+                    (false, true) => crate::i18n::msg("{value1} tools in {value3}  server"),
+                    (false, false) => crate::i18n::msg("{value1} tools in {value3}  servers"),
+                },
+                &[
+                    ("value1", &filtered.len().to_string()),
+                    ("value3", &groups.len().to_string()),
+                ],
+            );
+            self.identity_list.append(&line);
         }
         for (server, identities) in groups {
             // A search forces matches open so they are visible without a click.
@@ -6202,24 +6396,30 @@ impl ActivityPage {
         }
     }
 
+    /// A refresh that failed as a whole (a damaged savings tally, a crashed
+    /// worker). With nothing loaded yet it takes the audit log's place; over
+    /// loaded rows it keeps them and says the refresh failed.
     fn show_error(&self, error: &str) {
         if self.last_snapshot.borrow().is_none() {
-            self.list.remove_css_class("toolport-row-group");
-            while let Some(child) = self.list.first_child() {
-                self.list.remove(&child);
-            }
+            clear_box(&self.audit_state);
             let page = self.clone();
-            self.list.append(&error_callout(
+            self.audit_state.append(&error_callout(
                 crate::i18n::msg("Couldn't load activity"),
                 error,
                 move || page.refresh(),
             ));
-            self.feedback.set_visible(false);
-            l10n::bind_label(&self.security_status_title, "Protection state unavailable");
-            l10n::bind_label(
-                &self.security_status_detail,
-                "Retry Activity to check saved reviews.",
+            clear_box(&self.security_list);
+            let card = activity_status_card(
+                StatusTone::Warning,
+                crate::i18n::msg("Couldn't verify protection status."),
+                crate::i18n::msg(
+                    "Toolport couldn't read security events, so this is not an all-clear.",
+                ),
             );
+            let page = self.clone();
+            activity_card_action(&card, crate::i18n::msg("Retry"), move || page.refresh());
+            self.security_list.append(&card.root);
+            self.feedback.set_visible(false);
             return;
         }
         // A failed refresh over real rows must never read as "all clear": keep
@@ -6230,14 +6430,26 @@ impl ActivityPage {
         self.feedback.set_visible(true);
     }
 
+    /// An action's failure (export, clear, accept), shown without touching the rows.
+    fn show_feedback_error(&self, error: &str) {
+        self.feedback.set_label(error);
+        self.feedback.remove_css_class("success");
+        self.feedback.add_css_class("error");
+        self.feedback.set_visible(true);
+    }
+
     fn confirm_clear(&self) {
         let Some(parent) = self.app.active_window() else {
             return;
         };
         #[allow(deprecated)]
-        let dialog = adw::MessageDialog::new(Some(&parent), Some(&crate::i18n::tr("Clear retained activity?")), Some(&crate::i18n::tr("This permanently removes the local call audit, discovery traces, live inspector captures, and savings tally. Security drift history remains available for review.")));
+        let dialog = adw::MessageDialog::new(
+            Some(&parent),
+            Some(&crate::i18n::tr("Clear retained activity?")),
+            Some(&crate::i18n::tr("Permanently deletes everything Toolport keeps on this device: the audit log, discovery search traces, live-inspection captures, and the savings tally (including its running total). Nothing is sent anywhere; each log starts fresh on the next event. This can't be undone.")),
+        );
         l10n::bind_dialog_heading(&dialog, "Clear retained activity?");
-        l10n::bind_dialog_body(&dialog, "This permanently removes the local call audit, discovery traces, live inspector captures, and savings tally. Security drift history remains available for review.");
+        l10n::bind_dialog_body(&dialog, "Permanently deletes everything Toolport keeps on this device: the audit log, discovery search traces, live-inspection captures, and the savings tally (including its running total). Nothing is sent anywhere; each log starts fresh on the next event. This can't be undone.");
         dialog.add_response("cancel", &crate::i18n::tr("Cancel"));
         l10n::bind_dialog_response(&dialog, "cancel", "Cancel");
         dialog.add_response("clear", &crate::i18n::tr("Clear activity"));
@@ -6259,23 +6471,157 @@ impl ActivityPage {
         self.clear_button.set_sensitive(false);
         self.feedback
             .set_label(&crate::i18n::tr("Clearing retained activity…"));
+        self.feedback.set_visible(true);
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
             let result =
                 gtk::gio::spawn_blocking(crate::observability_controller::clear_activity_logs)
                     .await;
             match result {
-                Ok(Ok(())) => page.refresh(),
-                Ok(Err(error)) => page.show_error(&crate::i18n::trf(
-                    "could not clear activity: {value0}",
-                    &[("value0", &error.to_string())],
-                )),
-                Err(_) => {
-                    page.show_error(&crate::i18n::tr("the clear operation stopped unexpectedly"))
+                Ok(Ok(())) => {
+                    // A failed read right after a successful wipe must not bring the
+                    // deleted rows back as "last known".
+                    page.last_snapshot.borrow_mut().take();
+                    page.recent_rows.borrow_mut().clear();
+                    page.refresh();
                 }
+                Ok(Err(error)) => page.show_feedback_error(&crate::i18n::trf(
+                    "Couldn't clear activity: {value1}",
+                    &[("value1", &error.to_string())],
+                )),
+                Err(_) => page.show_feedback_error(&crate::i18n::tr(
+                    "the clear operation stopped unexpectedly",
+                )),
             }
         });
     }
+}
+
+fn clear_box(list: &gtk::Box) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+}
+
+/// Searches among the recent rows, which Discovery counts when it has no
+/// detailed records (React counts the same rows).
+fn activity_search_count(recent: &[state::ActivityView]) -> usize {
+    recent
+        .iter()
+        .filter(|row| row.internal && row.tool == "search")
+        .count()
+}
+
+fn activity_count_label() -> gtk::Label {
+    gtk::Label::builder()
+        .halign(gtk::Align::Fill)
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["toolport-muted", "caption"])
+        .build()
+}
+
+/// A panel's heading line: icon, name and an optional count badge.
+fn activity_panel_title(icon: &str, source: &'static str, count: Option<&gtk::Label>) -> gtk::Box {
+    let title = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let image = gtk::Image::from_icon_name(icon);
+    image.add_css_class("toolport-muted");
+    title.append(&image);
+    let label = l10n::label(source);
+    label.set_xalign(0.0);
+    label.set_wrap(true);
+    label.add_css_class("heading");
+    title.append(&label);
+    if let Some(count) = count {
+        count.add_css_class("toolport-badge");
+        count.add_css_class("caption");
+        count.set_valign(gtk::Align::Center);
+        title.append(count);
+    }
+    title
+}
+
+/// A collapsible Activity panel like React's: heading with a count, then a
+/// description over `content` when open.
+fn activity_panel(
+    icon: &str,
+    source: &'static str,
+    count: &gtk::Label,
+    description: &'static str,
+    content: &impl IsA<gtk::Widget>,
+) -> gtk::Expander {
+    let expander = gtk::Expander::new(None);
+    expander.add_css_class("toolport-card");
+    expander.set_label_widget(Some(&activity_panel_title(icon, source, Some(count))));
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    body.set_margin_top(8);
+    let text = empty_activity_source_label(description);
+    text.add_css_class("caption");
+    body.append(&text);
+    body.append(content);
+    expander.set_child(Some(&body));
+    expander
+}
+
+/// React's `PanelErrorNotice`: a panel that could not be read is not empty.
+fn activity_panel_error(label: &'static str, retry: impl Fn() + 'static) -> gtk::Box {
+    let card = error_callout(
+        crate::i18n::msg("Couldn't load {label}."),
+        &crate::i18n::tr("This isn't necessarily empty — Toolport couldn't check."),
+        retry,
+    );
+    let mut labels = Vec::new();
+    collect_labels(card.upcast_ref(), &mut labels);
+    if let Some(heading) = labels.first() {
+        l10n::bind_label_with(heading, move || {
+            crate::i18n::trf(
+                "Couldn't load {label}.",
+                &[("label", &crate::i18n::lookup(label).to_lowercase())],
+            )
+            .to_string()
+        });
+    }
+    if let Some(detail) = labels.get(1) {
+        l10n::bind_label(
+            detail,
+            "This isn't necessarily empty — Toolport couldn't check.",
+        );
+    }
+    card
+}
+
+fn collect_labels(widget: &gtk::Widget, out: &mut Vec<gtk::Label>) {
+    if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+        out.push(label.clone());
+        return;
+    }
+    let mut child = widget.first_child();
+    while let Some(next) = child {
+        collect_labels(&next, out);
+        child = next.next_sibling();
+    }
+}
+
+/// React's `StatusCard` with a fixed title and detail that follow the language.
+fn activity_status_card(tone: StatusTone, title: &'static str, detail: &'static str) -> StatusCard {
+    let card = StatusCard::new();
+    card.show(
+        tone,
+        &crate::i18n::lookup(title),
+        &crate::i18n::lookup(detail),
+    );
+    l10n::bind_label(&card.title, title);
+    if !detail.is_empty() {
+        l10n::bind_label(&card.detail, detail);
+    }
+    card
+}
+
+fn activity_card_action(card: &StatusCard, label: &'static str, action: impl Fn() + 'static) {
+    let button = l10n::button(label);
+    button.add_css_class("toolport-secondary-action");
+    button.connect_clicked(move |_| action());
+    card.actions.append(&button);
 }
 
 fn empty_activity_source_label(source: &'static str) -> gtk::Label {
@@ -6432,22 +6778,6 @@ fn remember_activity_expansion(
         expanded_rows.insert(key.to_string());
     } else {
         expanded_rows.remove(key);
-    }
-}
-
-fn security_status_detail(events: &[serde_json::Value]) -> &'static str {
-    let changes: Vec<_> = events
-        .iter()
-        .filter(|event| event["type"] == "tool_drift")
-        .collect();
-    if changes.is_empty() {
-        crate::i18n::msg("Security findings need review. Open Protection history for details.")
-    } else if changes.iter().any(|event| event["blocked"] == true) {
-        crate::i18n::msg("Some tools are blocked. Review the changes or accept them.")
-    } else if changes.iter().any(|event| event["blocked"].is_null()) {
-        crate::i18n::msg("Blocking status unavailable. Review in Settings > Quarantined tools.")
-    } else {
-        crate::i18n::msg("Not blocked. Review the changes or accept them.")
     }
 }
 
@@ -7267,55 +7597,90 @@ fn savings_title(loads: u64) -> &'static str {
     }
 }
 
-fn activity_count_summary(total: usize, visible: usize, recent: usize, filtered: bool) -> String {
-    activity_count_summary_in(crate::i18n::group_digits, total, visible, recent, filtered)
-}
-
-/// [`activity_count_summary`] with the counts grouped by `group`: the current language's
-/// grouping (1.000 in German), as React's `toLocaleString` writes them.
-fn activity_count_summary_in(
-    group: impl Fn(usize) -> String,
-    total: usize,
+fn activity_count_summary(
+    total: Option<usize>,
     visible: usize,
     recent: usize,
-    filtered: bool,
+    open: bool,
 ) -> String {
-    // The total counts tool calls; the list also holds approvals and Toolport's own
-    // searches, so the shown rows are "entries", never "calls". React's Activity view
-    // uses the same sentences.
-    let visible_text = group(visible);
-    let recent_text = group(recent);
-    let shown = if filtered && visible == 1 {
-        crate::i18n::trf(
-            "Showing 1 matching entry from the latest {value1}.",
-            &[("value1", &recent_text)],
-        )
-    } else if filtered {
-        crate::i18n::trf(
-            "Showing {value0} matching entries from the latest {value1}.",
-            &[("value0", &visible_text), ("value1", &recent_text)],
-        )
-    } else if visible == recent && visible == 1 {
-        crate::i18n::tr("Showing the latest entry.")
+    activity_count_summary_in(crate::i18n::group_digits, total, visible, recent, open)
+}
+
+/// The count line under Recent calls and approvals, in React's sentences: the
+/// total of tool calls (when the stats were read), then what the list holds,
+/// "Latest N entries available." while closed. The list also holds approvals
+/// and Toolport's own searches, so the rows are "entries", never "calls".
+/// Counts are grouped by `group`, the current language's grouping (1.000 in
+/// German), as React's `toLocaleString` writes them.
+fn activity_count_summary_in(
+    group: impl Fn(usize) -> String,
+    total: Option<usize>,
+    visible: usize,
+    recent: usize,
+    open: bool,
+) -> String {
+    let mut line = total
+        .map(|total| {
+            crate::i18n::trf(
+                if total == 1 {
+                    crate::i18n::msg("{count} call recorded on this computer. ")
+                } else {
+                    crate::i18n::msg("{count} calls recorded on this computer. ")
+                },
+                &[("count", &group(total))],
+            )
+            .to_string()
+        })
+        .unwrap_or_default();
+    let shown = if !open {
+        if recent == 1 {
+            crate::i18n::tr("Latest entry available.").to_string()
+        } else {
+            crate::i18n::trf(
+                "Latest {count} entries available.",
+                &[("count", &group(recent))],
+            )
+            .to_string()
+        }
     } else if visible == recent {
+        if recent == 1 {
+            crate::i18n::tr("Showing the latest entry.").to_string()
+        } else {
+            crate::i18n::trf(
+                "Showing the latest {count} entries.",
+                &[("count", &group(visible))],
+            )
+            .to_string()
+        }
+    } else if visible == 1 {
         crate::i18n::trf(
-            "Showing the latest {value0} entries.",
-            &[("value0", &visible_text)],
+            "Showing 1 matching entry from the latest {total}.",
+            &[("total", &group(recent))],
         )
+        .to_string()
     } else {
         crate::i18n::trf(
-            "Showing {value0} of the latest {value1} entries.",
-            &[("value0", &visible_text), ("value1", &recent_text)],
+            "Showing {matching} matching entries from the latest {total}.",
+            &[("matching", &group(visible)), ("total", &group(recent))],
         )
+        .to_string()
     };
-    crate::i18n::trf(
-        if total == 1 {
-            crate::i18n::msg("{value0} call recorded on this computer. {value2}")
-        } else {
-            crate::i18n::msg("{value0} calls recorded on this computer. {value2}")
-        },
-        &[("value0", &group(total)), ("value2", &shown.to_string())],
-    )
+    line.push_str(&shown);
+    line
+}
+
+/// React's `fmtPercent`: one decimal under 10%, and with `floor_non_zero` a rate
+/// that rounds to nothing still reads as "<0.1%".
+fn format_percent(rate: f64, floor_non_zero: bool) -> String {
+    let percent = rate * 100.0;
+    if floor_non_zero && percent < 0.1 {
+        return "<0.1%".to_string();
+    }
+    if percent > 0.0 && percent < 10.0 {
+        format!("{percent:.1}%")
+    } else {
+        format!("{percent:.0}%")
+    }
 }
 
 fn format_saved_tokens(tokens_saved: i64) -> String {
@@ -7650,9 +8015,30 @@ fn activity_detail_tooltip(activity: &state::ActivityView) -> String {
     )
 }
 
-fn activity_card(activity: &state::ActivityView) -> gtk::Box {
-    let card = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+/// One recent-call row, as React's `CallRow`: the server and the tool as two
+/// pieces, the client and time line, and the status chip. A failed call with a
+/// recorded error is a button that opens the error (and run id) below it.
+fn activity_card(
+    activity: &state::ActivityView,
+    expanded_rows: ActivityExpansionState,
+) -> gtk::Box {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
     card.add_css_class("toolport-card");
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    let has_detail = activity.approval_decision.is_none()
+        && !activity.ok
+        && (activity.error.is_some() || activity.run_id.is_some());
+    // An empty slot keeps rows without details aligned with those that have them.
+    let chevron = if has_detail {
+        gtk::Image::from_icon_name("pan-end-symbolic")
+    } else {
+        gtk::Image::new()
+    };
+    chevron.set_pixel_size(12);
+    chevron.set_size_request(12, -1);
+    chevron.set_valign(gtk::Align::Center);
+    chevron.add_css_class("toolport-muted");
+    row.append(&chevron);
     let outcome = activity.approval_decision.as_deref().map(approval_outcome);
     // The icon says what kind of call this was, in a neutral color; the status
     // chip is the row's only status color (spec 7).
@@ -7676,28 +8062,53 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
         emblem.set_valign(gtk::Align::Center);
         emblem.add_css_class("toolport-kind-emblem");
         overlay.add_overlay(&emblem);
-        card.append(&overlay);
+        row.append(&overlay);
     } else {
-        card.append(&icon);
+        row.append(&icon);
     }
 
     let copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
     copy.set_hexpand(true);
-    let heading = gtk::Label::builder()
-        .label(activity_title(activity))
-        .tooltip_text(format!("{} / {}", activity.server, activity.tool))
-        .halign(gtk::Align::Fill)
-        .xalign(0.0)
-        .wrap(true)
-        .css_classes(["heading"])
-        .build();
     if activity.internal {
+        let heading = gtk::Label::builder()
+            .label(activity_title(activity))
+            .tooltip_text(crate::i18n::trf(
+                "Toolport: {tool}",
+                &[("tool", &activity.tool)],
+            ))
+            .halign(gtk::Align::Fill)
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["heading"])
+            .build();
         let activity = activity.clone();
         l10n::bind_label_with(&heading, move || {
             crate::i18n::lookup(&activity_title(&activity))
         });
+        copy.append(&heading);
+    } else {
+        // Two pieces on one line; each ellipsizes with its full text on hover.
+        let title = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        title.append(
+            &gtk::Label::builder()
+                .label(&activity.server)
+                .tooltip_text(&activity.server)
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["heading"])
+                .build(),
+        );
+        title.append(
+            &gtk::Label::builder()
+                .label(&activity.tool)
+                .tooltip_text(&activity.tool)
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["monospace", "caption", "toolport-muted"])
+                .build(),
+        );
+        copy.append(&title);
     }
-    copy.append(&heading);
     let detail_label = gtk::Label::builder()
         .label(activity_detail(activity))
         .tooltip_text(activity_detail_tooltip(activity))
@@ -7716,25 +8127,13 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
     });
     copy.append(&detail_label);
     let thread_chip = host_thread_chip(activity.host.as_deref(), activity.host_thread.as_deref());
-    if let Some(error) = activity.error.as_deref() {
-        copy.append(
-            &gtk::Label::builder()
-                .label(error)
-                .halign(gtk::Align::Start)
-                .xalign(0.0)
-                .single_line_mode(true)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .css_classes(["caption", "toolport-activity-error"])
-                .build(),
-        );
-    }
     // The chips sit right of the text when both fit, and wrap below it otherwise, so
     // they never squeeze the title.
     let chips = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     chips.set_valign(gtk::Align::Center);
     let wrap = page_header::HeaderWrap::new(&copy, &chips);
     wrap.set_hexpand(true);
-    card.append(&wrap);
+    row.append(&wrap);
     if let Some(chip) = thread_chip {
         chips.append(&chip);
     }
@@ -7777,7 +8176,76 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
     badge.set_halign(gtk::Align::Start);
     badge.add_css_class(class);
     chips.append(&badge);
+    if !has_detail {
+        card.append(&row);
+        return card;
+    }
+    let button = gtk::Button::builder()
+        .child(&row)
+        .css_classes(["flat", "toolport-activity-row-button"])
+        .build();
+    card.append(&button);
+    let detail = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    detail.add_css_class("toolport-activity-detail");
+    if let Some(error) = activity.error.clone().or_else(|| {
+        activity
+            .failure_kind
+            .as_ref()
+            .map(|kind| kind.replace('_', " "))
+    }) {
+        detail.append(
+            &gtk::Label::builder()
+                .label(error)
+                .halign(gtk::Align::Fill)
+                .xalign(0.0)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .selectable(true)
+                .css_classes(["caption", "monospace", "toolport-activity-error"])
+                .build(),
+        );
+    }
+    if let Some(run) = activity.run_id.clone() {
+        let label = gtk::Label::builder()
+            .halign(gtk::Align::Fill)
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .selectable(true)
+            .css_classes(["caption", "monospace"])
+            .build();
+        l10n::bind_formatted_label(&label, "Run: {run}", &[("run", &run)]);
+        detail.append(&label);
+    }
+    let key = format!(
+        "call:{}:{}:{}",
+        activity.timestamp_ms, activity.server, activity.tool
+    );
+    let open = expanded_rows.borrow().contains(&key);
+    let show = {
+        let (detail, chevron, button) = (detail.clone(), chevron.clone(), button.clone());
+        move |open: bool| {
+            detail.set_visible(open);
+            chevron.set_icon_name(Some(if open {
+                "pan-down-symbolic"
+            } else {
+                "pan-end-symbolic"
+            }));
+            button.update_state(&[gtk::accessible::State::Expanded(Some(open))]);
+        }
+    };
+    show(open);
+    button.connect_clicked(move |_| {
+        let open = !detail_visible(&expanded_rows, &key);
+        remember_activity_expansion(&mut expanded_rows.borrow_mut(), &key, open);
+        show(open);
+    });
+    card.append(&detail);
     card
+}
+
+fn detail_visible(expanded_rows: &ActivityExpansionState, key: &str) -> bool {
+    expanded_rows.borrow().contains(key)
 }
 
 fn approval_outcome(
@@ -7889,44 +8357,102 @@ fn activity_client_name(activity: &state::ActivityView) -> String {
     }
 }
 
-/// One aggregation row's metrics, shared by the server line and its tool lines:
-/// calls, errors, and latency where the log carried durations.
-fn stat_metrics_line(stat: &serde_json::Value) -> String {
+/// Width of each number column in the per-server breakdown, so the header and
+/// every row line up; four of them still leave the name room at 480 px.
+const STAT_COLUMN_WIDTH: i32 = 64;
+
+/// One row's cells after its name: calls, errors (as a rate), average and p95,
+/// as React's table shows them.
+fn stat_cells(stat: &serde_json::Value) -> [String; 4] {
     let number = |key: &str| stat.get(key).and_then(serde_json::Value::as_u64);
     let calls = number("calls").unwrap_or(0);
     let errors = number("errors").unwrap_or(0);
-    let mut parts = vec![
-        crate::i18n::trf(
-            if calls == 1 {
-                crate::i18n::msg("{count} call")
+    let rate = stat
+        .get("errorRate")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or_else(|| {
+            if calls == 0 {
+                0.0
             } else {
-                crate::i18n::msg("{count} calls")
-            },
-            &[("count", &calls.to_string())],
-        ),
-        crate::i18n::trf(
-            if errors == 1 {
-                crate::i18n::msg("{count} error")
-            } else {
-                crate::i18n::msg("{count} errors")
-            },
-            &[("count", &errors.to_string())],
-        ),
-    ];
-    if let Some(avg) = number("avgMs") {
-        parts.push(crate::i18n::trf(
-            "avg {value0}",
-            &[("value0", &format_duration(avg).to_string())],
-        ));
-    }
-    if let Some(p95) = number("p95Ms") {
-        parts.push(format!("p95 {}", format_duration(p95)));
-    }
-    parts.join(" · ")
+                errors as f64 / calls as f64
+            }
+        });
+    let ms = |key: &str| {
+        number(key)
+            .map(format_duration)
+            .unwrap_or_else(|| "-".into())
+    };
+    [
+        crate::i18n::group_digits(calls as usize),
+        format_percent(rate, errors > 0),
+        ms("avgMs"),
+        ms("p95Ms"),
+    ]
 }
 
-/// One server's row in the per-server breakdown. Expanding it reveals the
-/// per-tool breakdown, built on first expansion like the identity groups.
+fn stat_line(name: &impl IsA<gtk::Widget>, cells: &[gtk::Label]) -> gtk::Box {
+    let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    name.set_hexpand(true);
+    line.append(name);
+    for cell in cells {
+        cell.set_size_request(STAT_COLUMN_WIDTH, -1);
+        cell.set_xalign(1.0);
+        cell.add_css_class("toolport-stat-metrics");
+        line.append(cell);
+    }
+    line
+}
+
+fn stat_cell_labels(stat: &serde_json::Value, classes: &[&str]) -> Vec<gtk::Label> {
+    let errors = stat
+        .get("errors")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    stat_cells(stat)
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| {
+            let cell = gtk::Label::new(Some(&text));
+            for class in classes {
+                cell.add_css_class(class);
+            }
+            cell.add_css_class(if index == 1 && errors > 0 {
+                "error"
+            } else if index == 0 {
+                "toolport-stat-calls"
+            } else {
+                "toolport-muted"
+            });
+            cell
+        })
+        .collect()
+}
+
+/// The breakdown's column headings: Server, Calls, Errors, Avg, p95.
+fn server_stat_header() -> gtk::Box {
+    let heading = |source: &'static str| {
+        let label = l10n::label(source);
+        label.add_css_class("caption");
+        label.add_css_class("toolport-muted");
+        label
+    };
+    let name = heading("Server");
+    name.set_xalign(0.0);
+    let header = stat_line(
+        &name,
+        &[
+            heading("Calls"),
+            heading("Errors"),
+            heading("Avg"),
+            heading("p95"),
+        ],
+    );
+    header.add_css_class("toolport-card");
+    header.add_css_class("toolport-stat-header");
+    header
+}
+
+/// The name a breakdown row is kept and ordered by.
 fn stat_server_name(stat: &serde_json::Value) -> String {
     stat.get("server")
         .and_then(serde_json::Value::as_str)
@@ -7936,105 +8462,109 @@ fn stat_server_name(stat: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// One server's row in the per-server breakdown, as React's `ServerRow`: the
+/// name is a button that opens the per-tool rows, built on first opening.
 fn server_stat_row(
     stat: &serde_json::Value,
     expanded_servers: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
-) -> gtk::Expander {
+) -> gtk::Box {
     let server = stat_server_name(stat);
-    let expander = gtk::Expander::new(None);
-    expander.add_css_class("toolport-card");
-    let title = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    title.append(
-        &gtk::Label::builder()
-            .label(
-                if stat
-                    .get("server")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|name| !name.trim().is_empty())
-                {
-                    server.clone()
-                } else {
-                    crate::i18n::tr("Unknown server")
-                },
-            )
-            .halign(gtk::Align::Start)
-            .xalign(0.0)
-            .hexpand(true)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .css_classes(["heading"])
-            .build(),
-    );
-    title.append(
-        &gtk::Label::builder()
-            .label(stat_metrics_line(stat))
-            .halign(gtk::Align::End)
-            .xalign(1.0)
-            .css_classes(["toolport-muted", "caption", "toolport-stat-metrics"])
-            .build(),
-    );
-    expander.set_label_widget(Some(&title));
+    let shown_name = if stat
+        .get("server")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|name| !name.trim().is_empty())
+    {
+        server.clone()
+    } else {
+        crate::i18n::tr("Unknown server").to_string()
+    };
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    card.add_css_class("toolport-card");
     let tools = stat
         .get("tools")
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let pending = std::rc::Rc::new(std::cell::RefCell::new(Some(tools)));
-    let server_for_expansion = server.clone();
-    let expanded_for_notify = expanded_servers.clone();
-    expander.connect_expanded_notify(move |expander| {
-        if !expander.is_expanded() {
-            expanded_for_notify
-                .borrow_mut()
-                .remove(&server_for_expansion);
-            return;
-        }
-        expanded_for_notify
-            .borrow_mut()
-            .insert(server_for_expansion.clone());
-        let Some(tools) = pending.borrow_mut().take() else {
-            return;
-        };
-        let list = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        list.set_margin_top(8);
-        if tools.is_empty() {
-            list.append(&empty_activity_source_label(crate::i18n::msg(
-                "No per-tool rows retained.",
-            )));
-        }
-        for tool in tools {
-            let name = tool
-                .get("tool")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| crate::i18n::tr("Unknown tool"));
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-            row.add_css_class("toolport-stat-row");
-            row.append(
-                &gtk::Label::builder()
-                    .label(name)
-                    .halign(gtk::Align::Start)
-                    .xalign(0.0)
-                    .hexpand(true)
-                    .ellipsize(gtk::pango::EllipsizeMode::End)
-                    .css_classes(["toolport-muted"])
-                    .build(),
-            );
-            row.append(
-                &gtk::Label::builder()
-                    .label(stat_metrics_line(&tool))
-                    .halign(gtk::Align::End)
-                    .xalign(1.0)
-                    .css_classes(["toolport-muted", "caption", "toolport-stat-metrics"])
-                    .build(),
-            );
-            list.append(&row);
-        }
-        expander.set_child(Some(&list));
-    });
-    if expanded_servers.borrow().contains(&server) {
-        expander.set_expanded(true);
+    let name_line = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let chevron = if tools.is_empty() {
+        gtk::Image::new()
+    } else {
+        gtk::Image::from_icon_name("pan-end-symbolic")
+    };
+    chevron.set_pixel_size(12);
+    chevron.set_size_request(12, -1);
+    chevron.add_css_class("toolport-muted");
+    name_line.append(&chevron);
+    name_line.append(
+        &gtk::Label::builder()
+            .label(&shown_name)
+            .tooltip_text(&shown_name)
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["heading"])
+            .build(),
+    );
+    let cells = stat_cell_labels(stat, &[]);
+    if tools.is_empty() {
+        card.append(&stat_line(&name_line, &cells));
+        return card;
     }
-    expander
+    let toggle = gtk::Button::builder()
+        .child(&name_line)
+        .halign(gtk::Align::Start)
+        .css_classes(["flat", "toolport-activity-row-button"])
+        .build();
+    card.append(&stat_line(&toggle, &cells));
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    list.set_margin_top(6);
+    list.set_visible(false);
+    card.append(&list);
+    let pending = std::rc::Rc::new(std::cell::RefCell::new(Some(tools)));
+    let show = {
+        let (list, chevron, toggle) = (list.clone(), chevron.clone(), toggle.clone());
+        move |open: bool| {
+            if open {
+                if let Some(tools) = pending.borrow_mut().take() {
+                    for tool in tools {
+                        let name = gtk::Label::builder()
+                            .label(
+                                tool.get("tool")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_owned)
+                                    .unwrap_or_else(|| crate::i18n::tr("Unknown tool").to_string()),
+                            )
+                            .xalign(0.0)
+                            .margin_start(18)
+                            .ellipsize(gtk::pango::EllipsizeMode::End)
+                            .css_classes(["monospace", "caption", "toolport-muted"])
+                            .build();
+                        let line = stat_line(&name, &stat_cell_labels(&tool, &["caption"]));
+                        line.add_css_class("toolport-stat-row");
+                        list.append(&line);
+                    }
+                }
+            }
+            list.set_visible(open);
+            chevron.set_icon_name(Some(if open {
+                "pan-down-symbolic"
+            } else {
+                "pan-end-symbolic"
+            }));
+            toggle.update_state(&[gtk::accessible::State::Expanded(Some(open))]);
+        }
+    };
+    let open = expanded_servers.borrow().contains(&server);
+    show(open);
+    toggle.connect_clicked(move |_| {
+        let open = !expanded_servers.borrow().contains(&server);
+        if open {
+            expanded_servers.borrow_mut().insert(server.clone());
+        } else {
+            expanded_servers.borrow_mut().remove(&server);
+        }
+        show(open);
+    });
+    card
 }
 
 /// The fingerprint as the provenance list shows it: version prefix stripped,
@@ -8064,13 +8594,14 @@ fn short_fingerprint(fingerprint: &str) -> String {
 /// Stable filter choices. Keeping this model unchanged prevents an open dropdown
 /// from being dismissed by an unrelated live-metrics refresh.
 fn activity_server_filter_options(calls: &[state::ActivityView]) -> Vec<String> {
-    let mut options = vec![crate::i18n::tr("All servers").to_string()];
-    for call in calls {
-        if !options.iter().any(|server| server == &call.server) {
-            options.push(call.server.clone());
-        }
-    }
-    options
+    // Sorted, as React's `[...new Set(servers)].sort()`.
+    let servers = calls
+        .iter()
+        .map(|call| call.server.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    std::iter::once(crate::i18n::tr("All servers").to_string())
+        .chain(servers)
+        .collect()
 }
 
 /// Which of the recent calls the current filter keeps.
@@ -8117,17 +8648,36 @@ fn tool_identity_group(
         .iter()
         .filter(|identity| identity.quarantined)
         .count();
-    let mut label = format!(
-        "{server} · {count} {}",
-        if count == 1 { "tool" } else { "tools" }
+    // React's group heading: the server, its tool count, and how many are quarantined.
+    let title = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    title.append(
+        &gtk::Label::builder()
+            .label(server)
+            .tooltip_text(server)
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build(),
     );
+    let badge = gtk::Label::builder()
+        .label(crate::i18n::group_digits(count))
+        .valign(gtk::Align::Center)
+        .css_classes(["toolport-badge", "caption"])
+        .build();
+    title.append(&badge);
     if quarantined > 0 {
-        label.push_str(&crate::i18n::trf(
-            " · {value0} quarantined",
-            &[("value0", &format!("{}", quarantined))],
-        ));
+        let flagged = gtk::Label::builder()
+            .valign(gtk::Align::Center)
+            .css_classes(["toolport-badge", "caption", "review"])
+            .build();
+        l10n::bind_formatted_label(
+            &flagged,
+            "{value1} quarantined",
+            &[("value1", &quarantined.to_string())],
+        );
+        title.append(&flagged);
     }
-    let expander = gtk::Expander::new(Some(&label));
+    let expander = gtk::Expander::new(None);
+    expander.set_label_widget(Some(&title));
     expander.add_css_class("toolport-card");
     let pending = std::rc::Rc::new(std::cell::RefCell::new(Some(identities)));
     expander.connect_expanded_notify(move |expander| {
@@ -18192,7 +18742,7 @@ mod tests {
             assert_eq!(recent_heading.text(), "Recent client activity · 1");
             recent.set_expanded(true);
             assert!(recent.is_expanded());
-            let activity_widget = activity_card(&activity);
+            let activity_widget = activity_card(&activity, Default::default());
             let root = gtk::Box::new(gtk::Orientation::Vertical, 18);
             root.set_margin_top(24);
             root.set_margin_bottom(24);
@@ -19676,8 +20226,17 @@ mod tests {
             .application_id("com.tsout.ActivityRowsTest")
             .build();
         let page = ActivityPage::new(&app);
-        assert_eq!(page.security_status_title.text(), "Checking protection…");
-        assert!(!page.security_status_detail.text().contains("No changes"));
+        let text_of = |widget: &gtk::Box| {
+            let mut labels = Vec::new();
+            collect_labels(widget.upcast_ref(), &mut labels);
+            labels
+                .iter()
+                .map(|label| label.text().to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(text_of(&page.security_list).contains("Checking protection status…"));
+        assert!(!text_of(&page.security_list).contains("Protection active."));
         std::fs::write(
             data.dir.join("audit.jsonl"),
             "{\"ts\":1,\"tool\":\"server__first\",\"server\":\"server\",\"ok\":true}\n",
@@ -19704,17 +20263,19 @@ mod tests {
         assert!(page.feedback.text().contains("Could not refresh"));
         page.set_revision_error(Some("revision read failed".into()));
         page.apply_health_notices(Vec::new());
+        assert!(page.revision_notice.is_visible());
         assert!(page
-            .telemetry_feedback
+            .revision_notice
             .text()
             .contains("Activity change checks are unavailable"));
         page.render(state::load_activity_snapshot().unwrap());
         assert!(page
-            .telemetry_feedback
-            .text()
-            .contains("revision read failed"));
+            .revision_notice
+            .tooltip_text()
+            .is_some_and(|cause| cause.contains("revision read failed")));
         page.set_revision_error(None);
         assert!(!page.telemetry_feedback.is_visible());
+        assert!(!page.revision_notice.is_visible());
         page.render(state::load_activity_snapshot().unwrap());
         assert_eq!(page.list.first_child().unwrap(), old);
         assert_eq!(page.stats_list.first_child().unwrap(), stats);
@@ -19734,12 +20295,10 @@ mod tests {
         assert!(page.recent_rows.borrow().is_empty());
         assert!(page.stat_rows.borrow().is_empty());
         assert!(page.list.first_child().is_none());
-        assert_eq!(page.security_status_title.text(), "Checking protection…");
+        assert!(text_of(&page.security_list).contains("Checking protection status…"));
         page.show_error("unreadable");
-        assert_eq!(
-            page.security_status_title.text(),
-            "Protection state unavailable"
-        );
+        assert!(text_of(&page.security_list).contains("Couldn't verify protection status."));
+        assert!(text_of(&page.audit_state).contains("Couldn't load activity"));
     }
 
     #[test]
@@ -19984,6 +20543,68 @@ mod tests {
             pii_replaced: None,
             pii_incomplete: false,
         }
+    }
+
+    #[test]
+    fn activity_reads_and_lists_the_latest_200_entries_like_react() {
+        let data = crate::registry::DataDirTestEnv::new("gtk-activity-row-limit");
+        let lines = (0..250)
+            .map(|index| {
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "ts": index, "server": "files", "tool": format!("read_{index}"),
+                        "ok": true, "durationMs": 5
+                    })
+                )
+            })
+            .collect::<String>();
+        std::fs::write(data.dir.join("audit.jsonl"), lines).unwrap();
+        let snapshot = state::load_activity_snapshot().unwrap();
+        assert_eq!(snapshot.call_count, 250, "the total counts the whole log");
+        assert_eq!(snapshot.recent.len(), 200);
+        assert_eq!(snapshot.recent[0].tool, "read_249");
+        // React lists what `get_audit_log(200)` returns: the same rows.
+        let react = crate::audit::read_activity(200).unwrap();
+        assert_eq!(react.len(), snapshot.recent.len());
+        assert_eq!(react[199]["tool"], snapshot.recent[199].tool);
+        assert_eq!(
+            activity_count_summary(
+                Some(snapshot.call_count),
+                snapshot.recent.len(),
+                snapshot.recent.len(),
+                false
+            ),
+            "250 calls recorded on this computer. Latest 200 entries available."
+        );
+    }
+
+    #[test]
+    fn an_unreadable_audit_log_leaves_the_other_panels_loaded() {
+        let data = crate::registry::DataDirTestEnv::new("gtk-activity-unreadable-log");
+        // A directory where the log should be: every read fails.
+        std::fs::create_dir_all(data.dir.join("audit.jsonl")).unwrap();
+        let event = serde_json::json!({
+            "type": "tool_poison_flag", "server": "srv", "tool": "srv__read",
+            "ts": 1, "severity": "high"
+        });
+        std::fs::write(data.dir.join("security.jsonl"), format!("{event}\n")).unwrap();
+        let snapshot = state::load_activity_snapshot().expect("the other panels still load");
+        // The same cause the Tauri command gives React.
+        let react = crate::audit::read_activity(200)
+            .map_err(|error| format!("Couldn't read the activity log: {error}"))
+            .unwrap_err();
+        assert_eq!(snapshot.audit_error.as_deref(), Some(react.as_str()));
+        assert!(snapshot.recent.is_empty());
+        assert_eq!(snapshot.call_count, 0);
+        assert!(snapshot.security_error.is_none());
+        assert_eq!(
+            snapshot.security_events.len(),
+            1,
+            "protection keeps its real state"
+        );
+        assert!(snapshot.search_traces_error.is_none());
+        assert!(snapshot.tool_identities_error.is_none());
     }
 
     #[test]
@@ -20651,50 +21272,65 @@ mod tests {
     }
 
     #[test]
-    fn recorded_call_summary_uses_plain_counts() {
+    fn recorded_call_summary_uses_react_sentences() {
         // Approvals and searches are rows but not calls: 4 calls can show 6 entries.
         assert_eq!(
-            activity_count_summary(4, 6, 6, false),
+            activity_count_summary(Some(4), 6, 6, true),
             "4 calls recorded on this computer. Showing the latest 6 entries."
         );
         assert_eq!(
-            activity_count_summary(1, 2, 2, false),
+            activity_count_summary(Some(1), 2, 2, true),
             "1 call recorded on this computer. Showing the latest 2 entries."
         );
         assert_eq!(
-            activity_count_summary(1, 1, 1, false),
+            activity_count_summary(Some(1), 1, 1, true),
             "1 call recorded on this computer. Showing the latest entry."
         );
         assert_eq!(
-            activity_count_summary(5225, 5, 5, false),
-            "5,225 calls recorded on this computer. Showing the latest 5 entries."
-        );
-        assert_eq!(
-            activity_count_summary(5225, 10, 100, false),
-            "5,225 calls recorded on this computer. Showing 10 of the latest 100 entries."
-        );
-        assert_eq!(
-            activity_count_summary(5225, 2, 5, true),
+            activity_count_summary(Some(5225), 2, 5, true),
             "5,225 calls recorded on this computer. Showing 2 matching entries from the latest 5."
         );
         assert_eq!(
-            activity_count_summary(5225, 1, 5, true),
+            activity_count_summary(Some(5225), 1, 5, true),
             "5,225 calls recorded on this computer. Showing 1 matching entry from the latest 5."
         );
         assert_eq!(
-            activity_count_summary(5225, 0, 5, true),
+            activity_count_summary(Some(5225), 0, 5, true),
             "5,225 calls recorded on this computer. Showing 0 matching entries from the latest 5."
+        );
+        // Closed, the line says how many entries the list holds.
+        assert_eq!(
+            activity_count_summary(Some(90), 150, 150, false),
+            "90 calls recorded on this computer. Latest 150 entries available."
+        );
+        assert_eq!(
+            activity_count_summary(Some(0), 1, 1, false),
+            "0 calls recorded on this computer. Latest entry available."
+        );
+        // Without stats (a stale read), only the list part.
+        assert_eq!(
+            activity_count_summary(None, 200, 200, true),
+            "Showing the latest 200 entries."
         );
         // Grouped as the current language groups digits, as React's toLocaleString does.
         let german = |value| crate::i18n::group_digits_for("de", value);
         assert_eq!(
-            activity_count_summary_in(german, 5225, 1500, 2000, false),
-            "5.225 calls recorded on this computer. Showing 1.500 of the latest 2.000 entries."
+            activity_count_summary_in(german, Some(5225), 1500, 2000, true),
+            "5.225 calls recorded on this computer. Showing 1.500 matching entries from the latest 2.000."
         );
         assert_eq!(
-            activity_count_summary(5225, 1_000, 1_000, false),
+            activity_count_summary(Some(5225), 1_000, 1_000, true),
             "5,225 calls recorded on this computer. Showing the latest 1,000 entries."
         );
+    }
+
+    #[test]
+    fn error_rates_read_like_react() {
+        assert_eq!(format_percent(0.0, false), "0%");
+        assert_eq!(format_percent(1.0, true), "100%");
+        assert_eq!(format_percent(1.0 / 3.0, true), "33%");
+        assert_eq!(format_percent(0.05, true), "5.0%");
+        assert_eq!(format_percent(0.0004, true), "<0.1%");
     }
 
     #[test]
@@ -21159,27 +21795,6 @@ mod tests {
     }
 
     #[test]
-    fn security_status_copy_uses_only_tool_changes_for_blocking_wording() {
-        for ty in [
-            "result_injection_blocked",
-            "sync_change_refused",
-            "tool_poison_flag",
-        ] {
-            let event = serde_json::json!({"type":ty, "blocked":false});
-            assert_eq!(
-                security_status_detail(&[event]),
-                "Security findings need review. Open Protection history for details."
-            );
-        }
-        let drift = serde_json::json!({"type":"tool_drift", "blocked":false});
-        let injection = serde_json::json!({"type":"result_injection_blocked", "blocked":true});
-        assert_eq!(
-            security_status_detail(&[drift, injection]),
-            "Not blocked. Review the changes or accept them."
-        );
-    }
-
-    #[test]
     fn a_reviewed_shared_change_stays_visible_for_a_later_profile_block() {
         let mut event = serde_json::json!({"type":"tool_drift", "server":"srv", "tool":"srv__read", "profiles":["personal", "work"], "blocked":true, "ts":1});
         let markers = vec![security_dismissal_key(&event)];
@@ -21477,16 +22092,13 @@ mod tests {
     }
 
     #[test]
-    fn stat_lines_only_promise_latency_the_log_actually_carried() {
+    fn stat_cells_only_promise_latency_the_log_actually_carried() {
         let with_latency = serde_json::json!({
-            "calls": 12, "errors": 1, "avgMs": 40, "p95Ms": 90
+            "calls": 12, "errors": 1, "errorRate": 1.0 / 12.0, "avgMs": 40, "p95Ms": 90
         });
-        assert_eq!(
-            stat_metrics_line(&with_latency),
-            "12 calls · 1 error · avg 40 ms · p95 90 ms"
-        );
+        assert_eq!(stat_cells(&with_latency), ["12", "8.3%", "40 ms", "90 ms"]);
         let without_latency = serde_json::json!({ "calls": 1, "errors": 0 });
-        assert_eq!(stat_metrics_line(&without_latency), "1 call · 0 errors");
+        assert_eq!(stat_cells(&without_latency), ["1", "0%", "-", "-"]);
         assert_eq!(
             stat_server_name(&serde_json::json!({ "server": "" })),
             "Unknown server"

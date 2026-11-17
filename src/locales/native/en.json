@@ -1212,5 +1212,6 @@
   "Showing {value0} matching entries from the latest {value1}.": "Showing {value0} matching entries from the latest {value1}.",
   "Showing {value0} of the latest {value1} entries.": "Showing {value0} of the latest {value1} entries.",
   "Showing 1 matching entry from the latest {value1}.": "Showing 1 matching entry from the latest {value1}.",
-  "Show all {value0} entries": "Show all {value0} entries"
+  "Show all {value0} entries": "Show all {value0} entries",
+  "Per-server breakdown": "Per-server breakdown"
 }

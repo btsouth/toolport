@@ -1080,6 +1080,36 @@ button.toolport-activity-filter {{
   font-variant-numeric: tabular-nums;
 }}
 
+/* A failed Activity call and a breakdown server open in place; the button keeps
+   the row's look instead of a button's. */
+button.toolport-activity-row-button {{
+  padding: 0;
+  margin: 0;
+  min-height: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  font-weight: normal;
+}}
+
+.toolport-activity-detail {{
+  margin-top: 10px;
+  padding-top: 8px;
+  padding-left: 52px;
+  border-top: 1px solid @toolport_border;
+}}
+
+.toolport-activity-error {{
+  color: @toolport_error;
+}}
+
+.toolport-row-group .toolport-card.toolport-stat-header {{
+  min-height: 0;
+  padding-top: 8px;
+  padding-bottom: 8px;
+  background-color: alpha(@toolport_fg, 0.03);
+}}
+
 .toolport-settings-parent {{ font-weight: 600; }}
 .toolport-safety-card {{ border: 1px solid @toolport_border; border-radius: 12px; padding: 16px; background-color: @toolport_card; }}
 .toolport-safety-card:checked {{ border-color: @toolport_accent; background: mix(@toolport_card, @toolport_accent, 0.08); }}

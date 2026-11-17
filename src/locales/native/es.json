@@ -1212,5 +1212,6 @@
   "Showing {value0} matching entries from the latest {value1}.": "Se muestran {value0} entradas coincidentes de las {value1} más recientes.",
   "Showing {value0} of the latest {value1} entries.": "Se muestran {value0} de las {value1} entradas más recientes.",
   "Showing 1 matching entry from the latest {value1}.": "Se muestra 1 entrada coincidente de las {value1} más recientes.",
-  "Show all {value0} entries": "Mostrar las {value0} entradas"
+  "Show all {value0} entries": "Mostrar las {value0} entradas",
+  "Per-server breakdown": "Desglose por servidor"
 }
