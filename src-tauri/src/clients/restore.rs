@@ -334,7 +334,11 @@ pub(super) fn remember(
         record.created_parents = missing_parents(path);
     }
     if !fresh && before.map(crate::registry::sha256_hex) != record.last_written_hash {
-        record.exact_eligible = false;
+        // A setting the client saved in Toolport's entry is not an edit to the file.
+        if !only_client_settings_changed(client_id, format, record.last_written.as_deref(), before)
+        {
+            record.exact_eligible = false;
+        }
         let previous_written = mutation::value(format, record.last_written.as_deref())?;
         let native = mutation::value(format, before)?;
         let mut paths = Vec::new();
@@ -411,12 +415,71 @@ fn rebase_value(baseline: &mut Value, native: &Value, path: &[String]) {
 }
 
 /// Whether a changed `path` is one of the [`client_entry_settings`] inside Toolport's
-/// gateway entry, such as Pi's `enabled` or Antigravity's `disabled`.
+/// gateway entry, such as Pi's `enabled` or Antigravity's `disabled`, or a value
+/// nested in one, such as one tool in Pi's `toolExposure`.
 fn client_setting_in_gateway(client_id: &str, format: Format, path: &[String]) -> bool {
-    matches!(path, [container, name, field]
+    matches!(path, [container, name, field, ..]
         if container == key(format)
             && name == GATEWAY_ENTRY_NAME
             && client_entry_settings(client_id).contains(&field.as_str()))
+}
+
+/// Whether `current` differs from Toolport's last write `written` only by the
+/// [`client_entry_settings`] the client saved in Toolport's entry (and how it laid out
+/// the file), so Disconnect can still put the original bytes back.
+fn only_client_settings_changed(
+    client_id: &str,
+    format: Format,
+    written: Option<&str>,
+    current: Option<&str>,
+) -> bool {
+    if client_entry_settings(client_id).is_empty() || written.is_none() || current.is_none() {
+        return false;
+    }
+    let (Ok(mut written), Ok(mut current)) = (
+        mutation::value(format, written),
+        mutation::value(format, current),
+    ) else {
+        return false;
+    };
+    let inner_key = nested_in(format, &written);
+    take_client_settings(client_id, format, inner_key, &mut written);
+    take_client_settings(client_id, format, inner_key, &mut current);
+    written == current
+}
+
+/// Toolport's entry in a server map (`servers`, one level down for nested formats).
+fn gateway_in<'a>(servers: Option<&'a Value>, inner_key: Option<&str>) -> Option<&'a Value> {
+    let servers = match inner_key {
+        Some(inner) => servers?.get(inner),
+        None => servers,
+    };
+    servers?.get(GATEWAY_ENTRY_NAME)
+}
+
+/// Remove the [`client_entry_settings`] from Toolport's entry in `root` and return them.
+fn take_client_settings(
+    client_id: &str,
+    format: Format,
+    inner_key: Option<&str>,
+    root: &mut Value,
+) -> serde_json::Map<String, Value> {
+    let mut taken = serde_json::Map::new();
+    let mut servers = root.get_mut(key(format));
+    if let Some(inner) = inner_key {
+        servers = servers.and_then(|value| value.get_mut(inner));
+    }
+    if let Some(entry) = servers
+        .and_then(|servers| servers.get_mut(GATEWAY_ENTRY_NAME))
+        .and_then(Value::as_object_mut)
+    {
+        for setting in client_entry_settings(client_id) {
+            if let Some(value) = entry.remove(*setting) {
+                taken.insert(setting.to_string(), value);
+            }
+        }
+    }
+    taken
 }
 
 /// Undo only leaves whose value still matches Toolport's last write. Missing
@@ -973,7 +1036,13 @@ fn apply_inner(
         record.last_written.as_deref()
     };
     if record.exact_eligible
-        && current.as_deref().map(crate::registry::sha256_hex) == record.last_written_hash
+        && (current.as_deref().map(crate::registry::sha256_hex) == record.last_written_hash
+            || only_client_settings_changed(
+                client_id,
+                format,
+                record.last_written.as_deref(),
+                current.as_deref(),
+            ))
     {
         match record.original {
             Some(original) => atomic_write(path, &original)?,
@@ -1060,13 +1129,31 @@ fn apply_inner(
         named_list(&mut latest, key)?;
     }
     *adopted |= adopt_legacy_shared_http(client_id, format, &written, &mut before, &mut latest);
-    let restored = undo(
+    // Settings the client saved in Toolport's entry (such as Pi's `enabled`) are not
+    // an edit to it: compare without them, so the entry leaves with them. An entry
+    // kept for another reason keeps them too.
+    take_client_settings(client_id, format, inner_key, &mut written);
+    let settings = take_client_settings(client_id, format, inner_key, &mut latest);
+    let mut restored = undo(
         before.get(key),
         written.get(key),
         latest.get(key),
         1,
         if inner_key.is_some() { 3 } else { 2 },
     );
+    let kept = gateway_in(latest.get(key), inner_key).cloned();
+    if let Some(entry) = restored
+        .as_mut()
+        .and_then(|servers| match inner_key {
+            Some(inner) => servers.get_mut(inner),
+            None => Some(servers),
+        })
+        .and_then(|servers| servers.get_mut(GATEWAY_ENTRY_NAME))
+        .filter(|entry| kept.as_ref() == Some(&**entry))
+        .and_then(Value::as_object_mut)
+    {
+        entry.extend(settings);
+    }
     let object = latest
         .as_object_mut()
         .ok_or("Client config root must be an object")?;

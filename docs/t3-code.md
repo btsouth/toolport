@@ -28,7 +28,13 @@ elsewhere is never read.
     `opencode.jsonc` when only that exists (comments are kept).
   - Grok: `config.toml` in its `GROK_HOME`.
   - Pi: `mcp.json` in its `PI_CODING_AGENT_DIR`. Settings Pi saves in Toolport's
-    entry, such as `enabled` and `exposure`, are kept when Toolport rewrites it.
+    entry, such as `enabled` and `exposure`, are kept when Toolport rewrites it,
+    also when you connect again through the review.
+
+  Pi's settings never make the entry count as edited by you, and Disconnect takes
+  them out with the entry. If nothing else in the file changed, the file goes back
+  exactly as it was.
+
 - On Linux, the Toolport entry in a T3 Code home names Toolport's data folder
   (`TOOLPORT_DATA_DIR`), because OpenCode passes its instance's `XDG_CONFIG_HOME`
   on to MCP servers. If an OpenCode instance sets `mcp.toolport` in its inline
