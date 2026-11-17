@@ -487,13 +487,16 @@ pub(crate) fn import_connection_key(server: &ServerEntry) -> String {
     format!(
         "connection:{}",
         registry::sha256_hex(&format!(
-            "{salt}\n{}",
+            "{salt}\n{}\n{}",
             clients::connection_key(
                 &server.transport,
                 server.command.as_deref(),
                 &server.args,
                 server.url.as_deref()
-            )
+            ),
+            // Two accounts of one package under different names (a personal and a
+            // work token) are two servers, as before identity matching.
+            server.name.to_ascii_lowercase()
         ))
     )
 }
@@ -670,7 +673,9 @@ fn preview_client_imports_scoped(
             return Err("Missing import client".into());
         }
     }
-    import_candidates(&detected, &registry, Confirm::WithVault)
+    // A review may read the keychain to confirm identity, but never ask to unlock it:
+    // a locked keyring leaves the row unconfirmed with its reason. The import may ask.
+    crate::secrets::without_prompts(|| import_candidates(&detected, &registry, Confirm::WithVault))
         .into_iter()
         .map(
             |ImportCandidate {
@@ -910,7 +915,13 @@ pub(crate) fn existing_connection(
     detected: &clients::McpServer,
     confirm: Confirm,
 ) -> ConnectionState {
-    let candidates = connection_candidates(registry, detected);
+    let mut candidates = connection_candidates(registry, detected);
+    // Credentials in env are not part of the connection, so two accounts of one server
+    // (one token each) look alike. For such an entry only a server saved under its
+    // name, or that name with an import suffix (`slack (2)`), is the same one.
+    if !detected.env_keys.is_empty() {
+        candidates.retain(|existing| saved_under_name(&existing.name, &detected.name));
+    }
     if candidates.is_empty() {
         return ConnectionState::New;
     }
@@ -943,7 +954,7 @@ pub(crate) fn existing_connection(
         }
         // Only the vault could tell; detection never reads it. Review confirms.
         return ConnectionState::Unknown(format!(
-            "Review {} to compare it with {}, whose saved values are in the keychain.",
+            "Review {} to check whether it is already in Toolport as {}.",
             detected.name, candidates[0].name
         ));
     }
@@ -959,20 +970,39 @@ pub(crate) fn existing_connection(
         // or launch resolution, which needs a prepared import: unknown, never assumed.
         Err(error) => return ConnectionState::Unknown(error),
     };
-    let mut unresolved = None;
+    let (mut unresolved, mut locked) = (None, false);
     for existing in candidates {
         match import.matches(existing) {
             Ok(true) => return ConnectionState::Existing(existing.id.clone()),
             Ok(false) => {}
+            // A keychain that could not be read is not a missing value.
+            Err(error) if crate::import_credentials::is_vault_failure(&error) => locked = true,
             Err(_) => {
                 unresolved.get_or_insert(existing.name.clone());
             }
         }
     }
-    match unresolved {
-        Some(name) => ConnectionState::Unknown(unresolved_connection(&detected.name, &name)),
-        None => ConnectionState::New,
+    match (locked, unresolved) {
+        (true, _) => ConnectionState::Unknown(format!(
+            "Could not read the keyring to compare {} with a server in Toolport. Unlock your keyring, then review again. Client config unchanged.",
+            detected.name
+        )),
+        (false, Some(name)) => {
+            ConnectionState::Unknown(unresolved_connection(&detected.name, &name))
+        }
+        (false, None) => ConnectionState::New,
     }
+}
+
+/// Whether `saved` is `name`, or `name (N)` as [`clients::distinct_import_name`] saves
+/// it beside a taken name (ignoring ASCII case).
+fn saved_under_name(saved: &str, name: &str) -> bool {
+    let (saved, name) = (saved.to_ascii_lowercase(), name.to_ascii_lowercase());
+    saved == name
+        || saved
+            .strip_prefix(&format!("{name} ("))
+            .and_then(|rest| rest.strip_suffix(')'))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The raw native connection of a detected client server. Two reviewed entries with the
@@ -10194,5 +10224,139 @@ DOCS_TOKEN = "tok"
         assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
         assert!(read_registry_exact().unwrap().servers.is_empty());
         assert!(!fixture.move_record("claude-code").exists());
+    }
+
+    /// Opening the import review (a preview) never asks to unlock the keyring, even
+    /// when only the keychain could confirm a server Toolport already imported.
+    #[test]
+    fn the_import_review_never_asks_to_unlock_the_keyring() {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"remote":{"type":"http","url":"https://same.invalid/mcp?token=synthetic-a"},
+                "arg":{"command":"arg-cmd","args":["--api-key=synthetic-arg-a"]}}}"#,
+        )
+        .unwrap();
+        let keys = preview_client_imports_for("claude-code")
+            .unwrap()
+            .into_iter()
+            .map(|item| item.key)
+            .collect::<Vec<_>>();
+        assert_eq!(import_client_servers(keys).unwrap().1, 2);
+        // The client still lists both (Import does not change the client).
+        let mut shown = Vec::new();
+        let prompts = crate::secrets::locked_store::prompts_during(|| {
+            shown = preview_client_imports_for("claude-code")
+                .unwrap()
+                .into_iter()
+                .map(|item| (item.name, item.unsupported))
+                .collect();
+        });
+        assert!(
+            prompts.is_empty(),
+            "the review asked to unlock: {prompts:?}"
+        );
+        // A locked keyring is not a missing value: the row says to unlock it.
+        assert_eq!(shown.len(), 2, "{shown:?}");
+        for (name, reason) in &shown {
+            let reason = reason.as_deref().unwrap_or_default();
+            assert!(reason.contains("Unlock your keyring"), "{name}: {reason}");
+            assert!(
+                !reason.contains("missing a required value"),
+                "{name}: {reason}"
+            );
+        }
+    }
+
+    /// Two accounts of one server (same command and arguments, one token each in
+    /// env) are two servers: both are offered and imported, and each row is in
+    /// Toolport afterwards, its own token stored with it.
+    #[test]
+    fn two_accounts_of_one_server_are_both_offered_and_imported() {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{
+                "slack-work":{"command":"npx","args":["-y","@acme/slack-mcp"],"env":{"SLACK_BOT_TOKEN":"synthetic-work"}},
+                "slack-home":{"command":"npx","args":["-y","@acme/slack-mcp"],"env":{"SLACK_BOT_TOKEN":"synthetic-home"}}}}"#,
+        )
+        .unwrap();
+        let client = detected_client("claude-code");
+        let registry = read_registry_exact().unwrap();
+        let mut offered = names(clients::importable_servers(&client, &registry));
+        offered.sort_unstable();
+        assert_eq!(offered, ["slack-home", "slack-work"]);
+        assert!(clients::managed_server_names(&client, &registry).is_empty());
+        let review = preview_client_imports_for("claude-code").unwrap();
+        assert_eq!(review.len(), 2);
+        let (_, added) =
+            import_client_servers(review.iter().map(|item| item.key.clone()).collect()).unwrap();
+        assert_eq!(added, 2);
+        let saved = read_registry_exact().unwrap();
+        for (name, token) in [
+            ("slack-work", "synthetic-work"),
+            ("slack-home", "synthetic-home"),
+        ] {
+            let server = saved.servers.iter().find(|s| s.name == name).unwrap();
+            assert_eq!(
+                crate::secrets::get_vault_secret_result(&server.id, "SLACK_BOT_TOKEN")
+                    .unwrap()
+                    .as_deref(),
+                Some(token)
+            );
+        }
+        let mut managed = clients::managed_server_names(&client, &saved);
+        managed.sort_unstable();
+        assert_eq!(managed, ["slack-home", "slack-work"]);
+        assert!(clients::importable_servers(&client, &saved).is_empty());
+    }
+
+    /// After one account is imported, a second account of the same server added to
+    /// the client later is still offered, not shown as already in Toolport.
+    #[test]
+    fn a_later_second_account_is_offered_not_shown_in_toolport() {
+        let fixture = MoveFixture::new(&Registry::default());
+        let work = r#""slack-work":{"command":"npx","args":["-y","@acme/slack-mcp"],"env":{"SLACK_BOT_TOKEN":"synthetic-work"}}"#;
+        let home = r#""slack-home":{"command":"npx","args":["-y","@acme/slack-mcp"],"env":{"SLACK_BOT_TOKEN":"synthetic-home"}}"#;
+        std::fs::write(fixture.claude(), format!(r#"{{"mcpServers":{{{work}}}}}"#)).unwrap();
+        let keys = preview_client_imports_for("claude-code")
+            .unwrap()
+            .into_iter()
+            .map(|item| item.key)
+            .collect::<Vec<_>>();
+        assert_eq!(import_client_servers(keys).unwrap().1, 1);
+        std::fs::write(
+            fixture.claude(),
+            format!(r#"{{"mcpServers":{{{work},{home}}}}}"#),
+        )
+        .unwrap();
+        let client = detected_client("claude-code");
+        let saved = read_registry_exact().unwrap();
+        assert_eq!(
+            names(clients::importable_servers(&client, &saved)),
+            ["slack-home"]
+        );
+        assert_eq!(
+            clients::managed_server_names(&client, &saved),
+            ["slack-work"]
+        );
+        let review = preview_client_imports_for("claude-code").unwrap();
+        assert_eq!(
+            review
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["slack-home"]
+        );
+    }
+
+    /// An account saved as `name (2)` beside a taken name is still that account.
+    #[test]
+    fn an_account_saved_under_a_suffixed_name_is_still_in_toolport() {
+        assert!(super::saved_under_name("Slack (2)", "slack"));
+        assert!(super::saved_under_name("slack", "Slack"));
+        assert!(!super::saved_under_name("slack-home", "slack"));
+        assert!(!super::saved_under_name("slack (x)", "slack"));
+        assert!(!super::saved_under_name("slack ()", "slack"));
     }
 }

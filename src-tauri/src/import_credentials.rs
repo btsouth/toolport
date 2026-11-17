@@ -591,6 +591,9 @@ impl Import {
         if existing.command != self.entry.command || existing.transport != self.entry.transport {
             return Ok(false);
         }
+        // A read that failed (a locked keyring) is reported as such, not as the
+        // missing value `resolve_args_with` would name.
+        let read_failed = std::cell::Cell::new(false);
         let args = |server: &ServerEntry, imported: bool| {
             crate::launch_inputs::resolve_args_with(server, |id, key| {
                 if imported {
@@ -598,9 +601,16 @@ impl Import {
                         return Ok(value.clone());
                     }
                 }
-                secrets::get_vault_secret_result(id, key)
+                secrets::get_vault_secret_result(id, key).inspect_err(|_| read_failed.set(true))
             })
             .map(|args| args.args)
+            .map_err(|error| {
+                if read_failed.get() {
+                    VAULT_FAILURE.to_string()
+                } else {
+                    error
+                }
+            })
         };
         if args(existing, false)? != args(&self.entry, true)? {
             return Ok(false);

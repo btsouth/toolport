@@ -4398,22 +4398,6 @@ pub fn distinct_import_name(name: &str, names: &[String]) -> String {
     candidate
 }
 
-/// Key an imported server for bulk-import dedupe. The friendly display name
-/// intentionally drops a package scope, so keying on it alone collapses
-/// `@acme/mcp-weather` and `@other/mcp-weather` (both name "weather") during
-/// import (#257). Fold the launched package spec into the key so those stay
-/// distinct, but keep the name as a tiebreaker so two entries for the SAME
-/// package under different names (e.g. `github-personal` and `github-work`,
-/// one token each) both survive instead of silently collapsing to one. Servers
-/// without a recognizable runner package key on name alone, as before.
-pub fn import_dedupe_key(name: &str, command: Option<&str>, args: &[String]) -> String {
-    let name = name.to_ascii_lowercase();
-    match command.and_then(|command| launcher_package_arg(command, args)) {
-        Some(package) => format!("package:{}|name:{}", package.to_ascii_lowercase(), name),
-        None => format!("name:{}", name),
-    }
-}
-
 /// Parse a JSON snippet, trying each known wrapper key, then a bare server object.
 fn parse_json_snippet(
     content: &str,
@@ -18955,6 +18939,33 @@ OD_DATA_DIR = "/tmp/data"
         assert_eq!(
             name_from_invocation("/usr/local/bin/my-server", &[]),
             "my-server"
+        );
+    }
+
+    #[test]
+    fn npx_bat_names_its_package_like_npx_cmd() {
+        let vs = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let a = vs(&["-y", "@acme/mcp-weather"]);
+        let b = vs(&["-y", "@other/mcp-weather"]);
+        for runner in [
+            r"C:\Program Files\nodejs\npx.cmd",
+            r"C:\Program Files\nodejs\npx.bat",
+        ] {
+            assert_eq!(
+                launcher_package_arg(runner, &a).as_deref(),
+                Some("@acme/mcp-weather"),
+                "{runner}"
+            );
+            assert_ne!(
+                launcher_package_arg(runner, &a),
+                launcher_package_arg(runner, &b),
+                "{runner}"
+            );
+        }
+        // Only runners lose the extension: a plain batch program is not a package runner.
+        assert_eq!(
+            launcher_package_arg(r"C:\tools\my-server.bat", &vs(&["--port", "1"])),
+            None
         );
     }
 
