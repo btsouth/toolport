@@ -3667,6 +3667,25 @@ impl ClientPage {
         self.refresh();
     }
 
+    /// After a disconnect: React's "Still connected until restart" notice on the client's
+    /// details, with the restart line, what was put back and any other warning. The list
+    /// shows nothing, as in React.
+    fn refresh_with_removal_notice(
+        &self,
+        client_id: &str,
+        client_name: &str,
+        done: String,
+        warnings: Vec<String>,
+    ) {
+        self.recovery_success.borrow_mut().take();
+        self.pending_confirmation.borrow_mut().take();
+        self.cancel_feedback_timer();
+        self.feedback.set_visible(false);
+        let (title, text) = removal_notice(client_name, done, warnings);
+        self.set_detail_notice((client_id.to_string(), title, text));
+        self.refresh();
+    }
+
     /// After a connect: React's "Not live yet" reminder, naming the client, on its detail
     /// page and on the list. It stays until dismissed or replaced.
     fn refresh_with_restart_notice(&self, client_id: &str, client_name: &str) {
@@ -4496,6 +4515,21 @@ fn confirm_client_disconnect(client: &state::ClientView, button: gtk::Button, pa
     dialog.present();
 }
 
+/// React's notice after a disconnect (`noteRestartNeeded("removed", ...)`): the title,
+/// then the restart line, what the disconnect did and any other warning.
+fn removal_notice(client_name: &str, done: String, warnings: Vec<String>) -> (String, String) {
+    let title = crate::i18n::tr("Still connected until restart");
+    let text = std::iter::once(crate::i18n::trf(
+        "Restart {client} so it stops loading Toolport.",
+        &[("client", client_name)],
+    ))
+    .chain(std::iter::once(done))
+    .chain(warnings)
+    .collect::<Vec<_>>()
+    .join(" ");
+    (title, text)
+}
+
 /// Disconnect warnings minus the ones a recovery card already shows (they
 /// begin with that card's message). The React shell filters the same way.
 fn other_warnings(warnings: Vec<String>, recoveries: &[String]) -> Vec<String> {
@@ -4547,6 +4581,8 @@ fn run_client_mutation(
                 // The config write is not live until the client restarts; saying
                 // only "Connected" would misstate what the running client does.
                 let restored = result.outcome.restored.len();
+                // React's wording: a connect says to restart to apply it; a disconnect is
+                // "Still connected until restart" with what it put back.
                 let message = if connect {
                     crate::i18n::trf(
                         "Connected {value0} to Toolport. Restart {value1} to apply it.",
@@ -4556,25 +4592,23 @@ fn run_client_mutation(
                         ],
                     )
                 } else if restored > 0 {
-                    crate::i18n::trf(
-                        if restored == 1 {
-                            crate::i18n::msg("Disconnected {value0} from Toolport and put back {value1} server it had moved. Restart {value3} to apply it.")
-                        } else {
-                            crate::i18n::msg("Disconnected {value0} from Toolport and put back {value1} servers it had moved. Restart {value3} to apply it.")
-                        },
-                        &[
-                            ("value0", &client_name.to_string()),
-                            ("value1", &format!("{}", restored)),
-                            ("value3", &client_name.to_string()),
-                        ],
-                    )
+                    let count = crate::i18n::group_digits(restored);
+                    let values = [("client", client_name.as_str()), ("count", count.as_str())];
+                    if restored == 1 {
+                        crate::i18n::trf(
+                            "Disconnected Toolport from {client} and put back {count} server.",
+                            &values,
+                        )
+                    } else {
+                        crate::i18n::trf(
+                            "Disconnected Toolport from {client} and put back {count} servers.",
+                            &values,
+                        )
+                    }
                 } else {
                     crate::i18n::trf(
-                        "Disconnected {value0} from Toolport. Restart {value1} to apply it.",
-                        &[
-                            ("value0", &client_name.to_string()),
-                            ("value1", &client_name.to_string()),
-                        ],
+                        "Disconnected Toolport from {value0}.",
+                        &[("value0", &client_name.to_string())],
                     )
                 };
                 // A recovery card owns its own notice, so its text is not repeated
@@ -4595,13 +4629,15 @@ fn run_client_mutation(
                     page.pending_confirmation.borrow_mut().take();
                     page.feedback.set_visible(false);
                     page.refresh();
-                } else {
+                } else if connect {
                     page.refresh_with_confirmation(
                         std::iter::once(message)
                             .chain(warnings)
                             .collect::<Vec<_>>()
                             .join(" "),
                     );
+                } else {
+                    page.refresh_with_removal_notice(&mutated_id, &client_name, message, warnings);
                 }
             }
             Ok(Err(error)) => {
@@ -16490,6 +16526,23 @@ mod tests {
         assert_eq!(
             kept,
             vec!["config restored; could not remove the revoked keychain token: locked"]
+        );
+    }
+
+    /// A disconnect's notice reads as React's: "Still connected until restart", then the
+    /// restart line, what was put back and the other warnings.
+    #[test]
+    fn disconnect_notice_matches_react() {
+        let (title, text) = super::removal_notice(
+            "Cursor",
+            "Disconnected Toolport from Cursor and put back 2 servers.".into(),
+            vec!["could not remove the revoked keychain token: locked".into()],
+        );
+        assert_eq!(title, "Still connected until restart");
+        assert_eq!(
+            text,
+            "Restart Cursor so it stops loading Toolport. Disconnected Toolport from Cursor \
+             and put back 2 servers. could not remove the revoked keychain token: locked"
         );
     }
 
