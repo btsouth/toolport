@@ -1035,18 +1035,18 @@ describe("ClientsView", () => {
       expect(card()).not.toHaveTextContent(/not connected|is connected/);
     });
 
-    it("says to add an OpenCode, Grok or Pi home no row covers by hand", async () => {
+    it("says an OpenCode home that doesn't exist yet must be started once", async () => {
       vi.useFakeTimers();
       vi.mocked(t3CodeRevision).mockResolvedValue("a");
       vi.mocked(t3CodeOtherInstances).mockResolvedValue([
-        other("notes", "OpenCode", "Notes", "unlistedOpenCodeHome"),
+        other("notes", "OpenCode", "Notes", "missingHome"),
       ]);
       render(
         <ClientsView clients={[client()]} registry={null} onSelectClient={vi.fn()} />,
       );
       await act(() => vi.advanceTimersByTimeAsync(0));
       expect(card()).toHaveTextContent(
-        "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once Notes (OpenCode)'s config folder exists, add the opencode folder inside it by hand as a client location to connect it.",
+        "Toolport can't connect Notes (OpenCode) yet: its home folder doesn't exist yet. Start it once in T3 Code, then refresh Clients.",
       );
     });
 

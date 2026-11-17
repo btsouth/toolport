@@ -82,11 +82,8 @@ export interface T3CodeOther {
    * folder variable is sensitive or not plain text. `relativeHome`: its home folder is a
    * relative path. `outsideHome`: its home folder isn't inside the user's home (judged by
    * its text alone). `linkedHome`: its home folder or config file is a link or not a plain
-   * folder or file. `missingHome`: its home folder doesn't exist yet. `unlistedHome`: a
-   * Grok or Pi home, existing or not, that no Clients row covers; Toolport makes rows only
-   * for Claude Code and Codex homes. `unlistedOpenCodeHome`: the same for OpenCode, whose
-   * hand-added location is the `opencode` folder inside its config folder. `providerName` is empty when the driver
-   * can't be shown. */
+   * folder or file. `missingHome`: its home folder doesn't exist yet. `providerName` is
+   * empty when the driver can't be shown. */
   gap:
     | "unsupported"
     | "privateHome"
@@ -96,9 +93,7 @@ export interface T3CodeOther {
     | "relativeHome"
     | "outsideHome"
     | "linkedHome"
-    | "missingHome"
-    | "unlistedHome"
-    | "unlistedOpenCodeHome";
+    | "missingHome";
 }
 
 /** What tells one Claude Code profile apart (src-tauri/src/clients/claude_profiles.rs). */

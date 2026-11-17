@@ -277,14 +277,13 @@ describe("t3CodeGapLines for homes Toolport won't use", () => {
         other("Linked", "Claude", "linkedHome", false),
         other("Work", "Claude", "missingHome"),
         other("Grok", "Grok", "relativeHome"),
-        other("Notes", "OpenCode", "unlistedOpenCodeHome"),
+        other("Notes", "OpenCode", "missingHome"),
       ]),
     ).toEqual([
       "Toolport can't tell which home folder Grok uses: it is a relative path. Set it to a full path in T3 Code's provider settings.",
       "Toolport won't use the home folder Away (Codex) uses: it isn't written as a plain folder inside your home folder. Toolport only manages configs inside it; add it by hand as a client location if you trust it.",
       "Toolport won't use the home folder Linked (Claude) (off) uses: it, or its config file, is a link or not a plain folder or file. Point it at the real folder in T3 Code's provider settings.",
-      "Toolport can't connect Work (Claude) yet: its home folder doesn't exist yet. Start it once in T3 Code, then refresh Clients.",
-      "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once Notes (OpenCode)'s config folder exists, add the opencode folder inside it by hand as a client location to connect it.",
+      "Toolport can't connect Work (Claude), Notes (OpenCode) yet: their home folders don't exist yet. Start each once in T3 Code, then refresh Clients.",
     ]);
     expect(
       t3CodeGapLines([
@@ -294,17 +293,12 @@ describe("t3CodeGapLines for homes Toolport won't use", () => {
         other("D", "Pi", "linkedHome"),
         other("E", "Grok", "missingHome"),
         other("F", "Codex", "missingHome", false),
-        other("G", "OpenCode", "unlistedOpenCodeHome"),
-        other("H", "Pi", "unlistedHome", false),
-        other("I", "Grok", "unlistedHome"),
-        other("J", "OpenCode", "unlistedOpenCodeHome", false),
+        other("G", "OpenCode", "missingHome", false),
       ]),
     ).toEqual([
       "Toolport won't use the home folders A (Codex), B (Claude) use: they aren't written as plain folders inside your home folder. Toolport only manages configs inside it; add each by hand as a client location if you trust it.",
       "Toolport won't use the home folders C (Claude), D (Pi) use: they, or their config files, are links or not plain folders or files. Point each at the real folder in T3 Code's provider settings.",
-      "Toolport can't connect E (Grok), F (Codex) (off) yet: their home folders don't exist yet. Start each once in T3 Code, then refresh Clients.",
-      "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once the home folders H (Pi) (off), I (Grok) use exist, add each by hand as a client location to connect it.",
-      "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once the config folders G (OpenCode), J (OpenCode) (off) use exist, add the opencode folder inside each by hand as a client location to connect it.",
+      "Toolport can't connect E (Grok), F (Codex) (off), G (OpenCode) (off) yet: their home folders don't exist yet. Start each once in T3 Code, then refresh Clients.",
     ]);
     // Every enabled one counts as not connected; an off one does not.
     expect(

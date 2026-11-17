@@ -18,11 +18,22 @@ elsewhere is never read.
 - Each row a T3 Code instance uses is labelled **Used by T3 Code** with the
   instance names. An instance that is off in T3 Code reads "(off)". This includes
   rows such as Cursor or Kiro that T3 Code runs with their usual config.
-- An instance's home comes from its home folder setting, else `CLAUDE_CONFIG_DIR`
-  or `CODEX_HOME` from its environment variables, else the default.
-- A Claude Code or Codex home only T3 Code knows about, such as one under `~/.t3`,
-  gets its own row once its folder exists, so it can be connected like any other.
-  Homes of other providers, such as OpenCode, Grok or Pi, get no row of their own.
+- An instance's home comes from its home folder setting, else `CLAUDE_CONFIG_DIR`,
+  `CODEX_HOME`, `XDG_CONFIG_HOME` (OpenCode), `GROK_HOME` or `PI_CODING_AGENT_DIR`
+  from its environment variables, else the default.
+- A Claude Code, Codex, OpenCode, Grok or Pi home only T3 Code knows about, such as
+  one under `~/.t3`, gets its own row once its folder exists, so it can be connected
+  like any other. Each row writes the file that provider reads under T3 Code:
+  - OpenCode: `opencode/opencode.json` in its `XDG_CONFIG_HOME`, or
+    `opencode.jsonc` when only that exists (comments are kept).
+  - Grok: `config.toml` in its `GROK_HOME`.
+  - Pi: `mcp.json` in its `PI_CODING_AGENT_DIR`. Settings Pi saves in Toolport's
+    entry, such as `enabled` and `exposure`, are kept when Toolport rewrites it.
+- On Linux, the Toolport entry in a T3 Code home names Toolport's data folder
+  (`TOOLPORT_DATA_DIR`), because OpenCode passes its instance's `XDG_CONFIG_HOME`
+  on to MCP servers. If an OpenCode instance sets `mcp.toolport` in its inline
+  `OPENCODE_CONFIG_CONTENT`, that wins over the file; Toolport doesn't read that
+  value, since it sits beside API keys.
 - Folders named like `~/.claude_personal` and `~/.codex_personal`, which T3 Code's
   guides suggest, are found the same way as `~/.claude2`.
 - Toolport uses only homes inside your home folder, written plainly. A home outside
@@ -90,15 +101,8 @@ as it is, with why and what to do:
   (the home itself, a folder above it, or its config file), or something that isn't a
   plain folder or file. Point the instance at the real folder in T3 Code's provider
   settings.
-- A Claude Code or Codex home folder that doesn't exist yet. Start the instance once in T3 Code, then
-  refresh Clients.
-- A Grok or Pi home folder that no row on the page covers. Toolport makes rows only
-  for Claude Code and Codex homes, so once the folder exists, add it by hand as a
-  client location to connect it. Toolport's own Grok and Pi rows follow `GROK_HOME`
-  and `PI_CODING_AGENT_DIR` as Toolport sees them, so a home that is one of those
-  already has a row.
-- An OpenCode config folder (its `XDG_CONFIG_HOME`) that no row covers. Once it
-  exists, add the `opencode` folder inside it by hand as a client location.
+- A home folder that doesn't exist yet (for OpenCode, the `opencode` folder in its
+  `XDG_CONFIG_HOME`). Start the instance once in T3 Code, then refresh Clients.
 - An entry in `settings.json` Toolport can't read, or a settings file it can't read
   at all, named by its path with `~` for your home folder.
 
@@ -148,6 +152,8 @@ not change. Activity and approval prompts add **via T3 Code**:
   few environment variables, and one Codex process serves many threads, so Toolport
   goes by T3 Code having started Codex. Toolport knows T3 Code's process names on
   Linux, macOS and Windows; this was tested on Linux.
+- **OpenCode**: "OpenCode via T3 Code", without a thread, the same way as Codex: T3
+  Code runs one `opencode serve` per instance for all its threads.
 - **Pi, Kiro, Grok, fx and ACP Registry agents**: T3 Code gives these its thread
   variable too. When the provider passes it on to its MCP servers, Activity shows "via
   T3 Code" and the thread, as for Claude Code. Toolport checks that T3 Code started

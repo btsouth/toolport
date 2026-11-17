@@ -136,6 +136,43 @@ const detailClients = [
     ],
   }),
 ];
+// T3 Code's OpenCode, Grok and Pi homes as rows, with the card.
+const t3Homes = new URLSearchParams(location.search).has("t3-homes");
+const t3Use = (displayName: string, enabled = true) => ({
+  instanceId: displayName.toLowerCase().replace(/ /g, "_"),
+  displayName,
+  enabled,
+});
+const t3HomeClients = [
+  fixtureClient(
+    "opencode@t3-0f1e2d3c4b5a6978",
+    "OpenCode (~/.t3/hermes-providers/clinepass/config/opencode)",
+    {
+      configPath:
+        "/home/fixture/.t3/hermes-providers/clinepass/config/opencode/opencode.json",
+      t3Code: [t3Use("ClinePass")],
+    },
+  ),
+  fixtureClient("grok@t3-1a2b3c4d5e6f7081", "Grok Build (~/.t3/grok-alt)", {
+    configPath: "/home/fixture/.t3/grok-alt/config.toml",
+    t3Code: [t3Use("Grok Alt")],
+  }),
+  fixtureClient("pi@t3-9f8e7d6c5b4a3921", "Pi (~/.t3/pi-work)", {
+    configPath: "/home/fixture/.t3/pi-work/mcp.json",
+    gatewayInstalled: true,
+    entryState: "managed",
+    t3Code: [t3Use("Pi Work"), t3Use("Pi Old", false)],
+  }),
+];
+const t3HomeOthers = [
+  {
+    instanceId: "ollama_cloud",
+    providerName: "OpenCode",
+    displayName: "Ollama Cloud",
+    enabled: true,
+    gap: "missingHome",
+  },
+];
 const claudeProfileClients = [
   fixtureClient("claude-code", "Claude Code", {
     configPath: "/fixture/.claude.json",
@@ -1084,6 +1121,7 @@ mockIPC(
           ...fixtureLocations,
           ...(detailStates ? detailClients : []),
           ...(claudeProfiles ? claudeProfileClients : []),
+          ...(t3Homes ? t3HomeClients : []),
           ...(args.inspectConfigs && !claudeProfiles
             ? [
                 {
@@ -1175,10 +1213,11 @@ mockIPC(
       case "take_registry_recovery_notice":
       case "team_pair_state":
       case "plugin:updater|check":
-      case "t3_code_revision":
         return null;
+      case "t3_code_revision":
+        return t3Homes ? "fixture-t3-homes" : null;
       case "t3_code_other_instances":
-        return [];
+        return t3Homes ? t3HomeOthers : [];
       case "savings_summary":
         return savingsSummary;
       case "plugin:app|version":
