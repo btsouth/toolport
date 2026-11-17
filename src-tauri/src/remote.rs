@@ -188,6 +188,9 @@ fn issuer_bound_token_endpoint<'a>(
 /// Remove refresh metadata when the user clears OAuth or replaces it with a
 /// manually pasted bearer token. Otherwise stale vaulted state could silently
 /// recreate a credential the user explicitly removed.
+/// The keys a sign-in keeps its state under.
+pub(crate) const OAUTH_STATE_KEYS: [&str; 2] = [CC_STATE_KEY, STATE_KEY];
+
 pub fn clear_oauth_state(server_id: &str) -> Result<(), String> {
     // Attempt both, then surface the first failure. Swallowing the
     // client-credentials delete would leave state that silently reacquires with
