@@ -30,9 +30,13 @@ export function useClientNotices(): State {
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
 
-/** Show feedback on the details page only. */
+/** Show feedback on the details page. Other feedback for the client the list reminder
+ * names (an error, a disconnect) replaces that reminder too, as GTK's
+ * `set_detail_notice` does, so the list never keeps advice the details no longer give. */
 export function setDetailNotice(notice: ClientNotice | null) {
-  update({ ...state, detail: notice });
+  const replaces =
+    notice !== null && state.list?.clientId === notice.clientId && state.list !== notice;
+  update({ detail: notice, list: replaces ? null : state.list });
 }
 
 /** After a connect: the restart reminder on the details page and on the Clients list. */
