@@ -14199,19 +14199,20 @@ impl PastedEnvSection {
             .css_classes(["flat", "toolport-destructive-icon"])
             .build();
         l10n::bind_tooltip(&remove, "Remove this value");
-        // React's order, wrapped onto two lines as React's narrow dialog wraps it.
+        // React's order, wrapped as React's narrow dialog wraps it: the value
+        // (or the password manager reference) on its own line, then its choices.
         key.set_hexpand(true);
         let name_line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         name_line.append(&key);
         name_line.append(&source);
-        let value_line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        value_line.append(&value);
-        value_line.append(&keychain);
-        value_line.append(&sync);
-        value_line.append(&remove);
+        let choices_line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        choices_line.append(&keychain);
+        choices_line.append(&sync);
+        choices_line.append(&remove);
         row.append(&name_line);
-        row.append(&value_line);
+        row.append(&value);
         row.append(&reference_box);
+        row.append(&choices_line);
         row.append(&feedback);
         let entry = PastedEnvRow {
             row: row.clone(),
@@ -15153,8 +15154,9 @@ mod tests {
         let remove = removed
             .upgrade()
             .unwrap()
-            .first_child()
-            .and_then(|line| line.next_sibling())
+            .last_child()
+            // The feedback caption ends the row; the choices line comes before it.
+            .and_then(|feedback| feedback.prev_sibling())
             .and_then(|line| line.last_child())
             .and_downcast::<gtk::Button>()
             .unwrap();
@@ -15209,32 +15211,45 @@ mod tests {
         window.present();
         let rows = section.rows.borrow().clone();
         let [api, region, node, token] = [0, 1, 2, 3].map(|i| rows[i].clone());
+        // Lines flattened: a box's children in order, any other widget itself.
         let line: Vec<gtk::Widget> = {
             let mut children = Vec::new();
             let mut line = api.row.first_child();
-            for _ in 0..2 {
-                let current = line.unwrap();
-                let mut child = current.first_child();
-                while let Some(widget) = child {
-                    child = widget.next_sibling();
-                    children.push(widget);
-                }
+            while let Some(current) = line {
                 line = current.next_sibling();
+                if current.is::<gtk::Box>() && current.first_child().is_some() {
+                    let mut child = current.first_child();
+                    while let Some(widget) = child {
+                        child = widget.next_sibling();
+                        children.push(widget);
+                    }
+                } else {
+                    children.push(current);
+                }
             }
             children
         };
-        assert_eq!(
-            line,
-            [
-                api.key.clone().upcast(),
-                api.source.clone().upcast(),
-                api.value.clone().upcast(),
-                api.keychain.clone().upcast(),
-                api.sync.clone().upcast(),
-                line[5].clone(),
-            ],
-            "React's order: name, source, value, Keychain, sync, remove"
+        let reference_box = api.reference.parent().unwrap().upcast::<gtk::Widget>();
+        let position = |widget: &gtk::Widget| line.iter().position(|w| w == widget);
+        let order = [
+            api.key.clone().upcast(),
+            api.source.clone().upcast(),
+            api.value.clone().upcast(),
+            api.keychain.clone().upcast(),
+            api.sync.clone().upcast(),
+        ]
+        .map(|widget| position(&widget).expect("a row control"));
+        assert!(
+            order.windows(2).all(|pair| pair[0] < pair[1]),
+            "React's order: name, source, value, Keychain, sync, remove: {order:?}"
         );
+        // The password manager reference comes before the row's choices too.
+        let reference_at = line
+            .iter()
+            .position(|w| w.is_ancestor(&reference_box) || *w == reference_box)
+            .expect("the reference fields");
+        assert!(order[2] < reference_at && reference_at < order[3]);
+        assert!(line[order[4] + 1].is::<gtk::Button>(), "remove comes last");
         // A keychain value: source shown, value hidden as typed, no sync choice.
         assert!(api.source.is_visible() && !api.sync.is_visible());
         assert!(!EntryExt::is_visible(&api.value));
