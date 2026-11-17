@@ -3228,8 +3228,8 @@ fn preview_import(state: State<RegistryState>, json: String) -> Result<Vec<Impor
     struct Doc {
         servers: Vec<ServerEntry>,
     }
-    let doc: Doc = serde_json::from_str(&json)
-        .map_err(|e| format!("That doesn't look like a Toolport setup: {e}"))?;
+    let doc: Doc =
+        serde_json::from_str(&json).map_err(|e| crate::sharing_controller::not_a_setup(&e))?;
     let reg = state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
