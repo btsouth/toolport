@@ -372,7 +372,9 @@ jobs:
             tests::pasted_rows_offer_the_react_choices \
             credential_dialog_tests::credentials_dialog_waits_for_values_and_stays_open_after_each_write \
             credential_dialog_tests::authentication_dialog_confirms_removals_and_keeps_focus_and_caption \
-            credential_dialog_tests::a_locked_keyring_asks_once_per_click_and_unknown_is_not_absent
+            credential_dialog_tests::a_locked_keyring_asks_once_per_click_and_unknown_is_not_absent \
+            credential_dialog_tests::a_reference_saved_from_add_updates_a_launch_input_row \
+            credential_dialog_tests::remove_client_credentials_shows_when_the_secret_is_unknown
           do
             xvfb-run -a dbus-run-session -- cargo test \
               --manifest-path src-tauri/Cargo.toml --no-default-features \

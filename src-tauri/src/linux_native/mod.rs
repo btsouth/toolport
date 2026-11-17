@@ -11271,7 +11271,9 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
         let remove_client = remove_client.downgrade();
         form.also(move || {
             if let Some(remove_client) = remove_client.upgrade() {
-                remove_client.set_visible(configured.get() || secret_present.get() == Some(true));
+                // Unknown is not absent: a removal that failed halfway can leave a
+                // secret without settings, so Remove stays until none is stored.
+                remove_client.set_visible(configured.get() || secret_present.get() != Some(false));
             }
         });
     }
@@ -12164,6 +12166,7 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
         empty,
         new_key: new_key.clone(),
         rows: Default::default(),
+        launch_rows: Default::default(),
     };
     for key in &server.secret_keys {
         ui.append_row(
@@ -12502,6 +12505,8 @@ struct CredentialsUi {
     empty: gtk::Label,
     new_key: gtk::Entry,
     rows: CredentialRows,
+    /// Secret command argument rows by key; they save through their own path.
+    launch_rows: std::rc::Rc<std::cell::RefCell<Vec<(String, gtk::Box)>>>,
 }
 
 impl CredentialsUi {
@@ -12575,6 +12580,31 @@ impl CredentialsUi {
     /// Add rows for keys the server gained and drop the ones it lost. `written`
     /// names a key just saved from Add, whose row is rebuilt to show it.
     fn sync_rows(&self, server: &state::ServerView, written: Option<&str>) {
+        // A reference saved from Add for a secret command argument updates its row.
+        if let (Some(written), Some(launch)) = (written, &server.launch) {
+            let old = {
+                let rows = self.launch_rows.borrow();
+                rows.iter()
+                    .position(|(key, _)| key == written)
+                    .map(|index| (index, rows[index].1.clone()))
+            };
+            if let Some((index, old)) = old {
+                let before = old.prev_sibling();
+                self.stored.remove(&old);
+                self.launch_rows.borrow_mut().remove(index);
+                let name = crate::launch_inputs::input_display_name(&server.args, launch, written);
+                self.append_row(
+                    written,
+                    Some(&name),
+                    server.secret_references.get(written).map(String::as_str),
+                );
+                let mut rows = self.launch_rows.borrow_mut();
+                if let Some(entry) = rows.pop() {
+                    self.stored.reorder_child_after(&entry.1, before.as_ref());
+                    rows.insert(index, entry);
+                }
+            }
+        }
         // The written key's row comes back at the same place.
         let rebuilt = written.and_then(|written| {
             let rows = self.rows.borrow();
@@ -12727,6 +12757,7 @@ impl CredentialsUi {
         // Secret command arguments keep their dedicated save path; they have no
         // remove action.
         if launch.is_some() {
+            self.launch_rows.borrow_mut().push((key.to_string(), row));
             return;
         }
         let remove = gtk::Button::builder()
@@ -13065,6 +13096,83 @@ mod credential_dialog_tests {
             has_focus(&editor, &next),
             "focus moves to the next credential"
         );
+        editor.close();
+    }
+
+    /// A reference saved from Add for a secret command argument shows in its row,
+    /// which keeps its place.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn a_reference_saved_from_add_updates_a_launch_input_row() {
+        let _data = crate::registry::DataDirTestEnv::new("credentials-launch-reference");
+        let app = app("com.tsout.Toolport.CredentialsLaunchTest");
+        let (page, server) = page_with(
+            &app,
+            serde_json::json!({
+                "id": "cred-launch", "name": "Launch fixture", "transport": "stdio",
+                "command": "/nonexistent/mock", "args": ["--key", "<launch-input>"],
+                "enabled": false,
+                "env": [{"key": "TOKEN", "secret": true}],
+                "launch": {
+                    "inputs": [{"key": "SECRET", "label": "Secret", "secret": true, "required": true}],
+                    "bindings": [{"index": 1, "parts": [{"kind": "input", "key": "SECRET"}]}]
+                }
+            }),
+        );
+        open_credentials_editor(server, page);
+        let editor = window_titled("Credentials for Launch fixture");
+        let status: gtk::Label = named(&editor, "credential-status");
+        let source: gtk::DropDown = named(&editor, "credential-source:SECRET");
+        assert_eq!(source.selected(), 0);
+        let new_key: gtk::Entry = named(&editor, "credential-new-key");
+        let add_source: gtk::DropDown = named(&editor, "credential-add-source");
+        let add_reference: gtk::Entry = named(&editor, "credential-add-reference");
+        let add_save: gtk::Button = named(&editor, "credential-add-save-reference");
+        add_source.set_selected(1);
+        new_key.set_text("SECRET");
+        add_reference.set_text("op://vault/item/field");
+        press(&add_save);
+        pump_until("the reference", || status.text() == "Reference saved");
+        let source: gtk::DropDown = named(&editor, "credential-source:SECRET");
+        assert_eq!(source.selected(), 1, "the SECRET row shows the reference");
+        let row = source.parent().unwrap();
+        assert_eq!(
+            row.prev_sibling().map(|w| w.widget_name().to_string()),
+            Some("credential:TOKEN".into()),
+            "the rebuilt row keeps its place"
+        );
+        editor.close();
+    }
+
+    /// With the keychain unreadable and no saved client settings, Remove client
+    /// credentials still shows: a secret may be left from a partial removal.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn remove_client_credentials_shows_when_the_secret_is_unknown() {
+        let _data = crate::registry::DataDirTestEnv::new("authentication-dialog-unknown-secret");
+        let app = app("com.tsout.Toolport.AuthenticationUnknownTest");
+        let (page, server) = page_with(
+            &app,
+            serde_json::json!({
+                "id": "auth-unknown", "name": "Unknown fixture", "transport": "http",
+                "url": "http://127.0.0.1:9/mcp", "args": [], "env": [], "enabled": false
+            }),
+        );
+        let mut opened = None;
+        crate::secrets::locked_store::prompts_during(|| {
+            open_authentication_editor(server, page);
+            let editor = window_titled("Authentication for Unknown fixture");
+            let caption: gtk::Label = named(&editor, "auth-secret-status");
+            pump_until("the failed check", || {
+                caption
+                    .text()
+                    .starts_with("Couldn't check the stored secret")
+            });
+            opened = Some(editor);
+        });
+        let editor = opened.unwrap();
+        let remove_client: gtk::Button = named(&editor, "auth-remove-client");
+        assert!(remove_client.is_visible() && remove_client.is_sensitive());
         editor.close();
     }
 
