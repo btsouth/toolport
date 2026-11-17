@@ -187,28 +187,30 @@ export function ConnectReviewDialog({
             <div className="flex flex-col gap-3 text-sm">
               <Check className="mx-auto size-10 text-success" />
               <p>{t("Restart {client} to load Toolport.", { client: clientName })}</p>
-              <ul className="divide-y rounded-lg border">
-                {result.servers.map((row) => {
-                  return (
-                    <li
-                      key={row.name}
-                      className="flex items-center justify-between gap-3 p-3"
-                    >
-                      <div>
-                        <p className="font-medium">{row.name}</p>
-                        <p className="text-meta text-muted-foreground">
-                          {translate("{count} tools", { count: row.toolCount })} ·{" "}
-                          {row.credentialState === "stored"
-                            ? translate("Stored in keychain")
-                            : row.credentialState === "missing"
-                              ? translate("Needs input")
-                              : translate("No credentials needed")}
-                        </p>
-                      </div>
-                    </li>
-                  );
-                })}
-              </ul>
+              {result.servers.length > 0 && (
+                <ul className="divide-y rounded-lg border">
+                  {result.servers.map((row) => {
+                    return (
+                      <li
+                        key={row.name}
+                        className="flex items-center justify-between gap-3 p-3"
+                      >
+                        <div>
+                          <p className="font-medium">{row.name}</p>
+                          <p className="text-meta text-muted-foreground">
+                            {translate("{count} tools", { count: row.toolCount })} ·{" "}
+                            {row.credentialState === "stored"
+                              ? translate("Stored in keychain")
+                              : row.credentialState === "missing"
+                                ? translate("Needs input")
+                                : translate("No credentials needed")}
+                          </p>
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
               {result.outcome.warnings?.map((warning) => (
                 <p key={warning} className="text-meta text-muted-foreground">
                   {warning}
@@ -218,11 +220,19 @@ export function ConnectReviewDialog({
                 <summary className={disclosureSummary}>
                   {t("What your agent sees")}
                 </summary>
-                <ul className="mt-2 font-mono text-meta">
-                  {result.tools.map((t) => (
-                    <li key={t.name}>{t.name}</li>
-                  ))}
-                </ul>
+                {/* Said when nothing moved, rather than opening on nothing; GTK says
+                    the same. */}
+                {result.tools.length === 0 ? (
+                  <p className="mt-2 text-meta text-muted-foreground">
+                    {t("No servers moved, so your agent has no new tools.")}
+                  </p>
+                ) : (
+                  <ul className="mt-2 font-mono text-meta">
+                    {result.tools.map((t) => (
+                      <li key={t.name}>{t.name}</li>
+                    ))}
+                  </ul>
+                )}
               </details>
               <details>
                 <summary className={disclosureSummary}>{t("Details")}</summary>

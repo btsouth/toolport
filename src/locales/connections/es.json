@@ -1132,5 +1132,6 @@
   "Connected {connected} of {total} T3 Code instance.": "Se conectó {connected} de {total} instancia de T3 Code.",
   "Connected {connected} of {total} T3 Code instances.": "Se conectaron {connected} de {total} instancias de T3 Code.",
   "Not connected: {names}.": "Sin conectar: {names}.",
-  "Skip": "Omitir"
+  "Skip": "Omitir",
+  "No servers moved, so your agent has no new tools.": "No se movió ningún servidor, así que tu agente no tiene herramientas nuevas."
 }

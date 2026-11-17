@@ -2809,7 +2809,15 @@ impl ServerPage {
 struct ClientPage {
     details: details::DetailHost,
     detail_clients: std::rc::Rc<std::cell::RefCell<Vec<state::ClientView>>>,
-    detail_notice: std::rc::Rc<std::cell::RefCell<Option<(String, String)>>>,
+    /// A client's notice on its detail page: client id, title, text (React's
+    /// `restartNotice`).
+    detail_notice: std::rc::Rc<std::cell::RefCell<Option<(String, String, String)>>>,
+    /// The restart reminder on the list after a row's Connect, as React shows it on the
+    /// client it connected.
+    list_notice: gtk::Box,
+    /// The notice `list_notice` shows (client id, title, text), so a dismiss or a later
+    /// notice for that client clears only that reminder.
+    list_notice_of: std::rc::Rc<std::cell::RefCell<Option<(String, String, String)>>>,
     /// The client whose refused Connect or Disconnect the error line shows.
     error_client: std::rc::Rc<std::cell::RefCell<Option<String>>>,
     recoveries: std::rc::Rc<std::cell::RefCell<Vec<crate::clients::recovery::ClientRecovery>>>,
@@ -2904,6 +2912,9 @@ impl ClientPage {
         dismiss.add_css_class("flat");
         lasting_card.actions.append(&dismiss);
         page.append(&lasting);
+        let list_notice = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        list_notice.set_visible(false);
+        page.append(&list_notice);
 
         // Full width, like every other list page; the row groups line up with Servers.
         let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -2929,6 +2940,8 @@ impl ClientPage {
             details,
             detail_clients: Default::default(),
             detail_notice: Default::default(),
+            list_notice,
+            list_notice_of: Default::default(),
             error_client: Default::default(),
             recoveries: Default::default(),
             recovery_feedback: Default::default(),
@@ -3574,7 +3587,7 @@ impl ClientPage {
         self.show_error_line(error);
         // Keyed by the client the action was for, not whichever client is
         // open now: the user may have selected another one meanwhile.
-        *self.detail_notice.borrow_mut() = Some((client_id.to_string(), error.into()));
+        self.set_detail_notice((client_id.to_string(), error.into(), String::new()));
         *self.error_client.borrow_mut() = Some(client_id.to_string());
         if self.details.selected.borrow().as_deref() == Some(client_id) {
             self.refresh_open_detail();
@@ -3593,7 +3606,7 @@ impl ClientPage {
             .detail_notice
             .borrow()
             .as_ref()
-            .is_some_and(|(id, _)| id == client_id);
+            .is_some_and(|(id, _, _)| id == client_id);
         if stale {
             self.detail_notice.borrow_mut().take();
             if self.details.selected.borrow().as_deref() == Some(client_id) {
@@ -3605,7 +3618,7 @@ impl ClientPage {
     fn show_error(&self, error: &str) {
         let selected = self.details.selected.borrow().clone();
         if let Some(id) = selected {
-            *self.detail_notice.borrow_mut() = Some((id, error.into()));
+            self.set_detail_notice((id, error.into(), String::new()));
             self.refresh_open_detail();
         }
         self.show_error_line(error);
@@ -3633,7 +3646,7 @@ impl ClientPage {
     fn show_confirmation(&self, message: &str) {
         let selected = self.details.selected.borrow().clone();
         if let Some(id) = selected {
-            *self.detail_notice.borrow_mut() = Some((id, message.into()));
+            self.set_detail_notice((id, message.into(), String::new()));
             self.refresh_open_detail();
         }
         self.cancel_feedback_timer();
@@ -3646,10 +3659,88 @@ impl ClientPage {
     fn refresh_with_confirmation(&self, message: String) {
         self.recovery_success.borrow_mut().take();
         if let Some(id) = self.details.selected.borrow().clone() {
-            *self.detail_notice.borrow_mut() = Some((id, message.clone()));
+            self.set_detail_notice((id, message.clone(), String::new()));
         }
         *self.pending_confirmation.borrow_mut() = Some(message);
         self.refresh();
+    }
+
+    /// After a connect: React's "Not live yet" reminder, naming the client, on its detail
+    /// page and on the list. It stays until dismissed or replaced.
+    fn refresh_with_restart_notice(&self, client_id: &str, client_name: &str) {
+        self.recovery_success.borrow_mut().take();
+        let title = crate::i18n::tr("Not live yet");
+        let text = crate::i18n::trf(
+            "Restart {client} so it loads Toolport.",
+            &[("client", client_name)],
+        );
+        self.set_detail_notice((client_id.to_string(), title.clone(), text.clone()));
+        self.show_list_notice(client_id, &title, &text);
+        self.refresh();
+    }
+
+    /// Sets the detail notice. A different notice for the client the list reminder
+    /// names (an error, a disconnect) replaces that reminder too, so the list never
+    /// keeps advice the client's own page no longer gives.
+    fn set_detail_notice(&self, notice: (String, String, String)) {
+        let replaces_reminder = self
+            .list_notice_of
+            .borrow()
+            .as_ref()
+            .is_some_and(|shown| shown.0 == notice.0 && shown != &notice);
+        if replaces_reminder {
+            self.clear_list_notice();
+        }
+        *self.detail_notice.borrow_mut() = Some(notice);
+    }
+
+    fn show_list_notice(&self, client_id: &str, title: &str, text: &str) {
+        self.clear_list_notice();
+        let shown = (client_id.to_string(), title.to_string(), text.to_string());
+        *self.list_notice_of.borrow_mut() = Some(shown);
+        let holder = self.list_notice.clone();
+        let detail = self.detail_notice.clone();
+        let of = self.list_notice_of.clone();
+        self.list_notice
+            .append(&restart_notice(title, text, move || {
+                holder.set_visible(false);
+                // Only the same reminder on the detail page goes with it; another
+                // client's error or confirmation stays.
+                let dismissed = of.borrow_mut().take();
+                if dismissed.is_some() && *detail.borrow() == dismissed {
+                    detail.borrow_mut().take();
+                }
+            }));
+        self.list_notice.set_visible(true);
+    }
+
+    fn clear_list_notice(&self) {
+        self.list_notice_of.borrow_mut().take();
+        while let Some(child) = self.list_notice.first_child() {
+            self.list_notice.remove(&child);
+        }
+        self.list_notice.set_visible(false);
+    }
+
+    /// Dismissing the detail notice. The list reminder goes with it only when it is
+    /// that same notice.
+    pub(super) fn dismiss_detail_notice(&self) {
+        let dismissed = self.detail_notice.borrow_mut().take();
+        if dismissed.is_some() && *self.list_notice_of.borrow() == dismissed {
+            self.clear_list_notice();
+        }
+    }
+
+    /// The client's connection changed, so a list reminder about it is stale.
+    fn clear_list_notice_for(&self, client_id: &str) {
+        let stale = self
+            .list_notice_of
+            .borrow()
+            .as_ref()
+            .is_some_and(|shown| shown.0 == client_id);
+        if stale {
+            self.clear_list_notice();
+        }
     }
 
     fn cancel_feedback_timer(&self) {
@@ -3657,6 +3748,54 @@ impl ClientPage {
             timer.remove();
         }
     }
+}
+
+/// React's client notice (`ClientDetail`'s restart reminder): an info bar with the
+/// refresh icon, a bold title, optional text, and a dismiss button.
+pub(super) fn restart_notice(title: &str, text: &str, on_dismiss: impl Fn() + 'static) -> gtk::Box {
+    let notice = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    notice.set_widget_name("toolport-restart-notice");
+    notice.add_css_class("toolport-feedback");
+    notice.add_css_class("info");
+    let icon = gtk::Image::from_icon_name("view-refresh-symbolic");
+    icon.set_valign(gtk::Align::Start);
+    icon.set_margin_top(2);
+    notice.append(&icon);
+    let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    copy.set_hexpand(true);
+    let heading = gtk::Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .selectable(true)
+        .build();
+    heading.add_css_class("heading");
+    copy.append(&heading);
+    if !text.is_empty() {
+        let body = gtk::Label::builder()
+            .label(text)
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .selectable(true)
+            .build();
+        body.add_css_class("toolport-muted");
+        copy.append(&body);
+    }
+    notice.append(&copy);
+    let dismiss = header_icon_button("window-close-symbolic");
+    dismiss.set_valign(gtk::Align::Start);
+    l10n::bind_tooltip(&dismiss, "Dismiss restart reminder");
+    let weak = notice.downgrade();
+    dismiss.connect_clicked(move |_| {
+        if let Some(notice) = weak.upgrade() {
+            notice.set_visible(false);
+        }
+        on_dismiss();
+    });
+    notice.append(&dismiss);
+    notice
 }
 
 fn client_activity_detail(client: &serde_json::Value) -> String {
@@ -3987,7 +4126,8 @@ fn confirm_client_migrate(client: &state::ClientView, page: ClientPage) {
         client.gateway_state == state::ClientGatewayState::Customized,
         {
             let page = page.clone();
-            move || page.refresh_with_confirmation(crate::i18n::tr("Restart the client afterward."))
+            let (id, name) = (client.id.clone(), client.name.clone());
+            move || page.refresh_with_restart_notice(&id, &name)
         },
         Some(page.credential_page.clone()),
     );
@@ -4346,7 +4486,7 @@ fn run_client_mutation(
         crate::i18n::msg("Disconnecting client…")
     }));
     let client_id = client.id.clone();
-    let client_id_for_error = client.id.clone();
+    let mutated_id = client.id.clone();
     let client_name = client.name.clone();
     let button = button.clone();
     gtk::glib::spawn_future_local(async move {
@@ -4365,6 +4505,7 @@ fn run_client_mutation(
         button.set_sensitive(true);
         match result {
             Ok(Ok(result)) => {
+                page.clear_list_notice_for(&mutated_id);
                 // The config write is not live until the client restarts; saying
                 // only "Connected" would misstate what the running client does.
                 let restored = result.outcome.restored.len();
@@ -4426,7 +4567,7 @@ fn run_client_mutation(
                 }
             }
             Ok(Err(error)) => {
-                page.show_client_error(&client_id_for_error, &format!("{client_name}: {error}"))
+                page.show_client_error(&mutated_id, &format!("{client_name}: {error}"))
             }
             Err(_) => page.show_error(&crate::i18n::trf(
                 "{value0}: the operation stopped",
@@ -17973,6 +18114,138 @@ mod tests {
                 main_loop.run();
             }
         }
+    }
+
+    /// After a connect GTK shows React's reminder: "Not live yet", the restart line
+    /// naming the client, an info bar, and a dismiss that clears it on the list and on
+    /// the client's details, but never another client's notice.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn connect_shows_reacts_restart_reminder() {
+        use super::*;
+        fn fixture_descendants(widget: &gtk::Widget) -> Vec<gtk::Widget> {
+            let mut out = vec![widget.clone()];
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                out.extend(fixture_descendants(&widget));
+            }
+            out
+        }
+        adw::init().unwrap();
+        let notice = restart_notice(
+            &crate::i18n::tr("Not live yet"),
+            &crate::i18n::trf(
+                "Restart {client} so it loads Toolport.",
+                &[("client", "Cursor")],
+            ),
+            || {},
+        );
+        assert!(notice.has_css_class("toolport-feedback"));
+        assert!(notice.has_css_class("info"));
+        let labels = fixture_descendants(notice.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .collect::<Vec<_>>();
+        assert_eq!(labels[0].text(), "Not live yet");
+        assert!(labels[0].has_css_class("heading"));
+        assert_eq!(labels[1].text(), "Restart Cursor so it loads Toolport.");
+        let dismiss = fixture_descendants(notice.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .next()
+            .unwrap();
+        assert_eq!(
+            dismiss.tooltip_text().as_deref(),
+            Some("Dismiss restart reminder")
+        );
+
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.RestartNoticeFixture")
+            .build();
+        let server_page = ServerPage {
+            details: Default::default(),
+            app: app.clone(),
+            share_requests: Default::default(),
+            server_count: gtk::Label::new(None),
+            section_title: gtk::Label::new(None),
+            posture: gtk::Label::new(None),
+            search: gtk::SearchEntry::new(),
+            feedback: gtk::Label::new(None),
+            list: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            last_snapshot: Default::default(),
+            feedback_timer: Default::default(),
+            health_rows: Default::default(),
+            rows: Default::default(),
+            no_matches: Default::default(),
+            off_heading: Default::default(),
+            health: Default::default(),
+            registry_reload: Default::default(),
+        };
+        let page = ClientPage::new(&app, server_page);
+        let dismiss_list = |page: &ClientPage| {
+            fixture_descendants(page.list_notice.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Button>().ok())
+                .next()
+                .unwrap()
+                .emit_clicked();
+        };
+        let remind = |page: &ClientPage, id: &str| {
+            let notice = (
+                id.to_string(),
+                "Not live yet".to_string(),
+                "Restart Cursor so it loads Toolport.".to_string(),
+            );
+            page.set_detail_notice(notice.clone());
+            page.show_list_notice(&notice.0, &notice.1, &notice.2);
+        };
+        let error = |id: &str| (id.to_string(), "refused".to_string(), String::new());
+
+        remind(&page, "cursor");
+        assert!(page.list_notice.is_visible());
+        let shown = fixture_descendants(page.list_notice.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .map(|l| l.text().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shown,
+            vec!["Not live yet", "Restart Cursor so it loads Toolport."]
+        );
+        dismiss_list(&page);
+        assert!(!page.list_notice.is_visible());
+        assert!(page.detail_notice.borrow().is_none());
+
+        // Dismissing on the detail page takes the same reminder off the list.
+        remind(&page, "cursor");
+        page.dismiss_detail_notice();
+        assert!(!page.list_notice.is_visible());
+
+        // Another client's error stays when Cursor's list reminder is dismissed.
+        remind(&page, "cursor");
+        page.set_detail_notice(error("codex"));
+        assert!(page.list_notice.is_visible());
+        dismiss_list(&page);
+        assert_eq!(page.detail_notice.borrow().clone(), Some(error("codex")));
+
+        // Dismissing another client's notice keeps Cursor's list reminder.
+        remind(&page, "cursor");
+        page.set_detail_notice(error("codex"));
+        page.dismiss_detail_notice();
+        assert!(page.list_notice.is_visible());
+
+        // A later notice for Cursor itself (a disconnect, an error) replaces the
+        // reminder on the list too.
+        page.set_detail_notice(error("cursor"));
+        assert!(!page.list_notice.is_visible());
+
+        // So does a finished Connect or Disconnect that leaves no notice behind.
+        remind(&page, "cursor");
+        page.clear_list_notice_for("codex");
+        assert!(page.list_notice.is_visible());
+        page.clear_list_notice_for("cursor");
+        assert!(!page.list_notice.is_visible());
     }
 
     #[test]

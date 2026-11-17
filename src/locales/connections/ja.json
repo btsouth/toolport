@@ -1132,5 +1132,6 @@
   "Connected {connected} of {total} T3 Code instance.": "T3 Code インスタンス {total} 件中 {connected} 件を接続しました。",
   "Connected {connected} of {total} T3 Code instances.": "T3 Code インスタンス {total} 件中 {connected} 件を接続しました。",
   "Not connected: {names}.": "未接続: {names}。",
-  "Skip": "スキップ"
+  "Skip": "スキップ",
+  "No servers moved, so your agent has no new tools.": "移動したサーバーがないため、エージェントに新しいツールはありません。"
 }
