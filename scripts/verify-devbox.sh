@@ -44,7 +44,8 @@ sync_tree() {
 }
 
 ensure_node_modules() {
-  remote "cd '$REMOTE' && if [ ! -f node_modules/.package-lock.json ] || [ package-lock.json -nt node_modules/.package-lock.json ]; then heavy-run -- npm ci --no-audit --no-fund --loglevel=error; fi"
+  # Keyed on the lockfile's content: rsync keeps mtimes, so a time check can miss an edit.
+  remote "cd '$REMOTE' && sum=\$(sha256sum package-lock.json) && if [ \"\$(cat node_modules/.verify-lock-sum 2>/dev/null)\" != \"\$sum\" ]; then heavy-run -- npm ci --no-audit --no-fund --loglevel=error && printf '%s' \"\$sum\" >node_modules/.verify-lock-sum; fi" >&2 # stdout carries only the fixture URL
 }
 
 port_free_here() { ! ss -Hltn "sport = :$1" | grep -q .; }
@@ -73,7 +74,9 @@ cmd_fixture() {
   local url="http://127.0.0.1:$port/fixtures/"
   mkdir -p "$ROOT/.verify/shots"
   for _ in $(seq 1 60); do
-    if curl -fsS -o /dev/null "$url" 2>/dev/null; then
+    # The answer must come from this run's vite and tunnel, not an older server on the port.
+    if curl -fsS -o /dev/null "$url" 2>/dev/null && kill -0 "$tunnel" 2>/dev/null &&
+      remote "kill -0 $pid" 2>/dev/null; then
       say "fixture ready (devbox log: $log)"
       printf '%s\n' "$url"
       return 0
@@ -93,8 +96,9 @@ cmd_fixture_stop() {
   }
   # shellcheck disable=SC1090
   . "$FIXTURE_STATE"
-  remote "kill -TERM -- -$REMOTE_PID 2>/dev/null || kill $REMOTE_PID 2>/dev/null || true"
   kill "$TUNNEL_PID" 2>/dev/null || true
+  remote "kill -TERM -- -$REMOTE_PID 2>/dev/null || kill $REMOTE_PID 2>/dev/null || true" ||
+    say "could not reach $HOST to stop vite (pid $REMOTE_PID); stop it there by hand"
   rm -f "$FIXTURE_STATE"
   [ "${1:-}" = quiet ] || say "fixture stopped"
 }

@@ -47,7 +47,11 @@ const WEAKENING = [
   [/continue-on-error\s*:\s*true/, "lets a CI step fail without failing the job"],
 ];
 
-const TEST_CASE = /^\s*(#\[(tokio::)?test\b|(it|test)(\.each\(.*?\))?\s*\(\s*["'`])/;
+// A test declaration's first line: #[test], it("name"..., or a call whose name
+// or table starts on a later line (it(, it.each([, it.each`).
+const TEST_CASE =
+  /^\s*(#\[(tokio::)?test\b|(it|test)(\.each\(.*?\))?\s*\(\s*["'`]|(it|test)(\.each)?\s*\(\s*(\[|$)|(it|test)\.each\s*`)/;
+const RUST_TEST_ATTR = /^\s*#\[(tokio::)?test\b/;
 
 // Walks a unified diff. Each entry is [kind, text] with kind "+", "-" or " ".
 function patchLines(patch) {
@@ -68,6 +72,14 @@ export function classify(files) {
     const lines = patchLines(file.patch);
     const added = lines.filter(([k, t]) => k === "+" && t.trim()).length;
     const removed = lines.filter(([k, t]) => k === "-" && t.trim()).length;
+
+    const guarded = (path) =>
+      [...GATE_PATHS, ...CHECK_PATHS].some((re) => re.test(path ?? ""));
+    if (file.status === "renamed" && guarded(file.previous_filename) && !guarded(name))
+      findings.push({
+        file: name,
+        reason: `moves ${file.previous_filename} out of the checked paths`,
+      });
 
     if (GATE_PATHS.some((re) => re.test(name)))
       findings.push({
@@ -97,24 +109,23 @@ export function classify(files) {
 
     const isWorkflow = /^\.github\/workflows\//.test(name);
     const reasons = new Set();
-    let previous = null;
+    // The lines as they are after this PR, for looking at attribute groups.
+    const after = lines.filter(([k]) => k !== "-");
+    let at = -1;
     let net = 0;
     for (const [kind, text] of lines) {
+      if (kind !== "-") at++;
       if (kind === "+") {
         for (const [re, reason] of WEAKENING) if (re.test(text)) reasons.add(reason);
         if (isWorkflow && /\|\|\s*true\b/.test(text))
           reasons.add("ignores a failing command in CI");
         // An ignore on a test this PR adds is how desktop-only tests are
-        // written; an ignore on an existing test turns it off.
-        if (
-          /#\[ignore\b/.test(text) &&
-          previous?.[0] === " " &&
-          /#\[(tokio::)?test\b/.test(previous[1])
-        )
+        // written; an ignore on an existing test turns it off. Look through
+        // the attribute group around it for an unchanged #[test].
+        if (/#\[ignore\b/.test(text) && existingTestAttr(after, at))
           reasons.add("ignores an existing Rust test");
       }
       if (TEST_CASE.test(text)) net += kind === "+" ? 1 : kind === "-" ? -1 : 0;
-      if (kind !== "-") previous = [kind, text];
     }
     for (const reason of reasons) findings.push({ file: name, reason });
     if (file.status !== "removed" && net) testCases.set(name, net);
@@ -132,9 +143,21 @@ export function classify(files) {
   return findings;
 }
 
+function existingTestAttr(after, at) {
+  for (const step of [-1, 1])
+    for (let i = at + step; i >= 0 && i < after.length; i += step) {
+      const [kind, text] = after[i];
+      if (!/^\s*#\[/.test(text)) break;
+      if (kind === " " && RUST_TEST_ATTR.test(text)) return true;
+    }
+  return false;
+}
+
+// The reason must be on the same line as the label and contain a word.
 export function explanation(body) {
-  const match = /^[\s>*_-]*check changes\s*:[*_]*\s*(\S.*)$/im.exec(body ?? "");
-  return match ? match[1].trim() : null;
+  const match = /^[ \t>*_-]*check changes[ \t]*:(.*)$/im.exec(body ?? "");
+  const reason = match?.[1].replace(/^[\s*_`]+|[\s*_`]+$/g, "");
+  return reason && /\w/.test(reason) ? reason : null;
 }
 
 async function listFiles(repo, number, token) {

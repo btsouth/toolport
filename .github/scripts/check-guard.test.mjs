@@ -110,6 +110,24 @@ test("skips, retries and swallowed failures are flagged", () => {
   );
 });
 
+test("an ignore anywhere in an existing test's attributes is flagged", () => {
+  for (const patch of [
+    "@@\n+    #[ignore]\n     #[test]\n     fn old() {}",
+    "@@\n     #[test]\n     #[cfg(unix)]\n+    #[ignore]\n     fn old() {}",
+  ])
+    assert.deepEqual(
+      reasons([{ filename: "src-tauri/src/router.rs", status: "modified", patch }]),
+      ["src-tauri/src/router.rs: ignores an existing Rust test"],
+    );
+  const fresh = '@@\n+    #[ignore = "desktop"]\n+    #[test]\n+    fn fits() {}';
+  assert.deepEqual(
+    reasons([
+      { filename: "src-tauri/src/linux_native/mod.rs", status: "modified", patch: fresh },
+    ]),
+    [],
+  );
+});
+
 test("ignoring an existing Rust test is flagged, a new desktop-only test is not", () => {
   const existing = "@@\n     #[test]\n+    #[ignore]\n     fn old() {}";
   assert.deepEqual(
@@ -162,6 +180,40 @@ test("a net loss of test cases across the PR is flagged, a move or rewrite is no
   );
 });
 
+test("multiline test declarations are counted", () => {
+  const each =
+    '@@\n-  it.each([\n-    ["a", 1],\n-  ])("handles %s", () => {});\n-  it(\n-    "long name",\n-    () => {},\n-  );';
+  assert.deepEqual(
+    reasons([{ filename: "src/lib/updater.test.ts", status: "modified", patch: each }]),
+    [
+      "src/lib/updater.test.ts: removes 2 test cases overall (from src/lib/updater.test.ts)",
+    ],
+  );
+});
+
+test("moving a check file out of the checked paths is flagged", () => {
+  assert.deepEqual(
+    reasons([
+      {
+        filename: ".github/ci.yml",
+        previous_filename: ".github/workflows/ci.yml",
+        status: "renamed",
+      },
+    ]),
+    [".github/ci.yml: moves .github/workflows/ci.yml out of the checked paths"],
+  );
+  assert.deepEqual(
+    reasons([
+      {
+        filename: ".github/workflows/ci2.yml",
+        previous_filename: ".github/workflows/ci.yml",
+        status: "renamed",
+      },
+    ]),
+    [],
+  );
+});
+
 test("the PR body explanation is found in common forms", () => {
   assert.equal(
     explanation("## Notes\nCheck changes: CI moved to Node 24"),
@@ -172,6 +224,13 @@ test("the PR body explanation is found in common forms", () => {
     "dropped a duplicate smoke step",
   );
   assert.equal(explanation("check changes:   "), null);
+  assert.equal(
+    explanation("Check changes:\n\n## Testing"),
+    null,
+    "reason on the next line",
+  );
+  assert.equal(explanation("**Check changes:**"), null, "bold label only");
+  assert.equal(explanation("**Check changes:** **"), null, "markup only");
   assert.equal(explanation("No checks changed here."), null);
   assert.equal(explanation(null), null);
 });
