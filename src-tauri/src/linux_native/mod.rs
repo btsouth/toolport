@@ -12332,6 +12332,33 @@ fn duplicate_server_name(name: &str, existing: &[String]) -> String {
     }
 }
 
+/// Signal handlers connected on an editor's widgets, disconnected together.
+#[derive(Default)]
+struct EditorHandlers(
+    std::cell::RefCell<
+        Vec<(
+            gtk::glib::WeakRef<gtk::glib::Object>,
+            gtk::glib::SignalHandlerId,
+        )>,
+    >,
+);
+
+impl EditorHandlers {
+    fn keep(&self, object: &impl IsA<gtk::glib::Object>, id: gtk::glib::SignalHandlerId) {
+        self.0
+            .borrow_mut()
+            .push((object.upcast_ref::<gtk::glib::Object>().downgrade(), id));
+    }
+
+    fn disconnect_all(&self) {
+        for (object, id) in self.0.take() {
+            if let Some(object) = object.upgrade() {
+                object.disconnect(id);
+            }
+        }
+    }
+}
+
 /// `url_placeholder` overrides the generic URL example for catalog entries that
 /// carry a `url_hint`: the user has to supply their own instance endpoint, so
 /// the hint is a placeholder, never prefilled text they could save verbatim.
@@ -12373,9 +12400,24 @@ fn open_server_editor_prefilled(
     save.add_css_class("suggested-action");
     root.append(&header);
     close_on_escape(&editor);
+    // Handlers on the editor's own widgets capture those widgets, so each one
+    // would keep its widget alive after the window closes. They are
+    // disconnected when the editor is destroyed.
+    let editor_handlers = std::rc::Rc::new(EditorHandlers::default());
     {
-        let editor = editor.clone();
-        cancel.connect_clicked(move |_| editor.close());
+        let handlers = editor_handlers.clone();
+        editor.connect_destroy(move |_| handlers.disconnect_all());
+    }
+    {
+        // Weak: a handler that kept its own window would keep it, and every
+        // widget in it, alive after it closes.
+        let editor = editor.downgrade();
+        let id = cancel.connect_clicked(move |_| {
+            if let Some(editor) = editor.upgrade() {
+                editor.close();
+            }
+        });
+        editor_handlers.keep(&cancel, id);
     }
 
     let scroller = gtk::ScrolledWindow::builder()
@@ -12472,7 +12514,7 @@ fn open_server_editor_prefilled(
                     .collect()
             })
             .unwrap_or_default();
-        name.connect_changed(move |name| {
+        let id = name.connect_changed(move |name| {
             let typed = name.text().trim().to_lowercase();
             let duplicate = !typed.is_empty() && existing.contains(&typed);
             if duplicate {
@@ -12480,6 +12522,7 @@ fn open_server_editor_prefilled(
             }
             duplicate_warning.set_visible(duplicate);
         });
+        editor_handlers.keep(&name, id);
     }
     form.append(&identity);
 
@@ -12602,7 +12645,9 @@ fn open_server_editor_prefilled(
                     );
                     field.set_visible(choice.selected() == 0);
                     let paste = field.clone();
-                    choice.connect_selected_notify(move |c| paste.set_visible(c.selected() == 0));
+                    let id = choice
+                        .connect_selected_notify(move |c| paste.set_visible(c.selected() == 0));
+                    editor_handlers.keep(&choice, id);
                     row.append(&choice);
                     row.append(&controls);
                     Some((choice, reference))
@@ -12640,8 +12685,10 @@ fn open_server_editor_prefilled(
         };
         let update_warning = std::rc::Rc::new(update_warning);
         let on_args = update_warning.clone();
-        args.buffer().connect_changed(move |_| on_args());
-        command.connect_changed(move |_| update_warning());
+        let id = args.buffer().connect_changed(move |_| on_args());
+        editor_handlers.keep(&args.buffer(), id);
+        let id = command.connect_changed(move |_| update_warning());
+        editor_handlers.keep(&command, id);
     }
 
     let cwd = {
@@ -12842,7 +12889,7 @@ fn open_server_editor_prefilled(
         let credentials_for_fill = credentials.clone();
         let page_for_fill = page.clone();
         let quiet_for_fill = quiet_empty_fields.clone();
-        fill.connect_clicked(move |fill| {
+        let id = fill.connect_clicked(move |fill| {
             let buffer = snippet.buffer();
             let text = buffer
                 .text(&buffer.start_iter(), &buffer.end_iter(), false)
@@ -12918,6 +12965,7 @@ fn open_server_editor_prefilled(
                 }
             }
         });
+        editor_handlers.keep(&fill, id);
     }
 
     update_editor_transport(
@@ -12935,7 +12983,7 @@ fn open_server_editor_prefilled(
     if let Some(section) = &env_section {
         section.set_visible(transport.selected() == 0);
     }
-    transport.connect_selected_notify(move |transport| {
+    let id = transport.connect_selected_notify(move |transport| {
         update_editor_transport(
             transport.selected(),
             &command_row_for_transport,
@@ -12947,6 +12995,7 @@ fn open_server_editor_prefilled(
             section.set_visible(transport.selected() == 0);
         }
     });
+    editor_handlers.keep(&transport, id);
     let plain_env = plain_env.map(|(_, rows)| rows);
 
     let clamp = adw::Clamp::builder()
@@ -13091,36 +13140,45 @@ fn open_server_editor_prefilled(
     for (entry, _, touched) in &validation_errors {
         let edited_change = edited.clone();
         let touched_change = touched.clone();
-        entry.connect_changed(move |_| {
+        let id = entry.connect_changed(move |_| {
             touched_change.set(true);
             edited_change();
         });
+        editor_handlers.keep(entry, id);
         let focus = gtk::EventControllerFocus::new();
         let (touched, validate) = (touched.clone(), validate.clone());
-        focus.connect_leave(move |_| {
+        let id = focus.connect_leave(move |_| {
             touched.set(true);
             validate();
         });
+        editor_handlers.keep(&focus, id);
         entry.add_controller(focus);
     }
     let edited_args = edited.clone();
-    args.buffer().connect_changed(move |_| edited_args());
+    let id = args.buffer().connect_changed(move |_| edited_args());
+    editor_handlers.keep(&args.buffer(), id);
     let edited_cwd = edited.clone();
-    cwd.connect_changed(move |_| edited_cwd());
+    let id = cwd.connect_changed(move |_| edited_cwd());
+    editor_handlers.keep(&cwd, id);
     let edited_inherit = edited.clone();
-    inherit_env.connect_active_notify(move |_| edited_inherit());
+    let id = inherit_env.connect_active_notify(move |_| edited_inherit());
+    editor_handlers.keep(&inherit_env, id);
     for (_, field, source) in &launch_entries {
         let edited_field = edited.clone();
-        field.connect_changed(move |_| edited_field());
+        let id = field.connect_changed(move |_| edited_field());
+        editor_handlers.keep(field, id);
         if let Some((choice, reference)) = source {
             let edited_choice = edited.clone();
-            choice.connect_selected_notify(move |_| edited_choice());
+            let id = choice.connect_selected_notify(move |_| edited_choice());
+            editor_handlers.keep(choice, id);
             let edited_reference = edited.clone();
-            reference.connect_changed(move |_| edited_reference());
+            let id = reference.connect_changed(move |_| edited_reference());
+            editor_handlers.keep(reference, id);
         }
     }
     let edited_transport = edited;
-    transport.connect_selected_notify(move |_| edited_transport());
+    let id = transport.connect_selected_notify(move |_| edited_transport());
+    editor_handlers.keep(&transport, id);
     validate();
     // The default shown matches React: 10 seconds for a local command, 120
     // when it downloads its package first, the request timeout for a remote.
@@ -13149,11 +13207,14 @@ fn open_server_editor_prefilled(
         })
     };
     let hint_command = timeout_hint.clone();
-    command.connect_changed(move |_| hint_command());
+    let id = command.connect_changed(move |_| hint_command());
+    editor_handlers.keep(&command, id);
     let hint_args = timeout_hint.clone();
-    args.buffer().connect_changed(move |_| hint_args());
+    let id = args.buffer().connect_changed(move |_| hint_args());
+    editor_handlers.keep(&args.buffer(), id);
     let hint_transport = timeout_hint.clone();
-    transport.connect_selected_notify(move |_| hint_transport());
+    let id = transport.connect_selected_notify(move |_| hint_transport());
+    editor_handlers.keep(&transport, id);
     timeout_hint();
     let timeout_for_test = timeout.clone();
     let server_id_for_test = server_id.clone();
@@ -13174,7 +13235,7 @@ fn open_server_editor_prefilled(
     let busy_for_test = busy.clone();
     let generation_for_test = generation.clone();
     let validate_for_test = validate.clone();
-    test.connect_clicked(move |_| {
+    let id = test.connect_clicked(move |_| {
         let Some(timeout_ms) = timeout_value(&timeout_for_test.text()) else {
             validate_for_test();
             return;
@@ -13315,15 +13376,17 @@ fn open_server_editor_prefilled(
             }
         });
     });
+    editor_handlers.keep(&test, id);
 
-    let editor_for_save = editor.clone();
+    // Weak for the same reason as Cancel; a save in progress holds it.
+    let editor_for_save = editor.downgrade();
     let launch_for_save = launch_entries.clone();
     let original_launch_for_save = original_launch.clone();
     let original_command_for_save = original_command.clone();
     let original_args_for_save = original_args.clone();
     let busy_for_save = busy;
     let validate_for_save = validate;
-    save.connect_clicked(move |_| {
+    let id = save.connect_clicked(move |_| {
         let Some(timeout_ms) = timeout_value(&timeout.text()) else {
             validate_for_save();
             return;
@@ -13371,7 +13434,9 @@ fn open_server_editor_prefilled(
         let busy = busy_for_save.clone();
         let validate = validate_for_save.clone();
         let feedback = feedback.clone();
-        let editor = editor_for_save.clone();
+        let Some(editor) = editor_for_save.upgrade() else {
+            return;
+        };
         gtk::glib::spawn_future_local(async move {
             let update = gtk::gio::spawn_blocking(move || {
                 #[cfg(test)]
@@ -13467,6 +13532,7 @@ fn open_server_editor_prefilled(
             }
         });
     });
+    editor_handlers.keep(&save, id);
     editor.present();
     Some(editor)
 }
@@ -14313,15 +14379,22 @@ fn add_plain_env_row(
         let check = l10n::check_button("This machine only");
         row.append(&check);
         let setting = std::rc::Rc::new(std::cell::Cell::new(false));
+        // Weak: these run from the key and value fields' own handlers, which
+        // would otherwise keep the row alive after the editor closes.
         let refresh = {
             let (key, value, check, touched, setting) = (
-                key.clone(),
-                value.clone(),
-                check.clone(),
+                key.downgrade(),
+                value.downgrade(),
+                check.downgrade(),
                 touched.clone(),
                 setting.clone(),
             );
             move || {
+                let (Some(key), Some(value), Some(check)) =
+                    (key.upgrade(), value.upgrade(), check.upgrade())
+                else {
+                    return;
+                };
                 let name = key.text();
                 let name = name.trim();
                 let risky = crate::personal_sync::risky_sync_env(name);
@@ -14367,11 +14440,20 @@ fn add_plain_env_row(
         local,
         touched,
     });
-    let list = list.clone();
-    let rows_for_remove = rows.clone();
+    // Weak: the button is inside the row it removes.
+    let (list, row, rows_for_remove) = (
+        list.downgrade(),
+        row.downgrade(),
+        std::rc::Rc::downgrade(rows),
+    );
     remove.connect_clicked(move |_| {
+        let (Some(list), Some(row)) = (list.upgrade(), row.upgrade()) else {
+            return;
+        };
         list.remove(&row);
-        rows_for_remove.borrow_mut().retain(|r| r.row != row);
+        if let Some(rows) = rows_for_remove.upgrade() {
+            rows.borrow_mut().retain(|r| r.row != row);
+        }
     });
     key
 }
@@ -18001,6 +18083,142 @@ mod tests {
         assert_eq!(filter_tool_identities(&identities, "search").len(), 1);
         assert_eq!(filter_tool_identities(&identities, "jira").len(), 1);
         assert_eq!(filter_tool_identities(&identities, "nothing").len(), 0);
+    }
+
+    /// Cancel and close dispose the Add and Edit windows: their own handlers
+    /// do not keep them, or the widgets they hold, alive.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn closed_server_editors_are_freed() {
+        use super::*;
+        adw::init().unwrap();
+        let _data = crate::registry::DataDirTestEnv::new("gtk-editor-freed");
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.EditorFreed")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gtk::gio::Cancellable::NONE).unwrap();
+        let parent = adw::ApplicationWindow::builder().application(&app).build();
+        let (content, page, _) = build_content(&app, crate::approval_broker::start_native());
+        parent.set_content(Some(&content));
+        parent.present();
+        let server = state::ServerView {
+            id: "local".into(),
+            name: "Local tool".into(),
+            origin_label: "Personal".into(),
+            transport: "stdio".into(),
+            transport_id: "stdio".into(),
+            command: Some("npx".into()),
+            args: vec![],
+            launch: None,
+            url: None,
+            cwd: None,
+            inherit_env: false,
+            hide_prompts: false,
+            secret_keys: vec![],
+            plain_env: vec![state::PlainEnvView {
+                key: "REGION".into(),
+                value: "eu".into(),
+                portable: None,
+            }],
+            secret_references: Default::default(),
+            client_credentials: None,
+            enabled: false,
+            requires_review: false,
+            team_route_removed: false,
+            probe_fingerprint: 1,
+        };
+        let pump = || {
+            let context = gtk::glib::MainContext::default();
+            for _ in 0..50 {
+                while context.pending() {
+                    context.iteration(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        fn widgets(widget: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+            out.push(widget.clone());
+            let mut child = widget.first_child();
+            while let Some(node) = child {
+                child = node.next_sibling();
+                widgets(&node, out);
+            }
+        }
+        for (label, editing, by_cancel, personal) in [
+            ("add, Cancel", false, true, false),
+            ("add, closed", false, false, false),
+            ("edit, Cancel", true, true, false),
+            ("edit, closed", true, false, false),
+            // With personal sync on, each plain value row gets its "This
+            // machine only" box and the handlers that keep it current.
+            ("edit with sync, Cancel", true, true, true),
+            ("edit with sync, closed", true, false, true),
+        ] {
+            *page.last_snapshot.borrow_mut() = Some(state::RegistrySnapshot {
+                servers: vec![server.clone()],
+                profiles: Vec::new(),
+                enabled_count: 0,
+                profile_count: 1,
+                active_profile_id: "default".into(),
+                paired: false,
+                personal_sync: personal,
+            });
+            let editor = if editing {
+                open_server_editor_prefilled(
+                    Some(server.clone()),
+                    Some("local".into()),
+                    page.clone(),
+                    None,
+                )
+            } else {
+                open_server_editor_prefilled(None, None, page.clone(), None)
+            }
+            .unwrap();
+            pump();
+            let weak = editor.downgrade();
+            let every: Vec<_> = {
+                let mut all = Vec::new();
+                widgets(editor.upcast_ref(), &mut all);
+                all.iter()
+                    .map(|w| (w.type_().name().to_string(), w.downgrade()))
+                    .collect()
+            };
+            if personal {
+                let mut all = Vec::new();
+                widgets(editor.upcast_ref(), &mut all);
+                assert!(
+                    all.iter()
+                        .filter_map(|w| w.downcast_ref::<gtk::CheckButton>())
+                        .any(|c| c.label().as_deref() == Some("This machine only")),
+                    "{label}: the plain value row has no \"This machine only\" box"
+                );
+            }
+            if by_cancel {
+                let mut all = Vec::new();
+                widgets(editor.upcast_ref(), &mut all);
+                all.into_iter()
+                    .filter_map(|w| w.downcast::<gtk::Button>().ok())
+                    .find(|b| b.label().as_deref() == Some("Cancel"))
+                    .unwrap()
+                    .emit_clicked();
+            } else {
+                editor.close();
+            }
+            drop(editor);
+            pump();
+            assert!(
+                weak.upgrade().is_none(),
+                "{label}: the editor window is still alive"
+            );
+            let alive: Vec<_> = every
+                .iter()
+                .filter(|(_, w)| w.upgrade().is_some())
+                .map(|(name, _)| name.as_str())
+                .collect();
+            assert!(alive.is_empty(), "{label}: widgets still alive: {alive:?}");
+        }
+        parent.close();
     }
 
     /// A refused paste leaves Add server as it was before that paste and shows
