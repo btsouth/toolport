@@ -1019,20 +1019,28 @@ pub fn add_server_with_rows(
         .iter()
         .filter(|row| row.reference.is_none())
         .map(|row| {
-            let value = row.value.trim();
-            // A remote server's Authorization is a bearer token; a bare one gets its scheme.
-            let value = if remote
-                && row.key.eq_ignore_ascii_case("authorization")
-                && !value.is_empty()
-                && !value.contains(char::is_whitespace)
-            {
-                format!("Bearer {value}")
+            // A blank value is no value: the key is reported as needing one.
+            if row.value.trim().is_empty() {
+                return Ok((row.key.clone(), serde_json::Value::Null));
+            }
+            // A remote server's Authorization is a bearer token, written as
+            // the import reads one.
+            let value = if remote && row.key.eq_ignore_ascii_case("authorization") {
+                match bearer_token(&row.value) {
+                    Ok(token) => format!("Bearer {token}"),
+                    Err(AuthValueError::NoToken) => {
+                        return Err("This server needs a bearer token. Review its native authentication settings. Client config unchanged.".to_string());
+                    }
+                    Err(AuthValueError::OtherScheme) => {
+                        return Err("This server uses unsupported HTTP authentication. Keep its native entry.".to_string());
+                    }
+                }
             } else {
                 row.value.clone()
             };
-            (row.key.clone(), serde_json::Value::String(value))
+            Ok((row.key.clone(), serde_json::Value::String(value)))
         })
-        .collect::<serde_json::Map<_, _>>()});
+        .collect::<Result<serde_json::Map<_, _>, String>>()?});
     let choices = rows
         .iter()
         .filter(|row| row.reference.is_none())
@@ -3376,24 +3384,22 @@ pub fn set_server_secret_with(
 ) -> Result<Registry, String> {
     // Both shells store through here, so both get the same rules.
     let (key, value, bearer) = credential_slot(server_id, key, value)?;
-    let key = normalize_secret_key(key)?;
+    let key = normalize_secret_key(&key)?;
     let _lock = acquire_auth_lock(server_id)?;
     // Same as a token set from the server's sign-in settings: a stale sign-in
-    // must not outlive the token typed over it. Read first, so a failed save
+    // must not outlive the token typed over it. Taken first, so a failed save
     // puts the sign-in back.
     let sign_in = if bearer {
-        let saved = crate::remote::OAUTH_STATE_KEYS
-            .iter()
-            .map(|key| Ok((*key, crate::secrets::get_secret_result(server_id, key)?)))
-            .collect::<Result<Vec<_>, String>>()
-            .map_err(|error| could_not_clear_sign_in_state(&error))?;
-        crate::remote::clear_oauth_state(server_id)
-            .map_err(|error| could_not_clear_sign_in_state(&error))?;
-        saved
+        take_sign_in_using(
+            server_id,
+            crate::secrets::get_secret_result,
+            crate::secrets::delete_secret,
+            crate::secrets::set_secret,
+        )?
     } else {
         Vec::new()
     };
-    let result = set_server_secret_using(
+    set_server_secret_using(
         server_id,
         &key,
         value,
@@ -3401,15 +3407,71 @@ pub fn set_server_secret_with(
         crate::secrets::set_secret,
         crate::secrets::delete_secret,
         write_registry,
-    );
-    if result.is_err() {
-        for (key, value) in sign_in {
-            if let Some(value) = value {
-                let _ = crate::secrets::set_secret(server_id, key, &value);
+    )
+    .map_err(|error| {
+        with_sign_in_put_back(
+            error,
+            put_back_sign_in(server_id, &sign_in, crate::secrets::set_secret),
+        )
+    })
+}
+
+/// A sign-in's saved state, by key, as it was before a typed token replaced it.
+type SignIn = Vec<(&'static str, Option<String>)>;
+
+/// Clear a sign-in's state and return what was there. When a delete fails,
+/// whatever was deleted is put back and the error says so.
+fn take_sign_in_using(
+    server_id: &str,
+    mut get: impl FnMut(&str, &str) -> Result<Option<String>, String>,
+    mut delete: impl FnMut(&str, &str) -> Result<(), String>,
+    set: impl FnMut(&str, &str, &str) -> Result<(), String>,
+) -> Result<SignIn, String> {
+    let saved = crate::remote::OAUTH_STATE_KEYS
+        .iter()
+        .map(|key| Ok((*key, get(server_id, key)?)))
+        .collect::<Result<SignIn, String>>()
+        .map_err(|error| could_not_clear_sign_in_state(&error))?;
+    // Attempt every delete, as `clear_oauth_state` does, then report the first failure.
+    let mut failed = None;
+    for (key, _) in &saved {
+        if let Err(error) = delete(server_id, key) {
+            failed.get_or_insert(error);
+        }
+    }
+    match failed {
+        None => Ok(saved),
+        Some(error) => Err(with_sign_in_put_back(
+            could_not_clear_sign_in_state(&error),
+            put_back_sign_in(server_id, &saved, set),
+        )),
+    }
+}
+
+/// Put a taken sign-in back, every key tried; the first failure is returned.
+fn put_back_sign_in(
+    server_id: &str,
+    sign_in: &SignIn,
+    mut set: impl FnMut(&str, &str, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut failed = None;
+    for (key, value) in sign_in {
+        if let Some(value) = value {
+            if let Err(error) = set(server_id, key, value) {
+                failed.get_or_insert(error);
             }
         }
     }
-    result
+    failed.map_or(Ok(()), Err)
+}
+
+fn with_sign_in_put_back(error: String, put_back: Result<(), String>) -> String {
+    match put_back {
+        Ok(()) => error,
+        Err(put_back) => {
+            format!("{error}; the previous sign-in could not be restored: {put_back}")
+        }
+    }
 }
 
 pub fn delete_server_secret_with(
@@ -3441,44 +3503,73 @@ pub fn set_server_secret(server_id: &str, key: &str, value: &str) -> Result<Regi
 /// Authorization header is its bearer token, kept where sign-in keeps it.
 fn credential_slot<'a>(
     server_id: &str,
-    key: &'a str,
+    key: &str,
     value: &'a str,
-) -> Result<(&'a str, &'a str, bool), String> {
+) -> Result<(String, &'a str, bool), String> {
     if !crate::import_credentials::provided(value) {
         return Err("Enter a credential value. Placeholder values cannot be saved.".into());
     }
     if !key.trim().eq_ignore_ascii_case("authorization") {
-        return Ok((key, value, false));
+        return Ok((key.to_string(), value, false));
     }
     let registry = read_registry_exact()?;
     let Some(server) = registry.servers.iter().find(|s| s.id == server_id) else {
-        return Ok((key, value, false));
+        return Ok((key.to_string(), value, false));
     };
     // A shared Authorization header keeps its own row, so a member's value
-    // replaces the team's source there. Only the bearer slot is mapped here.
-    let header_row = server
+    // replaces the team's source there, under the header's own name. Only the
+    // bearer slot is mapped here.
+    let header = server
         .unknown_fields
         .get("headerKeys")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|headers| {
-            headers.iter().any(|h| {
+        .and_then(|headers| {
+            headers.iter().find_map(|h| {
                 h["key"]
                     .as_str()
-                    .is_some_and(|name| name.trim().eq_ignore_ascii_case(key.trim()))
+                    .filter(|name| name.trim().eq_ignore_ascii_case(key.trim()))
             })
         });
-    if server.transport == "stdio" || header_row {
-        return Ok((key, value, false));
+    if let Some(header) = header {
+        return Ok((header.to_string(), value, false));
     }
-    // A bare token is what the bearer slot holds; a Bearer value is unwrapped.
-    let token = match value.trim().split_once(char::is_whitespace) {
-        None => value.trim(),
-        Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => token.trim(),
-        Some(_) => {
-            return Err("Only Bearer authentication is supported for Authorization headers".into());
+    if server.transport == "stdio" {
+        return Ok((key.to_string(), value, false));
+    }
+    match bearer_token(value) {
+        Ok(token) => Ok((crate::secrets::HTTP_AUTH_KEY.to_string(), token, true)),
+        Err(AuthValueError::NoToken) => {
+            Err("Enter the token after Bearer in the Authorization value".into())
         }
-    };
-    Ok((crate::secrets::HTTP_AUTH_KEY, token, true))
+        Err(AuthValueError::OtherScheme) => {
+            Err("Only Bearer authentication is supported for Authorization headers".into())
+        }
+    }
+}
+
+/// Why an Authorization value holds no bearer token.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AuthValueError {
+    /// `Bearer` (or `Basic`) alone.
+    NoToken,
+    /// A scheme other than Bearer, or more than a scheme and a token.
+    OtherScheme,
+}
+
+/// The bearer token in a typed or pasted Authorization value: a bare token, or
+/// `Bearer` and a token, split on any whitespace. Both shells read it here.
+pub(crate) fn bearer_token(value: &str) -> Result<&str, AuthValueError> {
+    let mut words = value.split_whitespace();
+    match (words.next(), words.next(), words.next()) {
+        (Some(word), None, _)
+            if word.eq_ignore_ascii_case("bearer") || word.eq_ignore_ascii_case("basic") =>
+        {
+            Err(AuthValueError::NoToken)
+        }
+        (Some(token), None, _) => Ok(token),
+        (Some(scheme), Some(token), None) if scheme.eq_ignore_ascii_case("bearer") => Ok(token),
+        _ => Err(AuthValueError::OtherScheme),
+    }
 }
 
 /// Vault a launch argument input without declaring an environment variable.
@@ -6118,9 +6209,9 @@ API_KEY = "synthetic-first-origin"
                         Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0)
                     })
                     .unwrap();
-                    // Every row has a value or a reference, so React switches it on.
-                    let profile = registry::load().unwrap().default_access_id();
-                    set_server_enabled(&profile, &id, true, false).unwrap();
+                    // React switches a new server on only when every row has a
+                    // typed value (`declared.every((r) => r.value.trim())`); a
+                    // password manager row has none, so these rows stay off.
                     id
                 };
                 let registry = registry::load().unwrap();
@@ -6134,11 +6225,14 @@ API_KEY = "synthetic-first-origin"
             result.unwrap()
         };
         let (gtk, react) = (saved("gtk"), saved("react"));
-        assert_eq!(gtk, react);
+        assert_eq!((&gtk.0, &gtk.1), (&react.0, &react.1));
         assert_eq!(gtk.1.as_deref(), Some("sk-live-typed"));
+        // GTK switches it on when no value is missing, a reference counting as
+        // one; React leaves a typed row next to a reference off.
+        assert!(gtk.2, "GTK: nothing is missing, so it is on");
         assert!(
-            gtk.2,
-            "every row has a value or a reference, so both switch it on"
+            !react.2,
+            "React: the reference row has no typed value, so it is off"
         );
     }
 
@@ -6313,25 +6407,28 @@ API_KEY = "synthetic-first-origin"
     /// reported as needing a value, whether the row is plain or in the keychain.
     #[test]
     fn rows_with_a_placeholder_save_the_server_once_and_off() {
-        for (value, secret) in [
-            ("${API_BASE}", false),
-            ("${API_KEY}", true),
-            ("YOUR_API_KEY", true),
-            ("   ", true),
+        for (transport, key, value, secret) in [
+            ("stdio", "API_KEY", "${API_BASE}", false),
+            ("stdio", "API_KEY", "${API_KEY}", true),
+            ("stdio", "API_KEY", "YOUR_API_KEY", true),
+            ("stdio", "API_KEY", "   ", true),
+            // A pasted header name with no value.
+            ("http", "Authorization", "", true),
+            ("http", "Authorization", "   ", true),
         ] {
             crate::secrets::tests::with_isolated_vault(|| {
-                let outcome = add_server_with_rows(
-                    fields("demo", "stdio"),
-                    vec![row("API_KEY", value, secret)],
-                )
-                .unwrap_or_else(|e| panic!("{value}: {e}"));
-                assert_eq!(outcome.declared_without_value, vec!["API_KEY".to_string()]);
-                assert_eq!(saved_servers(), vec![("demo".into(), false)], "{value}");
+                let outcome =
+                    add_server_with_rows(fields("demo", transport), vec![row(key, value, secret)])
+                        .unwrap_or_else(|e| panic!("{transport} {value:?}: {e}"));
+                assert_eq!(outcome.declared_without_value, vec![key.to_string()]);
+                assert_eq!(saved_servers(), vec![("demo".into(), false)], "{value:?}");
                 let id = outcome.registry.servers[0].id.clone();
-                assert_eq!(
-                    crate::secrets::get_secret_result(&id, "API_KEY").unwrap(),
-                    None
-                );
+                for stored in [key, crate::secrets::HTTP_AUTH_KEY] {
+                    assert_eq!(
+                        crate::secrets::get_secret_result(&id, stored).unwrap(),
+                        None
+                    );
+                }
             });
         }
     }
@@ -6390,29 +6487,180 @@ API_KEY = "synthetic-first-origin"
     }
 
     /// A shared Authorization header keeps its row whatever case or spacing the
-    /// team or the member used for its name.
+    /// member types its name in: the value lands under the header's own name and
+    /// replaces the team's source.
     #[test]
     fn a_shared_authorization_header_matches_its_name_loosely() {
+        for typed in ["authorization", " Authorization ", "AUTHORIZATION"] {
+            crate::secrets::tests::with_isolated_vault(|| {
+                let (_, id) =
+                    add_reviewed_entry(entry_from_fields(fields("demo", "http")).unwrap()).unwrap();
+                registry::update(|r| {
+                    let server = r.servers.iter_mut().find(|s| s.id == id).unwrap();
+                    server.unknown_fields.insert(
+                        "headerKeys".into(),
+                        serde_json::json!([{"key": "Authorization", "source": {"ref": "op://Team/api/token"}}]),
+                    );
+                    Ok(())
+                })
+                .unwrap();
+                set_server_secret_with(&id, typed, "Bearer member-token", |id, key| {
+                    Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0)
+                })
+                .unwrap();
+                let secret = |key: &str| crate::secrets::get_secret_result(&id, key).unwrap();
+                assert_eq!(
+                    secret("Authorization").as_deref(),
+                    Some("Bearer member-token"),
+                    "{typed:?}"
+                );
+                assert_eq!(secret(crate::secrets::HTTP_AUTH_KEY), None, "{typed:?}");
+                let server = registry::load()
+                    .unwrap()
+                    .servers
+                    .into_iter()
+                    .find(|s| s.id == id)
+                    .unwrap();
+                assert_eq!(
+                    server.unknown_fields["headerKeys"],
+                    serde_json::json!([{"key": "Authorization"}]),
+                    "{typed:?}: the member's value replaces the team source"
+                );
+                assert!(
+                    server.env.iter().all(|e| e.key == "Authorization"
+                        || !e.key.eq_ignore_ascii_case("authorization")),
+                    "{typed:?}: no second Authorization row: {:?}",
+                    server.env
+                );
+            });
+        }
+    }
+
+    /// Both paths read an Authorization value the same way: trimmed, split on any
+    /// whitespace, a lone scheme is no token.
+    #[test]
+    fn authorization_values_read_the_same_in_both_paths() {
+        for (value, token) in [
+            ("abc123", Ok("abc123")),
+            (" Bearer abc123", Ok("abc123")),
+            ("Bearer\tabc123", Ok("abc123")),
+            ("Bearer abc123 ", Ok("abc123")),
+            ("Bearer  abc123", Ok("abc123")),
+            ("bearer abc123", Ok("abc123")),
+            ("Bearer", Err(AuthValueError::NoToken)),
+            ("Basic", Err(AuthValueError::NoToken)),
+            ("Basic dXNlcjpwYXNz", Err(AuthValueError::OtherScheme)),
+            ("Token abc123", Err(AuthValueError::OtherScheme)),
+            ("Bearer a b", Err(AuthValueError::OtherScheme)),
+        ] {
+            assert_eq!(bearer_token(value), token, "{value:?}");
+            let stored = |id: &str| {
+                crate::secrets::get_secret_result(id, crate::secrets::HTTP_AUTH_KEY).unwrap()
+            };
+            crate::secrets::tests::with_isolated_vault(|| {
+                let rows = add_server_with_rows(
+                    fields("demo", "http"),
+                    vec![row("Authorization", value, true)],
+                );
+                assert_eq!(
+                    rows.is_ok(),
+                    token.is_ok(),
+                    "rows {value:?}: {rows:?}",
+                    rows = rows.as_ref().map(|_| ())
+                );
+                if let Ok(outcome) = rows {
+                    let id = outcome.registry.servers[0].id.clone();
+                    assert_eq!(
+                        stored(&id).as_deref(),
+                        token.as_ref().ok().copied(),
+                        "rows {value:?}"
+                    );
+                }
+            });
+            crate::secrets::tests::with_isolated_vault(|| {
+                let (_, id) =
+                    add_reviewed_entry(entry_from_fields(fields("demo", "http")).unwrap()).unwrap();
+                let typed = set_server_secret_with(&id, "Authorization", value, |id, key| {
+                    Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0)
+                });
+                assert_eq!(typed.is_ok(), token.is_ok(), "typed {value:?}");
+                assert_eq!(
+                    stored(&id).as_deref(),
+                    token.as_ref().ok().copied(),
+                    "typed {value:?}"
+                );
+            });
+        }
+    }
+
+    /// A sign-in whose clear fails half way is put back, and a put-back that
+    /// fails is named in the error instead of a claim that it was restored.
+    #[test]
+    fn a_sign_in_is_put_back_when_its_clear_or_the_save_fails() {
+        let vault = std::cell::RefCell::new(std::collections::BTreeMap::from([
+            (
+                crate::remote::OAUTH_STATE_KEYS[0].to_string(),
+                "cc-state".to_string(),
+            ),
+            (
+                crate::remote::OAUTH_STATE_KEYS[1].to_string(),
+                "refresh-state".to_string(),
+            ),
+        ]));
+        let get = |_: &str, key: &str| Ok(vault.borrow().get(key).cloned());
+        let set = |_: &str, key: &str, value: &str| {
+            vault.borrow_mut().insert(key.into(), value.into());
+            Ok(())
+        };
+        // The first delete works, the second fails: the first comes back.
+        let delete = |_: &str, key: &str| {
+            if key == crate::remote::OAUTH_STATE_KEYS[1] {
+                return Err("locked".to_string());
+            }
+            vault.borrow_mut().remove(key);
+            Ok(())
+        };
+        let error = take_sign_in_using("demo", get, delete, set).unwrap_err();
+        assert!(!error.contains("could not be restored"), "{error}");
+        assert_eq!(
+            vault
+                .borrow()
+                .get(crate::remote::OAUTH_STATE_KEYS[0])
+                .map(String::as_str),
+            Some("cc-state")
+        );
+        // And when putting it back fails too, the error says so.
+        let error = take_sign_in_using(
+            "demo",
+            get,
+            |_: &str, key: &str| {
+                vault.borrow_mut().remove(key);
+                Err("locked".to_string())
+            },
+            |_: &str, _: &str, _: &str| Err("still locked".to_string()),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("the previous sign-in could not be restored"),
+            "{error}"
+        );
+
+        // A failed save whose put-back fails says so too.
         crate::secrets::tests::with_isolated_vault(|| {
             let (_, id) =
                 add_reviewed_entry(entry_from_fields(fields("demo", "http")).unwrap()).unwrap();
-            registry::update(|r| {
-                let server = r.servers.iter_mut().find(|s| s.id == id).unwrap();
-                server.unknown_fields.insert(
-                    "headerKeys".into(),
-                    serde_json::json!([{"key": "authorization"}]),
-                );
-                Ok(())
-            })
-            .unwrap();
-            set_server_secret_with(&id, " Authorization ", "Bearer member-token", |id, key| {
-                Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0)
-            })
-            .unwrap();
-            assert_eq!(
-                crate::secrets::get_secret_result(&id, crate::secrets::HTTP_AUTH_KEY).unwrap(),
-                None,
-                "the member's value goes to the header row, not the bearer slot"
+            crate::secrets::set_secret(&id, crate::remote::OAUTH_STATE_KEY, "refresh-state")
+                .unwrap();
+            let error =
+                crate::secrets::tests::with_failed_write(crate::remote::OAUTH_STATE_KEY, || {
+                    set_server_secret_with(&id, "Authorization", "Bearer typed", |_, _| {
+                        Err("synthetic registry failure".into())
+                    })
+                })
+                .unwrap_err();
+            assert!(
+                error.contains("the previous sign-in could not be restored"),
+                "{error}"
             );
         });
     }
