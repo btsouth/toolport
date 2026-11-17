@@ -6646,7 +6646,9 @@ API_KEY = "synthetic-first-origin"
             ),
         ] {
             crate::secrets::tests::with_isolated_vault(|| {
-                let error = add_react(entry).unwrap_err();
+                let Err(error) = add_react(entry) else {
+                    panic!("{case}: saved");
+                };
                 assert!(error.contains(expected), "{case}: {error}");
                 assert!(registry::load().unwrap().servers.is_empty(), "{case}");
                 for key in ["API_KEY", "SECRET"] {
