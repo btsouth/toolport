@@ -6964,6 +6964,27 @@ mod tests {
         assert!(!out.contains("sk-SECRE"), "{}", &out[..40]);
     }
 
+    /// A tool cache write in flight is not scrubbed: its writer renames it into
+    /// place, and the scrub's lock on it was left behind after data removal.
+    #[test]
+    fn the_scrub_skips_temp_files_of_writes_in_flight() {
+        let dir = std::env::temp_dir().join(format!("tp-scrub-tmp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = format!("tool-cache-v2-{}.json", "c".repeat(64));
+        for name in [cache.clone(), format!("{cache}.7842.4.conduit-tmp")] {
+            std::fs::write(dir.join(name), "{}").unwrap();
+        }
+        let files = persisted_log_files(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(files.contains(&dir.join(&cache)));
+        assert!(
+            !files
+                .iter()
+                .any(|path| path.to_string_lossy().ends_with(".conduit-tmp")),
+            "{files:?}"
+        );
+    }
+
     #[test]
     fn blank_lines_after_a_live_prefix_cost_linear_work_and_are_capped() {
         let m = m(&[("KEY", "sk-AbC123xyZ")]);

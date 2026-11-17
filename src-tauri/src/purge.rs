@@ -2000,6 +2000,48 @@ mod tests {
         );
         drop(env);
     }
+    /// macOS acceptance after "Remove Toolport data": the secret scrub's marker
+    /// and lock, and a lock the scrub took on a tool cache write in flight, were
+    /// left in the data folder as entries Toolport did not create.
+    #[test]
+    fn purge_removes_the_secret_scrub_files_and_locks_on_temp_writes() {
+        let env = crate::registry::DataDirTestEnv::new("purge_scrub_leftovers");
+        let dir = env.dir.join("data");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = format!("tool-cache-v2-{}.json", "c".repeat(64));
+        let created = [
+            "secret-scrub-v1.json".to_string(),
+            "secret-scrub.lock".to_string(),
+            "secret-scrub-pending".to_string(),
+            format!("{cache}.7842.4.conduit-tmp.lock"),
+            format!("{cache}.7842.4.conduit-tmp"),
+            "registry.json.123.1.conduit-tmp.lock".to_string(),
+        ];
+        for name in &created {
+            std::fs::write(dir.join(name), "fixture").unwrap();
+        }
+        std::fs::write(dir.join("notes.txt"), "user bytes").unwrap();
+        let mut report = Report::default();
+        remove_data_contents(&dir, &[], &mut report);
+        assert!(report.leftovers.is_empty(), "{:?}", report.leftovers);
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["notes.txt"]);
+        // Only a lock on a temp copy of an owned file, not any doubled suffix.
+        let legacy = Default::default();
+        for name in [
+            "secret-scrub.json",
+            "registry.json.lock.lock",
+            "notes.txt.123.1.conduit-tmp.lock",
+            "registry.json.notes.conduit-tmp.lock",
+        ] {
+            assert!(!owned_data_name(name, &legacy), "{name}");
+        }
+        drop(env);
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn purge_autostart_requires_toolports_marker() {
