@@ -930,8 +930,32 @@ mod platform {
     /// after the crash this module guards against, so treating it as transient
     /// would tax every later vault read with a pointless sleep and could raise a
     /// second unlock prompt. `NoEntry` is likewise an answer, not a failure.
+    ///
+    /// One `PlatformFailure` is an answer too: a write to a collection that is
+    /// still locked, see [`is_locked_collection`].
     fn is_transient(err: &keyring::Error) -> bool {
-        matches!(err, keyring::Error::PlatformFailure(_))
+        matches!(err, keyring::Error::PlatformFailure(_)) && !is_locked_collection(err)
+    }
+
+    /// The Secret Service's own error for a call on a locked collection or item.
+    const IS_LOCKED: &str = "org.freedesktop.Secret.Error.IsLocked";
+
+    /// True when a write failed because the collection is still locked.
+    ///
+    /// keyring 3.6.3's `set_password` asks to unlock the collection; when that ask
+    /// is dismissed it falls back to `create_collection` and then `create_item`,
+    /// which the service refuses with `IsLocked`. keyring passes that on as a
+    /// `PlatformFailure` wrapping `dbus_secret_service::Error::Dbus`, not as
+    /// `NoStorageAccess`. Matched by the D-Bus error name, never by its text.
+    /// Retrying it asks to unlock a second time and cannot succeed.
+    fn is_locked_collection(err: &keyring::Error) -> bool {
+        let keyring::Error::PlatformFailure(inner) = err else {
+            return false;
+        };
+        matches!(
+            inner.downcast_ref::<dbus_secret_service::Error>(),
+            Some(dbus_secret_service::Error::Dbus(error)) if error.name() == Some(IS_LOCKED)
+        )
     }
 
     /// Cross-process serialization for Secret Service access.
@@ -1038,7 +1062,9 @@ mod platform {
             other => other,
         };
         // Locked, or its unlock dialog dismissed: this call asked and was refused.
-        if matches!(result, Err(keyring::Error::NoStorageAccess(_))) {
+        if matches!(result, Err(keyring::Error::NoStorageAccess(_)))
+            || result.as_ref().err().is_some_and(is_locked_collection)
+        {
             super::note_refused_ask();
         }
         result
@@ -1250,9 +1276,7 @@ mod platform {
             dbus_secret_service::Error::Crypto(_)
             | dbus_secret_service::Error::Parse
             | dbus_secret_service::Error::UnsupportedSecretFormat => State::Corrupt,
-            dbus_secret_service::Error::Dbus(error)
-                if error.name() == Some("org.freedesktop.Secret.Error.IsLocked") =>
-            {
+            dbus_secret_service::Error::Dbus(error) if error.name() == Some(IS_LOCKED) => {
                 State::Locked
             }
             dbus_secret_service::Error::Dbus(error)
@@ -1655,6 +1679,85 @@ mod platform {
                 1,
                 "a locked collection is an answer, not a dead daemon"
             );
+        }
+
+        fn locked_collection() -> keyring::Error {
+            keyring::Error::PlatformFailure(Box::new(dbus_secret_service::Error::Dbus(
+                dbus::Error::new_custom(IS_LOCKED, "Cannot create an item in a locked collection"),
+            )))
+        }
+
+        /// A write to a locked collection whose unlock prompt was dismissed is an
+        /// answer: it is attempted once, so the user is asked once, and it counts
+        /// as a refused ask so the rest of an `asking_once` run does not ask again.
+        #[test]
+        fn a_write_to_a_locked_collection_is_not_retried_and_counts_as_refused() {
+            let _data = crate::registry::DataDirTestEnv::new(
+                "a_write_to_a_locked_collection_is_not_retried_and_counts_as_refused",
+            );
+            let calls = AtomicUsize::new(0);
+            let (result, refused) = super::super::asking_once(|| {
+                with_service_after(Duration::ZERO, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), _>(locked_collection())
+                })
+            });
+            assert!(result.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "asked once, not twice");
+            assert!(refused, "a dismissed unlock is a refused ask");
+        }
+
+        /// Only that one D-Bus error is an answer: any other platform failure,
+        /// another D-Bus error included, keeps the single retry.
+        #[test]
+        fn other_platform_failures_keep_their_retry() {
+            let _data =
+                crate::registry::DataDirTestEnv::new("other_platform_failures_keep_their_retry");
+            for error in [
+                || {
+                    keyring::Error::PlatformFailure(Box::new(dbus_secret_service::Error::Dbus(
+                        dbus::Error::new_custom("org.freedesktop.DBus.Error.NoReply", "no reply"),
+                    )))
+                },
+                || {
+                    keyring::Error::PlatformFailure(Box::new(
+                        dbus_secret_service::Error::Unavailable,
+                    ))
+                },
+                dead_daemon,
+            ] {
+                let calls = AtomicUsize::new(0);
+                let (result, refused) = super::super::asking_once(|| {
+                    with_service_after(Duration::ZERO, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Err::<(), _>(error())
+                    })
+                });
+                assert!(result.is_err());
+                assert_eq!(calls.load(Ordering::SeqCst), 2, "one retry");
+                assert!(!refused);
+            }
+        }
+
+        /// The classification above rests on how keyring 3.6.3 and
+        /// dbus-secret-service 4.1 report a refused write: as a platform failure
+        /// carrying the D-Bus error, shown as below (the line a real locked keyring
+        /// logs). A version bump that changes either needs `is_locked_collection`
+        /// checked again against a real locked keyring.
+        #[test]
+        fn the_locked_collection_error_is_the_one_keyring_reports() {
+            assert_eq!(
+                locked_collection().to_string(),
+                "Platform secure storage failure: DBus error: Cannot create an item in a locked collection"
+            );
+            let lock = include_str!("../Cargo.lock");
+            for (name, version) in [("keyring", "3.6.3"), ("dbus-secret-service", "4.1.0")] {
+                assert!(
+                    lock.contains(&format!("name = \"{name}\"\nversion = \"{version}\"\n")),
+                    "{name} is no longer {version}: check how it reports a write to a locked \
+                     collection before keeping is_locked_collection"
+                );
+            }
         }
 
         /// The app and the gateway must not wake from the retry on the same tick,
