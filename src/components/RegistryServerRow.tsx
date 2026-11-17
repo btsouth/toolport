@@ -43,7 +43,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { testServer } from "@/lib/api";
+import { probeRegistered } from "@/lib/api";
 
 // Opened from the row menu only, so it loads in its own chunk.
 const SyncSettingsDialog = lazy(() =>
@@ -262,7 +262,7 @@ export function RegistryServerRow({
   async function testConnection() {
     const id = toast.loading(t("Testing {value0}…", { value0: server.name }));
     try {
-      const probe = await testServer(server);
+      const probe = await probeRegistered(server.id);
       if (probe.ok)
         toast.success(
           probe.toolCount === 1

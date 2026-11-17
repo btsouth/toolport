@@ -140,6 +140,18 @@ fn clear_update_http_bridge_intent_at(path: &std::path::Path) -> Result<(), Stri
     }
 }
 
+/// Test a saved server, as the GTK row menu does: reload its saved definition
+/// and give up after the probe timeout, so a stalled credential provider ends
+/// the test instead of leaving it spinning.
+#[tauri::command]
+async fn probe_registered(server_id: String) -> Result<ProbeResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::server_runtime::probe_registered(&server_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Connect to a possibly-unsaved server entry and report whether it came up and
 /// how many tools it exposes. Backs the "Test connection" button in the add/edit
 /// dialog, so the user learns a server is broken before saving it. Never
@@ -4862,6 +4874,7 @@ pub fn run() {
             gather_diagnostics,
             probe_servers,
             test_server,
+            probe_registered,
             list_server_tools,
             list_server_resources,
             list_server_prompts,

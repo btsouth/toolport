@@ -143,6 +143,12 @@ export function testServer(entry: ServerEntry): Promise<ProbeResult> {
   return invoke<ProbeResult>("test_server", { entry });
 }
 
+/** Test a saved server from its saved definition, bounded by the probe timeout
+ * (the GTK row menu's check). Unsaved entries use `testServer`. */
+export function probeRegistered(serverId: string): Promise<ProbeResult> {
+  return invoke<ProbeResult>("probe_registered", { serverId });
+}
+
 /** Result of registering an HTTP-bridge client: the updated registry plus the
  * plaintext bearer token, shown once and never returned again. */
 export interface AddedHttpClient {

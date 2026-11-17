@@ -4,6 +4,13 @@ import { describe, expect, it, vi } from "vitest";
 import type { ProbeResult, ServerEntry } from "@/lib/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { RegistryServerRow } from "./RegistryServerRow";
+import { probeRegistered, testServer } from "@/lib/api";
+
+vi.mock("@/lib/api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/api")>()),
+  probeRegistered: vi.fn(),
+  testServer: vi.fn(),
+}));
 
 vi.mock("@/components/ServerToolsPanel", () => ({
   ServerToolsPanel: ({ serverId }: { serverId: string }) => (
@@ -392,6 +399,16 @@ describe("RegistryServerRow actions menu", () => {
       "Credentials",
       "Remove",
     ]);
+  });
+
+  it("tests the saved server by its id, as the GTK row menu does", async () => {
+    const user = userEvent.setup();
+    vi.mocked(probeRegistered).mockResolvedValue(health({ ok: true, toolCount: 3 }));
+    renderRow(true, health({ ok: true }));
+    await user.click(screen.getByRole("button", { name: "Actions for Example" }));
+    await user.click(screen.getByRole("menuitem", { name: "Test connection" }));
+    expect(probeRegistered).toHaveBeenCalledWith("server-1");
+    expect(testServer).not.toHaveBeenCalled();
   });
 
   it("leaves out Authentication for a local server", async () => {
