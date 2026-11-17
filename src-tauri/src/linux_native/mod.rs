@@ -11146,6 +11146,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
     secret_status.set_widget_name("auth-secret-status");
     client_section.append(&secret_status);
     let secret_retry = l10n::button("Retry the secret check");
+    secret_retry.set_widget_name("auth-secret-retry");
     secret_retry.add_css_class("flat");
     secret_retry.set_halign(gtk::Align::Start);
     secret_retry.set_visible(false);
@@ -11261,6 +11262,9 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
     }
     form.watch(&save_client, || Ok(()));
     form.watch(&remove_client, || Ok(()));
+    // A check started during a write could read the store before the write lands
+    // and overwrite the caption the write sets, so Retry waits for the write too.
+    form.watch(&secret_retry, || Ok(()));
     {
         let configured = client_configured.clone();
         let secret_present = secret_present.clone();
@@ -13134,9 +13138,12 @@ mod credential_dialog_tests {
         let remove_client: gtk::Button = named(&editor, "auth-remove-client");
         let client_status: gtk::Label = named(&editor, "auth-client-status");
         let caption: gtk::Label = named(&editor, "auth-secret-status");
+        let retry: gtk::Button = named(&editor, "auth-secret-retry");
+        assert!(retry.is_visible() && retry.is_sensitive());
         let asks = crate::secrets::locked_store::prompts_during(|| {
             secret.set_text("replacement");
             press(&save_client);
+            assert!(!retry.is_sensitive(), "no secret check during a write");
             pump_until("the refused save", || {
                 client_status
                     .text()
