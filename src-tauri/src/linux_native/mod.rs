@@ -12332,10 +12332,6 @@ fn duplicate_server_name(name: &str, existing: &[String]) -> String {
     }
 }
 
-/// `url_placeholder` overrides the generic URL example for catalog entries that
-/// carry a `url_hint`: the user has to supply their own instance endpoint, so
-/// the hint is a placeholder, never prefilled text they could save verbatim.
-/// Returns the editor window so callers can refresh once it closes.
 /// Signal handlers connected on an editor's widgets, disconnected together.
 #[derive(Default)]
 struct EditorHandlers(
@@ -12363,6 +12359,10 @@ impl EditorHandlers {
     }
 }
 
+/// `url_placeholder` overrides the generic URL example for catalog entries that
+/// carry a `url_hint`: the user has to supply their own instance endpoint, so
+/// the hint is a placeholder, never prefilled text they could save verbatim.
+/// Returns the editor window so callers can refresh once it closes.
 fn open_server_editor_prefilled(
     server: Option<state::ServerView>,
     server_id: Option<String>,
