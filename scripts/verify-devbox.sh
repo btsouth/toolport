@@ -11,6 +11,9 @@
 #                                            isolated data: kept, --fresh reseeds one mock server,
 #                                            --empty starts as a new user (setup dialog)
 #   scripts/verify-devbox.sh headless        sync, run npm run verify:headless on devbox, fetch .verify
+#   scripts/verify-devbox.sh parity [--only NAME]
+#                                            sync, run the GTK vs React parity report on devbox (report
+#                                            only), print it and fetch .verify/parity/run-*
 #
 # Environment: VERIFY_HOST (default devbox-bts), VERIFY_REMOTE_DIR (default
 # /workspace/worktrees/toolport-verify-<worktree name>), VERIFY_PORT (fixture port).
@@ -185,6 +188,22 @@ cmd_headless() {
   return "$status"
 }
 
+cmd_parity() {
+  sync_tree
+  ensure_node_modules
+  local status=0
+  # The GTK half renders under xvfb inside the script; nothing opens a window.
+  remote "cd '$REMOTE' && export PATH=\$HOME/.cargo/bin:\$PATH && heavy-run -- npm run --silent parity -- $*" || status=$?
+  mkdir -p "$ROOT/.verify/parity"
+  local run
+  run="$(remote "ls -dt '$REMOTE'/.verify/parity/run-* 2>/dev/null | head -1")"
+  if [ -n "$run" ]; then
+    rsync -az "$HOST:$run" "$ROOT/.verify/parity/"
+    say "report: .verify/parity/$(basename "$run")/report.txt"
+  fi
+  return "$status"
+}
+
 case "${1:-}" in
   sync) sync_tree ;;
   fixture) cmd_fixture ;;
@@ -192,8 +211,9 @@ case "${1:-}" in
   gtk-build) cmd_gtk_build ;;
   gtk-launch) shift; cmd_gtk_launch "$@" ;;
   headless) cmd_headless ;;
+  parity) shift; cmd_parity "$@" ;;
   *)
-    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

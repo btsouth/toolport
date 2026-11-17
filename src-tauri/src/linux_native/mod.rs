@@ -17,6 +17,8 @@ mod onboarding;
 mod package_updates;
 mod page_header;
 mod pairing;
+#[cfg(test)]
+mod parity;
 mod quiet_tooltips;
 mod settings;
 mod setup;
@@ -8693,7 +8695,18 @@ fn approval_card(
     (card, deadline)
 }
 
+/// A pinned clock for parity extraction; zero reads the real clock.
+#[cfg(test)]
+static TEST_NOW_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn epoch_ms() -> u64 {
+    #[cfg(test)]
+    {
+        let pinned = TEST_NOW_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if pinned != 0 {
+            return pinned;
+        }
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)

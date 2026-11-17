@@ -1,0 +1,224 @@
+{
+  "screen": "servers",
+  "description": "Sign-in, service key, refused, exited, keyring locked, timed out, one ready and one turned off.",
+  "now_ms": 1790000000000,
+  "viewport": {
+    "width": 1240,
+    "height": 900
+  },
+  "ipc": {
+    "get_registry": {
+      "version": 3,
+      "servers": [
+        {
+          "id": "remote",
+          "name": "Remote project tools",
+          "enabled": true,
+          "transport": "http",
+          "command": null,
+          "args": [],
+          "env": [],
+          "url": "https://example.invalid/mcp",
+          "source": "manual"
+        },
+        {
+          "id": "service",
+          "name": "Service API tools",
+          "enabled": true,
+          "transport": "stdio",
+          "command": "fixture-only",
+          "args": [],
+          "env": [
+            {
+              "key": "API_KEY",
+              "value": "",
+              "secret": true
+            }
+          ],
+          "url": null,
+          "source": "manual"
+        },
+        {
+          "id": "refused",
+          "name": "Refused server",
+          "enabled": true,
+          "transport": "stdio",
+          "command": "fixture-only",
+          "args": [],
+          "env": [],
+          "url": null,
+          "source": "manual"
+        },
+        {
+          "id": "exited",
+          "name": "Exited server",
+          "enabled": true,
+          "transport": "stdio",
+          "command": "fixture-only",
+          "args": [],
+          "env": [],
+          "url": null,
+          "source": "manual"
+        },
+        {
+          "id": "locked",
+          "name": "Locked keyring server",
+          "enabled": true,
+          "transport": "stdio",
+          "command": "fixture-only",
+          "args": [],
+          "env": [],
+          "url": null,
+          "source": "manual"
+        },
+        {
+          "id": "slow",
+          "name": "Slow server",
+          "enabled": true,
+          "transport": "stdio",
+          "command": "fixture-only",
+          "args": [],
+          "env": [],
+          "url": null,
+          "source": "manual"
+        },
+        {
+          "id": "ready",
+          "name": "Ready server",
+          "enabled": true,
+          "transport": "stdio",
+          "command": "fixture-only",
+          "args": [],
+          "env": [],
+          "url": null,
+          "source": "manual"
+        },
+        {
+          "id": "off",
+          "name": "Turned off server",
+          "enabled": false,
+          "transport": "stdio",
+          "command": "fixture-only",
+          "args": [],
+          "env": [],
+          "url": null,
+          "source": "manual"
+        }
+      ],
+      "profiles": [
+        {
+          "id": "local",
+          "name": "Local",
+          "enabledServerIds": [
+            "remote",
+            "service",
+            "refused",
+            "exited",
+            "locked",
+            "slow",
+            "ready"
+          ]
+        }
+      ],
+      "activeProfileId": "local",
+      "defaultAccessContextId": "local",
+      "defaultAccessLegacyPolicy": true,
+      "accessUpgradeNoticeDismissed": true
+    },
+    "probe_servers": [
+      {
+        "serverId": "remote",
+        "ok": false,
+        "toolCount": 0,
+        "error": "HTTP 401 (needs authentication)",
+        "authRequired": true,
+        "failure": {
+          "kind": "auth",
+          "target": "endpoint"
+        },
+        "authTarget": "endpoint",
+        "keyringLocked": false
+      },
+      {
+        "serverId": "service",
+        "ok": false,
+        "toolCount": 0,
+        "error": "HTTP 401 (needs authentication)",
+        "authRequired": true,
+        "failure": {
+          "kind": "auth",
+          "target": "service_credential"
+        },
+        "authTarget": "service_credential",
+        "keyringLocked": false
+      },
+      {
+        "serverId": "refused",
+        "ok": false,
+        "toolCount": 0,
+        "error": "transport error (retryable): Connection refused (os error 111)",
+        "authRequired": false,
+        "failure": {
+          "kind": "unavailable",
+          "after_send": false
+        },
+        "authTarget": null,
+        "keyringLocked": false
+      },
+      {
+        "serverId": "exited",
+        "ok": false,
+        "toolCount": 0,
+        "error": "downstream server exited with status 1",
+        "authRequired": false,
+        "failure": {
+          "kind": "internal"
+        },
+        "authTarget": null,
+        "keyringLocked": false
+      },
+      {
+        "serverId": "locked",
+        "ok": false,
+        "toolCount": 0,
+        "error": null,
+        "authRequired": false,
+        "failure": null,
+        "authTarget": null,
+        "keyringLocked": true
+      },
+      {
+        "serverId": "slow",
+        "ok": false,
+        "toolCount": 0,
+        "error": "timed out waiting for initialize",
+        "authRequired": false,
+        "failure": {
+          "kind": "timeout",
+          "after_send": false
+        },
+        "authTarget": null,
+        "keyringLocked": false
+      },
+      {
+        "serverId": "ready",
+        "ok": true,
+        "toolCount": 3,
+        "error": null,
+        "authRequired": false,
+        "failure": null,
+        "authTarget": null,
+        "keyringLocked": false
+      }
+    ]
+  },
+  "calls": [
+    [
+      "get_audit_log",
+      {
+        "limit": 2147483647
+      }
+    ],
+    ["savings_summary", {}]
+  ]
+}

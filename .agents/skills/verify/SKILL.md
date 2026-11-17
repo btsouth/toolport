@@ -131,6 +131,25 @@ Do not edit `scripts/verify-devbox.sh` while it runs. The browser regression
 smoke is the same pattern with `heavy-run -- npm run smoke:browser` (about 1
 min; screenshots in the devbox directory's `.verify/browser-*`).
 
+## Parity report: GTK vs React (about 1 min after the first build)
+
+When a change touches a screen the parity tool covers (Servers or Activity) in
+either shell, run it before calling the change done:
+
+```bash
+scripts/verify-devbox.sh parity              # or: parity --only servers-empty
+```
+
+It builds the GTK test binary on devbox, renders each scenario in
+`parity/scenarios/` with the real GTK page under xvfb and in the React browser
+fixture from the same data, and prints every difference (screen, region,
+element, both values) to `.verify/parity/run-*/report.txt` and `report.json`.
+It is report-only: differences never fail it, only a harness problem does (a
+self-check, an empty menu, a scenario the fixture cannot answer). Fix a new
+difference in the shell that drifted, or, when the difference is intended, add
+an entry with a reason to `parity/known-differences.json`; the report lists it
+separately and notes entries that no longer match anything.
+
 ## Evidence to report
 
 - Tier 1 and 2: the screenshot paths under `.verify/shots/` (both themes for a

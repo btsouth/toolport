@@ -1,0 +1,24 @@
+{
+  "screen": "servers",
+  "description": "The registry cannot be read.",
+  "now_ms": 1790000000000,
+  "viewport": {
+    "width": 1240,
+    "height": 900
+  },
+  "ipc": {
+    "get_registry": {
+      "error": "registry.json: expected value at line 1 column 1"
+    },
+    "probe_servers": []
+  },
+  "calls": [
+    [
+      "get_audit_log",
+      {
+        "limit": 2147483647
+      }
+    ],
+    ["savings_summary", {}]
+  ]
+}

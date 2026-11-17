@@ -29,6 +29,7 @@ test("docs, packaging and non-CI workflow PRs skip native checks", () => {
     ["packaging/linux/native/PKGBUILD", "packaging/homebrew/toolport.rb"],
     [".github/workflows/release.yml"],
     [".github/workflows/docker-publish.yml", ".github/workflows/winget.yml"],
+    ["parity/scenarios/servers-empty.json", "parity/known-differences.json"],
   ])
     assert.equal(needsRust("pull_request", files), false, files.join());
 });

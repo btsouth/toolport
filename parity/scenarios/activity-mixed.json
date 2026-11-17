@@ -1,0 +1,190 @@
+{
+  "screen": "activity",
+  "description": "150 calls: ok, failed, approved and internal, newest one minute before now. Every collapsed section is opened.",
+  "now_ms": 1790000000000,
+  "viewport": {
+    "width": 1240,
+    "height": 900
+  },
+  "ipc": {
+    "get_registry": {
+      "version": 3,
+      "servers": [
+        {
+          "id": "github",
+          "name": "GitHub",
+          "enabled": true,
+          "transport": "stdio",
+          "command": "fixture-only",
+          "args": [],
+          "env": [],
+          "url": null,
+          "source": "manual"
+        },
+        {
+          "id": "linear",
+          "name": "Linear",
+          "enabled": true,
+          "transport": "stdio",
+          "command": "fixture-only",
+          "args": [],
+          "env": [],
+          "url": null,
+          "source": "manual"
+        },
+        {
+          "id": "stripe",
+          "name": "Stripe",
+          "enabled": true,
+          "transport": "stdio",
+          "command": "fixture-only",
+          "args": [],
+          "env": [],
+          "url": null,
+          "source": "manual"
+        }
+      ],
+      "profiles": [
+        {
+          "id": "local",
+          "name": "Local",
+          "enabledServerIds": ["github", "linear", "stripe"]
+        }
+      ],
+      "activeProfileId": "local",
+      "defaultAccessContextId": "local",
+      "defaultAccessLegacyPolicy": true,
+      "accessUpgradeNoticeDismissed": true
+    },
+    "probe_servers": [
+      {
+        "serverId": "github",
+        "ok": true,
+        "toolCount": 25,
+        "error": null,
+        "authRequired": false,
+        "failure": null,
+        "authTarget": null,
+        "keyringLocked": false
+      },
+      {
+        "serverId": "linear",
+        "ok": true,
+        "toolCount": 25,
+        "error": null,
+        "authRequired": false,
+        "failure": null,
+        "authTarget": null,
+        "keyringLocked": false
+      },
+      {
+        "serverId": "stripe",
+        "ok": true,
+        "toolCount": 25,
+        "error": null,
+        "authRequired": false,
+        "failure": null,
+        "authTarget": null,
+        "keyringLocked": false
+      }
+    ]
+  },
+  "seeds": {
+    "files": {
+      "audit.jsonl": {
+        "generate": {
+          "count": 150,
+          "start_ts": 1789991000000,
+          "step_ms": 60000,
+          "cycle": [
+            {
+              "server": "github",
+              "tool": "list_issues",
+              "ok": true,
+              "durationMs": 120,
+              "client": "adapter:claude-code",
+              "clientName": "Claude Code"
+            },
+            {
+              "server": "linear",
+              "tool": "create_issue_{n}",
+              "ok": false,
+              "durationMs": 900,
+              "error": "HTTP 500 Internal Server Error",
+              "client": "adapter:codex",
+              "clientName": "Codex"
+            },
+            {
+              "server": "stripe",
+              "tool": "refund",
+              "kind": "approval",
+              "decision": "approved",
+              "ok": true,
+              "heldMs": 4000,
+              "client": "adapter:claude-code",
+              "clientName": "Claude Code"
+            },
+            {
+              "server": "toolport",
+              "tool": "search",
+              "kind": "internal",
+              "ok": true,
+              "durationMs": 8,
+              "cold": false
+            },
+            {
+              "server": "github",
+              "tool": "get_file",
+              "ok": true,
+              "durationMs": 45
+            }
+          ]
+        }
+      }
+    }
+  },
+  "calls": [
+    [
+      "get_audit_log",
+      {
+        "limit": 200
+      }
+    ],
+    [
+      "get_audit_log",
+      {
+        "limit": 2147483647
+      }
+    ],
+    ["audit_stats", {}],
+    ["savings_summary", {}],
+    [
+      "get_security_events",
+      {
+        "limit": 2000
+      }
+    ],
+    [
+      "get_search_traces",
+      {
+        "limit": 100
+      }
+    ],
+    [
+      "get_inspect_log",
+      {
+        "limit": 50
+      }
+    ],
+    ["list_tool_identities", {}],
+    ["activity_health", {}],
+    ["activity_revision", {}],
+    ["release_activity_revision", {}]
+  ],
+  "expand": [
+    "Recent calls and approvals",
+    "Per-server breakdown",
+    "Performance and savings",
+    "Security and diagnostics"
+  ]
+}
