@@ -623,6 +623,26 @@ fn registry_matches(left: &Registry, right: &Registry) -> Result<bool, String> {
     Ok(serde_json::to_value(&left).map_err(|e| e.to_string())?
         == serde_json::to_value(&right).map_err(|e| e.to_string())?)
 }
+/// The check before a connect rewrites its client: the servers and all shared settings
+/// are as staged. Another client's own records (its managed entry and scope) may change
+/// meanwhile, for example when a Clients scan finishes a repair it deferred while the
+/// keyring was locked, and the connect's own registry write keeps them as they are now.
+fn setup_registry_matches(
+    latest: &Registry,
+    staged: &Registry,
+    client_id: &str,
+) -> Result<bool, String> {
+    let own = |registry: &Registry| {
+        let mut registry = registry.clone();
+        registry
+            .client_managed_entries
+            .retain(|id, _| id == client_id);
+        registry.client_scopes.retain(|id, _| id == client_id);
+        registry
+    };
+    registry_matches(&own(latest), &own(staged))
+}
+
 fn commit_imports(previous: &Registry, prepared: Registry) -> Result<Registry, String> {
     registry::update(|latest| {
         if !registry_matches(latest, previous)? {
@@ -2765,7 +2785,7 @@ fn migrate_client_reviewed_inputs_with(
                 let verification = verify(&staged, &moved, client_id, profile)?;
                 let outcome =
                     clients::migrate_reviewed(client_id, profile, &moved, revision, || {
-                        if !registry_matches(&read_registry_exact()?, &staged)? {
+                        if !setup_registry_matches(&read_registry_exact()?, &staged, client_id)? {
                             return Err("Servers changed during setup. Review again.".into());
                         }
                         Ok(())
@@ -4603,6 +4623,133 @@ API_KEY = "synthetic-first-origin"
                 .as_deref(),
             Some("stale-orphan")
         );
+    }
+
+    /// F29: a Clients scan that writes another client's records during a connect (a
+    /// deferred repair finishing after an unlock) no longer fails it, and keeps them.
+    #[test]
+    fn reviewed_connect_keeps_another_clients_records_written_meanwhile() {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"one":{"command":"one"}}}"#,
+        )
+        .unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        let other: crate::registry::ManagedEntry =
+            serde_json::from_value(serde_json::json!({"command": "toolport-gateway"})).unwrap();
+        let written = other.clone();
+        migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["one".into()],
+            &review.revision,
+            move |_, _, _, _| {
+                registry::update(|r| {
+                    r.set_client_managed_entry("codex@t3-home", written.clone());
+                    r.set_client_unscoped("codex@t3-home");
+                    Ok(())
+                })
+                .unwrap();
+                Ok(Vec::new().into())
+            },
+        )
+        .unwrap();
+        let saved = read_registry_exact().unwrap();
+        assert!(saved.servers.iter().any(|s| s.name == "one"));
+        assert_eq!(
+            saved.client_managed_entries.get("codex@t3-home"),
+            Some(&other)
+        );
+        assert_eq!(
+            saved.client_scopes.get("codex@t3-home").map(String::as_str),
+            Some("")
+        );
+    }
+
+    /// A server changed during the connect still stops it before the client is rewritten.
+    #[test]
+    fn reviewed_connect_still_stops_when_servers_change_meanwhile() {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"one":{"command":"one"}}}"#,
+        )
+        .unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        let error = migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["one".into()],
+            &review.revision,
+            |_, _, _, _| {
+                registry::update(|r| {
+                    r.servers
+                        .iter_mut()
+                        .find(|s| s.name == "one")
+                        .unwrap()
+                        .command = Some("changed".into());
+                    Ok(())
+                })
+                .unwrap();
+                Ok(Vec::new().into())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("Servers changed during setup"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.claude()).unwrap(),
+            r#"{"mcpServers":{"one":{"command":"one"}}}"#
+        );
+    }
+
+    /// A change to the connecting client's own records during verification still stops
+    /// the connect and leaves its config alone.
+    fn assert_own_record_change_stops_the_connect(change: fn(&mut Registry)) {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"one":{"command":"one"}}}"#,
+        )
+        .unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        let error = migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["one".into()],
+            &review.revision,
+            move |_, _, _, _| {
+                registry::update(|r| {
+                    change(r);
+                    Ok(())
+                })
+                .unwrap();
+                Ok(Vec::new().into())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("Servers changed during setup"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.claude()).unwrap(),
+            r#"{"mcpServers":{"one":{"command":"one"}}}"#
+        );
+    }
+
+    #[test]
+    fn reviewed_connect_still_stops_when_its_own_managed_entry_changes_meanwhile() {
+        assert_own_record_change_stops_the_connect(|r| {
+            let entry: crate::registry::ManagedEntry =
+                serde_json::from_value(serde_json::json!({"command": "toolport-gateway"})).unwrap();
+            r.set_client_managed_entry("claude-code", entry);
+        });
+    }
+
+    #[test]
+    fn reviewed_connect_still_stops_when_its_own_scope_changes_meanwhile() {
+        assert_own_record_change_stops_the_connect(|r| r.set_client_unscoped("claude-code"));
     }
 
     #[test]
