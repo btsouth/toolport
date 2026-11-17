@@ -1043,7 +1043,9 @@ pub fn add_server_with_values(
     }
     let mut entry = entry_from_fields(fields)?;
     if let Some(mut launch) = launch {
-        launch.validate(&entry.args, true)?;
+        // Secret inputs still carry their values here; the import moves them
+        // to the keychain, and the registry checks the stored form on save.
+        launch.validate(&entry.args, false)?;
         // Every row still needs a value before the server is switched on, as
         // without launch inputs (the import lists them all then).
         for row in &rows {
