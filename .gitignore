@@ -27,7 +27,9 @@ dist-ssr
 /docs/MONETIZATION.md
 
 # Editor directories and files
-.claude/
+# Local agent state anywhere, except the repo's shared skills.
+**/.claude/*
+!/.claude/skills
 .vscode/*
 !.vscode/extensions.json
 .idea

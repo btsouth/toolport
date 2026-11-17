@@ -17,4 +17,6 @@
 ## Notes
 
 <!-- Screenshots for UI changes, follow-ups, or anything a reviewer should know.
-     Confirm no secrets, keys, or personal paths are included in the diff. -->
+     Confirm no secrets, keys, or personal paths are included in the diff.
+     If this changes CI, tests or review rules in a way that removes coverage,
+     add a line starting "Check changes:" that says why. -->
