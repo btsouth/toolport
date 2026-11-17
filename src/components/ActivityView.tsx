@@ -2041,7 +2041,8 @@ export function ActivityView({
       })
       .catch((error: unknown) => {
         if (!alive || generation !== auditGeneration.current) return;
-        setAuditError(String(error));
+        // Tauri rejects with the command's message; an Error carries it in `message`.
+        setAuditError(error instanceof Error ? error.message : String(error));
         // Never replace a last-known audit trail with a false empty state.
         setAuditLoadStatus((status) =>
           status === "ready" || status === "stale" ? "stale" : "error",
