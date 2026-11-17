@@ -1088,8 +1088,6 @@ pub fn add_server_with_values(
     }
     entry.request_timeout_ms = extras.request_timeout_ms;
     entry.unknown_fields.extend(extras.kept_fields);
-    // A bad header reference is refused before the keychain is asked for anything.
-    crate::secret_refs::headers(&entry).map_err(|error| error.to_string())?;
     if let Some(mut launch) = extras.launch {
         // A row named like a launch input would be stored under the input's
         // name and vanish from the entry.

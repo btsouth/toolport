@@ -627,7 +627,8 @@ function fixtureAddWithRows(entry: ServerEntry) {
   // out, every row is required otherwise, and a blank required launch input is
   // named by its label.
   const launch = entry.launch;
-  const required = (key: string) => !launch?.template || (launch.requiredEnv ?? []).includes(key);
+  const required = (key: string) =>
+    !launch?.template || (launch.requiredEnv ?? []).includes(key);
   const declaredWithoutValue = [
     ...(entry.env ?? [])
       .filter((row) => !row.source && !row.value?.trim() && required(row.key))
