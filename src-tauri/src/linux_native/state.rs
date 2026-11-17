@@ -443,9 +443,9 @@ pub(super) struct ClientView {
     pub(super) config_exists: bool,
     pub(super) uses_connectors: bool,
     pub(super) server_count: usize,
-    /// Config-file servers other than the gateway itself that are not in Toolport
-    /// yet: what a one-shot migration would import. Plugin-detected servers are
-    /// excluded because migration leaves them untouched.
+    /// Config-file servers other than the gateway itself: what a one-shot
+    /// migration would import and then move out of the client. Plugin-detected
+    /// servers are excluded because migration leaves them untouched.
     pub(super) movable_server_count: usize,
     /// Servers the client lists besides Toolport's own entry, plugins included.
     pub(super) other_server_count: usize,
@@ -635,10 +635,8 @@ pub(super) fn apply_import_state(client: &mut ClientView, registry: &crate::regi
     };
     let configured = detected.servers.len();
     let slots = crate::clients::importable_server_slots(&detected.0, registry);
-    client.movable_server_count = slots
-        .iter()
-        .filter(|(index, _, _)| *index < configured)
-        .count();
+    // `movable_server_count` stays what the move migrates: every config server but
+    // the gateway, in Toolport already or not, as React counts it.
     client.imported_names = crate::clients::managed_server_names(&detected.0, registry);
     detected.1 = slots
         .into_iter()
@@ -1150,7 +1148,9 @@ pub(super) mod tests {
         );
         let mut client = super::ClientView::from_detected(detected);
         super::apply_import_state(&mut client, &registry);
-        assert_eq!(client.movable_server_count, 1);
+        // "Move N servers" counts what the move migrates: both config servers, the
+        // one already in Toolport too, as React does. The gateway is not one.
+        assert_eq!(client.movable_server_count, 2);
         assert_eq!(client.imported_names, ["my-notes"]);
         let importable = client
             .detected

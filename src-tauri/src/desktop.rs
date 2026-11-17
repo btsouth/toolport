@@ -5942,17 +5942,24 @@ mod tests {
     }
 
     #[test]
-    fn servers_to_import_dedupes_identical_connections_under_distinct_names() {
-        // The same connection under two names would land on one endpoint twice.
-        // Credentials do not identify a connection, so it is imported once.
+    fn servers_to_import_keeps_same_package_under_distinct_names() {
+        // A multi-account setup runs the SAME package twice under different
+        // names (e.g. a personal and a work token). Keying on the package alone
+        // would collapse them and silently drop one; the name tiebreaker keeps
+        // both while still distinguishing different packages (see the test above).
         let mut client = detected_client("claude", vec![], vec![]);
         client.servers = vec![
             detected_mcp_server_with_args("github-personal", "npx", &["-y", "@mcp/server-github"]),
             detected_mcp_server_with_args("github-work", "npx", &["-y", "@mcp/server-github"]),
         ];
         let picked = servers_to_import(&[client], &Registry::default());
-        assert_eq!(picked.len(), 1);
-        assert_eq!(picked[0].name, "github-personal");
+        assert_eq!(picked.len(), 2);
+        let names: std::collections::HashSet<_> =
+            picked.iter().map(|server| server.name.as_str()).collect();
+        assert_eq!(
+            names,
+            std::collections::HashSet::from(["github-personal", "github-work"])
+        );
     }
 
     #[test]

@@ -486,7 +486,7 @@ export interface ImportItem {
   command: string | null;
   args: string[];
   url: string | null;
-  /** False if a server with this name is already present (import skips it). */
+  /** False if a server with this connection is already in Toolport (import skips it). */
   isNew: boolean;
   updates?: string[];
   /** The client's own name when `name`, the name the import saves, differs. */
