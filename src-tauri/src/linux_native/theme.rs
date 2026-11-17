@@ -1121,6 +1121,25 @@ button.toolport-activity-row-button {{
   background-color: alpha(@toolport_success, 0.08);
 }}
 
+.toolport-savings-card.cost {{
+  border-left-color: @toolport_border;
+  background-color: alpha(@toolport_fg, 0.03);
+}}
+
+.toolport-savings-card.cost image,
+.toolport-sidebar-savings.cost image {{
+  color: @toolport_text_secondary;
+}}
+
+.toolport-savings-card.cost .toolport-savings-value {{
+  color: @toolport_fg;
+}}
+
+.toolport-sidebar-savings.cost {{
+  border-color: @toolport_border;
+  background: alpha(@toolport_fg, 0.03);
+}}
+
 .toolport-savings-title {{
   color: @toolport_text_secondary;
   font-weight: 500;

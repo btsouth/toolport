@@ -1355,6 +1355,12 @@ fn install_sidebar_footer(root: &gtk::Box, nav: &gtk::Box, page: &ServerPage) {
                             return;
                         };
                         l10n::bind_label_with(&label, move || sidebar_savings_text(tokens));
+                        // Green only for a real saving; extra tokens read neutral.
+                        if tokens < 0 {
+                            button.add_css_class("cost");
+                        } else {
+                            button.remove_css_class("cost");
+                        }
                         button.set_visible(loads > 0);
                     }
                     _ => button.set_visible(false),
@@ -5984,6 +5990,12 @@ impl ActivityPage {
             (crate::i18n::tr("Not measured yet").to_string(), "")
         };
         self.savings_share.set_visible(has_catalog);
+        // Green only for a real saving; a net cost reads neutral, as in React.
+        if has_catalog && snapshot.tokens_saved < 0 {
+            self.savings_banner.add_css_class("cost");
+        } else {
+            self.savings_banner.remove_css_class("cost");
+        }
         self.savings_value.set_label(&primary);
         l10n::bind_label(&self.savings_unit, unit);
         let old = savings_old_estimate_display(snapshot.savings_previous_tokens);
@@ -7698,6 +7710,9 @@ fn activity_count_summary(
 /// total of tool calls (when the stats were read), then what the list holds,
 /// "Latest N entries available." while closed. The list also holds approvals
 /// and Toolport's own searches, so the rows are "entries", never "calls".
+/// The total shows only when the log holds more calls than the list has
+/// entries; otherwise "4 calls" beside "the latest 5 entries" reads as a
+/// contradiction.
 /// Counts are grouped by `group`, the current language's grouping (1.000 in
 /// German), as React's `toLocaleString` writes them.
 fn activity_count_summary_in(
@@ -7708,6 +7723,7 @@ fn activity_count_summary_in(
     open: bool,
 ) -> String {
     let mut line = total
+        .filter(|total| *total > recent)
         .map(|total| {
             crate::i18n::trf(
                 if total == 1 {
@@ -8445,10 +8461,6 @@ fn activity_client_name(activity: &state::ActivityView) -> String {
     }
 }
 
-/// Width of each number column in the per-server breakdown, so the header and
-/// every row line up; four of them still leave the name room at 480 px.
-const STAT_COLUMN_WIDTH: i32 = 64;
-
 /// One row's cells after its name: calls, errors (as a rate), average and p95,
 /// as React's table shows them.
 fn stat_cells(stat: &serde_json::Value) -> [String; 4] {
@@ -8481,7 +8493,9 @@ fn stat_cells(stat: &serde_json::Value) -> [String; 4] {
 fn stat_line(name: &impl IsA<gtk::Widget>, cells: &[gtk::Label]) -> gtk::Box {
     let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     // Equal columns, the server spanning two, so every row and the header line
-    // up and the numbers spread across the table as in React's.
+    // up and the numbers spread across the table as in React's. No column has
+    // a minimum width: in a narrow window the name ellipsizes (its tooltip
+    // keeps it whole) and the table still fits.
     let grid = gtk::Grid::builder()
         .column_homogeneous(true)
         .column_spacing(8)
@@ -8490,7 +8504,7 @@ fn stat_line(name: &impl IsA<gtk::Widget>, cells: &[gtk::Label]) -> gtk::Box {
     name.set_hexpand(true);
     grid.attach(name, 0, 0, 2, 1);
     for (column, cell) in (2..).zip(cells) {
-        cell.set_size_request(STAT_COLUMN_WIDTH, -1);
+        cell.set_ellipsize(gtk::pango::EllipsizeMode::End);
         cell.set_xalign(1.0);
         cell.add_css_class("toolport-stat-metrics");
         grid.attach(cell, column, 0, 1, 1);
@@ -21397,18 +21411,19 @@ mod tests {
 
     #[test]
     fn recorded_call_summary_uses_react_sentences() {
-        // Approvals and searches are rows but not calls: 4 calls can show 6 entries.
+        // Approvals and searches are rows but not calls: 4 calls can show 6
+        // entries, so the total shows only when it is more than the list holds.
         assert_eq!(
             activity_count_summary(Some(4), 6, 6, true),
-            "4 calls recorded on this computer. Showing the latest 6 entries."
+            "Showing the latest 6 entries."
         );
         assert_eq!(
-            activity_count_summary(Some(1), 2, 2, true),
-            "1 call recorded on this computer. Showing the latest 2 entries."
+            activity_count_summary(Some(2), 2, 2, true),
+            "Showing the latest 2 entries."
         );
         assert_eq!(
             activity_count_summary(Some(1), 1, 1, true),
-            "1 call recorded on this computer. Showing the latest entry."
+            "Showing the latest entry."
         );
         assert_eq!(
             activity_count_summary(Some(5225), 2, 5, true),
@@ -21425,11 +21440,15 @@ mod tests {
         // Closed, the line says how many entries the list holds.
         assert_eq!(
             activity_count_summary(Some(90), 150, 150, false),
-            "90 calls recorded on this computer. Latest 150 entries available."
+            "Latest 150 entries available."
+        );
+        assert_eq!(
+            activity_count_summary(Some(250), 200, 200, false),
+            "250 calls recorded on this computer. Latest 200 entries available."
         );
         assert_eq!(
             activity_count_summary(Some(0), 1, 1, false),
-            "0 calls recorded on this computer. Latest entry available."
+            "Latest entry available."
         );
         // Without stats (a stale read), only the list part.
         assert_eq!(

@@ -681,6 +681,8 @@ it("shows negative net savings with the tokenizer method and excludes legacy est
   });
   expect(badge).not.toHaveTextContent("-");
   expect(badge).not.toHaveTextContent("tokens saved");
+  // Extra tokens are a cost, not drawn green like a saving.
+  expect(badge).not.toHaveClass("border-success/30");
   expect(badge).toHaveAttribute("title", expect.stringContaining("cl100k_base"));
   expect(badge).toHaveAttribute(
     "title",

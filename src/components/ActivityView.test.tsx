@@ -127,17 +127,23 @@ it("p10c shows approval outcomes without treating them as call errors", async ()
   );
   expect(screen.getByText("errors (50%)").parentElement).toHaveTextContent(/1\s*errors/);
   for (const [, label] of outcomes) expect(screen.getByText(label)).toBeInTheDocument();
-  // Approvals are rows but not calls, so the shown rows are counted as entries.
-  expect(screen.getByText(/2 calls recorded on this computer/)).toHaveTextContent(
-    `2 calls recorded on this computer. Showing the latest ${outcomes.length + initialLog.length} entries.`,
-  );
+  // Approvals are rows but not calls, so the shown rows are counted as entries,
+  // and 2 calls are not set beside more entries.
+  expect(
+    screen.getByText(
+      `Showing the latest ${outcomes.length + initialLog.length} entries.`,
+    ),
+  ).toBeInTheDocument();
+  expect(screen.queryByText(/calls recorded on this computer/)).not.toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: /errors only/i }));
   expect(screen.getByText("merge_pr")).toBeInTheDocument();
   for (const [, label] of outcomes)
     expect(screen.queryByText(label)).not.toBeInTheDocument();
-  expect(screen.getByText(/2 calls recorded on this computer/)).toHaveTextContent(
-    `2 calls recorded on this computer. Showing 1 matching entry from the latest ${outcomes.length + initialLog.length}.`,
-  );
+  expect(
+    screen.getByText(
+      `Showing 1 matching entry from the latest ${outcomes.length + initialLog.length}.`,
+    ),
+  ).toBeInTheDocument();
 });
 
 it("counts Activity rows as entries in singular and plural", async () => {
@@ -150,18 +156,14 @@ it("counts Activity rows as entries in singular and plural", async () => {
     name: /recent calls/i,
     expanded: true,
   });
-  expect(screen.getByText(/2 calls recorded on this computer/)).toHaveTextContent(
-    "2 calls recorded on this computer. Showing the latest 2 entries.",
-  );
+  expect(screen.getByText("Showing the latest 2 entries.")).toBeInTheDocument();
   await user.click(toggle);
-  expect(screen.getByText(/2 calls recorded on this computer/)).toHaveTextContent(
-    "2 calls recorded on this computer. Latest 2 entries available.",
-  );
+  expect(screen.getByText("Latest 2 entries available.")).toBeInTheDocument();
   await user.click(toggle);
   await user.click(screen.getByRole("button", { name: /errors only/i }));
-  expect(screen.getByText(/2 calls recorded on this computer/)).toHaveTextContent(
-    "2 calls recorded on this computer. Showing 0 matching entries from the latest 2.",
-  );
+  expect(
+    screen.getByText("Showing 0 matching entries from the latest 2."),
+  ).toBeInTheDocument();
   expect(screen.getByText("No errors in the latest 2 entries.")).toBeInTheDocument();
   view.unmount();
 
@@ -169,13 +171,9 @@ it("counts Activity rows as entries in singular and plural", async () => {
   getAuditStats.mockResolvedValue({ total: 1, errors: 0, errorRate: 0, servers: [] });
   render(<ActivityView refreshKey={0} registry={null} />);
   const single = await screen.findByRole("button", { name: /recent calls/i });
-  expect(screen.getByText(/1 call recorded on this computer/)).toHaveTextContent(
-    "1 call recorded on this computer. Showing the latest entry.",
-  );
+  expect(screen.getByText("Showing the latest entry.")).toBeInTheDocument();
   await user.click(single);
-  expect(screen.getByText(/1 call recorded on this computer/)).toHaveTextContent(
-    "1 call recorded on this computer. Latest entry available.",
-  );
+  expect(screen.getByText("Latest entry available.")).toBeInTheDocument();
   await user.click(single);
   await user.click(screen.getByRole("button", { name: /errors only/i }));
   expect(screen.getByText("No errors in the latest entry.")).toBeInTheDocument();
@@ -834,9 +832,11 @@ it("keeps contradictory pre-session history outside all measured totals", async 
   expect(screen.getByText(/100 baseline tokens/)).toHaveTextContent(
     "100 baseline tokens − 50 catalog response tokens − 60 search response tokens = -10 net token change. A negative change means responses used more tokens than the baseline.",
   );
-  expect(screen.getByText(/-10/, { selector: "span.text-3xl" })).toHaveTextContent(
-    "-10 net token change",
-  );
+  const net = screen.getByText(/-10/, { selector: "span.text-3xl" });
+  expect(net).toHaveTextContent("-10 net token change");
+  // A net cost is not drawn as a saving: no green.
+  expect(net).not.toHaveClass("text-success");
+  expect(net.closest(".toolport-alert")).not.toHaveClass("border-success");
   expect(screen.queryByText("net tokens saved")).not.toBeInTheDocument();
   expect(screen.getByText(/1 client sessions/)).toHaveTextContent("2 catalog responses");
   expect(screen.getByText(/1.2 KB baseline catalog text/)).toHaveTextContent(

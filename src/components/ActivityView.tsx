@@ -518,10 +518,16 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
       toastError(tr("Couldn't copy to clipboard"));
     }
   };
+  // Green only for a real saving; a net cost reads neutral, as in GTK.
+  const cost = hasCatalog && negative;
   return (
-    <div className="mb-6 toolport-alert border-success bg-success/8 p-4">
+    <div
+      className={`mb-6 toolport-alert p-4 ${cost ? "border-border bg-muted/20" : "border-success bg-success/8"}`}
+    >
       <div className="flex items-center gap-2">
-        <Sparkles className="size-4 text-success" />
+        <Sparkles
+          className={`size-4 ${cost ? "text-muted-foreground" : "text-success"}`}
+        />
         <span className="text-sm font-medium text-muted-foreground">
           {hasCatalog
             ? tr("Net tool description savings")
@@ -531,7 +537,10 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
         </span>
       </div>
       <div className="mt-2 flex flex-wrap items-end gap-x-6 gap-y-1">
-        <span className="text-3xl font-semibold tabular-nums text-success" title={method}>
+        <span
+          className={`text-3xl font-semibold tabular-nums ${cost ? "text-foreground" : "text-success"}`}
+          title={method}
+        >
           {hasCatalog
             ? fmtTokens(savings.tokensSaved)
             : discovered
@@ -2391,7 +2400,9 @@ export function ActivityView({
       </div>
 
       <p className="mb-2 text-meta text-muted-foreground">
-        {stats
+        {/* The total only when the log holds more calls than the list has entries,
+            so the two numbers never contradict (as in GTK). */}
+        {stats && stats.total > entries.length
           ? tr(
               stats.total === 1
                 ? "{count} call recorded on this computer. "
