@@ -340,6 +340,11 @@ pub(super) fn remember(
             &mut paths,
         );
         for path in paths {
+            // A setting the client saved in Toolport's own entry belongs to that entry
+            // (a rewrite carries it), not to the file Disconnect puts back.
+            if client_setting_in_gateway(client_id, format, &path) {
+                continue;
+            }
             rebase_value(&mut record.baseline, &native, &path);
         }
     }
@@ -398,6 +403,15 @@ fn rebase_value(baseline: &mut Value, native: &Value, path: &[String]) {
             rest,
         );
     }
+}
+
+/// Whether a changed `path` is one of the [`client_entry_settings`] inside Toolport's
+/// gateway entry, such as Pi's `enabled` or Antigravity's `disabled`.
+fn client_setting_in_gateway(client_id: &str, format: Format, path: &[String]) -> bool {
+    matches!(path, [container, name, field]
+        if container == key(format)
+            && name == GATEWAY_ENTRY_NAME
+            && client_entry_settings(client_id).contains(&field.as_str()))
 }
 
 /// Undo only leaves whose value still matches Toolport's last write. Missing
