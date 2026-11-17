@@ -19,6 +19,10 @@ written automatically when you connect:
 - `TOOLPORT_DATA_DIR=<path>` - override the full Toolport data directory. A desktop
   launch with this override keeps its startup migration within that instance:
   it does not rewrite client configs or agent hooks in the user's normal home.
+  On Linux, Toolport also writes it into the entry of every row that is not a
+  client's main config (a T3 Code home or a location you added), because such a
+  client may set its own `XDG_CONFIG_HOME` and the gateway would otherwise look
+  for its data there. macOS and Windows entries never get it.
 - `TOOLPORT_RESULT_BUDGET=<bytes>` - cap oversized tool results at this many bytes
   (0 disables it). Optional; default budget applies when unset.
 - `TOOLPORT_HTTP=<port>` (with optional `TOOLPORT_HTTP_HOST`, default `127.0.0.1`,
