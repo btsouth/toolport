@@ -967,8 +967,8 @@ pub struct RowsAddOutcome {
 /// Add a server from Add server's rows in one step, as a pasted server is added:
 /// the entry, its plain values and references, and every typed secret are saved
 /// together or not at all, with one keychain unlock. The server is switched on
-/// (and added to the default access) once every row has a value; a password
-/// manager row leaves it off, as the React dialog does.
+/// (and added to the default access) once every row has a value or a password
+/// manager reference, as the React dialog does.
 pub fn add_server_with_rows(
     fields: ServerFields,
     rows: Vec<ValueRow>,
@@ -1043,7 +1043,6 @@ pub fn add_server_with_rows(
         Some(&definition),
         Some(&choices),
     )?;
-    let has_reference = rows.iter().any(|row| row.reference.is_some());
     let (registry, missing) = crate::import_credentials::transaction(|writes| {
         let current = read_registry_exact_or_default()?;
         let mut registry = current.clone();
@@ -1052,7 +1051,7 @@ pub fn add_server_with_rows(
         let id = registry.add_server(entry);
         let missing =
             import.transfer_into(&id, writes, current.servers.iter().any(|s| s.id == id))?;
-        if missing.is_empty() && !has_reference {
+        if missing.is_empty() {
             let profile = registry.default_access_id();
             if apply_server_enabled(&mut registry, &profile, &id, true, false).is_ok() {
                 let _ = registry.set_access_server(&profile, &id, true);
@@ -6119,7 +6118,9 @@ API_KEY = "synthetic-first-origin"
                         Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0)
                     })
                     .unwrap();
-                    // A reference row has no typed value, so React leaves it off.
+                    // Every row has a value or a reference, so React switches it on.
+                    let profile = registry::load().unwrap().default_access_id();
+                    set_server_enabled(&profile, &id, true, false).unwrap();
                     id
                 };
                 let registry = registry::load().unwrap();
@@ -6136,8 +6137,8 @@ API_KEY = "synthetic-first-origin"
         assert_eq!(gtk, react);
         assert_eq!(gtk.1.as_deref(), Some("sk-live-typed"));
         assert!(
-            !gtk.2,
-            "a reference row has no typed value, so neither shell switches it on"
+            gtk.2,
+            "every row has a value or a reference, so both switch it on"
         );
     }
 
@@ -6241,8 +6242,9 @@ API_KEY = "synthetic-first-origin"
         }
     }
 
-    /// A password manager row leaves the new server off; switching it on later
-    /// works, since its value is read from the password manager at start.
+    /// A password manager row counts as a value: the new server is switched on,
+    /// and can be switched off and on again, since its value is read from the
+    /// password manager at start.
     #[test]
     fn a_server_with_a_password_manager_row_can_be_switched_on() {
         for transport in ["stdio", "http"] {
@@ -6265,7 +6267,11 @@ API_KEY = "synthetic-first-origin"
                     .unwrap();
                     let id = outcome.registry.servers[0].id.clone();
                     let profile = outcome.registry.default_access_id();
-                    assert!(!outcome.registry.is_enabled(&profile, &id));
+                    assert!(
+                        outcome.registry.is_enabled(&profile, &id),
+                        "switched on at save"
+                    );
+                    set_server_enabled(&profile, &id, false, false).unwrap();
                     let registry = set_server_enabled(&profile, &id, true, reviewed)
                         .unwrap_or_else(|e| panic!("{transport} reviewed={reviewed}: {e}"));
                     assert!(registry.is_enabled(&profile, &id));
