@@ -4,6 +4,7 @@
 usage:
   clients.py seed <home> <manifest.json>
   clients.py check <home> <manifest.json> <entries-dir> [--not-connected] [--registry=<registry.json>]
+                    [--previous=<tag>]
   clients.py restored <home> <manifest.json>
   clients.py unchanged <home> <before-manifest.json>
 
@@ -525,6 +526,19 @@ def snapshot(manifest_path, out_path):
     return []
 
 
+def as_previous_release(rows, tag):
+    """The previous release only sets up an upgrade and is not under test: what
+    it gets wrong is noted as UNTESTED, never a FAIL. Tool calls through the
+    entries it wrote are checked separately and still fail."""
+    out = []
+    for r in rows:
+        area, status, check_name, detail = (r.split("\t", 3) + ["", "", "", ""])[:4]
+        if status == "FAIL":
+            r = row(area, "UNTESTED", check_name, f"the previous release ({tag}) is not under test: {detail}")
+        out.append(r)
+    return out
+
+
 def main(argv):
     if len(argv) < 4:
         print(__doc__, file=sys.stderr)
@@ -538,6 +552,9 @@ def main(argv):
             return 2
         reg = next((a.split("=", 1)[1] for a in argv if a.startswith("--registry=")), None)
         rows = check(home, manifest, argv[4], "--not-connected" not in argv, reg)
+        previous = next((a.split("=", 1)[1] for a in argv if a.startswith("--previous=")), None)
+        if previous:
+            rows = as_previous_release(rows, previous)
     elif cmd == "restored":
         rows = compare(home, manifest, "config restored byte-exact")
     elif cmd == "unchanged":

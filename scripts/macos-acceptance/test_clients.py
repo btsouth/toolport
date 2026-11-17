@@ -181,6 +181,19 @@ class ClientsTest(unittest.TestCase):
         self.assertIn("\tFAIL\t", detail)
         self.assertIn("never reads", detail)
 
+    def test_previous_release_problems_are_untested_not_failed(self):
+        # Nothing connected: every client lacks its entry, which fails for the
+        # release under test and is only noted for the previous release.
+        rows = clients.check(self.home, self.manifest, self.entries)
+        self.assertIn("FAIL", statuses(rows, "Goose has a Toolport entry"))
+        previous = clients.as_previous_release(rows, "v2.3.5")
+        self.assertEqual(statuses(previous, "Goose has a Toolport entry"), ["UNTESTED"])
+        self.assertFalse([r for r in previous if "\tFAIL\t" in r])
+        self.assertTrue(all("v2.3.5" in r for r in previous if "\tUNTESTED\t" in r))
+        # PASS and INFO rows are kept as they are.
+        kept = [r for r in rows if "\tFAIL\t" not in r]
+        self.assertEqual([r for r in previous if r in kept], kept)
+
     def test_strip_jsonc_keeps_strings(self):
         text = '{"a": "http://x//y", /* c */ "b": [1, 2,], // tail\n}'
         self.assertEqual(json.loads(clients.strip_jsonc(text)), {"a": "http://x//y", "b": [1, 2]})

@@ -32,6 +32,9 @@ ENTRIES="$EVIDENCE/client-entries-$LABEL"
 # builds call Toolport's own status tool instead.
 CALL_TOOL=check_secret
 [[ "${SIGNED:-1}" == "1" ]] || CALL_TOOL=toolport_status
+# Clients the previous release does not offer (" id " each), from onboarding.
+NOT_OFFERED=""
+not_offered() { [[ "$NOT_OFFERED" == *" $1 "* ]]; }
 
 [[ -n "$(app_pid)" ]] || { fail "app is running" "start it first"; finish_step; }
 ui_activate
@@ -44,11 +47,20 @@ if ui_wait "Welcome to Toolport" 10; then
   ui_press "Review and connect your clients" && sleep 2 && shot "$LABEL-onboarding-3-connect" >/dev/null
   detected=""
   missing=""
-  while IFS=$'\t' read -r _ name; do
-    if ui_wait "$name" 3; then detected+="$name, "; else missing+="$name, "; fi
+  while IFS=$'\t' read -r cid name; do
+    if ui_wait "$name" 3; then
+      detected+="$name, "
+    else
+      missing+="$name, "
+      # The previous release only prepares the upgrade: a client it does not
+      # offer yet is left out of its setup instead of failing it.
+      [[ "$LABEL" == previous ]] && NOT_OFFERED+=" $cid "
+    fi
   done <<<"$CLIENTS"
   if [[ -z "$missing" && -n "$detected" ]]; then
     pass "onboarding lists every seeded client" "${detected%, }"
+  elif [[ "$LABEL" == previous && -n "$detected" ]]; then
+    untested "onboarding lists every seeded client" "the previous release (${PREVIOUS_TAG:-?}) does not offer ${missing%, }; left out of its setup"
   else
     fail "onboarding lists every seeded client" "missing: ${missing%, } (listed: ${detected%, })"
   fi
@@ -208,6 +220,10 @@ fi
 log "Connecting clients"
 first=1
 while IFS=$'\t' read -r cid name; do
+  if not_offered "$cid"; then
+    untested "$name connected through the UI" "the previous release (${PREVIOUS_TAG:-?}) does not offer $name"
+    continue
+  fi
   ok=0
   if ui_press "Clients" && ui_press "$name" && ui_press "Connect to Toolport"; then
     if ui_wait "Review and connect $name" 20; then
@@ -237,7 +253,13 @@ python3 -c 'import json,sys,shutil,os
 for k, v in json.load(open(sys.argv[1])).items():
     if os.path.exists(v["path"]):
         shutil.copyfile(v["path"], os.path.join(sys.argv[2], k + os.path.splitext(v["path"])[1]))' "$MANIFEST" "$EVIDENCE/client-configs-$LABEL"
-record_rows "clients ($LABEL)" "client configs validated" python3 "$HERE/clients.py" check "$HOME" "$MANIFEST" "$ENTRIES" "--registry=$REGISTRY"
+if [[ "$LABEL" == previous ]]; then
+  # The previous release is not under test: its own config format is noted, and
+  # the tool calls below still fail for any entry it wrote that does not work.
+  record_rows "clients ($LABEL)" "client configs validated" python3 "$HERE/clients.py" check "$HOME" "$MANIFEST" "$ENTRIES" "--registry=$REGISTRY" "--previous=${PREVIOUS_TAG:-previous release}"
+else
+  record_rows "clients ($LABEL)" "client configs validated" python3 "$HERE/clients.py" check "$HOME" "$MANIFEST" "$ENTRIES" "--registry=$REGISTRY"
+fi
 
 # ── A real stdio tool call through each entry Toolport wrote ──────────────
 log "Calling the mock server through each client entry"
@@ -247,6 +269,10 @@ what="gets the keychain token"
 [[ "$CALL_TOOL" == check_secret ]] || what="reaches Toolport"
 while IFS=$'\t' read -r cid name; do
   entry="$ENTRIES/$cid.json"
+  if not_offered "$cid"; then
+    untested "tool call through the $cid entry $what" "the previous release (${PREVIOUS_TAG:-?}) does not offer $name"
+    continue
+  fi
   if [[ ! -f "$entry" ]]; then
     fail "tool call through the $cid entry $what" "no usable entry was written for $name"
     continue
