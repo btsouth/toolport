@@ -77,15 +77,16 @@ export function SyncSettingsDialog({ server, registry, onSaved, onClose }: Props
           localOnly: on,
         });
       if (personal && localOnly) next = await setLocalOnly(true);
-      // Stop sharing before starting to share: if a write fails part way,
-      // the server can be left sharing less than asked, never more.
-      const ordered = [...values].sort((a, b) => Number(marked(a)) - Number(marked(b)));
-      for (const value of ordered)
-        next = await invoke<Registry>("personal_sync_portable", {
+      // Every mark in one write: a refused mark saves none of them, so a
+      // failed save never leaves a value the user unchecked shared.
+      if (values.length)
+        next = await invoke<Registry>("personal_sync_portable_many", {
           serverId: server.id,
-          kind: value.kind,
-          key: value.key,
-          enabled: marked(value),
+          marks: values.map((value) => ({
+            kind: value.kind,
+            key: value.key,
+            enabled: marked(value),
+          })),
         });
       if (personal && !localOnly) next = await setLocalOnly(false);
       if (next) onSaved(next);

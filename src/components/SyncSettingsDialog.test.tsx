@@ -53,23 +53,28 @@ describe("SyncSettingsDialog", () => {
     expect(screen.getByRole("checkbox", { name: /REGION/ })).not.toBeChecked();
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
 
-    const marks = invoke.mock.calls
-      .filter(([command]) => command === "personal_sync_portable")
-      .map(([, args]) => [args.key, args.enabled]);
-    expect(marks).toEqual([
-      ["REGION", false],
+    const [, args] = invoke.mock.calls.find(
+      ([command]) => command === "personal_sync_portable_many",
+    )!;
+    expect(
+      args.marks.map((mark: { key: string; enabled: boolean }) => [
+        mark.key,
+        mark.enabled,
+      ]),
+    ).toEqual([
       ["TEAM", true],
+      ["REGION", false],
     ]);
   });
 
-  it("stops sharing first, so a failed save never leaves an unchecked value shared", async () => {
+  it("saves every mark in one write, so a refused mark saves none", async () => {
     const path = {
       key: "PATH",
       value: "/bin",
       secret: false,
     } as ServerEntry["env"][number];
-    invoke.mockImplementation((command: string, args: { key?: string }) =>
-      command === "personal_sync_portable" && args.key === "PATH"
+    invoke.mockImplementation((command: string) =>
+      command === "personal_sync_portable_many"
         ? Promise.reject(new Error("PATH can't sync"))
         : Promise.resolve(registry),
     );
@@ -86,15 +91,20 @@ describe("SyncSettingsDialog", () => {
     await userEvent.click(screen.getByRole("checkbox", { name: /TEAM/ }));
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
 
-    const marks = invoke.mock.calls
-      .filter(([command]) => command === "personal_sync_portable")
-      .map(([, args]) => [args.key, args.enabled]);
-    expect(marks[0]).toEqual(["TEAM", false]);
+    const writes = invoke.mock.calls.filter(([command]) =>
+      String(command).startsWith("personal_sync_portable"),
+    );
+    expect(writes).toHaveLength(1);
+    expect(writes[0][1].marks).toEqual([
+      { kind: "env", key: "REGION", enabled: true },
+      { kind: "env", key: "PATH", enabled: true },
+      { kind: "env", key: "TEAM", enabled: false },
+    ]);
   });
 
   it("turns local-only off last, and not at all when a mark fails", async () => {
     invoke.mockImplementation((command: string) =>
-      command === "personal_sync_portable"
+      command === "personal_sync_portable_many"
         ? Promise.reject(new Error("disk full"))
         : Promise.resolve(registry),
     );
@@ -111,7 +121,7 @@ describe("SyncSettingsDialog", () => {
     );
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
 
-    expect(invoke).toHaveBeenCalledWith("personal_sync_portable", expect.anything());
+    expect(invoke).toHaveBeenCalledWith("personal_sync_portable_many", expect.anything());
     expect(invoke).not.toHaveBeenCalledWith(
       "personal_sync_local_only",
       expect.anything(),

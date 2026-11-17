@@ -15851,13 +15851,10 @@ fn open_sync_settings(server_id: &str, page: &ServerPage) {
         let id = id.clone();
         let page = page.clone();
         let local = local.is_active();
-        let mut marks: Vec<_> = portable
+        let marks: Vec<_> = portable
             .iter()
             .map(|(k, key, c)| (k.clone(), key.clone(), c.is_active()))
             .collect();
-        // Stop sharing before starting to share: if a write fails part way,
-        // the server can be left sharing less than asked, never more.
-        marks.sort_by_key(|(_, _, enabled)| *enabled);
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || {
                 // Lock first, unlock last: if a mark fails to save, the server
@@ -15865,9 +15862,8 @@ fn open_sync_settings(server_id: &str, page: &ServerPage) {
                 if personal && local {
                     crate::personal_sync::set_local_only(&id, true)?;
                 }
-                for (kind, key, enabled) in marks {
-                    crate::personal_sync::set_portable(&id, &kind, &key, enabled)?;
-                }
+                // One write for every mark: a refused mark saves none of them.
+                crate::personal_sync::set_portable_many(&id, &marks)?;
                 if personal && !local {
                     crate::personal_sync::set_local_only(&id, false)?;
                 }

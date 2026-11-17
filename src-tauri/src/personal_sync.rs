@@ -2253,40 +2253,63 @@ pub fn set_portable(
     key: &str,
     enabled: bool,
 ) -> Result<Registry, String> {
+    set_portable_many(server_id, &[(kind.to_string(), key.to_string(), enabled)])
+}
+
+/// Sets several portable marks in one registry write. If any mark is refused, none is
+/// saved, so a save that fails part way never leaves a value the user unchecked shared.
+pub fn set_portable_many(
+    server_id: &str,
+    marks: &[(String, String, bool)],
+) -> Result<Registry, String> {
     crate::registry::update(|r| {
         let s = r
             .servers
             .iter_mut()
             .find(|s| s.id == server_id)
             .ok_or("Server no longer exists")?;
-        if enabled && kind == "env" && risky_sync_env(key) { return Err("Execution environment overrides cannot be portable. Keep this server on this machine only.".into()); }
-        let (secret, fields) = match kind {
-            "env" => {
-                let i = s
-                    .env
-                    .iter_mut()
-                    .find(|i| i.key == key)
-                    .ok_or("Variable no longer exists")?;
-                (i.secret, &mut i.unknown_fields)
-            }
-            "input" => {
-                let i = s
-                    .launch
-                    .iter_mut()
-                    .flat_map(|l| &mut l.inputs)
-                    .find(|i| i.key == key)
-                    .ok_or("Input no longer exists")?;
-                (i.secret, &mut i.unknown_fields)
-            }
-            _ => return Err("Unknown portable value type".into()),
-        };
-        if secret || fields.contains_key("source") {
-            return Err("Secret values always stay on this machine".into());
+        for (kind, key, enabled) in marks {
+            mark_portable(s, kind, key, *enabled)?;
         }
-        fields.insert("portable".into(), json!(enabled));
         Ok(())
     })
     .map(|(r, ())| r)
+}
+
+fn mark_portable(
+    s: &mut crate::registry::ServerEntry,
+    kind: &str,
+    key: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    if enabled && kind == "env" && risky_sync_env(key) {
+        return Err("Execution environment overrides cannot be portable. Keep this server on this machine only.".into());
+    }
+    let (secret, fields) = match kind {
+        "env" => {
+            let i = s
+                .env
+                .iter_mut()
+                .find(|i| i.key == key)
+                .ok_or("Variable no longer exists")?;
+            (i.secret, &mut i.unknown_fields)
+        }
+        "input" => {
+            let i = s
+                .launch
+                .iter_mut()
+                .flat_map(|l| &mut l.inputs)
+                .find(|i| i.key == key)
+                .ok_or("Input no longer exists")?;
+            (i.secret, &mut i.unknown_fields)
+        }
+        _ => return Err("Unknown portable value type".into()),
+    };
+    if secret || fields.contains_key("source") {
+        return Err("Secret values always stay on this machine".into());
+    }
+    fields.insert("portable".into(), json!(enabled));
+    Ok(())
 }
 pub fn resolve_conflict(
     id: &str,
@@ -5094,5 +5117,68 @@ mod tests {
         assert!(!b.servers.iter().any(|s| s.id == "docs"));
         stop.store(true, Ordering::Release);
         handle.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod portable_many_tests {
+    #[test]
+    fn a_refused_mark_saves_none_of_the_marks() {
+        let _data = crate::registry::DataDirTestEnv::new("portable-many-atomic");
+        let registry = serde_json::json!({
+            "version": 3,
+            "servers": [{
+                "id": "s",
+                "name": "Example",
+                "transport": "stdio",
+                "command": "example",
+                "args": [],
+                "env": [
+                    { "key": "REGION", "value": "eu", "secret": false, "portable": true },
+                    { "key": "PATH", "value": "/bin", "secret": false },
+                    { "key": "TEAM", "value": "core", "secret": false, "portable": true }
+                ],
+                "enabled": true,
+                "source": "manual"
+            }],
+            "profiles": [{ "id": "default", "name": "Default", "enabledServerIds": ["s"] }],
+            "activeProfileId": "default"
+        });
+        std::fs::write(
+            crate::registry::resolved_path().unwrap(),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+
+        // REGION and TEAM are unchecked; PATH can never be portable, so the save fails.
+        let marks = [
+            ("env".to_string(), "REGION".to_string(), false),
+            ("env".to_string(), "PATH".to_string(), true),
+            ("env".to_string(), "TEAM".to_string(), false),
+        ];
+        assert!(super::set_portable_many("s", &marks).is_err());
+
+        let saved = crate::registry::load().unwrap();
+        let portable = |key: &str| {
+            saved.servers[0]
+                .env
+                .iter()
+                .find(|e| e.key == key)
+                .and_then(|e| e.unknown_fields.get("portable").cloned())
+        };
+        // Nothing was written: not even the unmark that came before the refusal.
+        assert_eq!(portable("REGION"), Some(serde_json::json!(true)));
+        assert_eq!(portable("TEAM"), Some(serde_json::json!(true)));
+        assert_eq!(portable("PATH"), None);
+
+        let fine = [
+            ("env".to_string(), "REGION".to_string(), false),
+            ("env".to_string(), "TEAM".to_string(), false),
+        ];
+        let saved = super::set_portable_many("s", &fine).unwrap();
+        let env = &saved.servers[0].env;
+        assert!(env
+            .iter()
+            .all(|e| e.unknown_fields.get("portable") != Some(&serde_json::json!(true))));
     }
 }

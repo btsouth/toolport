@@ -2601,6 +2601,26 @@ fn personal_sync_portable(
     crate::personal_sync::set_portable(&server_id, &kind, &key, enabled)?;
     reload_into_state(state.inner())
 }
+#[derive(serde::Deserialize)]
+struct PortableMark {
+    kind: String,
+    key: String,
+    enabled: bool,
+}
+/// All of a server's portable marks in one registry write, so a failure saves none.
+#[tauri::command]
+fn personal_sync_portable_many(
+    state: State<RegistryState>,
+    server_id: String,
+    marks: Vec<PortableMark>,
+) -> Result<Registry, String> {
+    let marks: Vec<_> = marks
+        .into_iter()
+        .map(|m| (m.kind, m.key, m.enabled))
+        .collect();
+    crate::personal_sync::set_portable_many(&server_id, &marks)?;
+    reload_into_state(state.inner())
+}
 #[tauri::command]
 fn personal_sync_new_servers_local_only(
     state: State<RegistryState>,
@@ -4909,6 +4929,7 @@ pub fn run() {
             set_client_discovery,
             personal_sync_local_only,
             personal_sync_portable,
+            personal_sync_portable_many,
             reconnect_sync,
             personal_sync_resolve_conflict,
             personal_sync_finish_selection,
