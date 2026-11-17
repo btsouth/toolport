@@ -101,7 +101,9 @@ omabox shot --window Toolport --fit 1456       # a PNG path: Read it
   when the shot looks right. Done: `omabox down`.
 
 The binary is built on devbox (Ubuntu, glibc 2.43, GTK 4.22) and runs here
-(Arch, newer glibc and GTK); that direction works. RogAlly has no omabox.
+(Arch, newer glibc and GTK); that direction works. The same steps run from
+RogAlly (`ssh rogally`, a checkout in `~/Projects/toolport`), which has omabox
+and reaches devbox, so GUI checks can run there instead of the workstation.
 
 ## Tier 3: gateway and backend
 
