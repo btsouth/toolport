@@ -89,6 +89,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 
 /** A badge describing one security event by kind. */
 function eventBadge(e: SecurityEvent): { label: string; cls: string } {
@@ -642,7 +648,7 @@ function errCell(errors: number, errorRate: number) {
 
 /** One server row that expands to reveal its per-tool breakdown. */
 function ServerRow({ s }: { s: ServerStat }) {
-  const { t: tr } = useI18n();
+  const { t: tr, locale } = useI18n();
   const [open, setOpen] = useState(false);
   const tools = s.tools ?? [];
   const expandable = tools.length > 0;
@@ -685,7 +691,9 @@ function ServerRow({ s }: { s: ServerStat }) {
             </span>
           )}
         </td>
-        <td className="px-3 py-2 text-right tabular-nums">{s.calls}</td>
+        <td className="px-3 py-2 text-right tabular-nums">
+          {s.calls.toLocaleString(locale)}
+        </td>
         <td
           className={`px-3 py-2 text-right tabular-nums ${
             s.errors > 0 ? "text-destructive" : "text-muted-foreground"
@@ -710,7 +718,7 @@ function ServerRow({ s }: { s: ServerStat }) {
               {t.tool}
             </td>
             <td className="px-3 py-1.5 text-right text-xs tabular-nums text-muted-foreground">
-              {t.calls}
+              {t.calls.toLocaleString(locale)}
             </td>
             <td
               className={`px-3 py-1.5 text-right text-xs tabular-nums ${
@@ -1035,7 +1043,7 @@ function StatsPanel({ stats }: { stats: AuditStats }) {
           <div
             className={`text-2xl font-semibold tabular-nums ${stats.errors > 0 ? "text-destructive" : ""}`}
           >
-            {stats.errors}
+            {stats.errors.toLocaleString(locale)}
           </div>
           <div className="text-meta text-muted-foreground">
             {tr("errors ({value1})", { value1: errPct })}
@@ -1043,7 +1051,7 @@ function StatsPanel({ stats }: { stats: AuditStats }) {
         </div>
         <div className="rounded-lg border p-3">
           <div className="text-2xl font-semibold tabular-nums">
-            {stats.servers.length}
+            {stats.servers.length.toLocaleString(locale)}
           </div>
           <div className="text-meta text-muted-foreground">{tr("servers used")}</div>
         </div>
@@ -1895,6 +1903,8 @@ export function ActivityView({
   // this, a first-run backend failure renders the friendly "No tool calls yet" state
   // and hides that anything is wrong.
   const [auditLoadStatus, setAuditLoadStatus] = useState<LoadStatus>("loading");
+  // The real cause of a failed audit read, shown as the error's cause line.
+  const [auditError, setAuditError] = useState<string | null>(null);
   // Local reload trigger: bumped after a "Clear retained activity" so the panels
   // refetch (they'd otherwise keep showing the just-deleted rows until the parent's
   // refreshKey next changes).
@@ -2027,9 +2037,11 @@ export function ActivityView({
         if (!alive || generation !== auditGeneration.current) return;
         setEntries(e);
         setAuditLoadStatus("ready");
+        setAuditError(null);
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         if (!alive || generation !== auditGeneration.current) return;
+        setAuditError(String(error));
         // Never replace a last-known audit trail with a false empty state.
         setAuditLoadStatus((status) =>
           status === "ready" || status === "stale" ? "stale" : "error",
@@ -2071,20 +2083,17 @@ export function ActivityView({
     };
   }, [liveKey, reloadTick, windowVisible]);
 
-  // Export the full retained audit log. The save dialog offers CSV and JSON; the
-  // chosen extension picks the format. CSV is formula-injection-safe in the backend.
-  async function exportLog() {
+  // Export the full retained audit log in the format picked from the Export menu;
+  // the save dialog offers that format only. CSV is formula-injection-safe in the
+  // backend.
+  async function exportLog(format: "csv" | "json") {
     try {
       const path = await save({
         title: tr("Export activity log"),
-        defaultPath: "toolport-activity.csv",
-        filters: [
-          { name: "CSV", extensions: ["csv"] },
-          { name: "JSON", extensions: ["json"] },
-        ],
+        defaultPath: `toolport-activity.${format}`,
+        filters: [{ name: format.toUpperCase(), extensions: [format] }],
       });
       if (!path) return;
-      const format = path.toLowerCase().endsWith(".json") ? "json" : "csv";
       await exportAuditToPath(path, format);
       toast.success(tr("Exported activity log"));
     } catch (e) {
@@ -2214,6 +2223,49 @@ export function ActivityView({
     [entries],
   );
 
+  // Export and Clear stay in the page header on every Activity state, as in GTK.
+  const headerActions = (
+    <PageHeaderActions>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            variant="outline"
+            title={tr("Export the full activity log to a file (CSV or JSON)")}
+          >
+            <Download className="size-4" aria-hidden="true" />
+            {tr("Export")}
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          <DropdownMenuItem onSelect={() => void exportLog("json")}>
+            {tr("Export JSON")}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => void exportLog("csv")}>
+            {tr("Export CSV")}
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+      <ConfirmDialog
+        trigger={
+          <Button
+            variant="destructive"
+            title={tr("Delete all retained activity kept on this device")}
+          >
+            <Trash2 className="size-4" aria-hidden="true" />
+            {tr("Clear")}
+          </Button>
+        }
+        title={tr("Clear retained activity?")}
+        description={tr(
+          "Permanently deletes everything Toolport keeps on this device: the audit log, discovery search traces, live-inspection captures, and the savings tally (including its running total). Nothing is sent anywhere; each log starts fresh on the next event. This can't be undone.",
+        )}
+        confirmLabel={tr("Clear activity")}
+        destructive
+        onConfirm={clearActivity}
+      />
+    </PageHeaderActions>
+  );
+
   const visible = (entries ?? []).filter(
     (e) =>
       (!serverFilter || e.server === serverFilter) &&
@@ -2223,6 +2275,7 @@ export function ActivityView({
   if (entries === null && auditLoadStatus === "loading") {
     return (
       <div>
+        {headerActions}
         {banner}
         <SkeletonRows label={tr("Loading activity…")} />
       </div>
@@ -2232,12 +2285,11 @@ export function ActivityView({
   if (entries === null && auditLoadStatus === "error") {
     return (
       <div>
+        {headerActions}
         {banner}
         <ErrorCallout
           title={tr("Couldn't load activity")}
-          cause={tr(
-            "Toolport couldn't reach the gateway or read the audit log. This is not an empty log, if the gateway isn't running, start it and refresh.",
-          )}
+          cause={auditError ?? undefined}
           onRetry={retryLoads}
           retryAriaLabel={tr("Retry activity log")}
           onViewLog={() =>
@@ -2253,6 +2305,7 @@ export function ActivityView({
   if (entries === null) {
     return (
       <div>
+        {headerActions}
         {banner}
         <ErrorCallout
           title={tr("Activity status is unavailable. Retry the activity log.")}
@@ -2267,6 +2320,7 @@ export function ActivityView({
     // One card: the stale notice already says the refresh failed and offers Retry.
     return (
       <div>
+        {headerActions}
         {banner}
         <StatusCard
           role="alert"
@@ -2294,6 +2348,7 @@ export function ActivityView({
   if (entries.length === 0) {
     return (
       <div>
+        {headerActions}
         {banner}
         <EmptyState
           icon={<ScrollText />}
@@ -2313,6 +2368,7 @@ export function ActivityView({
 
   return (
     <div>
+      {headerActions}
       {banner}
       {auditLoadStatus === "stale" && <AuditStaleNotice onRetry={retryLoads} />}
       {stats && <StatsPanel stats={stats} />}
@@ -2331,34 +2387,6 @@ export function ActivityView({
             {tr("latest {count}", { count: entries.length })}
           </span>
         </button>
-        <PageHeaderActions>
-          <Button
-            variant="outline"
-            onClick={() => void exportLog()}
-            title={tr("Export the full activity log to a file (CSV or JSON)")}
-          >
-            <Download className="size-4" aria-hidden="true" />
-            {tr("Export")}
-          </Button>
-          <ConfirmDialog
-            trigger={
-              <Button
-                variant="destructive"
-                title={tr("Delete all retained activity kept on this device")}
-              >
-                <Trash2 className="size-4" aria-hidden="true" />
-                {tr("Clear")}
-              </Button>
-            }
-            title={tr("Clear retained activity?")}
-            description={tr(
-              "Permanently deletes everything Toolport keeps on this device: the audit log, discovery search traces, live-inspection captures, and the savings tally (including its running total). Nothing is sent anywhere; each log starts fresh on the next event. This can't be undone.",
-            )}
-            confirmLabel={tr("Clear activity")}
-            destructive
-            onConfirm={clearActivity}
-          />
-        </PageHeaderActions>
       </div>
 
       <p className="mb-2 text-meta text-muted-foreground">

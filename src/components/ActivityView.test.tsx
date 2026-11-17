@@ -21,12 +21,13 @@ const getSavingsSummary = vi.fn();
 const getAuditStats = vi.fn();
 
 const clearActivityLogs = vi.fn();
+const exportAuditToPath = vi.fn();
 const releaseQuarantine = vi.fn();
 
 vi.mock("@/lib/api", () => ({
   releaseQuarantine: (...a: unknown[]) => releaseQuarantine(...a),
   clearActivityLogs: (...a: unknown[]) => clearActivityLogs(...a),
-  exportAuditToPath: vi.fn(),
+  exportAuditToPath: (...a: unknown[]) => exportAuditToPath(...a),
   getActivityRevision: (...a: unknown[]) => getActivityRevision(...a),
   releaseActivityRevision: (...a: unknown[]) => releaseActivityRevision(...a),
   getActivityHealth: (...a: unknown[]) => getActivityHealth(...a),
@@ -45,7 +46,8 @@ vi.mock("sonner", () => ({
 
 vi.mock("@/lib/toast", () => ({ toastError: vi.fn() }));
 
-vi.mock("@tauri-apps/plugin-dialog", () => ({ save: vi.fn() }));
+const save = vi.fn();
+vi.mock("@tauri-apps/plugin-dialog", () => ({ save: (...a: unknown[]) => save(...a) }));
 
 function entry(over: Partial<AuditEntry> = {}): AuditEntry {
   return {
@@ -501,16 +503,22 @@ describe("ActivityView trust-state loading", () => {
     const user = userEvent.setup({
       advanceTimers: (ms) => vi.advanceTimersByTime(ms),
     });
+    const cause = "Couldn't read the activity log: Is a directory (os error 21)";
     getAuditLog
-      .mockRejectedValueOnce(new Error("offline"))
-      .mockRejectedValueOnce(new Error("offline"))
+      .mockRejectedValueOnce(cause)
+      .mockRejectedValueOnce(cause)
       .mockResolvedValueOnce([]);
 
     render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
 
     expect(screen.getByText("Couldn't load activity")).toBeInTheDocument();
+    // The real cause, as GTK shows it, not a fixed sentence.
+    expect(screen.getByText(cause)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "View log" })).toBeInTheDocument();
     expect(screen.queryByText("No activity yet")).not.toBeInTheDocument();
+    // Protection still shows its real state while the log is unreadable.
+    expect(screen.getByText("Protection active.")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Retry activity log" }));
     await act(async () => {});
@@ -1636,4 +1644,37 @@ it("names calls made through T3 Code and shows their thread", async () => {
   expect(detailLine("Zed · 2m ago · 120 ms")).toBeVisible();
   expect(detailLine("Claude Code · 2m ago · 120 ms")).toBeVisible();
   expect(screen.queryByText(/Zed via/)).not.toBeInTheDocument();
+});
+
+describe("ActivityView header actions", () => {
+  it("offers Export and Clear on an empty log, as on a busy one", async () => {
+    getAuditLog.mockResolvedValue([]);
+    render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    expect(screen.getByText("No activity yet")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clear" })).toBeInTheDocument();
+  });
+
+  it("exports the format picked from the Export menu", async () => {
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    save.mockResolvedValue("/tmp/toolport-activity.json");
+    exportAuditToPath.mockResolvedValue(undefined);
+    render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    await user.click(screen.getByRole("button", { name: "Export" }));
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
+      "Export JSON",
+      "Export CSV",
+    ]);
+    await user.click(screen.getByRole("menuitem", { name: "Export JSON" }));
+    await act(async () => {});
+    expect(save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        defaultPath: "toolport-activity.json",
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      }),
+    );
+    expect(exportAuditToPath).toHaveBeenCalledWith("/tmp/toolport-activity.json", "json");
+  });
 });
