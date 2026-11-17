@@ -353,8 +353,7 @@ async fn add_server_with_rows(
     entry: ServerEntry,
 ) -> Result<serde_json::Value, String> {
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        let (fields, rows, launch) = crate::registry_controller::values_from_entry(entry)?;
-        crate::registry_controller::add_server_with_values(fields, rows, launch)
+        crate::registry_controller::add_server_from_dialog(entry)
     })
     .await
     .map_err(|_| "Saving the server stopped".to_string())??;
