@@ -925,12 +925,17 @@ dropdown popover row:selected {{
   margin-bottom: 8px;
 }}
 
+/* Activity's stat tiles (spec 9): a surface card, as React draws them. */
 .toolport-summary-item {{
-  background-color: transparent;
-  border: none;
-  border-bottom: 1px solid @toolport_border;
-  border-radius: 0;
-  padding: 10px 13px;
+  background-color: @toolport_card;
+  border: 1px solid @toolport_border;
+  border-radius: 12px;
+  padding: 12px 13px;
+}}
+
+.toolport-summary-item.error {{
+  background-color: alpha(@toolport_error, 0.08);
+  border-color: alpha(@toolport_error, 0.5);
 }}
 
 .toolport-security-status {{
@@ -1328,6 +1333,8 @@ button.toolport-catalog-action {{
 .toolport-status-card.status-success {{ border-left: 3px solid @toolport_success; }}
 .toolport-status-card.status-warning {{ border-left: 3px solid @toolport_warning; }}
 .toolport-status-card.status-danger {{ border-left: 3px solid @toolport_error; }}
+.toolport-card.toolport-activity-panel {{ background-color: @toolport_card; border: 1px solid @toolport_border; border-radius: 12px; padding: 12px 16px; }}
+.toolport-card.toolport-activity-panel:hover {{ background-color: @toolport_card; }}
 .toolport-status-card .toolport-status-tile {{ border-radius: 8px; }}
 .toolport-status-card.status-info .toolport-status-tile {{ background: alpha(@toolport_fg, 0.06); color: @toolport_text_secondary; }}
 .toolport-status-card.status-success .toolport-status-tile {{ background: alpha(@toolport_success, 0.12); color: @toolport_success; }}

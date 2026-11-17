@@ -4756,8 +4756,16 @@ impl ActivityPage {
             .valign(gtk::Align::Center)
             .css_classes(["toolport-secondary-action"])
             .build();
-        let export_label = l10n::label("Export");
-        export_button.set_child(Some(&export_label));
+        // Icon and label, as the other header actions and React's Export.
+        let export_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        export_content.append(
+            &gtk::Image::builder()
+                .icon_name("document-save-symbolic")
+                .pixel_size(16)
+                .build(),
+        );
+        export_content.append(&l10n::label("Export"));
+        export_button.set_child(Some(&export_content));
         l10n::bind_tooltip(
             &export_button,
             "Export the full activity log to a file (CSV or JSON)",
@@ -4898,6 +4906,7 @@ impl ActivityPage {
         // collapsed list of searches.
         let discovery_plain = gtk::Box::new(gtk::Orientation::Vertical, 4);
         discovery_plain.add_css_class("toolport-card");
+        discovery_plain.add_css_class("toolport-activity-panel");
         discovery_plain.set_visible(false);
         discovery_plain.append(&activity_panel_title(
             "edit-find-symbolic",
@@ -5361,6 +5370,7 @@ impl ActivityPage {
         self.inspect_expander.set_visible(false);
         clear_box(&self.discovery_error);
         clear_box(&self.identity_error);
+        self.hide_empty_slots();
     }
 
     fn release_rows(&self) {
@@ -5655,6 +5665,19 @@ impl ActivityPage {
             self.render_inspector();
         }
         self.render_audit();
+        self.hide_empty_slots();
+    }
+
+    /// Error and state slots take no room while empty: a visible empty box
+    /// still adds the page's spacing, a gap React does not have.
+    fn hide_empty_slots(&self) {
+        for slot in [
+            &self.audit_state,
+            &self.discovery_error,
+            &self.identity_error,
+        ] {
+            slot.set_visible(slot.first_child().is_some());
+        }
     }
 
     fn render_security(&self) {
@@ -6144,10 +6167,18 @@ impl ActivityPage {
         }
         bind_grouped_number(&self.call_count, snapshot.call_count);
         bind_grouped_number(&self.error_count, snapshot.error_count);
+        // The errors tile turns red with its number, as in React.
+        let error_tile = self.error_count.parent();
         if snapshot.error_count > 0 {
             self.error_count.add_css_class("error");
+            if let Some(tile) = &error_tile {
+                tile.add_css_class("error");
+            }
         } else {
             self.error_count.remove_css_class("error");
+            if let Some(tile) = &error_tile {
+                tile.remove_css_class("error");
+            }
         }
         l10n::bind_formatted_label(
             &self.error_caption,
@@ -6419,6 +6450,7 @@ impl ActivityPage {
             activity_card_action(&card, crate::i18n::msg("Retry"), move || page.refresh());
             self.security_list.append(&card.root);
             self.feedback.set_visible(false);
+            self.hide_empty_slots();
             return;
         }
         // A failed refresh over real rows must never read as "all clear": keep
@@ -6556,6 +6588,8 @@ fn activity_panel(
 ) -> gtk::Expander {
     let expander = gtk::Expander::new(None);
     expander.add_css_class("toolport-card");
+    // A bordered card, as React draws each Activity panel.
+    expander.add_css_class("toolport-activity-panel");
     expander.set_label_widget(Some(&activity_panel_title(icon, source, Some(count))));
     let body = gtk::Box::new(gtk::Orientation::Vertical, 10);
     body.set_margin_top(8);
