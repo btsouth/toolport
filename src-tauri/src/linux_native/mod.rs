@@ -5040,7 +5040,8 @@ impl ActivityPage {
         recent_content.set_margin_top(8);
         let filter_count = activity_count_label();
         recent_content.append(&filter_count);
-        let filter_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        // Wraps below 480 px instead of widening the page.
+        let filter_row = wrapping_actions();
         let filter_server = gtk::DropDown::from_strings(&[&crate::i18n::tr("All servers")]);
         quiet_tooltips::guard_dropdown(&filter_server);
         filter_server.add_css_class("toolport-input");
@@ -5074,20 +5075,20 @@ impl ActivityPage {
         });
         filter_server.set_factory(Some(&factory));
         filter_server.set_list_factory(Some(&details::checked_list_factory()));
-        filter_row.append(&filter_server);
+        filter_row.insert(&filter_server, -1);
         let errors_only = gtk::ToggleButton::new();
         l10n::bind_button(errors_only.upcast_ref(), "Errors only");
         errors_only.add_css_class("toolport-secondary-action");
         errors_only.add_css_class("toolport-activity-filter");
         errors_only.set_valign(gtk::Align::Center);
-        filter_row.append(&errors_only);
+        filter_row.insert(&errors_only, -1);
         let filtered_label = l10n::label("Filtered");
         filtered_label.set_hexpand(true);
         filtered_label.set_halign(gtk::Align::End);
         filtered_label.set_visible(false);
         filtered_label.add_css_class("toolport-muted");
         filtered_label.add_css_class("caption");
-        filter_row.append(&filtered_label);
+        filter_row.insert(&filtered_label, -1);
         recent_content.append(&filter_row);
         // Holds the call rows as one row group, or a single state card.
         let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -6010,19 +6011,20 @@ impl ActivityPage {
         if snapshot.search_traces.is_empty() {
             let searches = activity_search_count(&snapshot.recent);
             if searches > 0 {
-                l10n::bind_formatted_label(
-                    &self.discovery_plain_text,
-                    "{count} searches in recent activity; detailed search records are not available.",
-                    &[("count", &crate::i18n::group_digits(searches))],
-                );
+                l10n::bind_label_with(&self.discovery_plain_text, move || {
+                    crate::i18n::trf(
+                        "{count} searches in recent activity; detailed search records are not available.",
+                        &[("count", &crate::i18n::group_digits(searches))],
+                    )
+                    .to_string()
+                });
             } else {
                 l10n::bind_label(&self.discovery_plain_text, "Nothing searched yet.");
             }
             self.discovery_plain.set_visible(true);
             return;
         }
-        self.discovery_count
-            .set_label(&crate::i18n::group_digits(snapshot.search_traces.len()));
+        bind_grouped_number(&self.discovery_count, snapshot.search_traces.len());
         for trace in &snapshot.search_traces {
             self.search_list.append(&search_trace_card(
                 trace,
@@ -6042,8 +6044,7 @@ impl ActivityPage {
         if !snapshot.live_inspect {
             return;
         }
-        self.inspect_count
-            .set_label(&crate::i18n::group_digits(snapshot.inspect_calls.len()));
+        bind_grouped_number(&self.inspect_count, snapshot.inspect_calls.len());
         if snapshot.inspect_error.is_some() {
             let page = self.clone();
             self.inspect_list.append(&activity_panel_error(
@@ -6141,10 +6142,8 @@ impl ActivityPage {
         if !shown {
             return;
         }
-        self.call_count
-            .set_label(&crate::i18n::group_digits(snapshot.call_count));
-        self.error_count
-            .set_label(&crate::i18n::group_digits(snapshot.error_count));
+        bind_grouped_number(&self.call_count, snapshot.call_count);
+        bind_grouped_number(&self.error_count, snapshot.error_count);
         if snapshot.error_count > 0 {
             self.error_count.add_css_class("error");
         } else {
@@ -6162,8 +6161,7 @@ impl ActivityPage {
             )],
         );
         let servers = snapshot.server_stats.len();
-        self.server_count
-            .set_label(&crate::i18n::group_digits(servers));
+        bind_grouped_number(&self.server_count, servers);
         l10n::bind_formatted_label(
             &self.stats_server_count,
             if servers == 1 {
@@ -6290,11 +6288,13 @@ impl ActivityPage {
                     if recent == 1 {
                         l10n::bind_label(&title, "No errors in the latest entry.");
                     } else {
-                        l10n::bind_formatted_label(
-                            &title,
-                            "No errors in the latest {count} entries.",
-                            &[("count", &crate::i18n::group_digits(recent))],
-                        );
+                        l10n::bind_label_with(&title, move || {
+                            crate::i18n::trf(
+                                "No errors in the latest {count} entries.",
+                                &[("count", &crate::i18n::group_digits(recent))],
+                            )
+                            .to_string()
+                        });
                     }
                 }
             }
@@ -6350,8 +6350,7 @@ impl ActivityPage {
         if snapshot.tool_identities.is_empty() {
             return;
         }
-        self.identity_count
-            .set_label(&crate::i18n::group_digits(snapshot.tool_identities.len()));
+        bind_grouped_number(&self.identity_count, snapshot.tool_identities.len());
         let query = self.identity_search.text().trim().to_lowercase();
         let filtered = filter_tool_identities(&snapshot.tool_identities, &query);
         if filtered.is_empty() {
@@ -6497,6 +6496,11 @@ impl ActivityPage {
     }
 }
 
+/// A count grouped the current language's way, regrouped when the language changes.
+fn bind_grouped_number(label: &gtk::Label, value: usize) {
+    l10n::bind_label_with(label, move || crate::i18n::group_digits(value));
+}
+
 fn clear_box(list: &gtk::Box) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
@@ -6587,6 +6591,20 @@ fn activity_panel_error(label: &'static str, retry: impl Fn() + 'static) -> gtk:
             "This isn't necessarily empty — Toolport couldn't check.",
         );
     }
+    // Announced with the panel's name, in the current language.
+    l10n::unbind(&card, "accessible-label");
+    l10n::bind_accessible_with(&card, move || {
+        (
+            crate::i18n::trf(
+                "Couldn't load {label}.",
+                &[("label", &crate::i18n::lookup(label).to_lowercase())],
+            )
+            .to_string(),
+            Some(crate::i18n::lookup(
+                "This isn't necessarily empty — Toolport couldn't check.",
+            )),
+        )
+    });
     card
 }
 
@@ -6614,6 +6632,12 @@ fn activity_status_card(tone: StatusTone, title: &'static str, detail: &'static 
     if !detail.is_empty() {
         l10n::bind_label(&card.detail, detail);
     }
+    l10n::bind_accessible_with(&card.root, move || {
+        (
+            crate::i18n::lookup(title),
+            (!detail.is_empty()).then(|| crate::i18n::lookup(detail)),
+        )
+    });
     card
 }
 
@@ -8413,6 +8437,13 @@ fn stat_cell_labels(stat: &serde_json::Value, classes: &[&str]) -> Vec<gtk::Labe
         .enumerate()
         .map(|(index, text)| {
             let cell = gtk::Label::new(Some(&text));
+            if index == 0 {
+                let calls = stat
+                    .get("calls")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                bind_grouped_number(&cell, calls as usize);
+            }
             for class in classes {
                 cell.add_css_class(class);
             }
