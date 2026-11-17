@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type {
   AuditEntry,
   ClientActivity,
@@ -165,13 +166,36 @@ export function listServerTools(serverId: string): Promise<McpTool[]> {
   return invoke<McpTool[]>("list_server_tools", { serverId });
 }
 
-/** Invoke one tool on a server and return its raw MCP result. */
+/**
+ * Invoke one tool on a server and return its raw MCP result. With a `runId`,
+ * the Run can be cancelled with {@link cancelToolCall} and reports its phases
+ * through {@link onToolRunProgress}.
+ */
 export function callTool(
   serverId: string,
   tool: string,
   args: Record<string, unknown>,
+  runId?: string,
 ): Promise<ToolCallResult> {
-  return invoke<ToolCallResult>("call_tool", { serverId, tool, arguments: args });
+  return invoke<ToolCallResult>("call_tool", { serverId, tool, arguments: args, runId });
+}
+
+/** Cancel a Tools tab Run, including one still waiting for its server to start. */
+export function cancelToolCall(runId: string): Promise<void> {
+  return invoke<void>("cancel_tool_call", { runId });
+}
+
+/** A Tools tab Run's phase: the gateway is starting its server, or has started it. */
+export interface ToolRunProgress {
+  runId: string;
+  phase: "starting" | "started";
+}
+
+/** Listen for Tools tab Run phases. Resolves to the unlisten function. */
+export function onToolRunProgress(
+  handler: (progress: ToolRunProgress) => void,
+): Promise<() => void> {
+  return listen<ToolRunProgress>("tool-run-progress", (event) => handler(event.payload));
 }
 
 /** List the resources one server advertises (connects on demand). Server > Tools. */

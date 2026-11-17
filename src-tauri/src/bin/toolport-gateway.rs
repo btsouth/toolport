@@ -1339,6 +1339,15 @@ fn without_progress_token(meta: &Value) -> Value {
     out
 }
 
+/// A copy of `meta` without the gateway's start notices ask.
+fn without_start_notices(meta: &Value) -> Value {
+    let mut out = meta.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.remove(downstream::START_NOTICES_META_KEY);
+    }
+    out
+}
+
 /// The live token table, created on first use so tests can exercise routing
 /// without standing up a full gateway.
 fn progress_routes() -> &'static Arc<Mutex<ProgressRoutes>> {
@@ -5060,6 +5069,7 @@ fn cold_start_target(
     server: &str,
     tool: &str,
     cancel: Option<&downstream::CancelContext>,
+    client_meta: Option<&Value>,
 ) -> Result<Option<String>, Value> {
     let failure =
         |text: String| json!({"content": [{"type": "text", "text": text}], "isError": true});
@@ -5103,13 +5113,20 @@ fn cold_start_target(
     }
     view.prepare_lazy_use(server);
     view.kick_pending(server, |id| id == server);
+    cold_start_progress(client_meta, server, ColdStartPhase::Starting);
     let candidates = [server.to_string()];
     let only_target = |id: &str| id == server;
+    // As long as this server may take to start, so a slow start is never cut
+    // short; Cancel still ends the wait at once.
+    let start_wait = reg.servers.iter().find(|entry| entry.id == server).map_or(
+        downstream::SETUP_CATALOG_WAIT_BUDGET,
+        conduit_lib::playground::start_wait,
+    );
     let fresh = wait_for_first_catalog(
         router,
         Some(fresh),
         live_router,
-        downstream::SETUP_CATALOG_WAIT_BUDGET,
+        start_wait,
         &candidates,
         only_target,
         |view| view.exposed_tool_name(server, tool).is_some(),
@@ -5139,7 +5156,48 @@ fn cold_start_target(
         false,
     )
     .map_err(|message| failure(format!("Toolport: {message}")))?;
+    cold_start_progress(client_meta, server, ColdStartPhase::Started);
     Ok(Some(alias))
+}
+
+#[derive(Clone, Copy)]
+enum ColdStartPhase {
+    Starting,
+    Started,
+}
+
+/// Tell the client its call is waiting for the server to start, and when that
+/// is over, as progress on the request's own `progressToken`. Sent only when the
+/// request asked for it with [`downstream::START_NOTICES_META_KEY`] and the
+/// progress can be delivered.
+fn cold_start_progress(client_meta: Option<&Value>, server: &str, phase: ColdStartPhase) {
+    let asked = client_meta
+        .and_then(|meta| meta.get(downstream::START_NOTICES_META_KEY))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !asked {
+        return;
+    }
+    let (Some(_route), Some(relayed)) = prepare_progress(client_meta, None, server) else {
+        return;
+    };
+    let (Some(token), Some(dispatch)) = (relayed.get("progressToken"), PROGRESS_DISPATCH.get())
+    else {
+        return;
+    };
+    let (progress, name, message) = match phase {
+        ColdStartPhase::Starting => (0, "starting", format!("Starting {server}")),
+        ColdStartPhase::Started => (1, "started", format!("Started {server}")),
+    };
+    dispatch(
+        server.to_string(),
+        json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": {
+            "progressToken": token,
+            "progress": progress,
+            "message": message,
+            "_meta": {"toolport/phase": name, "toolport/serverId": server},
+        }}),
+    );
 }
 
 /// Startup may outlast a policy edit, so check on both sides of the wait.
@@ -5449,8 +5507,16 @@ fn execute_call(
             // A cached route proves identity, not current safety metadata. Keep
             // the existing readiness wait before classifying a known call.
             for owner in &candidates {
+                // A known server that is not up yet: say the call waits for it.
+                let starting = view.lazy_starting(owner);
+                if starting {
+                    cold_start_progress(client_meta, owner, ColdStartPhase::Starting);
+                }
                 if let Err(message) = view.wait_for_server(owner, cancel.as_ref(), false) {
                     return json!({"content": [{"type": "text", "text": format!("Toolport: {message}")}], "isError": true});
+                }
+                if starting {
+                    cold_start_progress(client_meta, owner, ColdStartPhase::Started);
                 }
             }
             fresh = clone_live_router(live_router);
@@ -5956,7 +6022,12 @@ fn execute_call(
         Some(&json!({ "arguments": client_arguments })),
         server_id,
     );
-    let client_meta = relay_owned.as_ref().or(client_meta);
+    // The request's ask for start notices is for the gateway, not the server.
+    let relayed = relay_owned
+        .as_ref()
+        .or(client_meta)
+        .map(without_start_notices);
+    let client_meta = relayed.as_ref();
 
     // Resolve pseudonyms LAST, immediately before the call leaves the machine, so
     // the downstream server gets real data while every model-facing path above
@@ -9038,6 +9109,7 @@ fn handle_request_with_cancel(
                             server,
                             tool,
                             cancel.as_ref(),
+                            req.get("params").and_then(|p| p.get("_meta")),
                         ) {
                             Ok(alias) => alias,
                             Err(result) => return Some(success(id, result)),
@@ -9207,7 +9279,10 @@ fn handle_request_with_cancel(
                     ));
                 }
             }
-            let client_meta = params.and_then(|p| p.get("_meta")).cloned();
+            // The start notices ask is for the gateway alone; never relay it.
+            let client_meta = params
+                .and_then(|p| p.get("_meta"))
+                .map(without_start_notices);
             let mrtr = MrtrRequest::from_params(params);
             let (_progress_route, relay_owned) = match router.resource_server(uri) {
                 Some(owner) => prepare_progress(client_meta.as_ref(), params, owner),
@@ -9363,7 +9438,10 @@ fn handle_request_with_cancel(
                     ));
                 }
             }
-            let client_meta = params.and_then(|p| p.get("_meta")).cloned();
+            // The start notices ask is for the gateway alone; never relay it.
+            let client_meta = params
+                .and_then(|p| p.get("_meta"))
+                .map(without_start_notices);
             let mrtr = MrtrRequest::from_params(params);
             let (_progress_route, relay_owned) = match router.prompt_server(name) {
                 Some(owner) => prepare_progress(client_meta.as_ref(), params, owner),

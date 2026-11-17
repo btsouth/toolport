@@ -613,6 +613,13 @@ pub const PER_HOP_META_KEYS: [&str; 3] = [
     "io.modelcontextprotocol/clientCapabilities",
 ];
 
+/// A request asks the gateway to say, as progress on its own token, when the
+/// call waits for its server to start. Only Toolport's Tools tab sends it: the
+/// notices carry their own progress values, so a client that also reads the
+/// server's progress on that token could see the count go backwards. The
+/// gateway reads it and does not pass it on to the server.
+pub const START_NOTICES_META_KEY: &str = "app.toolport/startNotices";
+
 /// Keys relayed only once Toolport can honour what they ask for.
 ///
 /// `progressToken` lived here until the gateway learned to route

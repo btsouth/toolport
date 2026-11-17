@@ -23,6 +23,9 @@ pub(super) struct ServerToolsPanel {
 
 #[derive(Clone)]
 struct ToolPolicy {
+    /// The server's name, for "Starting {server}…" without a registry read on
+    /// the UI thread.
+    name: String,
     disabled: std::collections::HashSet<String>,
     pinned: std::collections::HashSet<String>,
     overrides: std::collections::HashMap<String, crate::registry::ToolOverride>,
@@ -151,6 +154,11 @@ impl ServerToolsPanel {
             let result = gtk::gio::spawn_blocking(move || {
                 let capabilities = crate::playground::capabilities(&server_id)?;
                 let registry = crate::registry::load()?;
+                let name = registry
+                    .servers
+                    .iter()
+                    .find(|server| server.id == server_id)
+                    .map_or_else(|| server_id.clone(), |server| server.name.clone());
                 let disabled = registry
                     .servers
                     .iter()
@@ -170,6 +178,7 @@ impl ServerToolsPanel {
                 Ok::<_, String>((
                     capabilities,
                     ToolPolicy {
+                        name,
                         disabled,
                         pinned,
                         overrides,
@@ -684,9 +693,24 @@ fn tool_row(
         let name = name_for_run.clone();
         let title = crate::i18n::trf("Run {value0}", &[("value0", &name.to_string())]);
         let tool_name = name.clone();
-        open_json_action(&page, &title, &schema, move |server_id, arguments| {
-            crate::playground::call_tool(&server_id, &tool_name, arguments)
-        });
+        // A Run the dialog can cancel, and watch while the server starts.
+        let tool_run = crate::playground::ToolRun::new();
+        let run_for_call = tool_run.clone();
+        open_json_action(
+            &page,
+            &title,
+            &schema,
+            Some(tool_run),
+            move |server_id, arguments| {
+                crate::playground::call_tool_run(
+                    &server_id,
+                    &tool_name,
+                    arguments,
+                    &run_for_call,
+                    |_| {},
+                )
+            },
+        );
     });
 
     row.append(&visibility);
@@ -931,6 +955,7 @@ fn prompt_row(prompt: serde_json::Value, page: ServerToolsPanel) -> gtk::Box {
             &page,
             &title,
             &serde_json::json!({"type": "object"}),
+            None,
             move |server_id, arguments| {
                 crate::playground::get_prompt(&server_id, &prompt_name, arguments)
             },
@@ -1217,6 +1242,7 @@ fn open_json_action(
     page: &ServerToolsPanel,
     title: &str,
     schema: &serde_json::Value,
+    tool_run: Option<crate::playground::ToolRun>,
     execute: impl FnOnce(String, serde_json::Value) -> Result<serde_json::Value, String>
         + Send
         + 'static,
@@ -1369,12 +1395,17 @@ fn open_json_action(
     root.append(&actions);
     shell.append(&root);
     dialog.set_content(Some(&shell));
-    // Cancelling mid-call abandons the wait (the server finishes on its own);
-    // the completion handler checks this before touching the closed dialog.
+    // Cancelling mid-call cancels a tool Run in the gateway, including a wait
+    // for the server to start; other actions only stop waiting. The completion
+    // handler checks this before touching the closed dialog.
     let cancelled = Rc::new(Cell::new(false));
     let cancelled_on_close = cancelled.clone();
+    let run_on_close = tool_run.clone();
     dialog.connect_close_request(move |_| {
         cancelled_on_close.set(true);
+        if let Some(run) = &run_on_close {
+            run.cancel();
+        }
         gtk::glib::Propagation::Proceed
     });
     let dialog_for_cancel = dialog.clone();
@@ -1386,6 +1417,12 @@ fn open_json_action(
     let Some(server_id) = page.selected_server_id() else {
         return;
     };
+    let server_name = tool_run.as_ref().map(|_| {
+        page.last_load
+            .borrow()
+            .as_ref()
+            .map_or_else(|| server_id.clone(), |(_, policy)| policy.name.clone())
+    });
     let execute = Rc::new(RefCell::new(Some(execute)));
     let execute_for_run = execute.clone();
     let dialog_for_run = dialog.clone();
@@ -1442,18 +1479,25 @@ fn open_json_action(
         {
             let feedback = feedback.clone();
             let done = done.clone();
-            gtk::glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
+            let tool_run = tool_run.clone();
+            let server_name = server_name.clone();
+            // A quarter second, so "Starting" shows as soon as the gateway says
+            // so; the text changes only once a second.
+            gtk::glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
                 if done.get() {
                     return gtk::glib::ControlFlow::Break;
                 }
-                set_dialog_status(
-                    &feedback,
-                    &crate::i18n::trf(
-                        "Calling… {seconds}s",
-                        &[("seconds", &started.elapsed().as_secs().to_string())],
+                let seconds = started.elapsed().as_secs().to_string();
+                let text = match (&tool_run, &server_name) {
+                    (Some(run), Some(name)) if run.is_starting() => crate::i18n::trf(
+                        "Starting {value0}… {value1}s",
+                        &[("value0", name), ("value1", &seconds)],
                     ),
-                    false,
-                );
+                    _ => crate::i18n::trf("Calling… {seconds}s", &[("seconds", &seconds)]),
+                };
+                if feedback.label() != text {
+                    set_dialog_status(&feedback, &text, false);
+                }
                 gtk::glib::ControlFlow::Continue
             });
         }
@@ -1720,6 +1764,7 @@ mod tests {
                 &panel,
                 "B4 pending tool",
                 &serde_json::json!({"type": "object"}),
+                None,
                 move |_, _| {
                     did_start.store(true, Ordering::SeqCst);
                     gate.recv_timeout(std::time::Duration::from_secs(3))

@@ -1438,16 +1438,59 @@ async fn list_server_tools(
 /// the audit log, just like a call routed through the gateway.
 #[tauri::command]
 async fn call_tool(
+    app: tauri::AppHandle,
     _state: State<'_, RegistryState>,
     server_id: String,
     tool: String,
     arguments: serde_json::Value,
+    run_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::playground::call_tool(&server_id, &tool, arguments)
+    let run = crate::playground::ToolRun::new();
+    if let Some(id) = &run_id {
+        tool_runs().insert(id.clone(), run.clone());
+    }
+    let result = tauri::async_runtime::spawn_blocking({
+        let run = run.clone();
+        let run_id = run_id.clone();
+        move || {
+            crate::playground::call_tool_run(&server_id, &tool, arguments, &run, move |phase| {
+                let Some(run_id) = &run_id else { return };
+                let phase = match phase {
+                    crate::playground::RunPhase::Starting => "starting",
+                    crate::playground::RunPhase::Started => "started",
+                };
+                let _ = app.emit(
+                    "tool-run-progress",
+                    serde_json::json!({"runId": run_id, "phase": phase}),
+                );
+            })
+        }
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string());
+    if let Some(id) = &run_id {
+        tool_runs().remove(id);
+    }
+    result?
+}
+
+/// Runs the Tools tab can still cancel, by the id the frontend gave each one.
+fn tool_runs(
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<String, crate::playground::ToolRun>> {
+    static RUNS: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<String, crate::playground::ToolRun>>,
+    > = std::sync::OnceLock::new();
+    RUNS.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Cancel a Tools tab Run, including one still waiting for its server to start.
+#[tauri::command]
+fn cancel_tool_call(run_id: String) {
+    if let Some(run) = tool_runs().remove(&run_id) {
+        run.cancel();
+    }
 }
 
 /// List the resources a server advertises (uri, name, mimeType). Connects on
@@ -4803,6 +4846,7 @@ pub fn run() {
             add_http_client,
             remove_http_client,
             call_tool,
+            cancel_tool_call,
             set_tool_enabled,
             set_tool_pinned,
             set_safety_level,
