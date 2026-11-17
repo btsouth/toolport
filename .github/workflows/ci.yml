@@ -371,7 +371,8 @@ jobs:
             tests::a_connected_row_with_a_migration_fits_a_narrow_window_in_every_language \
             tests::pasted_rows_offer_the_react_choices \
             credential_dialog_tests::credentials_dialog_waits_for_values_and_stays_open_after_each_write \
-            credential_dialog_tests::authentication_dialog_confirms_removals_and_keeps_focus_and_caption
+            credential_dialog_tests::authentication_dialog_confirms_removals_and_keeps_focus_and_caption \
+            credential_dialog_tests::a_locked_keyring_asks_once_per_click_and_unknown_is_not_absent
           do
             xvfb-run -a dbus-run-session -- cargo test \
               --manifest-path src-tauri/Cargo.toml --no-default-features \
