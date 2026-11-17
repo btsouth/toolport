@@ -6,6 +6,14 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Added
+
+- T3 Code's OpenCode, Grok and Pi instances with their own home now get a row on
+  the Clients page once the home exists, and connect like any other client. The
+  T3 Code card no longer asks you to add them by hand, Connect all includes them,
+  and Activity shows "OpenCode via T3 Code". Settings Pi saves in Toolport's entry
+  are kept when Toolport rewrites it.
+
 ### Fixed
 
 - On Linux, a T3 Code OpenCode instance, or any client run with its own

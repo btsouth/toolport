@@ -128,15 +128,9 @@ pub enum T3CodeGap {
     /// This instance's home folder, or the config file in it, is a link or not a plain
     /// folder or file, so Toolport does not make it a row it could write to.
     LinkedHome,
-    /// This instance's home folder does not exist yet.
+    /// This instance's home folder does not exist yet. For OpenCode, the `opencode`
+    /// folder inside its `XDG_CONFIG_HOME`.
     MissingHome,
-    /// A Grok or Pi instance's home folder, existing or not yet, that no Clients row
-    /// covers. Toolport makes rows only for Claude Code and Codex homes, so this one has
-    /// to be added by hand as a client location.
-    UnlistedHome,
-    /// [`T3CodeGap::UnlistedHome`] for OpenCode, whose home is its `XDG_CONFIG_HOME`: the
-    /// location added by hand is the `opencode` folder inside it.
-    UnlistedOpenCodeHome,
 }
 
 /// A T3 Code instance Toolport cannot connect, shown on the T3 Code card.
@@ -1156,12 +1150,9 @@ fn outside_covered(outside: &[Outside]) -> Vec<usize> {
         .collect()
 }
 
-/// Instances with a home of their own that no Clients row covers, with why. For Claude
-/// Code and Codex: the folder does not exist yet, or it or its config file is a link or
-/// not a plain folder or file ([`walk_below_home`]). For the other providers (OpenCode,
-/// Grok, Pi), whose homes never become rows by themselves: a link or not plain as for
-/// Claude Code and Codex, and otherwise, existing or not, a home to add by hand. A home
-/// the page lists anyway (a client's main config, a profile, a launcher or a saved
+/// Instances with a home of their own that no Clients row covers, with why: the folder
+/// does not exist yet, or it or its config file is a link or not a plain folder or file
+/// ([`walk_below_home`]). A home the page lists anyway (a client's main config, a profile, a launcher or a saved
 /// location) is not one. Only homes that passed [`lexically_inside`] get here. A home that
 /// passed the walk is compared with the listed rows by where it resolves to; one that did
 /// not is compared by its text only, so nothing it names is followed.
@@ -1177,24 +1168,13 @@ fn home_gaps(instances: &[Instance]) -> Vec<T3CodeOther> {
         .filter_map(|instance| {
             let path = instance.config_path.as_deref()?;
             let walk = walk_below_home(path, &home);
-            let gap = if matches!(instance.provider, Provider::ClaudeCode | Provider::Codex) {
-                match walk {
-                    HomeWalk::Plain => return None,
-                    HomeWalk::Missing => T3CodeGap::MissingHome,
-                    HomeWalk::Link | HomeWalk::NotPlain => T3CodeGap::LinkedHome,
-                }
-            } else {
-                // These homes only label rows that already exist, so one with no row is
-                // listed whether its folder exists or not.
-                match walk {
-                    HomeWalk::Plain | HomeWalk::Missing
-                        if instance.provider == Provider::OpenCode =>
-                    {
-                        T3CodeGap::UnlistedOpenCodeHome
-                    }
-                    HomeWalk::Plain | HomeWalk::Missing => T3CodeGap::UnlistedHome,
-                    HomeWalk::Link | HomeWalk::NotPlain => T3CodeGap::LinkedHome,
-                }
+            let gap = match walk {
+                // OpenCode reads `opencode.jsonc` when only that exists: a link there
+                // makes no row either.
+                HomeWalk::Plain if !opencode_jsonc_is_plain(path) => T3CodeGap::LinkedHome,
+                HomeWalk::Plain => return None,
+                HomeWalk::Missing => T3CodeGap::MissingHome,
+                HomeWalk::Link | HomeWalk::NotPlain => T3CodeGap::LinkedHome,
             };
             // The same text below the resolved home, for rows listed by resolved path.
             let below: PathBuf = path.components().skip(home.components().count()).collect();
@@ -1232,6 +1212,25 @@ fn home_gaps(instances: &[Instance]) -> Vec<T3CodeOther> {
             })
         })
         .collect()
+}
+
+/// The `opencode.jsonc` beside an OpenCode `opencode.json`, which a location added by
+/// hand may name instead when only that file exists.
+fn jsonc_twin(config: &Path) -> Option<PathBuf> {
+    config
+        .file_name()
+        .is_some_and(|name| name == "opencode.json")
+        .then(|| config.with_extension("jsonc"))
+}
+
+/// For an OpenCode `opencode.json` path, whether the `opencode.jsonc` beside it is absent
+/// or a plain file reached without a link, since OpenCode reads that one when only it
+/// exists. Any other path passes.
+fn opencode_jsonc_is_plain(config: &Path) -> bool {
+    let Some(twin) = jsonc_twin(config) else {
+        return true;
+    };
+    home().is_some_and(|home| walk_below_home(&twin, &home) == HomeWalk::Plain)
 }
 
 fn default_config_path(provider: Provider) -> Option<PathBuf> {
@@ -1279,20 +1278,16 @@ pub(super) fn path_is_safe(config: &Path) -> bool {
         .is_some_and(|root| walk_below_home(config, &root) == HomeWalk::Plain)
 }
 
-/// Locations for T3 Code's Claude Code and Codex homes that are not a client's main
-/// config and that `known` does not already list. Homes whose folder does not exist yet
-/// are left out until it does; [`other_instances`] lists them, and the other homes left
-/// out, on the card.
+/// Locations for T3 Code's provider homes (Claude Code, Codex, OpenCode, Grok and Pi)
+/// that are not a client's main config and that `known` does not already list. Homes
+/// whose folder does not exist yet are left out until it does; [`other_instances`] lists
+/// them, and the other homes left out, on the card.
 pub(super) fn automatic(known: &[locations::ClientLocation]) -> Vec<locations::ClientLocation> {
     let mut rows: Vec<locations::ClientLocation> = Vec::new();
-    // Only Claude Code and Codex homes become rows; other providers' homes only label
-    // rows that already exist.
+    // Cursor and Kiro instances use the user's own config, which has its own row.
     let homes: Vec<Instance> = instances()
         .into_iter()
-        .filter(|instance| {
-            matches!(instance.provider, Provider::ClaudeCode | Provider::Codex)
-                && instance.config_path.is_some()
-        })
+        .filter(|instance| instance.config_path.is_some())
         .collect();
     if homes.is_empty() {
         return rows;
@@ -1310,12 +1305,12 @@ pub(super) fn automatic(known: &[locations::ClientLocation]) -> Vec<locations::C
         if main
             .as_ref()
             .is_some_and(|main| locations::same_path(main, &config_path))
-            || known
-                .iter()
-                .chain(&saved)
-                .chain(rows.iter())
-                .any(|row| row_has_path(row, &config_path))
+            || known.iter().chain(&saved).chain(rows.iter()).any(|row| {
+                row_has_path(row, &config_path)
+                    || jsonc_twin(&config_path).is_some_and(|twin| row_has_path(row, &twin))
+            })
             || !path_is_safe(&config_path)
+            || !opencode_jsonc_is_plain(&config_path)
         {
             continue;
         }
@@ -1489,6 +1484,9 @@ pub(super) fn annotate_with(clients: &mut [DetectedClient], instances: &[Instanc
     }
 }
 
+#[cfg(test)]
+#[path = "t3code_homes_tests.rs"]
+mod homes_tests;
 #[cfg(test)]
 #[path = "t3code_tests.rs"]
 mod tests;

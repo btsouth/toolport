@@ -493,6 +493,54 @@ impl CodexValue {
 }
 
 /// Codex, including a Codex home added as a location (`codex@<key>`).
+/// Keys Pi itself saves into a server's entry (its `enabled` switch and how its tools
+/// are exposed and kept running). Pi edits them in place, so a rewrite of Toolport's
+/// entry keeps them, and they never make the entry count as changed by hand.
+const PI_ENTRY_SETTINGS: [&str; 5] = [
+    "enabled",
+    "exposure",
+    "toolExposure",
+    "lifecycle",
+    "idleTimeout",
+];
+
+/// `entry` with the [`PI_ENTRY_SETTINGS`] Pi saved into Toolport's current entry in
+/// `path`, for a Pi row. Any other client, or a file without such an entry, gets
+/// `entry` as it is.
+fn with_pi_settings(
+    client_id: &str,
+    format: Format,
+    path: &Path,
+    entry: &ServerEntry,
+) -> ServerEntry {
+    let mut entry = entry.clone();
+    if !(client_id == "pi" || client_id.starts_with("pi@"))
+        || !matches!(format, Format::JsonMcpServers)
+    {
+        return entry;
+    }
+    let Some(root) = read_config_file(path)
+        .ok()
+        .and_then(|text| mutation::value(format, Some(&text)).ok())
+    else {
+        return entry;
+    };
+    let Some(prior) = root["mcpServers"].as_object().and_then(|servers| {
+        servers
+            .iter()
+            .find(|(name, value)| gateway_edit_matches(name, value["command"].as_str()))
+            .map(|(_, value)| value)
+    }) else {
+        return entry;
+    };
+    for key in PI_ENTRY_SETTINGS {
+        if let Some(value) = prior.get(key) {
+            entry.unknown_fields.insert(key.to_string(), value.clone());
+        }
+    }
+    entry
+}
+
 fn is_codex_client(client_id: &str) -> bool {
     client_id == "codex" || client_id.starts_with("codex@")
 }
@@ -9562,6 +9610,12 @@ fn edit_json_gateway_body(
                 .unwrap()
                 .insert("tools".into(), serde_json::json!(["*"]));
         }
+        // Settings the client keeps in Toolport's entry (Pi's), never over its shape.
+        if let Some(fields) = value.as_object_mut() {
+            for (key, setting) in &entry.unknown_fields {
+                fields.entry(key.clone()).or_insert_with(|| setting.clone());
+            }
+        }
         servers.insert(GATEWAY_ENTRY_NAME.to_string(), value);
     }
 
@@ -9742,7 +9796,8 @@ fn install_or_remove_inner(
     if let Some(record) = managed.as_mut().filter(|_| is_codex_client(client_id)) {
         record.codex_settings = codex_setting_keys(false);
     }
-    edit_format(def.format, &path, entry, lenient)?;
+    let entry = entry.map(|entry| with_pi_settings(client_id, def.format, &path, entry));
+    edit_format(def.format, &path, entry.as_ref(), lenient)?;
     Ok(WriteOutcome {
         existed_before: true,
         path: path.display().to_string(),
