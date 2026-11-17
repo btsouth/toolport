@@ -476,7 +476,43 @@ def check(home, manifest_path, entries_dir, expect_connected=True, registry=None
     return rows
 
 
-def compare(home, manifest_path, label):
+# The repairs 2.3.7 makes to Toolport's own entry on its first start (#1340): the
+# `type` these clients document as required, added when it is missing, and the
+# gateway path written in canonical form. An upgrade may make exactly these.
+REPAIRED_TYPES = {"cursor": "stdio", "vscode": "stdio", "github-copilot-cli": "local"}
+
+
+def upgrade_repairs(cid, before_path, after_path):
+    """The repairs that turn the config at before_path into the one at after_path,
+    or None when anything else changed (or either file cannot be read)."""
+    import copy
+
+    client = BY_ID.get(cid)
+    if client is None or client["format"] not in USER_TABLES:
+        return None
+    try:
+        before, after = load(client, before_path), load(client, after_path)
+    except Exception:
+        return None
+    table = USER_TABLES[client["format"]]
+    expected = copy.deepcopy(before)
+    entry = ((expected or {}).get(table) or {}).get("toolport")
+    if not isinstance(entry, dict):
+        return None
+    repairs = []
+    if cid in REPAIRED_TYPES and "type" not in entry:
+        entry["type"] = REPAIRED_TYPES[cid]
+        repairs.append(f'added type "{REPAIRED_TYPES[cid]}"')
+    command = entry.get("command")
+    if isinstance(command, str) and os.path.isabs(command) and os.path.normpath(command) != command:
+        entry["command"] = os.path.normpath(command)
+        repairs.append(f"gateway path made canonical ({entry['command']})")
+    if not repairs or expected != after:
+        return None
+    return repairs
+
+
+def compare(home, manifest_path, label, allow_upgrade_repairs=False):
     with open(manifest_path, encoding="utf-8") as f:
         manifest = json.load(f)
     originals = os.path.splitext(manifest_path)[0] + "-originals"
@@ -502,6 +538,10 @@ def compare(home, manifest_path, label):
                     after = f.read()
             except OSError as e:
                 rows.append(row("clients", "FAIL", f"{name} {label}", f"{path} differs; no diff: {e}"))
+                continue
+            repairs = upgrade_repairs(cid, os.path.join(originals, cid), path) if allow_upgrade_repairs else None
+            if repairs:
+                rows.append(row("clients", "PASS", f"{name} {label}", "only Toolport's entry was repaired: " + "; ".join(repairs)))
                 continue
             import difflib
 
@@ -558,9 +598,9 @@ def main(argv):
     elif cmd == "restored":
         rows = compare(home, manifest, "config restored byte-exact")
     elif cmd == "unchanged":
-        rows = compare(home, manifest, "config untouched by the upgrade")
+        rows = compare(home, manifest, "config untouched by the upgrade", allow_upgrade_repairs=True)
     elif cmd == "updated":
-        rows = compare(home, manifest, "config untouched by the in-app update")
+        rows = compare(home, manifest, "config untouched by the in-app update", allow_upgrade_repairs=True)
     elif cmd == "snapshot":
         rows = snapshot(manifest, argv[4] if len(argv) > 4 else manifest)
     else:

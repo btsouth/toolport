@@ -123,6 +123,69 @@ class ClientsTest(unittest.TestCase):
         rows = clients.compare(self.home, snap, "untouched")
         self.assertEqual(statuses(rows, "Cursor untouched"), ["FAIL"])
 
+    def snapshot_with(self, cid, entry):
+        """Connect cid with entry as the previous release wrote it, then snapshot."""
+        table = clients.USER_TABLES[clients.BY_ID[cid]["format"]]
+        self.edit_json(cid, lambda d: d.setdefault(table, {}).update(toolport=dict(entry)))
+        snap = os.path.join(self.tmp.name, "ev", "snap.json")
+        clients.snapshot(self.manifest, snap)
+        return snap, table
+
+    def test_the_2_3_7_repairs_pass_and_nothing_else_does(self):
+        old = {"command": self.gw, "env": {"TOOLPORT_CLIENT_ID": "cursor"}}
+        for cid, kind in [("cursor", "stdio"), ("vscode", "stdio"), ("github-copilot-cli", "local")]:
+            name = clients.BY_ID[cid]["name"]
+            snap, table = self.snapshot_with(cid, old)
+            self.edit_json(cid, lambda d: d[table]["toolport"].update(type=kind))
+            rows = clients.compare(self.home, snap, "untouched", allow_upgrade_repairs=True)
+            self.assertEqual(statuses(rows, f"{name} untouched"), ["PASS"], cid)
+            self.assertIn("repaired", [r for r in rows if name in r][0])
+            # Not when byte-exact is asked for.
+            rows = clients.compare(self.home, snap, "restored")
+            self.assertEqual(statuses(rows, f"{name} restored"), ["FAIL"], cid)
+            # Not another type, and not the repair plus anything else.
+            for change in (
+                lambda d: d[table]["toolport"].update(type="sse"),
+                lambda d: d[table]["toolport"].update(args=["--extra"]),
+                lambda d: d[table].pop("filesystem", None) or d.update(extra=1),
+            ):
+                self.edit_json(cid, lambda d: d[table]["toolport"].update(type=kind))
+                self.edit_json(cid, change)
+                rows = clients.compare(self.home, snap, "untouched", allow_upgrade_repairs=True)
+                self.assertEqual(statuses(rows, f"{name} untouched"), ["FAIL"], cid)
+            self.edit_json(cid, lambda d: d[table].update(toolport=dict(old)))
+        # A client 2.3.7 does not add a type to.
+        snap, table = self.snapshot_with("claude-code", old)
+        self.edit_json("claude-code", lambda d: d[table]["toolport"].update(type="stdio"))
+        rows = clients.compare(self.home, snap, "untouched", allow_upgrade_repairs=True)
+        self.assertEqual(statuses(rows, "Claude Code untouched"), ["FAIL"])
+
+    def test_a_canonical_gateway_path_passes(self):
+        bundle = os.path.join(self.tmp.name, "Toolport.app", "Contents")
+        os.makedirs(os.path.join(bundle, "MacOS"))
+        canonical = os.path.join(bundle, "Helpers", "toolport-gateway")
+        old = {"command": os.path.join(bundle, "MacOS", "..", "Helpers", "toolport-gateway")}
+        snap, table = self.snapshot_with("claude-code", old)
+        self.edit_json("claude-code", lambda d: d[table]["toolport"].update(command=canonical))
+        rows = clients.compare(self.home, snap, "untouched", allow_upgrade_repairs=True)
+        self.assertEqual(statuses(rows, "Claude Code untouched"), ["PASS"])
+        # Another path is not a repair.
+        self.edit_json("claude-code", lambda d: d[table]["toolport"].update(command=canonical + "-2"))
+        rows = clients.compare(self.home, snap, "untouched", allow_upgrade_repairs=True)
+        self.assertEqual(statuses(rows, "Claude Code untouched"), ["FAIL"])
+        if clients.tomllib:
+            codex = self.path("codex")
+            with open(codex, "a") as f:
+                f.write(f'\n[mcp_servers.toolport]\ncommand = "{old["command"]}"\n')
+            snap = os.path.join(self.tmp.name, "ev", "snap2.json")
+            clients.snapshot(self.manifest, snap)
+            with open(codex) as f:
+                text = f.read()
+            with open(codex, "w") as f:
+                f.write(text.replace(old["command"], canonical))
+            rows = clients.compare(self.home, snap, "untouched", allow_upgrade_repairs=True)
+            self.assertEqual(statuses(rows, "Codex untouched"), ["PASS"])
+
     def cursor_connected(self, user=None):
         def change(d):
             d["mcpServers"]["toolport"] = {"command": self.gw, "args": [], "env": {"TOOLPORT_CLIENT_ID": "cursor"}}
