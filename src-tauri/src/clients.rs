@@ -11179,6 +11179,10 @@ mod tests {
     #[test]
     fn unwritable_or_unreadable_configs_name_the_file() {
         use std::os::unix::fs::PermissionsExt;
+        // Root ignores the permission bits these failures come from.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
         let root = std::env::temp_dir().join(format!(
             "toolport-unwritable-config-{}-{}",
             std::process::id(),
@@ -11202,7 +11206,10 @@ mod tests {
         let disk = read_config_file_disk(&path).map(|_| ());
         mode(&path, 0o644);
         std::fs::remove_dir_all(&root).unwrap();
-        let shown = path.display().to_string();
+        // As the error shows it: `~/...` when HOME holds the temp folder.
+        let shown = name_file_in_error(&path, "(os error 0)".into())
+            .trim_end_matches(": (os error 0)")
+            .to_string();
         for (what, result) in [
             ("write", write),
             ("remove", remove),

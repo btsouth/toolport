@@ -6597,10 +6597,17 @@ API_KEY = "synthetic-first-origin"
     #[test]
     fn connect_and_disconnect_errors_name_the_config_file() {
         use std::os::unix::fs::PermissionsExt;
+        // Root ignores the permission bits these failures come from.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
         let fixture = MoveFixture::new(&Registry::default());
         let config = fixture.claude();
         let folder = config.parent().unwrap().to_path_buf();
-        let shown = config.display().to_string();
+        // As the error shows it: `~/...` when HOME holds the fixture.
+        let shown = crate::clients::name_file_in_error(&config, "(os error 0)".into())
+            .trim_end_matches(": (os error 0)")
+            .to_string();
         let named = |error: Option<String>, what: &str| {
             let error = error.unwrap_or_else(|| panic!("{what} should fail"));
             assert!(
