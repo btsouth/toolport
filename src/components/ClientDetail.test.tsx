@@ -1,11 +1,18 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, renderHook, screen, waitFor, within } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import userEvent from "@testing-library/user-event";
 import { ClientDetail } from "./ClientDetail";
 import { setLanguage } from "@/lib/i18n";
 import {
+  resetClientNotices,
+  setConnectNotice,
+  setDetailNotice,
+  useClientNotices,
+} from "@/lib/clientNotice";
+import {
   importServers,
+  setClientDiscovery,
   previewImportServers,
   listClientRecoveries,
   retryClientRecovery,
@@ -93,6 +100,7 @@ function emptyRegistry(): Registry {
 }
 
 beforeEach(() => {
+  resetClientNotices();
   vi.mocked(listClientRecoveries).mockResolvedValue([]);
   vi.mocked(importServers).mockReset();
   vi.mocked(previewImportServers).mockReset().mockResolvedValue([]);
@@ -167,6 +175,13 @@ it("uses bulk review storage choices and leaves unsupported servers unchecked", 
       onRegistryChange={vi.fn()}
     />,
   );
+  // The same chevron fold marker as the connect dialogs and GTK's expander.
+  expect(
+    screen
+      .getByText("How importing works")
+      .closest("summary")!
+      .querySelector('[data-slot="disclosure-chevron"]'),
+  ).not.toBeNull();
   await userEvent.click(screen.getByRole("button", { name: "Import all (2)" }));
   const choice = await screen.findByRole("checkbox", { name: /Keep PORT in keychain/ });
   expect(choice).not.toBeChecked();
@@ -1117,4 +1132,117 @@ it("shows the recovery card a Disconnect leaves at once, without a rescan", asyn
   expect(
     within(card).getByText(/WEATHER_API_KEY for weather-demo: keyring locked/),
   ).toBeVisible();
+});
+
+it("draws Disconnect as the tinted destructive trigger", () => {
+  render(
+    <ClientDetail
+      client={client({ gatewayInstalled: true, entryState: "managed" })}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  const disconnect = screen.getByRole("button", { name: "Disconnect" });
+  expect(disconnect).toHaveAttribute("data-variant", "destructive");
+  expect(disconnect).not.toHaveAttribute("data-confirm");
+  expect(disconnect).toHaveClass("bg-destructive/12", "text-destructive");
+  expect(disconnect.className).not.toMatch(/dark:bg-destructive\/20(\s|$)/);
+});
+
+it("keeps a connect's restart reminder for the Clients list until it is dismissed", async () => {
+  migrateClient.mockResolvedValue({
+    registry: emptyRegistry(),
+    tools: [],
+    servers: [],
+    outcome: { path: "/fixture/client.json", backup: null },
+  });
+  const store = renderHook(() => useClientNotices());
+  const view = render(
+    <ClientDetail
+      client={client()}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  await userEvent.click(screen.getByRole("button", { name: /connect to toolport/i }));
+  await userEvent.click(
+    await within(await screen.findByRole("dialog")).findByRole("button", {
+      name: /connect to toolport/i,
+    }),
+  );
+  await userEvent.click(await screen.findByRole("button", { name: "Done" }));
+  expect(await screen.findByText("Not live yet")).toBeVisible();
+  expect(store.result.current.list).toMatchObject({
+    clientId: "claude-desktop",
+    title: "Not live yet",
+  });
+  // Leaving the page keeps it, for the list and for coming back.
+  view.unmount();
+  render(
+    <ClientDetail
+      client={client()}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  const card = screen.getByText("Not live yet").closest('[data-slot="status-card"]')!;
+  await userEvent.click(
+    within(card as HTMLElement).getByRole("button", { name: "Dismiss" }),
+  );
+  expect(screen.queryByText("Not live yet")).not.toBeInTheDocument();
+  expect(store.result.current).toEqual({ detail: null, list: null });
+});
+
+it("shows a client's list reminder on its details after another client's feedback", () => {
+  const reminder = {
+    clientId: "claude-desktop",
+    title: "Not live yet",
+    text: "Restart Claude Desktop so it loads Toolport.",
+  };
+  setConnectNotice(reminder);
+  // Codex's feedback replaces the details notice; the list still names Claude Desktop.
+  setDetailNotice({ clientId: "codex", title: "refused", text: "" });
+  render(
+    <ClientDetail
+      client={client()}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  expect(screen.getByText("Not live yet")).toBeVisible();
+  expect(screen.queryByText("refused")).not.toBeInTheDocument();
+});
+
+it("drops discovery feedback that arrives after the details page closed", async () => {
+  const reminder = {
+    clientId: "cursor",
+    title: "Not live yet",
+    text: "Restart Cursor so it loads Toolport.",
+  };
+  setConnectNotice(reminder);
+  let finish: (registry: Registry) => void = () => {};
+  vi.mocked(setClientDiscovery).mockReturnValue(
+    new Promise<Registry>((resolve) => {
+      finish = resolve;
+    }),
+  );
+  const store = renderHook(() => useClientNotices());
+  const view = render(
+    <ClientDetail
+      client={client({ id: "codex", name: "Codex" })}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  await userEvent.click(screen.getByRole("combobox", { name: "Discovery mode" }));
+  await userEvent.click(await screen.findByRole("option", { name: "Lazy · search" }));
+  expect(setClientDiscovery).toHaveBeenCalledWith("codex", "lazy");
+  view.unmount();
+  await act(async () => finish(emptyRegistry()));
+  expect(store.result.current).toEqual({ detail: reminder, list: reminder });
 });

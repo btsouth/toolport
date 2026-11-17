@@ -479,3 +479,44 @@ it("leaves a single Connect asking as before when its review asked", async () =>
     "reviewed",
   );
 });
+
+it("sizes both connect dialogs 512px with 17/600 titles, chevron folds and mono paths", async () => {
+  api.migrateClient.mockResolvedValue({
+    registry: { servers: [] },
+    outcome: { path: "/fixture/config", backup: "/fixture/backups/config.bak" },
+    backupDate: 1_700_000_000,
+    tools: [],
+    servers: [],
+  });
+  render(
+    <ConnectReviewDialog
+      clientId="fixture"
+      clientName="Fixture"
+      onClose={vi.fn()}
+      onConnected={vi.fn()}
+    />,
+  );
+  await screen.findByRole("button", { name: /one/ });
+  expect(screen.getByRole("dialog")).toHaveClass("sm:max-w-lg");
+  expect(screen.getByRole("heading", { name: "Review and connect Fixture" })).toHaveClass(
+    "text-[17px]",
+    "font-semibold",
+  );
+  await userEvent.click(screen.getByRole("button", { name: "Connect to Toolport" }));
+  const title = await screen.findByRole("heading", { name: "Fixture connected" });
+  expect(title).toHaveClass("text-[17px]", "font-semibold");
+  expect(screen.getByRole("dialog")).toHaveClass("sm:max-w-lg");
+  for (const name of ["What your agent sees", "Details"]) {
+    const summary = screen.getByText(name).closest("summary")!;
+    expect(summary.querySelector('[data-slot="disclosure-chevron"]')).not.toBeNull();
+  }
+  expect(screen.getByText("Config: /fixture/config")).toHaveClass(
+    "font-mono",
+    "text-[13px]",
+  );
+  expect(screen.getByText("Backup: /fixture/backups/config.bak")).toHaveClass(
+    "font-mono",
+    "text-[13px]",
+  );
+  expect(screen.getByText(/^Backup saved /)).not.toHaveClass("font-mono");
+});

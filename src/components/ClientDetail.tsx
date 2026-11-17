@@ -1,5 +1,5 @@
 import { msg, Trans, translate, useI18n, type SourceMessage } from "@/lib/i18n";
-import { useEffect, useId, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   ArrowRight,
   Check,
@@ -48,10 +48,19 @@ import {
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ConnectReviewDialog } from "@/components/ConnectReviewDialog";
 import { GatewaySettingsNotice } from "@/components/GatewaySettingsNotice";
-import { ImportReviewDialog } from "@/components/ImportReviewDialog";
+import { DisclosureSummary, ImportReviewDialog } from "@/components/ImportReviewDialog";
 import { clientRestartHint, clientRestartHintAfterRemoval } from "@/lib/clientConnect";
 import { ClientRecoveryBanners } from "@/components/ClientRecoveryBanners";
 import { clientDiscovery } from "@/lib/clientDiscovery";
+import {
+  clearListNotice,
+  dismissClientNotice,
+  noticeFor,
+  releaseDetailNotice,
+  setConnectNotice,
+  setDetailNotice,
+  useClientNotices,
+} from "@/lib/clientNotice";
 
 interface Props {
   client: DetectedClient;
@@ -141,12 +150,20 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   // Keyed by client id rather than cleared in an effect: selecting another client must
   // not carry the previous one's advice across, and deriving that from the key avoids a
   // cascading-render setState-in-effect.
-  const [restartNotice, setRestartNotice] = useState<{
-    clientId: string;
-    title: string;
-    text: string;
-  } | null>(null);
-  const showRestartNotice = restartNotice?.clientId === client.id ? restartNotice : null;
+  // The notice lives in a small store: the connect reminder also shows on the Clients
+  // list, and dismissing it in either place clears both (as GTK does).
+  const showRestartNotice = noticeFor(useClientNotices(), client.id);
+  const setRestartNotice = setDetailNotice;
+  // Feedback that arrives after this page closed is dropped: it would replace another
+  // client's notice, or this client's list reminder, in the shared store.
+  const pageOpen = useRef(true);
+  useEffect(() => {
+    pageOpen.current = true;
+    return () => {
+      pageOpen.current = false;
+      releaseDetailNotice();
+    };
+  }, []);
   const [actionError, setActionError] = useState<{
     clientId: string;
     text: string;
@@ -158,11 +175,16 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
    * Both need a restart, for opposite reasons, and the connect wording ("so it loads
    * Toolport") reads as a failed disconnect on the removal path. */
   function showFeedback(title: string, text = "") {
+    if (!pageOpen.current) return;
     setRestartNotice({ clientId: client.id, title, text });
   }
 
-  function noteRestartNeeded(kind: "applied" | "removed", warnings: string[] = []) {
-    setRestartNotice({
+  function noteRestartNeeded(
+    kind: "applied" | "removed",
+    warnings: string[] = [],
+    connected = false,
+  ) {
+    (connected ? setConnectNotice : setRestartNotice)({
       clientId: client.id,
       title:
         kind === "applied"
@@ -382,6 +404,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           return;
         }
         // The disconnect already committed, even if loading notices later fails.
+        clearListNotice(client.id);
         onChanged();
         setRecoveryEpoch((value) => value + 1);
         const restored = outcome.restored?.length ?? 0;
@@ -653,7 +676,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           {installed ? (
             <ConfirmDialog
               trigger={
-                <Button size="sm" variant="outline" disabled={busy || !!client.error}>
+                <Button size="sm" variant="destructive" disabled={busy || !!client.error}>
                   <Trans
                     message={msg("{value1}Disconnect")}
                     values={{ value1: <Plug className="size-4" /> }}
@@ -720,7 +743,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               type="button"
               variant="ghost"
               size="sm"
-              onClick={() => setRestartNotice(null)}
+              onClick={() => dismissClientNotice(showRestartNotice)}
             >
               {t("Dismiss")}
             </Button>
@@ -894,9 +917,9 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             </div>
           </div>
           <details className="mb-2">
-            <summary className="cursor-pointer text-meta font-medium text-muted-foreground hover:text-foreground">
+            <DisclosureSummary className="text-meta font-medium text-muted-foreground hover:text-foreground">
               {t("How importing works")}
-            </summary>
+            </DisclosureSummary>
             <ul className="mt-1.5 mb-1 space-y-0.5 text-meta text-muted-foreground">
               <li>
                 <Trans
@@ -993,7 +1016,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           onClose={() => setMigrateOpen(false)}
           onConnected={(next) => {
             onRegistryChange(next);
-            noteRestartNeeded("applied");
+            noteRestartNeeded("applied", [], true);
             onChanged();
           }}
         />

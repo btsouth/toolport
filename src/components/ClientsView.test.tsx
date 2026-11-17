@@ -1,9 +1,14 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, renderHook, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DetectedClient, McpServer, T3CodeOther } from "@/lib/types";
 import { type ComponentProps, useRef, useState } from "react";
 import { ClientsView, type ConnectAllCard, type T3CodeSeen } from "./ClientsView";
+import {
+  resetClientNotices,
+  setConnectNotice,
+  useClientNotices,
+} from "@/lib/clientNotice";
 import {
   getClientSessions,
   listClientRecoveries,
@@ -2020,4 +2025,32 @@ it("keeps a T3 Code home row's label beside its recovery cards", async () => {
   expect(screen.getByText(`${name} is disconnected.`)).toBeInTheDocument();
   expect(screen.getByText(`${name} recovery needs attention.`)).toBeInTheDocument();
   expect(screen.getByText("Used by T3 Code: Codex Extra (off)")).toBeInTheDocument();
+});
+
+it("shows a connect's restart reminder above the list and dismisses it everywhere", async () => {
+  resetClientNotices();
+  const notice = {
+    clientId: "cursor",
+    title: "Not live yet",
+    text: "Restart Cursor so it loads Toolport.",
+  };
+  act(() => setConnectNotice(notice));
+  const store = renderHook(() => useClientNotices());
+  render(<ClientsView clients={[client()]} registry={null} onSelectClient={vi.fn()} />);
+  const card = (await screen.findByText("Not live yet")).closest<HTMLElement>(
+    '[data-slot="status-card"]',
+  )!;
+  expect(card).toHaveAttribute("role", "status");
+  expect(card).toHaveAttribute("data-slot", "status-card");
+  expect(card).toHaveAttribute("data-variant", "info");
+  expect(card).toHaveTextContent("Not live yet");
+  expect(card).toHaveTextContent("Restart Cursor so it loads Toolport.");
+  // Above the list.
+  const list = screen.getByText("Available to connect");
+  expect(
+    card.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING,
+  ).toBeTruthy();
+  await userEvent.click(within(card).getByRole("button", { name: "Dismiss" }));
+  expect(screen.queryByText("Not live yet")).not.toBeInTheDocument();
+  expect(store.result.current).toEqual({ detail: null, list: null });
 });
