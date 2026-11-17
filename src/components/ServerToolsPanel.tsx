@@ -774,9 +774,9 @@ export function ServerToolsPanel({
     // A server switch invalidates any in-flight call: drop its late result and clear the
     // "Calling…" state + ticker, so a superseded call can't paint under the new server.
     callSeq.current += 1;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Invalidate the previous server call and clear its visible state together.
     abandonRun();
     if (tickerRef.current) clearInterval(tickerRef.current);
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- Invalidate the previous server call and clear its visible state together.
     setCalling(false);
     setElapsed(0);
     if (!serverId) {
@@ -869,9 +869,9 @@ export function ServerToolsPanel({
     // Switching tools also invalidates an in-flight call (same reasoning as the server
     // effect), so a late result doesn't land under the newly selected tool.
     callSeq.current += 1;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Invalidate the previous tool call and clear its visible state together.
     abandonRun();
     if (tickerRef.current) clearInterval(tickerRef.current);
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- Invalidate the previous tool call and clear its visible state together.
     setCalling(false);
     setElapsed(0);
     setArgs({});
