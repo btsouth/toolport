@@ -549,8 +549,7 @@ pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
         if id == &client.id {
             let p = page.clone();
             body.append(&super::restart_notice(title, notice, move || {
-                p.detail_notice.borrow_mut().take();
-                p.clear_list_notice();
+                p.dismiss_detail_notice();
             }));
         }
     }
