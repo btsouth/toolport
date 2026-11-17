@@ -17624,17 +17624,21 @@ mod tests {
             let entry: crate::registry::ServerEntry = serde_json::from_value(serde_json::json!({
                 "id": "", "enabled": false, "name": "demo", "transport": "stdio",
                 "command": "npx",
-                "args": ["-y", "example-server", "<launch-input>", "<launch-input>"],
+                "args": ["-y", "example-server", "<launch-input>", "<launch-input>",
+                         "<launch-input>"],
                 "launch": {
                     "inputs": [
                         {"key": "ACCOUNT", "label": "Account", "secret": false,
                          "required": true, "value": null},
                         {"key": "SECRET", "label": "Secret", "secret": true,
+                         "required": true, "value": null},
+                        {"key": "REF", "label": "Reference", "secret": true,
                          "required": true, "value": null}
                     ],
                     "bindings": [
                         {"index": 2, "parts": [{"kind": "input", "key": "ACCOUNT"}]},
-                        {"index": 3, "parts": [{"kind": "input", "key": "SECRET"}]}
+                        {"index": 3, "parts": [{"kind": "input", "key": "SECRET"}]},
+                        {"index": 4, "parts": [{"kind": "input", "key": "REF"}]}
                     ]
                 },
                 "env": [{"key": "API_KEY", "value": "pasted-row-value", "secret": true}],
@@ -17648,8 +17652,14 @@ mod tests {
             let values = launch
                 .inputs
                 .iter()
-                .zip(["AC123", "typed-launch-secret"])
-                .map(|(input, typed)| super::launch_editor_value(input, typed, None))
+                .zip([
+                    ("AC123", None),
+                    ("typed-launch-secret", None),
+                    ("", Some("env:REF_TOKEN")),
+                ])
+                .map(|(input, (typed, reference))| {
+                    super::launch_editor_value(input, typed, reference)
+                })
                 .collect::<Vec<_>>();
             extras.launch = Some(super::launch_with_values(launch, &values));
             let outcome =
@@ -17659,6 +17669,11 @@ mod tests {
             let launch = server.launch.as_ref().expect("launch inputs kept");
             assert_eq!(launch.inputs[0].value.as_deref(), Some("AC123"));
             assert_eq!(launch.inputs[1].value, None);
+            // A password manager reference counts as set and is kept as the source.
+            assert_eq!(
+                crate::secret_refs::source(&launch.inputs[2].unknown_fields).unwrap(),
+                Some("env:REF_TOKEN")
+            );
             assert!(server.enabled);
             for (key, value) in [
                 ("SECRET", "typed-launch-secret"),
