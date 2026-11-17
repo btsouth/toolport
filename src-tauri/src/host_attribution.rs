@@ -22,7 +22,9 @@
 //!   threads, T3 Code puts the thread id only in Codex's shell environment, and the
 //!   `threadId` Codex sends in tool call `_meta` is Codex's own id, not T3 Code's.
 //! * OpenCode is the same: T3 Code starts one `opencode serve` per instance, which serves
-//!   every thread of it and starts MCP servers as its own children.
+//!   every thread of it and starts MCP servers as its own children. Antigravity's `agy acp`
+//!   (installed as `agy` or `antigravity`) starts them as its children too; when T3 Code
+//!   passes it the thread, the first rule names it.
 //! * Nothing else is attributed: a thread id without T3 Code among the ancestors is not.
 //!
 //! T3 Code's process is its Electron executable run as Node (`process.execPath`):
@@ -98,9 +100,10 @@ pub fn is_t3_code_process_on(name: &str, os: Os) -> bool {
     }
 }
 
-/// Providers T3 Code starts itself that do not pass its thread to MCP servers: one
-/// process serves many threads (Codex's `app-server`, OpenCode's `serve`).
-const PROVIDER_STEMS: [&str; 2] = ["codex", "opencode"];
+/// Providers T3 Code starts itself whose MCP servers may not get its thread: one process
+/// serves many threads (Codex's `app-server`, OpenCode's `serve`), or T3 Code gives it a
+/// filtered environment (Antigravity's `agy acp`).
+const PROVIDER_STEMS: [&str; 4] = ["codex", "opencode", "agy", "antigravity"];
 
 fn stem(name: &str) -> String {
     let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
@@ -133,8 +136,8 @@ pub fn detect_with(
             thread,
         });
     }
-    // T3 Code starts Codex and OpenCode directly, or through npm's Node launcher, which
-    // starts the native binary.
+    // T3 Code starts Codex, OpenCode and Antigravity directly, or through npm's Node
+    // launcher, which starts the native binary.
     let provider_under_t3 = match names.as_slice() {
         [parent, grandparent, rest @ ..] if PROVIDER_STEMS.contains(&stem(parent).as_str()) => {
             let provider = stem(parent);
@@ -422,11 +425,13 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn opencode_is_attributed_by_its_parents_without_a_thread() {
+    fn opencode_and_antigravity_are_attributed_by_their_parents_without_a_thread() {
         for chain in [
             vec!["opencode", "t3code"],
             vec!["opencode", "node", "t3code"],
             vec!["opencode", "opencode", "t3code"],
+            vec!["agy", "t3code"],
+            vec!["antigravity", "t3code"],
         ] {
             let host = detect_with(
                 env(&[]),

@@ -14,7 +14,6 @@
   "{names} use {client}, which isn't installed. Install {client}, then connect it.": "{names} usam {client}, que não está instalado. Instale {client} e depois conecte.",
   "{name} ({provider})": "{name} ({provider})",
   "Not supported by Toolport yet: {names}.": "Ainda não compatível com o Toolport: {names}.",
-  "Toolport can't connect {names} yet: T3 Code gives it a private settings folder.": "O Toolport ainda não consegue conectar {names}: o T3 Code atribui a ele uma pasta de configurações privada.",
   "Toolport can't read {names} in T3 Code's settings. Fix this instance in T3 Code's settings.": "O Toolport não consegue ler {names} nas configurações do T3 Code. Corrija esta instância nas configurações do T3 Code.",
   "Toolport can't read {names} in T3 Code's settings. Fix these instances in T3 Code's settings.": "O Toolport não consegue ler {names} nas configurações do T3 Code. Corrija estas instâncias nas configurações do T3 Code.",
   "Toolport can't see which home folder {names} uses: it is marked sensitive or isn't plain text. Set its home folder as plain text in T3 Code's provider settings.": "O Toolport não consegue ver qual pasta pessoal {names} usa: ela está marcada como sensível ou não é texto simples. Defina a pasta pessoal como texto simples nas configurações de provedores do T3 Code.",

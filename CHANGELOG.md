@@ -14,6 +14,8 @@ Entries before the rename below shipped under the project's former name, Conduit
   and Activity shows "OpenCode via T3 Code". Settings Pi saves in Toolport's
   entry are kept when Toolport rewrites it, and Disconnect takes them out with
   the entry, for Pi's usual config too.
+- T3 Code's Antigravity instances get a row too, for the `mcp_config.json` in the
+  private profile T3 Code gives each one. Toolport changes nothing else there.
 
 ### Fixed
 

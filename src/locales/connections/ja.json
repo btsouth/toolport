@@ -14,7 +14,6 @@
   "{names} use {client}, which isn't installed. Install {client}, then connect it.": "{names} は {client} を使っていますが、インストールされていません。{client} をインストールしてから接続してください。",
   "{name} ({provider})": "{name} ({provider})",
   "Not supported by Toolport yet: {names}.": "Toolport はまだ対応していません: {names}。",
-  "Toolport can't connect {names} yet: T3 Code gives it a private settings folder.": "Toolport はまだ {names} に接続できません: T3 Code が専用の設定フォルダーを割り当てています。",
   "Toolport can't read {names} in T3 Code's settings. Fix this instance in T3 Code's settings.": "Toolport は T3 Code の設定で {names} を読み取れません。T3 Code の設定でこのインスタンスを修正してください。",
   "Toolport can't read {names} in T3 Code's settings. Fix these instances in T3 Code's settings.": "Toolport は T3 Code の設定で {names} を読み取れません。T3 Code の設定でこれらのインスタンスを修正してください。",
   "Toolport can't see which home folder {names} uses: it is marked sensitive or isn't plain text. Set its home folder as plain text in T3 Code's provider settings.": "Toolport は {names} が使うホームフォルダーを確認できません。機密としてマークされているか、プレーンテキストではありません。T3 Code のプロバイダー設定でホームフォルダーをプレーンテキストで設定してください。",

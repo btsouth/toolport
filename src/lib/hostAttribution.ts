@@ -225,14 +225,6 @@ export function t3CodeGapLines(others: T3CodeOther[]): string[] {
     lines.push(
       translate("Not supported by Toolport yet: {names}.", { names: unsupported }),
     );
-  const privateHome = names("privateHome");
-  if (privateHome)
-    lines.push(
-      translate(
-        "Toolport can't connect {names} yet: T3 Code gives it a private settings folder.",
-        { names: privateHome },
-      ),
-    );
   const malformed = of("malformed");
   if (malformed.length > 0)
     lines.push(

@@ -14,7 +14,6 @@
   "{names} use {client}, which isn't installed. Install {client}, then connect it.": "{names} use {client}, which isn't installed. Install {client}, then connect it.",
   "{name} ({provider})": "{name} ({provider})",
   "Not supported by Toolport yet: {names}.": "Not supported by Toolport yet: {names}.",
-  "Toolport can't connect {names} yet: T3 Code gives it a private settings folder.": "Toolport can't connect {names} yet: T3 Code gives it a private settings folder.",
   "Toolport can't read {names} in T3 Code's settings. Fix this instance in T3 Code's settings.": "Toolport can't read {names} in T3 Code's settings. Fix this instance in T3 Code's settings.",
   "Toolport can't read {names} in T3 Code's settings. Fix these instances in T3 Code's settings.": "Toolport can't read {names} in T3 Code's settings. Fix these instances in T3 Code's settings.",
   "Toolport can't see which home folder {names} uses: it is marked sensitive or isn't plain text. Set its home folder as plain text in T3 Code's provider settings.": "Toolport can't see which home folder {names} uses: it is marked sensitive or isn't plain text. Set its home folder as plain text in T3 Code's provider settings.",

@@ -180,6 +180,15 @@ const t3HomeClients = [
     entryState: "managed",
     t3Code: [t3Use("Pi Work"), t3Use("Pi Old", false)],
   }),
+  fixtureClient(
+    "antigravity@t3-5e4d3c2b1a098f7e",
+    "Antigravity (~/.t3/userdata/providers/antigravity/c1a9e44a/config)",
+    {
+      configPath:
+        "/home/fixture/.t3/userdata/providers/antigravity/c1a9e44a482971b672b7f9a0ef35dad8f943f7d5bc73859a9de21eb7db7dc810/config/mcp_config.json",
+      t3Code: [t3Use("Antigravity Work")],
+    },
+  ),
 ];
 const t3HomeOthers = [
   {

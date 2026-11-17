@@ -493,9 +493,10 @@ impl CodexValue {
 }
 
 /// Keys a client itself saves into a server's entry, which it edits in place: Pi's
-/// `enabled` switch and how its tools are exposed and kept running. A rewrite of
-/// Toolport's entry keeps them, they never make the entry count as changed by hand,
-/// and Disconnect takes them out with the entry.
+/// `enabled` switch and how its tools are exposed and kept running, and the `disabled`
+/// switch Antigravity's `agy` writes. A rewrite of Toolport's entry keeps them, they
+/// never make the entry count as changed by hand, and Disconnect takes them out with
+/// the entry.
 fn client_entry_settings(client_id: &str) -> &'static [&'static str] {
     match client_id.split('@').next().unwrap_or(client_id) {
         "pi" => &[
@@ -505,6 +506,7 @@ fn client_entry_settings(client_id: &str) -> &'static [&'static str] {
             "lifecycle",
             "idleTimeout",
         ],
+        "antigravity" => &["disabled"],
         _ => &[],
     }
 }

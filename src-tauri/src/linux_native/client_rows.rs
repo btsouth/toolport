@@ -805,13 +805,6 @@ pub(super) fn t3_code_gap_lines(others: &[crate::clients::T3CodeOther]) -> Vec<S
             &[("names", &unsupported)],
         ));
     }
-    let private_home = names(crate::clients::T3CodeGap::PrivateHome);
-    if !private_home.is_empty() {
-        lines.push(crate::i18n::trf(
-            "Toolport can't connect {names} yet: T3 Code gives it a private settings folder.",
-            &[("names", &private_home)],
-        ));
-    }
     let malformed = count(crate::clients::T3CodeGap::Malformed);
     if malformed > 0 {
         lines.push(crate::i18n::trf(
@@ -1626,12 +1619,12 @@ mod tests {
                     "Antigravity",
                     "Antigravity",
                     true,
-                    T3CodeGap::PrivateHome
+                    T3CodeGap::MissingHome
                 ),
             ]),
             [
                 "Not supported by Toolport yet: Muse Code, My fx (fx) (off).",
-                "Toolport can't connect Antigravity yet: T3 Code gives it a private settings folder.",
+                "Toolport can't connect Antigravity yet: its home folder doesn't exist yet. Start it once in T3 Code, then refresh Clients.",
             ]
         );
         assert_eq!(

@@ -14,7 +14,6 @@
   "{names} use {client}, which isn't installed. Install {client}, then connect it.": "{names} 使用 {client}，但它尚未安裝。請安裝 {client}，然後再連線。",
   "{name} ({provider})": "{name}（{provider}）",
   "Not supported by Toolport yet: {names}.": "Toolport 尚未支援：{names}。",
-  "Toolport can't connect {names} yet: T3 Code gives it a private settings folder.": "Toolport 暫時無法連線 {names}：T3 Code 為其指派了專用設定資料夾。",
   "Toolport can't read {names} in T3 Code's settings. Fix this instance in T3 Code's settings.": "Toolport 無法讀取 T3 Code 設定中的 {names}。請在 T3 Code 的設定中修正此執行個體。",
   "Toolport can't read {names} in T3 Code's settings. Fix these instances in T3 Code's settings.": "Toolport 無法讀取 T3 Code 設定中的 {names}。請在 T3 Code 的設定中修正這些執行個體。",
   "Toolport can't see which home folder {names} uses: it is marked sensitive or isn't plain text. Set its home folder as plain text in T3 Code's provider settings.": "Toolport 無法看到 {names} 使用的主資料夾：它被標記為敏感或不是純文字。請在 T3 Code 的提供者設定中以純文字設定其主資料夾。",

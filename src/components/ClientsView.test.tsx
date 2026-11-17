@@ -892,7 +892,7 @@ describe("ClientsView", () => {
         .mockResolvedValueOnce([
           other("muse", "Muse Code", "Muse Code", "unsupported"),
           other("fx", "fx", "My fx", "unsupported", false),
-          other("antigravity", "Antigravity", "Antigravity", "privateHome"),
+          other("antigravity", "Antigravity", "Antigravity", "missingHome"),
         ])
         .mockResolvedValue([]);
       render(
@@ -910,7 +910,7 @@ describe("ClientsView", () => {
         "Not supported by Toolport yet: Muse Code, My fx (fx) (off).",
       );
       expect(card()).toHaveTextContent(
-        "Toolport can't connect Antigravity yet: T3 Code gives it a private settings folder.",
+        "Toolport can't connect Antigravity yet: its home folder doesn't exist yet. Start it once in T3 Code, then refresh Clients.",
       );
       expect(card()).not.toHaveTextContent(/not connected|is connected/);
       expect(within(card() as HTMLElement).queryByRole("button")).not.toBeInTheDocument();
