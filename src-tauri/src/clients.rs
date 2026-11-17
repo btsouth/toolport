@@ -648,6 +648,7 @@ fn client_gateway_entry_needs_rewrite(
     current: &str,
     config_text: Option<&str>,
     handled: &[String],
+    record: Option<&ManagedEntry>,
 ) -> bool {
     gateway_entry_needs_rewrite(entry_name, stored_command, current, config_text)
         || data_dir_pin_is_stale(
@@ -656,6 +657,7 @@ fn client_gateway_entry_needs_rewrite(
             entry_name,
             stored_command,
             config_text,
+            record,
         )
         || (command_is_gateway_binary(stored_command)
             && !codex_entry_missing_settings(client_id, entry_name, config_text, handled, false)
@@ -9152,7 +9154,10 @@ pub(crate) fn pinned_data_dir(client_id: &str) -> Option<String> {
     if !cfg!(all(unix, not(target_os = "macos"))) || !client_id.contains('@') {
         return None;
     }
-    crate::registry::conduit_dir().and_then(|dir| dir.to_str().map(str::to_string))
+    // A relative folder would be read against the client's working directory.
+    crate::registry::conduit_dir()
+        .filter(|dir| dir.is_absolute())
+        .and_then(|dir| dir.to_str().map(str::to_string))
 }
 
 /// The environment Toolport's gateway entry for `client_id` carries, for tests that
@@ -9167,14 +9172,21 @@ pub fn gateway_entry_env(client_id: &str) -> Vec<(String, String)> {
 }
 
 /// Whether a location row's entry names a data folder other than this Toolport's,
-/// as after the `Conduit` folder was renamed. An entry without one is left alone.
+/// as after the `Conduit` folder was renamed. Only a pin this Toolport wrote (its
+/// ownership record holds the same value) counts: a pin from another Toolport on its
+/// own data folder, or one the user set by hand, is theirs and stays. An entry
+/// without a pin is left alone.
 fn data_dir_pin_is_stale(
     client_id: &str,
     format: impl FnOnce() -> Option<Format>,
     entry_name: &str,
     stored_command: &str,
     config_text: Option<&str>,
+    record: Option<&ManagedEntry>,
 ) -> bool {
+    let Some(written) = record.and_then(|record| record.env.get(DATA_DIR_ENV)) else {
+        return false;
+    };
     // Only location rows carry a pin; read the entry before resolving the data folder.
     if !client_id.contains('@') || !command_is_gateway_binary(stored_command) {
         return false;
@@ -9188,7 +9200,32 @@ fn data_dir_pin_is_stale(
     else {
         return false;
     };
-    pinned_data_dir(client_id).is_some_and(|current| pinned != current)
+    pinned == *written && pinned_data_dir(client_id).is_some_and(|current| pinned != current)
+}
+
+/// Keep a pin in `entry` that the file had and this Toolport did not write, when a
+/// scan or start-up pass rewrites the entry for another reason. Returns whether it did.
+fn keep_foreign_data_dir_pin(
+    entry: &mut ServerEntry,
+    format: Format,
+    text: &str,
+    entry_name: &str,
+    record: Option<&ManagedEntry>,
+) -> bool {
+    let Some(prior) = entry_env_value(format, text, entry_name, DATA_DIR_ENV) else {
+        return false;
+    };
+    if record.and_then(|record| record.env.get(DATA_DIR_ENV)) == Some(&prior) {
+        return false;
+    }
+    entry.env.retain(|var| var.key != DATA_DIR_ENV);
+    entry.env.push(crate::registry::EnvVar {
+        key: DATA_DIR_ENV.into(),
+        value: Some(prior),
+        secret: false,
+        unknown_fields: Default::default(),
+    });
+    true
 }
 
 /// The string value of `key` in the environment of the entry named `name`, read from
@@ -10689,6 +10726,7 @@ fn repoint_stale_gateways_in(
                 current,
                 config_text.as_deref(),
                 handled,
+                managed.get(&client.id),
             )
             && entry
                 .env_keys
@@ -10738,6 +10776,7 @@ fn repoint_stale_gateways_in(
                             current,
                             config_text.as_deref(),
                             handled,
+                            managed.get(&client.id),
                         )
                     {
                         backfill_gateway_identity(&def, &path, entry_name, &client.id)?;
@@ -10790,17 +10829,35 @@ fn repoint_stale_gateways_in(
                         let mut entry =
                             repair_gateway_entry(def.format, &path, entry_name, &client.id)?;
                         entry.command = Some(current.to_string());
+                        let text = read_config_file(&path).ok();
                         // A repair is not a Connect: it adds only the Codex settings a
                         // launch would add, so a handled key stays as the user left it
                         // and an entry without a record keeps its removals.
                         keep_only_missing_codex_settings(
                             &client.id,
                             entry_name,
-                            read_config_file(&path).ok().as_deref(),
+                            text.as_deref(),
                             handled,
                             &mut entry,
                         );
-                        install_or_remove(&client.id, Some(&entry))
+                        // Nor does it move a data folder pin this Toolport did not write.
+                        let kept_pin = text.as_deref().is_some_and(|text| {
+                            keep_foreign_data_dir_pin(
+                                &mut entry,
+                                def.format,
+                                text,
+                                entry_name,
+                                managed.get(&client.id),
+                            )
+                        });
+                        let mut write = install_or_remove(&client.id, Some(&entry))?;
+                        // Owned, but not a value this Toolport wrote, so never stale.
+                        if kept_pin {
+                            if let Some(record) = write.managed.as_mut() {
+                                record.env.insert(DATA_DIR_ENV.into(), String::new());
+                            }
+                        }
+                        Ok(write)
                     }
                 })
             });
@@ -14410,6 +14467,7 @@ bad = "not-a-table"
                 current,
                 Some(text),
                 &[],
+                None,
             )
         };
         // Keys Toolport handled before never trigger a repair again.
@@ -14421,6 +14479,7 @@ bad = "not-a-table"
             current,
             Some(&lacking),
             &all_handled,
+            None,
         ));
         assert!(needs("codex", current, &lacking));
         assert!(needs("codex@work", current, &lacking));
@@ -14440,6 +14499,7 @@ bad = "not-a-table"
             current,
             None,
             &[],
+            None,
         ));
     }
 

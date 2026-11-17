@@ -909,6 +909,18 @@ fn restart_advice_line(clients: &[crate::gateway_publish::ClientNeedingRestart])
 }
 
 fn run_startup_maintenance() {
+    // As in the desktop app: a data folder override is a separate Toolport, and the
+    // client configs and agent hooks in the user's home belong to their usual one.
+    if crate::brand::env_var_os("TOOLPORT_DATA_DIR", "CONDUIT_DATA_DIR").is_some() {
+        return;
+    }
+    repoint_clients_on_start();
+    crate::hooks::cleanup_on_startup();
+    // One-time removal of the retired agent guard hook entries (see `guard_cleanup`).
+    crate::guard_cleanup::run_once();
+}
+
+fn repoint_clients_on_start() {
     if let Some(migrated) = crate::registry::migrate_legacy_data_dir() {
         eprintln!(
             "toolport: migrated data directory to {}",
@@ -934,9 +946,6 @@ fn run_startup_maintenance() {
             repoint.failed.len()
         );
     }
-    crate::hooks::cleanup_on_startup();
-    // One-time removal of the retired agent guard hook entries (see `guard_cleanup`).
-    crate::guard_cleanup::run_once();
 }
 
 fn show_registry_startup_failure(app: &adw::Application, error: &str) {
