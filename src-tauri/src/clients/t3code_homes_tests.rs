@@ -426,10 +426,16 @@ fn pi_keeps_the_settings_it_saved_in_toolports_entry() {
     assert!(
         kept.get("TOOLPORT_PROFILE").is_none() && kept["env"].get("TOOLPORT_PROFILE").is_none()
     );
+    // Disconnect takes the whole entry out, Pi's settings in it too, and keeps the
+    // rest of the file as Pi left it.
+    uninstall_gateway(&row.id).unwrap();
+    let after = json(&path);
+    assert!(after["mcpServers"].get("toolport").is_none(), "{after}");
+    assert_eq!(after["autoEnableCodemode"], false);
     // Other clients' entries never get these keys from a Toolport rewrite.
     let fake = gateway_entry(None, "cursor").unwrap();
     assert!(
-        with_pi_settings("cursor", Format::JsonMcpServers, &path, &fake)
+        with_client_settings("cursor", Format::JsonMcpServers, &path, &fake)
             .unknown_fields
             .is_empty()
     );
