@@ -2538,16 +2538,50 @@ impl From<Vec<serde_json::Value>> for SetupVerification {
     }
 }
 
+/// A client server a connect moves into Toolport: its name in the client config and the
+/// Toolport server it lands on, which may be saved under another name (`github (2)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MovedServer {
+    pub client_name: String,
+    pub id: String,
+}
+
+fn moved_ids(moved: &[MovedServer]) -> Vec<String> {
+    let mut ids = Vec::new();
+    for server in moved {
+        if !ids.contains(&server.id) {
+            ids.push(server.id.clone());
+        }
+    }
+    ids
+}
+
+/// The Toolport server a client server already is, by connection as import and the
+/// client rows decide it, else `None`. A server with only the same name is not it.
+fn existing_for_connect(
+    registry: &Registry,
+    client: &clients::DetectedClient,
+    server: &clients::McpServer,
+) -> Result<Option<String>, String> {
+    match existing_connection(registry, client, server, Confirm::WithVault) {
+        ConnectionState::Existing(id) => Ok(Some(id)),
+        ConnectionState::New => Ok(None),
+        ConnectionState::Unknown(reason) => Err(reason),
+    }
+}
+
 /// Import the servers a client directly manages before its config is replaced
 /// with the Toolport gateway. Gateway identities must be skipped before they
 /// reach `moved`, otherwise migration reports moving a server it never imported.
+/// Each server lands on the Toolport server with its connection, whatever that one is
+/// named; a different server under its name stops the connect.
 fn prepare_client_servers_for_migration(
     registry: &mut Registry,
     client: &clients::DetectedClient,
     writes: &mut crate::import_credentials::VaultWrites,
     choices: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
     inputs: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
-) -> Result<(usize, Vec<String>), String> {
+) -> Result<(usize, Vec<MovedServer>), String> {
     let names = client
         .servers
         .iter()
@@ -2561,7 +2595,6 @@ fn prepare_client_servers_for_migration(
         if clients::detected_is_gateway(server) {
             continue;
         }
-        moved.push(server.name.clone());
         let definition = clients::import_definition(client, &server.name)?;
         let mut import = crate::import_credentials::Import::prepare_with_choices(
             server_from_detected(server, &client.id),
@@ -2571,19 +2604,17 @@ fn prepare_client_servers_for_migration(
         if let Some(values) = inputs.get(&server.name) {
             import.supply(values)?;
         }
-        let was_registered = registry
-            .servers
-            .iter()
-            .any(|entry| entry.name.eq_ignore_ascii_case(&server.name));
-        let id = if let Some(existing) = registry
-            .servers
-            .iter()
-            .find(|entry| entry.name.eq_ignore_ascii_case(&server.name))
+        let existing = existing_for_connect(registry, client, server)?;
+        if existing.is_none()
+            && registry
+                .servers
+                .iter()
+                .any(|entry| entry.name.eq_ignore_ascii_case(&server.name))
         {
-            if !import.matches(existing)? {
-                return Err(format!("{} already exists with a different definition. Resolve it under Servers before connecting. Client config unchanged.", server.name));
-            }
-            let id = existing.id.clone();
+            return Err(format!("{} already exists with a different definition. Resolve it under Servers before connecting. Client config unchanged.", server.name));
+        }
+        let was_registered = existing.is_some();
+        let id = if let Some(id) = existing {
             let entry = registry.servers.iter_mut().find(|e| e.id == id).unwrap();
             entry.command = import.entry.command.clone();
             entry.args = import.entry.args.clone();
@@ -2604,6 +2635,10 @@ fn prepare_client_servers_for_migration(
         if !missing.is_empty() {
             return Err(format!("{} needs credentials. Enter the missing values in review or its native config, then review again. Client config unchanged.", server.name));
         }
+        moved.push(MovedServer {
+            client_name: server.name.clone(),
+            id,
+        });
     }
     if !moved.is_empty() {
         registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
@@ -2625,9 +2660,15 @@ pub(crate) fn import_client_servers_for_migration(
             &Default::default(),
         )
     })
+    .map(|(imported, moved)| {
+        (
+            imported,
+            moved.into_iter().map(|server| server.client_name).collect(),
+        )
+    })
 }
 
-/// Enable each moved server (matched by name, as the import above does) in the
+/// Enable each moved server (by the Toolport id the import above chose) in the
 /// profile the migrated client will use: the named scope, else the active profile.
 fn enable_moved_servers(
     registry: &mut Registry,
@@ -2644,12 +2685,12 @@ fn enable_moved_servers(
             "The access set no longer exists, so the client's config was left unchanged".into(),
         );
     }
-    for name in moved {
-        let Some(id) = registry
+    for id in moved {
+        let Some((id, name)) = registry
             .servers
             .iter()
-            .find(|server| server.name.eq_ignore_ascii_case(name))
-            .map(|server| server.id.clone())
+            .find(|server| &server.id == id)
+            .map(|server| (server.id.clone(), server.name.clone()))
         else {
             continue;
         };
@@ -2740,30 +2781,36 @@ pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String
         .filter(|s| !clients::detected_is_gateway(s))
         .map(|s| {
             let definition = clients::import_definition(&client, &s.name)?;
-            let prepared = crate::import_credentials::Import::prepare(
-                server_from_detected(s, &client.id),
-                definition.as_ref(),
-            );
-            let updates = prepared
-                .as_ref()
-                .ok()
-                .and_then(|import| {
+            // The server Connect lands on: the one with this connection, as the client rows
+            // decide it. With none, a server under the same name is shown, which Connect
+            // refuses to replace.
+            let (existing, unknown) = match existing_for_connect(&registry, &client, s) {
+                Ok(Some(id)) => (registry.servers.iter().find(|e| e.id == id), None),
+                Ok(None) => (
                     registry
                         .servers
                         .iter()
-                        .find(|existing| existing.name.eq_ignore_ascii_case(&s.name))
-                        .map(|existing| import.updates(existing))
-                })
+                        .find(|e| e.name.eq_ignore_ascii_case(&s.name)),
+                    None,
+                ),
+                Err(reason) => (None, Some(reason)),
+            };
+            let prepared = match unknown {
+                Some(reason) => Err(reason),
+                None => crate::import_credentials::Import::prepare(
+                    server_from_detected(s, &client.id),
+                    definition.as_ref(),
+                ),
+            };
+            let updates = prepared
+                .as_ref()
+                .ok()
+                .and_then(|import| existing.map(|existing| import.updates(existing)))
                 .unwrap_or_default();
             let (credentials, unsupported) = match prepared {
                 Ok(import) => (
                     import
-                        .review_credentials_for(
-                            registry
-                                .servers
-                                .iter()
-                                .find(|existing| existing.name.eq_ignore_ascii_case(&s.name)),
-                        )?
+                        .review_credentials_for(existing)?
                         .into_iter()
                         .map(|(key, secret, present, required)| CredentialReview {
                             key,
@@ -2794,10 +2841,7 @@ pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String
                 args: crate::import_credentials::shown_args(&s.args),
                 url: s.url.as_deref().map(crate::import_credentials::shown_url),
                 env_keys: s.env_keys.clone(),
-                is_new: !registry
-                    .servers
-                    .iter()
-                    .any(|e| e.name.eq_ignore_ascii_case(&s.name)),
+                is_new: existing.is_none(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -3162,7 +3206,7 @@ fn migrate_client_reviewed_inputs_with(
             "Client config changed. Review it again before connecting. Config unchanged.".into(),
         );
     }
-    let (mut result, imported, moved, verification) =
+    let (mut result, imported, (moved, moved_ids), verification) =
         crate::import_credentials::transaction(|writes| {
             let mut prepared = current.clone();
             let (imported, moved) = prepare_client_servers_for_migration(
@@ -3172,7 +3216,12 @@ fn migrate_client_reviewed_inputs_with(
                 choices,
                 inputs,
             )?;
-            enable_moved_servers(&mut prepared, profile, &moved)?;
+            let ids = moved_ids(&moved);
+            let names = moved
+                .iter()
+                .map(|server| server.client_name.clone())
+                .collect::<Vec<_>>();
+            enable_moved_servers(&mut prepared, profile, &ids)?;
             // Only staged registry writes run under the client mutation lock. Vault and
             // transport work can prompt or block and must run without either lock.
             let staged = clients::stage_reviewed(client_id, revision, || {
@@ -3180,9 +3229,9 @@ fn migrate_client_reviewed_inputs_with(
                 commit_imports(&current, prepared)
             })?;
             let attempt = (|| {
-                let verification = verify(&staged, &moved, client_id, profile)?;
+                let verification = verify(&staged, &ids, client_id, profile)?;
                 let outcome =
-                    clients::migrate_reviewed(client_id, profile, &moved, revision, || {
+                    clients::migrate_reviewed(client_id, profile, &names, revision, || {
                         if !registry_matches(&read_registry_exact()?, &staged)? {
                             return Err("Servers changed during setup. Review again.".into());
                         }
@@ -3198,7 +3247,7 @@ fn migrate_client_reviewed_inputs_with(
                         ))
                     })
                 })?;
-                Ok((result, imported, moved, verification))
+                Ok((result, imported, (names, ids), verification))
             })();
             match attempt {
                 Ok(result) => Ok(result),
@@ -3226,7 +3275,7 @@ fn migrate_client_reviewed_inputs_with(
         .registry
         .servers
         .iter()
-        .filter(|s| result.registry.is_enabled(&context, &s.id) && !moved.contains(&s.name))
+        .filter(|s| result.registry.is_enabled(&context, &s.id) && !moved_ids.contains(&s.id))
         .map(|s| s.name.clone())
         .collect::<Vec<_>>();
     if !others.is_empty() {
@@ -3246,6 +3295,7 @@ fn migrate_client_reviewed_inputs_with(
 
 /// Read the same gateway surface and discovery mode this client will use. Probe
 /// selected entries first so an empty cold catalog cannot masquerade as success.
+/// `moved` holds the Toolport ids of the moved servers.
 fn verify_setup_gateway(
     registry: &Registry,
     moved: &[String],
@@ -3265,11 +3315,11 @@ fn verify_setup_gateway(
     }
     let mut servers = Vec::new();
     let mut tool_counts = std::collections::BTreeMap::new();
-    for name in intended {
+    for id in intended {
         let server = registry
             .servers
             .iter()
-            .find(|s| s.name.eq_ignore_ascii_case(name))
+            .find(|s| &s.id == id)
             .ok_or("Reviewed server missing")?;
         if !crate::import_credentials::ready(server)? {
             return Err(format!(
@@ -3337,12 +3387,8 @@ fn verify_setup_gateway(
     let mut gateway =
         crate::downstream::DownstreamServer::connect("setup-review".into(), Box::new(transport))
             .map_err(|_| "Gateway did not answer. Client config unchanged.")?;
-    for name in intended {
-        let server = registry
-            .servers
-            .iter()
-            .find(|s| s.name.eq_ignore_ascii_case(name))
-            .unwrap();
+    for id in intended {
+        let server = registry.servers.iter().find(|s| &s.id == id).unwrap();
         let response = gateway
             .call(
                 "toolport_search_tools",
@@ -5536,6 +5582,116 @@ API_KEY = "synthetic-first-origin"
         );
     }
 
+    /// The client's `gh` has the connection of Toolport's `GitHub`, so the client rows call
+    /// it in Toolport; review and Connect land on `GitHub` instead of importing a second
+    /// server.
+    #[test]
+    fn connect_lands_on_the_server_with_the_same_connection_under_another_name() {
+        let mut previous = Registry::default();
+        let mut github = server("GitHub");
+        github.command = Some("npx".into());
+        github.args = vec!["-y".into(), "@modelcontextprotocol/server-github".into()];
+        let id = previous.add_server(github);
+        let fixture = MoveFixture::new(&previous);
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"gh":{"command":"npx","args":["-y","@modelcontextprotocol/server-github"]}}}"#,
+        )
+        .unwrap();
+        let client = detected_client("claude-code");
+        let registry = read_registry_exact().unwrap();
+        assert_eq!(clients::managed_server_names(&client, &registry), ["gh"]);
+        let review = preview_client_setup("claude-code").unwrap();
+        assert!(!review.items[0].is_new, "the review must not call gh new");
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let record = seen.clone();
+        let outcome = migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["gh".into()],
+            &review.revision,
+            move |_, ids, _, _| {
+                record.borrow_mut().extend(ids.iter().cloned());
+                Ok(Vec::new().into())
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.imported, 0);
+        assert_eq!(outcome.moved, ["gh"]);
+        assert_eq!(
+            *seen.borrow(),
+            std::slice::from_ref(&id),
+            "verification checks GitHub"
+        );
+        let after = read_registry_exact().unwrap();
+        assert_eq!(after.servers.len(), 1);
+        let context = after.resolve_profile_id("");
+        assert!(after.is_enabled(&context, &id));
+        let config = std::fs::read_to_string(fixture.claude()).unwrap();
+        assert!(!config.contains("\"gh\""), "{config}");
+    }
+
+    /// The remote `github` imported beside a local `GitHub` is saved as `github (2)`; a
+    /// later Connect moves the client's `github` onto it instead of refusing.
+    #[test]
+    fn connect_after_importing_under_a_suffixed_name_moves_onto_it() {
+        let mut previous = Registry::default();
+        let mut github = server("GitHub");
+        github.command = Some("npx".into());
+        github.args = vec!["-y".into(), "@modelcontextprotocol/server-github".into()];
+        previous.add_server(github);
+        let fixture = MoveFixture::new(&previous);
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"github":{"type":"http","url":"https://api.githubcopilot.com/mcp/"}}}"#,
+        )
+        .unwrap();
+        let keys = preview_client_imports_for("claude-code")
+            .unwrap()
+            .into_iter()
+            .map(|item| item.key)
+            .collect::<Vec<_>>();
+        assert_eq!(import_client_servers(keys).unwrap().1, 1);
+        let client = detected_client("claude-code");
+        let mut registry = read_registry_exact().unwrap();
+        assert_eq!(
+            clients::managed_server_names(&client, &registry),
+            ["github"]
+        );
+        let (imported, moved) =
+            import_client_servers_for_migration(&mut registry, &client).unwrap();
+        assert_eq!((imported, moved), (0, vec!["github".to_string()]));
+        assert_eq!(registry.servers.len(), 2);
+        let review = preview_client_setup("claude-code").unwrap();
+        assert!(!review.items[0].is_new);
+    }
+
+    /// A different server under the client server's name is still never replaced.
+    #[test]
+    fn connect_still_refuses_a_different_server_under_the_same_name() {
+        let mut previous = Registry::default();
+        let mut github = server("github");
+        github.command = Some("npx".into());
+        github.args = vec!["-y".into(), "@modelcontextprotocol/server-github".into()];
+        previous.add_server(github);
+        let fixture = MoveFixture::new(&previous);
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"github":{"type":"http","url":"https://api.githubcopilot.com/mcp/"}}}"#,
+        )
+        .unwrap();
+        let client = detected_client("claude-code");
+        let mut registry = read_registry_exact().unwrap();
+        let error = import_client_servers_for_migration(&mut registry, &client).unwrap_err();
+        assert!(
+            error.contains("already exists with a different definition"),
+            "{error}"
+        );
+        assert_eq!(registry.servers.len(), 1);
+        drop(fixture);
+    }
+
     #[test]
     fn reviewed_conflict_restores_other_existing_server_secret() {
         let mut previous = Registry::default();
@@ -6627,7 +6783,7 @@ API_KEY = "synthetic-first-origin"
         entry.command = Some("/does-not-exist-toolport-setup".into());
         let id = reg.add_server(entry);
         assert!(
-            verify_setup_gateway(&reg, &["broken".into()], "claude-code", None)
+            verify_setup_gateway(&reg, std::slice::from_ref(&id), "claude-code", None)
                 .unwrap_err()
                 .contains("could not start")
         );
@@ -6642,7 +6798,9 @@ API_KEY = "synthetic-first-origin"
                 secret: true,
                 unknown_fields: Default::default(),
             });
-        assert!(verify_setup_gateway(&reg, &["broken".into()], "claude-code", None).is_err());
+        assert!(
+            verify_setup_gateway(&reg, std::slice::from_ref(&id), "claude-code", None).is_err()
+        );
     }
 
     #[test]
