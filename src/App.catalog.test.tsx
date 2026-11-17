@@ -145,7 +145,11 @@ describe("Servers empty state import count", () => {
     importServers.mockResolvedValue(registryWithServer());
     const scans = detectClients.mock.calls.length;
     await userEvent.click(importButton);
-    await userEvent.click(await screen.findByRole("button", { name: "Import 1 server" }));
+    // The review renders after its preview resolves; a loaded runner can take
+    // longer than the default second to get there, so wait as long as it needs.
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Import 1 server" }, { timeout: 5000 }),
+    );
     await waitFor(() => expect(importServers).toHaveBeenCalledWith(["connection:a"]));
     await waitFor(() => expect(detectClients.mock.calls.length).toBeGreaterThan(scans));
   });
