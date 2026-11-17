@@ -55,6 +55,16 @@ impl From<&str> for Completion {
 /// dot, the name over its command, then the labels on the right.
 /// React's dialog width (`sm:max-w-lg`), for the review, its result and its prompts.
 const REVIEW_WIDTH: i32 = 512;
+
+/// A dialog's width as React sizes it: `width`, but never wider than the window it
+/// opens over less 16px each side (`max-w-[calc(100%-2rem)]`), so it never runs off a
+/// narrow window. An unrealized parent has no width yet and keeps `width`.
+fn dialog_width(parent: &impl IsA<gtk::Window>, width: i32) -> i32 {
+    match parent.as_ref().width() {
+        available if available > 0 => width.min(available - 32).max(240),
+        _ => width,
+    }
+}
 /// The tallest the review's body grows before it scrolls.
 const REVIEW_MAX_BODY_HEIGHT: i32 = 600;
 
@@ -70,7 +80,7 @@ fn credential_prompt(
     let prompt = adw::Window::builder()
         .transient_for(owner)
         .modal(true)
-        .default_width(384)
+        .default_width(dialog_width(owner, 384))
         .default_height(-1)
         .build();
     prompt.set_widget_name("toolport-credential-prompt");
@@ -98,8 +108,9 @@ fn credential_prompt(
     // The key names the field above it, as React's label does.
     let field = gtk::Label::builder().label(key).xalign(0.0).build();
     field.add_css_class("toolport-dialog-field");
+    // Masked with no show/hide control, as React's password field (the spec is silent).
     let entry = gtk::PasswordEntry::builder()
-        .show_peek_icon(true)
+        .show_peek_icon(false)
         .activates_default(true)
         .build();
     entry.update_property(&[gtk::accessible::Property::Label(key)]);
@@ -1045,11 +1056,13 @@ pub(super) fn review_with_notice(
     scroller.set_widget_name("toolport-setup-scroller");
     root.append(&scroller);
     root.append(&super::dialog_footer(&[&cancel, &skip, &confirm]));
-    // React's 512px width: never narrower, and long lines wrap instead of widening it.
-    root.set_width_request(REVIEW_WIDTH);
+    // React's 512px width, capped to a narrow window: never narrower than that, and
+    // long lines wrap instead of widening it.
+    let width = dialog_width(parent, REVIEW_WIDTH);
+    root.set_width_request(width);
     let clamp = adw::Clamp::builder()
-        .maximum_size(REVIEW_WIDTH)
-        .tightening_threshold(REVIEW_WIDTH)
+        .maximum_size(width)
+        .tightening_threshold(width)
         .child(&root)
         .build();
     dialog.set_content(Some(&clamp));
@@ -2923,6 +2936,41 @@ mod tests {
         let quit = main_loop.clone();
         gtk::glib::timeout_add_seconds_local_once(seconds, move || quit.quit());
         main_loop.run();
+    }
+
+    /// A connect dialog never runs off a narrow window: it takes React's width, capped
+    /// to the window less 16px each side, and its credential field is masked with no
+    /// show/hide control, as React's.
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn connect_dialogs_fit_a_narrow_window_and_mask_the_credential() {
+        adw::init().unwrap();
+        let owner = gtk::Window::builder()
+            .default_width(300)
+            .default_height(600)
+            .build();
+        owner.present();
+        let context = gtk::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while owner.width() == 0 && std::time::Instant::now() < deadline {
+            context.iteration(false);
+        }
+        assert_eq!(dialog_width(&owner, REVIEW_WIDTH), owner.width() - 32);
+        assert_eq!(
+            dialog_width(&gtk::Window::new(), REVIEW_WIDTH),
+            REVIEW_WIDTH
+        );
+        // The window's allocation can still settle without a window manager, so the
+        // prompt is checked against React's width rather than an exact figure.
+        let prompt = credential_prompt(&owner, "notes", "NOTES_TOKEN", |_| {});
+        assert!(prompt.default_width() < 384, "{}", prompt.default_width());
+        let entry = descendants(prompt.upcast_ref())
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::PasswordEntry>().ok())
+            .unwrap();
+        assert!(!entry.shows_peek_icon());
+        prompt.close();
+        owner.close();
     }
 
     /// Spec §5: the credential prompt is a sheet with a right-aligned footer, Cancel then
