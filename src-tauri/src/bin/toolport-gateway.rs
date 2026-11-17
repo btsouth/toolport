@@ -5116,11 +5116,17 @@ fn cold_start_target(
     cold_start_progress(client_meta, server, ColdStartPhase::Starting);
     let candidates = [server.to_string()];
     let only_target = |id: &str| id == server;
+    // As long as this server may take to start, so a slow start is never cut
+    // short; Cancel still ends the wait at once.
+    let start_wait = reg.servers.iter().find(|entry| entry.id == server).map_or(
+        downstream::SETUP_CATALOG_WAIT_BUDGET,
+        conduit_lib::playground::start_wait,
+    );
     let fresh = wait_for_first_catalog(
         router,
         Some(fresh),
         live_router,
-        downstream::SETUP_CATALOG_WAIT_BUDGET,
+        start_wait,
         &candidates,
         only_target,
         |view| view.exposed_tool_name(server, tool).is_some(),

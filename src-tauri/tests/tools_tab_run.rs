@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chaos_support::{mock_entry, write_registry, Scratch, GATEWAY};
-use conduit_lib::playground::{call_tool_with_gateway, run_time_limit, RunPhase, ToolRun};
+use conduit_lib::playground::{
+    call_tool_with_gateway, run_time_limit, start_wait, RunPhase, ToolRun,
+};
 use serde_json::json;
 
 fn scratch(tag: &str, env: &[(&str, &str)]) -> (Scratch, conduit_lib::registry::DataDirOverride) {
@@ -34,11 +36,33 @@ fn the_limit_covers_a_cold_start_an_approval_and_the_call() {
     let limit = run_time_limit(None);
     assert!(limit > conduit_lib::downstream::SETUP_CATALOG_WAIT_BUDGET * 2);
     assert!(limit >= Duration::from_secs(25 + 120 + 30));
+    let server = |command: &str, args: &[&str]| -> conduit_lib::registry::ServerEntry {
+        serde_json::from_value(serde_json::json!({
+            "id": "s", "name": "S", "transport": "stdio", "command": command,
+            "args": args, "env": [],
+        }))
+        .unwrap()
+    };
+    let local = server("/usr/bin/local-server", &[]);
+    assert_eq!(run_time_limit(Some(&local)), limit);
     // A server's own longer call limit is added, not capped at the default.
+    let mut long_calls = local.clone();
+    long_calls.request_timeout_ms = Some(600_000);
     assert_eq!(
-        run_time_limit(Some(600_000)) - limit,
+        run_time_limit(Some(&long_calls)) - limit,
         Duration::from_secs(600) - conduit_lib::downstream::STDIO_READ_TIMEOUT
     );
+    // So is the time a server may take to start: two minutes for a command that
+    // downloads its package first, or the server's own startup limit.
+    let download = server("npx", &["-y", "@example/server"]);
+    assert_eq!(start_wait(&download), Duration::from_secs(120));
+    assert_eq!(
+        run_time_limit(Some(&download)) - limit,
+        Duration::from_secs(120) - conduit_lib::downstream::SETUP_CATALOG_WAIT_BUDGET
+    );
+    let mut slow = local.clone();
+    slow.initialize_timeout_ms = Some(300_000);
+    assert_eq!(start_wait(&slow), Duration::from_secs(300));
 }
 
 #[test]

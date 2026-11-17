@@ -112,14 +112,33 @@ pub fn capabilities(server_id: &str) -> Result<Capabilities, String> {
 /// waiting for the server to start.
 const RUN_PROGRESS_TOKEN: &str = "tools-tab-run";
 
+/// How long the gateway waits for a Tools tab Run's server to start: as long
+/// as the server itself may take to start (its own startup limit, or two
+/// minutes for a command that downloads its package first), never less than
+/// the setup catalog wait.
+pub fn start_wait(server: &crate::registry::ServerEntry) -> std::time::Duration {
+    let start = server.initialize_timeout().ok().flatten().or_else(|| {
+        server
+            .command
+            .as_deref()
+            .map(|command| crate::downstream::stdio_connect_timeout(command, &server.args))
+    });
+    start
+        .unwrap_or_default()
+        .max(crate::downstream::SETUP_CATALOG_WAIT_BUDGET)
+}
+
 /// How long one Tools tab Run may take: the gateway's wait for a cold server's
 /// first catalog, a pending approval, and the server's own call limit, plus a
 /// margin for the gateway itself. A Run is cancelled, never cut short.
-pub fn run_time_limit(request_timeout_ms: Option<u64>) -> std::time::Duration {
-    let call = request_timeout_ms
+pub fn run_time_limit(server: Option<&crate::registry::ServerEntry>) -> std::time::Duration {
+    let call = server
+        .and_then(|server| server.request_timeout_ms)
         .map(std::time::Duration::from_millis)
         .unwrap_or(crate::downstream::STDIO_READ_TIMEOUT);
-    crate::downstream::SETUP_CATALOG_WAIT_BUDGET
+    server
+        .map(start_wait)
+        .unwrap_or(crate::downstream::SETUP_CATALOG_WAIT_BUDGET)
         + std::time::Duration::from_secs(crate::approval::DEFAULT_TIMEOUT_SECS)
         + call
         + std::time::Duration::from_secs(5)
@@ -212,8 +231,7 @@ pub fn call_tool_with_gateway(
         registry
             .servers
             .iter()
-            .find(|server| server.id == server_id)
-            .and_then(|server| server.request_timeout_ms),
+            .find(|server| server.id == server_id),
     );
     let env = vec![
         (
@@ -228,6 +246,12 @@ pub fn call_tool_with_gateway(
         (
             "TOOLPORT_CLIENT_ID".to_string(),
             crate::clients::TOOLS_TAB_CLIENT_ID.to_string(),
+        ),
+        // A server with a call limit past the adapter's own request deadline
+        // still gets the whole Run.
+        (
+            crate::stdio_adapter::REQUEST_TIMEOUT_ENV.to_string(),
+            limit.as_millis().to_string(),
         ),
     ];
     let mut transport = crate::downstream::StdioTransport::spawn(

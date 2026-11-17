@@ -87,6 +87,20 @@ pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// A single request may legitimately run long (a slow downstream call), so the
 /// HTTP budget is generous; the listen stream is separate and reconnects.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+/// A longer request deadline, in milliseconds, for the process that set it:
+/// the Tools tab gives a Run its whole time limit. It never shortens the default.
+pub const REQUEST_TIMEOUT_ENV: &str = "TOOLPORT_ADAPTER_REQUEST_TIMEOUT_MS";
+
+fn request_timeout() -> Duration {
+    request_timeout_from(std::env::var(REQUEST_TIMEOUT_ENV).ok())
+}
+
+fn request_timeout_from(value: Option<String>) -> Duration {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .map_or(REQUEST_TIMEOUT, |longer| longer.max(REQUEST_TIMEOUT))
+}
 // Bound replayed handshakes so EOF never waits for the full user-request budget.
 const RECOVERY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A subscription's reply stays open for the life of the subscription, so it has
@@ -653,7 +667,7 @@ impl Session {
             handshake_initialize: Mutex::new(None),
             handshake_initialized: Mutex::new(None),
             stdout: Mutex::new(Box::new(std::io::stdout())),
-            request_timeout: REQUEST_TIMEOUT,
+            request_timeout: request_timeout(),
             client_id,
             attribution_id: std::env::var(crate::brand::ATTRIBUTION_ID)
                 .ok()
@@ -2432,6 +2446,17 @@ fn read_bounded_line<R: BufRead>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Tools tab can give a Run a longer request deadline; nothing can
+    /// shorten the default, and a bad value keeps it.
+    #[test]
+    fn a_run_may_lengthen_the_request_deadline_but_never_shorten_it() {
+        let ms = |value: &str| request_timeout_from(Some(value.to_string()));
+        assert_eq!(request_timeout_from(None), REQUEST_TIMEOUT);
+        assert_eq!(ms("1080000"), Duration::from_secs(1080));
+        assert_eq!(ms("1000"), REQUEST_TIMEOUT);
+        assert_eq!(ms("soon"), REQUEST_TIMEOUT);
+    }
 
     #[test]
     fn the_flag_selects_the_adapter_role() {

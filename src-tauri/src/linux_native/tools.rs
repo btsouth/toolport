@@ -23,6 +23,9 @@ pub(super) struct ServerToolsPanel {
 
 #[derive(Clone)]
 struct ToolPolicy {
+    /// The server's name, for "Starting {server}…" without a registry read on
+    /// the UI thread.
+    name: String,
     disabled: std::collections::HashSet<String>,
     pinned: std::collections::HashSet<String>,
     overrides: std::collections::HashMap<String, crate::registry::ToolOverride>,
@@ -151,6 +154,11 @@ impl ServerToolsPanel {
             let result = gtk::gio::spawn_blocking(move || {
                 let capabilities = crate::playground::capabilities(&server_id)?;
                 let registry = crate::registry::load()?;
+                let name = registry
+                    .servers
+                    .iter()
+                    .find(|server| server.id == server_id)
+                    .map_or_else(|| server_id.clone(), |server| server.name.clone());
                 let disabled = registry
                     .servers
                     .iter()
@@ -170,6 +178,7 @@ impl ServerToolsPanel {
                 Ok::<_, String>((
                     capabilities,
                     ToolPolicy {
+                        name,
                         disabled,
                         pinned,
                         overrides,
@@ -1409,16 +1418,10 @@ fn open_json_action(
         return;
     };
     let server_name = tool_run.as_ref().map(|_| {
-        crate::registry::load()
-            .ok()
-            .and_then(|registry| {
-                registry
-                    .servers
-                    .into_iter()
-                    .find(|server| server.id == server_id)
-                    .map(|server| server.name)
-            })
-            .unwrap_or_else(|| server_id.clone())
+        page.last_load
+            .borrow()
+            .as_ref()
+            .map_or_else(|| server_id.clone(), |(_, policy)| policy.name.clone())
     });
     let execute = Rc::new(RefCell::new(Some(execute)));
     let execute_for_run = execute.clone();
