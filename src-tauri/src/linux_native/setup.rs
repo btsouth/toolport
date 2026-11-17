@@ -114,6 +114,21 @@ impl ReviewItem {
 
     fn add_suffix(&self, widget: &impl IsA<gtk::Widget>) {
         self.suffixes.append(widget);
+        // A status label that changes or shows later (the credential state, the Error
+        // chip) updates what a screen reader hears, as React's button text does.
+        if let Some(label) = widget.dynamic_cast_ref::<gtk::Label>() {
+            let (check, name, subtitle, suffixes) = (
+                self.check.clone(),
+                self.name.clone(),
+                self.subtitle.clone(),
+                self.suffixes.clone(),
+            );
+            let describe = move || describe_toggle(&check, &name, &subtitle, &suffixes);
+            let again = describe.clone();
+            label.connect_label_notify(move |_| describe());
+            label.connect_visible_notify(move |_| again());
+        }
+        self.describe();
     }
 
     fn set_subtitle(&self, text: &str) {
@@ -126,14 +141,34 @@ impl ReviewItem {
         self.describe();
     }
 
-    /// The name is the button's accessible name and the command its description, as a
-    /// screen reader reads React's button text; the toggle itself reports pressed.
     fn describe(&self) {
-        self.check.update_property(&[
-            gtk::accessible::Property::Label(&self.name),
-            gtk::accessible::Property::Description(&self.subtitle.label()),
-        ]);
+        describe_toggle(&self.check, &self.name, &self.subtitle, &self.suffixes);
     }
+}
+
+/// The name is the toggle's accessible name. Its description is the command, then each
+/// status label shown beside the name (New, the credential state, Error), as a screen
+/// reader reads React's button text. The toggle itself reports pressed.
+fn describe_toggle(
+    check: &gtk::ToggleButton,
+    name: &str,
+    subtitle: &gtk::Label,
+    suffixes: &gtk::Box,
+) {
+    let mut parts = vec![subtitle.label().to_string()];
+    let mut child = suffixes.first_child();
+    while let Some(widget) = child {
+        if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+            if label.is_visible() && !label.label().is_empty() {
+                parts.push(label.label().to_string());
+            }
+        }
+        child = widget.next_sibling();
+    }
+    check.update_property(&[
+        gtk::accessible::Property::Label(name),
+        gtk::accessible::Property::Description(&parts.join(", ")),
+    ]);
 }
 
 /// When the backup file was written, in local time and the app language, as React writes
@@ -1023,11 +1058,19 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
                     feedback.set_visible(false);
                     // React's result: the title on the left says what happened, a
                     // centred check under it, then the text on the left.
-                    let done_title = outcome
-                        .message
-                        .split_once(". ")
-                        .map_or(outcome.message.as_str(), |(title, _)| title)
-                        .to_string();
+                    // React's "{client} connected" for a connect. Other results have no
+                    // separate title, so their message's first sentence is the title.
+                    let done_title = match &outcome.connect {
+                        Some(connect) => crate::i18n::trf(
+                            "{value0} connected",
+                            &[("value0", connect.client.as_str())],
+                        ),
+                        None => outcome
+                            .message
+                            .split_once(". ")
+                            .map_or(outcome.message.as_str(), |(title, _)| title)
+                            .to_string(),
+                    };
                     heading.set_label(&done_title);
                     dialog.set_title(Some(&done_title));
                     // GTK's built-in check icon; emblem-ok is missing from some themes.
@@ -1464,6 +1507,63 @@ mod tests {
         assert_ne!(row.name, crate::i18n::tr("Client"));
         let _ = std::fs::remove_dir_all(&root);
     }
+    /// Whether the widget's accessible description is exactly `expected`, read through
+    /// GTK's own accessibility test check.
+    fn described_as(widget: &impl IsA<gtk::Accessible>, expected: &str) -> bool {
+        use gtk::glib::translate::ToGlibPtr;
+        let expected = std::ffi::CString::new(expected).unwrap();
+        let accessible: &gtk::Accessible = widget.as_ref();
+        // SAFETY: a live accessible, a known string property and a NUL-terminated value;
+        // the returned message, when there is one, is ours to free.
+        unsafe {
+            let message = gtk::ffi::gtk_test_accessible_check_property(
+                accessible.to_glib_none().0,
+                gtk::ffi::GTK_ACCESSIBLE_PROPERTY_DESCRIPTION,
+                expected.as_ptr(),
+            );
+            if message.is_null() {
+                true
+            } else {
+                gtk::glib::ffi::g_free(message.cast());
+                false
+            }
+        }
+    }
+
+    /// The connect dialogs' plain folds: the app stylesheet reaches the title inside
+    /// GtkExpander's box (React's tight title: 2px above and below the text).
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn disclosure_title_styles_reach_the_expander_title() {
+        adw::init().unwrap();
+        let provider = gtk::CssProvider::new();
+        provider.load_from_data(&super::super::theme::OmarchyPalette::default().css());
+        gtk::style_context_add_provider_for_display(
+            &gtk::gdk::Display::default().unwrap(),
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        let (expander, _) = details_expander("Details");
+        expander.add_css_class("small");
+        let window = gtk::Window::new();
+        window.set_child(Some(&expander));
+        window.present();
+        let context = gtk::glib::MainContext::default();
+        while context.pending() {
+            context.iteration(false);
+        }
+        let label = expander.label_widget().unwrap();
+        let title = label.parent().unwrap();
+        assert_eq!(title.css_name(), "title");
+        let font = label.pango_context().font_description().unwrap();
+        assert_eq!(font.size(), 13 * gtk::pango::SCALE);
+        // Measured, not the last allocation, which may predate the stylesheet.
+        let natural = |widget: &gtk::Widget| widget.measure(gtk::Orientation::Vertical, -1).1;
+        let content = natural(&label).max(natural(&title.first_child().unwrap()));
+        assert_eq!(natural(&title), content + 4);
+        window.close();
+    }
+
     fn descendants(widget: &gtk::Widget) -> Vec<gtk::Widget> {
         let mut out = vec![widget.clone()];
         let mut child = widget.first_child();
@@ -1844,7 +1944,9 @@ mod tests {
             true,
             |_, _, _| {
                 Ok(Completion {
-                    message: "Claude Code connected. Restart it to load Toolport.".into(),
+                    // A translated message with no ". " (Japanese ends sentences with
+                    // "。"): the title still comes from the client, as React's does.
+                    message: "Claude Code に接続しました。再起動してください。".into(),
                     // Enough moved servers that the page is taller than the window.
                     servers: (0..8)
                         .map(|i| crate::registry_controller::SetupServerResult {
@@ -2287,6 +2389,18 @@ mod tests {
         // React's ImportRow: the name and its status on the dot's line, the command on
         // its own line under them, wrapping when short enough.
         assert_eq!(texts, ["notes", "New", "/usr/bin/notes"]);
+        // A screen reader hears the command and the status beside the name, as in React's
+        // button text, and a status shown later (the Error chip) joins it.
+        assert!(described_as(notes, "/usr/bin/notes, New"));
+        let error_chip = descendants(notes.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .find(|l| l.text() == "Error")
+            .unwrap();
+        error_chip.set_visible(true);
+        assert!(described_as(notes, "/usr/bin/notes, New, Error"));
+        error_chip.set_visible(false);
+        assert!(described_as(notes, "/usr/bin/notes, New"));
         let (name, command) = (&labels[0], &labels[2]);
         assert!(name.has_css_class("toolport-review-name"));
         let dot_line = name.parent().unwrap();
