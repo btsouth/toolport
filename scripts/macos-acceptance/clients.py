@@ -482,8 +482,11 @@ def check(home, manifest_path, entries_dir, expect_connected=True, registry=None
 # - the gateway path written in canonical form (#1340);
 # - Codex only: the gateway settings Toolport writes when the user has not set them
 #   or an alias for them (`CODEX_GATEWAY_SETTINGS` in clients.rs, #1336), with
-#   exactly the values Toolport writes.
+#   exactly the values Toolport writes;
+# - `TOOLPORT_ATTRIBUTION_ID` set to the client's own id, added to the entry's env
+#   when Toolport rewrites the entry (#1104).
 REPAIRED_TYPES = {"cursor": "stdio", "vscode": "stdio", "github-copilot-cli": "local"}
+ATTRIBUTION_ID = "TOOLPORT_ATTRIBUTION_ID"
 CODEX_SETTINGS = [
     ("supports_parallel_tool_calls", (), True),
     ("startup_timeout_sec", ("startup_timeout_ms",), 75),
@@ -530,6 +533,14 @@ def upgrade_repairs(cid, before_path, after_path):
             if new[key] == value and type(new[key]) is type(value):
                 entry[key] = value
                 repairs.append(f"{key} = {str(value).lower()} added")
+    env, new_env = entry.get("env"), new.get("env")
+    if (
+        isinstance(new_env, dict)
+        and new_env.get(ATTRIBUTION_ID) == cid
+        and (env is None or (isinstance(env, dict) and ATTRIBUTION_ID not in env))
+    ):
+        entry.setdefault("env", {})[ATTRIBUTION_ID] = cid
+        repairs.append(f"{ATTRIBUTION_ID} added")
     if not repairs or expected != after:
         return None
     return repairs

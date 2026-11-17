@@ -221,6 +221,13 @@ class ClientsTest(unittest.TestCase):
         snap = os.path.join(self.tmp.name, "ev", "snap-codex.json")
         clients.snapshot(self.manifest, snap)
         self.assertEqual(codex_status(f'{head}command = "{canonical}"\n{settings}{env}'), ["PASS"])
+        # As seen on the real upgrade: Toolport's attribution id is added to the env.
+        self.assertEqual(
+            codex_status(f'{head}command = "{canonical}"\n{settings}{env}TOOLPORT_ATTRIBUTION_ID = "codex"\n'),
+            ["PASS"],
+        )
+        for other in ('TOOLPORT_ATTRIBUTION_ID = "cursor"\n', 'OTHER = "codex"\n'):
+            self.assertEqual(codex_status(f'{head}command = "{canonical}"\n{settings}{env}{other}'), ["FAIL"], other)
         self.assertEqual(codex_status(f'{head}command = "{old_path}"\n{settings}{env}'), ["PASS"])
         self.assertEqual(
             codex_status(f'{head}command = "{old_path}"\nsupports_parallel_tool_calls = true\n{env}'), ["PASS"]
