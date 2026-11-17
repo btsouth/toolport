@@ -280,5 +280,7 @@
   "Keep English": "Keep English",
   "Skills and rules each agent loads, and where they live": "Skills and rules each agent loads, and where they live",
   "Back to servers": "Back to servers",
-  "Add a config folder for a client Toolport did not find on its own": "Add a config folder for a client Toolport did not find on its own"
+  "Add a config folder for a client Toolport did not find on its own": "Add a config folder for a client Toolport did not find on its own",
+  "Check servers again": "Check servers again",
+  "Connect a local command or a remote endpoint once; every client gets it.": "Connect a local command or a remote endpoint once; every client gets it."
 }

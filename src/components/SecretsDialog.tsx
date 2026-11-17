@@ -73,6 +73,9 @@ export interface SecretsDialogProps {
   trigger?: ReactNode;
   /** Called after any auth/secret change, so the caller can re-probe health. */
   onChanged?: () => void;
+  /** Open on mount without a trigger, as from a row menu; `onClose` runs when it closes. */
+  autoOpen?: boolean;
+  onClose?: () => void;
 }
 
 /** Where to get the API key for known key-based (stdio) servers, keyed by env var. */
@@ -119,9 +122,11 @@ export function SecretsDialog({
   onSaved,
   trigger,
   onChanged,
+  autoOpen,
+  onClose,
 }: SecretsDialogProps) {
   const { t } = useI18n();
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(autoOpen ?? false);
   const [vaulted, setVaulted] = useState<Record<string, boolean>>({});
   // Whether the `secretStatus` probe succeeded. Failure must stay unknown
   // (SBS-841): an empty `vaulted` renders exactly like "nothing is saved" - no
@@ -365,8 +370,17 @@ export function SecretsDialog({
       runIdRef.current += 1;
       vaultRunIdRef.current += 1;
       void cancelOauth();
+      onClose?.();
     }
   }
+  // Opened from a menu: load the stored state once, as a trigger click would.
+  const autoOpened = useRef(false);
+  useEffect(() => {
+    if (!autoOpen || autoOpened.current) return;
+    autoOpened.current = true;
+    refreshStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- once, on mount
+  }, []);
 
   async function saveAuth() {
     if (!authInput) return;
@@ -632,16 +646,19 @@ export function SecretsDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogTrigger asChild>
-        {trigger ?? (
-          <button
-            aria-label={t("Manage secrets for {value1}", { value1: server.name })}
-            className="rounded p-1 text-muted-foreground transition hover:bg-accent hover:text-foreground"
-          >
-            <KeyRound className="size-3.5" />
-          </button>
-        )}
-      </DialogTrigger>
+      {/* Opened from a menu, it has no trigger of its own. */}
+      {!(autoOpen && !trigger) && (
+        <DialogTrigger asChild>
+          {trigger ?? (
+            <button
+              aria-label={t("Manage secrets for {value1}", { value1: server.name })}
+              className="rounded p-1 text-muted-foreground transition hover:bg-accent hover:text-foreground"
+            >
+              <KeyRound className="size-3.5" />
+            </button>
+          )}
+        </DialogTrigger>
+      )}
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>

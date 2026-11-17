@@ -280,5 +280,7 @@
   "Keep English": "英語のままにする",
   "Skills and rules each agent loads, and where they live": "各エージェントが読み込むスキルとルール、その保存場所",
   "Back to servers": "サーバーに戻る",
-  "Add a config folder for a client Toolport did not find on its own": "Toolport が自動検出できなかったクライアントの設定フォルダーを追加"
+  "Add a config folder for a client Toolport did not find on its own": "Toolport が自動検出できなかったクライアントの設定フォルダーを追加",
+  "Check servers again": "サーバーを再度確認します",
+  "Connect a local command or a remote endpoint once; every client gets it.": "ローカル コマンドまたはリモート エンドポイントを一度接続すれば、すべてのクライアントで使えます。"
 }

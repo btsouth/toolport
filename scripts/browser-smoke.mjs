@@ -218,7 +218,7 @@ try {
   const longServer = "A".repeat(70);
   await expect(page.getByTitle(longServer, { exact: true })).toBeVisible();
   const firstToggle = await page
-    .getByRole("switch", { name: `Toggle ${longServer}`, exact: true })
+    .getByRole("switch", { name: new RegExp(`^(Enable|Disable) ${longServer}$`) })
     .boundingBox();
   // The long name keeps the switch in the window: it wraps under the name
   // rather than being pushed off the right edge.
@@ -303,7 +303,7 @@ try {
   // A narrow window moves a row's status and actions under its name instead of
   // squeezing the name to nothing.
   await page.setViewportSize({ width: 480, height: 900 });
-  const serverNames = page.locator("[data-server-id] span.truncate.font-semibold");
+  const serverNames = page.locator("[data-server-id] button.truncate.font-semibold");
   expect(await serverNames.count()).toBeGreaterThan(2);
   for (const name of await serverNames.all()) {
     // The name's column keeps 200px or more, and the name itself is not cut.
@@ -498,7 +498,7 @@ try {
     .getByRole("button", { name: "Add", exact: true })
     .click();
   await expect(
-    page.getByRole("switch", { name: "Toggle Manual notes", exact: true }),
+    page.getByRole("switch", { name: "Disable Manual notes", exact: true }),
   ).toBeChecked();
   await page.screenshot({
     animations: "disabled",
@@ -534,7 +534,7 @@ try {
   await page.getByRole("button", { name: "Add", exact: true }).first().click();
   await page.getByRole("button", { name: "Servers", exact: true }).click();
   await expect(
-    page.getByRole("switch", { name: "Toggle NoteKit", exact: true }),
+    page.getByRole("switch", { name: "Disable NoteKit", exact: true }),
   ).toBeChecked();
   await page.screenshot({
     animations: "disabled",

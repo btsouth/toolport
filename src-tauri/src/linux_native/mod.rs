@@ -2310,7 +2310,8 @@ impl ServerPage {
                 self.clear_server_list();
                 *self.last_snapshot.borrow_mut() = None;
                 self.server_count.set_visible(false);
-                self.posture.set_visible(false);
+                self.show_posture(None);
+                self.section_title.set_visible(true);
                 l10n::bind_text(&self.section_title, "Servers unavailable");
                 let page = self.clone();
                 self.list.append(&registry_error_callout(&cause, move || {
@@ -2321,7 +2322,8 @@ impl ServerPage {
                 self.clear_server_list();
                 *self.last_snapshot.borrow_mut() = None;
                 self.server_count.set_visible(false);
-                self.posture.set_visible(false);
+                self.show_posture(None);
+                self.section_title.set_visible(true);
                 self.section_title
                     .set_label(&crate::i18n::tr("Servers unavailable"));
                 self.list.append(&state_card_formatted(
@@ -2416,15 +2418,18 @@ impl ServerPage {
         if snapshot.servers.is_empty() {
             self.server_count.set_visible(false);
             self.clear_server_list();
-            self.posture.set_visible(false);
+            self.show_posture(None);
+            // The empty state is the whole list, as in React: no group heading.
+            self.section_title.set_visible(false);
             self.list.append(&self.empty_servers(
                 crate::i18n::msg("No servers yet"),
                 crate::i18n::msg(
-                    "Use Add server to connect your first local command or remote endpoint.",
+                    "Connect a local command or a remote endpoint once; every client gets it.",
                 ),
             ));
             return;
         }
+        self.section_title.set_visible(true);
 
         // Turned-off servers get their own group below the running ones, so a
         // disabled server never reads as one that is merely still loading.
@@ -2570,13 +2575,45 @@ impl ServerPage {
             .borrow()
             .as_ref()
             .is_some_and(|card| card.is_visible());
-        if enabled.is_empty() || filtered_out {
-            self.posture.set_visible(false);
+        let all = snapshot
+            .iter()
+            .flat_map(|snapshot| snapshot.servers.iter())
+            .count();
+        if all == 0 || filtered_out {
+            self.show_posture(None);
             return;
         }
-        let tally = self.health.borrow().tally(enabled.iter().copied());
-        self.posture.set_visible(true);
-        self.posture.set_label(&posture_line(tally, enabled.len()));
+        let health = self.health.borrow();
+        let servers = snapshot
+            .iter()
+            .flat_map(|snapshot| snapshot.servers.iter())
+            .filter(|server| server.enabled)
+            .map(|server| PostureServer {
+                name: &server.name,
+                result: health.result(&server.id),
+                checking: health.checking(&server.id),
+            })
+            .collect::<Vec<_>>();
+        self.show_posture(Some(server_posture_copy(&servers, all - enabled.len())));
+    }
+
+    /// The summary card above the list; `None` hides it. Pages built in tests
+    /// keep a bare label, which gets the title only.
+    fn show_posture(&self, copy: Option<PostureCopy>) {
+        let card = StatusCard::from_title(&self.posture);
+        let root = card
+            .as_ref()
+            .map(|card| card.root.clone().upcast::<gtk::Widget>())
+            .unwrap_or_else(|| self.posture.clone().upcast());
+        let Some(copy) = copy else {
+            root.set_visible(false);
+            return;
+        };
+        match card {
+            Some(card) => card.show_with_icon(copy.tone, copy.icon, &copy.title, &copy.detail),
+            None => self.posture.set_label(&copy.title),
+        }
+        root.set_visible(true);
     }
 
     /// Probe the enabled servers the health cache says need it, in the
@@ -8960,6 +8997,13 @@ fn build_content(
 
     let approval_page = ApprovalPage::new(app, broker);
 
+    // The summary card above the list, as React's posture and next-action
+    // cards. The page keeps its title label; `show_posture` finds the card.
+    let posture_card = StatusCard::new();
+    posture_card.root.set_visible(false);
+    page.append(&posture_card.root);
+    let posture = posture_card.title.clone();
+
     // Group header: section label plus the count of servers in the group.
     let section_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let section_title = {
@@ -8979,15 +9023,6 @@ fn build_content(
         .build();
     section_header.append(&server_count);
     page.append(&section_header);
-
-    let posture = gtk::Label::builder()
-        .halign(gtk::Align::Fill)
-        .xalign(0.0)
-        .wrap(true)
-        .visible(false)
-        .css_classes(["toolport-muted"])
-        .build();
-    page.append(&posture);
 
     let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
     list.append(&skeleton_rows(crate::i18n::msg("Loading servers… ")));
@@ -9067,6 +9102,8 @@ fn build_content(
         open_shared_setup(url, page_for_share.clone());
     });
     app.add_action(&open_share_action);
+    let enable_all_for_menu = enable_all.clone();
+    let disable_all_for_menu = disable_all.clone();
     let page_for_enable_all = server_page.1.clone();
     enable_all.connect_clicked(move |_| {
         let Some(snapshot) = page_for_enable_all.last_snapshot.borrow().clone() else {
@@ -9078,6 +9115,17 @@ fn build_content(
             crate::i18n::msg("Enabled reviewed servers"),
             move || crate::registry_controller::set_all_enabled(&profile_id, true),
         );
+    });
+    // The bulk actions only show once there are servers, as in React.
+    let page_for_bulk_menu = server_page.1.clone();
+    profile_popover.connect_show(move |_| {
+        let any = page_for_bulk_menu
+            .last_snapshot
+            .borrow()
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.servers.is_empty());
+        enable_all_for_menu.set_visible(any);
+        disable_all_for_menu.set_visible(any);
     });
     let page_for_disable_all = server_page.1.clone();
     disable_all.connect_clicked(move |_| {
@@ -10349,64 +10397,188 @@ fn probe_tooltip(probe: &crate::server_runtime::ProbeResult) -> Option<String> {
 }
 
 /// The one-line posture summary above the server list.
-fn posture_line(tally: health::Tally, total: usize) -> String {
-    let health::Tally {
-        ready,
-        auth,
-        errors,
-        locked,
-        pending,
-    } = tally;
-    if pending > 0 {
-        return crate::i18n::trf(
-            if total == 1 {
-                crate::i18n::msg("Checking {value0} of {value1} enabled server…")
+/// One enabled server as the Servers summary sees it.
+struct PostureServer<'a> {
+    name: &'a str,
+    result: Option<&'a crate::server_runtime::ProbeResult>,
+    checking: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PostureCopy {
+    tone: StatusTone,
+    icon: &'static str,
+    title: String,
+    detail: String,
+}
+
+/// The Servers summary card, as React words it: `ServerNextAction` (App.tsx)
+/// when an enabled server needs attention, else `ServerPosture`
+/// (`serverPostureCopy` in serverPosture.ts). Keep the two in step.
+fn server_posture_copy(enabled: &[PostureServer], disabled: usize) -> PostureCopy {
+    use crate::i18n::{tr, trf};
+    let attention = enabled
+        .iter()
+        .filter(|server| server.result.is_some_and(|result| !result.ok))
+        .collect::<Vec<_>>();
+    let auth = attention
+        .iter()
+        .filter(|server| server.result.is_some_and(|result| result.auth_required))
+        .collect::<Vec<_>>();
+    let locked = attention
+        .iter()
+        .filter(|server| {
+            server
+                .result
+                .is_some_and(|result| !result.auth_required && result.keyring_locked)
+        })
+        .count();
+    let errors = attention
+        .iter()
+        .filter(|server| {
+            server
+                .result
+                .is_some_and(|result| !result.auth_required && !result.keyring_locked)
+        })
+        .collect::<Vec<_>>();
+    let count = |n: usize| format!("{n}");
+    let copy = |tone, icon, title: String, detail: String| PostureCopy {
+        tone,
+        icon,
+        title,
+        detail,
+    };
+    const KEY: &str = "dialog-password-symbolic";
+    const ALERT: &str = "dialog-warning-symbolic";
+    if !attention.is_empty() {
+        if locked > 0 && auth.is_empty() && errors.is_empty() {
+            return copy(
+                StatusTone::Warning,
+                KEY,
+                tr("Keyring locked"),
+                tr("Unlock your keyring, then choose Retry."),
+            );
+        }
+        if locked > 0 {
+            let mut parts = Vec::new();
+            if auth.len() == 1 {
+                parts.push(trf("{value0} needs sign-in", &[("value0", &count(1))]));
+            } else if auth.len() > 1 {
+                parts.push(trf(
+                    "{value0} need sign-in",
+                    &[("value0", &count(auth.len()))],
+                ));
+            }
+            if !errors.is_empty() {
+                parts.push(trf("{value0} failing", &[("value0", &count(errors.len()))]));
+            }
+            parts.push(trf(
+                "{value0} waiting for the keyring",
+                &[("value0", &count(locked))],
+            ));
+            return copy(
+                if errors.is_empty() {
+                    StatusTone::Warning
+                } else {
+                    StatusTone::Danger
+                },
+                ALERT,
+                trf(
+                    "{value1} servers need a quick check",
+                    &[("value1", &count(auth.len() + errors.len() + locked))],
+                ),
+                parts.join(" · "),
+            );
+        }
+        let title = match (auth.len(), errors.len()) {
+            (1, 0) => trf("Sign in to {value1}", &[("value1", auth[0].name)]),
+            (n, 0) => trf("Sign in to {value1} servers", &[("value1", &count(n))]),
+            (0, 1) => trf("{value1} couldn't start", &[("value1", errors[0].name)]),
+            (0, n) => trf("{value1} servers couldn't start", &[("value1", &count(n))]),
+            (a, e) => trf(
+                "{value1} servers need a quick check",
+                &[("value1", &count(a + e))],
+            ),
+        };
+        let detail = match (auth.len(), errors.len()) {
+            (_, 0) => tr("Use the actions below to finish setup. Everything else stays available."),
+            (0, _) => tr("Open the affected rows below for the error and recovery details."),
+            (a, e) => trf(
+                "{value1} need sign-in; {value2} couldn't start. The other servers stay available.",
+                &[("value1", &count(a)), ("value2", &count(e))],
+            ),
+        };
+        return copy(
+            if auth.is_empty() {
+                StatusTone::Danger
             } else {
-                crate::i18n::msg("Checking {value0} of {value1} enabled servers…")
+                StatusTone::Warning
             },
-            &[
-                ("value0", &format!("{}", pending)),
-                ("value1", &format!("{}", total)),
-            ],
+            if errors.is_empty() { KEY } else { ALERT },
+            title,
+            detail,
         );
     }
-    if auth == 0 && errors == 0 && locked == 0 {
-        return crate::i18n::trf(
-            if total == 1 {
-                crate::i18n::msg("All {value0} enabled server is ready.")
-            } else {
-                crate::i18n::msg("All {value0} enabled servers are ready.")
-            },
-            &[("value0", &format!("{}", total))],
-        );
+    let total = enabled.len();
+    let checked = enabled
+        .iter()
+        .filter(|server| server.result.is_some())
+        .count();
+    let connected = enabled
+        .iter()
+        .filter(|server| server.result.is_some_and(|result| result.ok))
+        .count();
+    let probing = enabled.iter().any(|server| server.checking);
+    let healthy = total > 0 && checked == total && !probing;
+    let title = if total == 0 {
+        tr("No servers enabled")
+    } else if probing {
+        tr("Checking server reachability")
+    } else if checked < total {
+        tr("Reachability check incomplete")
+    } else if connected == 1 {
+        trf(
+            "{connected} enabled server reachable",
+            &[("connected", &count(connected))],
+        )
+    } else {
+        trf(
+            "{connected} enabled servers reachable",
+            &[("connected", &count(connected))],
+        )
+    };
+    let detail = if total == 0 {
+        if disabled == 1 {
+            trf(
+                "{disabled} server turned off.",
+                &[("disabled", &count(disabled))],
+            )
+        } else {
+            trf(
+                "{disabled} servers turned off.",
+                &[("disabled", &count(disabled))],
+            )
+        }
+    } else if probing {
+        trf(
+            "{checked} of {enabled} checked so far.",
+            &[("checked", &count(checked)), ("enabled", &count(total))],
+        )
+    } else if checked < total {
+        trf(
+            "{checked} of {enabled} checked. Refresh to try again.",
+            &[("checked", &count(checked)), ("enabled", &count(total))],
+        )
+    } else if disabled > 0 {
+        trf("{disabled} turned off.", &[("disabled", &count(disabled))])
+    } else {
+        tr("Every enabled server is ready.")
+    };
+    if healthy {
+        copy(StatusTone::Success, "object-select-symbolic", title, detail)
+    } else {
+        copy(StatusTone::Info, "view-refresh-symbolic", title, detail)
     }
-    let mut parts = vec![crate::i18n::trf(
-        "{value0} ready",
-        &[("value0", &format!("{}", ready))],
-    )];
-    if auth > 0 {
-        parts.push(crate::i18n::trf(
-            if auth == 1 {
-                crate::i18n::msg("{value0} needs sign-in")
-            } else {
-                crate::i18n::msg("{value0} need sign-in")
-            },
-            &[("value0", &format!("{}", auth))],
-        ));
-    }
-    if errors > 0 {
-        parts.push(crate::i18n::trf(
-            "{value0} failing",
-            &[("value0", &format!("{}", errors))],
-        ));
-    }
-    if locked > 0 {
-        parts.push(crate::i18n::trf(
-            "{value0} waiting for the keyring",
-            &[("value0", &format!("{}", locked))],
-        ));
-    }
-    parts.join(" · ")
 }
 
 fn server_groups(
@@ -16248,6 +16420,7 @@ pub(super) enum StatusTone {
     Info,
     Success,
     Warning,
+    Danger,
 }
 
 impl StatusTone {
@@ -16257,6 +16430,7 @@ impl StatusTone {
             Self::Info => "status-info",
             Self::Success => "status-success",
             Self::Warning => "status-warning",
+            Self::Danger => "status-danger",
         }
     }
 
@@ -16265,6 +16439,7 @@ impl StatusTone {
             Self::Info => "dialog-information-symbolic",
             Self::Success => "object-select-symbolic",
             Self::Warning => "dialog-warning-symbolic",
+            Self::Danger => "dialog-error-symbolic",
         }
     }
 }
@@ -16350,11 +16525,21 @@ impl StatusCard {
 
     /// Shows `title` and `detail` (hidden when empty) in `tone`.
     pub(super) fn show(&self, tone: StatusTone, title: &str, detail: &str) {
-        for other in [StatusTone::Info, StatusTone::Success, StatusTone::Warning] {
+        self.show_with_icon(tone, tone.icon(), title, detail);
+    }
+
+    /// [`Self::show`] with React's icon for this message instead of the tone's.
+    pub(super) fn show_with_icon(&self, tone: StatusTone, icon: &str, title: &str, detail: &str) {
+        for other in [
+            StatusTone::Info,
+            StatusTone::Success,
+            StatusTone::Warning,
+            StatusTone::Danger,
+        ] {
             self.root.remove_css_class(other.class());
         }
         self.root.add_css_class(tone.class());
-        self.tile.set_icon_name(Some(tone.icon()));
+        self.tile.set_icon_name(Some(icon));
         self.title.set_label(title);
         self.detail.set_label(detail);
         self.detail.set_visible(!detail.is_empty());
@@ -16362,6 +16547,26 @@ impl StatusCard {
             gtk::accessible::Property::Label(title),
             gtk::accessible::Property::Description(detail),
         ]);
+    }
+
+    /// The card whose title is `title`, if it is one. Lets a page keep its
+    /// card as the title label it always had.
+    fn from_title(title: &gtk::Label) -> Option<Self> {
+        let copy = title.parent()?;
+        let mut root = copy.parent();
+        while let Some(widget) = root.as_ref() {
+            if widget.has_css_class("toolport-status-card") {
+                break;
+            }
+            root = widget.parent();
+        }
+        Some(Self {
+            root: root?.downcast().ok()?,
+            tile: copy.prev_sibling()?.downcast().ok()?,
+            title: title.clone(),
+            detail: title.next_sibling()?.downcast().ok()?,
+            actions: gtk::Box::new(gtk::Orientation::Horizontal, 0),
+        })
     }
 }
 
@@ -21047,69 +21252,102 @@ mod tests {
     }
 
     #[test]
-    fn posture_lines_cover_checking_healthy_and_mixed_states() {
+    fn server_summary_matches_react_for_checking_healthy_and_attention_states() {
+        let probe = |ok: bool, auth: bool, locked: bool| crate::server_runtime::ProbeResult {
+            server_id: String::new(),
+            ok,
+            tool_count: 3,
+            error: (!ok && !auth && !locked).then(|| "Connection refused".to_string()),
+            auth_required: auth,
+            failure: None,
+            auth_target: None,
+            keyring_locked: locked,
+        };
+        let (ready, auth, error, locked) = (
+            probe(true, false, false),
+            probe(false, true, false),
+            probe(false, false, false),
+            probe(false, false, true),
+        );
+        let server = |name, result, checking| PostureServer {
+            name,
+            result,
+            checking,
+        };
+        let text = |copy: PostureCopy| (copy.tone, copy.title, copy.detail);
+        assert_eq!(
+            text(server_posture_copy(
+                &[
+                    server("A", Some(&ready), false),
+                    server("B", Some(&ready), false)
+                ],
+                0
+            )),
+            (
+                StatusTone::Success,
+                "2 enabled servers reachable".into(),
+                "Every enabled server is ready.".into()
+            )
+        );
+        assert_eq!(
+            text(server_posture_copy(&[server("A", None, true)], 1)),
+            (
+                StatusTone::Info,
+                "Checking server reachability".into(),
+                "0 of 1 checked so far.".into()
+            )
+        );
+        assert_eq!(
+            text(server_posture_copy(&[], 2)),
+            (
+                StatusTone::Info,
+                "No servers enabled".into(),
+                "2 servers turned off.".into()
+            )
+        );
         // A locked keyring is not a failure: those servers were not checked.
         assert_eq!(
-            posture_line(
-                health::Tally {
-                    locked: 9,
-                    ..health::Tally::default()
-                },
-                9
-            ),
-            "0 ready · 9 waiting for the keyring"
+            text(server_posture_copy(&[server("A", Some(&locked), false)], 0)),
+            (
+                StatusTone::Warning,
+                "Keyring locked".into(),
+                "Unlock your keyring, then choose Retry.".into()
+            )
         );
         assert_eq!(
-            posture_line(
-                health::Tally {
-                    ready: 0,
-                    auth: 0,
-                    errors: 0,
-                    locked: 0,
-                    pending: 3,
-                },
-                3
-            ),
-            "Checking 3 of 3 enabled servers…"
+            text(server_posture_copy(
+                &[
+                    server("A", Some(&auth), false),
+                    server("B", Some(&error), false),
+                    server("C", Some(&locked), false),
+                    server("D", Some(&ready), false),
+                ],
+                0
+            )),
+            (
+                StatusTone::Danger,
+                "3 servers need a quick check".into(),
+                "1 needs sign-in · 1 failing · 1 waiting for the keyring".into()
+            )
         );
         assert_eq!(
-            posture_line(
-                health::Tally {
-                    ready: 4,
-                    auth: 0,
-                    errors: 0,
-                    locked: 0,
-                    pending: 0,
-                },
-                4
-            ),
-            "All 4 enabled servers are ready."
+            text(server_posture_copy(
+                &[server("Linear", Some(&auth), false)],
+                0
+            ))
+            .1,
+            "Sign in to Linear"
         );
         assert_eq!(
-            posture_line(
-                health::Tally {
-                    ready: 1,
-                    auth: 0,
-                    errors: 0,
-                    locked: 0,
-                    pending: 0,
-                },
-                1
-            ),
-            "All 1 enabled server is ready."
-        );
-        assert_eq!(
-            posture_line(
-                health::Tally {
-                    ready: 2,
-                    auth: 1,
-                    errors: 1,
-                    locked: 0,
-                    pending: 0,
-                },
-                4
-            ),
-            "2 ready · 1 needs sign-in · 1 failing"
+            text(server_posture_copy(
+                &[server("Stripe", Some(&error), false)],
+                0
+            )),
+            (
+                StatusTone::Danger,
+                "Stripe couldn't start".into(),
+                "Open the affected rows below for the error and recovery details.".into()
+            )
         );
     }
 

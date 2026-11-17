@@ -280,5 +280,7 @@
   "Keep English": "Garder l’anglais",
   "Skills and rules each agent loads, and where they live": "Les compétences et règles chargées par chaque agent et leur emplacement",
   "Back to servers": "Retour aux serveurs",
-  "Add a config folder for a client Toolport did not find on its own": "Ajouter un dossier de configuration pour un client que Toolport n’a pas détecté automatiquement"
+  "Add a config folder for a client Toolport did not find on its own": "Ajouter un dossier de configuration pour un client que Toolport n’a pas détecté automatiquement",
+  "Check servers again": "Vérifier à nouveau les serveurs",
+  "Connect a local command or a remote endpoint once; every client gets it.": "Connectez une commande locale ou un point de terminaison distant une seule fois ; chaque client en profite."
 }

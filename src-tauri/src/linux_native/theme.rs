@@ -1297,10 +1297,12 @@ button.toolport-catalog-action {{
 .toolport-status-card {{ background: @toolport_card; border: 1px solid @toolport_border; border-radius: 12px; padding: 16px; }}
 .toolport-status-card.status-success {{ border-left: 3px solid @toolport_success; }}
 .toolport-status-card.status-warning {{ border-left: 3px solid @toolport_warning; }}
+.toolport-status-card.status-danger {{ border-left: 3px solid @toolport_error; }}
 .toolport-status-card .toolport-status-tile {{ border-radius: 8px; }}
 .toolport-status-card.status-info .toolport-status-tile {{ background: alpha(@toolport_fg, 0.06); color: @toolport_text_secondary; }}
 .toolport-status-card.status-success .toolport-status-tile {{ background: alpha(@toolport_success, 0.12); color: @toolport_success; }}
 .toolport-status-card.status-warning .toolport-status-tile {{ background: alpha(@toolport_warning, 0.12); color: @toolport_warning; }}
+.toolport-status-card.status-danger .toolport-status-tile {{ background: alpha(@toolport_error, 0.12); color: @toolport_error; }}
 .toolport-status-title {{ font-size: 14px; font-weight: 600; }}
 .toolport-status-detail {{ font-size: 13px; }}
 .toolport-error-callout {{ background: @toolport_card; border: 1px solid @toolport_border; border-left: 3px solid @toolport_error; border-radius: 12px; padding: 16px; }}

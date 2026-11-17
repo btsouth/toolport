@@ -26,7 +26,9 @@ pub(super) enum ProbeReason {
     Unlocked,
 }
 
-/// Enabled servers by health state, for the page's one-line summary.
+/// Enabled servers by health state. The page's summary reads each result
+/// (see `server_posture_copy`); the tests use this count to check the cache.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct Tally {
     pub(super) ready: usize,
@@ -88,6 +90,11 @@ pub(super) struct HealthCache {
 impl HealthCache {
     pub(super) fn result(&self, server_id: &str) -> Option<&ProbeResult> {
         self.results.get(server_id).map(|cached| &cached.result)
+    }
+
+    /// A probe of this server is running.
+    pub(super) fn checking(&self, server_id: &str) -> bool {
+        self.in_flight.contains_key(server_id)
     }
 
     /// Some row shows "Keyring locked".
@@ -231,6 +238,7 @@ impl HealthCache {
     }
 
     /// Ready, needs sign-in, failing and still checking, over enabled servers.
+    #[cfg(test)]
     pub(super) fn tally<'a>(&self, enabled: impl IntoIterator<Item = &'a str>) -> Tally {
         let mut tally = Tally::default();
         for id in enabled {
