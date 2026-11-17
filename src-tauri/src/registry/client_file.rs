@@ -58,7 +58,12 @@ pub(crate) struct Revision {
     permissions: Option<fs::Permissions>,
 }
 
+/// Read a client config. An operating system error names the file.
 pub(crate) fn read(path: &Path) -> Result<Revision, String> {
+    read_revision(path).map_err(|error| crate::clients::name_file_in_error(path, error))
+}
+
+fn read_revision(path: &Path) -> Result<Revision, String> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -399,7 +404,13 @@ fn exchange(_: &Path, _: &Path, _: &Path) -> Result<bool, String> {
     Ok(false)
 }
 
+/// Write or remove a client config. An operating system error names the file.
 pub(crate) fn commit(path: &Path, expected: &Revision, output: Option<&str>) -> Result<(), String> {
+    commit_revision(path, expected, output)
+        .map_err(|error| crate::clients::name_file_in_error(path, error))
+}
+
+fn commit_revision(path: &Path, expected: &Revision, output: Option<&str>) -> Result<(), String> {
     let dest = resolve_atomic_write_dest(path)?;
     if output.is_none() {
         return remove(&dest, expected);
@@ -427,7 +438,7 @@ pub(crate) fn commit(path: &Path, expected: &Revision, output: Option<&str>) -> 
     }
     file.sync_all().map_err(|e| e.to_string())?;
     drop(file);
-    if read(&dest)?.text != expected.text {
+    if read_revision(&dest)?.text != expected.text {
         return Err(CHANGED.into());
     }
     #[cfg(test)]
@@ -458,7 +469,7 @@ pub(crate) fn commit(path: &Path, expected: &Revision, output: Option<&str>) -> 
         // From here cleanup must never delete unverified displaced bytes.
         cleanup.disarm();
         let matches = fs::symlink_metadata(&displaced).is_ok_and(|meta| meta.is_file())
-            && read(&displaced).is_ok_and(|old| old.text == expected.text);
+            && read_revision(&displaced).is_ok_and(|old| old.text == expected.text);
         if !matches {
             #[cfg(windows)]
             let rollback_displaced = sibling(&dest);
@@ -477,7 +488,7 @@ pub(crate) fn commit(path: &Path, expected: &Revision, output: Option<&str>) -> 
             }
             // If a client saved again after our swap, retain that second save
             // rather than deleting it along with our rejected output.
-            if read(&rollback_displaced)?.text.as_deref() == Some(output) {
+            if read_revision(&rollback_displaced)?.text.as_deref() == Some(output) {
                 cleanup_published(&rollback_displaced);
             } else {
                 return Err(format!(
@@ -527,7 +538,7 @@ fn remove(dest: &Path, expected: &Revision) -> Result<(), String> {
         }
     })?;
     // No cleanup guard: unreadable or conflicting bytes must stay recoverable.
-    if !read(&tombstone).is_ok_and(|old| old.text == expected.text) {
+    if !read_revision(&tombstone).is_ok_and(|old| old.text == expected.text) {
         // A no-clobber restore also preserves a new save at the original path.
         #[cfg(test)]
         hook("restore", dest);
