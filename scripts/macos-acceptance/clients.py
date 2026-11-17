@@ -494,6 +494,30 @@ CODEX_SETTINGS = [
 ]
 
 
+def comments(fmt, text):
+    """The comments in a TOML or JSONC file, in order, which parsing drops."""
+    if fmt.startswith("toml"):
+        marks = ("#",)
+    elif fmt.startswith("jsonc"):
+        marks = ("//", "/*")
+    else:
+        return []
+    found = []
+    for line in text.splitlines():
+        quoted = escaped = False
+        for i, ch in enumerate(line):
+            if escaped:
+                escaped = False
+            elif ch == "\\" and quoted:
+                escaped = True
+            elif ch == '"':
+                quoted = not quoted
+            elif not quoted and line.startswith(marks, i):
+                found.append(line[i:].strip())
+                break
+    return found
+
+
 def upgrade_repairs(cid, before_path, after_path):
     """The repairs that turn the config at before_path into the one at after_path,
     or None when anything else changed (or either file cannot be read)."""
@@ -504,6 +528,10 @@ def upgrade_repairs(cid, before_path, after_path):
         return None
     try:
         before, after = load(client, before_path), load(client, after_path)
+        with open(before_path, encoding="utf-8") as f, open(after_path, encoding="utf-8") as g:
+            # Parsing drops comments; the user's must all still be there.
+            if comments(client["format"], f.read()) != comments(client["format"], g.read()):
+                return None
     except Exception:
         return None
     table = USER_TABLES[client["format"]]

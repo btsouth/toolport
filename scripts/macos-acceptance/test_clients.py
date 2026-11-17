@@ -204,7 +204,7 @@ class ClientsTest(unittest.TestCase):
         if not clients.tomllib:
             return
         codex = self.path("codex")
-        head = 'model = "gpt-5-codex"\n\n[mcp_servers.toolport]\n'
+        head = 'model = "gpt-5-codex" # "#" in a string is not one\n\n# my servers\n[mcp_servers.toolport]\n'
         env = '\n[mcp_servers.toolport.env]\nTOOLPORT_CLIENT_ID = "codex"\n'
 
         def write(text):
@@ -241,6 +241,14 @@ class ClientsTest(unittest.TestCase):
             self.assertEqual(codex_status(f'{head}command = "{canonical}"\n{wrong}{env}'), ["FAIL"], wrong)
             with open(os.path.join(self.tmp.name, "ev", "snap-codex-changed", "codex")) as f:
                 self.assertIn(wrong, f.read())
+        # A repair does not cover a removed or changed comment.
+        repaired = f'{head}command = "{canonical}"\n{settings}{env}'
+        for text in (
+            repaired.replace("# my servers\n", ""),
+            repaired.replace("# my servers", "# servers"),
+            repaired.replace("[mcp_servers.toolport]\n", "[mcp_servers.toolport]  # added\n"),
+        ):
+            self.assertEqual(codex_status(text), ["FAIL"], text)
         # A setting the user already had, under its alias, is not added to.
         write(f'{head}command = "{old_path}"\nstartup_timeout_ms = 5000\n{env}')
         clients.snapshot(self.manifest, snap)
