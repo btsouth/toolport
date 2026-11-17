@@ -13484,8 +13484,19 @@ fn open_server_editor_prefilled(
                     }
                     None => {
                         // All or nothing: a failure leaves the editor open with its values.
-                        let outcome =
-                            crate::registry_controller::add_server_with_rows(fields, env)?;
+                        // A preset's or a Duplicate's launch inputs stay when the paste
+                        // left the command alone, saved in the same step as the rows.
+                        let launch = launch_definition
+                            .filter(|_| !binding_changed)
+                            .map(|launch| launch_with_values(launch, &launch_values));
+                        let outcome = crate::registry_controller::add_server_with_values(
+                            fields,
+                            env,
+                            crate::registry_controller::EntryExtras {
+                                launch,
+                                ..Default::default()
+                            },
+                        )?;
                         Ok::<_, String>((
                             outcome.registry,
                             outcome.declared_without_value,
@@ -13560,6 +13571,22 @@ fn apply_launch_probe_value(input: &mut crate::registry::LaunchInput, value: &st
     if !input.secret || !value.is_empty() {
         input.value = (!value.is_empty()).then(|| value.to_string());
     }
+}
+
+/// `launch` with the editor's values in its inputs, as React's dialog sends it:
+/// a typed value in the input (a secret one moves to the keychain on save), a
+/// password manager reference in its source.
+fn launch_with_values(
+    mut launch: crate::registry::LaunchConfig,
+    values: &[(crate::registry::LaunchInput, String)],
+) -> crate::registry::LaunchConfig {
+    for input in &mut launch.inputs {
+        if let Some((edited, value)) = values.iter().find(|(edited, _)| edited.key == input.key) {
+            *input = edited.clone();
+            input.value = (!value.is_empty()).then(|| value.clone());
+        }
+    }
+    launch
 }
 
 fn launch_editor_value(
@@ -17586,6 +17613,83 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(pasted.value.as_deref(), Some("replacement"));
+    }
+
+    /// A preset or a Duplicate opened in the editor, with a pasted row and the
+    /// command left alone, keeps its launch inputs: the typed secret goes to the
+    /// keychain with the row's value, in one save.
+    #[test]
+    fn a_pasted_row_keeps_the_launch_inputs_of_an_unchanged_command() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let entry: crate::registry::ServerEntry = serde_json::from_value(serde_json::json!({
+                "id": "", "enabled": false, "name": "demo", "transport": "stdio",
+                "command": "npx",
+                "args": ["-y", "example-server", "<launch-input>", "<launch-input>",
+                         "<launch-input>"],
+                "launch": {
+                    "inputs": [
+                        {"key": "ACCOUNT", "label": "Account", "secret": false,
+                         "required": true, "value": null},
+                        {"key": "SECRET", "label": "Secret", "secret": true,
+                         "required": true, "value": null},
+                        {"key": "REF", "label": "Reference", "secret": true,
+                         "required": true, "value": null}
+                    ],
+                    "bindings": [
+                        {"index": 2, "parts": [{"kind": "input", "key": "ACCOUNT"}]},
+                        {"index": 3, "parts": [{"kind": "input", "key": "SECRET"}]},
+                        {"index": 4, "parts": [{"kind": "input", "key": "REF"}]}
+                    ]
+                },
+                "env": [{"key": "API_KEY", "value": "pasted-row-value", "secret": true}],
+                "url": null, "source": "catalog:curated", "cwd": null,
+                "inheritEnv": true, "hidePrompts": false, "initializeTimeoutMs": 45000
+            }))
+            .unwrap();
+            let (fields, rows, mut extras) =
+                crate::registry_controller::values_from_entry(entry).unwrap();
+            let launch = extras.launch.take().unwrap();
+            let values = launch
+                .inputs
+                .iter()
+                .zip([
+                    ("AC123", None),
+                    ("typed-launch-secret", None),
+                    ("", Some("env:REF_TOKEN")),
+                ])
+                .map(|(input, (typed, reference))| {
+                    super::launch_editor_value(input, typed, reference)
+                })
+                .collect::<Vec<_>>();
+            extras.launch = Some(super::launch_with_values(launch, &values));
+            let outcome =
+                crate::registry_controller::add_server_with_values(fields, rows, extras).unwrap();
+            assert!(outcome.declared_without_value.is_empty());
+            let server = crate::registry::load().unwrap().servers.remove(0);
+            let launch = server.launch.as_ref().expect("launch inputs kept");
+            assert_eq!(launch.inputs[0].value.as_deref(), Some("AC123"));
+            assert_eq!(launch.inputs[1].value, None);
+            // A password manager reference counts as set and is kept as the source.
+            assert_eq!(
+                crate::secret_refs::source(&launch.inputs[2].unknown_fields).unwrap(),
+                Some("env:REF_TOKEN")
+            );
+            assert!(server.enabled);
+            for (key, value) in [
+                ("SECRET", "typed-launch-secret"),
+                ("API_KEY", "pasted-row-value"),
+            ] {
+                assert_eq!(
+                    crate::secrets::get_secret_result(&outcome.id, key)
+                        .unwrap()
+                        .as_deref(),
+                    Some(value),
+                    "{key}"
+                );
+            }
+            let saved = serde_json::to_string(&server).unwrap();
+            assert!(!saved.contains("typed-launch-secret") && !saved.contains("pasted-row-value"));
+        });
     }
 
     #[test]
