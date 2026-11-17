@@ -322,7 +322,9 @@ function ImportReviewContent({
                     <div className="flex flex-col gap-2 pt-2">
                       {item.credentials.map((env) => (
                         <div key={env.key} className="flex items-center gap-2">
-                          <label className="flex items-center gap-2">
+                          {/* A long key wraps instead of pushing the state and Enter
+                              value out of the dialog, as GTK's line does. */}
+                          <label className="flex min-w-0 flex-1 items-center gap-2 [overflow-wrap:anywhere]">
                             <input
                               type="checkbox"
                               disabled={
@@ -345,7 +347,7 @@ function ImportReviewContent({
                                 {t("Optional")}
                               </span>
                             )}
-                            <span className="ml-auto text-muted-foreground">
+                            <span className="ml-auto shrink-0 text-muted-foreground">
                               {env.present
                                 ? t("Found")
                                 : credentialInputs[item.name]?.[env.key]
@@ -403,7 +405,8 @@ function ImportReviewContent({
               )}
             </p>
             <label className="flex flex-col gap-2 text-meta">
-              {editing.key}
+              {/* A long key wraps instead of widening the sheet, as GTK's does. */}
+              <span className="[overflow-wrap:anywhere]">{editing.key}</span>
               {/* Spec §13: surface fill and a 2px accent focus ring. */}
               <Input
                 type="password"
@@ -412,8 +415,11 @@ function ImportReviewContent({
                 value={value}
                 onChange={(e) => setValue(e.target.value)}
                 onKeyDown={(e) => {
-                  // Return uses the value, as the GTK prompt's default button does.
-                  if (e.key === "Enter" && value.trim()) {
+                  // Return uses the value, as the GTK prompt's default button does. Not
+                  // while an input method is composing: that Enter picks a candidate
+                  // (229 is the IME key code).
+                  const composing = e.nativeEvent.isComposing || e.keyCode === 229;
+                  if (e.key === "Enter" && !composing && value.trim()) {
                     e.preventDefault();
                     applyValue();
                   }
@@ -432,7 +438,7 @@ function ImportReviewContent({
         </Dialog>
       )}
       {missingRequired.map((reason) => (
-        <p key={reason} className="text-sm text-warning">
+        <p key={reason} className="text-sm text-warning [overflow-wrap:anywhere]">
           {reason}
         </p>
       ))}

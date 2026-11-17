@@ -3743,11 +3743,23 @@ impl ClientPage {
         self.list_notice.set_visible(false);
     }
 
-    /// Dismissing the detail notice. The list reminder goes with it only when it is
-    /// that same notice.
-    pub(super) fn dismiss_detail_notice(&self) {
-        let dismissed = self.detail_notice.borrow_mut().take();
-        if dismissed.is_some() && *self.list_notice_of.borrow() == dismissed {
+    /// The notice a client's details show: its own feedback first, else the connect
+    /// reminder the list still shows for it, so other feedback that later replaced the
+    /// detail notice never hides that reminder from the client's page.
+    pub(super) fn notice_for(&self, client_id: &str) -> Option<(String, String, String)> {
+        let matching = |notice: &Option<(String, String, String)>| {
+            notice.clone().filter(|notice| notice.0 == client_id)
+        };
+        matching(&self.detail_notice.borrow()).or_else(|| matching(&self.list_notice_of.borrow()))
+    }
+
+    /// Dismissing a notice shown on a client's details: it goes from wherever it is
+    /// shown, the details, the list or both.
+    pub(super) fn dismiss_notice(&self, notice: &(String, String, String)) {
+        if self.detail_notice.borrow().as_ref() == Some(notice) {
+            self.detail_notice.borrow_mut().take();
+        }
+        if self.list_notice_of.borrow().as_ref() == Some(notice) {
             self.clear_list_notice();
         }
     }
@@ -18331,7 +18343,8 @@ mod tests {
 
         // Dismissing on the detail page takes the same reminder off the list.
         remind(&page, "cursor");
-        page.dismiss_detail_notice();
+        let shown = page.detail_notice.borrow().clone().unwrap();
+        page.dismiss_notice(&shown);
         assert!(!page.list_notice.is_visible());
 
         // Another client's error stays when Cursor's list reminder is dismissed.
@@ -18344,8 +18357,24 @@ mod tests {
         // Dismissing another client's notice keeps Cursor's list reminder.
         remind(&page, "cursor");
         page.set_detail_notice(error("codex"));
-        page.dismiss_detail_notice();
+        let shown = page.detail_notice.borrow().clone().unwrap();
+        page.dismiss_notice(&shown);
         assert!(page.list_notice.is_visible());
+
+        // Cursor's details still show its list reminder under Codex's error, and
+        // dismissing it there leaves Codex's error.
+        page.set_detail_notice(error("codex"));
+        assert_eq!(
+            page.notice_for("cursor").map(|n| n.1),
+            Some("Not live yet".into())
+        );
+        assert_eq!(page.notice_for("codex"), Some(error("codex")));
+        let reminder = page.notice_for("cursor").unwrap();
+        page.dismiss_notice(&reminder);
+        assert!(!page.list_notice.is_visible());
+        assert_eq!(page.detail_notice.borrow().clone(), Some(error("codex")));
+        assert_eq!(page.notice_for("cursor"), None);
+        remind(&page, "cursor");
 
         // A later notice for Cursor itself (a disconnect, an error) replaces the
         // reminder on the list too.

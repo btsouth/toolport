@@ -68,6 +68,12 @@ fn dialog_width(parent: &impl IsA<gtk::Window>, width: i32) -> i32 {
 /// The tallest the review's body grows before it scrolls.
 const REVIEW_MAX_BODY_HEIGHT: i32 = 600;
 
+/// A credential counts once it has more than spaces, as React's prompt and the review's
+/// own check (`refresh_confirm`) decide. The value itself is used as typed.
+fn credential_entered(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
 /// Asks for one credential value in a sheet with the spec §5 footer (Cancel, then "Use for
 /// connection"), in place of a message dialog with a response strip. Esc cancels.
 fn credential_prompt(
@@ -105,8 +111,14 @@ fn credential_prompt(
             "This value is used only for the selected server. It is saved only if connection succeeds.",
         ),
     );
-    // The key names the field above it, as React's label does.
-    let field = gtk::Label::builder().label(key).xalign(0.0).build();
+    // The key names the field above it, as React's label does, and wraps as React's does
+    // (a long key would otherwise widen the sheet past a narrow window).
+    let field = gtk::Label::builder()
+        .label(key)
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .build();
     field.add_css_class("toolport-dialog-field");
     // Masked with no show/hide control, as React's password field (the spec is silent).
     let entry = gtk::PasswordEntry::builder()
@@ -133,8 +145,14 @@ fn credential_prompt(
     save.add_css_class("suggested-action");
     save.set_sensitive(false);
     {
-        let save = save.clone();
-        entry.connect_changed(move |entry| save.set_sensitive(!entry.text().is_empty()));
+        // Weak: the save handler holds the entry, so a strong reference here would keep
+        // both, and the typed value, alive after the sheet closes.
+        let save = save.downgrade();
+        entry.connect_changed(move |entry| {
+            if let Some(save) = save.upgrade() {
+                save.set_sensitive(credential_entered(&entry.text()));
+            }
+        });
     }
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.append(&header);
@@ -155,7 +173,7 @@ fn credential_prompt(
         let prompt = prompt.downgrade();
         let entry = entry.clone();
         save.connect_clicked(move |_| {
-            if entry.text().is_empty() {
+            if !credential_entered(&entry.text()) {
                 return;
             }
             on_save(entry.text().to_string());
@@ -695,9 +713,11 @@ pub(super) fn review_with_notice(
         String,
         Vec<crate::registry_controller::CredentialReview>,
     )>::new()));
+    // Names the key, so a long one wraps anywhere rather than widening the dialog.
     let missing_reason = gtk::Label::builder()
         .xalign(0.0)
         .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
         .visible(false)
         .build();
     missing_reason.add_css_class("warning");
@@ -2715,7 +2735,9 @@ mod tests {
         assert!(widgets
             .iter()
             .filter_map(|w| w.downcast_ref::<gtk::Label>())
-            .any(|l| l.text() == "Enter PAT or deselect One"));
+            .any(|l| l.text() == "Enter PAT or deselect One"
+                // It names the key, so it wraps anywhere instead of widening the dialog.
+                && l.wrap_mode() == gtk::pango::WrapMode::WordChar));
         let selected = widgets
             .iter()
             .filter_map(|w| w.downcast_ref::<gtk::ToggleButton>())
@@ -2970,6 +2992,17 @@ mod tests {
             .unwrap();
         assert!(!entry.shows_peek_icon());
         prompt.close();
+        // A long key wraps instead of widening the sheet past the window.
+        let key = "A_VERY_LONG_ENVIRONMENT_VARIABLE_NAME_FOR_A_PERSONAL_ACCESS_TOKEN_VALUE";
+        let prompt = credential_prompt(&owner, "notes", key, |_| {});
+        let field = descendants(prompt.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .find(|l| l.text() == key)
+            .unwrap();
+        let (minimum, _, _, _) = field.measure(gtk::Orientation::Horizontal, -1);
+        assert!(minimum < 200, "{minimum}");
+        prompt.close();
         owner.close();
     }
 
@@ -3035,6 +3068,12 @@ mod tests {
             .unwrap()
             .clone();
         assert!(entry.has_css_class("toolport-input"));
+        // Spaces alone are no value: React's prompt and the review's check both refuse it.
+        entry.set_text("   ");
+        assert!(!buttons[1].is_sensitive(), "spaces are not a value");
+        buttons[1].emit_clicked();
+        assert!(saved.borrow().is_none());
+        assert!(prompt.is_visible());
         entry.set_text("secret-value");
         assert!(buttons[1].is_sensitive());
         buttons[1].emit_clicked();

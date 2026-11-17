@@ -545,13 +545,13 @@ pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
         ));
     }
     page.append_recoveries(&body, Some(&client.id));
-    if let Some((id, title, notice)) = page.detail_notice.borrow().as_ref() {
-        if id == &client.id {
-            let p = page.clone();
-            body.append(&super::restart_notice(title, notice, move || {
-                p.dismiss_detail_notice();
-            }));
-        }
+    if let Some(shown) = page.notice_for(&client.id) {
+        let p = page.clone();
+        let (_, title, text) = &shown;
+        body.append(&super::restart_notice(title, text, {
+            let shown = shown.clone();
+            move || p.dismiss_notice(&shown)
+        }));
     }
     if customized {
         body.append(&message("Toolport is leaving your hand-edited gateway entry as-is. Reset it only if you want Toolport to manage the entry."));
@@ -680,30 +680,40 @@ fn discovery_picker(
         let updating = updating.clone();
         let persisted = persisted.clone();
         gtk::glib::spawn_future_local(async move {
+            let client_id = id.clone();
             let result = gtk::gio::spawn_blocking(move || write(&id, mode)).await;
+            // Feedback for a page that closed meanwhile is dropped: it would land on
+            // whichever client is open now and replace that client's notice.
+            let still_open = p.details.selected.borrow().as_deref() == Some(client_id.as_str());
             match result {
                 Ok(Ok(_)) => {
                     persisted.set(control.selected());
                     updating.set(false);
-                    p.show_confirmation(&crate::i18n::trf(
-                        "Updated discovery for {value0}.",
-                        &[("value0", &name)],
-                    ));
+                    if still_open {
+                        p.show_confirmation(&crate::i18n::trf(
+                            "Updated discovery for {value0}.",
+                            &[("value0", &name)],
+                        ));
+                    }
                     p.refresh();
                 }
                 Ok(Err(e)) => {
                     control.set_selected(persisted.get());
                     updating.set(false);
                     control.set_sensitive(true);
-                    p.show_error(&e);
+                    if still_open {
+                        p.show_error(&e);
+                    }
                 }
                 Err(_) => {
                     control.set_selected(persisted.get());
                     updating.set(false);
                     control.set_sensitive(true);
-                    p.show_error(&crate::i18n::tr(
-                        "the discovery update stopped unexpectedly",
-                    ));
+                    if still_open {
+                        p.show_error(&crate::i18n::tr(
+                            "the discovery update stopped unexpectedly",
+                        ));
+                    }
                 }
             }
         });
@@ -2002,6 +2012,7 @@ mod tests {
         let app = app();
         let (_, servers, _) = build_content(&app, crate::approval_broker::start_native());
         let page = ClientPage::new(&app, servers);
+        *page.details.selected.borrow_mut() = Some("codex@work".into());
         let mut selected = fixture_client("codex@work");
         selected.discovery_mode = Some("lazy".into());
         let mode = discovery_picker(&selected, &page, reject);
@@ -2049,6 +2060,44 @@ mod tests {
             std::fs::read(crate::registry::registry_path().unwrap()).unwrap(),
             before
         );
+    }
+
+    /// A discovery result that arrives after its client's page closed shows nothing: it
+    /// would otherwise replace the open client's notice and its list reminder.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn late_discovery_feedback_leaves_another_clients_notice() {
+        fn reject(_: &str, _: Option<&str>) -> Result<crate::registry::Registry, String> {
+            Err("Synthetic late discovery error".into())
+        }
+        let _data = crate::registry::DataDirTestEnv::new("late-discovery-feedback");
+        let app = app();
+        let (_, servers, _) = build_content(&app, crate::approval_broker::start_native());
+        let page = ClientPage::new(&app, servers);
+        let mode = discovery_picker(&fixture_client("codex@work"), &page, reject);
+        // The user has gone on to Cursor, which has a restart reminder.
+        *page.details.selected.borrow_mut() = Some("cursor".into());
+        let reminder = (
+            "cursor".to_string(),
+            "Not live yet".to_string(),
+            "Restart Cursor so it loads Toolport.".to_string(),
+        );
+        page.set_detail_notice(reminder.clone());
+        page.show_list_notice(&reminder.0, &reminder.1, &reminder.2);
+        mode.set_selected(3);
+        let context = gtk::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !mode.is_sensitive() && std::time::Instant::now() < deadline {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(mode.is_sensitive());
+        assert_eq!(page.detail_notice.borrow().clone(), Some(reminder.clone()));
+        assert_eq!(page.list_notice_of.borrow().clone(), Some(reminder));
+        assert!(page.list_notice.is_visible());
+        assert_ne!(page.feedback.text(), "Synthetic late discovery error");
     }
 
     #[test]

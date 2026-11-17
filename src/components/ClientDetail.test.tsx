@@ -4,9 +4,15 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import userEvent from "@testing-library/user-event";
 import { ClientDetail } from "./ClientDetail";
 import { setLanguage } from "@/lib/i18n";
-import { resetClientNotices, useClientNotices } from "@/lib/clientNotice";
+import {
+  resetClientNotices,
+  setConnectNotice,
+  setDetailNotice,
+  useClientNotices,
+} from "@/lib/clientNotice";
 import {
   importServers,
+  setClientDiscovery,
   previewImportServers,
   listClientRecoveries,
   retryClientRecovery,
@@ -1188,4 +1194,55 @@ it("keeps a connect's restart reminder for the Clients list until it is dismisse
   );
   expect(screen.queryByText("Not live yet")).not.toBeInTheDocument();
   expect(store.result.current).toEqual({ detail: null, list: null });
+});
+
+it("shows a client's list reminder on its details after another client's feedback", () => {
+  const reminder = {
+    clientId: "claude-desktop",
+    title: "Not live yet",
+    text: "Restart Claude Desktop so it loads Toolport.",
+  };
+  setConnectNotice(reminder);
+  // Codex's feedback replaces the details notice; the list still names Claude Desktop.
+  setDetailNotice({ clientId: "codex", title: "refused", text: "" });
+  render(
+    <ClientDetail
+      client={client()}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  expect(screen.getByText("Not live yet")).toBeVisible();
+  expect(screen.queryByText("refused")).not.toBeInTheDocument();
+});
+
+it("drops discovery feedback that arrives after the details page closed", async () => {
+  const reminder = {
+    clientId: "cursor",
+    title: "Not live yet",
+    text: "Restart Cursor so it loads Toolport.",
+  };
+  setConnectNotice(reminder);
+  let finish: (registry: Registry) => void = () => {};
+  vi.mocked(setClientDiscovery).mockReturnValue(
+    new Promise<Registry>((resolve) => {
+      finish = resolve;
+    }),
+  );
+  const store = renderHook(() => useClientNotices());
+  const view = render(
+    <ClientDetail
+      client={client({ id: "codex", name: "Codex" })}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  await userEvent.click(screen.getByRole("combobox", { name: "Discovery mode" }));
+  await userEvent.click(await screen.findByRole("option", { name: "Lazy · search" }));
+  expect(setClientDiscovery).toHaveBeenCalledWith("codex", "lazy");
+  view.unmount();
+  await act(async () => finish(emptyRegistry()));
+  expect(store.result.current).toEqual({ detail: reminder, list: reminder });
 });

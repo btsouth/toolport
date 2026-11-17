@@ -30,6 +30,15 @@ export function useClientNotices(): State {
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
 
+/** The notice a client's details page shows: its own feedback first, else the connect
+ * reminder the Clients list still shows for it, so other feedback that later replaced the
+ * details notice never hides that reminder from the client's page. */
+export function noticeFor(notices: State, clientId: string): ClientNotice | null {
+  if (notices.detail?.clientId === clientId) return notices.detail;
+  if (notices.list?.clientId === clientId) return notices.list;
+  return null;
+}
+
 /** Show feedback on the details page. Other feedback for the client the list reminder
  * names (an error, a disconnect) replaces that reminder too, as GTK's
  * `set_detail_notice` does, so the list never keeps advice the details no longer give. */

@@ -1,5 +1,5 @@
 import { msg, Trans, translate, useI18n, type SourceMessage } from "@/lib/i18n";
-import { useEffect, useId, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   ArrowRight,
   Check,
@@ -55,6 +55,7 @@ import { clientDiscovery } from "@/lib/clientDiscovery";
 import {
   clearListNotice,
   dismissClientNotice,
+  noticeFor,
   releaseDetailNotice,
   setConnectNotice,
   setDetailNotice,
@@ -151,10 +152,18 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   // cascading-render setState-in-effect.
   // The notice lives in a small store: the connect reminder also shows on the Clients
   // list, and dismissing it in either place clears both (as GTK does).
-  const restartNotice = useClientNotices().detail;
-  const showRestartNotice = restartNotice?.clientId === client.id ? restartNotice : null;
+  const showRestartNotice = noticeFor(useClientNotices(), client.id);
   const setRestartNotice = setDetailNotice;
-  useEffect(() => releaseDetailNotice, []);
+  // Feedback that arrives after this page closed is dropped: it would replace another
+  // client's notice, or this client's list reminder, in the shared store.
+  const pageOpen = useRef(true);
+  useEffect(() => {
+    pageOpen.current = true;
+    return () => {
+      pageOpen.current = false;
+      releaseDetailNotice();
+    };
+  }, []);
   const [actionError, setActionError] = useState<{
     clientId: string;
     text: string;
@@ -166,6 +175,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
    * Both need a restart, for opposite reasons, and the connect wording ("so it loads
    * Toolport") reads as a failed disconnect on the removal path. */
   function showFeedback(title: string, text = "") {
+    if (!pageOpen.current) return;
     setRestartNotice({ clientId: client.id, title, text });
   }
 

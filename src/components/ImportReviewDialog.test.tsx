@@ -1,6 +1,6 @@
 import { ImportReviewDialog } from "./ImportReviewDialog";
 import { describe, it, expect, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import {
   runsShell,
@@ -82,8 +82,17 @@ describe("ImportReviewDialog", () => {
       confirmLabel: "Connect",
     });
     expect(screen.getByRole("button", { name: "Connect" })).toBeDisabled();
+    // A long key wraps instead of running out of the dialog, as in GTK.
+    expect(screen.getByText("Enter PAT or deselect Calendar")).toHaveClass(
+      "[overflow-wrap:anywhere]",
+    );
     expect(screen.getByText("Enter PAT or deselect Calendar")).toBeVisible();
     await userEvent.click(screen.getByText("Calendar credentials and settings"));
+    expect(screen.getByText(/Keep PAT in keychain/).closest("label")).toHaveClass(
+      "min-w-0",
+      "flex-1",
+      "[overflow-wrap:anywhere]",
+    );
     await userEvent.click(screen.getByRole("button", { name: "Enter value" }));
     await userEvent.type(screen.getByLabelText("PAT"), "synthetic");
     await userEvent.click(screen.getByRole("button", { name: "Use for connection" }));
@@ -529,6 +538,9 @@ describe("ImportReviewDialog spec details", () => {
     const input = screen.getByLabelText("PAT");
     expect(input).toHaveAttribute("data-slot", "input");
     expect(input).toHaveAttribute("type", "password");
+    expect(input.closest("label")!.firstElementChild).toHaveClass(
+      "[overflow-wrap:anywhere]",
+    );
     expect(input).toHaveClass(
       "h-8",
       "rounded-md",
@@ -546,6 +558,20 @@ describe("ImportReviewDialog spec details", () => {
     ).toHaveClass("text-meta", "text-muted-foreground");
     // Return uses the value, as the GTK prompt does.
     await userEvent.type(input, "fixture-token{Enter}");
+    expect(screen.queryByRole("heading", { name: "Calendar credentials" })).toBeNull();
+    expect(screen.getByText("Ready for connection")).toBeInTheDocument();
+  });
+
+  it("keeps the credential sheet open on an Enter that ends an input method composition", async () => {
+    renderDialog({ items: withCredentials(), requireCredentials: true });
+    await userEvent.click(screen.getByRole("button", { name: "Enter value" }));
+    const input = screen.getByLabelText("PAT");
+    fireEvent.change(input, { target: { value: "ねこ" } });
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
+    expect(screen.getByRole("heading", { name: "Calendar credentials" })).toBeVisible();
+    expect(screen.queryByText("Ready for connection")).toBeNull();
+    fireEvent.keyDown(input, { key: "Enter" });
     expect(screen.queryByRole("heading", { name: "Calendar credentials" })).toBeNull();
     expect(screen.getByText("Ready for connection")).toBeInTheDocument();
   });
