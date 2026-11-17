@@ -1589,15 +1589,35 @@ mod tests {
         assert!(page.details.selected.borrow().is_none());
         window.close();
     }
+    /// The mock MCP server this test probes: `TOOLPORT_MOCK_BIN`, else the one Cargo
+    /// built next to this test binary (`--features test-support --bin mock-mcp-server`),
+    /// else `~/bin/mock-mcp-server` as an omabox copy has it.
+    fn mock_mcp_server() -> String {
+        let built = std::env::current_exe()
+            .ok()
+            .and_then(|exe| Some(exe.parent()?.parent()?.join("mock-mcp-server")));
+        let home = std::env::var_os("HOME")
+            .map(|home| std::path::Path::new(&home).join("bin/mock-mcp-server"));
+        std::env::var_os("TOOLPORT_MOCK_BIN")
+            .map(std::path::PathBuf::from)
+            .into_iter()
+            .chain(built)
+            .chain(home)
+            .find(|path| path.is_file())
+            .expect("build mock-mcp-server with --features test-support or set TOOLPORT_MOCK_BIN")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     #[test]
-    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    #[ignore = "requires an isolated GTK desktop and mock-mcp-server"]
     fn b5_credential_save_reprobes_unchanged_detail_without_refresh() {
         let _data = crate::registry::DataDirTestEnv::new("b5-credential-refresh");
         let app = app();
         let registry = crate::registry::update(|registry| {
             registry.servers = vec![serde_json::from_value(serde_json::json!({
                 "id": "b5-credential", "name": "Credential fixture", "transport": "stdio",
-                "command": "/home/sbx/bin/mock-mcp-server", "args": [], "env": [], "enabled": true
+                "command": mock_mcp_server(), "args": [], "env": [], "enabled": true
             }))
             .unwrap()];
             Ok(())
