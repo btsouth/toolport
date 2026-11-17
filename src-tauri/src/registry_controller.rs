@@ -988,6 +988,9 @@ pub struct EntryExtras {
     pub source: Option<String>,
     /// A remote Duplicate's request timeout.
     pub request_timeout_ms: Option<u64>,
+    /// A remote Duplicate's header credentials (`headerKeys`) and its allowed
+    /// password manager prefixes (`secretSources`), kept as the entry had them.
+    pub kept_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Add the server React's Add server dialog sends, in one step: what the
@@ -1000,6 +1003,9 @@ pub fn add_server_from_dialog(entry: ServerEntry) -> Result<RowsAddOutcome, Stri
 /// React's Add server dialog sends its whole entry: split it into what
 /// [`add_server_with_values`] takes. Every env row is a value row; a row with a
 /// `source` is a password manager reference.
+/// The entry fields React's dialog sends that the values path keeps as they are.
+const KEPT_ENTRY_FIELDS: [&str; 2] = ["headerKeys", "secretSources"];
+
 pub fn values_from_entry(
     entry: ServerEntry,
 ) -> Result<(ServerFields, Vec<ValueRow>, EntryExtras), String> {
@@ -1035,10 +1041,20 @@ pub fn values_from_entry(
         inherit_env: Some(entry.inherit_env),
         hide_prompts: Some(entry.hide_prompts),
     };
+    let kept_fields = KEPT_ENTRY_FIELDS
+        .iter()
+        .filter_map(|key| {
+            entry
+                .unknown_fields
+                .get(*key)
+                .map(|value| (key.to_string(), value.clone()))
+        })
+        .collect();
     let extras = EntryExtras {
         launch: entry.launch,
         source: entry.source,
         request_timeout_ms: entry.request_timeout_ms,
+        kept_fields,
     };
     Ok((fields, rows, extras))
 }
@@ -1071,6 +1087,9 @@ pub fn add_server_with_values(
         entry.source = Some(source);
     }
     entry.request_timeout_ms = extras.request_timeout_ms;
+    entry.unknown_fields.extend(extras.kept_fields);
+    // A bad header reference is refused before the keychain is asked for anything.
+    crate::secret_refs::headers(&entry).map_err(|error| error.to_string())?;
     if let Some(mut launch) = extras.launch {
         // A row named like a launch input would be stored under the input's
         // name and vanish from the entry.
@@ -6628,6 +6647,55 @@ API_KEY = "synthetic-first-origin"
                     .contains("typed-token"));
             });
         }
+    }
+
+    /// A Duplicate of a remote server keeps its header credentials and allowed
+    /// password manager prefixes, and a bad header reference saves nothing.
+    #[test]
+    fn a_duplicate_keeps_its_header_credentials() {
+        let remote = |headers: serde_json::Value| -> ServerEntry {
+            serde_json::from_value(serde_json::json!({
+                "id": "", "enabled": false, "name": "Header copy", "transport": "http",
+                "command": null, "args": [], "launch": null,
+                "env": [{"key": "API_TOKEN", "value": "typed-token", "secret": true}],
+                "url": "https://example.com/mcp", "source": "shared", "cwd": null,
+                "inheritEnv": false, "hidePrompts": false, "requestTimeoutMs": null,
+                "initializeTimeoutMs": null, "headerKeys": headers,
+                "secretSources": {"allowedPrefixes": ["op://Team/"]}
+            }))
+            .unwrap()
+        };
+        crate::secrets::tests::with_isolated_vault(|| {
+            let headers = serde_json::json!([
+                {"key": "X-Api-Key", "env": "API_TOKEN"},
+                {"key": "X-Team-Key", "source": {"ref": "op://Team/service/key"}}
+            ]);
+            let outcome = add_react(remote(headers.clone())).unwrap();
+            let server = registry::load().unwrap().servers.remove(0);
+            assert_eq!(server.unknown_fields.get("headerKeys"), Some(&headers));
+            assert_eq!(
+                server.unknown_fields["secretSources"],
+                serde_json::json!({"allowedPrefixes": ["op://Team/"]})
+            );
+            assert_eq!(
+                crate::secrets::get_secret_result(&outcome.id, "API_TOKEN")
+                    .unwrap()
+                    .as_deref(),
+                Some("typed-token")
+            );
+        });
+        crate::secrets::tests::with_isolated_vault(|| {
+            let bad = serde_json::json!([
+                {"key": "X-Team-Key", "source": {"ref": "op://Team/service/key", "command": "evil"}}
+            ]);
+            let mut outcome = None;
+            let prompts = crate::secrets::locked_store::write_prompts_during(|| {
+                outcome = Some(add_react(remote(bad)));
+            });
+            assert!(outcome.unwrap().is_err());
+            assert!(prompts.is_empty(), "{prompts:?}");
+            assert!(registry::load().unwrap().servers.is_empty());
+        });
     }
 
     /// A launch config that does not fit the arguments, and a row named like
