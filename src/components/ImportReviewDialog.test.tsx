@@ -575,4 +575,32 @@ describe("ImportReviewDialog spec details", () => {
     expect(screen.queryByRole("heading", { name: "Calendar credentials" })).toBeNull();
     expect(screen.getByText("Ready for connection")).toBeInTheDocument();
   });
+
+  it("grows the server list to the dialog window-margin cap and scrolls only the list", async () => {
+    const base = items()[0];
+    const many = Array.from({ length: 40 }, (_, i) => ({
+      ...base,
+      key: `s${i}`,
+      name: `srv-${i + 1}`,
+    }));
+    renderDialog({ items: many, details: "Config: /fixture/config" });
+    const dialog = screen.getByRole("dialog");
+    expect(dialog).toHaveClass(
+      "max-h-[calc(100dvh-2rem)]",
+      "max-w-[calc(100%-2rem)]",
+      "sm:max-w-lg",
+    );
+    const list = screen.getByRole("button", { name: /srv-1\b/ }).parentElement!
+      .parentElement!;
+    expect(list).toContainElement(screen.getByRole("button", { name: /srv-40\b/ }));
+    expect(list).toHaveClass("overflow-y-auto", "min-h-0");
+    expect(list.className).not.toMatch(/\bmax-h-/);
+    expect(list).not.toHaveAttribute("tabindex");
+    expect(list.parentElement).toHaveClass("flex", "flex-col", "min-h-0");
+    const details = screen.getByText("Details").closest("details")!;
+    expect(list.contains(details)).toBe(false);
+    expect(details).toHaveClass("shrink-0");
+    await userEvent.click(screen.getByText("Details"));
+    expect(dialog.querySelector('[data-slot="dialog-footer"]')).toBeVisible();
+  });
 });

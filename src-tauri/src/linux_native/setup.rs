@@ -56,17 +56,113 @@ impl From<&str> for Completion {
 /// React's dialog width (`sm:max-w-lg`), for the review, its result and its prompts.
 const REVIEW_WIDTH: i32 = 512;
 
+const DIALOG_MARGIN: i32 = 32;
+
 /// A dialog's width as React sizes it: `width`, but never wider than the window it
 /// opens over less 16px each side (`max-w-[calc(100%-2rem)]`), so it never runs off a
 /// narrow window. An unrealized parent has no width yet and keeps `width`.
 fn dialog_width(parent: &impl IsA<gtk::Window>, width: i32) -> i32 {
     match parent.as_ref().width() {
-        available if available > 0 => width.min(available - 32).max(240),
+        available if available > 0 => width.min(available - DIALOG_MARGIN).max(240),
         _ => width,
     }
 }
-/// The tallest the review's body grows before it scrolls.
-const REVIEW_MAX_BODY_HEIGHT: i32 = 600;
+
+fn track_review_bounds(
+    parent: &gtk::Window,
+    dialog: &adw::Window,
+    entries: &gtk::ScrolledWindow,
+    details: &gtk::Expander,
+    notes: &[&gtk::Widget],
+) -> std::rc::Rc<dyn Fn()> {
+    let (pw, dw, ew) = (parent.downgrade(), dialog.downgrade(), entries.downgrade());
+    let sync: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+        let _ = (|| -> Option<()> {
+            let (p, d, e) = (pw.upgrade()?, dw.upgrade()?, ew.upgrade()?);
+            let clamp: adw::Clamp = d.content()?.downcast().ok()?;
+            let root: gtk::Box = clamp.child()?.downcast().ok()?;
+            let scroller: gtk::ScrolledWindow =
+                root.first_child()?.next_sibling()?.downcast().ok()?;
+            let body: gtk::Box = e.parent()?.downcast().ok()?;
+            let w = dialog_width(&p, REVIEW_WIDTH);
+            clamp.set_maximum_size(w);
+            clamp.set_tightening_threshold(w);
+            root.set_width_request(w);
+            let ph = match p.height() {
+                h if h > 0 => h,
+                _ => p.default_height(),
+            };
+            let max_h = match ph {
+                h if h > 0 => (h - DIALOG_MARGIN).max(160),
+                _ => 600,
+            };
+            let mv = |x: &gtk::Widget, fw: i32| x.measure(gtk::Orientation::Vertical, fw).1;
+            let cap =
+                (max_h - 2 - mv(&root.first_child()?, w) - mv(&root.last_child()?, w)).max(72);
+            scroller.set_max_content_height(cap);
+            if !e.is_visible() {
+                return Some(());
+            }
+            let (iw, mut n, mut oh, mut cur) = ((w - 48).max(1), 0, 0, body.first_child());
+            while let Some(c) = cur {
+                cur = c.next_sibling();
+                if c.is_visible() {
+                    n += 1;
+                    if c != e {
+                        let mut h = mv(&c, iw);
+                        if let Some(ex) = c.downcast_ref::<gtk::Expander>() {
+                            if ex.is_expanded() {
+                                let t = ex
+                                    .label_widget()
+                                    .and_then(|l| l.parent())
+                                    .map_or(0, |x| mv(&x, iw));
+                                h = h.max(t + ex.child().map_or(0, |x| mv(&x, iw)));
+                            }
+                        }
+                        oh += h;
+                    }
+                }
+            }
+            e.set_max_content_height((cap - 36 - (n - 1).max(0) * 16 - oh).max(48));
+            Some(())
+        })();
+    });
+    sync();
+    let po: gtk::glib::Object = parent.clone().upcast();
+    let mut watched = vec![
+        (details.clone().upcast(), "expanded"),
+        (po.clone(), "default-width"),
+        (po, "default-height"),
+    ];
+    for w in notes {
+        let o: gtk::glib::Object = (*w).clone().upcast();
+        watched.push((o.clone(), "visible"));
+        if w.is::<gtk::Label>() {
+            watched.push((o, "label"));
+        }
+    }
+    if let Some(s) = parent.surface().map(|s| s.upcast::<gtk::glib::Object>()) {
+        watched.extend([(s.clone(), "width"), (s, "height")]);
+    }
+    let ids = std::cell::RefCell::new(Vec::with_capacity(watched.len()));
+    for (obj, prop) in watched {
+        let s = sync.clone();
+        let id = obj.connect_notify_local(Some(prop), move |_, _| {
+            s();
+            let s2 = s.clone();
+            gtk::glib::idle_add_local_once(move || s2());
+        });
+        ids.borrow_mut().push((obj, id));
+    }
+    let s = sync.clone();
+    dialog.connect_realize(move |_| s());
+    dialog.connect_destroy(move |_| {
+        for (o, id) in ids.borrow_mut().drain(..) {
+            o.disconnect(id);
+        }
+    });
+    sync
+}
 
 /// A credential counts once it has more than spaces, as React's prompt and the review's
 /// own check (`refresh_confirm`) decide. The value itself is used as typed.
@@ -700,7 +796,6 @@ pub(super) fn review_with_notice(
     }
     // React's review: one bordered toggle per entry, stacked with a small gap.
     let rows = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    rows.set_widget_name("toolport-setup-review-entries");
     let mut selected = Vec::new();
     let mut credential_choices = Vec::new();
     let credential_inputs =
@@ -1029,7 +1124,15 @@ pub(super) fn review_with_notice(
             error_chip,
         ));
     }
-    body.append(&rows);
+    let entries = gtk::ScrolledWindow::builder()
+        .child(&rows)
+        .focusable(false)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .visible(!unreadable)
+        .build();
+    entries.set_widget_name("toolport-setup-review-entries");
+    body.append(&entries);
     body.append(&missing_reason);
     refresh_confirm();
     let (details, content) = details_expander(&crate::i18n::tr("Details"));
@@ -1066,18 +1169,10 @@ pub(super) fn review_with_notice(
         .vexpand(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .propagate_natural_height(true)
-        .max_content_height(REVIEW_MAX_BODY_HEIGHT)
         .build();
-    // Natural heights, then scroll: at minimum heights a result page taller than the
-    // window shrinks its status to the icon and cuts off the title.
-    if let Some(viewport) = scroller.child().and_downcast::<gtk::Viewport>() {
-        viewport.set_vscroll_policy(gtk::ScrollablePolicy::Natural);
-    }
     scroller.set_widget_name("toolport-setup-scroller");
     root.append(&scroller);
     root.append(&super::dialog_footer(&[&cancel, &skip, &confirm]));
-    // React's 512px width, capped to a narrow window: never narrower than that, and
-    // long lines wrap instead of widening it.
     let width = dialog_width(parent, REVIEW_WIDTH);
     root.set_width_request(width);
     let clamp = adw::Clamp::builder()
@@ -1086,6 +1181,12 @@ pub(super) fn review_with_notice(
         .child(&root)
         .build();
     dialog.set_content(Some(&clamp));
+    let notes = [
+        missing_reason.upcast_ref(),
+        feedback.upcast_ref(),
+        skip.upcast_ref(),
+    ];
+    let sync_bounds = track_review_bounds(parent, &dialog, &entries, &details, &notes);
     {
         let (closing, skipped) = (dialog.clone(), skipped.clone());
         skip.connect_clicked(move |_| {
@@ -1196,6 +1297,7 @@ pub(super) fn review_with_notice(
             notice.clone(),
         );
         let (shown, keyboard, step_line) = (shown.clone(), keyboard.clone(), step_line.clone());
+        let (entries, sync_bounds) = (entries.clone(), sync_bounds.clone());
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || action(chosen, choices, inputs)).await;
             busy.set(false);
@@ -1223,6 +1325,7 @@ pub(super) fn review_with_notice(
                     skip.set_visible(false);
                     // Next while more steps follow, Done on the last.
                     l10n::bind_text(&button, if more { "Next" } else { "Done" });
+                    entries.set_visible(false);
                     rows.set_visible(false);
                     details.set_visible(false);
                     lede.set_visible(false);
@@ -1409,6 +1512,7 @@ pub(super) fn review_with_notice(
                     // Return activates Next or Done without first tabbing through the
                     // results; the button was disabled while the step ran, which dropped
                     // focus and its ring.
+                    sync_bounds();
                     focus_with_ring(&shown, &button, keyboard.get());
                     finished();
                 }
@@ -3080,5 +3184,96 @@ mod tests {
         assert_eq!(saved.borrow().as_deref(), Some("secret-value"));
         assert!(!prompt.is_visible(), "saving closes the sheet");
         owner.destroy();
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn review_list_caps_at_parent_height_and_keeps_footer_visible() {
+        adw::init().unwrap();
+        let parent = gtk::Window::new();
+        parent.set_default_size(480, 600);
+        parent.present();
+        wait_for(&|| parent.width() >= 480 && parent.height() >= 600);
+        let item = |i: usize| SetupItem {
+            key: format!("s{i}"),
+            name: format!("srv-{i:02}"),
+            transport: "stdio".into(),
+            command: Some("/bin/true".into()),
+            args: vec![],
+            url: None,
+            env_keys: vec![],
+            is_new: true,
+            credentials: vec![],
+            unsupported: None,
+            updates: vec![],
+        };
+        review(
+            &parent,
+            "Height",
+            (0..40).map(item).collect(),
+            "Config: /c\nBackup: /b",
+            "Connect",
+            true,
+            |_, _, _| Err("x".into()),
+            || {},
+            None,
+        );
+        let win = window_titled("Height").unwrap();
+        let all = descendants(win.upcast_ref());
+        let named = |n: &str| all.iter().find(|w| w.widget_name() == n).unwrap().clone();
+        let footer = all
+            .iter()
+            .find(|w| w.has_css_class("toolport-dialog-footer"))
+            .unwrap();
+        let confirm = button_named(&win, "toolport-setup-confirm");
+        let details: gtk::Expander = named("toolport-setup-review-details").downcast().unwrap();
+        let entries: gtk::ScrolledWindow =
+            named("toolport-setup-review-entries").downcast().unwrap();
+        let outer: gtk::ScrolledWindow = named("toolport-setup-scroller").downcast().unwrap();
+        let fits = |w: &gtk::Widget, bx: &gtk::Widget, pad: f32| {
+            let ok = |b: gtk::graphene::Rect| {
+                b.height() > 0.0 && b.y() >= -1.0 && b.y() + b.height() <= bx.height() as f32 + pad
+            };
+            w.compute_bounds(bx).is_some_and(ok)
+        };
+        let footer_ok =
+            || footer.is_visible() && confirm.is_visible() && fits(footer, win.upcast_ref(), 1.0);
+        wait_for(&|| {
+            win.height() > 0 && footer.height() > 0 && win.height() <= parent.height() - 32
+        });
+        assert!(win.width() == parent.width() - 32 && win.height() <= parent.height() - 32);
+        assert!(footer_ok() && !entries.is_focusable());
+        assert!(entries.vadjustment().upper() > entries.vadjustment().page_size());
+        assert!(outer.vadjustment().upper() <= outer.vadjustment().page_size() + 1.0);
+        let (t_lbl, l_lbl) = (named("toolport-setup-title"), named("toolport-setup-lede"));
+        for w in [&t_lbl, &l_lbl, details.upcast_ref(), footer] {
+            assert!(!w.is_ancestor(&entries) && !entries.is_ancestor(w));
+        }
+        details.set_expanded(true);
+        wait_for(&|| details.height() > 40 && win.height() <= parent.height() - 32);
+        assert!(win.height() <= parent.height() - 32 && footer_ok());
+        assert!(outer.vadjustment().upper() <= outer.vadjustment().page_size() + 1.0);
+        details.set_expanded(false);
+        wait_for(&|| details.height() < 40 && win.height() <= parent.height() - 32);
+        assert!(footer_ok());
+        let toggles = descendants(entries.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::ToggleButton>().ok());
+        let last = toggles.last().unwrap();
+        last.grab_focus();
+        wait_for(&|| {
+            entries.vadjustment().value() > 0.0
+                && fits(last.upcast_ref(), entries.upcast_ref(), 2.0)
+        });
+        assert!(fits(last.upcast_ref(), entries.upcast_ref(), 2.0));
+        let h0 = win.height();
+        parent.set_default_size(960, 840);
+        wait_for(&|| parent.height() >= 820 && win.height() > h0);
+        assert!(win.width() == REVIEW_WIDTH && win.height() <= parent.height() - 32 && footer_ok());
+        parent.set_default_size(480, 500);
+        wait_for(&|| parent.height() <= 520 && win.height() <= parent.height() - 32);
+        assert!(win.height() <= parent.height() - 32 && footer_ok());
+        win.close();
+        parent.close();
     }
 }

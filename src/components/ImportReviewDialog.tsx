@@ -227,8 +227,8 @@ function ImportReviewContent({
         </DialogTitle>
         {step && <p className="text-meta text-muted-foreground">{step}</p>}
       </DialogHeader>
-      <div className="flex flex-col gap-4 py-1">
-        <p className="text-meta text-muted-foreground">
+      <div className="flex min-h-0 flex-col gap-4 py-1">
+        <p className="shrink-0 text-meta text-muted-foreground">
           {description ??
             t(
               "Review the commands and URLs before adding them. Leave any server unchecked to keep it as it is.",
@@ -236,7 +236,7 @@ function ImportReviewContent({
         </p>
         {notice}
         {details && (
-          <details>
+          <details className="shrink-0">
             <DisclosureSummary className="text-meta">{t("Details")}</DisclosureSummary>
             <p
               className={`mt-2 whitespace-pre-wrap break-all text-muted-foreground ${pathText}`}
@@ -246,13 +246,16 @@ function ImportReviewContent({
           </details>
         )}
         {error && (
-          <p role="alert" className="text-sm text-warning">
+          <p role="alert" className="shrink-0 text-sm text-warning">
             {error}
           </p>
         )}
         {/* The inset keeps each card's selection and focus rings inside the
             scroller and the dialog body, which both clip them. */}
-        <div className="-my-1 flex max-h-72 flex-col gap-2 overflow-y-auto p-1">
+        <div
+          data-slot="review-list"
+          className="-my-1 flex min-h-0 flex-col gap-2 overflow-y-auto p-1"
+        >
           {keyedItems.map(({ item, key }) => {
             const isSelected = selected.has(key);
             return (
@@ -440,7 +443,10 @@ function ImportReviewContent({
         </Dialog>
       )}
       {missingRequired.map((reason) => (
-        <p key={reason} className="text-sm text-warning [overflow-wrap:anywhere]">
+        <p
+          key={reason}
+          className="shrink-0 text-sm text-warning [overflow-wrap:anywhere]"
+        >
           {reason}
         </p>
       ))}
