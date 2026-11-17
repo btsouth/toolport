@@ -175,7 +175,7 @@ GitHub's Apple Silicon runners:
 
 ```bash
 gh workflow run macos-acceptance.yml --repo btsouth/toolport            # latest release
-gh workflow run macos-acceptance.yml --repo btsouth/toolport -f tag=v2.3.6
+gh workflow run macos-acceptance.yml --repo btsouth/toolport -f tag=vX.Y.Z  # a published release
 ```
 
 It installs the dmg the way a user does (browser quarantine, Finder drag,
@@ -189,7 +189,7 @@ runs the Intel dmg on an Intel runner, installs the Homebrew cask, uninstalls
 per [uninstall.md](uninstall.md) and lists every leftover. Every check is
 pass, fail or untested with a reason. The Homebrew and in-app update legs only
 run for the latest release, since that is all the tap and the updater offer.
-The five jobs run in parallel in about ten minutes. Screenshots, logs and leftover lists are in the
+The five jobs run in parallel and take 10 to 25 minutes. Screenshots, logs and leftover lists are in the
 run's artifacts; the job summary lists every check and what the runner could
 not test. `-f build_ref=true` builds the current ref unsigned instead (about 20
 minutes; keychain checks are skipped because they need the signed entitlements).
