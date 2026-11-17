@@ -3934,7 +3934,9 @@ pub fn persisted_log_files(dir: &Path) -> Vec<PathBuf> {
                 "team-activity-",
             ]
             .iter()
-            .any(|prefix| name.starts_with(prefix) && !name.ends_with(".lock"));
+            .any(|prefix| name.starts_with(prefix) && !name.ends_with(".lock"))
+                // A write in flight: its writer renames it into place.
+                && !name.ends_with(".conduit-tmp");
             if rotated && !files.contains(&path) {
                 files.push(path);
             }

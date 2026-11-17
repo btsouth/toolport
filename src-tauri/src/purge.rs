@@ -899,6 +899,9 @@ const DATA_FILES: &[&str] = &[
     "agent-activity-removed",
     "agent-guard-removed",
     "legacy-topology-retired.notice",
+    // Startup secret scrub of old logs (secret_redact).
+    "secret-scrub-v1.json",
+    "secret-scrub-pending",
 ];
 
 fn hex_name(value: &str, length: usize) -> bool {
@@ -914,18 +917,23 @@ fn decimal(value: &str) -> bool {
 // registry::atomic_write and lock_at generate siblings of a known file, never
 // siblings of a directory. Apply the same rule at every selected depth.
 fn generated_file_name(name: &str, owned: impl Fn(&str) -> bool) -> bool {
-    if owned(name) {
+    let temp_of_owned = |name: &str| {
+        name.strip_suffix(".conduit-tmp").is_some_and(|base| {
+            base.rsplit_once('.').is_some_and(|(base, seq)| {
+                decimal(seq)
+                    && base.rsplit_once('.').is_some_and(|(base, pid)| {
+                        decimal(pid) && pid.parse::<u32>().is_ok() && owned(base)
+                    })
+            })
+        })
+    };
+    if owned(name) || temp_of_owned(name) {
         return true;
     }
-    if let Some(base) = name.strip_suffix(".conduit-tmp") {
-        return base.rsplit_once('.').is_some_and(|(base, seq)| {
-            decimal(seq)
-                && base.rsplit_once('.').is_some_and(|(base, pid)| {
-                    decimal(pid) && pid.parse::<u32>().is_ok() && owned(base)
-                })
-        });
-    }
-    name.strip_suffix(".lock").is_some_and(owned)
+    // A lock beside an owned file, or beside a temp copy of one (a scrub of a
+    // write in flight locked `<file>.<pid>.<seq>.conduit-tmp`).
+    name.strip_suffix(".lock")
+        .is_some_and(|base| owned(base) || temp_of_owned(base))
 }
 
 fn owned_data_name(name: &str, legacy: &std::collections::HashSet<String>) -> bool {
@@ -942,7 +950,10 @@ fn owned_data_name(name: &str, legacy: &std::collections::HashSet<String>) -> bo
             })
         || matches!(
             name,
-            "secret-service.lock" | "task-handle-key.lock" | "client-config-mutation.lock"
+            "secret-service.lock"
+                | "task-handle-key.lock"
+                | "client-config-mutation.lock"
+                | "secret-scrub.lock"
         )
         || name
             .strip_prefix("daemon-")
