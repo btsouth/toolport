@@ -4705,6 +4705,53 @@ API_KEY = "synthetic-first-origin"
         );
     }
 
+    /// A change to the connecting client's own records during verification still stops
+    /// the connect and leaves its config alone.
+    fn assert_own_record_change_stops_the_connect(change: fn(&mut Registry)) {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"one":{"command":"one"}}}"#,
+        )
+        .unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        let error = migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["one".into()],
+            &review.revision,
+            move |_, _, _, _| {
+                registry::update(|r| {
+                    change(r);
+                    Ok(())
+                })
+                .unwrap();
+                Ok(Vec::new().into())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("Servers changed during setup"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.claude()).unwrap(),
+            r#"{"mcpServers":{"one":{"command":"one"}}}"#
+        );
+    }
+
+    #[test]
+    fn reviewed_connect_still_stops_when_its_own_managed_entry_changes_meanwhile() {
+        assert_own_record_change_stops_the_connect(|r| {
+            let entry: crate::registry::ManagedEntry =
+                serde_json::from_value(serde_json::json!({"command": "toolport-gateway"})).unwrap();
+            r.set_client_managed_entry("claude-code", entry);
+        });
+    }
+
+    #[test]
+    fn reviewed_connect_still_stops_when_its_own_scope_changes_meanwhile() {
+        assert_own_record_change_stops_the_connect(|r| r.set_client_unscoped("claude-code"));
+    }
+
     #[test]
     fn reviewed_conflict_restores_other_existing_server_secret() {
         let mut previous = Registry::default();
