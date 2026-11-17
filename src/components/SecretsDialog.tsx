@@ -50,6 +50,22 @@ function secretErrorMessage(e: unknown): string {
   return msg;
 }
 
+/** Put focus on `target` after an action unless the user already moved it. */
+function refocusIfLost(target: () => HTMLElement | null) {
+  // Run after Radix has restored focus from a closing confirmation.
+  setTimeout(() => {
+    const active = document.activeElement as HTMLElement | null;
+    const lost =
+      !active ||
+      active === document.body ||
+      !active.isConnected ||
+      (active as HTMLButtonElement).disabled ||
+      active.getAttribute("role") === "dialog";
+    const element = target();
+    if (lost && element?.isConnected) element.focus();
+  });
+}
+
 export interface SecretsDialogProps {
   server: ServerEntry;
   onSaved: (registry: Registry) => void;
@@ -123,6 +139,21 @@ export function SecretsDialog({
   const [oauthBusy, setOauthBusy] = useState(false);
   const [oauthMessage, setOauthMessage] = useState("");
   const oauthRef = useRef<{ id: Promise<string>; retired: boolean } | null>(null);
+  const tokenInputRef = useRef<HTMLInputElement>(null);
+  const clientDisclosureRef = useRef<HTMLButtonElement>(null);
+  // Where focus goes once an action's result has rendered (the pressed button
+  // may be gone by then).
+  const focusAfterRender = useRef<(() => HTMLElement | null) | null>(null);
+  const [focusRequest, setFocusRequest] = useState(0);
+  useEffect(() => {
+    const target = focusAfterRender.current;
+    focusAfterRender.current = null;
+    if (target) refocusIfLost(target);
+  }, [focusRequest]);
+  function focusAfterAction(target: () => HTMLElement | null) {
+    focusAfterRender.current = target;
+    setFocusRequest((n) => n + 1);
+  }
 
   // Closing/unmounting retires UI ownership immediately. The backend id is
   // allocated first so even a queued worker can be cancelled without a race.
@@ -349,6 +380,7 @@ export function SecretsDialog({
       setAuthProbeError(false);
       setAuthInput("");
       toast.success(t("Saved auth token"));
+      focusAfterAction(() => tokenInputRef.current);
       onChanged?.();
     } catch (e) {
       toastError(secretErrorMessage(e));
@@ -364,6 +396,7 @@ export function SecretsDialog({
       await clearAuthToken(server.id);
       setAuthSet(false);
       toast.success(t("Cleared auth token"));
+      focusAfterAction(() => tokenInputRef.current);
       onChanged?.();
     } catch (e) {
       toastError(secretErrorMessage(e));
@@ -431,6 +464,7 @@ export function SecretsDialog({
       setCcMethod("");
       setCcOpen(false);
       toast.success(t("Removed client credentials"));
+      focusAfterAction(() => clientDisclosureRef.current);
       onChanged?.();
     } catch (e) {
       toastError(`${e}`);
@@ -686,6 +720,7 @@ export function SecretsDialog({
                     </div>
                     <div className="flex items-center gap-2">
                       <Input
+                        ref={tokenInputRef}
                         type="password"
                         placeholder={
                           authSet ? t("•••••••• (set)") : t("paste access token")
@@ -797,6 +832,7 @@ export function SecretsDialog({
                   <div className="mt-1 border-t border-border/60 pt-3">
                     {!ccOpen ? (
                       <button
+                        ref={clientDisclosureRef}
                         type="button"
                         className="text-meta text-muted-foreground underline underline-offset-2 hover:text-foreground"
                         onClick={() => setCcOpen(true)}

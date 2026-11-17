@@ -1910,7 +1910,7 @@ mod tab_order_tests {
             page.detail_notice
                 .borrow()
                 .as_ref()
-                .map(|(id, _)| id.clone()),
+                .map(|(id, _, _)| id.clone()),
             Some("cursor".to_string())
         );
         page.set_recovery_result("cursor", "Cursor: record deleted.".into(), true);

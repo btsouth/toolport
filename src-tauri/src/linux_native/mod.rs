@@ -2811,7 +2811,15 @@ impl ServerPage {
 struct ClientPage {
     details: details::DetailHost,
     detail_clients: std::rc::Rc<std::cell::RefCell<Vec<state::ClientView>>>,
-    detail_notice: std::rc::Rc<std::cell::RefCell<Option<(String, String)>>>,
+    /// A client's notice on its detail page: client id, title, text (React's
+    /// `restartNotice`).
+    detail_notice: std::rc::Rc<std::cell::RefCell<Option<(String, String, String)>>>,
+    /// The restart reminder on the list after a row's Connect, as React shows it on the
+    /// client it connected.
+    list_notice: gtk::Box,
+    /// The notice `list_notice` shows (client id, title, text), so a dismiss or a later
+    /// notice for that client clears only that reminder.
+    list_notice_of: std::rc::Rc<std::cell::RefCell<Option<(String, String, String)>>>,
     /// The client whose refused Connect or Disconnect the error line shows.
     error_client: std::rc::Rc<std::cell::RefCell<Option<String>>>,
     recoveries: std::rc::Rc<std::cell::RefCell<Vec<crate::clients::recovery::ClientRecovery>>>,
@@ -2906,6 +2914,9 @@ impl ClientPage {
         dismiss.add_css_class("flat");
         lasting_card.actions.append(&dismiss);
         page.append(&lasting);
+        let list_notice = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        list_notice.set_visible(false);
+        page.append(&list_notice);
 
         // Full width, like every other list page; the row groups line up with Servers.
         let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -2931,6 +2942,8 @@ impl ClientPage {
             details,
             detail_clients: Default::default(),
             detail_notice: Default::default(),
+            list_notice,
+            list_notice_of: Default::default(),
             error_client: Default::default(),
             recoveries: Default::default(),
             recovery_feedback: Default::default(),
@@ -3576,7 +3589,7 @@ impl ClientPage {
         self.show_error_line(error);
         // Keyed by the client the action was for, not whichever client is
         // open now: the user may have selected another one meanwhile.
-        *self.detail_notice.borrow_mut() = Some((client_id.to_string(), error.into()));
+        self.set_detail_notice((client_id.to_string(), error.into(), String::new()));
         *self.error_client.borrow_mut() = Some(client_id.to_string());
         if self.details.selected.borrow().as_deref() == Some(client_id) {
             self.refresh_open_detail();
@@ -3595,7 +3608,7 @@ impl ClientPage {
             .detail_notice
             .borrow()
             .as_ref()
-            .is_some_and(|(id, _)| id == client_id);
+            .is_some_and(|(id, _, _)| id == client_id);
         if stale {
             self.detail_notice.borrow_mut().take();
             if self.details.selected.borrow().as_deref() == Some(client_id) {
@@ -3607,7 +3620,7 @@ impl ClientPage {
     fn show_error(&self, error: &str) {
         let selected = self.details.selected.borrow().clone();
         if let Some(id) = selected {
-            *self.detail_notice.borrow_mut() = Some((id, error.into()));
+            self.set_detail_notice((id, error.into(), String::new()));
             self.refresh_open_detail();
         }
         self.show_error_line(error);
@@ -3635,7 +3648,7 @@ impl ClientPage {
     fn show_confirmation(&self, message: &str) {
         let selected = self.details.selected.borrow().clone();
         if let Some(id) = selected {
-            *self.detail_notice.borrow_mut() = Some((id, message.into()));
+            self.set_detail_notice((id, message.into(), String::new()));
             self.refresh_open_detail();
         }
         self.cancel_feedback_timer();
@@ -3648,10 +3661,88 @@ impl ClientPage {
     fn refresh_with_confirmation(&self, message: String) {
         self.recovery_success.borrow_mut().take();
         if let Some(id) = self.details.selected.borrow().clone() {
-            *self.detail_notice.borrow_mut() = Some((id, message.clone()));
+            self.set_detail_notice((id, message.clone(), String::new()));
         }
         *self.pending_confirmation.borrow_mut() = Some(message);
         self.refresh();
+    }
+
+    /// After a connect: React's "Not live yet" reminder, naming the client, on its detail
+    /// page and on the list. It stays until dismissed or replaced.
+    fn refresh_with_restart_notice(&self, client_id: &str, client_name: &str) {
+        self.recovery_success.borrow_mut().take();
+        let title = crate::i18n::tr("Not live yet");
+        let text = crate::i18n::trf(
+            "Restart {client} so it loads Toolport.",
+            &[("client", client_name)],
+        );
+        self.set_detail_notice((client_id.to_string(), title.clone(), text.clone()));
+        self.show_list_notice(client_id, &title, &text);
+        self.refresh();
+    }
+
+    /// Sets the detail notice. A different notice for the client the list reminder
+    /// names (an error, a disconnect) replaces that reminder too, so the list never
+    /// keeps advice the client's own page no longer gives.
+    fn set_detail_notice(&self, notice: (String, String, String)) {
+        let replaces_reminder = self
+            .list_notice_of
+            .borrow()
+            .as_ref()
+            .is_some_and(|shown| shown.0 == notice.0 && shown != &notice);
+        if replaces_reminder {
+            self.clear_list_notice();
+        }
+        *self.detail_notice.borrow_mut() = Some(notice);
+    }
+
+    fn show_list_notice(&self, client_id: &str, title: &str, text: &str) {
+        self.clear_list_notice();
+        let shown = (client_id.to_string(), title.to_string(), text.to_string());
+        *self.list_notice_of.borrow_mut() = Some(shown);
+        let holder = self.list_notice.clone();
+        let detail = self.detail_notice.clone();
+        let of = self.list_notice_of.clone();
+        self.list_notice
+            .append(&restart_notice(title, text, move || {
+                holder.set_visible(false);
+                // Only the same reminder on the detail page goes with it; another
+                // client's error or confirmation stays.
+                let dismissed = of.borrow_mut().take();
+                if dismissed.is_some() && *detail.borrow() == dismissed {
+                    detail.borrow_mut().take();
+                }
+            }));
+        self.list_notice.set_visible(true);
+    }
+
+    fn clear_list_notice(&self) {
+        self.list_notice_of.borrow_mut().take();
+        while let Some(child) = self.list_notice.first_child() {
+            self.list_notice.remove(&child);
+        }
+        self.list_notice.set_visible(false);
+    }
+
+    /// Dismissing the detail notice. The list reminder goes with it only when it is
+    /// that same notice.
+    pub(super) fn dismiss_detail_notice(&self) {
+        let dismissed = self.detail_notice.borrow_mut().take();
+        if dismissed.is_some() && *self.list_notice_of.borrow() == dismissed {
+            self.clear_list_notice();
+        }
+    }
+
+    /// The client's connection changed, so a list reminder about it is stale.
+    fn clear_list_notice_for(&self, client_id: &str) {
+        let stale = self
+            .list_notice_of
+            .borrow()
+            .as_ref()
+            .is_some_and(|shown| shown.0 == client_id);
+        if stale {
+            self.clear_list_notice();
+        }
     }
 
     fn cancel_feedback_timer(&self) {
@@ -3659,6 +3750,54 @@ impl ClientPage {
             timer.remove();
         }
     }
+}
+
+/// React's client notice (`ClientDetail`'s restart reminder): an info bar with the
+/// refresh icon, a bold title, optional text, and a dismiss button.
+pub(super) fn restart_notice(title: &str, text: &str, on_dismiss: impl Fn() + 'static) -> gtk::Box {
+    let notice = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    notice.set_widget_name("toolport-restart-notice");
+    notice.add_css_class("toolport-feedback");
+    notice.add_css_class("info");
+    let icon = gtk::Image::from_icon_name("view-refresh-symbolic");
+    icon.set_valign(gtk::Align::Start);
+    icon.set_margin_top(2);
+    notice.append(&icon);
+    let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    copy.set_hexpand(true);
+    let heading = gtk::Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .selectable(true)
+        .build();
+    heading.add_css_class("heading");
+    copy.append(&heading);
+    if !text.is_empty() {
+        let body = gtk::Label::builder()
+            .label(text)
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .selectable(true)
+            .build();
+        body.add_css_class("toolport-muted");
+        copy.append(&body);
+    }
+    notice.append(&copy);
+    let dismiss = header_icon_button("window-close-symbolic");
+    dismiss.set_valign(gtk::Align::Start);
+    l10n::bind_tooltip(&dismiss, "Dismiss restart reminder");
+    let weak = notice.downgrade();
+    dismiss.connect_clicked(move |_| {
+        if let Some(notice) = weak.upgrade() {
+            notice.set_visible(false);
+        }
+        on_dismiss();
+    });
+    notice.append(&dismiss);
+    notice
 }
 
 fn client_activity_detail(client: &serde_json::Value) -> String {
@@ -3989,7 +4128,8 @@ fn confirm_client_migrate(client: &state::ClientView, page: ClientPage) {
         client.gateway_state == state::ClientGatewayState::Customized,
         {
             let page = page.clone();
-            move || page.refresh_with_confirmation(crate::i18n::tr("Restart the client afterward."))
+            let (id, name) = (client.id.clone(), client.name.clone());
+            move || page.refresh_with_restart_notice(&id, &name)
         },
         Some(page.credential_page.clone()),
     );
@@ -4348,7 +4488,7 @@ fn run_client_mutation(
         crate::i18n::msg("Disconnecting client…")
     }));
     let client_id = client.id.clone();
-    let client_id_for_error = client.id.clone();
+    let mutated_id = client.id.clone();
     let client_name = client.name.clone();
     let button = button.clone();
     gtk::glib::spawn_future_local(async move {
@@ -4367,6 +4507,7 @@ fn run_client_mutation(
         button.set_sensitive(true);
         match result {
             Ok(Ok(result)) => {
+                page.clear_list_notice_for(&mutated_id);
                 // The config write is not live until the client restarts; saying
                 // only "Connected" would misstate what the running client does.
                 let restored = result.outcome.restored.len();
@@ -4428,7 +4569,7 @@ fn run_client_mutation(
                 }
             }
             Ok(Err(error)) => {
-                page.show_client_error(&client_id_for_error, &format!("{client_name}: {error}"))
+                page.show_client_error(&mutated_id, &format!("{client_name}: {error}"))
             }
             Err(_) => page.show_error(&crate::i18n::trf(
                 "{value0}: the operation stopped",
@@ -10989,6 +11130,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
         .default_height(440)
         .build();
     editor.add_css_class("toolport-editor");
+    let form = CredentialForm::new(&editor);
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let header = adw::HeaderBar::new();
@@ -10999,14 +11141,16 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
     let content = gtk::Box::new(gtk::Orientation::Vertical, 16);
     content.add_css_class("toolport-editor-body");
     content.append(&editor_intro("system-lock-screen-symbolic", crate::i18n::msg("Remote authentication"), crate::i18n::msg("Use browser sign-in when supported, or paste a token supplied by your provider. Toolport stores credentials in the system keychain.")));
+    // Token and sign-in results show under the token actions, client results
+    // under theirs, so each message sits by the button that caused it.
     let feedback = gtk::Label::builder()
         .halign(gtk::Align::Fill)
         .xalign(0.0)
         .wrap(true)
         .css_classes(["toolport-feedback"])
         .build();
+    feedback.set_widget_name("auth-token-status");
     l10n::bind_text(&feedback, "Checking the system keychain…");
-    content.append(&feedback);
 
     // What the server actually wants, probed live so the user does not have to
     // guess between a token paste and a browser sign-in.
@@ -11047,17 +11191,20 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
         l10n::bind_placeholder(&widget, "Paste a new token");
         widget
     };
+    token.set_widget_name("auth-token");
     token_section.append(&token);
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     actions.set_halign(gtk::Align::End);
     let sign_in = l10n::button("Sign in with browser");
+    sign_in.set_widget_name("auth-sign-in");
     sign_in.add_css_class("toolport-secondary-action");
     let cancel_sign_in = l10n::button("Cancel sign-in");
     cancel_sign_in.set_visible(false);
     let remove = l10n::button("Remove token");
+    remove.set_widget_name("auth-remove-token");
     remove.add_css_class("toolport-destructive");
-    remove.set_sensitive(false);
     let save = l10n::button("Store token");
+    save.set_widget_name("auth-store-token");
     save.add_css_class("suggested-action");
     let browser_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     browser_actions.set_halign(gtk::Align::Start);
@@ -11067,6 +11214,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
     actions.append(&remove);
     actions.append(&save);
     token_section.append(&actions);
+    token_section.append(&feedback);
     content.append(&token_section);
 
     let client_section = gtk::Box::new(gtk::Orientation::Vertical, 10);
@@ -11087,6 +11235,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
         l10n::bind_placeholder(&widget, "OAuth client id");
         widget
     };
+    client_id.set_widget_name("auth-client-id");
     let client_secret = {
         let widget = gtk::PasswordEntry::builder()
             .placeholder_text(if server.client_credentials.is_some() {
@@ -11107,6 +11256,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
         );
         widget
     };
+    client_secret.set_widget_name("auth-client-secret");
     let methods = gtk::StringList::new(&["client_secret_basic", "client_secret_post"]);
     let method = gtk::DropDown::new(Some(methods), None::<gtk::Expression>);
     quiet_tooltips::guard_dropdown(&method);
@@ -11147,63 +11297,70 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
         .visible(false)
         .css_classes(["toolport-muted", "caption"])
         .build();
+    secret_status.set_widget_name("auth-secret-status");
     client_section.append(&secret_status);
     let secret_retry = l10n::button("Retry the secret check");
+    secret_retry.set_widget_name("auth-secret-retry");
     secret_retry.add_css_class("flat");
     secret_retry.set_halign(gtk::Align::Start);
     secret_retry.set_visible(false);
     client_section.append(&secret_retry);
+    // What the keychain holds, kept apart from the typed fields: None is unknown.
+    let token_present = std::rc::Rc::new(std::cell::Cell::new(None::<bool>));
+    let secret_present = std::rc::Rc::new(std::cell::Cell::new(None::<bool>));
+    let client_configured =
+        std::rc::Rc::new(std::cell::Cell::new(server.client_credentials.is_some()));
+    // Each secret check and client write retires the checks before it, so a
+    // late answer never overwrites a newer one.
+    let secret_epoch = std::rc::Rc::new(std::cell::Cell::new(0u64));
+    let show_secret: std::rc::Rc<dyn Fn(Option<bool>)> = {
+        let secret_status = secret_status.clone();
+        let secret_retry = secret_retry.clone();
+        let client_secret = client_secret.clone();
+        let secret_present = secret_present.clone();
+        let form = form.clone();
+        std::rc::Rc::new(move |present| {
+            secret_present.set(present);
+            secret_status.set_visible(true);
+            let (caption, placeholder) = match present {
+                Some(true) => ("A client secret is stored in the keychain. It cannot be shown again; leave the field blank to keep it.", "Leave blank to keep the stored secret"),
+                Some(false) => ("No client secret is stored yet.", "OAuth client secret"),
+                None => ("Couldn't check the stored secret. Unknown is not the same as absent.", "OAuth client secret"),
+            };
+            l10n::bind_text(&secret_status, caption);
+            l10n::bind_placeholder(client_secret.upcast_ref::<gtk::Widget>(), placeholder);
+            secret_retry.set_visible(present.is_none());
+            form.refresh();
+        })
+    };
+    let check: std::rc::Rc<dyn Fn()> = {
+        let server_id = server.id.clone();
+        let show_secret = show_secret.clone();
+        let secret_epoch = secret_epoch.clone();
+        std::rc::Rc::new(move || {
+            let server_id = server_id.clone();
+            let show_secret = show_secret.clone();
+            let secret_epoch = secret_epoch.clone();
+            let ticket = secret_epoch.get().wrapping_add(1);
+            secret_epoch.set(ticket);
+            gtk::glib::spawn_future_local(async move {
+                let result = gtk::gio::spawn_blocking(move || {
+                    crate::registry_controller::has_client_secret(&server_id)
+                })
+                .await;
+                if secret_epoch.get() == ticket {
+                    show_secret(match result {
+                        Ok(Ok(present)) => Some(present),
+                        _ => None,
+                    });
+                }
+            });
+        })
+    };
+    check();
     {
-        let check = {
-            let server_id = server.id.clone();
-            let secret_status = secret_status.clone();
-            let secret_retry = secret_retry.clone();
-            let client_secret = client_secret.clone();
-            std::rc::Rc::new(move || {
-                let server_id = server_id.clone();
-                let secret_status = secret_status.clone();
-                let secret_retry = secret_retry.clone();
-                let client_secret = client_secret.clone();
-                gtk::glib::spawn_future_local(async move {
-                    let result = gtk::gio::spawn_blocking(move || {
-                        crate::registry_controller::has_client_secret(&server_id)
-                    })
-                    .await;
-                    secret_status.set_visible(true);
-                    match result {
-                        Ok(Ok(true)) => {
-                            l10n::bind_text(
-                                &secret_status,
-                                "A client secret is stored in the keychain. It cannot be shown again; leave the field blank to keep it.",
-                            );
-                            secret_retry.set_visible(false);
-                            l10n::bind_placeholder(
-                                client_secret.upcast_ref::<gtk::Widget>(),
-                                "Leave blank to keep the stored secret",
-                            );
-                        }
-                        Ok(Ok(false)) => {
-                            l10n::bind_text(&secret_status, "No client secret is stored yet.");
-                            secret_retry.set_visible(false);
-                            l10n::bind_placeholder(
-                                client_secret.upcast_ref::<gtk::Widget>(),
-                                "OAuth client secret",
-                            );
-                        }
-                        _ => {
-                            l10n::bind_text(
-                                &secret_status,
-                                "Couldn't check the stored secret. Unknown is not the same as absent.",
-                            );
-                            secret_retry.set_visible(true);
-                        }
-                    }
-                });
-            })
-        };
-        check();
-        let check_for_retry = check.clone();
-        secret_retry.connect_clicked(move |_| check_for_retry());
+        let check = check.clone();
+        secret_retry.connect_clicked(move |_| check());
     }
     client_section.append(&editor_field(
         crate::i18n::msg("Token endpoint auth method"),
@@ -11213,14 +11370,89 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
     let client_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     client_actions.set_halign(gtk::Align::End);
     let remove_client = l10n::button("Remove client credentials");
+    remove_client.set_widget_name("auth-remove-client");
     remove_client.add_css_class("toolport-destructive");
-    remove_client.set_sensitive(server.client_credentials.is_some());
     let save_client = l10n::button("Save client credentials");
+    save_client.set_widget_name("auth-save-client");
     save_client.add_css_class("suggested-action");
     client_actions.append(&remove_client);
     client_actions.append(&save_client);
     client_section.append(&client_actions);
+    let client_feedback = gtk::Label::builder()
+        .halign(gtk::Align::Fill)
+        .xalign(0.0)
+        .wrap(true)
+        .visible(false)
+        .css_classes(["toolport-feedback"])
+        .build();
+    client_feedback.set_widget_name("auth-client-status");
+    client_section.append(&client_feedback);
     content.append(&client_section);
+
+    // Every action waits for the one in flight, browser sign-in included.
+    form.watch(&sign_in, || Ok(()));
+    {
+        let token = token.downgrade();
+        form.watch(&save, move || {
+            token
+                .upgrade()
+                .is_some_and(|token| !token.text().is_empty())
+                .then_some(())
+                .ok_or(Some(crate::i18n::msg("Paste a token before storing it.")))
+        });
+    }
+    // As in React, Remove shows only when there is something to remove (unknown
+    // is not absent, so it shows then and the backend decides), and Save client
+    // credentials says what is missing when pressed, so no reason lives only in a
+    // tooltip a keyboard cannot reach.
+    form.watch(&remove, || Ok(()));
+    {
+        let (present, remove) = (token_present.clone(), remove.downgrade());
+        form.also(move || {
+            if let Some(remove) = remove.upgrade() {
+                remove.set_visible(present.get() != Some(false));
+            }
+        });
+    }
+    form.watch(&save_client, || Ok(()));
+    form.watch(&remove_client, || Ok(()));
+    // A check started during a write could read the store before the write lands
+    // and overwrite the caption the write sets, so Retry waits for the write too.
+    form.watch(&secret_retry, || Ok(()));
+    {
+        let configured = client_configured.clone();
+        let secret_present = secret_present.clone();
+        let remove_client = remove_client.downgrade();
+        form.also(move || {
+            if let Some(remove_client) = remove_client.upgrade() {
+                // Unknown is not absent: a removal that failed halfway can leave a
+                // secret without settings, so Remove stays until none is stored.
+                remove_client.set_visible(configured.get() || secret_present.get() != Some(false));
+            }
+        });
+    }
+    // Enter in the token field stores it, as in React.
+    press_on_enter(&token, &save);
+    for field in [
+        token.clone().upcast::<gtk::Editable>(),
+        client_id.clone().upcast(),
+        client_secret.clone().upcast(),
+    ] {
+        let form = form.clone();
+        field.connect_changed(move |_| form.refresh());
+    }
+    // Editing a client field retires the error it caused, as in the Credentials dialog.
+    for field in [
+        client_id.clone().upcast::<gtk::Editable>(),
+        client_secret.clone().upcast(),
+    ] {
+        let status = client_feedback.downgrade();
+        field.connect_changed(move |_| {
+            if let Some(status) = status.upgrade().filter(|s| s.has_css_class("error")) {
+                status.set_visible(false);
+            }
+        });
+    }
 
     let clamp = adw::Clamp::builder()
         .maximum_size(680)
@@ -11257,12 +11489,14 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
     let status_epoch = auth_epoch.clone();
     let server_id = server.id.clone();
     let feedback_for_status = feedback.clone();
-    let remove_for_status = remove.clone();
+    let present_for_status = token_present.clone();
+    let form_for_status = form.clone();
     gtk::glib::spawn_future_local(async move {
         let result = gtk::gio::spawn_blocking(move || {
             crate::registry_controller::has_auth_token(&server_id)
         })
         .await;
+        // A sign-in or token write since opening knows better.
         if status_epoch.get() != 0 {
             return;
         }
@@ -11278,7 +11512,8 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
                 );
                 feedback_for_status.remove_css_class("error");
                 feedback_for_status.add_css_class("success");
-                remove_for_status.set_sensitive(has_token);
+                present_for_status.set(Some(has_token));
+                form_for_status.refresh();
             }
             Ok(Err(error)) => {
                 l10n::bind_formatted_label(
@@ -11287,6 +11522,8 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
                     &[("value0", &error.to_string())],
                 );
                 feedback_for_status.add_css_class("error");
+                present_for_status.set(None);
+                form_for_status.refresh();
             }
             Err(_) => {
                 l10n::bind_text(
@@ -11298,126 +11535,238 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
         }
     });
 
-    let server_id = server.id.clone();
-    let server_name = server.name.clone();
-    let page_for_client = page.clone();
-    let feedback_for_client = feedback.clone();
-    let remove_for_client = remove_client.clone();
-    save_client.connect_clicked(move |button| {
-        button.set_sensitive(false);
-        let server_id = server_id.clone();
-        let server_name = server_name.clone();
-        let client_id = client_id.text().to_string();
-        let secret = client_secret.text().to_string();
-        let method = if method.selected() == 1 {
-            "client_secret_post"
-        } else {
-            "client_secret_basic"
-        }
-        .to_string();
-        let scope = scope.text().to_string();
-        let page = page_for_client.clone();
-        let feedback = feedback_for_client.clone();
-        let remove = remove_for_client.clone();
-        let button = button.clone();
-        gtk::glib::spawn_future_local(async move {
-            let result = gtk::gio::spawn_blocking(move || {
-                crate::registry_controller::set_client_credentials(
-                    &server_id,
-                    &client_id,
-                    Some(secret),
-                    Some(&method),
-                    Some(&scope),
-                )
-            })
-            .await;
-            button.set_sensitive(true);
-            match result {
-                Ok(Ok(registry)) => {
-                    page.render(state::RegistryState::Ready(
-                        state::RegistrySnapshot::from_registry(registry),
-                    ));
-                    l10n::bind_formatted_label(
-                        &feedback,
-                        "Client credentials for {value0} are configured.",
-                        &[("value0", &server_name.to_string())],
-                    );
-                    feedback.remove_css_class("error");
-                    feedback.add_css_class("success");
-                    remove.set_sensitive(true);
-                }
-                Ok(Err(error)) => {
-                    l10n::bind_formatted_label(
-                        &feedback,
-                        "Could not save client credentials: {value0}",
-                        &[("value0", &error.to_string())],
-                    );
-                    feedback.add_css_class("error");
-                }
-                Err(_) => {
-                    l10n::bind_text(
-                        &feedback,
-                        "The client-credentials update stopped unexpectedly.",
-                    );
-                    feedback.add_css_class("error");
-                }
+    {
+        let (server_id, server_name) = (server.id.clone(), server.name.clone());
+        let (page, feedback, form, editor) = (
+            page.clone(),
+            client_feedback.clone(),
+            form.clone(),
+            editor.clone(),
+        );
+        let (client_id, client_secret, method, scope) = (
+            client_id.clone(),
+            client_secret.clone(),
+            method.clone(),
+            scope.clone(),
+        );
+        let (configured, show_secret, secret_epoch, secret_present) = (
+            client_configured.clone(),
+            show_secret.clone(),
+            secret_epoch.clone(),
+            secret_present.clone(),
+        );
+        save_client.connect_clicked(move |button| {
+            if !button.is_sensitive() {
+                return;
             }
+            // As in React, the reason shows by the button and focus stays put.
+            let missing = if client_id.text().trim().is_empty() {
+                Some("Enter the client id issued by your authorization server.")
+            } else if secret_present.get() == Some(false) && client_secret.text().trim().is_empty()
+            {
+                // A blank secret keeps a stored one; unknown lets the backend decide.
+                Some("Enter the client secret issued by your authorization server.")
+            } else {
+                None
+            };
+            if let Some(reason) = missing {
+                l10n::bind_text(&feedback, reason);
+                credential_feedback(&feedback, true);
+                return;
+            }
+            let server_id = server_id.clone();
+            let id = client_id.text().trim().to_string();
+            let secret = client_secret.text().to_string();
+            let submitted = secret.clone();
+            let chosen_method = if method.selected() == 1 {
+                "client_secret_post"
+            } else {
+                "client_secret_basic"
+            };
+            let chosen_scope = scope.text().trim().to_string();
+            let page = page.clone();
+            let (server_name, feedback, client_secret) =
+                (server_name.clone(), feedback.clone(), client_secret.clone());
+            let (configured, show_secret) = (configured.clone(), show_secret.clone());
+            let button_for_focus = button.clone();
+            // Retire a secret check still in flight.
+            secret_epoch.set(secret_epoch.get().wrapping_add(1));
+            let render = page.clone();
+            auth_write(
+                &form,
+                &editor,
+                &page,
+                button,
+                "The client-credentials update stopped unexpectedly.",
+                Some(crate::i18n::trf(
+                    "Client credentials for {value0} are configured.",
+                    &[("value0", &server_name)],
+                )),
+                move || {
+                    crate::registry_controller::set_client_credentials(
+                        &server_id,
+                        &id,
+                        Some(secret),
+                        Some(chosen_method),
+                        Some(&chosen_scope),
+                    )
+                },
+                move |result: &Result<crate::registry::Registry, String>| {
+                    if let Ok(registry) = result {
+                        render.render(state::RegistryState::Ready(
+                            state::RegistrySnapshot::from_registry(registry.clone()),
+                        ))
+                    }
+                },
+                move |result| match result {
+                    Ok(_) => {
+                        feedback.set_label(&crate::i18n::trf(
+                            "Client credentials for {value0} are configured.",
+                            &[("value0", &server_name)],
+                        ));
+                        credential_feedback(&feedback, false);
+                        configured.set(true);
+                        if client_secret.text() == submitted {
+                            client_secret.set_text("");
+                        }
+                        // A successful write is an authoritative "secret stored".
+                        show_secret(Some(true));
+                        client_secret.upcast()
+                    }
+                    Err(error) => {
+                        feedback.set_label(&crate::i18n::trf(
+                            "Could not save client credentials: {value0}",
+                            &[("value0", &error)],
+                        ));
+                        // A refused save leaves the stored secret as it was, so the
+                        // caption still holds. Reading again would ask to unlock twice.
+                        credential_feedback(&feedback, true);
+                        button_for_focus.upcast()
+                    }
+                },
+            );
         });
-    });
+    }
 
-    let server_id = server.id.clone();
-    let server_name = server.name.clone();
-    let page_for_client_remove = page.clone();
-    let feedback_for_client_remove = feedback.clone();
-    remove_client.connect_clicked(move |button| {
-        button.set_sensitive(false);
-        let server_id = server_id.clone();
-        let server_name = server_name.clone();
-        let page = page_for_client_remove.clone();
-        let feedback = feedback_for_client_remove.clone();
-        let button = button.clone();
-        gtk::glib::spawn_future_local(async move {
-            let result = gtk::gio::spawn_blocking(move || {
-                crate::registry_controller::clear_client_credentials(&server_id)
-            })
-            .await;
-            match result {
-                Ok(Ok(registry)) => {
-                    page.render(state::RegistryState::Ready(
-                        state::RegistrySnapshot::from_registry(registry),
-                    ));
-                    l10n::bind_formatted_label(
-                        &feedback,
-                        "Removed client credentials for {value0}.",
-                        &[("value0", &server_name.to_string())],
+    {
+        let (server_id, server_name) = (server.id.clone(), server.name.clone());
+        let (page, feedback, form, editor) = (
+            page.clone(),
+            client_feedback.clone(),
+            form.clone(),
+            editor.clone(),
+        );
+        let (client_id, client_secret, method, scope) = (
+            client_id.clone(),
+            client_secret.clone(),
+            method.clone(),
+            scope.clone(),
+        );
+        let (configured, show_secret, secret_epoch) = (
+            client_configured.clone(),
+            show_secret.clone(),
+            secret_epoch.clone(),
+        );
+        remove_client.connect_clicked(move |button| {
+            let (server_id, server_name, page, feedback, form, editor_for_write) = (
+                server_id.clone(),
+                server_name.clone(),
+                page.clone(),
+                feedback.clone(),
+                form.clone(),
+                editor.clone(),
+            );
+            let (client_id, client_secret, method, scope) = (
+                client_id.clone(),
+                client_secret.clone(),
+                method.clone(),
+                scope.clone(),
+            );
+            let (configured, show_secret, secret_epoch) = (
+                configured.clone(),
+                show_secret.clone(),
+                secret_epoch.clone(),
+            );
+            let opener = button.clone();
+            confirm_credential_removal(
+                &editor,
+                button,
+                "Remove client credentials?",
+                &[],
+                "The client secret is deleted from your keychain and cannot be shown again. You'll need to get a new one from your authorization server to reconnect this way.",
+                move || {
+                    if !opener.is_sensitive() {
+                        return;
+                    }
+                    secret_epoch.set(secret_epoch.get().wrapping_add(1));
+                    let server_id = server_id.clone();
+                    let page = page.clone();
+                    let (server_name, feedback, opener_for_focus) =
+                        (server_name.clone(), feedback.clone(), opener.clone());
+                    let (client_id, client_secret, method, scope) = (
+                        client_id.clone(),
+                        client_secret.clone(),
+                        method.clone(),
+                        scope.clone(),
                     );
-                    feedback.remove_css_class("error");
-                    feedback.add_css_class("success");
-                    button.set_sensitive(false);
-                }
-                Ok(Err(error)) => {
-                    button.set_sensitive(true);
-                    l10n::bind_formatted_label(
-                        &feedback,
-                        "Could not remove client credentials: {value0}",
-                        &[("value0", &error.to_string())],
-                    );
-                    feedback.add_css_class("error");
-                }
-                Err(_) => {
-                    button.set_sensitive(true);
-                    l10n::bind_text(
-                        &feedback,
+                    let (configured, show_secret) = (configured.clone(), show_secret.clone());
+                    auth_write(
+                        &form,
+                        &editor_for_write,
+                        &page,
+                        &opener,
                         "The client-credentials removal stopped unexpectedly.",
+                        Some(crate::i18n::trf(
+                            "Removed client credentials for {value0}.",
+                            &[("value0", &server_name)],
+                        )),
+                        move || crate::registry_controller::clear_client_credentials(&server_id),
+                        {
+                            let page = page.clone();
+                            move |result: &Result<crate::registry::Registry, String>| {
+                                if let Ok(registry) = result {
+                                    page.render(state::RegistryState::Ready(
+                                        state::RegistrySnapshot::from_registry(registry.clone()),
+                                    ))
+                                }
+                            }
+                        },
+                        move |result| match result {
+                            Ok(_) => {
+                                feedback.set_label(&crate::i18n::trf(
+                                        "Removed client credentials for {value0}.",
+                                        &[("value0", &server_name)],
+                                    ));
+                                    credential_feedback(&feedback, false);
+                                // Back to an unconfigured form.
+                                configured.set(false);
+                                client_id.set_text("");
+                                client_secret.set_text("");
+                                scope.set_text("");
+                                method.set_selected(0);
+                                show_secret(Some(false));
+                                // Focus moves up to Client id; the result stays in view.
+                                reveal_after_focus(&feedback);
+                                client_id.upcast()
+                            }
+                            Err(error) => {
+                                feedback.set_label(&crate::i18n::trf(
+                                        "Could not remove client credentials: {value0}",
+                                        &[("value0", &error)],
+                                    ));
+                                    credential_feedback(&feedback, true);
+                                // Part of the removal may have happened. Say it is unknown
+                                // and leave the next read to Retry, so one click asks once.
+                                show_secret(None);
+                                opener_for_focus.upcast()
+                            }
+                        },
                     );
-                    feedback.add_css_class("error");
-                }
-            }
+                },
+            );
         });
-    });
+    }
 
-    let has_client = server.client_credentials.is_some();
-    let remove_before_oauth = std::rc::Rc::new(std::cell::Cell::new(false));
     // Only the current editor attempt may update widgets after blocking work.
     // Cancellation retires it before a late callback/token response can return.
     let server_id = server.id.clone();
@@ -11425,31 +11774,25 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
     let server_url = server.url.clone().unwrap_or_default();
     {
         let feedback = feedback.clone();
-        let remove = remove.clone();
-        let save = save.clone();
-        let save_client = save_client.clone();
-        let remove_client = remove_client.clone();
         let cancel = cancel_sign_in.clone();
         let page = page.clone();
         let attempt = oauth_attempt.clone();
         let epoch = auth_epoch.clone();
-        let remove_before = remove_before_oauth.clone();
-        sign_in.connect_clicked(move |button| {
+        let form = form.clone();
+        let token_present = token_present.clone();
+        sign_in.connect_clicked(move |_| {
             if server_url.is_empty() {
                 l10n::bind_text(&feedback, "This server does not have a remote URL to sign in to.");
                 feedback.add_css_class("error");
+                return;
+            }
+            if !form.begin() {
                 return;
             }
             let id = crate::oauth_controller::start_attempt();
             *attempt.borrow_mut() = Some(id.clone());
             epoch.set(epoch.get().wrapping_add(1));
             let generation = epoch.get();
-            button.set_sensitive(false);
-            save.set_sensitive(false);
-            save_client.set_sensitive(false);
-            remove_client.set_sensitive(false);
-            remove_before.set(remove.is_sensitive());
-            remove.set_sensitive(false);
             cancel.set_visible(true);
             l10n::bind_text(&feedback, "Opening your browser. Approve access there. Waiting up to 3 minutes for the callback. Closed the browser? Cancel sign-in, then sign in again to reopen it. Closing this panel cancels sign-in. The main window closes to tray; Quit Toolport exits.");
             feedback.remove_css_class("error");
@@ -11459,35 +11802,28 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
             let server_name = server_name.clone();
             let server_url = server_url.clone();
             let feedback = feedback.clone();
-            let remove = remove.clone();
-            let save = save.clone();
-            let save_client = save_client.clone();
-            let remove_client = remove_client.clone();
-
             let cancel = cancel.clone();
             let page = page.clone();
-            let button = button.clone();
             let attempt = attempt.clone();
             let epoch = epoch.clone();
-            let remove_before = remove_before.clone();
+            let form = form.clone();
+            let token_present = token_present.clone();
             gtk::glib::spawn_future_local(async move {
                 let result = gtk::gio::spawn_blocking(move || {
                     crate::oauth_controller::authenticate(&server_id, &server_url, &id)
                 }).await;
                 if epoch.get() != generation { return; }
                 attempt.borrow_mut().take();
-                remove.set_sensitive(remove_before.get());
-                button.set_sensitive(true);
-                save.set_sensitive(true);
-                save_client.set_sensitive(true);
-                remove_client.set_sensitive(has_client);
                 cancel.set_visible(false);
+                if matches!(result, Ok(Ok(()))) {
+                    token_present.set(Some(true));
+                }
+                form.finish();
                 match result {
                     Ok(Ok(())) => {
                         l10n::bind_text(&feedback, "Browser sign-in completed and the token is stored in the system keychain.");
                         feedback.remove_css_class("error");
                         feedback.add_css_class("success");
-                        remove.set_sensitive(true);
                         page.show_confirmation(&crate::i18n::trf("Authenticated {value0}", &[("value0", &server_name.to_string())]));
                         page.reprobe_after_auth_change(&reprobe_id);
                     }
@@ -11501,6 +11837,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
                         feedback.add_css_class("error");
                     }
                 }
+                reveal(&feedback);
             });
         });
     }
@@ -11508,13 +11845,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
         let attempt = oauth_attempt.clone();
         let epoch = auth_epoch.clone();
         let feedback = feedback.clone();
-        let sign_in = sign_in.clone();
-        let save = save.clone();
-        let save_client = save_client.clone();
-        let remove_client = remove_client.clone();
-        let has_client = server.client_credentials.is_some();
-        let remove = remove.clone();
-        let remove_before = remove_before_oauth.clone();
+        let form = form.clone();
         cancel_sign_in.connect_clicked(move |button| {
             let Some(id) = attempt.borrow_mut().take() else {
                 return;
@@ -11526,12 +11857,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
             l10n::bind_text(&feedback, "Cancelling browser sign-in…");
             let epoch = epoch.clone();
             let feedback = feedback.clone();
-            let sign_in = sign_in.clone();
-            let save = save.clone();
-            let save_client = save_client.clone();
-            let remove_client = remove_client.clone();
-            let remove = remove.clone();
-            let remove_before = remove_before.clone();
+            let form = form.clone();
             let button = button.clone();
             gtk::glib::spawn_future_local(async move {
                 let result =
@@ -11540,11 +11866,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
                 if epoch.get() != generation {
                     return;
                 }
-                sign_in.set_sensitive(true);
-                save.set_sensitive(true);
-                save_client.set_sensitive(true);
-                remove_client.set_sensitive(has_client);
-                remove.set_sensitive(remove_before.get());
+                form.finish();
                 button.set_sensitive(true);
                 button.set_visible(false);
                 feedback.set_label(&match result {
@@ -11556,115 +11878,232 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
         });
     }
 
-    let server_id = server.id.clone();
-    let server_name = server.name.clone();
-    let feedback_for_save = feedback.clone();
-    let remove_for_save = remove.clone();
-    let page_for_save = page.clone();
-    save.connect_clicked(move |button| {
-        let value = token.text().to_string();
-        if value.is_empty() {
-            l10n::bind_text(&feedback_for_save, "Paste a token before storing it.");
-            feedback_for_save.add_css_class("error");
-            return;
-        }
-        let remove_was_sensitive = remove_for_save.is_sensitive();
-        button.set_sensitive(false);
-        remove_for_save.set_sensitive(false);
-        l10n::bind_text(&feedback_for_save, "Storing token in the system keychain…");
-        feedback_for_save.remove_css_class("error");
-        let server_id = server_id.clone();
-        let reprobe_id = server_id.clone();
-        let server_name = server_name.clone();
-        let feedback = feedback_for_save.clone();
-        let remove = remove_for_save.clone();
-        let page = page_for_save.clone();
-        let button = button.clone();
-        gtk::glib::spawn_future_local(async move {
-            let result = gtk::gio::spawn_blocking(move || {
-                crate::registry_controller::set_auth_token(&server_id, &value)
-            })
-            .await;
-            button.set_sensitive(true);
-            match result {
-                Ok(Ok(())) => {
-                    l10n::bind_text(&feedback, "Bearer token stored in the system keychain.");
-                    feedback.remove_css_class("error");
-                    feedback.add_css_class("success");
-                    remove.set_sensitive(true);
-                    page.show_confirmation(&crate::i18n::trf(
-                        "Updated authentication for {value0}",
-                        &[("value0", &server_name.to_string())],
-                    ));
-                    page.reprobe_after_auth_change(&reprobe_id);
-                }
-                Ok(Err(error)) => {
-                    feedback.set_label(&error);
-                    feedback.remove_css_class("success");
-                    feedback.add_css_class("error");
-                    remove.set_sensitive(remove_was_sensitive);
-                }
-                Err(_) => {
-                    l10n::bind_text(&feedback, "The token update stopped unexpectedly.");
-                    feedback.add_css_class("error");
-                    remove.set_sensitive(remove_was_sensitive);
-                }
+    {
+        let (server_id, server_name) = (server.id.clone(), server.name.clone());
+        let (feedback, page, form, editor) =
+            (feedback.clone(), page.clone(), form.clone(), editor.clone());
+        let (epoch, token, token_present) =
+            (auth_epoch.clone(), token.clone(), token_present.clone());
+        save.connect_clicked(move |button| {
+            let value = token.text().to_string();
+            if value.is_empty() || !button.is_sensitive() {
+                return;
             }
+            // Retire the status check from opening.
+            epoch.set(epoch.get().wrapping_add(1));
+            l10n::bind_text(&feedback, "Storing token in the system keychain…");
+            feedback.remove_css_class("error");
+            feedback.remove_css_class("success");
+            let (server_id, server_name, page) =
+                (server_id.clone(), server_name.clone(), page.clone());
+            let (feedback, token, token_present) =
+                (feedback.clone(), token.clone(), token_present.clone());
+            let button_for_focus = button.clone();
+            let submitted = value.clone();
+            let reprobe_id = server_id.clone();
+            auth_write(
+                &form,
+                &editor,
+                &page,
+                button,
+                "The token update stopped unexpectedly.",
+                None,
+                move || crate::registry_controller::set_auth_token(&server_id, &value),
+                {
+                    let page = page.clone();
+                    move |result: &Result<(), String>| {
+                        // A failed write can leave either state behind: unknown.
+                        token_present.set(result.is_ok().then_some(true));
+                        if result.is_ok() {
+                            page.show_confirmation(&crate::i18n::trf(
+                                "Updated authentication for {value0}",
+                                &[("value0", &server_name)],
+                            ));
+                            page.reprobe_after_auth_change(&reprobe_id);
+                        }
+                    }
+                },
+                move |result| match result {
+                    Ok(()) => {
+                        l10n::bind_text(&feedback, "Bearer token stored in the system keychain.");
+                        credential_feedback(&feedback, false);
+                        if token.text() == submitted {
+                            token.set_text("");
+                        }
+                        token.upcast()
+                    }
+                    Err(error) => {
+                        feedback.set_label(&error);
+                        credential_feedback(&feedback, true);
+                        button_for_focus.upcast()
+                    }
+                },
+            );
         });
-    });
+    }
 
-    let server_id = server.id;
-    let server_name = server.name;
-    let feedback_for_remove = feedback;
-    let page_for_remove = page;
-    let sign_in_for_remove = sign_in.clone();
-    remove.connect_clicked(move |button| {
-        if !sign_in_for_remove.is_sensitive() {
+    {
+        let (server_id, server_name) = (server.id.clone(), server.name.clone());
+        let editor = editor.clone();
+        remove.connect_clicked(move |button| {
+            let (server_id, server_name, feedback, page, form) = (
+                server_id.clone(),
+                server_name.clone(),
+                feedback.clone(),
+                page.clone(),
+                form.clone(),
+            );
+            let (editor_for_write, epoch, token, token_present) = (
+                editor.clone(),
+                auth_epoch.clone(),
+                token.clone(),
+                token_present.clone(),
+            );
+            let opener = button.clone();
+            confirm_credential_removal(
+                &editor,
+                button,
+                "Remove this credential?",
+                &[],
+                "The saved credential is deleted from your keychain. You'll need to authenticate this server again before it works.",
+                move || {
+                    if !opener.is_sensitive() {
+                        return;
+                    }
+                    epoch.set(epoch.get().wrapping_add(1));
+                    l10n::bind_text(&feedback, "Removing token from the system keychain…");
+                    feedback.remove_css_class("error");
+                    feedback.remove_css_class("success");
+                    let (server_id, server_name, page) =
+                        (server_id.clone(), server_name.clone(), page.clone());
+                    let (feedback, token, token_present) =
+                        (feedback.clone(), token.clone(), token_present.clone());
+                    let opener_for_focus = opener.clone();
+                    let reprobe_id = server_id.clone();
+                    auth_write(
+                        &form,
+                        &editor_for_write,
+                        &page,
+                        &opener,
+                        "The token removal stopped unexpectedly.",
+                        None,
+                        move || crate::registry_controller::clear_auth_token(&server_id),
+                        {
+                            let page = page.clone();
+                            move |result: &Result<(), String>| {
+                                // A failed removal can leave either state behind: unknown.
+                                token_present.set(result.is_ok().then_some(false));
+                                if result.is_ok() {
+                                    page.show_confirmation(&crate::i18n::trf(
+                                        "Removed authentication for {value0}",
+                                        &[("value0", &server_name)],
+                                    ));
+                                    page.reprobe_after_auth_change(&reprobe_id);
+                                }
+                            }
+                        },
+                        move |result| match result {
+                            Ok(()) => {
+                                l10n::bind_text(
+                                    &feedback,
+                                    "No bearer token is stored for this server.",
+                                );
+                                credential_feedback(&feedback, false);
+                                token.set_text("");
+                                token.upcast()
+                            }
+                            Err(error) => {
+                                feedback.set_label(&error);
+                                credential_feedback(&feedback, true);
+                                opener_for_focus.upcast()
+                            }
+                        },
+                    );
+                },
+            );
+        });
+    }
+    editor.present();
+}
+
+/// One write in the Authentication dialog. `settled` runs whenever the write
+/// ends, even after the dialog closed, before the buttons recheck; `shown`
+/// updates the open dialog and returns where keyboard focus goes. Once the
+/// dialog has closed, a failure, and `closed_success` when given, go to the page.
+#[allow(clippy::too_many_arguments)]
+fn auth_write<T: Send + 'static>(
+    form: &CredentialForm,
+    editor: &adw::Window,
+    page: &ServerPage,
+    button: &gtk::Button,
+    stopped: &'static str,
+    closed_success: Option<String>,
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+    settled: impl FnOnce(&Result<T, String>) + 'static,
+    shown: impl FnOnce(Result<T, String>) -> gtk::Widget + 'static,
+) {
+    if !form.begin() {
+        return;
+    }
+    let (form, editor, page, button) = (form.clone(), editor.clone(), page.clone(), button.clone());
+    gtk::glib::spawn_future_local(async move {
+        let result = gtk::gio::spawn_blocking(work)
+            .await
+            .unwrap_or_else(|_| Err(crate::i18n::lookup(stopped)));
+        settled(&result);
+        if !form.finish() {
+            match (&result, closed_success) {
+                (Err(error), _) => page.show_feedback(error, true),
+                (Ok(_), Some(message)) => page.show_confirmation(&message),
+                (Ok(_), None) => {}
+            }
             return;
         }
-        button.set_sensitive(false);
-        l10n::bind_text(
-            &feedback_for_remove,
-            "Removing token from the system keychain…",
-        );
-        feedback_for_remove.remove_css_class("error");
-        let server_id = server_id.clone();
-        let reprobe_id = server_id.clone();
-        let server_name = server_name.clone();
-        let feedback = feedback_for_remove.clone();
-        let page = page_for_remove.clone();
-        let button = button.clone();
-        gtk::glib::spawn_future_local(async move {
-            let result = gtk::gio::spawn_blocking(move || {
-                crate::registry_controller::clear_auth_token(&server_id)
-            })
-            .await;
-            match result {
-                Ok(Ok(())) => {
-                    l10n::bind_text(&feedback, "No bearer token is stored for this server.");
-                    feedback.remove_css_class("error");
-                    feedback.add_css_class("success");
-                    page.show_confirmation(&crate::i18n::trf(
-                        "Removed authentication for {value0}",
-                        &[("value0", &server_name.to_string())],
-                    ));
-                    page.reprobe_after_auth_change(&reprobe_id);
-                }
-                Ok(Err(error)) => {
-                    button.set_sensitive(true);
-                    feedback.set_label(&error);
-                    feedback.remove_css_class("success");
-                    feedback.add_css_class("error");
-                }
-                Err(_) => {
-                    button.set_sensitive(true);
-                    l10n::bind_text(&feedback, "The token removal stopped unexpectedly.");
-                    feedback.add_css_class("error");
-                }
-            }
-        });
+        let target = shown(result);
+        credential_focus(&editor, button.upcast_ref(), &target);
     });
-    editor.present();
+}
+
+/// The vendor a key belongs to, as React names it in its removal question:
+/// `GITHUB_TOKEN` is "Github", `OPENAI_API_KEY` is "Openai".
+fn vendor_from_key(key: &str) -> String {
+    let upper = key.to_ascii_uppercase();
+    let stem = ["_API_KEY", "_KEY", "_TOKEN", "_SECRET"]
+        .iter()
+        .find(|suffix| upper.ends_with(*suffix))
+        .map_or(key, |suffix| &key[..key.len() - suffix.len()]);
+    let head = stem.split('_').next().unwrap_or_default();
+    let mut chars = head.chars();
+    match chars.next() {
+        None => crate::i18n::tr("This server"),
+        Some(first) => first
+            .to_uppercase()
+            .chain(chars.flat_map(char::to_lowercase))
+            .collect(),
+    }
+}
+
+/// Enter in `field` presses `button` when it can run, as React saves on Enter.
+fn press_on_enter(field: &gtk::PasswordEntry, button: &gtk::Button) {
+    let button = button.downgrade();
+    field.connect_activate(move |_| {
+        if let Some(button) = button.upgrade().filter(|button| button.is_sensitive()) {
+            button.emit_clicked();
+        }
+    });
+}
+
+/// Show a result label as success or error.
+fn credential_feedback(label: &gtk::Label, error: bool) {
+    label.set_visible(true);
+    reveal(label);
+    if error {
+        label.remove_css_class("success");
+        label.add_css_class("error");
+    } else {
+        label.remove_css_class("error");
+        label.add_css_class("success");
+    }
 }
 
 fn test_server_connection(server: &state::ServerView, button: &gtk::Button, page: ServerPage) {
@@ -11843,14 +12282,6 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
     content.add_css_class("toolport-editor-body");
     let intro = editor_intro("dialog-password-symbolic", crate::i18n::msg("Server credentials"), crate::i18n::msg("Paste a key into the system keychain or save a password manager reference. Only references sync."));
     content.append(&intro);
-    let feedback = gtk::Label::builder()
-        .halign(gtk::Align::Fill)
-        .xalign(0.0)
-        .wrap(true)
-        .visible(false)
-        .css_classes(["toolport-feedback", "error"])
-        .build();
-    content.append(&feedback);
 
     let stored = gtk::Box::new(gtk::Orientation::Vertical, 10);
     stored.add_css_class("toolport-form-section");
@@ -11858,225 +12289,57 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
         crate::i18n::msg("Stored credentials"),
         crate::i18n::msg("Enter a new value only when you want to replace one."),
     ));
+    let empty = l10n::label("No credential keys are declared for this server.");
+    empty.set_halign(gtk::Align::Fill);
+    empty.set_xalign(0.0);
+    empty.set_wrap(true);
+    empty.add_css_class("toolport-muted");
+    stored.append(&empty);
+    // Results show next to Done, outside the scrolled form, so a message never
+    // moves the fields under the pointer and stays visible at any scroll position.
+    let status = gtk::Label::builder()
+        .halign(gtk::Align::Fill)
+        .xalign(0.0)
+        .wrap(true)
+        .visible(false)
+        .css_classes(["toolport-feedback"])
+        .build();
+    status.set_widget_name("credential-status");
+    let new_key = gtk::Entry::builder()
+        .placeholder_text("VARIABLE_NAME")
+        .css_classes(["toolport-input"])
+        .build();
+    new_key.set_widget_name("credential-new-key");
+    let ui = CredentialsUi {
+        server_id: server.id.clone(),
+        page: page.clone(),
+        form: CredentialForm::new(&editor),
+        editor: editor.clone(),
+        status: status.clone(),
+        stored: stored.clone(),
+        empty,
+        new_key: new_key.clone(),
+        rows: Default::default(),
+        launch_rows: Default::default(),
+    };
+    for key in &server.secret_keys {
+        ui.append_row(
+            key,
+            None,
+            server.secret_references.get(key).map(String::as_str),
+        );
+    }
     // Secret command arguments are vaulted like keys but are not environment
     // variables, so they save through the launch-input path.
-    let launch_secrets: Vec<(String, String)> = server
-        .launch
-        .iter()
-        .flat_map(|launch| {
-            launch
-                .inputs
-                .iter()
-                .filter(|input| input.secret)
-                .map(|input| {
-                    (
-                        input.key.clone(),
-                        crate::launch_inputs::input_display_name(&server.args, launch, &input.key),
-                    )
-                })
-        })
-        .collect();
-    if server.secret_keys.is_empty() && launch_secrets.is_empty() {
-        stored.append(&{
-            let widget = gtk::Label::builder()
-                .label(crate::i18n::tr(
-                    "No credential keys are declared for this server.",
-                ))
-                .halign(gtk::Align::Fill)
-                .xalign(0.0)
-                .wrap(true)
-                .css_classes(["toolport-muted"])
-                .build();
-            l10n::bind_label(&widget, "No credential keys are declared for this server.");
-            widget
-        });
-    }
-    for key in &server.secret_keys {
-        let row = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        row.add_css_class("toolport-credential-row");
-        let key_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        key_row.append(
-            &gtk::Label::builder()
-                .label(key)
-                .halign(gtk::Align::Start)
-                .hexpand(true)
-                .css_classes(["heading"])
-                .build(),
-        );
-        let remove = gtk::Button::builder()
-            .icon_name("user-trash-symbolic")
-            .tooltip_text(crate::i18n::trf(
-                "Remove {value0}",
-                &[("value0", &key.to_string())],
-            ))
-            .css_classes(["flat", "toolport-destructive-icon"])
-            .build();
-        key_row.append(&remove);
-        row.append(&key_row);
-        let replace_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let value = {
-            let widget = gtk::PasswordEntry::builder()
-                .placeholder_text("Enter a replacement value")
-                .show_peek_icon(true)
-                .hexpand(true)
-                .css_classes(["toolport-input"])
-                .build();
-            l10n::bind_placeholder(&widget, "Enter a replacement value");
-            widget
-        };
-        replace_row.append(&value);
-        let replace = l10n::button("Replace");
-        replace.add_css_class("toolport-secondary-action");
-        replace_row.append(&replace);
-        let (source_choice, reference_box) = secret_reference_controls(
-            &server.id,
-            key,
-            server.secret_references.get(key).map(String::as_str),
-            &page,
-            &editor,
-            &feedback,
-        );
-        replace_row.set_visible(source_choice.selected() == 0);
-        let paste_row = replace_row.clone();
-        source_choice
-            .connect_selected_notify(move |choice| paste_row.set_visible(choice.selected() == 0));
-        row.append(&source_choice);
-        row.append(&replace_row);
-        row.append(&reference_box);
-        stored.append(&row);
-
-        let server_id = server.id.clone();
-        let key_for_replace = key.clone();
-        let feedback_for_replace = feedback.clone();
-        let page_for_replace = page.clone();
-        let editor_for_replace = editor.clone();
-        replace.connect_clicked(move |button| {
-            let secret = value.text().to_string();
-            if secret.is_empty() {
-                l10n::bind_text(&feedback_for_replace, "Enter a replacement value first.");
-                feedback_for_replace.set_visible(true);
-                return;
-            }
-            button.set_sensitive(false);
-            let server_id = server_id.clone();
-            let reprobe_id = server_id.clone();
-            let key = key_for_replace.clone();
-            let page = page_for_replace.clone();
-            let editor = editor_for_replace.clone();
-            let feedback = feedback_for_replace.clone();
-            let button = button.clone();
-            gtk::glib::spawn_future_local(async move {
-                let result = gtk::gio::spawn_blocking(move || {
-                    crate::registry_controller::set_server_secret(&server_id, &key, &secret)
-                })
-                .await;
-                finish_credential_update(
-                    result,
-                    &reprobe_id,
-                    &page,
-                    &editor,
-                    &feedback,
-                    &button,
-                    "Updated",
-                );
-            });
-        });
-
-        let server_id = server.id.clone();
-        let key_for_remove = key.clone();
-        let feedback_for_remove = feedback.clone();
-        let page_for_remove = page.clone();
-        let editor_for_remove = editor.clone();
-        remove.connect_clicked(move |button| {
-            confirm_remove_credential(
-                &server_id,
-                &key_for_remove,
-                page_for_remove.clone(),
-                editor_for_remove.clone(),
-                feedback_for_remove.clone(),
-                button.clone(),
+    if let Some(launch) = &server.launch {
+        for input in launch.inputs.iter().filter(|input| input.secret) {
+            let name = crate::launch_inputs::input_display_name(&server.args, launch, &input.key);
+            ui.append_row(
+                &input.key,
+                Some(&name),
+                server.secret_references.get(&input.key).map(String::as_str),
             );
-        });
-    }
-    for (key, name) in &launch_secrets {
-        let row = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        row.add_css_class("toolport-credential-row");
-        row.append(
-            &gtk::Label::builder()
-                .label(name)
-                .halign(gtk::Align::Start)
-                .wrap(true)
-                .css_classes(["heading"])
-                .build(),
-        );
-        let save_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let value = {
-            let widget = gtk::PasswordEntry::builder()
-                .placeholder_text("Enter the value for this machine")
-                .show_peek_icon(true)
-                .hexpand(true)
-                .css_classes(["toolport-input"])
-                .build();
-            l10n::bind_placeholder(&widget, "Enter the value for this machine");
-            widget
-        };
-        save_row.append(&value);
-        let save = l10n::button("Save");
-        save.add_css_class("toolport-secondary-action");
-        save_row.append(&save);
-        let (source_choice, reference_box) = secret_reference_controls(
-            &server.id,
-            key,
-            server.secret_references.get(key).map(String::as_str),
-            &page,
-            &editor,
-            &feedback,
-        );
-        save_row.set_visible(source_choice.selected() == 0);
-        let paste_row = save_row.clone();
-        source_choice
-            .connect_selected_notify(move |choice| paste_row.set_visible(choice.selected() == 0));
-        row.append(&source_choice);
-        row.append(&save_row);
-        row.append(&reference_box);
-        stored.append(&row);
-
-        let server_id = server.id.clone();
-        let key = key.clone();
-        let feedback = feedback.clone();
-        let page = page.clone();
-        let editor = editor.clone();
-        save.connect_clicked(move |button| {
-            let secret = value.text().to_string();
-            if secret.is_empty() {
-                l10n::bind_text(&feedback, "Enter a value first.");
-                feedback.set_visible(true);
-                return;
-            }
-            button.set_sensitive(false);
-            let server_id = server_id.clone();
-            let reprobe_id = server_id.clone();
-            let key = key.clone();
-            let page = page.clone();
-            let editor = editor.clone();
-            let feedback = feedback.clone();
-            let button = button.clone();
-            gtk::glib::spawn_future_local(async move {
-                let result = gtk::gio::spawn_blocking(move || {
-                    crate::registry_controller::set_launch_secret(&server_id, &key, &secret)
-                })
-                .await;
-                finish_credential_update(
-                    result,
-                    &reprobe_id,
-                    &page,
-                    &editor,
-                    &feedback,
-                    &button,
-                    "Updated",
-                );
-            });
-        });
+        }
     }
     content.append(&stored);
 
@@ -12087,10 +12350,6 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
         crate::i18n::msg("Use the environment variable name expected by this server."),
     ));
     let add_row = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    let new_key = gtk::Entry::builder()
-        .placeholder_text("VARIABLE_NAME")
-        .css_classes(["toolport-input"])
-        .build();
     let new_value = {
         let widget = gtk::PasswordEntry::builder()
             .placeholder_text("Secret value")
@@ -12101,17 +12360,13 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
         l10n::bind_placeholder(&widget, "Secret value");
         widget
     };
+    new_value.set_widget_name("credential-new-value");
     let add = l10n::button("Store");
+    add.set_widget_name("credential-store");
     add.add_css_class("suggested-action");
     add_row.append(&new_key);
-    let (source_choice, reference_box) = secret_reference_controls_dynamic(
-        &server.id,
-        new_key.clone(),
-        None,
-        &page,
-        &editor,
-        &feedback,
-    );
+    let (source_choice, reference_box) =
+        secret_reference_controls_dynamic(&ui, new_key.clone(), None, true);
     add_row.append(&source_choice);
     let value_for_source = new_value.clone();
     let add_for_source = add.clone();
@@ -12128,43 +12383,51 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
     add_section.append(&add_row);
     content.append(&add_section);
 
-    let server_id = server.id.clone();
-    let feedback_for_add = feedback.clone();
-    let page_for_add = page.clone();
-    let editor_for_add = editor.clone();
-    add.connect_clicked(move |button| {
-        let key = new_key.text().to_string();
-        let secret = new_value.text().to_string();
-        if key.trim().is_empty() || secret.is_empty() {
-            l10n::bind_text(
-                &feedback_for_add,
+    {
+        let key = new_key.downgrade();
+        let value = new_value.downgrade();
+        ui.form.watch(&add, move || {
+            let filled = key
+                .upgrade()
+                .is_some_and(|key| !key.text().trim().is_empty())
+                && value
+                    .upgrade()
+                    .is_some_and(|value| !value.text().is_empty());
+            filled.then_some(()).ok_or(Some(crate::i18n::msg(
                 "Enter both a variable name and a secret value.",
-            );
-            feedback_for_add.set_visible(true);
+            )))
+        });
+    }
+    ui.refresh_on_edit(&new_key);
+    ui.refresh_on_edit(&new_value);
+    press_on_enter(&new_value, &add);
+    let ui_for_add = ui.clone();
+    add.connect_clicked(move |button| {
+        let ui = ui_for_add.clone();
+        let key = ui.new_key.text().trim().to_string();
+        let secret = new_value.text().to_string();
+        if key.is_empty() || secret.is_empty() {
             return;
         }
-        button.set_sensitive(false);
-        let server_id = server_id.clone();
-        let reprobe_id = server_id.clone();
-        let page = page_for_add.clone();
-        let editor = editor_for_add.clone();
-        let feedback = feedback_for_add.clone();
-        let button = button.clone();
-        gtk::glib::spawn_future_local(async move {
-            let result = gtk::gio::spawn_blocking(move || {
-                crate::registry_controller::set_server_secret(&server_id, &key, &secret)
-            })
-            .await;
-            finish_credential_update(
-                result,
-                &reprobe_id,
-                &page,
-                &editor,
-                &feedback,
-                &button,
-                "Stored",
-            );
-        });
+        let id = ui.server_id.clone();
+        let (name, submitted) = (key.clone(), secret.clone());
+        let value = new_value.clone();
+        let after = ui.clone();
+        ui.write(
+            button,
+            crate::i18n::trf("Saved {value1}", &[("value1", &key)]),
+            move || crate::registry_controller::set_server_secret(&id, &key, &secret),
+            move |server| {
+                after.sync_rows(server, Some(&name));
+                if after.new_key.text().trim() == name {
+                    after.new_key.set_text("");
+                }
+                if value.text() == submitted {
+                    value.set_text("");
+                }
+                after.new_key.clone().upcast()
+            },
+        );
     });
 
     let clamp = adw::Clamp::builder()
@@ -12174,7 +12437,18 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
         .build();
     scroller.set_child(Some(&clamp));
     root.append(&scroller);
-    root.append(&dialog_footer(&[&done]));
+    let footer = dialog_footer(&[&done]);
+    status.set_hexpand(true);
+    if let Some(spacer) = footer.first_child() {
+        // The message takes the spacer's place, so Done stays at the end.
+        status
+            .bind_property("visible", &spacer, "visible")
+            .invert_boolean()
+            .sync_create()
+            .build();
+    }
+    footer.prepend(&status);
+    root.append(&footer);
     close_on_escape(&editor);
     editor.set_content(Some(&root));
     let editor_for_done = editor.clone();
@@ -12182,27 +12456,174 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
     editor.present();
 }
 
-fn confirm_remove_credential(
-    server_id: &str,
-    key: &str,
-    page: ServerPage,
-    editor: adw::Window,
-    feedback: gtk::Label,
-    button: gtk::Button,
+/// One credential write at a time in a dialog, and nothing touches the dialog
+/// after it closes. The backend's own locks stay authoritative.
+#[derive(Clone)]
+struct CredentialForm {
+    busy: std::rc::Rc<std::cell::Cell<bool>>,
+    closed: std::rc::Rc<std::cell::Cell<bool>>,
+    watchers: std::rc::Rc<std::cell::RefCell<Vec<CredentialWatcher>>>,
+}
+
+type CredentialWatcher = Box<dyn Fn()>;
+
+/// Whether an action can run now; `Err` carries the tooltip that says why not.
+type CredentialReady = Result<(), Option<&'static str>>;
+
+impl CredentialForm {
+    fn new(editor: &adw::Window) -> Self {
+        let form = Self {
+            busy: Default::default(),
+            closed: Default::default(),
+            watchers: Default::default(),
+        };
+        let closed = form.closed.clone();
+        editor.connect_close_request(move |_| {
+            closed.set(true);
+            gtk::glib::Propagation::Proceed
+        });
+        form
+    }
+
+    /// Keep `button` on only while nothing is in flight and `ready` allows it.
+    fn watch(&self, button: &gtk::Button, ready: impl Fn() -> CredentialReady + 'static) {
+        let weak = button.downgrade();
+        let busy = self.busy.clone();
+        let closed = self.closed.clone();
+        let explained = std::cell::Cell::new(false);
+        let apply = move || {
+            let Some(button) = weak.upgrade() else {
+                return;
+            };
+            let ready = ready();
+            button.set_sensitive(ready.is_ok() && !busy.get() && !closed.get());
+            match ready {
+                Err(Some(reason)) => {
+                    button.set_tooltip_text(Some(&crate::i18n::lookup(reason)));
+                    explained.set(true);
+                }
+                _ if explained.replace(false) => button.set_tooltip_text(None),
+                _ => {}
+            }
+        };
+        apply();
+        self.watchers.borrow_mut().push(Box::new(apply));
+    }
+
+    /// Run `apply` now and whenever the actions are rechecked.
+    fn also(&self, apply: impl Fn() + 'static) {
+        apply();
+        self.watchers.borrow_mut().push(Box::new(apply));
+    }
+
+    fn refresh(&self) {
+        for apply in self.watchers.borrow().iter() {
+            apply();
+        }
+    }
+
+    /// Start a write: false while another one runs or once the dialog closed.
+    fn begin(&self) -> bool {
+        if self.closed.get() || self.busy.replace(true) {
+            return false;
+        }
+        self.refresh();
+        true
+    }
+
+    /// End a write: false when the dialog closed meanwhile.
+    fn finish(&self) -> bool {
+        self.busy.set(false);
+        if self.closed.get() {
+            return false;
+        }
+        self.refresh();
+        true
+    }
+}
+
+/// After a write, give keyboard focus to `target` unless the user already put
+/// it somewhere else in the dialog.
+fn credential_focus(editor: &adw::Window, started: &gtk::Widget, target: &impl IsA<gtk::Widget>) {
+    if !editor.is_visible() {
+        return;
+    }
+    let lost = match gtk::prelude::GtkWindowExt::focus(editor) {
+        None => true,
+        Some(now) => &now == started || !now.is_ancestor(editor) || !now.is_sensitive(),
+    };
+    if lost {
+        target.grab_focus();
+        reveal(target);
+    }
+}
+
+/// Scroll `widget` into view after a focus move has scrolled to the field,
+/// so a result below the field it focused is still read.
+fn reveal_after_focus(widget: &impl IsA<gtk::Widget>) {
+    // The focus scroll lands in the next frame's layout; reveal after it.
+    widget.add_tick_callback(|widget, _| {
+        reveal(widget);
+        gtk::glib::ControlFlow::Break
+    });
+}
+
+/// Scroll `widget` into view once its dialog has laid out new content.
+fn reveal(widget: &impl IsA<gtk::Widget>) {
+    let widget = widget.clone().upcast::<gtk::Widget>();
+    let Some(scroller) = widget
+        .ancestor(gtk::ScrolledWindow::static_type())
+        .and_downcast::<gtk::ScrolledWindow>()
+    else {
+        return;
+    };
+    let Some(clock) = scroller.frame_clock() else {
+        return;
+    };
+    // Measure after the next frame is painted: by then a label that was just
+    // shown, or a focus scroll that was just asked for, has been laid out.
+    let handler = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let pending = handler.clone();
+    let id = clock.connect_after_paint(move |clock| {
+        if let Some(id) = pending.borrow_mut().take() {
+            clock.disconnect(id);
+        }
+        let content = scroller.child().and_then(|viewport| viewport.first_child());
+        if let Some(bounds) = content.and_then(|content| widget.compute_bounds(&content)) {
+            let adjustment = scroller.vadjustment();
+            let (top, bottom) = (
+                f64::from(bounds.y()),
+                f64::from(bounds.y() + bounds.height()),
+            );
+            if top < adjustment.value() {
+                adjustment.set_value(top);
+            } else if bottom > adjustment.value() + adjustment.page_size() {
+                adjustment.set_value(bottom - adjustment.page_size());
+            }
+        }
+    });
+    *handler.borrow_mut() = Some(id);
+    clock.request_phase(gtk::gdk::FrameClockPhase::LAYOUT);
+}
+
+/// Ask before deleting a stored credential. Cancel makes no call and puts focus
+/// back on the button that asked.
+fn confirm_credential_removal(
+    editor: &adw::Window,
+    opener: &gtk::Button,
+    heading: &'static str,
+    values: &[(&str, &str)],
+    body: &'static str,
+    remove: impl Fn() + 'static,
 ) {
     #[allow(deprecated)]
     let dialog = adw::MessageDialog::new(
-        Some(&editor),
-        Some(&crate::i18n::trf("Remove {value0}?", &[("value0", key)])),
-        Some(&crate::i18n::tr(
-            "The stored value will be removed from the system keychain.",
-        )),
+        Some(editor),
+        Some(&crate::i18n::format_message(heading, values)),
+        Some(&crate::i18n::lookup(body)),
     );
-    l10n::bind_formatted_dialog_heading(&dialog, "Remove {value0}?", &[("value0", key)]);
-    l10n::bind_dialog_body(
-        &dialog,
-        "The stored value will be removed from the system keychain.",
-    );
+    l10n::bind_formatted_dialog_heading(&dialog, heading, values);
+    l10n::bind_dialog_body(&dialog, body);
     dialog.add_response("cancel", &crate::i18n::tr("Cancel"));
     l10n::bind_dialog_response(&dialog, "cancel", "Cancel");
     dialog.add_response("remove", &crate::i18n::tr("Remove"));
@@ -12210,41 +12631,354 @@ fn confirm_remove_credential(
     dialog.set_close_response("cancel");
     dialog.set_default_response(Some("cancel"));
     dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
-    let server_id = server_id.to_string();
-    let key = key.to_string();
+    let opener = opener.clone();
     dialog.connect_response(None, move |dialog, response| {
-        if response != "remove" {
-            dialog.close();
-            return;
-        }
-        button.set_sensitive(false);
-        let server_id = server_id.clone();
-        let reprobe_id = server_id.clone();
-        let key = key.clone();
-        let page = page.clone();
-        let editor = editor.clone();
-        let feedback = feedback.clone();
-        let button = button.clone();
-        gtk::glib::spawn_future_local(async move {
-            let result = gtk::gio::spawn_blocking(move || {
-                crate::registry_controller::delete_server_secret(&server_id, &key)
-            })
-            .await;
-            finish_credential_update(
-                result,
-                &reprobe_id,
-                &page,
-                &editor,
-                &feedback,
-                &button,
-                "Removed",
-            );
-        });
         dialog.close();
+        if response == "remove" {
+            remove();
+        } else {
+            opener.grab_focus();
+        }
     });
     dialog.present();
 }
 
+/// Environment secret rows by key, with the control that takes focus.
+type CredentialRows = std::rc::Rc<std::cell::RefCell<Vec<(String, gtk::Box, gtk::Widget)>>>;
+
+/// The open Credentials dialog. It stays open after a save or removal and shows
+/// the result in place.
+#[derive(Clone)]
+struct CredentialsUi {
+    server_id: String,
+    page: ServerPage,
+    editor: adw::Window,
+    form: CredentialForm,
+    status: gtk::Label,
+    stored: gtk::Box,
+    empty: gtk::Label,
+    new_key: gtk::Entry,
+    rows: CredentialRows,
+    /// Secret command argument rows by key; they save through their own path.
+    launch_rows: std::rc::Rc<std::cell::RefCell<Vec<(String, gtk::Box)>>>,
+}
+
+impl CredentialsUi {
+    fn show(&self, message: &str, error: bool) {
+        self.status.set_label(message);
+        credential_feedback(&self.status, error);
+    }
+
+    /// Editing a field retires an old error and rechecks which actions can run.
+    fn refresh_on_edit(&self, field: &impl IsA<gtk::Editable>) {
+        let status = self.status.downgrade();
+        let form = self.form.clone();
+        field.connect_changed(move |_| {
+            if let Some(status) = status.upgrade().filter(|s| s.has_css_class("error")) {
+                status.set_visible(false);
+            }
+            form.refresh();
+        });
+    }
+
+    /// Run one write. On success `done` brings the dialog up to date with the
+    /// saved server and returns where keyboard focus goes.
+    fn write(
+        &self,
+        button: &gtk::Button,
+        success: String,
+        work: impl FnOnce() -> Result<crate::registry::Registry, String> + Send + 'static,
+        done: impl FnOnce(&state::ServerView) -> gtk::Widget + 'static,
+    ) {
+        if !self.form.begin() {
+            return;
+        }
+        let ui = self.clone();
+        let button = button.clone();
+        gtk::glib::spawn_future_local(async move {
+            let result = gtk::gio::spawn_blocking(work).await;
+            let result = finish_credential_update(result, &ui.server_id, &ui.page);
+            if !ui.form.finish() {
+                // Closed meanwhile: the page reports what happened.
+                match &result {
+                    Ok(_) => ui.page.show_confirmation(&success),
+                    Err(error) => ui.page.show_feedback(error, true),
+                }
+                return;
+            }
+            let target = match result.map(|registry| {
+                state::RegistrySnapshot::from_registry(registry)
+                    .servers
+                    .into_iter()
+                    .find(|server| server.id == ui.server_id)
+            }) {
+                Ok(Some(server)) => {
+                    let target = done(&server);
+                    ui.form.refresh();
+                    ui.show(&success, false);
+                    target
+                }
+                Ok(None) => {
+                    ui.editor.close();
+                    return;
+                }
+                Err(error) => {
+                    ui.show(&error, true);
+                    button.clone().upcast()
+                }
+            };
+            credential_focus(&ui.editor, button.upcast_ref(), &target);
+        });
+    }
+
+    /// Add rows for keys the server gained and drop the ones it lost. `written`
+    /// names a key just saved from Add, whose row is rebuilt to show it.
+    fn sync_rows(&self, server: &state::ServerView, written: Option<&str>) {
+        // A reference saved from Add for a secret command argument updates its row.
+        if let (Some(written), Some(launch)) = (written, &server.launch) {
+            let old = {
+                let rows = self.launch_rows.borrow();
+                rows.iter()
+                    .position(|(key, _)| key == written)
+                    .map(|index| (index, rows[index].1.clone()))
+            };
+            if let Some((index, old)) = old {
+                let before = old.prev_sibling();
+                self.stored.remove(&old);
+                self.launch_rows.borrow_mut().remove(index);
+                let name = crate::launch_inputs::input_display_name(&server.args, launch, written);
+                self.append_row(
+                    written,
+                    Some(&name),
+                    server.secret_references.get(written).map(String::as_str),
+                );
+                let mut rows = self.launch_rows.borrow_mut();
+                if let Some(entry) = rows.pop() {
+                    self.stored.reorder_child_after(&entry.1, before.as_ref());
+                    rows.insert(index, entry);
+                }
+            }
+        }
+        // The written key's row comes back at the same place.
+        let rebuilt = written.and_then(|written| {
+            let rows = self.rows.borrow();
+            let index = rows.iter().position(|(key, _, _)| key == written)?;
+            Some((index, rows[index].1.prev_sibling()))
+        });
+        let gone: Vec<gtk::Box> = {
+            let mut rows = self.rows.borrow_mut();
+            let (keep, gone): (Vec<_>, Vec<_>) = rows.drain(..).partition(|(key, _, _)| {
+                server.secret_keys.contains(key) && Some(key.as_str()) != written
+            });
+            *rows = keep;
+            gone.into_iter().map(|(_, row, _)| row).collect()
+        };
+        for row in gone {
+            self.stored.remove(&row);
+        }
+        if let (Some(written), Some((index, before))) = (written, rebuilt) {
+            if server.secret_keys.iter().any(|key| key == written) {
+                self.append_row(
+                    written,
+                    None,
+                    server.secret_references.get(written).map(String::as_str),
+                );
+                let mut rows = self.rows.borrow_mut();
+                if let Some(entry) = rows.pop() {
+                    self.stored.reorder_child_after(&entry.1, before.as_ref());
+                    let at = index.min(rows.len());
+                    rows.insert(at, entry);
+                }
+            }
+        }
+        for key in &server.secret_keys {
+            if !self.rows.borrow().iter().any(|(known, _, _)| known == key) {
+                self.append_row(
+                    key,
+                    None,
+                    server.secret_references.get(key).map(String::as_str),
+                );
+            }
+        }
+        self.empty
+            .set_visible(self.stored.observe_children().n_items() <= 2);
+    }
+
+    /// One stored credential: an environment secret, or a secret command
+    /// argument when `launch` names it.
+    fn append_row(&self, key: &str, launch: Option<&str>, reference: Option<&str>) {
+        self.empty.set_visible(false);
+        let row = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        row.add_css_class("toolport-credential-row");
+        row.set_widget_name(&format!("credential:{key}"));
+        let key_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        key_row.append(
+            &gtk::Label::builder()
+                .label(launch.unwrap_or(key))
+                .halign(gtk::Align::Start)
+                .hexpand(true)
+                .wrap(true)
+                .css_classes(["heading"])
+                .build(),
+        );
+        row.append(&key_row);
+        let paste_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let (placeholder, action, empty_reason) = if launch.is_some() {
+            (
+                crate::i18n::msg("Enter the value for this machine"),
+                crate::i18n::msg("Save"),
+                crate::i18n::msg("Enter a value first."),
+            )
+        } else {
+            (
+                crate::i18n::msg("Enter a replacement value"),
+                crate::i18n::msg("Replace"),
+                crate::i18n::msg("Enter a replacement value first."),
+            )
+        };
+        let value = gtk::PasswordEntry::builder()
+            .placeholder_text(crate::i18n::lookup(placeholder))
+            .show_peek_icon(true)
+            .hexpand(true)
+            .css_classes(["toolport-input"])
+            .build();
+        l10n::bind_placeholder(&value, placeholder);
+        value.set_widget_name(&format!("credential-value:{key}"));
+        paste_row.append(&value);
+        let save = l10n::button(action);
+        save.set_widget_name(&format!("credential-save:{key}"));
+        save.add_css_class("toolport-secondary-action");
+        paste_row.append(&save);
+        let key_field = gtk::Entry::builder().text(key).build();
+        let (source_choice, reference_box) =
+            secret_reference_controls_dynamic(self, key_field, reference, false);
+        source_choice.set_widget_name(&format!("credential-source:{key}"));
+        paste_row.set_visible(source_choice.selected() == 0);
+        let paste = paste_row.clone();
+        source_choice
+            .connect_selected_notify(move |choice| paste.set_visible(choice.selected() == 0));
+        row.append(&source_choice);
+        row.append(&paste_row);
+        row.append(&reference_box);
+        self.stored.append(&row);
+
+        let field = value.downgrade();
+        self.form.watch(&save, move || {
+            field
+                .upgrade()
+                .is_some_and(|field| !field.text().is_empty())
+                .then_some(())
+                .ok_or(Some(empty_reason))
+        });
+        self.refresh_on_edit(&value);
+        press_on_enter(&value, &save);
+        let ui = self.clone();
+        let launch_name = launch.map(str::to_string);
+        let key_for_save = key.to_string();
+        let field = value.clone();
+        save.connect_clicked(move |button| {
+            let secret = field.text().to_string();
+            if secret.is_empty() {
+                return;
+            }
+            let id = ui.server_id.clone();
+            let key = key_for_save.clone();
+            let launch = launch_name.is_some();
+            let message = match &launch_name {
+                Some(name) => crate::i18n::trf("Saved {input}", &[("input", name)]),
+                None => crate::i18n::trf("Saved {value1}", &[("value1", &key)]),
+            };
+            let value = field.clone();
+            let submitted = secret.clone();
+            ui.write(
+                button,
+                message,
+                move || {
+                    if launch {
+                        crate::registry_controller::set_launch_secret(&id, &key, &secret)
+                    } else {
+                        crate::registry_controller::set_server_secret(&id, &key, &secret)
+                    }
+                },
+                move |_| {
+                    if value.text() == submitted {
+                        value.set_text("");
+                    }
+                    value.upcast()
+                },
+            );
+        });
+        // Secret command arguments keep their dedicated save path; they have no
+        // remove action.
+        if launch.is_some() {
+            self.launch_rows.borrow_mut().push((key.to_string(), row));
+            return;
+        }
+        let remove = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text(crate::i18n::trf("Remove {value0}", &[("value0", key)]))
+            .css_classes(["flat", "toolport-destructive-icon"])
+            .build();
+        remove.set_widget_name(&format!("credential-remove:{key}"));
+        key_row.append(&remove);
+        self.form.watch(&remove, || Ok(()));
+        self.rows
+            .borrow_mut()
+            .push((key.to_string(), row, source_choice.upcast()));
+        let ui = self.clone();
+        let key = key.to_string();
+        remove.connect_clicked(move |button| {
+            let confirmed = ui.clone();
+            let opener = button.clone();
+            let removing = key.clone();
+            let vendor = vendor_from_key(&key);
+            confirm_credential_removal(
+                &ui.editor,
+                button,
+                "Remove the {value1} API key?",
+                &[("value1", &vendor)],
+                "The saved key is deleted from your keychain. You'll need to paste it again before this server works.",
+                move || {
+                    let ui = confirmed.clone();
+                    let id = ui.server_id.clone();
+                    let removed = removing.clone();
+                    let after = ui.clone();
+                    ui.write(
+                        &opener,
+                        crate::i18n::trf("Removed {value1}", &[("value1", &removing)]),
+                        move || crate::registry_controller::delete_server_secret(&id, &removed),
+                        {
+                            let key = removing.clone();
+                            move |server| {
+                                let index = after
+                                    .rows
+                                    .borrow()
+                                    .iter()
+                                    .position(|(known, _, _)| *known == key);
+                                after.sync_rows(server, None);
+                                // The next credential, else the one before, else
+                                // the new variable name.
+                                let rows = after.rows.borrow();
+                                let target = index
+                                    .and_then(|index| {
+                                        rows.get(index).or_else(|| {
+                                            index.checked_sub(1).and_then(|i| rows.get(i))
+                                        })
+                                    })
+                                    .map(|(_, _, focus)| focus.clone())
+                                    .unwrap_or_else(|| after.new_key.clone().upcast());
+                                target
+                            }
+                        },
+                    );
+                },
+            );
+        });
+    }
+}
+
+/// Refresh the server list after a credential write. Returns the saved registry,
+/// or the message the dialog shows.
 fn finish_credential_update(
     result: Result<
         Result<crate::registry::Registry, String>,
@@ -12252,45 +12986,587 @@ fn finish_credential_update(
     >,
     server_id: &str,
     page: &ServerPage,
-    editor: &adw::Window,
-    feedback: &gtk::Label,
-    button: &gtk::Button,
-    action: &str,
-) {
+) -> Result<crate::registry::Registry, String> {
     match result {
         Ok(Ok(registry)) => {
             // Secret values live in the keychain, outside the fingerprint the
             // health cache compares, so the new value needs its own probe.
             page.health.borrow_mut().invalidate(server_id);
             page.render(state::RegistryState::Ready(
-                state::RegistrySnapshot::from_registry(registry),
+                state::RegistrySnapshot::from_registry(registry.clone()),
             ));
             // Replacing a stored value can leave the registry snapshot identical,
             // in which case render deliberately skips rebuilding and probing.
             page.probe_servers(health::ProbeReason::ConfigChanged);
-            page.show_confirmation(&crate::i18n::trf(
-                "{value0} credential",
-                &[("value0", action)],
-            ));
-            editor.close();
+            Ok(registry)
         }
-        Ok(Err(error)) => {
-            l10n::bind_formatted_label(
-                feedback,
-                "Could not update credential: {value0}",
-                &[("value0", &error.to_string())],
+        Ok(Err(error)) => Err(crate::i18n::trf(
+            "Could not update credential: {value0}",
+            &[("value0", &error.to_string())],
+        )),
+        Err(_) => Err(crate::i18n::tr(
+            "Could not update credential: the operation stopped",
+        )),
+    }
+}
+
+#[cfg(test)]
+mod credential_dialog_tests {
+    use super::*;
+
+    fn app(id: &str) -> adw::Application {
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id(id)
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gtk::gio::Cancellable::NONE).unwrap();
+        app
+    }
+
+    /// A page in a presented window, with `server` saved in a synthetic data
+    /// directory whose secrets go to an encrypted file, never a keychain.
+    fn page_with(
+        app: &adw::Application,
+        server: serde_json::Value,
+    ) -> (ServerPage, state::ServerView) {
+        std::env::set_var("TOOLPORT_SECRET_KEY", "credential-dialog-fixture");
+        let registry = crate::registry::update(|registry| {
+            registry.servers = vec![serde_json::from_value(server).unwrap()];
+            Ok(())
+        })
+        .unwrap()
+        .0;
+        let snapshot = state::RegistrySnapshot::from_registry(registry);
+        let (root, page, _) = build_content(app, crate::approval_broker::start_native());
+        adw::ApplicationWindow::builder()
+            .application(app)
+            .content(&root)
+            .build()
+            .present();
+        page.render(state::RegistryState::Ready(snapshot.clone()));
+        (page, snapshot.servers[0].clone())
+    }
+
+    fn pump_until(what: &str, done: impl Fn() -> bool) {
+        let context = gtk::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
             );
-            feedback.set_visible(true);
-            button.set_sensitive(true);
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        Err(_) => {
-            l10n::bind_text(
-                feedback,
-                "Could not update credential: the operation stopped",
+    }
+
+    /// Let queued work (a closing dialog, a focus change) run.
+    fn settle() {
+        let context = gtk::glib::MainContext::default();
+        for _ in 0..20 {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Press `button` as a pointer click would, focus included.
+    fn press(button: &gtk::Button) {
+        button.grab_focus();
+        button.emit_clicked();
+    }
+
+    fn window_titled(title: &str) -> adw::Window {
+        gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|window| window.downcast::<adw::Window>().ok())
+            .find(|window| window.is_visible() && window.title().as_deref() == Some(title))
+            .unwrap_or_else(|| panic!("no window titled {title}"))
+    }
+
+    fn named<W: IsA<gtk::Widget>>(root: &impl IsA<gtk::Widget>, name: &str) -> W {
+        details::find_named(root.upcast_ref(), name)
+            .unwrap_or_else(|| panic!("no widget named {name}"))
+            .downcast::<W>()
+            .unwrap_or_else(|_| panic!("{name} has another type"))
+    }
+
+    /// Answer the open removal confirmation.
+    fn answer_confirmation(response: &str) {
+        #[allow(deprecated)]
+        let dialog = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|window| window.downcast::<adw::MessageDialog>().ok())
+            .find(|dialog| dialog.is_visible())
+            .expect("a removal confirmation");
+        assert_eq!(dialog.default_response().as_deref(), Some("cancel"));
+        #[allow(deprecated)]
+        dialog.response(response);
+    }
+
+    fn confirmation_heading() -> String {
+        #[allow(deprecated)]
+        gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|window| window.downcast::<adw::MessageDialog>().ok())
+            .find(|dialog| dialog.is_visible())
+            .and_then(|dialog| dialog.heading())
+            .expect("a removal confirmation")
+            .to_string()
+    }
+
+    fn focused(window: &adw::Window) -> Option<gtk::Widget> {
+        gtk::prelude::GtkWindowExt::focus(window)
+    }
+
+    fn has_focus(window: &adw::Window, widget: &impl IsA<gtk::Widget>) -> bool {
+        focused(window).is_some_and(|now| &now == widget.upcast_ref() || now.is_ancestor(widget))
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn credentials_dialog_waits_for_values_and_stays_open_after_each_write() {
+        let _data = crate::registry::DataDirTestEnv::new("credentials-dialog-stays-open");
+        let app = app("com.tsout.Toolport.CredentialsDialogTest");
+        let (page, server) = page_with(
+            &app,
+            serde_json::json!({
+                "id": "cred-dialog", "name": "Credential fixture", "transport": "stdio",
+                "command": "/nonexistent/mock", "args": [], "enabled": false,
+                "env": [{"key": "TOKEN", "secret": true}, {"key": "OTHER", "secret": true}]
+            }),
+        );
+        open_credentials_editor(server, page);
+        let editor = window_titled("Credentials for Credential fixture");
+        let status: gtk::Label = named(&editor, "credential-status");
+        // The message lives outside the scrolled form, so it cannot push fields.
+        assert!(status
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .is_none());
+        let replace: gtk::Button = named(&editor, "credential-save:TOKEN");
+        let value: gtk::PasswordEntry = named(&editor, "credential-value:TOKEN");
+        let store: gtk::Button = named(&editor, "credential-store");
+        let new_key: gtk::Entry = named(&editor, "credential-new-key");
+        let new_value: gtk::PasswordEntry = named(&editor, "credential-new-value");
+        assert!(!replace.is_sensitive(), "Replace waits for a value");
+        assert!(!store.is_sensitive(), "Store waits for a name and a value");
+        new_key.set_text("NEW_KEY");
+        assert!(!store.is_sensitive(), "a name alone is not enough");
+        new_value.set_text("new-secret");
+        assert!(store.is_sensitive());
+
+        press(&store);
+        assert!(
+            !store.is_sensitive() && !replace.is_sensitive(),
+            "one write at a time"
+        );
+        pump_until("the new credential", || {
+            status.is_visible() && new_key.text().is_empty()
+        });
+        assert!(editor.is_visible(), "Store keeps the dialog open");
+        assert_eq!(status.text(), "Saved NEW_KEY");
+        assert!(status.has_css_class("success"));
+        assert!(new_value.text().is_empty());
+        let _: gtk::Box = named(&editor, "credential:NEW_KEY");
+        assert!(
+            has_focus(&editor, &new_key),
+            "focus goes back to the name field"
+        );
+        assert_eq!(
+            crate::secrets::get_secret("cred-dialog", "NEW_KEY").as_deref(),
+            Some("new-secret")
+        );
+
+        value.set_text("replacement");
+        assert!(replace.is_sensitive());
+        // Enter in a value field saves it, as in React.
+        value.grab_focus();
+        value.emit_by_name::<()>("activate", &[]);
+        pump_until("the replacement", || value.text().is_empty());
+        assert!(editor.is_visible(), "Replace keeps the dialog open");
+        assert_eq!(status.text(), "Saved TOKEN");
+        assert!(has_focus(&editor, &value));
+        assert!(!replace.is_sensitive());
+
+        // A reference saved from Add for a key that has a row shows in that row.
+        let add_source: gtk::DropDown = named(&editor, "credential-add-source");
+        let add_reference: gtk::Entry = named(&editor, "credential-add-reference");
+        let add_save: gtk::Button = named(&editor, "credential-add-save-reference");
+        add_source.set_selected(1);
+        new_key.set_text("OTHER");
+        add_reference.set_text("op://vault/item/field");
+        press(&add_save);
+        pump_until("the reference", || status.text() == "Reference saved");
+        let other_source: gtk::DropDown = named(&editor, "credential-source:OTHER");
+        assert_eq!(
+            other_source.selected(),
+            1,
+            "the OTHER row shows the reference"
+        );
+        let rows: Vec<String> = {
+            let mut names = Vec::new();
+            let mut child = other_source
+                .ancestor(gtk::Box::static_type())
+                .and_then(|row| row.parent())
+                .and_then(|stored| stored.first_child());
+            while let Some(next) = child {
+                if next.widget_name().starts_with("credential:") {
+                    names.push(next.widget_name().to_string());
+                }
+                child = next.next_sibling();
+            }
+            names
+        };
+        assert_eq!(
+            rows,
+            ["credential:TOKEN", "credential:OTHER", "credential:NEW_KEY"],
+            "the rebuilt row keeps its place"
+        );
+        add_source.set_selected(0);
+
+        let remove: gtk::Button = named(&editor, "credential-remove:TOKEN");
+        press(&remove);
+        assert_eq!(confirmation_heading(), "Remove the Token API key?");
+        answer_confirmation("cancel");
+        settle();
+        assert!(
+            has_focus(&editor, &remove),
+            "Cancel returns focus to Remove"
+        );
+        assert!(details::find_named(editor.upcast_ref(), "credential:TOKEN").is_some());
+        assert!(crate::secrets::get_secret("cred-dialog", "TOKEN").is_some());
+        press(&remove);
+        answer_confirmation("remove");
+        pump_until("the removal", || status.text() == "Removed TOKEN");
+        assert!(details::find_named(editor.upcast_ref(), "credential:TOKEN").is_none());
+        assert!(editor.is_visible(), "Remove keeps the dialog open");
+        assert!(crate::secrets::get_secret("cred-dialog", "TOKEN").is_none());
+        let next: gtk::Box = named(&editor, "credential:OTHER");
+        assert!(
+            has_focus(&editor, &next),
+            "focus moves to the next credential"
+        );
+        editor.close();
+    }
+
+    /// A reference saved from Add for a secret command argument shows in its row,
+    /// which keeps its place.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn a_reference_saved_from_add_updates_a_launch_input_row() {
+        let _data = crate::registry::DataDirTestEnv::new("credentials-launch-reference");
+        let app = app("com.tsout.Toolport.CredentialsLaunchTest");
+        let (page, server) = page_with(
+            &app,
+            serde_json::json!({
+                "id": "cred-launch", "name": "Launch fixture", "transport": "stdio",
+                "command": "/nonexistent/mock", "args": ["--key", "<launch-input>"],
+                "enabled": false,
+                "env": [{"key": "TOKEN", "secret": true}],
+                "launch": {
+                    "inputs": [{"key": "SECRET", "label": "Secret", "secret": true, "required": true}],
+                    "bindings": [{"index": 1, "parts": [{"kind": "input", "key": "SECRET"}]}]
+                }
+            }),
+        );
+        open_credentials_editor(server, page);
+        let editor = window_titled("Credentials for Launch fixture");
+        let status: gtk::Label = named(&editor, "credential-status");
+        let source: gtk::DropDown = named(&editor, "credential-source:SECRET");
+        assert_eq!(source.selected(), 0);
+        let new_key: gtk::Entry = named(&editor, "credential-new-key");
+        let add_source: gtk::DropDown = named(&editor, "credential-add-source");
+        let add_reference: gtk::Entry = named(&editor, "credential-add-reference");
+        let add_save: gtk::Button = named(&editor, "credential-add-save-reference");
+        add_source.set_selected(1);
+        new_key.set_text("SECRET");
+        add_reference.set_text("op://vault/item/field");
+        press(&add_save);
+        pump_until("the reference", || status.text() == "Reference saved");
+        let source: gtk::DropDown = named(&editor, "credential-source:SECRET");
+        assert_eq!(source.selected(), 1, "the SECRET row shows the reference");
+        let row = source.parent().unwrap();
+        assert_eq!(
+            row.prev_sibling().map(|w| w.widget_name().to_string()),
+            Some("credential:TOKEN".into()),
+            "the rebuilt row keeps its place"
+        );
+        editor.close();
+    }
+
+    /// With the keychain unreadable and no saved client settings, Remove client
+    /// credentials still shows: a secret may be left from a partial removal.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn remove_client_credentials_shows_when_the_secret_is_unknown() {
+        let _data = crate::registry::DataDirTestEnv::new("authentication-dialog-unknown-secret");
+        let app = app("com.tsout.Toolport.AuthenticationUnknownTest");
+        let (page, server) = page_with(
+            &app,
+            serde_json::json!({
+                "id": "auth-unknown", "name": "Unknown fixture", "transport": "http",
+                "url": "http://127.0.0.1:9/mcp", "args": [], "env": [], "enabled": false
+            }),
+        );
+        let mut opened = None;
+        crate::secrets::locked_store::prompts_during(|| {
+            open_authentication_editor(server, page);
+            let editor = window_titled("Authentication for Unknown fixture");
+            let caption: gtk::Label = named(&editor, "auth-secret-status");
+            pump_until("the failed check", || {
+                caption
+                    .text()
+                    .starts_with("Couldn't check the stored secret")
+            });
+            opened = Some(editor);
+        });
+        let editor = opened.unwrap();
+        let remove_client: gtk::Button = named(&editor, "auth-remove-client");
+        assert!(remove_client.is_visible() && remove_client.is_sensitive());
+        editor.close();
+    }
+
+    /// A refused client-credentials write asks to unlock no more often than the
+    /// write itself does, and an unknown token state keeps Remove token available.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn a_locked_keyring_asks_once_per_click_and_unknown_is_not_absent() {
+        let _data = crate::registry::DataDirTestEnv::new("authentication-dialog-locked");
+        let app = app("com.tsout.Toolport.AuthenticationLockedTest");
+        let (page, _) = page_with(
+            &app,
+            serde_json::json!({
+                "id": "auth-locked", "name": "Locked fixture", "transport": "http",
+                "url": "http://127.0.0.1:9/mcp", "args": [], "env": [], "enabled": false
+            }),
+        );
+        crate::registry_controller::set_auth_token("auth-locked", "synthetic-token").unwrap();
+        let registry = crate::registry_controller::set_client_credentials(
+            "auth-locked",
+            "synthetic-client",
+            Some("synthetic-secret".into()),
+            None,
+            None,
+        )
+        .unwrap();
+        let server = state::RegistrySnapshot::from_registry(registry).servers[0].clone();
+        // What the writes themselves ask, called directly.
+        let save_asks = crate::secrets::locked_store::prompts_during(|| {
+            let _ = crate::registry_controller::set_client_credentials(
+                "auth-locked",
+                "synthetic-client",
+                Some("replacement".into()),
+                Some("client_secret_basic"),
+                Some(""),
             );
-            feedback.set_visible(true);
-            button.set_sensitive(true);
-        }
+        })
+        .len();
+        let remove_asks = crate::secrets::locked_store::prompts_during(|| {
+            let _ = crate::registry_controller::clear_client_credentials("auth-locked");
+        })
+        .len();
+
+        let mut opened = None;
+        let open_asks = crate::secrets::locked_store::prompts_during(|| {
+            open_authentication_editor(server.clone(), page.clone());
+            let editor = window_titled("Authentication for Locked fixture");
+            let status: gtk::Label = named(&editor, "auth-token-status");
+            let caption: gtk::Label = named(&editor, "auth-secret-status");
+            pump_until("the failed checks", || {
+                status
+                    .text()
+                    .starts_with("Could not read authentication status")
+                    && caption
+                        .text()
+                        .starts_with("Couldn't check the stored secret")
+            });
+            opened = Some(editor);
+        });
+        assert_eq!(open_asks.len(), 2, "one read each at open: {open_asks:?}");
+        let editor = opened.unwrap();
+        let remove: gtk::Button = named(&editor, "auth-remove-token");
+        assert!(
+            remove.is_visible() && remove.is_sensitive(),
+            "an unknown token can still be removed"
+        );
+        assert!(remove.tooltip_text().is_none());
+
+        let secret: gtk::PasswordEntry = named(&editor, "auth-client-secret");
+        let save_client: gtk::Button = named(&editor, "auth-save-client");
+        let remove_client: gtk::Button = named(&editor, "auth-remove-client");
+        let client_status: gtk::Label = named(&editor, "auth-client-status");
+        let caption: gtk::Label = named(&editor, "auth-secret-status");
+        let retry: gtk::Button = named(&editor, "auth-secret-retry");
+        assert!(retry.is_visible() && retry.is_sensitive());
+        let asks = crate::secrets::locked_store::prompts_during(|| {
+            secret.set_text("replacement");
+            press(&save_client);
+            assert!(!retry.is_sensitive(), "no secret check during a write");
+            pump_until("the refused save", || {
+                client_status
+                    .text()
+                    .starts_with("Could not save client credentials")
+            });
+            settle();
+        });
+        assert_eq!(asks.len(), save_asks, "a refused save asks once: {asks:?}");
+        assert_eq!(secret.text(), "replacement", "the typed secret is kept");
+
+        let asks = crate::secrets::locked_store::prompts_during(|| {
+            press(&remove_client);
+            answer_confirmation("remove");
+            pump_until("the refused removal", || {
+                client_status
+                    .text()
+                    .starts_with("Could not remove client credentials")
+            });
+            settle();
+        });
+        assert_eq!(
+            asks.len(),
+            remove_asks,
+            "a refused removal asks once: {asks:?}"
+        );
+        assert!(
+            caption
+                .text()
+                .starts_with("Couldn't check the stored secret"),
+            "after a refused removal the secret is unknown until Retry"
+        );
+        editor.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn authentication_dialog_confirms_removals_and_keeps_focus_and_caption() {
+        let _data = crate::registry::DataDirTestEnv::new("authentication-dialog-state");
+        let app = app("com.tsout.Toolport.AuthenticationDialogTest");
+        let (page, server) = page_with(
+            &app,
+            serde_json::json!({
+                "id": "auth-dialog", "name": "Auth fixture", "transport": "http",
+                "url": "http://127.0.0.1:9/mcp", "args": [], "env": [], "enabled": false
+            }),
+        );
+        open_authentication_editor(server, page);
+        let editor = window_titled("Authentication for Auth fixture");
+        let token: gtk::PasswordEntry = named(&editor, "auth-token");
+        let store: gtk::Button = named(&editor, "auth-store-token");
+        let remove: gtk::Button = named(&editor, "auth-remove-token");
+        let status: gtk::Label = named(&editor, "auth-token-status");
+        pump_until("the token check", || {
+            status.text() == "No bearer token is stored for this server."
+        });
+        let sign_in: gtk::Button = named(&editor, "auth-sign-in");
+        assert!(!store.is_sensitive(), "Store token waits for a token");
+        assert_eq!(
+            store.tooltip_text().as_deref(),
+            Some("Paste a token before storing it."),
+            "a disabled action says why"
+        );
+        assert!(!remove.is_visible(), "nothing stored, nothing to remove");
+        token.set_text("synthetic-token");
+        assert!(store.is_sensitive() && store.tooltip_text().is_none());
+        // Enter in the token field stores it, as in React.
+        token.emit_by_name::<()>("activate", &[]);
+        assert!(
+            !sign_in.is_sensitive() && !store.is_sensitive(),
+            "sign-in waits for the write"
+        );
+        pump_until("the stored token", || token.text().is_empty());
+        assert_eq!(status.text(), "Bearer token stored in the system keychain.");
+        assert!(remove.is_visible() && remove.is_sensitive() && !store.is_sensitive());
+        assert!(sign_in.is_sensitive());
+        assert!(has_focus(&editor, &token), "focus stays in the token field");
+
+        press(&remove);
+        answer_confirmation("cancel");
+        settle();
+        assert!(
+            has_focus(&editor, &remove),
+            "Cancel returns focus to Remove"
+        );
+        assert_eq!(
+            crate::registry_controller::has_auth_token("auth-dialog"),
+            Ok(true),
+            "Cancel removes nothing"
+        );
+        press(&remove);
+        answer_confirmation("remove");
+        pump_until("the removed token", || {
+            !remove.is_visible() && status.text() == "No bearer token is stored for this server."
+        });
+        assert_eq!(
+            crate::registry_controller::has_auth_token("auth-dialog"),
+            Ok(false)
+        );
+        assert!(editor.is_visible());
+        assert!(
+            has_focus(&editor, &token),
+            "focus returns to the token field"
+        );
+
+        let client_id: gtk::Entry = named(&editor, "auth-client-id");
+        let secret: gtk::PasswordEntry = named(&editor, "auth-client-secret");
+        let caption: gtk::Label = named(&editor, "auth-secret-status");
+        let save_client: gtk::Button = named(&editor, "auth-save-client");
+        let remove_client: gtk::Button = named(&editor, "auth-remove-client");
+        let client_status: gtk::Label = named(&editor, "auth-client-status");
+        pump_until("the secret check", || {
+            caption.text() == "No client secret is stored yet."
+        });
+        assert!(!remove_client.is_visible());
+        // Save says what is missing in the dialog, not only in a tooltip.
+        press(&save_client);
+        assert_eq!(
+            client_status.text(),
+            "Enter the client id issued by your authorization server."
+        );
+        assert!(client_status.is_visible() && client_status.has_css_class("error"));
+        assert!(
+            has_focus(&editor, &save_client),
+            "focus stays on Save, as in React"
+        );
+        client_id.set_text("synthetic-client");
+        assert!(!client_status.is_visible(), "typing retires the error");
+        press(&save_client);
+        assert_eq!(
+            client_status.text(),
+            "Enter the client secret issued by your authorization server."
+        );
+        assert!(client_status.is_visible(), "a first save needs a secret");
+        secret.set_text("synthetic-secret");
+        press(&save_client);
+        pump_until("the saved client", || secret.text().is_empty());
+        assert!(caption
+            .text()
+            .starts_with("A client secret is stored in the keychain."));
+        assert_eq!(
+            client_status.text(),
+            "Client credentials for Auth fixture are configured."
+        );
+        assert!(remove_client.is_visible() && remove_client.is_sensitive());
+        assert!(has_focus(&editor, &secret));
+
+        press(&remove_client);
+        answer_confirmation("remove");
+        pump_until("the removed client", || client_id.text().is_empty());
+        assert_eq!(caption.text(), "No client secret is stored yet.");
+        assert_eq!(
+            client_status.text(),
+            "Removed client credentials for Auth fixture."
+        );
+        assert!(!remove_client.is_visible());
+        assert!(has_focus(&editor, &client_id));
+        assert_eq!(
+            crate::registry_controller::has_client_secret("auth-dialog"),
+            Ok(false)
+        );
+        editor.close();
     }
 }
 
@@ -16853,6 +18129,138 @@ mod tests {
         }
     }
 
+    /// After a connect GTK shows React's reminder: "Not live yet", the restart line
+    /// naming the client, an info bar, and a dismiss that clears it on the list and on
+    /// the client's details, but never another client's notice.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn connect_shows_reacts_restart_reminder() {
+        use super::*;
+        fn fixture_descendants(widget: &gtk::Widget) -> Vec<gtk::Widget> {
+            let mut out = vec![widget.clone()];
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                out.extend(fixture_descendants(&widget));
+            }
+            out
+        }
+        adw::init().unwrap();
+        let notice = restart_notice(
+            &crate::i18n::tr("Not live yet"),
+            &crate::i18n::trf(
+                "Restart {client} so it loads Toolport.",
+                &[("client", "Cursor")],
+            ),
+            || {},
+        );
+        assert!(notice.has_css_class("toolport-feedback"));
+        assert!(notice.has_css_class("info"));
+        let labels = fixture_descendants(notice.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .collect::<Vec<_>>();
+        assert_eq!(labels[0].text(), "Not live yet");
+        assert!(labels[0].has_css_class("heading"));
+        assert_eq!(labels[1].text(), "Restart Cursor so it loads Toolport.");
+        let dismiss = fixture_descendants(notice.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .next()
+            .unwrap();
+        assert_eq!(
+            dismiss.tooltip_text().as_deref(),
+            Some("Dismiss restart reminder")
+        );
+
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.RestartNoticeFixture")
+            .build();
+        let server_page = ServerPage {
+            details: Default::default(),
+            app: app.clone(),
+            share_requests: Default::default(),
+            server_count: gtk::Label::new(None),
+            section_title: gtk::Label::new(None),
+            posture: gtk::Label::new(None),
+            search: gtk::SearchEntry::new(),
+            feedback: gtk::Label::new(None),
+            list: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            last_snapshot: Default::default(),
+            feedback_timer: Default::default(),
+            health_rows: Default::default(),
+            rows: Default::default(),
+            no_matches: Default::default(),
+            off_heading: Default::default(),
+            health: Default::default(),
+            registry_reload: Default::default(),
+        };
+        let page = ClientPage::new(&app, server_page);
+        let dismiss_list = |page: &ClientPage| {
+            fixture_descendants(page.list_notice.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Button>().ok())
+                .next()
+                .unwrap()
+                .emit_clicked();
+        };
+        let remind = |page: &ClientPage, id: &str| {
+            let notice = (
+                id.to_string(),
+                "Not live yet".to_string(),
+                "Restart Cursor so it loads Toolport.".to_string(),
+            );
+            page.set_detail_notice(notice.clone());
+            page.show_list_notice(&notice.0, &notice.1, &notice.2);
+        };
+        let error = |id: &str| (id.to_string(), "refused".to_string(), String::new());
+
+        remind(&page, "cursor");
+        assert!(page.list_notice.is_visible());
+        let shown = fixture_descendants(page.list_notice.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .map(|l| l.text().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shown,
+            vec!["Not live yet", "Restart Cursor so it loads Toolport."]
+        );
+        dismiss_list(&page);
+        assert!(!page.list_notice.is_visible());
+        assert!(page.detail_notice.borrow().is_none());
+
+        // Dismissing on the detail page takes the same reminder off the list.
+        remind(&page, "cursor");
+        page.dismiss_detail_notice();
+        assert!(!page.list_notice.is_visible());
+
+        // Another client's error stays when Cursor's list reminder is dismissed.
+        remind(&page, "cursor");
+        page.set_detail_notice(error("codex"));
+        assert!(page.list_notice.is_visible());
+        dismiss_list(&page);
+        assert_eq!(page.detail_notice.borrow().clone(), Some(error("codex")));
+
+        // Dismissing another client's notice keeps Cursor's list reminder.
+        remind(&page, "cursor");
+        page.set_detail_notice(error("codex"));
+        page.dismiss_detail_notice();
+        assert!(page.list_notice.is_visible());
+
+        // A later notice for Cursor itself (a disconnect, an error) replaces the
+        // reminder on the list too.
+        page.set_detail_notice(error("cursor"));
+        assert!(!page.list_notice.is_visible());
+
+        // So does a finished Connect or Disconnect that leaves no notice behind.
+        remind(&page, "cursor");
+        page.clear_list_notice_for("codex");
+        assert!(page.list_notice.is_visible());
+        page.clear_list_notice_for("cursor");
+        assert!(!page.list_notice.is_visible());
+    }
+
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn connect_all_summary_stays_until_dismissed_focus_returns_and_it_waits_for_a_later_scan() {
@@ -20954,57 +22362,70 @@ mod p10c_r1_presentation_tests {
     }
 }
 
-fn secret_reference_controls(
-    server_id: &str,
-    key: &str,
-    existing: Option<&str>,
-    page: &ServerPage,
-    editor: &adw::Window,
-    feedback: &gtk::Label,
-) -> (gtk::DropDown, gtk::Box) {
-    let key = gtk::Entry::builder().text(key).build();
-    secret_reference_controls_dynamic(server_id, key, existing, page, editor, feedback)
-}
+/// The password manager choice for one credential. `added` is the Add section,
+/// whose saved reference becomes a stored row.
 fn secret_reference_controls_dynamic(
-    server_id: &str,
+    ui: &CredentialsUi,
     key: gtk::Entry,
     existing: Option<&str>,
-    page: &ServerPage,
-    editor: &adw::Window,
-    feedback: &gtk::Label,
+    added: bool,
 ) -> (gtk::DropDown, gtk::Box) {
-    let (choice, container, reference) = secret_reference_fields(server_id, existing, feedback);
+    let (choice, container, reference) =
+        secret_reference_fields(&ui.server_id, existing, &ui.status);
     let save = l10n::button("Save reference");
     container.append(&save);
-    let id = server_id.to_string();
-    let page = page.clone();
-    let editor = editor.clone();
-    let feedback = feedback.clone();
-    save.connect_clicked(move |button| {
-        button.set_sensitive(false);
-        let id = id.clone();
-        let reprobe_id = id.clone();
-        let key = key.text().to_string();
-        let reference = reference.text().to_string();
-        let page = page.clone();
-        let editor = editor.clone();
-        let feedback = feedback.clone();
-        let button = button.clone();
-        gtk::glib::spawn_future_local(async move {
-            let result = gtk::gio::spawn_blocking(move || {
-                crate::registry_controller::set_secret_reference(&id, &key, &reference)
-            })
-            .await;
-            finish_credential_update(
-                result,
-                &reprobe_id,
-                &page,
-                &editor,
-                &feedback,
-                &button,
-                &crate::i18n::tr("Reference saved"),
-            );
+    if added {
+        choice.set_widget_name("credential-add-source");
+        reference.set_widget_name("credential-add-reference");
+        save.set_widget_name("credential-add-save-reference");
+    }
+    {
+        let key = key.downgrade();
+        let reference = reference.downgrade();
+        ui.form.watch(&save, move || {
+            let filled = |field: Option<gtk::Entry>| {
+                field.is_some_and(|field| !field.text().trim().is_empty())
+            };
+            (filled(key.upgrade()) && filled(reference.upgrade()))
+                .then_some(())
+                .ok_or(None)
         });
+    }
+    ui.refresh_on_edit(&key);
+    ui.refresh_on_edit(&reference);
+    let ui = ui.clone();
+    save.connect_clicked(move |button| {
+        let id = ui.server_id.clone();
+        let name = key.text().trim().to_string();
+        let submitted = reference.text().to_string();
+        if name.is_empty() || submitted.trim().is_empty() {
+            return;
+        }
+        let (key_for_write, reference_for_write) = (name.clone(), submitted.clone());
+        let after = ui.clone();
+        let (key, reference, button_for_focus) = (key.clone(), reference.clone(), button.clone());
+        ui.write(
+            button,
+            crate::i18n::tr("Reference saved"),
+            move || {
+                crate::registry_controller::set_secret_reference(
+                    &id,
+                    &key_for_write,
+                    &reference_for_write,
+                )
+            },
+            move |server| {
+                if !added {
+                    return button_for_focus.upcast();
+                }
+                after.sync_rows(server, Some(&name));
+                if key.text().trim() == name && reference.text() == submitted {
+                    key.set_text("");
+                    reference.set_text("");
+                }
+                key.upcast()
+            },
+        );
     });
     (choice, container)
 }
@@ -21089,12 +22510,13 @@ fn secret_reference_fields(
             button.set_sensitive(true);
             reference_field.set_sensitive(true);
             provider_field.set_sensitive(true);
-            feedback.set_visible(true);
-            feedback.set_label(&match result {
+            feedback.set_label(&match &result {
                 Ok(Ok(())) => crate::i18n::tr("Success in the desktop app environment. The MCP client gateway may use different environment variables or PATH."),
                 Ok(Err(e)) => e.to_string(),
                 Err(_) => crate::i18n::tr("Reference test stopped"),
             });
+            // The label is shared with saves, so its style follows this result.
+            credential_feedback(&feedback, !matches!(result, Ok(Ok(()))));
         });
     });
     (choice, container, reference)

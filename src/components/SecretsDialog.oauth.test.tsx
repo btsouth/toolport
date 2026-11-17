@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SecretsDialog } from "./SecretsDialog";
 import type { ServerEntry } from "@/lib/types";
+import { hasAuthToken, setAuthToken, clearAuthToken } from "@/lib/api";
 
 const api = vi.hoisted(() => ({
   start: vi.fn(),
@@ -26,6 +27,7 @@ vi.mock("@/lib/api", () => ({
   setSecret: vi.fn(),
   setAuthToken: vi.fn(),
   clearAuthToken: vi.fn(),
+  setUiLanguage: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("sonner", () => ({ toast: { success: api.success } }));
 vi.mock("@/lib/toast", () => ({ toastError: api.error }));
@@ -188,5 +190,37 @@ describe("browser OAuth recovery (simulated IPC)", () => {
     );
     await user.click(screen.getByRole("button", { name: "Cancel sign-in" }));
     expect(screen.getByRole("button", { name: "Sign in with browser" })).toBeEnabled();
+  });
+});
+
+describe("access token in the dialog (simulated IPC)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(setAuthToken).mockResolvedValue(undefined);
+    vi.mocked(clearAuthToken).mockResolvedValue(undefined);
+  });
+
+  it("keeps focus in the token field after Save", async () => {
+    const { user } = await open();
+    const field = screen.getByPlaceholderText("paste access token");
+    await user.type(field, "synthetic-token");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(setAuthToken).toHaveBeenCalledWith(server.id, "synthetic-token"),
+    );
+    await waitFor(() => expect(field).toHaveFocus());
+    expect(field).toHaveValue("");
+  });
+
+  it("asks before removing the token and then puts focus in the token field", async () => {
+    vi.mocked(hasAuthToken).mockResolvedValueOnce(true);
+    const { user } = await open();
+    await user.click(await screen.findByRole("button", { name: "Clear auth token" }));
+    expect(clearAuthToken).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(clearAuthToken).toHaveBeenCalledWith(server.id));
+    await waitFor(() =>
+      expect(screen.getByPlaceholderText("paste access token")).toHaveFocus(),
+    );
   });
 });

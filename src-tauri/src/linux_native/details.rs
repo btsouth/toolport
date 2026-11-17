@@ -129,7 +129,7 @@ fn find_class(root: &gtk::Widget, class: &str) -> Option<gtk::Widget> {
     None
 }
 
-fn find_named(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
+pub(super) fn find_named(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
     if root.widget_name() == name {
         return Some(root.clone());
     }
@@ -545,22 +545,12 @@ pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
         ));
     }
     page.append_recoveries(&body, Some(&client.id));
-    if let Some((id, notice)) = page.detail_notice.borrow().as_ref() {
+    if let Some((id, title, notice)) = page.detail_notice.borrow().as_ref() {
         if id == &client.id {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            let label = text(notice, false);
-            label.set_hexpand(true);
-            row.append(&label);
-            let dismiss = header_icon_button("window-close-symbolic");
-            l10n::bind_tooltip(&dismiss, "Dismiss restart reminder");
             let p = page.clone();
-            let row_for_dismiss = row.clone();
-            dismiss.connect_clicked(move |_| {
-                p.detail_notice.borrow_mut().take();
-                row_for_dismiss.set_visible(false);
-            });
-            row.append(&dismiss);
-            body.append(&row);
+            body.append(&super::restart_notice(title, notice, move || {
+                p.dismiss_detail_notice();
+            }));
         }
     }
     if customized {
@@ -1588,16 +1578,7 @@ mod tests {
                 .filter_map(|w| w.downcast_ref::<gtk::Label>())
                 .any(|l| l.text() == "Old credential failure")
         );
-        let editor = adw::Window::new();
-        finish_credential_update(
-            Ok(Ok(registry)),
-            "b5-credential",
-            &page,
-            &editor,
-            &gtk::Label::new(None),
-            &gtk::Button::new(),
-            "Updated",
-        );
+        finish_credential_update(Ok(Ok(registry)), "b5-credential", &page).unwrap();
         assert!(
             page.health.borrow().is_checking("b5-credential"),
             "credential completion schedules a probe even with an identical registry"
