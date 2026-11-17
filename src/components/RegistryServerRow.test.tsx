@@ -411,6 +411,20 @@ describe("RegistryServerRow actions menu", () => {
     expect(testServer).not.toHaveBeenCalled();
   });
 
+  it("starts nothing for a team server awaiting review", async () => {
+    const user = userEvent.setup();
+    renderRow(false, undefined, {
+      ...server,
+      source: "team:t",
+      teamEnableReview: true,
+    });
+    await user.click(screen.getByRole("button", { name: "Actions for Example" }));
+    expect(screen.getByRole("menuitem", { name: "Test connection" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+  });
+
   it("leaves out Authentication for a local server", async () => {
     const user = userEvent.setup();
     renderRow(true, health({ ok: true }));

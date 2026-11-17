@@ -230,13 +230,33 @@ export function knownMatches(known, entry) {
   );
 }
 
-/** Split entries into drift and known differences; list known entries that matched nothing. */
+/** The same text shown by the other shell in the same place: a moved line, not a missing one. */
+function hasCounterpart(entry, entries) {
+  const otherType = entry.type === "only-gtk" ? "only-react" : "only-gtk";
+  const text = entry.type === "only-gtk" ? entry.gtk : entry.react;
+  return entries.some(
+    (other) =>
+      other.type === otherType &&
+      other.screen === entry.screen &&
+      other.scenario === entry.scenario &&
+      other.region === entry.region &&
+      other.kind === entry.kind &&
+      (otherType === "only-gtk" ? other.gtk : other.react) === text,
+  );
+}
+
+/** Split entries into drift and known differences; list known entries that matched nothing.
+ * A known entry with `moved: true` covers a line only one shell shows when the other shell
+ * shows the same text elsewhere in that region, so a line one shell drops is still drift. */
 export function applyKnown(entries, knownList) {
   const used = new Set();
   const drift = [];
   const known = [];
   for (const entry of entries) {
-    const index = knownList.findIndex((item) => knownMatches(item, entry));
+    const index = knownList.findIndex(
+      (item) =>
+        knownMatches(item, entry) && (!item.moved || hasCounterpart(entry, entries)),
+    );
     if (index === -1) drift.push(entry);
     else {
       used.add(index);

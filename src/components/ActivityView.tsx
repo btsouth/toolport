@@ -680,11 +680,14 @@ function ServerRow({ s }: { s: ServerStat }) {
                 setOpen((o) => !o);
               }}
               aria-expanded={open}
-              className="flex min-w-0 items-center gap-1.5 rounded-sm text-left focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+              title={s.server}
+              // Bounded so a long name truncates instead of pushing the numbers
+              // out of a narrow window; the title keeps it whole.
+              className="flex max-w-[25vw] min-w-0 items-center gap-1.5 rounded-sm text-left focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
             >
               <ChevronRight
                 aria-hidden="true"
-                className={`size-3.5 text-muted-foreground transition-transform ${open ? "rotate-90" : ""}`}
+                className={`size-3.5 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-90" : ""}`}
               />
               <span className="truncate">{s.server}</span>
               <span className="sr-only">
@@ -694,8 +697,11 @@ function ServerRow({ s }: { s: ServerStat }) {
               </span>
             </button>
           ) : (
-            <span className="flex min-w-0 items-center gap-1.5">
-              <span className="inline-block size-3.5" />
+            <span
+              title={s.server}
+              className="flex max-w-[25vw] min-w-0 items-center gap-1.5"
+            >
+              <span className="inline-block size-3.5 shrink-0" />
               <span className="truncate">{s.server}</span>
             </span>
           )}
@@ -2216,15 +2222,16 @@ export function ActivityView({
         (savings.previousReportedTokensSaved ?? 0) !== 0) ? (
         <SavingsBanner savings={savings} />
       ) : null}
+      {/* Both count reloadTick, so Clear empties them too (both keys only grow). */}
       <DiscoveryTraces
-        refreshKey={liveKey}
+        refreshKey={liveKey + reloadTick}
         searches={
           (entries ?? []).filter((e) => e.kind === "internal" && e.tool === "search")
             .length
         }
       />
       <ToolIdentities refreshKey={liveKey} />
-      {registry?.liveInspect ? <LiveInspector refreshKey={liveKey} /> : null}
+      {registry?.liveInspect ? <LiveInspector refreshKey={liveKey + reloadTick} /> : null}
     </>
   );
 

@@ -5650,15 +5650,8 @@ impl ActivityPage {
         self.feedback.remove_css_class("success");
         self.feedback.set_visible(false);
         self.render_activity_notices(&snapshot.telemetry_notices);
-        self.clear_button.set_sensitive(
-            snapshot.call_count > 0
-                || !snapshot.recent.is_empty()
-                || snapshot.savings_list_loads > 0
-                || snapshot.savings_historical_loads > 0
-                || snapshot.savings_discovery_count > 0
-                || !snapshot.search_traces.is_empty()
-                || !snapshot.inspect_calls.is_empty(),
-        );
+        self.clear_button
+            .set_sensitive(activity_has_retained(&snapshot));
 
         // Rebuild the server filter's choices, keeping the current selection when
         // that server still exists in the data.
@@ -6554,16 +6547,43 @@ impl ActivityPage {
                     page.recent_rows.borrow_mut().clear();
                     page.refresh();
                 }
-                Ok(Err(error)) => page.show_feedback_error(&crate::i18n::trf(
-                    "Couldn't clear activity: {value1}",
-                    &[("value1", &error.to_string())],
-                )),
-                Err(_) => page.show_feedback_error(&crate::i18n::tr(
-                    "the clear operation stopped unexpectedly",
-                )),
+                Ok(Err(error)) => {
+                    page.restore_clear_button();
+                    page.show_feedback_error(&crate::i18n::trf(
+                        "Couldn't clear activity: {value1}",
+                        &[("value1", &error.to_string())],
+                    ))
+                }
+                Err(_) => {
+                    page.restore_clear_button();
+                    page.show_feedback_error(&crate::i18n::tr(
+                        "the clear operation stopped unexpectedly",
+                    ))
+                }
             }
         });
     }
+
+    /// After a failed clear, Clear is offered again while there is something to clear.
+    fn restore_clear_button(&self) {
+        let retained = self
+            .last_snapshot
+            .borrow()
+            .as_ref()
+            .is_some_and(activity_has_retained);
+        self.clear_button.set_sensitive(retained);
+    }
+}
+
+/// Whether anything is kept that Clear would delete.
+fn activity_has_retained(snapshot: &state::ActivitySnapshot) -> bool {
+    snapshot.call_count > 0
+        || !snapshot.recent.is_empty()
+        || snapshot.savings_list_loads > 0
+        || snapshot.savings_historical_loads > 0
+        || snapshot.savings_discovery_count > 0
+        || !snapshot.search_traces.is_empty()
+        || !snapshot.inspect_calls.is_empty()
 }
 
 /// A count grouped the current language's way, regrouped when the language changes.
@@ -8326,9 +8346,11 @@ fn activity_card(
         activity.timestamp_ms, activity.server, activity.tool
     );
     let open = expanded_rows.borrow().contains(&key);
+    // The button comes in as an argument: a clone held by its own click
+    // handler would keep the row alive after every refresh.
     let show = {
-        let (detail, chevron, button) = (detail.clone(), chevron.clone(), button.clone());
-        move |open: bool| {
+        let (detail, chevron) = (detail.clone(), chevron.clone());
+        move |button: &gtk::Button, open: bool| {
             detail.set_visible(open);
             chevron.set_icon_name(Some(if open {
                 "pan-down-symbolic"
@@ -8338,11 +8360,11 @@ fn activity_card(
             button.update_state(&[gtk::accessible::State::Expanded(Some(open))]);
         }
     };
-    show(open);
-    button.connect_clicked(move |_| {
+    show(&button, open);
+    button.connect_clicked(move |button| {
         let open = !detail_visible(&expanded_rows, &key);
         remember_activity_expansion(&mut expanded_rows.borrow_mut(), &key, open);
-        show(open);
+        show(button, open);
     });
     card.append(&detail);
     card
@@ -8638,19 +8660,23 @@ fn server_stat_row(
     list.set_visible(false);
     card.append(&list);
     let pending = std::rc::Rc::new(std::cell::RefCell::new(Some(tools)));
+    // The toggle comes in as an argument: a clone held by its own click
+    // handler would keep the row alive after every refresh.
     let show = {
-        let (list, chevron, toggle) = (list.clone(), chevron.clone(), toggle.clone());
-        move |open: bool| {
+        let (list, chevron) = (list.clone(), chevron.clone());
+        move |toggle: &gtk::Button, open: bool| {
             if open {
                 if let Some(tools) = pending.borrow_mut().take() {
                     for tool in tools {
+                        let tool_name = tool
+                            .get("tool")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| crate::i18n::tr("Unknown tool").to_string());
+                        // Ellipsized in a narrow table; the tooltip keeps it whole.
                         let name = gtk::Label::builder()
-                            .label(
-                                tool.get("tool")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(str::to_owned)
-                                    .unwrap_or_else(|| crate::i18n::tr("Unknown tool").to_string()),
-                            )
+                            .label(&tool_name)
+                            .tooltip_text(&tool_name)
                             .xalign(0.0)
                             .margin_start(18)
                             .ellipsize(gtk::pango::EllipsizeMode::End)
@@ -8672,15 +8698,15 @@ fn server_stat_row(
         }
     };
     let open = expanded_servers.borrow().contains(&server);
-    show(open);
-    toggle.connect_clicked(move |_| {
+    show(&toggle, open);
+    toggle.connect_clicked(move |toggle| {
         let open = !expanded_servers.borrow().contains(&server);
         if open {
             expanded_servers.borrow_mut().insert(server.clone());
         } else {
             expanded_servers.borrow_mut().remove(&server);
         }
-        show(open);
+        show(toggle, open);
     });
     card
 }
@@ -9723,6 +9749,12 @@ fn build_content(
         },
     );
     server_page.1.details.attach(&server_page.0);
+    // The summary card's text is built from the servers' state, not one
+    // source string: build it again in the new language.
+    let page_for_language = server_page.1.clone();
+    l10n::on_language_change(&server_page.1.posture, move || {
+        page_for_language.update_posture()
+    });
     let page_for_check = server_page.1.clone();
     check_servers
         .connect_clicked(move |_| page_for_check.probe_servers(health::ProbeReason::Refresh));
@@ -11849,6 +11881,8 @@ fn server_actions(server: &state::ServerView, page: ServerPage, include_details:
         crate::i18n::msg("Test connection"),
         "network-transmit-receive-symbolic",
     );
+    // A team server awaiting review starts nothing until the user consents.
+    test.set_sensitive(!server.requires_review);
     let server_for_test = server.clone();
     let page_for_test = page.clone();
     test.connect_clicked(move |button| {
@@ -15823,11 +15857,16 @@ fn open_sync_settings(server_id: &str, page: &ServerPage) {
             .collect();
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || {
-                if personal {
-                    crate::personal_sync::set_local_only(&id, local)?;
+                // Lock first, unlock last: if a mark fails to save, the server
+                // stays on this machine instead of syncing a value it excludes.
+                if personal && local {
+                    crate::personal_sync::set_local_only(&id, true)?;
                 }
                 for (kind, key, enabled) in marks {
                     crate::personal_sync::set_portable(&id, &kind, &key, enabled)?;
+                }
+                if personal && !local {
+                    crate::personal_sync::set_local_only(&id, false)?;
                 }
                 crate::registry::load()
             })
@@ -18940,18 +18979,29 @@ mod tests {
                     "canonical requester precedes its reported label"
                 );
             }
-            let activity_copy = activity_widget
-                .first_child()
-                .unwrap()
-                .next_sibling()
-                .unwrap();
-            let activity_detail = activity_copy
-                .first_child()
-                .unwrap()
-                .next_sibling()
-                .unwrap()
-                .downcast::<gtk::Label>()
-                .unwrap();
+            // The detail line is the label carrying the timing tooltip; a failed
+            // call's row is a button above its expandable detail, so the
+            // line is found by what it says, not by its position.
+            fn timing_label(widget: &gtk::Widget) -> Option<gtk::Label> {
+                if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                    if label
+                        .tooltip_text()
+                        .is_some_and(|tip| tip.contains("\nDispatch: "))
+                    {
+                        return Some(label.clone());
+                    }
+                }
+                let mut child = widget.first_child();
+                while let Some(next) = child {
+                    if let Some(found) = timing_label(&next) {
+                        return Some(found);
+                    }
+                    child = next.next_sibling();
+                }
+                None
+            }
+            let activity_detail =
+                timing_label(activity_widget.upcast_ref()).expect("the activity detail line");
             let identity = if reported_only {
                 displayed.to_owned()
             } else {

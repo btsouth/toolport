@@ -44,6 +44,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { probeRegistered } from "@/lib/api";
+import { needsTeamEnableReview } from "@/lib/importReview";
 
 // Opened from the row menu only, so it loads in its own chunk.
 const SyncSettingsDialog = lazy(() =>
@@ -499,7 +500,11 @@ export function RegistryServerRow({
               </DropdownMenuTrigger>
               {/* As wide as its longest item: no item wraps onto two lines. */}
               <DropdownMenuContent align="end" className="w-max" onClick={stop}>
-                <DropdownMenuItem onSelect={() => void testConnection()}>
+                {/* A team server awaiting review starts nothing until the user consents. */}
+                <DropdownMenuItem
+                  disabled={!enabled && needsTeamEnableReview(server)}
+                  onSelect={() => void testConnection()}
+                >
                   {t("Test connection")}
                 </DropdownMenuItem>
                 <DropdownMenuItem

@@ -56,25 +56,35 @@ export function SyncSettingsDialog({ server, registry, onSaved, onClose }: Props
       })),
   ];
   const [localOnly, setLocalOnly] = useState(server.syncLocalOnly === true);
-  const [marks, setMarks] = useState(values.map((value) => value.portable));
+  // Keyed by kind and key, so a registry update that reorders the values keeps
+  // each mark on its own value.
+  const id = (value: Portable) => `${value.kind}:${value.key}`;
+  const [marks, setMarks] = useState<Record<string, boolean>>(() =>
+    Object.fromEntries(values.map((value) => [id(value), value.portable])),
+  );
+  const marked = (value: Portable) => marks[id(value)] ?? value.portable;
   const [saving, setSaving] = useState(false);
 
   async function save() {
     setSaving(true);
     try {
       let next: Registry | null = null;
-      if (personal)
-        next = await invoke<Registry>("personal_sync_local_only", {
+      // Lock first, unlock last (as GTK): if a mark fails to save, the server
+      // stays on this machine instead of syncing a value it excludes.
+      const setLocalOnly = (on: boolean) =>
+        invoke<Registry>("personal_sync_local_only", {
           serverId: server.id,
-          localOnly,
+          localOnly: on,
         });
-      for (const [index, value] of values.entries())
+      if (personal && localOnly) next = await setLocalOnly(true);
+      for (const value of values)
         next = await invoke<Registry>("personal_sync_portable", {
           serverId: server.id,
           kind: value.kind,
           key: value.key,
-          enabled: marks[index],
+          enabled: marked(value),
         });
+      if (personal && !localOnly) next = await setLocalOnly(false);
       if (next) onSaved(next);
       onClose();
     } catch (error) {
@@ -113,18 +123,15 @@ export function SyncSettingsDialog({ server, registry, onSaved, onClose }: Props
               </span>
             </span>
           </label>
-          {values.map((value, index) => (
-            <label key={`${value.kind}:${value.key}`} className="flex items-center gap-2">
+          {values.map((value) => (
+            <label key={id(value)} className="flex items-center gap-2">
               <input
                 type="checkbox"
-                checked={marks[index]}
-                onChange={(event) =>
-                  setMarks((current) =>
-                    current.map((mark, at) =>
-                      at === index ? event.target.checked : mark,
-                    ),
-                  )
-                }
+                checked={marked(value)}
+                onChange={(event) => {
+                  const checked = event.target.checked;
+                  setMarks((current) => ({ ...current, [id(value)]: checked }));
+                }}
               />
               {t("{value0}: same on every machine", { value0: value.label })}
             </label>
