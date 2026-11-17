@@ -959,6 +959,8 @@ pub struct ValueRow {
 /// What [`add_server_with_rows`] saved.
 pub struct RowsAddOutcome {
     pub registry: Registry,
+    /// The added server's id.
+    pub id: String,
     /// Keys saved without a usable value (blank or a placeholder); the user adds
     /// them in Credentials.
     pub declared_without_value: Vec<String>,
@@ -972,6 +974,98 @@ pub struct RowsAddOutcome {
 pub fn add_server_with_rows(
     fields: ServerFields,
     rows: Vec<ValueRow>,
+) -> Result<RowsAddOutcome, String> {
+    add_server_with_values(fields, rows, EntryExtras::default())
+}
+
+/// What React's dialog sends beyond [`ServerFields`] and the rows. GTK passes none.
+#[derive(Debug, Default)]
+pub struct EntryExtras {
+    /// A catalog preset's or a Duplicate's launch inputs.
+    pub launch: Option<registry::LaunchConfig>,
+    /// Where the entry came from (`catalog:curated`, a Duplicate's original);
+    /// `manual` when absent.
+    pub source: Option<String>,
+    /// A remote Duplicate's request timeout.
+    pub request_timeout_ms: Option<u64>,
+    /// A remote Duplicate's header credentials (`headerKeys`) and its allowed
+    /// password manager prefixes (`secretSources`), kept as the entry had them.
+    pub kept_fields: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Add the server React's Add server dialog sends, in one step: what the
+/// `add_server_with_rows` command runs.
+pub fn add_server_from_dialog(entry: ServerEntry) -> Result<RowsAddOutcome, String> {
+    let (fields, rows, extras) = values_from_entry(entry)?;
+    add_server_with_values(fields, rows, extras)
+}
+
+/// React's Add server dialog sends its whole entry: split it into what
+/// [`add_server_with_values`] takes. Every env row is a value row; a row with a
+/// `source` is a password manager reference.
+/// The entry fields React's dialog sends that the values path keeps as they are.
+const KEPT_ENTRY_FIELDS: [&str; 2] = ["headerKeys", "secretSources"];
+
+pub fn values_from_entry(
+    entry: ServerEntry,
+) -> Result<(ServerFields, Vec<ValueRow>, EntryExtras), String> {
+    let rows = entry
+        .env
+        .iter()
+        .map(|env| {
+            let reference = crate::secret_refs::source(&env.unknown_fields)
+                .map_err(|error| error.to_string())?
+                .map(str::to_string);
+            Ok(ValueRow {
+                key: env.key.clone(),
+                value: env.value.clone().unwrap_or_default(),
+                secret: env.secret,
+                portable: env
+                    .unknown_fields
+                    .get("portable")
+                    .and_then(serde_json::Value::as_bool),
+                reference,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let fields = ServerFields {
+        sync_local_only: entry.unknown_fields.get("syncLocalOnly")
+            == Some(&serde_json::Value::Bool(true)),
+        initialize_timeout_ms: Some(entry.initialize_timeout_ms),
+        name: entry.name,
+        transport: entry.transport,
+        command: entry.command,
+        args: entry.args,
+        url: entry.url,
+        cwd: entry.cwd,
+        inherit_env: Some(entry.inherit_env),
+        hide_prompts: Some(entry.hide_prompts),
+    };
+    let kept_fields = KEPT_ENTRY_FIELDS
+        .iter()
+        .filter_map(|key| {
+            entry
+                .unknown_fields
+                .get(*key)
+                .map(|value| (key.to_string(), value.clone()))
+        })
+        .collect();
+    let extras = EntryExtras {
+        launch: entry.launch,
+        source: entry.source,
+        request_timeout_ms: entry.request_timeout_ms,
+        kept_fields,
+    };
+    Ok((fields, rows, extras))
+}
+
+/// [`add_server_with_rows`] with what React's dialog adds: a catalog preset's or
+/// a Duplicate's launch inputs, whose secret values are saved in the same step
+/// as the rows' values, and the entry's source and request timeout.
+pub fn add_server_with_values(
+    fields: ServerFields,
+    rows: Vec<ValueRow>,
+    extras: EntryExtras,
 ) -> Result<RowsAddOutcome, String> {
     let rows: Vec<ValueRow> = rows
         .into_iter()
@@ -989,6 +1083,51 @@ pub fn add_server_with_rows(
         ));
     }
     let mut entry = entry_from_fields(fields)?;
+    if let Some(source) = extras.source {
+        entry.source = Some(source);
+    }
+    entry.request_timeout_ms = extras.request_timeout_ms;
+    entry.unknown_fields.extend(extras.kept_fields);
+    if let Some(mut launch) = extras.launch {
+        // A row named like a launch input would be stored under the input's
+        // name and vanish from the entry.
+        if let Some(row) = rows
+            .iter()
+            .find(|row| launch.inputs.iter().any(|input| input.key == row.key))
+        {
+            return Err(crate::i18n::trf(
+                "Use each variable name once. Rename or remove the second {value0}.",
+                &[("value0", &row.key)],
+            ));
+        }
+        // Secret inputs still carry their values here; the import moves them
+        // to the keychain, and the registry checks the stored form on save.
+        launch.validate(&entry.args, false)?;
+        // Every row still needs a value before the server is switched on, as
+        // without launch inputs (the import lists them all then). A catalog
+        // preset's own list stays: it leaves its optional keys out.
+        if launch.template.is_none() {
+            for row in &rows {
+                if !launch.required_env.contains(&row.key) {
+                    launch.required_env.push(row.key.clone());
+                }
+            }
+        }
+        entry.launch = Some(launch);
+    }
+    // A launch input read from a password manager has its value there.
+    let referenced_inputs: Vec<String> = entry
+        .launch
+        .iter()
+        .flat_map(|launch| &launch.inputs)
+        .filter(|input| {
+            matches!(
+                crate::secret_refs::source(&input.unknown_fields),
+                Ok(Some(_))
+            )
+        })
+        .map(|input| input.key.clone())
+        .collect();
     let remote = entry.transport != "stdio";
     entry.env = rows
         .iter()
@@ -1051,14 +1190,15 @@ pub fn add_server_with_rows(
         Some(&definition),
         Some(&choices),
     )?;
-    let (registry, missing) = crate::import_credentials::transaction(|writes| {
+    let (registry, id, missing) = crate::import_credentials::transaction(|writes| {
         let current = read_registry_exact_or_default()?;
         let mut registry = current.clone();
         let mut entry = import.entry.clone();
         entry.enabled = false;
         let id = registry.add_server(entry);
-        let missing =
+        let mut missing =
             import.transfer_into(&id, writes, current.servers.iter().any(|s| s.id == id))?;
+        missing.retain(|key| !referenced_inputs.contains(key));
         if missing.is_empty() {
             let profile = registry.default_access_id();
             if apply_server_enabled(&mut registry, &profile, &id, true, false).is_ok() {
@@ -1066,23 +1206,46 @@ pub fn add_server_with_rows(
             }
         }
         registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
-        Ok((commit_imports(&current, registry)?, missing))
+        Ok((commit_imports(&current, registry)?, id, missing))
     })?;
-    // Name each key as its row did, not as it is stored (the bearer slot).
-    let declared_without_value = missing
+    // Name each key as its row did, not as it is stored (the bearer slot), and a
+    // launch input by its label.
+    let inputs: &[registry::LaunchInput] = import
+        .entry
+        .launch
+        .as_ref()
+        .map_or(&[], |launch| &launch.inputs);
+    let mut declared_without_value: Vec<String> = missing
         .into_iter()
         .map(|key| {
             if key == crate::secrets::HTTP_AUTH_KEY {
                 rows.iter()
                     .find(|row| row.key.eq_ignore_ascii_case("authorization"))
                     .map_or(key, |row| row.key.clone())
+            } else if let Some(input) = inputs.iter().find(|input| input.key == key) {
+                input.label.clone()
             } else {
                 key
             }
         })
         .collect();
+    // A required plain launch input left blank also keeps the server off.
+    if !registry.is_enabled(&registry.default_access_id(), &id) {
+        for input in inputs {
+            let blank = input.value.as_deref().is_none_or(|v| v.trim().is_empty());
+            if input.required
+                && !input.secret
+                && blank
+                && !referenced_inputs.contains(&input.key)
+                && !declared_without_value.contains(&input.label)
+            {
+                declared_without_value.push(input.label.clone());
+            }
+        }
+    }
     Ok(RowsAddOutcome {
         registry,
+        id,
         declared_without_value,
     })
 }
@@ -6310,6 +6473,366 @@ API_KEY = "synthetic-first-origin"
             });
             assert!(outcome.is_err());
             assert!(registry::load().unwrap().servers.is_empty());
+        });
+    }
+
+    /// The entry React's Add server dialog sends: a typed secret, a plain value
+    /// with its sync choice, a password manager row, and a pasted command line
+    /// with a plain and a secret launch input.
+    fn react_entry(extra_env: serde_json::Value) -> ServerEntry {
+        let mut env = vec![
+            serde_json::json!({"key": "API_KEY", "value": "sk-live-typed", "secret": true}),
+            serde_json::json!({"key": "REGION", "value": "eu", "secret": false, "portable": true}),
+            serde_json::json!({"key": "VAULT_TOKEN", "value": null, "secret": true,
+                "source": {"ref": "op://Private/Server/token"}}),
+        ];
+        if !extra_env.is_null() {
+            env.push(extra_env);
+        }
+        serde_json::from_value(serde_json::json!({
+            "id": "", "enabled": false, "syncLocalOnly": true, "name": "demo",
+            "transport": "stdio", "command": "npx",
+            "args": ["-y", "example-server", "<launch-input>", "<launch-input>"],
+            "launch": {
+                "inputs": [
+                    {"key": "ACCOUNT", "label": "Account", "secret": false,
+                     "required": true, "value": "AC123"},
+                    {"key": "SECRET", "label": "Secret", "secret": true,
+                     "required": true, "value": "launch-secret"}
+                ],
+                "bindings": [
+                    {"index": 2, "parts": [{"kind": "input", "key": "ACCOUNT"}]},
+                    {"index": 3, "parts": [{"kind": "input", "key": "SECRET"}]}
+                ]
+            },
+            "env": env, "url": null, "source": "manual", "cwd": null,
+            "inheritEnv": true, "hidePrompts": false, "initializeTimeoutMs": 45000
+        }))
+        .unwrap()
+    }
+
+    fn add_react(entry: ServerEntry) -> Result<RowsAddOutcome, String> {
+        add_server_from_dialog(entry)
+    }
+
+    /// The entry React's catalog dialog sends for a curated preset, with each
+    /// row's typed value from `fill` and each launch input's from `input`.
+    fn preset_entry(
+        name: &str,
+        fill: &dyn Fn(&str) -> Option<&'static str>,
+        input: Option<&str>,
+    ) -> ServerEntry {
+        let preset = crate::catalog::curated()
+            .into_iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("no curated {name}"));
+        let mut launch = serde_json::to_value(&preset.launch).unwrap();
+        if let Some(inputs) = launch.get_mut("inputs").and_then(|v| v.as_array_mut()) {
+            for i in inputs {
+                i["value"] = input.map_or(serde_json::Value::Null, |v| serde_json::json!(v));
+            }
+        }
+        let env: Vec<_> = preset
+            .env_keys
+            .iter()
+            .map(|key| serde_json::json!({"key": key, "secret": true, "value": fill(key)}))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "id": "", "enabled": false, "syncLocalOnly": false, "name": preset.name,
+            "transport": preset.transport, "command": preset.command, "args": preset.args,
+            "launch": launch, "env": env, "url": preset.url, "source": "catalog:curated",
+            "cwd": null, "inheritEnv": false, "hidePrompts": false, "initializeTimeoutMs": null
+        }))
+        .unwrap()
+    }
+
+    /// A curated preset keeps its own required keys: AWS, MongoDB and Qdrant
+    /// leave some keys optional, so saving them blank still switches the
+    /// server on, and it stays a catalog server.
+    #[test]
+    fn a_catalog_preset_keeps_its_optional_keys_and_its_source() {
+        let blank = |_: &str| None;
+        let qdrant_url = |key: &str| (key == "QDRANT_URL").then_some("http://localhost:6333");
+        let aws_key = |key: &str| (key == "AWS_ACCESS_KEY_ID").then_some("AKIATYPED");
+        type Fill = dyn Fn(&str) -> Option<&'static str>;
+        let cases: [(&str, &Fill); 4] = [
+            ("AWS", &blank),
+            ("MongoDB", &blank),
+            ("Qdrant", &qdrant_url),
+            ("AWS", &aws_key),
+        ];
+        for (name, fill) in cases {
+            crate::secrets::tests::with_isolated_vault(|| {
+                let entry = preset_entry(name, fill, None);
+                let preset_required = entry.launch.as_ref().unwrap().required_env.clone();
+                let outcome = add_react(entry).unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert!(
+                    outcome.declared_without_value.is_empty(),
+                    "{name}: {:?}",
+                    outcome.declared_without_value
+                );
+                assert_eq!(saved_servers(), vec![(name.to_string(), true)], "{name}");
+                let server = registry::load().unwrap().servers.remove(0);
+                assert_eq!(server.source.as_deref(), Some("catalog:curated"), "{name}");
+                assert_eq!(
+                    server.launch.unwrap().required_env,
+                    preset_required,
+                    "{name}"
+                );
+                if name == "AWS" && fill("AWS_ACCESS_KEY_ID").is_some() {
+                    assert_eq!(
+                        crate::secrets::get_secret_result(&outcome.id, "AWS_ACCESS_KEY_ID")
+                            .unwrap()
+                            .as_deref(),
+                        Some("AKIATYPED")
+                    );
+                }
+            });
+        }
+    }
+
+    /// A required launch input left blank keeps the server off and is named
+    /// by its label.
+    #[test]
+    fn a_blank_required_launch_input_is_named_by_its_label() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let outcome = add_react(preset_entry("Filesystem", &|_| None, None)).unwrap();
+            assert_eq!(
+                outcome.declared_without_value,
+                vec!["Allowed directory".to_string()]
+            );
+            assert_eq!(saved_servers(), vec![("Filesystem".into(), false)]);
+        });
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut entry = react_entry(serde_json::Value::Null);
+            entry.launch.as_mut().unwrap().inputs[1].value = None;
+            let outcome = add_react(entry).unwrap();
+            assert_eq!(outcome.declared_without_value, vec!["Secret".to_string()]);
+            assert_eq!(saved_servers(), vec![("demo".into(), false)]);
+        });
+    }
+
+    /// A Duplicate keeps where its original came from and its request timeout:
+    /// a remote server through the bearer slot, and a shared one stays shared.
+    #[test]
+    fn a_duplicate_keeps_its_source_and_request_timeout() {
+        for source in ["imported:cursor", "shared"] {
+            crate::secrets::tests::with_isolated_vault(|| {
+                let entry: ServerEntry = serde_json::from_value(serde_json::json!({
+                    "id": "", "enabled": false, "name": "Remote copy", "transport": "http",
+                    "command": null, "args": [], "launch": null,
+                    "env": [{"key": "Authorization", "value": "Bearer typed-token", "secret": true}],
+                    "url": "https://example.com/mcp", "source": source, "cwd": null,
+                    "inheritEnv": false, "hidePrompts": false, "requestTimeoutMs": 120000,
+                    "initializeTimeoutMs": null
+                }))
+                .unwrap();
+                let outcome = add_react(entry).unwrap_or_else(|e| panic!("{source}: {e}"));
+                assert!(outcome.declared_without_value.is_empty(), "{source}");
+                let server = registry::load().unwrap().servers.remove(0);
+                assert_eq!(server.source.as_deref(), Some(source));
+                assert_eq!(server.request_timeout_ms, Some(120000), "{source}");
+                assert_eq!(server.url.as_deref(), Some("https://example.com/mcp"));
+                assert_eq!(
+                    crate::secrets::get_secret_result(&outcome.id, crate::secrets::HTTP_AUTH_KEY)
+                        .unwrap()
+                        .as_deref(),
+                    Some("typed-token"),
+                    "{source}"
+                );
+                assert!(!serde_json::to_string(&server)
+                    .unwrap()
+                    .contains("typed-token"));
+            });
+        }
+    }
+
+    /// A Duplicate of a remote server keeps its header credentials and allowed
+    /// password manager prefixes, and a bad header reference saves nothing.
+    #[test]
+    fn a_duplicate_keeps_its_header_credentials() {
+        let remote = |headers: serde_json::Value| -> ServerEntry {
+            serde_json::from_value(serde_json::json!({
+                "id": "", "enabled": false, "name": "Header copy", "transport": "http",
+                "command": null, "args": [], "launch": null,
+                "env": [{"key": "API_TOKEN", "value": "typed-token", "secret": true}],
+                "url": "https://example.com/mcp", "source": "shared", "cwd": null,
+                "inheritEnv": false, "hidePrompts": false, "requestTimeoutMs": null,
+                "initializeTimeoutMs": null, "headerKeys": headers,
+                "secretSources": {"allowedPrefixes": ["op://Team/"]}
+            }))
+            .unwrap()
+        };
+        crate::secrets::tests::with_isolated_vault(|| {
+            let headers = serde_json::json!([
+                {"key": "X-Api-Key", "env": "API_TOKEN"},
+                {"key": "X-Team-Key", "source": {"ref": "op://Team/service/key"}}
+            ]);
+            let outcome = add_react(remote(headers.clone())).unwrap();
+            let server = registry::load().unwrap().servers.remove(0);
+            assert_eq!(server.unknown_fields.get("headerKeys"), Some(&headers));
+            assert_eq!(
+                server.unknown_fields["secretSources"],
+                serde_json::json!({"allowedPrefixes": ["op://Team/"]})
+            );
+            assert_eq!(
+                crate::secrets::get_secret_result(&outcome.id, "API_TOKEN")
+                    .unwrap()
+                    .as_deref(),
+                Some("typed-token")
+            );
+        });
+        crate::secrets::tests::with_isolated_vault(|| {
+            let bad = serde_json::json!([
+                {"key": "X-Team-Key", "source": {"ref": "op://Team/service/key", "command": "evil"}}
+            ]);
+            let mut outcome = None;
+            let prompts = crate::secrets::locked_store::write_prompts_during(|| {
+                outcome = Some(add_react(remote(bad)));
+            });
+            assert!(outcome.unwrap().is_err());
+            assert!(prompts.is_empty(), "{prompts:?}");
+            assert!(registry::load().unwrap().servers.is_empty());
+        });
+    }
+
+    /// A launch config that does not fit the arguments, and a row named like
+    /// a launch input, are refused before anything is saved, without asking to
+    /// unlock the keychain for a save that cannot happen.
+    #[test]
+    fn a_bad_launch_config_or_a_row_named_like_an_input_saves_nothing() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut no_marker = react_entry(serde_json::Value::Null);
+            no_marker.args = vec!["-y".into(), "example-server".into()];
+            let mut outcome = None;
+            let prompts = crate::secrets::locked_store::write_prompts_during(|| {
+                outcome = Some(add_react(no_marker));
+            });
+            assert!(outcome.unwrap().is_err());
+            assert!(prompts.is_empty(), "{prompts:?}");
+        });
+        let mut no_marker = react_entry(serde_json::Value::Null);
+        no_marker.args = vec!["-y".into(), "example-server".into()];
+        let named_like_input =
+            react_entry(serde_json::json!({"key": "SECRET", "value": "row-value", "secret": true}));
+        for (case, entry, expected) in [
+            ("no marker", no_marker, "launch argument"),
+            (
+                "row named like an input",
+                named_like_input,
+                "Use each variable name once",
+            ),
+        ] {
+            crate::secrets::tests::with_isolated_vault(|| {
+                let Err(error) = add_react(entry) else {
+                    panic!("{case}: saved");
+                };
+                assert!(error.contains(expected), "{case}: {error}");
+                assert!(registry::load().unwrap().servers.is_empty(), "{case}");
+                for key in ["API_KEY", "SECRET"] {
+                    assert_eq!(
+                        crate::secrets::get_secret_result("demo", key).unwrap(),
+                        None,
+                        "{case}"
+                    );
+                }
+            });
+        }
+    }
+
+    /// React's new-server save is one step: every value, the reference and the
+    /// launch inputs' secret are saved together, with one keychain unlock, and
+    /// no secret is left in the registry.
+    #[test]
+    fn react_add_saves_values_and_launch_inputs_in_one_step() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let outcome = add_react(react_entry(serde_json::Value::Null)).unwrap();
+            assert!(outcome.declared_without_value.is_empty());
+            assert_eq!(saved_servers(), vec![("demo".into(), true)]);
+            let id = outcome.id.clone();
+            let get = |key: &str| crate::secrets::get_secret_result(&id, key).unwrap();
+            assert_eq!(get("API_KEY").as_deref(), Some("sk-live-typed"));
+            assert_eq!(get("SECRET").as_deref(), Some("launch-secret"));
+            let server = registry::load().unwrap().servers.remove(0);
+            let text = serde_json::to_string(&server).unwrap();
+            for secret in ["sk-live-typed", "launch-secret"] {
+                assert!(!text.contains(secret), "{text}");
+            }
+            assert!(text.contains("AC123"), "{text}");
+            assert!(text.contains("op://Private/Server/token"), "{text}");
+            assert_eq!(
+                server.unknown_fields.get("syncLocalOnly"),
+                Some(&serde_json::json!(true))
+            );
+            assert!(server.inherit_env);
+            assert_eq!(server.initialize_timeout_ms, Some(45000));
+            let region = server.env.iter().find(|e| e.key == "REGION").unwrap();
+            assert_eq!(region.value.as_deref(), Some("eu"));
+            assert_eq!(
+                region.unknown_fields.get("portable"),
+                Some(&serde_json::json!(true))
+            );
+        });
+    }
+
+    /// A failed keychain write, the launch input's included, saves nothing; a
+    /// locked keychain the user does not unlock is asked once for all of them.
+    #[test]
+    fn react_add_saves_nothing_when_a_write_fails() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut outcome = None;
+            let prompts = crate::secrets::locked_store::write_prompts_during(|| {
+                outcome = Some(add_react(react_entry(serde_json::Value::Null)));
+            });
+            assert!(outcome.unwrap().is_err());
+            assert_eq!(prompts.len(), 1, "{prompts:?}");
+            assert!(registry::load().unwrap().servers.is_empty());
+        });
+        for key in ["API_KEY", "SECRET"] {
+            crate::secrets::tests::with_isolated_vault(|| {
+                let outcome = crate::secrets::tests::with_failed_write(key, || {
+                    add_react(react_entry(serde_json::Value::Null))
+                });
+                assert!(outcome.is_err(), "{key}");
+                assert!(registry::load().unwrap().servers.is_empty(), "{key}");
+                for stored in ["API_KEY", "SECRET"] {
+                    assert_eq!(
+                        crate::secrets::get_secret_result("demo", stored).unwrap(),
+                        None,
+                        "{key}: {stored} left behind"
+                    );
+                }
+            });
+        }
+    }
+
+    /// With launch inputs, a row with no value still keeps the server off and
+    /// is named; a launch input read from a password manager does not.
+    #[test]
+    fn react_add_with_launch_inputs_still_names_rows_without_a_value() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let outcome = add_react(react_entry(
+                serde_json::json!({"key": "EMPTY", "value": null, "secret": true}),
+            ))
+            .unwrap();
+            assert_eq!(outcome.declared_without_value, vec!["EMPTY".to_string()]);
+            assert_eq!(saved_servers(), vec![("demo".into(), false)]);
+        });
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut entry = react_entry(serde_json::Value::Null);
+            let input = &mut entry.launch.as_mut().unwrap().inputs[1];
+            input.value = None;
+            input.unknown_fields.insert(
+                "source".into(),
+                serde_json::json!({"ref": "op://Private/Server/secret"}),
+            );
+            let outcome = add_react(entry).unwrap();
+            assert!(
+                outcome.declared_without_value.is_empty(),
+                "{:?}",
+                outcome.declared_without_value
+            );
+            assert_eq!(saved_servers(), vec![("demo".into(), true)]);
         });
     }
 

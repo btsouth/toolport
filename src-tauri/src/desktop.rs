@@ -344,6 +344,29 @@ fn add_server(state: State<RegistryState>, mut entry: ServerEntry) -> Result<Reg
     Ok(reg)
 }
 
+/// Add a server from the Add server dialog in one step: the entry, its values
+/// and references, and its launch inputs' secrets are saved together or not at
+/// all. Nothing is saved on an error, so the dialog keeps what was typed.
+#[tauri::command]
+async fn add_server_with_rows(
+    state: State<'_, RegistryState>,
+    entry: ServerEntry,
+) -> Result<serde_json::Value, String> {
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        crate::registry_controller::add_server_from_dialog(entry)
+    })
+    .await
+    .map_err(|_| "Saving the server stopped".to_string())??;
+    let reg = reload_into_state(state.inner())?;
+    if let Some(saved) = reg.servers.iter().find(|s| s.id == outcome.id) {
+        prewarm_launcher(saved);
+    }
+    Ok(serde_json::json!({
+        "registry": reg,
+        "declaredWithoutValue": outcome.declared_without_value,
+    }))
+}
+
 /// Fire-and-forget spawn of a just-added download-then-run server (npx, uvx, ...)
 /// so the launcher fetches its package now, in the background, instead of on the
 /// first health probe or gateway connect. Lenient about env: missing secrets are
@@ -4795,6 +4818,7 @@ pub fn run() {
             parse_server_snippet,
             add_snippet_servers,
             add_server,
+            add_server_with_rows,
             update_server,
             remove_server,
             set_server_enabled,
