@@ -107,8 +107,13 @@ export function fmtPercent(
  * date-and-time shape used by most Activity rows; `"time"` and `"date"` are the
  * locale defaults for a single component, and `"monthDay"` is the compact
  * month-and-day used where the year would be noise (the savings banner).
+ * `"dateTime"` is the full numeric date with hours and minutes and no seconds
+ * (the connect backup line); GTK reproduces this exact shape per locale.
  */
-export function fmtTs(timestamp: number, format?: "time" | "date" | "monthDay"): string {
+export function fmtTs(
+  timestamp: number,
+  format?: "time" | "date" | "monthDay" | "dateTime",
+): string {
   if (format === "time") {
     return new Date(timestamp).toLocaleTimeString(getLocale());
   } else if (format === "date") {
@@ -117,6 +122,14 @@ export function fmtTs(timestamp: number, format?: "time" | "date" | "monthDay"):
     return new Date(timestamp).toLocaleDateString(getLocale(), {
       month: "short",
       day: "numeric",
+    });
+  } else if (format === "dateTime") {
+    return new Date(timestamp).toLocaleString(getLocale(), {
+      year: "numeric",
+      month: "numeric",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
     });
   } else {
     return new Date(timestamp).toLocaleString(getLocale(), {

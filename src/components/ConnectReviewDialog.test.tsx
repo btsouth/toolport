@@ -109,6 +109,58 @@ it("shows downstream tool counts and only Done on success", async () => {
   expect(screen.getByRole("button", { name: "Done" })).toBeVisible();
 });
 
+it("puts Done in the right-aligned footer and dates the backup without seconds", async () => {
+  const backupDate = new Date(2026, 10, 16, 1, 4, 37);
+  api.migrateClient.mockResolvedValue({
+    registry: { servers: [] },
+    outcome: { path: "/fixture/config", backup: "/fixture/backups/config.bak" },
+    backupDate: Math.floor(backupDate.getTime() / 1000),
+    tools: [],
+    servers: [],
+  });
+  render(
+    <ConnectReviewDialog
+      clientId="fixture"
+      clientName="Fixture"
+      onClose={vi.fn()}
+      onConnected={vi.fn()}
+    />,
+  );
+  await screen.findByRole("button", { name: /one/ });
+  await userEvent.click(screen.getByRole("button", { name: "Connect to Toolport" }));
+  const done = await screen.findByRole("button", { name: "Done" });
+  const footer = done.closest('[data-slot="dialog-footer"]');
+  expect(footer).not.toBeNull();
+  expect(footer).toHaveClass("justify-end");
+  expect(done).not.toHaveClass("w-full");
+  expect(done).toHaveAttribute("data-variant", "default");
+  const expected = backupDate.toLocaleString("en", {
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+  expect(screen.getByText(`Backup saved ${expected}`)).toBeInTheDocument();
+});
+
+it("puts Retry in the footer after a failed check", async () => {
+  api.previewClientSetup.mockRejectedValueOnce(new Error("config unreadable"));
+  render(
+    <ConnectReviewDialog
+      clientId="fixture"
+      clientName="Fixture"
+      onClose={vi.fn()}
+      onConnected={vi.fn()}
+    />,
+  );
+  expect(await screen.findByRole("alert")).toHaveTextContent("config unreadable");
+  const retry = screen.getByRole("button", { name: "Retry" });
+  expect(retry.closest('[data-slot="dialog-footer"]')).not.toBeNull();
+  await userEvent.click(retry);
+  expect(await screen.findByRole("button", { name: /one/ })).toBeVisible();
+});
+
 it("says what the agent sees when nothing moved, as GTK does", async () => {
   api.migrateClient.mockResolvedValue({
     registry: { servers: [] },
