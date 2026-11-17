@@ -1931,9 +1931,10 @@ mod tests {
             .filter_map(|w| w.downcast::<gtk::Button>().ok())
             .find(|b| b.label().as_deref() == Some("Connect"))
             .unwrap();
-        // Spec section 5: Cancel then the confirm, together at the right of a footer.
-        let cancel = connect
-            .prev_sibling()
+        // Spec section 5: Cancel then the confirm, together at the right of a footer
+        // (a batch step's Skip sits between them, hidden until a step fails).
+        let cancel = std::iter::successors(connect.prev_sibling(), |w| w.prev_sibling())
+            .find(|w| w.is_visible())
             .and_downcast::<gtk::Button>()
             .unwrap();
         assert_eq!(cancel.label().as_deref(), Some("Cancel"));

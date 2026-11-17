@@ -890,7 +890,6 @@ it("shows the restart reminder as an info card with a Dismiss button", async () 
   expect(screen.queryByText("Still connected until restart")).not.toBeInTheDocument();
 });
 
-
 it("lets the Discovery mode select show its whole label and wrap under its text", () => {
   render(
     <ClientDetail
@@ -907,7 +906,6 @@ it("lets the Discovery mode select show its whole label and wrap under its text"
   expect(row).toHaveClass("flex", "flex-wrap");
   expect(row.firstElementChild).toHaveClass("min-w-[min(15rem,100%)]", "flex-1");
 });
-
 
 it("keeps a keychain warning next to the recovery notice after disconnect", async () => {
   const recovery = "Cursor needs a missing value restored.";
