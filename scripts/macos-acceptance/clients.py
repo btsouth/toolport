@@ -476,10 +476,19 @@ def check(home, manifest_path, entries_dir, expect_connected=True, registry=None
     return rows
 
 
-# The repairs 2.3.7 makes to Toolport's own entry on its first start (#1340): the
-# `type` these clients document as required, added when it is missing, and the
-# gateway path written in canonical form. An upgrade may make exactly these.
+# The repairs an upgrade to 2.3.7 makes to Toolport's own entry on its first start.
+# Each is allowed only when the new file shows it, and nothing else may change:
+# - the `type` these clients document as required, added when it is missing (#1340);
+# - the gateway path written in canonical form (#1340);
+# - Codex only: the gateway settings Toolport writes when the user has not set them
+#   or an alias for them (`CODEX_GATEWAY_SETTINGS` in clients.rs, #1336), with
+#   exactly the values Toolport writes.
 REPAIRED_TYPES = {"cursor": "stdio", "vscode": "stdio", "github-copilot-cli": "local"}
+CODEX_SETTINGS = [
+    ("supports_parallel_tool_calls", (), True),
+    ("startup_timeout_sec", ("startup_timeout_ms",), 75),
+    ("tool_timeout_sec", (), 600),
+]
 
 
 def upgrade_repairs(cid, before_path, after_path):
@@ -497,16 +506,30 @@ def upgrade_repairs(cid, before_path, after_path):
     table = USER_TABLES[client["format"]]
     expected = copy.deepcopy(before)
     entry = ((expected or {}).get(table) or {}).get("toolport")
-    if not isinstance(entry, dict):
+    new = ((after or {}).get(table) or {}).get("toolport") if isinstance(after, dict) else None
+    if not isinstance(entry, dict) or not isinstance(new, dict):
         return None
     repairs = []
-    if cid in REPAIRED_TYPES and "type" not in entry:
-        entry["type"] = REPAIRED_TYPES[cid]
-        repairs.append(f'added type "{REPAIRED_TYPES[cid]}"')
+    kind = REPAIRED_TYPES.get(cid)
+    if kind and "type" not in entry and new.get("type") == kind:
+        entry["type"] = kind
+        repairs.append(f'added type "{kind}"')
     command = entry.get("command")
-    if isinstance(command, str) and os.path.isabs(command) and os.path.normpath(command) != command:
+    if (
+        isinstance(command, str)
+        and os.path.isabs(command)
+        and os.path.normpath(command) != command
+        and new.get("command") == os.path.normpath(command)
+    ):
         entry["command"] = os.path.normpath(command)
         repairs.append(f"gateway path made canonical ({entry['command']})")
+    if client["format"] == "toml-codex":
+        for key, aliases, value in CODEX_SETTINGS:
+            if any(k in entry for k in (key, *aliases)) or key not in new:
+                continue
+            if new[key] == value and type(new[key]) is type(value):
+                entry[key] = value
+                repairs.append(f"{key} = {str(value).lower()} added")
     if not repairs or expected != after:
         return None
     return repairs

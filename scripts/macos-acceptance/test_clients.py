@@ -186,6 +186,60 @@ class ClientsTest(unittest.TestCase):
             rows = clients.compare(self.home, snap, "untouched", allow_upgrade_repairs=True)
             self.assertEqual(statuses(rows, "Codex untouched"), ["PASS"])
 
+    def test_the_repairs_seen_on_a_real_2_3_7_upgrade_pass(self):
+        # From macOS acceptance run 44026014012: Cursor got only its type and kept
+        # the old path; Codex got the canonical path and its gateway settings.
+        bundle = os.path.join(self.tmp.name, "Toolport.app", "Contents")
+        os.makedirs(os.path.join(bundle, "MacOS"))
+        canonical = os.path.join(bundle, "Helpers", "toolport-gateway")
+        old_path = os.path.join(bundle, "MacOS", "..", "Helpers", "toolport-gateway")
+        old = {"args": [], "command": old_path, "env": {"TOOLPORT_CLIENT_ID": "cursor"}}
+        snap, table = self.snapshot_with("cursor", old)
+        self.edit_json("cursor", lambda d: d[table]["toolport"].update(type="stdio"))
+        rows = clients.compare(self.home, snap, "untouched", allow_upgrade_repairs=True)
+        self.assertEqual(statuses(rows, "Cursor untouched"), ["PASS"])
+        self.edit_json("cursor", lambda d: d[table]["toolport"].update(command=canonical))
+        rows = clients.compare(self.home, snap, "untouched", allow_upgrade_repairs=True)
+        self.assertEqual(statuses(rows, "Cursor untouched"), ["PASS"])
+        if not clients.tomllib:
+            return
+        codex = self.path("codex")
+        head = 'model = "gpt-5-codex"\n\n[mcp_servers.toolport]\n'
+        env = '\n[mcp_servers.toolport.env]\nTOOLPORT_CLIENT_ID = "codex"\n'
+
+        def write(text):
+            with open(codex, "w") as f:
+                f.write(text)
+
+        def codex_status(text):
+            write(text)
+            rows = clients.compare(self.home, snap, "untouched", allow_upgrade_repairs=True)
+            return statuses(rows, "Codex untouched")
+
+        settings = "supports_parallel_tool_calls = true\nstartup_timeout_sec = 75\ntool_timeout_sec = 600\n"
+        write(f'{head}command = "{old_path}"\n{env}')
+        snap = os.path.join(self.tmp.name, "ev", "snap-codex.json")
+        clients.snapshot(self.manifest, snap)
+        self.assertEqual(codex_status(f'{head}command = "{canonical}"\n{settings}{env}'), ["PASS"])
+        self.assertEqual(codex_status(f'{head}command = "{old_path}"\n{settings}{env}'), ["PASS"])
+        self.assertEqual(
+            codex_status(f'{head}command = "{old_path}"\nsupports_parallel_tool_calls = true\n{env}'), ["PASS"]
+        )
+        for wrong in (
+            settings.replace("600", "300"),
+            settings.replace("= true", '= "true"'),
+            settings + "startup_timeout_ms = 1000\n",
+            settings + "enabled = false\n",
+        ):
+            self.assertEqual(codex_status(f'{head}command = "{canonical}"\n{wrong}{env}'), ["FAIL"], wrong)
+        # A setting the user already had, under its alias, is not added to.
+        write(f'{head}command = "{old_path}"\nstartup_timeout_ms = 5000\n{env}')
+        clients.snapshot(self.manifest, snap)
+        self.assertEqual(
+            codex_status(f'{head}command = "{old_path}"\nstartup_timeout_ms = 5000\nstartup_timeout_sec = 75\n{env}'),
+            ["FAIL"],
+        )
+
     def cursor_connected(self, user=None):
         def change(d):
             d["mcpServers"]["toolport"] = {"command": self.gw, "args": [], "env": {"TOOLPORT_CLIENT_ID": "cursor"}}
