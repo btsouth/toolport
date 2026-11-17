@@ -284,12 +284,21 @@ export function formatEntry(entry) {
 
 export function formatReport(report) {
   const lines = [];
+  const failed = report.scenarios.filter((scenario) => scenario.error).length;
   lines.push(
-    `Shell parity report: GTK vs React, ${report.scenarios.length} scenarios, ${report.drift.length} differences, ${report.known.length} known (${report.seconds} s)`,
+    `Shell parity report: GTK vs React, ${report.scenarios.length} scenarios, ${report.drift.length} differences, ${report.known.length} known${failed ? `, ${failed} not compared` : ""} (${report.seconds} s)`,
   );
   for (const scenario of report.scenarios) {
     const drift = report.drift.filter((entry) => entry.scenario === scenario.name);
     lines.push("");
+    // A scenario that failed to extract was never compared; saying "no
+    // differences" for it would hide the failure.
+    if (scenario.error) {
+      lines.push(
+        `${scenario.screen} / ${scenario.name}: not compared: ${scenario.error}`,
+      );
+      continue;
+    }
     lines.push(
       `${scenario.screen} / ${scenario.name}: ${drift.length ? `${drift.length} differences` : "no differences"}`,
     );

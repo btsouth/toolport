@@ -8,6 +8,7 @@ import {
   formatEntry,
   normalizeText,
   validateKnown,
+  formatReport,
 } from "./diff.mjs";
 
 const text = (value, region = "body") => ({ region, kind: "text", value });
@@ -162,4 +163,25 @@ test("known differences move out of drift; unmatched ones become notes", () => {
   assert.deepEqual(validateKnown([{ reason: "r" }]), [
     "entry 0 needs gtk or react (null means the shell shows nothing)",
   ]);
+});
+
+test("a scenario that failed to extract is reported as not compared", () => {
+  const text = formatReport({
+    scenarios: [
+      {
+        screen: "servers",
+        name: "servers-empty",
+        error: "React: the React page did not settle in 30 s",
+      },
+      { screen: "servers", name: "servers-all-ready", error: null },
+    ],
+    drift: [],
+    known: [],
+    stale: [],
+    seconds: 1,
+  });
+  assert.match(text, /1 not compared/);
+  assert.match(text, /servers-empty: not compared: React: the React page did not settle/);
+  assert.doesNotMatch(text, /servers-empty: no differences/);
+  assert.match(text, /servers-all-ready: no differences/);
 });
