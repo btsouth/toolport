@@ -3251,6 +3251,24 @@ pub fn apply_secret_declaration(
         registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
         return Ok(());
     }
+    // A typed bearer token replaces a password manager Authorization row, which
+    // would otherwise still be sent in its place.
+    if key == crate::secrets::HTTP_AUTH_KEY {
+        let referenced = |entry: &crate::registry::EnvVar| {
+            entry.key.trim().eq_ignore_ascii_case("authorization")
+                && entry.unknown_fields.contains_key("source")
+        };
+        let dropped: Vec<String> = server
+            .env
+            .iter()
+            .filter(|entry| referenced(entry))
+            .map(|entry| entry.key.clone())
+            .collect();
+        server.env.retain(|entry| !referenced(entry));
+        if let Some(launch) = server.launch.as_mut() {
+            launch.required_env.retain(|k| !dropped.contains(k));
+        }
+    }
     match server.env.iter_mut().find(|entry| entry.key == key) {
         Some(entry) => {
             entry.secret = true;
@@ -3537,6 +3555,9 @@ fn credential_slot<'a>(
         return Ok((key.to_string(), value, false));
     }
     match bearer_token(value) {
+        Ok(token) if !crate::import_credentials::provided(token) => {
+            Err("Enter a credential value. Placeholder values cannot be saved.".into())
+        }
         Ok(token) => Ok((crate::secrets::HTTP_AUTH_KEY.to_string(), token, true)),
         Err(AuthValueError::NoToken) => {
             Err("Enter the token after Bearer in the Authorization value".into())
@@ -6415,6 +6436,9 @@ API_KEY = "synthetic-first-origin"
             // A pasted header name with no value.
             ("http", "Authorization", "", true),
             ("http", "Authorization", "   ", true),
+            // A placeholder token, bare or after Bearer.
+            ("http", "Authorization", "${API_KEY}", true),
+            ("http", "Authorization", "Bearer YOUR_API_KEY", true),
         ] {
             crate::secrets::tests::with_isolated_vault(|| {
                 let outcome =
@@ -6431,6 +6455,70 @@ API_KEY = "synthetic-first-origin"
                 }
             });
         }
+    }
+
+    /// A placeholder typed after Bearer is refused like any other placeholder.
+    #[test]
+    fn a_typed_placeholder_bearer_token_is_refused() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let (_, id) =
+                add_reviewed_entry(entry_from_fields(fields("demo", "http")).unwrap()).unwrap();
+            for value in ["Bearer ${API_KEY}", "Bearer YOUR_TOKEN", "<your-token>"] {
+                let err = set_server_secret(&id, "Authorization", value).unwrap_err();
+                assert!(err.contains("Placeholder"), "{value}: {err}");
+            }
+            assert_eq!(
+                crate::secrets::get_secret_result(&id, crate::secrets::HTTP_AUTH_KEY).unwrap(),
+                None
+            );
+        });
+    }
+
+    /// A token typed for a password manager Authorization row replaces the
+    /// reference, so the typed token is the one sent.
+    #[test]
+    fn a_typed_token_replaces_a_password_manager_authorization_row() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let outcome = add_server_with_rows(
+                fields("demo", "http"),
+                vec![ValueRow {
+                    key: "Authorization".into(),
+                    secret: true,
+                    reference: Some("op://Private/Server/token".into()),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+            let id = outcome.registry.servers[0].id.clone();
+            let registry = set_server_secret(&id, "Authorization", "Bearer typed").unwrap();
+            let server = registry.servers.iter().find(|s| s.id == id).unwrap();
+            assert!(
+                !server
+                    .env
+                    .iter()
+                    .any(|e| e.unknown_fields.contains_key("source")),
+                "{:?}",
+                server.env
+            );
+            let required = server
+                .launch
+                .as_ref()
+                .map(|l| l.required_env.clone())
+                .unwrap_or_default();
+            assert!(
+                !required.iter().any(|k| k == "Authorization"),
+                "{required:?}"
+            );
+            assert_eq!(
+                crate::secrets::get_secret_result(&id, crate::secrets::HTTP_AUTH_KEY)
+                    .unwrap()
+                    .as_deref(),
+                Some("typed")
+            );
+            let profile = registry.default_access_id();
+            set_server_enabled(&profile, &id, false, false).unwrap();
+            set_server_enabled(&profile, &id, true, true).unwrap();
+        });
     }
 
     /// A token typed over a sign-in clears the sign-in; a failed save puts it
