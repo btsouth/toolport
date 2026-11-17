@@ -6537,7 +6537,8 @@ API_KEY = "synthetic-first-origin"
         let blank = |_: &str| None;
         let qdrant_url = |key: &str| (key == "QDRANT_URL").then_some("http://localhost:6333");
         let aws_key = |key: &str| (key == "AWS_ACCESS_KEY_ID").then_some("AKIATYPED");
-        let cases: [(&str, &dyn Fn(&str) -> Option<&'static str>); 4] = [
+        type Fill = dyn Fn(&str) -> Option<&'static str>;
+        let cases: [(&str, &Fill); 4] = [
             ("AWS", &blank),
             ("MongoDB", &blank),
             ("Qdrant", &qdrant_url),
@@ -6630,9 +6631,20 @@ API_KEY = "synthetic-first-origin"
     }
 
     /// A launch config that does not fit the arguments, and a row named like
-    /// a launch input, are refused before anything is saved.
+    /// a launch input, are refused before anything is saved, without asking to
+    /// unlock the keychain for a save that cannot happen.
     #[test]
     fn a_bad_launch_config_or_a_row_named_like_an_input_saves_nothing() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut no_marker = react_entry(serde_json::Value::Null);
+            no_marker.args = vec!["-y".into(), "example-server".into()];
+            let mut outcome = None;
+            let prompts = crate::secrets::locked_store::write_prompts_during(|| {
+                outcome = Some(add_react(no_marker));
+            });
+            assert!(outcome.unwrap().is_err());
+            assert!(prompts.is_empty(), "{prompts:?}");
+        });
         let mut no_marker = react_entry(serde_json::Value::Null);
         no_marker.args = vec!["-y".into(), "example-server".into()];
         let named_like_input =
