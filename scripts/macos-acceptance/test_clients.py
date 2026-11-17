@@ -232,6 +232,8 @@ class ClientsTest(unittest.TestCase):
             settings + "enabled = false\n",
         ):
             self.assertEqual(codex_status(f'{head}command = "{canonical}"\n{wrong}{env}'), ["FAIL"], wrong)
+            with open(os.path.join(self.tmp.name, "ev", "snap-codex-changed", "codex")) as f:
+                self.assertIn(wrong, f.read())
         # A setting the user already had, under its alias, is not added to.
         write(f'{head}command = "{old_path}"\nstartup_timeout_ms = 5000\n{env}')
         clients.snapshot(self.manifest, snap)

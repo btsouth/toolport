@@ -569,7 +569,12 @@ def compare(home, manifest_path, label, allow_upgrade_repairs=False):
             import difflib
 
             diff = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), "before", "after", n=0))
-            rows.append(row("clients", "FAIL", f"{name} {label}", f"{path} differs: {diff[:300]}"))
+            # The detail is cut short; keep the whole changed file with the evidence.
+            kept = os.path.splitext(manifest_path)[0] + "-changed"
+            os.makedirs(kept, exist_ok=True)
+            shutil.copyfile(path, os.path.join(kept, cid))
+            detail = f"{path} differs (whole file: {os.path.basename(kept)}/{cid}): {diff[:300]}"
+            rows.append(row("clients", "FAIL", f"{name} {label}", detail))
     return rows
 
 
