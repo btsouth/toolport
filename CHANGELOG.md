@@ -12,7 +12,8 @@ Entries before the rename below shipped under the project's former name, Conduit
   `XDG_CONFIG_HOME`, no longer starts Toolport with an empty server list. Rows
   that are not a client's main config now name Toolport's data folder in their
   entry when you connect them. Rows you connected before are left as they are;
-  disconnect and connect one again if its client shows no servers.
+  disconnect and connect one again if its client shows no servers. A data
+  folder you set in such an entry yourself stays as you set it.
 
 ## [2.3.7] - 2026-11-16
 

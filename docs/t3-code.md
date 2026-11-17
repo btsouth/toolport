@@ -46,6 +46,27 @@ elsewhere is never read.
   **Remove location** is shown disabled with the reason: remove the instance from T3
   Code's provider settings first.
 
+## The data folder in a row's entry
+
+On Linux, a T3 Code home's entry names Toolport's data folder
+(`TOOLPORT_DATA_DIR`), because some providers, such as OpenCode, pass their own
+`XDG_CONFIG_HOME` to MCP servers and the gateway would look for its data there.
+Toolport replaces that value only when it wrote it itself, for example after its
+data folder was renamed. A folder you set by hand, or one another Toolport on its
+own data folder wrote, stays as it is. Some limits:
+
+- On macOS the entry gets no data folder. A client run there with its own `HOME`
+  starts the gateway without your servers. Windows is not affected.
+- A client's main row gets no data folder either. If T3 Code runs a provider with
+  no home of its own but sets `XDG_CONFIG_HOME` in the instance's environment
+  variables, the gateway won't find your servers. Give the instance its own home.
+- A data folder whose path is not plain UTF-8 text, or is relative, is not written.
+- A config shared by two machines or two users names the folder of whoever
+  connected it last. Connect it again on the other one.
+- If Toolport's data folder is renamed after a row was connected, the entry names
+  the old folder until Toolport next starts or opens Clients. That repair waits
+  while the keyring is locked.
+
 ## The T3 Code card
 
 With T3 Code installed, the Clients page shows a T3 Code card. It counts the

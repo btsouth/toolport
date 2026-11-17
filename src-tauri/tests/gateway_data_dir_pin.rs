@@ -132,7 +132,12 @@ fn start_as_client(
         child,
         stdin,
         lines,
-        dirs: vec![data.to_path_buf(), xdg.join("Toolport")],
+        // A release gateway would use `Toolport`, a debug one `Toolport-dev`.
+        dirs: vec![
+            data.to_path_buf(),
+            xdg.join("Toolport"),
+            xdg.join("Toolport-dev"),
+        ],
         next_id: 1,
     };
     let init = gateway.request(
@@ -203,9 +208,15 @@ fn a_t3_code_home_with_its_own_xdg_config_home_still_finds_the_registry() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    let strays: Vec<_> = std::fs::read_dir(&xdg)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with("Toolport") || name.starts_with("Conduit"))
+        .collect();
     assert!(
-        !xdg.join("Toolport").join("registry.json").exists(),
-        "no second registry under the client's XDG_CONFIG_HOME"
+        strays.is_empty(),
+        "no second data folder under the client's XDG_CONFIG_HOME: {strays:?}"
     );
     drop(gateway);
     let _ = std::fs::remove_dir_all(&data);
