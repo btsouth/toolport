@@ -2,6 +2,7 @@ import { initializeLanguage, isLanguageChoice, LanguageProvider } from "@/lib/i1
 import { LocalizationControls } from "./localization-controls";
 import { securityFixture } from "./security-fixture";
 import { applySkillState, skillsFixture } from "./skills-fixture";
+import { withParity } from "./parity-fixture";
 const fixtureLocations: import("@/lib/types").DetectedClient[] = [];
 // Separate development entry. Never imported by the shipping application.
 import { mockIPC } from "@tauri-apps/api/mocks";
@@ -709,7 +710,7 @@ if (new URLSearchParams(location.search).has("rules-link")) {
   });
 }
 mockIPC(
-  (command, payload) => {
+  withParity((command, payload) => {
     const args: Record<string, unknown> =
       payload &&
       !Array.isArray(payload) &&
@@ -1343,7 +1344,7 @@ mockIPC(
         missing.push(command);
         throw new Error(`Unimplemented fixture command: ${command}`);
     }
-  },
+  }),
   { shouldMockEvents: true },
 );
 

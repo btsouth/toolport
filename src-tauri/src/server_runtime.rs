@@ -10,6 +10,8 @@ use crate::registry::ServerEntry;
 use crate::{remote, secrets};
 
 #[derive(Debug, Clone, serde::Serialize)]
+// Parity scenarios (linux_native::parity) read probe answers back into this type.
+#[cfg_attr(test, derive(serde::Deserialize))]
 #[serde(rename_all = "camelCase")]
 pub struct ProbeResult {
     pub server_id: String,

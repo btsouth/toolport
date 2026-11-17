@@ -21,6 +21,9 @@ const SKIP_RUST_PREFIXES = [
   "packaging/",
   ".vscode/",
   ".github/ISSUE_TEMPLATE/",
+  // Parity scenarios and known differences: read only by the on-demand parity
+  // report (npm run parity), never by a CI test.
+  "parity/",
 ];
 
 // Files under those prefixes that the Rust crate reads anyway: the shell

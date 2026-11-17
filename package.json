@@ -36,6 +36,7 @@
     "verify:headless": "node scripts/verify.mjs --headless",
     "typecheck": "tsc --noEmit",
     "smoke:browser": "node scripts/browser-smoke.mjs",
+    "parity": "node scripts/parity/run.mjs",
     "dev:fixture": "vite --host 127.0.0.1 --open /fixtures/",
     "bench:bundle": "node benchmark/bundle.mjs",
     "bench:audit": "cargo run --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support --example audit-performance",

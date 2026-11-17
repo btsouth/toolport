@@ -1,0 +1,36 @@
+{
+  "screen": "servers",
+  "description": "A registry with no servers.",
+  "now_ms": 1790000000000,
+  "viewport": {
+    "width": 1240,
+    "height": 900
+  },
+  "ipc": {
+    "get_registry": {
+      "version": 3,
+      "servers": [],
+      "profiles": [
+        {
+          "id": "local",
+          "name": "Local",
+          "enabledServerIds": []
+        }
+      ],
+      "activeProfileId": "local",
+      "defaultAccessContextId": "local",
+      "defaultAccessLegacyPolicy": true,
+      "accessUpgradeNoticeDismissed": true
+    },
+    "probe_servers": []
+  },
+  "calls": [
+    [
+      "get_audit_log",
+      {
+        "limit": 2147483647
+      }
+    ],
+    ["savings_summary", {}]
+  ]
+}

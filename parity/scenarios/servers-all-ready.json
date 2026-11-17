@@ -1,0 +1,101 @@
+{
+  "screen": "servers",
+  "description": "Three enabled servers, all ready.",
+  "now_ms": 1790000000000,
+  "viewport": {
+    "width": 1240,
+    "height": 900
+  },
+  "ipc": {
+    "get_registry": {
+      "version": 3,
+      "servers": [
+        {
+          "id": "github",
+          "name": "GitHub",
+          "enabled": true,
+          "transport": "stdio",
+          "command": "fixture-only",
+          "args": [],
+          "env": [],
+          "url": null,
+          "source": "manual"
+        },
+        {
+          "id": "linear",
+          "name": "Linear",
+          "enabled": true,
+          "transport": "stdio",
+          "command": "fixture-only",
+          "args": [],
+          "env": [],
+          "url": null,
+          "source": "manual"
+        },
+        {
+          "id": "stripe",
+          "name": "Stripe",
+          "enabled": true,
+          "transport": "stdio",
+          "command": "fixture-only",
+          "args": [],
+          "env": [],
+          "url": null,
+          "source": "manual"
+        }
+      ],
+      "profiles": [
+        {
+          "id": "local",
+          "name": "Local",
+          "enabledServerIds": ["github", "linear", "stripe"]
+        }
+      ],
+      "activeProfileId": "local",
+      "defaultAccessContextId": "local",
+      "defaultAccessLegacyPolicy": true,
+      "accessUpgradeNoticeDismissed": true
+    },
+    "probe_servers": [
+      {
+        "serverId": "github",
+        "ok": true,
+        "toolCount": 25,
+        "error": null,
+        "authRequired": false,
+        "failure": null,
+        "authTarget": null,
+        "keyringLocked": false
+      },
+      {
+        "serverId": "linear",
+        "ok": true,
+        "toolCount": 1,
+        "error": null,
+        "authRequired": false,
+        "failure": null,
+        "authTarget": null,
+        "keyringLocked": false
+      },
+      {
+        "serverId": "stripe",
+        "ok": true,
+        "toolCount": 12,
+        "error": null,
+        "authRequired": false,
+        "failure": null,
+        "authTarget": null,
+        "keyringLocked": false
+      }
+    ]
+  },
+  "calls": [
+    [
+      "get_audit_log",
+      {
+        "limit": 2147483647
+      }
+    ],
+    ["savings_summary", {}]
+  ]
+}
