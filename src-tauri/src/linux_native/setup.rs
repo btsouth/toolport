@@ -740,6 +740,11 @@ l10n::bind_formatted_dialog_body(&prompt, "Enter {value0}. This value is used on
         .vexpand(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
+    // Natural heights, then scroll: at minimum heights a result page taller than the
+    // window shrinks its status to the icon and cuts off the title.
+    if let Some(viewport) = scroller.child().and_downcast::<gtk::Viewport>() {
+        viewport.set_vscroll_policy(gtk::ScrollablePolicy::Natural);
+    }
     root.append(&scroller);
     root.append(&super::dialog_footer(&[&cancel, &skip, &confirm]));
     dialog.set_content(Some(&root));
@@ -1711,6 +1716,14 @@ mod tests {
             |_, _, _| {
                 Ok(Completion {
                     message: "Claude Code connected. Restart it to load Toolport.".into(),
+                    // Enough moved servers that the page is taller than the window.
+                    servers: (0..8)
+                        .map(|i| crate::registry_controller::SetupServerResult {
+                            name: format!("server-{i}"),
+                            tool_count: 3,
+                            credential_state: "none".into(),
+                        })
+                        .collect(),
                     warnings: vec![
                         "Other servers were not verified during this connection: a".into()
                     ],
@@ -1777,6 +1790,24 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(connect.label().as_deref(), Some("Done"));
+        // The status keeps its title in view, however long the page below it is.
+        let status = descendants(window.upcast_ref())
+            .into_iter()
+            .find_map(|w| w.downcast::<adw::StatusPage>().ok())
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while status.height() == 0 && std::time::Instant::now() < deadline {
+            context.iteration(false);
+        }
+        while context.pending() {
+            context.iteration(false);
+        }
+        let (_, natural, _, _) = status.measure(gtk::Orientation::Vertical, status.width());
+        assert!(
+            status.height() >= natural,
+            "status squeezed to {} of {natural}",
+            status.height()
+        );
         let shown = labels(&window);
         assert!(
             shown
