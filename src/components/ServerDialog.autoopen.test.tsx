@@ -6,7 +6,10 @@ import { ServerDialog } from "./ServerDialog";
 
 // The dialog talks to Tauri on save; stub the surface it touches.
 vi.mock("@/lib/api", () => ({
-  addServer: vi.fn(async () => ({ servers: [], profiles: [] })),
+  addServerWithRows: vi.fn(async () => ({
+    registry: { servers: [], profiles: [] },
+    declaredWithoutValue: [],
+  })),
   updateServer: vi.fn(async () => ({ servers: [], profiles: [] })),
   setSecret: vi.fn(async () => undefined),
   testServer: vi.fn(async () => ({ ok: true, toolCount: 1, error: null })),

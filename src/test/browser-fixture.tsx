@@ -620,6 +620,28 @@ function fixtureAdd(entry: ServerEntry) {
   registry.profiles[0].enabledServerIds.push(saved.id);
   return structuredClone(registry);
 }
+// The dialog's one-step add: secret values go to the (absent) vault, and the
+// server is switched on once every row has a value or a reference.
+function fixtureAddWithRows(entry: ServerEntry) {
+  const declaredWithoutValue = (entry.env ?? [])
+    .filter((row) => !row.source && !row.value?.trim())
+    .map((row) => row.key);
+  const saved = {
+    ...entry,
+    id: `added-${registry.servers.length}`,
+    enabled: declaredWithoutValue.length === 0,
+    env: (entry.env ?? []).map((row) => (row.secret ? { ...row, value: null } : row)),
+    launch: entry.launch && {
+      ...entry.launch,
+      inputs: entry.launch.inputs.map((input) =>
+        input.secret ? { ...input, value: null } : input,
+      ),
+    },
+  };
+  registry.servers.push(saved);
+  if (saved.enabled) registry.profiles[0].enabledServerIds.push(saved.id);
+  return { registry: structuredClone(registry), declaredWithoutValue };
+}
 const calls: Record<string, number> = {};
 const missing: string[] = [];
 Object.assign(window, { toolportFixture: { calls, missing, driftEvents } });
@@ -765,6 +787,8 @@ mockIPC(
         return setupCatalog;
       case "add_server":
         return fixtureAdd(args.entry as ServerEntry);
+      case "add_server_with_rows":
+        return fixtureAddWithRows(args.entry as ServerEntry);
       case "test_secret_reference":
         return null;
       case "set_secret_reference": {

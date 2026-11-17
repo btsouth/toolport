@@ -1081,6 +1081,18 @@ export function addServer(entry: ServerEntry): Promise<Registry> {
   return invoke<Registry>("add_server", { entry });
 }
 
+/**
+ * Add a server from the Add server dialog in one step: its values (secret ones
+ * included), references and launch inputs are saved together or not at all.
+ * `declaredWithoutValue` lists the keys saved without a value; the server stays
+ * off until they have one.
+ */
+export function addServerWithRows(
+  entry: ServerEntry,
+): Promise<{ registry: Registry; declaredWithoutValue: string[] }> {
+  return invoke("add_server_with_rows", { entry });
+}
+
 /** Add a catalog entry as a registry server (the user vaults any keys after). */
 export function addCatalogServer(entry: CatalogEntry): Promise<Registry> {
   const server: ServerEntry = {

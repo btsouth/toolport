@@ -959,6 +959,8 @@ pub struct ValueRow {
 /// What [`add_server_with_rows`] saved.
 pub struct RowsAddOutcome {
     pub registry: Registry,
+    /// The added server's id.
+    pub id: String,
     /// Keys saved without a usable value (blank or a placeholder); the user adds
     /// them in Credentials.
     pub declared_without_value: Vec<String>,
@@ -972,6 +974,57 @@ pub struct RowsAddOutcome {
 pub fn add_server_with_rows(
     fields: ServerFields,
     rows: Vec<ValueRow>,
+) -> Result<RowsAddOutcome, String> {
+    add_server_with_values(fields, rows, None)
+}
+
+/// React's Add server dialog sends its whole entry: split it into what
+/// [`add_server_with_values`] takes. Every env row is a value row; a row with a
+/// `source` is a password manager reference.
+pub fn values_from_entry(
+    entry: ServerEntry,
+) -> Result<(ServerFields, Vec<ValueRow>, Option<registry::LaunchConfig>), String> {
+    let rows = entry
+        .env
+        .iter()
+        .map(|env| {
+            let reference = crate::secret_refs::source(&env.unknown_fields)
+                .map_err(|error| error.to_string())?
+                .map(str::to_string);
+            Ok(ValueRow {
+                key: env.key.clone(),
+                value: env.value.clone().unwrap_or_default(),
+                secret: env.secret,
+                portable: env
+                    .unknown_fields
+                    .get("portable")
+                    .and_then(serde_json::Value::as_bool),
+                reference,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let fields = ServerFields {
+        sync_local_only: entry.unknown_fields.get("syncLocalOnly")
+            == Some(&serde_json::Value::Bool(true)),
+        initialize_timeout_ms: Some(entry.initialize_timeout_ms),
+        name: entry.name,
+        transport: entry.transport,
+        command: entry.command,
+        args: entry.args,
+        url: entry.url,
+        cwd: entry.cwd,
+        inherit_env: Some(entry.inherit_env),
+        hide_prompts: Some(entry.hide_prompts),
+    };
+    Ok((fields, rows, entry.launch))
+}
+
+/// [`add_server_with_rows`] with the launch inputs a pasted command line made:
+/// their secret values are saved in the same step as the rows' values.
+pub fn add_server_with_values(
+    fields: ServerFields,
+    rows: Vec<ValueRow>,
+    launch: Option<registry::LaunchConfig>,
 ) -> Result<RowsAddOutcome, String> {
     let rows: Vec<ValueRow> = rows
         .into_iter()
@@ -989,6 +1042,30 @@ pub fn add_server_with_rows(
         ));
     }
     let mut entry = entry_from_fields(fields)?;
+    if let Some(mut launch) = launch {
+        launch.validate(&entry.args, true)?;
+        // Every row still needs a value before the server is switched on, as
+        // without launch inputs (the import lists them all then).
+        for row in &rows {
+            if !launch.required_env.contains(&row.key) {
+                launch.required_env.push(row.key.clone());
+            }
+        }
+        entry.launch = Some(launch);
+    }
+    // A launch input read from a password manager has its value there.
+    let referenced_inputs: Vec<String> = entry
+        .launch
+        .iter()
+        .flat_map(|launch| &launch.inputs)
+        .filter(|input| {
+            matches!(
+                crate::secret_refs::source(&input.unknown_fields),
+                Ok(Some(_))
+            )
+        })
+        .map(|input| input.key.clone())
+        .collect();
     let remote = entry.transport != "stdio";
     entry.env = rows
         .iter()
@@ -1051,14 +1128,15 @@ pub fn add_server_with_rows(
         Some(&definition),
         Some(&choices),
     )?;
-    let (registry, missing) = crate::import_credentials::transaction(|writes| {
+    let (registry, id, missing) = crate::import_credentials::transaction(|writes| {
         let current = read_registry_exact_or_default()?;
         let mut registry = current.clone();
         let mut entry = import.entry.clone();
         entry.enabled = false;
         let id = registry.add_server(entry);
-        let missing =
+        let mut missing =
             import.transfer_into(&id, writes, current.servers.iter().any(|s| s.id == id))?;
+        missing.retain(|key| !referenced_inputs.contains(key));
         if missing.is_empty() {
             let profile = registry.default_access_id();
             if apply_server_enabled(&mut registry, &profile, &id, true, false).is_ok() {
@@ -1066,7 +1144,7 @@ pub fn add_server_with_rows(
             }
         }
         registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
-        Ok((commit_imports(&current, registry)?, missing))
+        Ok((commit_imports(&current, registry)?, id, missing))
     })?;
     // Name each key as its row did, not as it is stored (the bearer slot).
     let declared_without_value = missing
@@ -1083,6 +1161,7 @@ pub fn add_server_with_rows(
         .collect();
     Ok(RowsAddOutcome {
         registry,
+        id,
         declared_without_value,
     })
 }
@@ -6310,6 +6389,142 @@ API_KEY = "synthetic-first-origin"
             });
             assert!(outcome.is_err());
             assert!(registry::load().unwrap().servers.is_empty());
+        });
+    }
+
+    /// The entry React's Add server dialog sends: a typed secret, a plain value
+    /// with its sync choice, a password manager row, and a pasted command line
+    /// with a plain and a secret launch input.
+    fn react_entry(extra_env: serde_json::Value) -> ServerEntry {
+        let mut env = vec![
+            serde_json::json!({"key": "API_KEY", "value": "sk-live-typed", "secret": true}),
+            serde_json::json!({"key": "REGION", "value": "eu", "secret": false, "portable": true}),
+            serde_json::json!({"key": "VAULT_TOKEN", "value": null, "secret": true,
+                "source": {"ref": "op://Private/Server/token"}}),
+        ];
+        if !extra_env.is_null() {
+            env.push(extra_env);
+        }
+        serde_json::from_value(serde_json::json!({
+            "id": "", "enabled": false, "syncLocalOnly": true, "name": "demo",
+            "transport": "stdio", "command": "npx",
+            "args": ["-y", "example-server", "<launch-input>", "<launch-input>"],
+            "launch": {
+                "inputs": [
+                    {"key": "ACCOUNT", "label": "Account", "secret": false,
+                     "required": true, "value": "AC123"},
+                    {"key": "SECRET", "label": "Secret", "secret": true,
+                     "required": true, "value": "launch-secret"}
+                ],
+                "bindings": [
+                    {"index": 2, "parts": [{"kind": "input", "key": "ACCOUNT"}]},
+                    {"index": 3, "parts": [{"kind": "input", "key": "SECRET"}]}
+                ]
+            },
+            "env": env, "url": null, "source": "manual", "cwd": null,
+            "inheritEnv": true, "hidePrompts": false, "initializeTimeoutMs": 45000
+        }))
+        .unwrap()
+    }
+
+    fn add_react(entry: ServerEntry) -> Result<RowsAddOutcome, String> {
+        let (fields, rows, launch) = values_from_entry(entry)?;
+        add_server_with_values(fields, rows, launch)
+    }
+
+    /// React's new-server save is one step: every value, the reference and the
+    /// launch inputs' secret are saved together, with one keychain unlock, and
+    /// no secret is left in the registry.
+    #[test]
+    fn react_add_saves_values_and_launch_inputs_in_one_step() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let outcome = add_react(react_entry(serde_json::Value::Null)).unwrap();
+            assert!(outcome.declared_without_value.is_empty());
+            assert_eq!(saved_servers(), vec![("demo".into(), true)]);
+            let id = outcome.id.clone();
+            let get = |key: &str| crate::secrets::get_secret_result(&id, key).unwrap();
+            assert_eq!(get("API_KEY").as_deref(), Some("sk-live-typed"));
+            assert_eq!(get("SECRET").as_deref(), Some("launch-secret"));
+            let server = registry::load().unwrap().servers.remove(0);
+            let text = serde_json::to_string(&server).unwrap();
+            for secret in ["sk-live-typed", "launch-secret"] {
+                assert!(!text.contains(secret), "{text}");
+            }
+            assert!(text.contains("AC123"), "{text}");
+            assert!(text.contains("op://Private/Server/token"), "{text}");
+            assert_eq!(
+                server.unknown_fields.get("syncLocalOnly"),
+                Some(&serde_json::json!(true))
+            );
+            assert!(server.inherit_env);
+            assert_eq!(server.initialize_timeout_ms, Some(45000));
+            let region = server.env.iter().find(|e| e.key == "REGION").unwrap();
+            assert_eq!(region.value.as_deref(), Some("eu"));
+            assert_eq!(
+                region.unknown_fields.get("portable"),
+                Some(&serde_json::json!(true))
+            );
+        });
+    }
+
+    /// A failed keychain write, the launch input's included, saves nothing; a
+    /// locked keychain the user does not unlock is asked once for all of them.
+    #[test]
+    fn react_add_saves_nothing_when_a_write_fails() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut outcome = None;
+            let prompts = crate::secrets::locked_store::write_prompts_during(|| {
+                outcome = Some(add_react(react_entry(serde_json::Value::Null)));
+            });
+            assert!(outcome.unwrap().is_err());
+            assert_eq!(prompts.len(), 1, "{prompts:?}");
+            assert!(registry::load().unwrap().servers.is_empty());
+        });
+        for key in ["API_KEY", "SECRET"] {
+            crate::secrets::tests::with_isolated_vault(|| {
+                let outcome = crate::secrets::tests::with_failed_write(key, || {
+                    add_react(react_entry(serde_json::Value::Null))
+                });
+                assert!(outcome.is_err(), "{key}");
+                assert!(registry::load().unwrap().servers.is_empty(), "{key}");
+                for stored in ["API_KEY", "SECRET"] {
+                    assert_eq!(
+                        crate::secrets::get_secret_result("demo", stored).unwrap(),
+                        None,
+                        "{key}: {stored} left behind"
+                    );
+                }
+            });
+        }
+    }
+
+    /// With launch inputs, a row with no value still keeps the server off and
+    /// is named; a launch input read from a password manager does not.
+    #[test]
+    fn react_add_with_launch_inputs_still_names_rows_without_a_value() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let outcome = add_react(react_entry(
+                serde_json::json!({"key": "EMPTY", "value": null, "secret": true}),
+            ))
+            .unwrap();
+            assert_eq!(outcome.declared_without_value, vec!["EMPTY".to_string()]);
+            assert_eq!(saved_servers(), vec![("demo".into(), false)]);
+        });
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut entry = react_entry(serde_json::Value::Null);
+            let input = &mut entry.launch.as_mut().unwrap().inputs[1];
+            input.value = None;
+            input.unknown_fields.insert(
+                "source".into(),
+                serde_json::json!({"ref": "op://Private/Server/secret"}),
+            );
+            let outcome = add_react(entry).unwrap();
+            assert!(
+                outcome.declared_without_value.is_empty(),
+                "{:?}",
+                outcome.declared_without_value
+            );
+            assert_eq!(saved_servers(), vec![("demo".into(), true)]);
         });
     }
 

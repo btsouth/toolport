@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import type { ProbeResult, Registry, ServerEntry } from "@/lib/types";
 
 const api = vi.hoisted(() => ({
-  addServer: vi.fn(),
+  addServerWithRows: vi.fn(),
   addSnippetServers: vi.fn(),
   setServerEnabled: vi.fn(),
   parseServerSnippet: vi.fn(),
@@ -50,6 +50,10 @@ const failure: ProbeResult = {
   error: "The updated command could not connect.",
   authRequired: false,
 };
+
+function rowsResult(registry: Registry, declaredWithoutValue: string[] = []) {
+  return { registry, declaredWithoutValue };
+}
 
 function savedRegistry(id: string): Registry {
   return {
@@ -102,7 +106,7 @@ describe("ServerDialog", () => {
     expect(screen.getByText(/Enter the command to run/)).toBeInTheDocument();
   });
 
-  it("vaults composed launch inputs and clears bindings when arguments change", async () => {
+  it("saves composed launch inputs with the server and clears bindings when arguments change", async () => {
     const initial: ServerEntry = {
       id: "",
       name: "Twilio",
@@ -133,27 +137,27 @@ describe("ServerDialog", () => {
       },
     };
     const added = savedRegistry("twilio");
-    api.addServer.mockResolvedValue(added);
-    api.setLaunchSecret.mockResolvedValue(added);
+    api.addServerWithRows.mockResolvedValue(rowsResult(added));
     const user = userEvent.setup();
     render(<ServerDialog autoOpen initial={initial} onSaved={vi.fn()} />);
     await user.type(screen.getByLabelText("Account SID *"), "AC123");
     await user.type(screen.getByLabelText("API Key SID *"), "SK123");
     await user.type(screen.getByLabelText("API Secret *"), "private-value");
     await user.click(screen.getByRole("button", { name: "Add" }));
-    await waitFor(() => expect(api.setLaunchSecret).toHaveBeenCalledTimes(2));
-    expect(api.addServer).toHaveBeenCalledWith(
+    // One call carries the secret inputs too; nothing is stored separately.
+    await waitFor(() => expect(api.addServerWithRows).toHaveBeenCalledTimes(1));
+    expect(api.addServerWithRows).toHaveBeenCalledWith(
       expect.objectContaining({
         launch: expect.objectContaining({
           inputs: [
             expect.objectContaining({ value: "AC123" }),
-            expect.objectContaining({ value: null }),
-            expect.objectContaining({ value: null }),
+            expect.objectContaining({ value: "SK123" }),
+            expect.objectContaining({ value: "private-value" }),
           ],
         }),
       }),
     );
-    expect(api.setLaunchSecret).toHaveBeenCalledWith("twilio", "SECRET", "private-value");
+    expect(api.setLaunchSecret).not.toHaveBeenCalled();
 
     render(<ServerDialog autoOpen initial={initial} onSaved={vi.fn()} />);
     await user.type(screen.getAllByLabelText("Arguments")[0], " extra");
@@ -396,22 +400,13 @@ describe("ServerDialog", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it("reports partial secret failure and retries by updating the added server", async () => {
+  it("saves a new server in one call and keeps the dialog open with its values when that fails", async () => {
     const added = savedRegistry("demo");
-    const afterFirstSecret = savedRegistry("demo");
-    const updated = savedRegistry("demo");
-    const afterRetryA = savedRegistry("demo");
-    const afterRetryB = savedRegistry("demo");
-    const afterRetryC = savedRegistry("demo");
-    api.addServer.mockResolvedValueOnce(added);
-    api.updateServer.mockResolvedValueOnce(updated);
-    api.setSecret
-      .mockResolvedValueOnce(afterFirstSecret)
-      .mockRejectedValueOnce(new Error("keychain locked"))
-      .mockRejectedValueOnce(new Error("keychain locked"))
-      .mockResolvedValueOnce(afterRetryA)
-      .mockResolvedValueOnce(afterRetryB)
-      .mockResolvedValueOnce(afterRetryC);
+    api.addServerWithRows
+      .mockRejectedValueOnce(
+        "Keychain unavailable. Unlock it and retry importing. Client config unchanged.",
+      )
+      .mockResolvedValueOnce(rowsResult(added));
     const onSaved = vi.fn();
     const user = userEvent.setup();
 
@@ -431,32 +426,54 @@ describe("ServerDialog", () => {
 
     await user.click(screen.getByRole("button", { name: "Add" }));
 
-    await waitFor(() => expect(api.setSecret).toHaveBeenCalledTimes(3));
-    expect(api.setSecret).toHaveBeenNthCalledWith(1, "demo", "KEY_A", "secret-0");
-    expect(api.setSecret).toHaveBeenNthCalledWith(2, "demo", "KEY_B", "secret-1");
-    expect(api.setSecret).toHaveBeenNthCalledWith(3, "demo", "KEY_C", "secret-2");
-    expect(onSaved).toHaveBeenLastCalledWith(afterFirstSecret);
-    expect(toast.warning).toHaveBeenCalledWith(
-      "Added demo, but couldn't save: KEY_B, KEY_C",
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "Couldn't save demo: Keychain unavailable. Unlock it and retry importing. Client config unchanged.",
+      ),
     );
-    expect(screen.getByText("Edit server")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    expect(api.addServerWithRows).toHaveBeenCalledTimes(1);
+    const sent = api.addServerWithRows.mock.calls[0][0] as ServerEntry;
+    expect(sent.env).toEqual([
+      { key: "KEY_A", value: "secret-0", secret: true },
+      { key: "KEY_B", value: "secret-1", secret: true },
+      { key: "KEY_C", value: "secret-2", secret: true },
+    ]);
+    expect(api.setSecret).not.toHaveBeenCalled();
+    expect(api.updateServer).not.toHaveBeenCalled();
+    expect(onSaved).not.toHaveBeenCalled();
+    // Still adding, with everything typed.
+    expect(screen.getByText("Add MCP server")).toBeInTheDocument();
+    expect(
+      screen.getAllByPlaceholderText("value").map((i) => (i as HTMLInputElement).value),
+    ).toEqual(["secret-0", "secret-1", "secret-2"]);
 
-    await user.click(screen.getByRole("button", { name: "Save" }));
+    await user.click(screen.getByRole("button", { name: "Add" }));
 
-    await waitFor(() => expect(api.setSecret).toHaveBeenCalledTimes(6));
-    expect(api.addServer).toHaveBeenCalledTimes(1);
-    expect(api.updateServer).toHaveBeenCalledTimes(1);
-    expect(api.updateServer).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "demo", name: "demo" }),
+    await waitFor(() => expect(api.addServerWithRows).toHaveBeenCalledTimes(2));
+    expect(api.addServerWithRows.mock.calls[1][0]).toEqual(sent);
+    expect(onSaved).toHaveBeenLastCalledWith(added);
+    expect(toast.success).toHaveBeenCalledWith("Added demo");
+    expect(screen.queryByText("Add MCP server")).not.toBeInTheDocument();
+  });
+
+  it("names the keys a new server was saved without", async () => {
+    api.addServerWithRows.mockResolvedValueOnce(
+      rowsResult(savedRegistry("demo"), ["KEY_B"]),
     );
-    expect(onSaved).toHaveBeenLastCalledWith(afterRetryC);
-    expect(toast.success).toHaveBeenCalledWith("Saved demo");
-    expect(screen.queryByText("Edit server")).not.toBeInTheDocument();
+    const user = userEvent.setup();
+    render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    await fillServer(user, "npx");
+    await user.click(screen.getByRole("button", { name: "Add" }));
+    await waitFor(() =>
+      expect(toast.success).toHaveBeenCalledWith(
+        "Added demo. Add a value for KEY_B in Credentials",
+      ),
+    );
   });
 
   it("leaves a new plain value's sync choice to the default unless changed", async () => {
-    api.addServer.mockResolvedValueOnce(savedRegistry("demo"));
+    api.addServerWithRows.mockResolvedValueOnce(rowsResult(savedRegistry("demo")));
     const user = userEvent.setup();
     render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
     await user.click(screen.getByRole("button", { name: "Add server" }));
@@ -485,8 +502,8 @@ describe("ServerDialog", () => {
 
     await user.click(screen.getByRole("button", { name: "Add" }));
 
-    await waitFor(() => expect(api.addServer).toHaveBeenCalledTimes(1));
-    const env = api.addServer.mock.calls[0][0].env;
+    await waitFor(() => expect(api.addServerWithRows).toHaveBeenCalledTimes(1));
+    const env = api.addServerWithRows.mock.calls[0][0].env;
     expect(env).toEqual([
       { key: "REGION", value: "west", secret: false },
       { key: "NOTES_DIR", value: "/home/me/notes", secret: false, portable: true },
@@ -619,7 +636,7 @@ describe("ServerDialog", () => {
     api.parseServerSnippet.mockResolvedValueOnce([
       { name: "demo", transport: "stdio", command: "node", args, url: null, env: [] },
     ]);
-    api.addServer.mockResolvedValueOnce(savedRegistry("demo"));
+    api.addServerWithRows.mockResolvedValueOnce(rowsResult(savedRegistry("demo")));
     const user = userEvent.setup();
     render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
     await user.click(screen.getByRole("button", { name: "Add server" }));
@@ -631,8 +648,8 @@ describe("ServerDialog", () => {
     );
     await user.click(screen.getByRole("button", { name: "Add" }));
 
-    await waitFor(() => expect(api.addServer).toHaveBeenCalledTimes(1));
-    expect(api.addServer.mock.calls[0][0].args).toEqual(args);
+    await waitFor(() => expect(api.addServerWithRows).toHaveBeenCalledTimes(1));
+    expect(api.addServerWithRows.mock.calls[0][0].args).toEqual(args);
   });
 
   it("refuses two variables with one name, as GTK does", async () => {
@@ -844,13 +861,13 @@ describe("ServerDialog", () => {
 
 it("marks a new server local-only in its first saved definition", async () => {
   const user = userEvent.setup();
-  api.addServer.mockResolvedValue(savedRegistry("demo"));
+  api.addServerWithRows.mockResolvedValue(rowsResult(savedRegistry("demo")));
   render(<ServerDialog autoOpen onSaved={vi.fn()} />);
   await fillServer(user, "echo");
   await user.click(screen.getByRole("checkbox", { name: "This machine only" }));
   await user.click(screen.getByRole("button", { name: "Add" }));
   await waitFor(() =>
-    expect(api.addServer).toHaveBeenCalledWith(
+    expect(api.addServerWithRows).toHaveBeenCalledWith(
       expect.objectContaining({ syncLocalOnly: true }),
     ),
   );

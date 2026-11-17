@@ -17,9 +17,8 @@ import {
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
 import {
-  addServer,
+  addServerWithRows,
   addSnippetServers,
-  setServerEnabled,
   parseServerSnippet,
   setSecret,
   setLaunchSecret,
@@ -180,10 +179,7 @@ export function ServerDialog({
   useEffect(() => {
     formRef.current = form;
   });
-  const [partialEdit, setPartialEdit] = useState<{ id: string; name: string } | null>(
-    null,
-  );
-  const currentEditId = editId ?? partialEdit?.id;
+  const currentEditId = editId;
   const isStdio = form.transport === "stdio";
   const initialUsesLocalCommand = initial?.transport === "stdio" || !!initial?.command;
   const editing = currentEditId !== undefined;
@@ -215,7 +211,6 @@ export function ServerDialog({
       return;
     }
     if (next) {
-      setPartialEdit(null);
       setLocalOnly(initial?.syncLocalOnly === true);
       setForm({
         name: initial?.name ?? "",
@@ -449,9 +444,7 @@ export function ServerDialog({
     errors.push(message);
     visibleErrors.push(message);
   }
-  const ownName = editing
-    ? (initial?.name ?? partialEdit?.name)?.trim().toLowerCase()
-    : undefined;
+  const ownName = editing ? initial?.name?.trim().toLowerCase() : undefined;
   const duplicateName =
     !!nameTrim &&
     nameTrim.toLowerCase() !== ownName &&
@@ -499,18 +492,17 @@ export function ServerDialog({
 
   async function handleSave() {
     if (errors.length > 0) return;
+    if (!editing) {
+      await handleAdd();
+      return;
+    }
     const entry = buildEntry(false);
     const declared = envRows.filter((r) => r.key.trim());
-    const wasEditing = editing;
     setBusy(true);
     try {
-      let result = wasEditing ? await updateServer(entry) : await addServer(entry);
-      // Vault any values the user entered now. setSecret keys by server id. For a
-      // new server, add_server appends it, so it's the last entry - resolving by
-      // name would pick the wrong one if two servers share a name.
-      const id = wasEditing
-        ? currentEditId
-        : result.servers[result.servers.length - 1]?.id;
+      let result = await updateServer(entry);
+      // Vault any values the user entered now. setSecret keys by server id.
+      const id = currentEditId;
       const failedKeys: string[] = [];
       if (id) {
         for (const r of declared) {
@@ -533,28 +525,41 @@ export function ServerDialog({
       }
       onSaved(result);
       if (failedKeys.length > 0) {
-        if (!wasEditing && id) setPartialEdit({ id, name: entry.name });
         toast.warning(
-          t(
-            wasEditing
-              ? "Saved {value2}, but couldn't save: {value3}"
-              : "Added {value2}, but couldn't save: {value3}",
-            { value2: entry.name, value3: failedKeys.join(", ") },
-          ),
+          t("Saved {value2}, but couldn't save: {value3}", {
+            value2: entry.name,
+            value3: failedKeys.join(", "),
+          }),
         );
         return;
       }
-      if (!wasEditing && id && declared.every((r) => r.value.trim()))
-        result = await setServerEnabled(
-          result.defaultAccessContextId ?? result.activeProfileId ?? "",
-          id,
-          true,
-        );
+      toast.success(translate("Saved {name}", { name: entry.name }));
+      onOpenChange(false);
+    } catch (e) {
+      toastError(
+        t("Couldn't save {value1}: {value2}", { value1: entry.name, value2: String(e) }),
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // A new server is saved in one step with its values and launch inputs, or not
+  // at all: on an error the dialog stays open with what was typed.
+  async function handleAdd() {
+    const entry = buildEntry(true);
+    setBusy(true);
+    try {
+      const { registry: result, declaredWithoutValue } = await addServerWithRows(entry);
       onSaved(result);
+      const added = translate("Added {name}", { name: entry.name });
       toast.success(
-        wasEditing
-          ? translate("Saved {name}", { name: entry.name })
-          : translate("Added {name}", { name: entry.name }),
+        declaredWithoutValue.length > 0
+          ? added +
+              t(". Add a value for {value0} in Credentials", {
+                value0: declaredWithoutValue.join(", "),
+              })
+          : added,
       );
       onOpenChange(false);
     } catch (e) {
