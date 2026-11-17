@@ -13418,18 +13418,14 @@ fn open_server_editor_prefilled(
                         Ok((registry, Vec::new(), Vec::new()))
                     }
                     None => {
-                        let without_value = env
-                            .iter()
-                            .filter(|row| {
-                                !row.key.is_empty()
-                                    && row.value.is_empty()
-                                    && row.reference.is_none()
-                            })
-                            .map(|row| row.key.clone())
-                            .collect();
+                        // All or nothing: a failure leaves the editor open with its values.
                         let outcome =
                             crate::registry_controller::add_server_with_rows(fields, env)?;
-                        Ok::<_, String>((outcome.registry, without_value, outcome.failed))
+                        Ok::<_, String>((
+                            outcome.registry,
+                            outcome.declared_without_value,
+                            Vec::new(),
+                        ))
                     }
                 }
             })

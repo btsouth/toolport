@@ -959,13 +959,16 @@ pub struct ValueRow {
 /// What [`add_server_with_rows`] saved.
 pub struct RowsAddOutcome {
     pub registry: Registry,
-    /// Keys whose typed secret could not be stored.
-    pub failed: Vec<String>,
+    /// Keys saved without a usable value (blank or a placeholder); the user adds
+    /// them in Credentials.
+    pub declared_without_value: Vec<String>,
 }
 
-/// Add a server the way the React dialog saves one: the entry with its plain
-/// values and references, then each typed secret into the keychain, then switch
-/// the server on once every row has a value.
+/// Add a server from Add server's rows in one step, as a pasted server is added:
+/// the entry, its plain values and references, and every typed secret are saved
+/// together or not at all, with one keychain unlock. The server is switched on
+/// (and added to the default access) once every row has a value; a password
+/// manager row leaves it off, as the React dialog does.
 pub fn add_server_with_rows(
     fields: ServerFields,
     rows: Vec<ValueRow>,
@@ -986,6 +989,7 @@ pub fn add_server_with_rows(
         ));
     }
     let mut entry = entry_from_fields(fields)?;
+    let remote = entry.transport != "stdio";
     entry.env = rows
         .iter()
         .map(|row| {
@@ -1004,34 +1008,76 @@ pub fn add_server_with_rows(
             }
             registry::EnvVar {
                 key: row.key.clone(),
-                value: (row.reference.is_none() && !row.secret && !row.value.is_empty())
-                    .then(|| row.value.clone()),
+                value: None,
                 secret: row.reference.is_some() || row.secret,
                 unknown_fields,
             }
         })
         .collect();
-    let (mut registry, id) = add_reviewed_entry(entry)?;
-    let mut failed = Vec::new();
-    for row in &rows {
-        if row.reference.is_some() || row.value.is_empty() || !row.secret {
-            continue;
+    // The rows' values, for the import to sort into the vault and the entry.
+    let definition = serde_json::json!({"env": rows
+        .iter()
+        .filter(|row| row.reference.is_none())
+        .map(|row| {
+            let value = row.value.trim();
+            // A remote server's Authorization is a bearer token; a bare one gets its scheme.
+            let value = if remote
+                && row.key.eq_ignore_ascii_case("authorization")
+                && !value.is_empty()
+                && !value.contains(char::is_whitespace)
+            {
+                format!("Bearer {value}")
+            } else {
+                row.value.clone()
+            };
+            (row.key.clone(), serde_json::Value::String(value))
+        })
+        .collect::<serde_json::Map<_, _>>()});
+    let choices = rows
+        .iter()
+        .filter(|row| row.reference.is_none())
+        .map(|row| (row.key.clone(), row.secret))
+        .collect();
+    let import = crate::import_credentials::Import::prepare_with_choices(
+        entry,
+        Some(&definition),
+        Some(&choices),
+    )?;
+    let has_reference = rows.iter().any(|row| row.reference.is_some());
+    let (registry, missing) = crate::import_credentials::transaction(|writes| {
+        let current = read_registry_exact_or_default()?;
+        let mut registry = current.clone();
+        let mut entry = import.entry.clone();
+        entry.enabled = false;
+        let id = registry.add_server(entry);
+        let missing =
+            import.transfer_into(&id, writes, current.servers.iter().any(|s| s.id == id))?;
+        if missing.is_empty() && !has_reference {
+            let profile = registry.default_access_id();
+            if apply_server_enabled(&mut registry, &profile, &id, true, false).is_ok() {
+                let _ = registry.set_access_server(&profile, &id, true);
+            }
         }
-        match set_server_secret_with(&id, &row.key, &row.value, |id, key| {
-            Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0)
-        }) {
-            Ok(saved) => registry = saved,
-            Err(_) => failed.push(row.key.clone()),
-        }
-    }
-    if failed.is_empty() && rows.iter().all(|row| !row.value.trim().is_empty()) {
-        registry = registry::update(|r| {
-            let profile = r.default_access_id();
-            apply_server_enabled(r, &profile, &id, true, false)
-        })?
-        .0;
-    }
-    Ok(RowsAddOutcome { registry, failed })
+        registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
+        Ok((commit_imports(&current, registry)?, missing))
+    })?;
+    // Name each key as its row did, not as it is stored (the bearer slot).
+    let declared_without_value = missing
+        .into_iter()
+        .map(|key| {
+            if key == crate::secrets::HTTP_AUTH_KEY {
+                rows.iter()
+                    .find(|row| row.key.eq_ignore_ascii_case("authorization"))
+                    .map_or(key, |row| row.key.clone())
+            } else {
+                key
+            }
+        })
+        .collect();
+    Ok(RowsAddOutcome {
+        registry,
+        declared_without_value,
+    })
 }
 
 /// [`add_snippet_server`] with the user's Keychain choice per key; a key absent
@@ -3333,13 +3379,22 @@ pub fn set_server_secret_with(
     let (key, value, bearer) = credential_slot(server_id, key, value)?;
     let key = normalize_secret_key(key)?;
     let _lock = acquire_auth_lock(server_id)?;
-    if bearer {
-        // Same as a token set from the server's sign-in settings: a stale
-        // sign-in must not outlive the token typed over it.
+    // Same as a token set from the server's sign-in settings: a stale sign-in
+    // must not outlive the token typed over it. Read first, so a failed save
+    // puts the sign-in back.
+    let sign_in = if bearer {
+        let saved = crate::remote::OAUTH_STATE_KEYS
+            .iter()
+            .map(|key| Ok((*key, crate::secrets::get_secret_result(server_id, key)?)))
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(|error| could_not_clear_sign_in_state(&error))?;
         crate::remote::clear_oauth_state(server_id)
             .map_err(|error| could_not_clear_sign_in_state(&error))?;
-    }
-    set_server_secret_using(
+        saved
+    } else {
+        Vec::new()
+    };
+    let result = set_server_secret_using(
         server_id,
         &key,
         value,
@@ -3347,7 +3402,15 @@ pub fn set_server_secret_with(
         crate::secrets::set_secret,
         crate::secrets::delete_secret,
         write_registry,
-    )
+    );
+    if result.is_err() {
+        for (key, value) in sign_in {
+            if let Some(value) = value {
+                let _ = crate::secrets::set_secret(server_id, key, &value);
+            }
+        }
+    }
+    result
 }
 
 pub fn delete_server_secret_with(
@@ -3398,7 +3461,13 @@ fn credential_slot<'a>(
         .unknown_fields
         .get("headerKeys")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|headers| headers.iter().any(|h| h["key"] == key));
+        .is_some_and(|headers| {
+            headers.iter().any(|h| {
+                h["key"]
+                    .as_str()
+                    .is_some_and(|name| name.trim().eq_ignore_ascii_case(key.trim()))
+            })
+        });
     if server.transport == "stdio" || header_row {
         return Ok((key, value, false));
     }
@@ -6039,7 +6108,7 @@ API_KEY = "synthetic-first-origin"
                 let fields = fields("demo", "stdio");
                 let id = if shell == "gtk" {
                     let outcome = add_server_with_rows(fields, rows.clone()).unwrap();
-                    assert!(outcome.failed.is_empty());
+                    assert_eq!(outcome.declared_without_value, Vec::<String>::new());
                     outcome.registry.servers[0].id.clone()
                 } else {
                     let mut entry = entry_from_fields(fields).unwrap();
@@ -6070,6 +6139,276 @@ API_KEY = "synthetic-first-origin"
             !gtk.2,
             "a reference row has no typed value, so neither shell switches it on"
         );
+    }
+
+    fn row(key: &str, value: &str, secret: bool) -> ValueRow {
+        ValueRow {
+            key: key.into(),
+            value: value.into(),
+            secret,
+            ..Default::default()
+        }
+    }
+
+    /// Each saved server: its id, whether it is on in the default access, and
+    /// whether that access lists it.
+    fn saved_servers() -> Vec<(String, bool)> {
+        let registry = registry::load().unwrap();
+        let profile = registry.default_access_id();
+        registry
+            .servers
+            .iter()
+            .map(|s| (s.name.clone(), registry.is_enabled(&profile, &s.id)))
+            .collect()
+    }
+
+    /// A locked keychain the user does not unlock: Add server asks once for
+    /// all its keychain rows, saves nothing and reports the failure, so the
+    /// editor stays open with the values.
+    #[test]
+    fn rows_save_nothing_and_ask_once_when_the_keychain_stays_locked() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut outcome = None;
+            let prompts = crate::secrets::locked_store::write_prompts_during(|| {
+                outcome = Some(add_server_with_rows(
+                    fields("demo", "stdio"),
+                    ["API_KEY", "DB_PASSWORD", "SESSION_TOKEN"]
+                        .iter()
+                        .map(|key| row(key, &format!("sk-live-{key}"), true))
+                        .collect(),
+                ));
+            });
+            assert!(outcome.unwrap().is_err());
+            assert_eq!(prompts.len(), 1, "{prompts:?}");
+            assert!(registry::load().unwrap().servers.is_empty());
+        });
+        crate::secrets::tests::with_isolated_vault(|| {
+            let outcome = crate::secrets::tests::with_failed_write("API_KEY", || {
+                add_server_with_rows(
+                    fields("demo", "stdio"),
+                    vec![
+                        row("API_KEY", "sk-live-typed", true),
+                        row("REGION", "eu", false),
+                    ],
+                )
+            });
+            assert!(outcome.is_err());
+            assert!(registry::load().unwrap().servers.is_empty());
+        });
+    }
+
+    /// Authorization pasted onto a remote server: a Basic value is refused
+    /// before anything is saved; a bare or Bearer token is the bearer token,
+    /// and with every value present the server is switched on.
+    #[test]
+    fn rows_refuse_basic_authorization_and_store_bearer_tokens() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let Err(error) = add_server_with_rows(
+                fields("demo", "http"),
+                vec![row("Authorization", "Basic dXNlcjpwYXNz", true)],
+            ) else {
+                panic!("a Basic header was saved");
+            };
+            assert_eq!(
+                error,
+                "This server uses unsupported HTTP authentication. Keep its native entry."
+            );
+            assert!(registry::load().unwrap().servers.is_empty());
+        });
+        for (value, keychain) in [
+            ("bare-token", true),
+            ("Bearer typed-token", true),
+            ("Bearer typed-token", false),
+        ] {
+            crate::secrets::tests::with_isolated_vault(|| {
+                let outcome = add_server_with_rows(
+                    fields("demo", "http"),
+                    vec![row("Authorization", value, keychain)],
+                )
+                .unwrap();
+                assert_eq!(outcome.declared_without_value, Vec::<String>::new());
+                let server = outcome.registry.servers[0].clone();
+                assert!(!serde_json::to_string(&server).unwrap().contains("token"));
+                assert_eq!(
+                    crate::secrets::get_secret_result(&server.id, crate::secrets::HTTP_AUTH_KEY)
+                        .unwrap()
+                        .as_deref(),
+                    Some(value.trim_start_matches("Bearer ")),
+                    "{value}"
+                );
+                assert_eq!(saved_servers(), vec![("demo".into(), true)], "{value}");
+            });
+        }
+    }
+
+    /// A password manager row leaves the new server off; switching it on later
+    /// works, since its value is read from the password manager at start.
+    #[test]
+    fn a_server_with_a_password_manager_row_can_be_switched_on() {
+        for transport in ["stdio", "http"] {
+            for reviewed in [false, true] {
+                crate::secrets::tests::with_isolated_vault(|| {
+                    let key = if transport == "stdio" {
+                        "VAULT_TOKEN"
+                    } else {
+                        "Authorization"
+                    };
+                    let outcome = add_server_with_rows(
+                        fields("demo", transport),
+                        vec![ValueRow {
+                            key: key.into(),
+                            secret: true,
+                            reference: Some("op://Private/Server/token".into()),
+                            ..Default::default()
+                        }],
+                    )
+                    .unwrap();
+                    let id = outcome.registry.servers[0].id.clone();
+                    let profile = outcome.registry.default_access_id();
+                    assert!(!outcome.registry.is_enabled(&profile, &id));
+                    let registry = set_server_enabled(&profile, &id, true, reviewed)
+                        .unwrap_or_else(|e| panic!("{transport} reviewed={reviewed}: {e}"));
+                    assert!(registry.is_enabled(&profile, &id));
+                });
+            }
+        }
+    }
+
+    /// With a named access set as the default, a server saved with a keychain
+    /// row is switched on in that set, as any other added server is.
+    #[test]
+    fn rows_add_the_server_to_a_named_default_access() {
+        for rows in [
+            vec![row("API_KEY", "sk-live-typed", true)],
+            vec![row("REGION", "eu", false)],
+        ] {
+            crate::secrets::tests::with_isolated_vault(|| {
+                let (_, profile) = registry::update(|r| {
+                    let id = r.add_profile("Work");
+                    r.set_default_access(Some(&id))?;
+                    Ok(id)
+                })
+                .unwrap();
+                add_server_with_rows(fields("demo", "stdio"), rows.clone()).unwrap();
+                let registry = registry::load().unwrap();
+                let id = registry.servers[0].id.clone();
+                let members = &registry
+                    .profiles
+                    .iter()
+                    .find(|p| p.id == profile)
+                    .unwrap()
+                    .enabled_server_ids;
+                assert!(members.contains(&id), "{rows:?}: {members:?}");
+            });
+        }
+    }
+
+    /// A placeholder is no value: the server is saved once, off, and the key is
+    /// reported as needing a value, whether the row is plain or in the keychain.
+    #[test]
+    fn rows_with_a_placeholder_save_the_server_once_and_off() {
+        for (value, secret) in [
+            ("${API_BASE}", false),
+            ("${API_KEY}", true),
+            ("YOUR_API_KEY", true),
+            ("   ", true),
+        ] {
+            crate::secrets::tests::with_isolated_vault(|| {
+                let outcome = add_server_with_rows(
+                    fields("demo", "stdio"),
+                    vec![row("API_KEY", value, secret)],
+                )
+                .unwrap_or_else(|e| panic!("{value}: {e}"));
+                assert_eq!(outcome.declared_without_value, vec!["API_KEY".to_string()]);
+                assert_eq!(saved_servers(), vec![("demo".into(), false)], "{value}");
+                let id = outcome.registry.servers[0].id.clone();
+                assert_eq!(
+                    crate::secrets::get_secret_result(&id, "API_KEY").unwrap(),
+                    None
+                );
+            });
+        }
+    }
+
+    /// A token typed over a sign-in clears the sign-in; a failed save puts it
+    /// back, so the user is not left signed out by a save that did not happen.
+    #[test]
+    fn a_typed_token_replaces_a_sign_in_only_when_it_is_saved() {
+        let signed_in = || {
+            let (_, id) =
+                add_reviewed_entry(entry_from_fields(fields("demo", "http")).unwrap()).unwrap();
+            crate::secrets::set_secret(&id, crate::remote::OAUTH_STATE_KEY, "refresh-state")
+                .unwrap();
+            crate::secrets::set_secret(&id, crate::secrets::HTTP_AUTH_KEY, "oauth-access").unwrap();
+            id
+        };
+        let declare =
+            |id: &str, key: &str| Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0);
+        crate::secrets::tests::with_isolated_vault(|| {
+            let id = signed_in();
+            set_server_secret_with(&id, "Authorization", "Bearer typed", declare).unwrap();
+            assert_eq!(
+                crate::secrets::get_secret_result(&id, crate::remote::OAUTH_STATE_KEY).unwrap(),
+                None
+            );
+        });
+        for failing in ["keychain", "registry"] {
+            crate::secrets::tests::with_isolated_vault(|| {
+                let id = signed_in();
+                let result = if failing == "keychain" {
+                    crate::secrets::tests::with_failed_write(crate::secrets::HTTP_AUTH_KEY, || {
+                        set_server_secret_with(&id, "Authorization", "Bearer typed", declare)
+                    })
+                } else {
+                    set_server_secret_with(&id, "Authorization", "Bearer typed", |_, _| {
+                        Err("synthetic registry failure".into())
+                    })
+                };
+                assert!(result.is_err(), "{failing}");
+                assert_eq!(
+                    crate::secrets::get_secret_result(&id, crate::remote::OAUTH_STATE_KEY)
+                        .unwrap()
+                        .as_deref(),
+                    Some("refresh-state"),
+                    "{failing}"
+                );
+                assert_eq!(
+                    crate::secrets::get_secret_result(&id, crate::secrets::HTTP_AUTH_KEY)
+                        .unwrap()
+                        .as_deref(),
+                    Some("oauth-access"),
+                    "{failing}"
+                );
+            });
+        }
+    }
+
+    /// A shared Authorization header keeps its row whatever case or spacing the
+    /// team or the member used for its name.
+    #[test]
+    fn a_shared_authorization_header_matches_its_name_loosely() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let (_, id) =
+                add_reviewed_entry(entry_from_fields(fields("demo", "http")).unwrap()).unwrap();
+            registry::update(|r| {
+                let server = r.servers.iter_mut().find(|s| s.id == id).unwrap();
+                server.unknown_fields.insert(
+                    "headerKeys".into(),
+                    serde_json::json!([{"key": "authorization"}]),
+                );
+                Ok(())
+            })
+            .unwrap();
+            set_server_secret_with(&id, " Authorization ", "Bearer member-token", |id, key| {
+                Ok(registry::update(|r| apply_secret_declaration(r, id, key))?.0)
+            })
+            .unwrap();
+            assert_eq!(
+                crate::secrets::get_secret_result(&id, crate::secrets::HTTP_AUTH_KEY).unwrap(),
+                None,
+                "the member's value goes to the header row, not the bearer slot"
+            );
+        });
     }
 
     /// Authorization typed onto a remote server: a bare or Bearer token goes to

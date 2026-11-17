@@ -103,6 +103,8 @@ pub fn resolve_args(server: &ServerEntry) -> Result<ResolvedArgs, String> {
                 })?;
             let present = match &entry.value {
                 Some(value) => !value.trim().is_empty(),
+                // Read from the password manager when the server starts.
+                None if entry.secret && crate::secret_refs::reference_for(entry).is_some() => true,
                 None if entry.secret => crate::secrets::get_secret_result(&server.id, key)
                     .map_err(|_| format!("could not read '{key}' from the vault"))?
                     .is_some_and(|value| !value.trim().is_empty()),
