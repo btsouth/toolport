@@ -346,9 +346,6 @@ pub(super) fn review_with_notice(
             if busy.get() {
                 gtk::glib::Propagation::Stop
             } else {
-                let source = lede.unwrap_or(crate::i18n::msg(
-                    "Review the selected servers before continuing.",
-                ));
                 gtk::glib::Propagation::Proceed
             }
         });
