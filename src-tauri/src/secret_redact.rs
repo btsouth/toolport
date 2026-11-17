@@ -2488,6 +2488,31 @@ fn scope_now() -> Scope {
     })
 }
 
+/// Wait until the main matcher of this scope covers every registered value
+/// (the background rebuild a registration starts has finished), up to
+/// `timeout`. For benchmarks that must time a whole rebuild.
+#[cfg(any(test, feature = "test-support"))]
+pub fn wait_for_main_build(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let settled = REGISTRY
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|map| map.get(&scope_now()))
+            .is_none_or(|reg| {
+                reg.secrets.len() == reg.main_len && reg.whole_gen == reg.main_whole_gen
+            });
+        if settled {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 #[cfg(not(any(test, feature = "test-support")))]
 fn scope_of(_dir: &Path) -> Scope {
     None
@@ -3803,7 +3828,26 @@ pub fn redact_outgoing_json(json: String) -> String {
     // forms only, as in [`redact_outgoing`].
     match m.main().redact_definition_line(&json) {
         Cow::Borrowed(_) => json,
-        Cow::Owned(out) => out,
+        Cow::Owned(out) => keep_request_id(&json, out),
+    }
+}
+
+/// `edited` with the `id` of `original` put back: a request's id is the
+/// gateway's own (or the server's), and the client answers by it, so it is
+/// never redacted, as a reply's id is not ([`redact_reply`]).
+fn keep_request_id(original: &str, edited: String) -> String {
+    let Ok(Value::Object(before)) = serde_json::from_str::<Value>(original) else {
+        return edited;
+    };
+    let Some(id) = before.get("id") else {
+        return edited;
+    };
+    match serde_json::from_str::<Value>(&edited) {
+        Ok(Value::Object(mut after)) if after.get("id") != Some(id) => {
+            after.insert("id".to_string(), id.clone());
+            Value::Object(after).to_string()
+        }
+        _ => edited,
     }
 }
 
@@ -6604,6 +6648,66 @@ mod tests {
         );
         // Inside a word it is still not one.
         assert_eq!(m.redact_text("xab12y"), "xab12y");
+    }
+
+    /// The benchmark's rebuild wait: false while the build is still due, true
+    /// once the main matcher covers every registered value.
+    #[test]
+    fn the_main_build_wait_returns_once_every_value_is_covered() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-main-wait-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        for i in 0..50 {
+            register(
+                "wait-srv",
+                &format!("K{i}"),
+                &format!("main-wait-value-{i:03}-Xq7"),
+            );
+        }
+        assert!(wait_for_main_build(std::time::Duration::from_secs(30)));
+        {
+            let guard = REGISTRY.read().unwrap();
+            let reg = guard.as_ref().unwrap().get(&scope_now()).unwrap();
+            assert_eq!(reg.main_len, reg.secrets.len());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Failure mode: a request the gateway sends to a client (sampling,
+    /// elicitation, roots) was edited in place as one line, id included, so an
+    /// id equal to a secret came back changed and the client's answer could
+    /// not be matched to it.
+    #[test]
+    fn a_request_to_the_client_keeps_its_id_and_redacts_its_params() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-push-id-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        register("push-srv", "PIN", "482193");
+        register("push-srv", "KEY", "sk-PushBodySecret77");
+        for id in [
+            serde_json::json!(482193),
+            serde_json::json!("sk-PushBodySecret77"),
+        ] {
+            let request = serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "sampling/createMessage",
+                "params": {"messages": [{"content": {"type": "text", "text": "key sk-PushBodySecret77 pin 482193"}}]}
+            });
+            let out: Value =
+                serde_json::from_str(&redact_outgoing_json(request.to_string())).unwrap();
+            assert_eq!(out["id"], id);
+            assert_eq!(out["jsonrpc"], "2.0");
+            assert_eq!(
+                out["params"]["messages"][0]["content"]["text"],
+                "key [secret:KEY] pin [secret:PIN]"
+            );
+        }
+        // A notification has no id to keep, and is redacted as before.
+        let note = r#"{"jsonrpc":"2.0","method":"notifications/message","params":{"data":"sk-PushBodySecret77"}}"#;
+        assert_eq!(
+            redact_outgoing_json(note.to_string()),
+            r#"{"jsonrpc":"2.0","method":"notifications/message","params":{"data":"[secret:KEY]"}}"#
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
