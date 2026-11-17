@@ -899,6 +899,9 @@ const DATA_FILES: &[&str] = &[
     "agent-activity-removed",
     "agent-guard-removed",
     "legacy-topology-retired.notice",
+    // Startup secret scrub of old logs (secret_redact).
+    "secret-scrub-v1.json",
+    "secret-scrub-pending",
 ];
 
 fn hex_name(value: &str, length: usize) -> bool {
@@ -914,18 +917,23 @@ fn decimal(value: &str) -> bool {
 // registry::atomic_write and lock_at generate siblings of a known file, never
 // siblings of a directory. Apply the same rule at every selected depth.
 fn generated_file_name(name: &str, owned: impl Fn(&str) -> bool) -> bool {
-    if owned(name) {
+    let temp_of_owned = |name: &str| {
+        name.strip_suffix(".conduit-tmp").is_some_and(|base| {
+            base.rsplit_once('.').is_some_and(|(base, seq)| {
+                decimal(seq)
+                    && base.rsplit_once('.').is_some_and(|(base, pid)| {
+                        decimal(pid) && pid.parse::<u32>().is_ok() && owned(base)
+                    })
+            })
+        })
+    };
+    if owned(name) || temp_of_owned(name) {
         return true;
     }
-    if let Some(base) = name.strip_suffix(".conduit-tmp") {
-        return base.rsplit_once('.').is_some_and(|(base, seq)| {
-            decimal(seq)
-                && base.rsplit_once('.').is_some_and(|(base, pid)| {
-                    decimal(pid) && pid.parse::<u32>().is_ok() && owned(base)
-                })
-        });
-    }
-    name.strip_suffix(".lock").is_some_and(owned)
+    // A lock beside an owned file, or beside a temp copy of one (a scrub of a
+    // write in flight locked `<file>.<pid>.<seq>.conduit-tmp`).
+    name.strip_suffix(".lock")
+        .is_some_and(|base| owned(base) || temp_of_owned(base))
 }
 
 fn owned_data_name(name: &str, legacy: &std::collections::HashSet<String>) -> bool {
@@ -942,7 +950,10 @@ fn owned_data_name(name: &str, legacy: &std::collections::HashSet<String>) -> bo
             })
         || matches!(
             name,
-            "secret-service.lock" | "task-handle-key.lock" | "client-config-mutation.lock"
+            "secret-service.lock"
+                | "task-handle-key.lock"
+                | "client-config-mutation.lock"
+                | "secret-scrub.lock"
         )
         || name
             .strip_prefix("daemon-")
@@ -2000,6 +2011,48 @@ mod tests {
         );
         drop(env);
     }
+    /// macOS acceptance after "Remove Toolport data": the secret scrub's marker
+    /// and lock, and a lock the scrub took on a tool cache write in flight, were
+    /// left in the data folder as entries Toolport did not create.
+    #[test]
+    fn purge_removes_the_secret_scrub_files_and_locks_on_temp_writes() {
+        let env = crate::registry::DataDirTestEnv::new("purge_scrub_leftovers");
+        let dir = env.dir.join("data");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = format!("tool-cache-v2-{}.json", "c".repeat(64));
+        let created = [
+            "secret-scrub-v1.json".to_string(),
+            "secret-scrub.lock".to_string(),
+            "secret-scrub-pending".to_string(),
+            format!("{cache}.7842.4.conduit-tmp.lock"),
+            format!("{cache}.7842.4.conduit-tmp"),
+            "registry.json.123.1.conduit-tmp.lock".to_string(),
+        ];
+        for name in &created {
+            std::fs::write(dir.join(name), "fixture").unwrap();
+        }
+        std::fs::write(dir.join("notes.txt"), "user bytes").unwrap();
+        let mut report = Report::default();
+        remove_data_contents(&dir, &[], &mut report);
+        assert!(report.leftovers.is_empty(), "{:?}", report.leftovers);
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["notes.txt"]);
+        // Only a lock on a temp copy of an owned file, not any doubled suffix.
+        let legacy = Default::default();
+        for name in [
+            "secret-scrub.json",
+            "registry.json.lock.lock",
+            "notes.txt.123.1.conduit-tmp.lock",
+            "registry.json.notes.conduit-tmp.lock",
+        ] {
+            assert!(!owned_data_name(name, &legacy), "{name}");
+        }
+        drop(env);
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn purge_autostart_requires_toolports_marker() {

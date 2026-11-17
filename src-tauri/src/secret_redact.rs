@@ -3922,25 +3922,87 @@ pub fn persisted_log_files(dir: &Path) -> Vec<PathBuf> {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            let rotated = [
-                "audit.jsonl.",
-                "security.jsonl.",
-                "gateway.log.",
-                "inspect.jsonl.",
-                // Tool catalogs and held (quarantined) definitions, which hold
-                // upstream definition text.
-                "tool-cache",
-                "quarantine",
-                "team-activity-",
-            ]
-            .iter()
-            .any(|prefix| name.starts_with(prefix) && !name.ends_with(".lock"));
+            let rotated = SCRUBBED_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix) && !name.ends_with(".lock"))
+                // A write in flight: its writer renames it into place. One a
+                // crashed writer left is removed by `remove_orphaned_temp_writes`.
+                && !name.ends_with(".conduit-tmp");
             if rotated && !files.contains(&path) {
                 files.push(path);
             }
         }
     }
     files
+}
+
+/// Rotated logs (`audit.jsonl.1`, `gateway.log.old`, ...), tool catalogs and held
+/// (quarantined) definitions, which hold upstream definition text.
+const SCRUBBED_PREFIXES: &[&str] = &[
+    "audit.jsonl.",
+    "security.jsonl.",
+    "gateway.log.",
+    "inspect.jsonl.",
+    "tool-cache",
+    "quarantine",
+    "team-activity-",
+];
+
+/// Delete the temp copies (`<file>.<pid>.<seq>.conduit-tmp`) of the scrubbed
+/// files that a writer which has since exited left behind, with any lock beside
+/// them. Such a write was never renamed into place, so the file itself is
+/// unchanged; the copy could still hold a secret the scrub would not reach.
+/// A copy whose writer is still running is in flight and stays, unless it is
+/// older than any write takes: then its pid belongs to another process now.
+/// An error means such a copy may remain, so the scrub is not finished.
+fn remove_orphaned_temp_writes(dir: &Path) -> std::io::Result<()> {
+    /// Far longer than a temp write takes; a copy this old is no write in flight.
+    const STALE_WRITE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let remove = |path: &Path| match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(pid) = name
+            .strip_suffix(".conduit-tmp")
+            .filter(|_| SCRUBBED_PREFIXES.iter().any(|p| name.starts_with(p)))
+            .and_then(|base| base.rsplit_once('.'))
+            .and_then(|(base, seq)| seq.parse::<u64>().ok().and(base.rsplit_once('.')))
+            .and_then(|(_, pid)| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|at| at.elapsed().ok())
+            .is_some_and(|age| age > STALE_WRITE);
+        let writer_running = pid == std::process::id() || crate::daemon::process_exists(pid);
+        if writer_running && !stale {
+            continue;
+        }
+        remove(&path)?;
+        remove(&dir.join(format!("{name}.lock")))?;
+    }
+    Ok(())
 }
 
 /// Rewrite one file with every registered secret redacted, under the same lock its
@@ -4252,6 +4314,7 @@ impl<'m> ScrubLines<'m> {
 /// Scrub every log file in `dir` for secrets not yet scrubbed there, then record
 /// their ids (names only, never values) in the marker so later starts skip the work.
 pub fn scrub_data_dir(dir: &Path) -> std::io::Result<usize> {
+    remove_orphaned_temp_writes(dir)?;
     // Nothing on disk to scrub: create no lock or marker either, so a directory
     // that was just purged (or never used) stays exactly as it is.
     if !persisted_log_files(dir).iter().any(|path| path.is_file()) {
@@ -4425,6 +4488,10 @@ pub fn scrub_value_now(owner: &str, key: &str, value: &str) -> Result<(), String
     let Some(dir) = scrub_dir_now() else {
         return Ok(());
     };
+    // A copy a crashed writer left is deleted, not scrubbed: it must be gone
+    // before the caller lets the value go.
+    remove_orphaned_temp_writes(&dir)
+        .map_err(|error| format!("scrub before retiring secret '{key}' failed: {error}"))?;
     if !persisted_log_files(&dir).iter().any(|path| path.is_file()) {
         return Ok(());
     }
@@ -6962,6 +7029,88 @@ mod tests {
         assert_eq!(out.matches('\n').count(), 10_000);
         assert_eq!(out.matches('\r').count(), 20_000);
         assert!(!out.contains("sk-SECRE"), "{}", &out[..40]);
+    }
+
+    /// A tool cache write in flight is not scrubbed: its writer renames it into
+    /// place, and the scrub's lock on it was left behind after data removal.
+    #[test]
+    fn the_scrub_skips_temp_files_of_writes_in_flight() {
+        let dir = std::env::temp_dir().join(format!("tp-scrub-tmp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = format!("tool-cache-v2-{}.json", "c".repeat(64));
+        for name in [cache.clone(), format!("{cache}.7842.4.conduit-tmp")] {
+            std::fs::write(dir.join(name), "{}").unwrap();
+        }
+        let files = persisted_log_files(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(files.contains(&dir.join(&cache)));
+        assert!(
+            !files
+                .iter()
+                .any(|path| path.to_string_lossy().ends_with(".conduit-tmp")),
+            "{files:?}"
+        );
+    }
+
+    /// A temp copy a crashed writer left could hold a secret the scrub skips:
+    /// the scrub deletes it, with its lock, and keeps a copy still in flight.
+    #[test]
+    fn the_scrub_deletes_temp_copies_a_crashed_writer_left() {
+        let dir = std::env::temp_dir().join(format!("tp-scrub-orphan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = format!("tool-cache-v2-{}.json", "c".repeat(64));
+        // No process has this pid (above Linux's pid_max and any Windows pid in use here).
+        let gone = 4_194_399u32;
+        let orphan = format!("{cache}.{gone}.4.conduit-tmp");
+        let live = format!("{cache}.{}.5.conduit-tmp", std::process::id());
+        // A running pid on a copy far older than any write: the pid was reused.
+        let reused = format!("{cache}.{}.6.conduit-tmp", std::process::id());
+        let other = format!("registry.json.{gone}.1.conduit-tmp");
+        // No scrubbed file itself, so the scrub stops after the cleanup and
+        // takes no lock of its own here.
+        for name in [&orphan, &format!("{orphan}.lock"), &live, &reused, &other] {
+            std::fs::write(dir.join(name), "sk-OrphanedTempSecret1").unwrap();
+        }
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join(&reused))
+            .unwrap()
+            .set_modified(hour_ago)
+            .unwrap();
+        assert_eq!(scrub_data_dir(&dir).unwrap(), 0);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut expected = vec![live, other];
+        expected.sort();
+        assert_eq!(left, expected);
+    }
+
+    /// A copy the cleanup cannot delete keeps the scrub unfinished.
+    #[cfg(unix)]
+    #[test]
+    fn a_temp_copy_that_cannot_be_deleted_leaves_the_scrub_unfinished() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tp-scrub-stuck-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let orphan = format!(
+            "tool-cache-v2-{}.json.4194399.4.conduit-tmp",
+            "c".repeat(64)
+        );
+        std::fs::write(dir.join(&orphan), "sk-OrphanedTempSecret1").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = scrub_data_dir(&dir);
+        let still_there = dir.join(&orphan).exists();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        // Root may delete it anyway; then the scrub may finish.
+        if still_there {
+            assert!(result.is_err(), "{result:?}");
+        }
     }
 
     #[test]
