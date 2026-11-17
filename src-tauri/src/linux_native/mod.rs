@@ -22986,13 +22986,13 @@ mod setup_import_share_tests {
 
     #[test]
     fn a_failed_paste_says_what_to_do_before_the_parser_detail() {
-        let message = paste_import_failure(
-            "That doesn't look like a Toolport setup: expected ident at line 1 column 2",
+        let reason = serde_json::from_str::<serde_json::Value>("not a setup").unwrap_err();
+        let message = paste_import_failure(&crate::sharing_controller::not_a_setup(&reason));
+        assert_eq!(
+            message,
+            "Couldn't read the pasted setup. Check that you copied all of it, then try again.\n\n\
+             That doesn't look like a Toolport setup. The text isn't JSON."
         );
-        assert!(message.starts_with(
-            "Couldn't read the pasted setup. Check that you copied all of it, then try again.\n\n"
-        ));
-        assert!(message.ends_with("expected ident at line 1 column 2"));
     }
 
     #[test]

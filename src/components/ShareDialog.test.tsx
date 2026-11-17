@@ -302,7 +302,7 @@ describe("ShareDialog share links", () => {
 
   it("leads a failed paste with what to do before the parser detail", async () => {
     mocks.previewImport.mockRejectedValueOnce(
-      "That doesn't look like a Toolport setup: expected ident at line 1 column 2",
+      "That doesn't look like a Toolport setup. The text isn't JSON.",
     );
     render(<ShareDialog trigger={<button>Share</button>} onImported={vi.fn()} />);
     await userEvent.click(screen.getByRole("button", { name: "Share" }));
@@ -320,7 +320,7 @@ describe("ShareDialog share links", () => {
       "Couldn't read the pasted setup. Check that you copied all of it, then try again.",
     );
     expect(error).toHaveTextContent(
-      "That doesn't look like a Toolport setup: expected ident at line 1 column 2",
+      "That doesn't look like a Toolport setup. The text isn't JSON.",
     );
     const field = screen.getByLabelText("Paste a shared setup");
     expect(field).toHaveAttribute("aria-describedby", error.id);
