@@ -77,7 +77,10 @@ export function SyncSettingsDialog({ server, registry, onSaved, onClose }: Props
           localOnly: on,
         });
       if (personal && localOnly) next = await setLocalOnly(true);
-      for (const value of values)
+      // Stop sharing before starting to share: if a write fails part way,
+      // the server can be left sharing less than asked, never more.
+      const ordered = [...values].sort((a, b) => Number(marked(a)) - Number(marked(b)));
+      for (const value of ordered)
         next = await invoke<Registry>("personal_sync_portable", {
           serverId: server.id,
           kind: value.kind,

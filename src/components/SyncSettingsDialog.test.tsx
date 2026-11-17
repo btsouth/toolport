@@ -57,9 +57,39 @@ describe("SyncSettingsDialog", () => {
       .filter(([command]) => command === "personal_sync_portable")
       .map(([, args]) => [args.key, args.enabled]);
     expect(marks).toEqual([
-      ["TEAM", true],
       ["REGION", false],
+      ["TEAM", true],
     ]);
+  });
+
+  it("stops sharing first, so a failed save never leaves an unchecked value shared", async () => {
+    const path = {
+      key: "PATH",
+      value: "/bin",
+      secret: false,
+    } as ServerEntry["env"][number];
+    invoke.mockImplementation((command: string, args: { key?: string }) =>
+      command === "personal_sync_portable" && args.key === "PATH"
+        ? Promise.reject(new Error("PATH can't sync"))
+        : Promise.resolve(registry),
+    );
+    render(
+      <SyncSettingsDialog
+        server={server([region, path, team])}
+        registry={registry}
+        onSaved={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+    await userEvent.click(screen.getByRole("checkbox", { name: /REGION/ }));
+    await userEvent.click(screen.getByRole("checkbox", { name: /PATH/ }));
+    await userEvent.click(screen.getByRole("checkbox", { name: /TEAM/ }));
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    const marks = invoke.mock.calls
+      .filter(([command]) => command === "personal_sync_portable")
+      .map(([, args]) => [args.key, args.enabled]);
+    expect(marks[0]).toEqual(["TEAM", false]);
   });
 
   it("turns local-only off last, and not at all when a mark fails", async () => {

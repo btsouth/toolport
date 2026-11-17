@@ -15851,10 +15851,13 @@ fn open_sync_settings(server_id: &str, page: &ServerPage) {
         let id = id.clone();
         let page = page.clone();
         let local = local.is_active();
-        let marks: Vec<_> = portable
+        let mut marks: Vec<_> = portable
             .iter()
             .map(|(k, key, c)| (k.clone(), key.clone(), c.is_active()))
             .collect();
+        // Stop sharing before starting to share: if a write fails part way,
+        // the server can be left sharing less than asked, never more.
+        marks.sort_by_key(|(_, _, enabled)| *enabled);
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || {
                 // Lock first, unlock last: if a mark fails to save, the server
