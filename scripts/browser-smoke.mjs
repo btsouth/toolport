@@ -218,7 +218,7 @@ try {
   const longServer = "A".repeat(70);
   await expect(page.getByTitle(longServer, { exact: true })).toBeVisible();
   const firstToggle = await page
-    .getByRole("switch", { name: `Toggle ${longServer}`, exact: true })
+    .getByRole("switch", { name: new RegExp(`^(Enable|Disable) ${longServer}$`) })
     .boundingBox();
   // The long name keeps the switch in the window: it wraps under the name
   // rather than being pushed off the right edge.
@@ -303,7 +303,7 @@ try {
   // A narrow window moves a row's status and actions under its name instead of
   // squeezing the name to nothing.
   await page.setViewportSize({ width: 480, height: 900 });
-  const serverNames = page.locator("[data-server-id] span.truncate.font-semibold");
+  const serverNames = page.locator("[data-server-id] button.truncate.font-semibold");
   expect(await serverNames.count()).toBeGreaterThan(2);
   for (const name of await serverNames.all()) {
     // The name's column keeps 200px or more, and the name itself is not cut.
@@ -400,7 +400,11 @@ try {
   await approval.getByRole("button", { name: "Deny", exact: true }).click();
   await expect(approval).toHaveCount(0);
   await page.getByRole("button", { name: "Activity", exact: true }).click();
-  await page.getByRole("button", { name: /recent calls/i }).click();
+  // The call list starts open.
+  await expect(page.getByRole("button", { name: /recent calls/i })).toHaveAttribute(
+    "aria-expanded",
+    "true",
+  );
   await expect(page.getByText("team_slack", { exact: true }).first()).toBeVisible();
   for (const label of [
     "Approved",
@@ -498,7 +502,7 @@ try {
     .getByRole("button", { name: "Add", exact: true })
     .click();
   await expect(
-    page.getByRole("switch", { name: "Toggle Manual notes", exact: true }),
+    page.getByRole("switch", { name: "Disable Manual notes", exact: true }),
   ).toBeChecked();
   await page.screenshot({
     animations: "disabled",
@@ -534,7 +538,7 @@ try {
   await page.getByRole("button", { name: "Add", exact: true }).first().click();
   await page.getByRole("button", { name: "Servers", exact: true }).click();
   await expect(
-    page.getByRole("switch", { name: "Toggle NoteKit", exact: true }),
+    page.getByRole("switch", { name: "Disable NoteKit", exact: true }),
   ).toBeChecked();
   await page.screenshot({
     animations: "disabled",
@@ -659,7 +663,10 @@ try {
     groupedClients.getByText(/60 calls today.*Last saw 1,711 tools/),
   ).toBeVisible();
   await page.getByRole("button", { name: "Activity", exact: true }).click();
-  await page.getByRole("button", { name: /Recent calls and approvals/ }).click();
+  // The call list starts open.
+  await expect(
+    page.getByRole("button", { name: /Recent calls and approvals/ }),
+  ).toHaveAttribute("aria-expanded", "true");
   for (const label of [
     "Searched tools",
     "Looked up a tool",
@@ -689,7 +696,9 @@ try {
   await page.getByRole("button", { name: /^Discovery/ }).click();
   await expect(page.getByText(/GitHub issues/)).toBeVisible();
   await page.screenshot({ path: path.join(output, "discovery-after-r2.png") });
-  await page.getByRole("button", { name: /^Per-server breakdown/ }).click();
+  await expect(
+    page.getByRole("button", { name: /^Per-server breakdown/ }),
+  ).toHaveAttribute("aria-expanded", "true");
   await page.screenshot({ path: path.join(output, "server-stats-after-r2.png") });
   await page.getByRole("button", { name: "Clear", exact: true }).click();
   await expect(page.getByRole("dialog")).toContainText("Clear retained activity?");

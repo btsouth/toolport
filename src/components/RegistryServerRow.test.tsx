@@ -4,6 +4,13 @@ import { describe, expect, it, vi } from "vitest";
 import type { ProbeResult, ServerEntry } from "@/lib/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { RegistryServerRow } from "./RegistryServerRow";
+import { probeRegistered, testServer } from "@/lib/api";
+
+vi.mock("@/lib/api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/api")>()),
+  probeRegistered: vi.fn(),
+  testServer: vi.fn(),
+}));
 
 vi.mock("@/components/ServerToolsPanel", () => ({
   ServerToolsPanel: ({ serverId }: { serverId: string }) => (
@@ -57,7 +64,7 @@ describe("RegistryServerRow status accessibility", () => {
         "Removed or disabled by the team. Your personal server stays off.",
       ),
     ).toBeInTheDocument();
-    expect(screen.getByRole("switch", { name: "Toggle Example" })).not.toBeChecked();
+    expect(screen.getByRole("switch", { name: "Enable Example" })).not.toBeChecked();
     view.unmount();
     renderRow(true, health({ ok: true }), { ...server, teamRouteRemoved: true });
     expect(screen.queryByText(/Your personal server stays off/)).not.toBeInTheDocument();
@@ -90,7 +97,7 @@ describe("RegistryServerRow status accessibility", () => {
     expect(chip).toHaveTextContent("Ready · 3 tools");
     expect(chip).toHaveAttribute("data-variant", "success");
     expect(screen.queryByText("Enabled")).not.toBeInTheDocument();
-    const toggle = screen.getByRole("switch", { name: "Toggle Example" });
+    const toggle = screen.getByRole("switch", { name: "Disable Example" });
     const name = screen.getByText("Example");
     // The switch trails the name and the status chip.
     expect(
@@ -367,7 +374,105 @@ describe("RegistryServerRow detail tabs", () => {
     await user.tab({ shift: true });
     await user.tab({ shift: true });
     expect(tools).toHaveFocus();
+    // Back out of the tabs to the row's last control, its actions menu.
     await user.tab({ shift: true });
-    expect(screen.getByRole("button", { name: "Hide Example details" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Actions for Example" })).toHaveFocus();
+  });
+});
+
+describe("RegistryServerRow actions menu", () => {
+  it("offers the same actions as the GTK row menu", async () => {
+    const user = userEvent.setup();
+    renderRow(true, health({ ok: true, toolCount: 3 }), {
+      ...server,
+      transport: "http",
+      url: "https://example.test/mcp",
+    });
+    await user.click(screen.getByRole("button", { name: "Actions for Example" }));
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
+      "Test connection",
+      "Server details and tools",
+      "Edit",
+      "Sync settings",
+      "Duplicate",
+      "Authentication",
+      "Credentials",
+      "Remove",
+    ]);
+  });
+
+  it("tests the saved server by its id, as the GTK row menu does", async () => {
+    const user = userEvent.setup();
+    vi.mocked(probeRegistered).mockResolvedValue(health({ ok: true, toolCount: 3 }));
+    renderRow(true, health({ ok: true }));
+    await user.click(screen.getByRole("button", { name: "Actions for Example" }));
+    await user.click(screen.getByRole("menuitem", { name: "Test connection" }));
+    expect(probeRegistered).toHaveBeenCalledWith("server-1");
+    expect(testServer).not.toHaveBeenCalled();
+  });
+
+  it("starts nothing for a team server awaiting review", async () => {
+    const user = userEvent.setup();
+    renderRow(false, undefined, {
+      ...server,
+      source: "team:t",
+      teamEnableReview: true,
+    });
+    await user.click(screen.getByRole("button", { name: "Actions for Example" }));
+    expect(screen.getByRole("menuitem", { name: "Test connection" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+  });
+
+  it("leaves out Authentication for a local server", async () => {
+    const user = userEvent.setup();
+    renderRow(true, health({ ok: true }));
+    await user.click(screen.getByRole("button", { name: "Actions for Example" }));
+    expect(
+      screen.queryByRole("menuitem", { name: "Authentication" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Credentials" })).toBeInTheDocument();
+  });
+
+  it("opens the details from the server name", async () => {
+    const user = userEvent.setup();
+    const onOpen = vi.fn();
+    render(
+      <TooltipProvider>
+        <RegistryServerRow
+          server={server}
+          registry={null}
+          enabled
+          onToggle={vi.fn()}
+          onRemove={vi.fn()}
+          onRegistryChange={vi.fn()}
+          onOpen={onOpen}
+        />
+      </TooltipProvider>,
+    );
+    await user.click(screen.getByRole("button", { name: "Show Example details" }));
+    expect(onOpen).toHaveBeenCalledWith("overview");
+  });
+
+  it("offers Retry for a locked keyring, with no log to view", () => {
+    const onReprobe = vi.fn();
+    render(
+      <TooltipProvider>
+        <RegistryServerRow
+          server={server}
+          registry={null}
+          enabled
+          health={health({ keyringLocked: true })}
+          onToggle={vi.fn()}
+          onRemove={vi.fn()}
+          onRegistryChange={vi.fn()}
+          onReprobe={onReprobe}
+        />
+      </TooltipProvider>,
+    );
+    act(() => screen.getByRole("button", { name: "Retry" }).click());
+    expect(onReprobe).toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "View log" })).not.toBeInTheDocument();
   });
 });

@@ -1167,6 +1167,14 @@ mockIPC(
           toolCount: 25,
           error: null,
         }));
+      case "probe_registered":
+        return {
+          serverId: String(args.serverId ?? ""),
+          ok: true,
+          toolCount: 25,
+          error: null,
+          authRequired: false,
+        };
       case "main_window_visible":
         return true;
       case "take_pending_tray_approvals":

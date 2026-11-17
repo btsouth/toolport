@@ -21,12 +21,13 @@ const getSavingsSummary = vi.fn();
 const getAuditStats = vi.fn();
 
 const clearActivityLogs = vi.fn();
+const exportAuditToPath = vi.fn();
 const releaseQuarantine = vi.fn();
 
 vi.mock("@/lib/api", () => ({
   releaseQuarantine: (...a: unknown[]) => releaseQuarantine(...a),
   clearActivityLogs: (...a: unknown[]) => clearActivityLogs(...a),
-  exportAuditToPath: vi.fn(),
+  exportAuditToPath: (...a: unknown[]) => exportAuditToPath(...a),
   getActivityRevision: (...a: unknown[]) => getActivityRevision(...a),
   releaseActivityRevision: (...a: unknown[]) => releaseActivityRevision(...a),
   getActivityHealth: (...a: unknown[]) => getActivityHealth(...a),
@@ -45,7 +46,8 @@ vi.mock("sonner", () => ({
 
 vi.mock("@/lib/toast", () => ({ toastError: vi.fn() }));
 
-vi.mock("@tauri-apps/plugin-dialog", () => ({ save: vi.fn() }));
+const save = vi.fn();
+vi.mock("@tauri-apps/plugin-dialog", () => ({ save: (...a: unknown[]) => save(...a) }));
 
 function entry(over: Partial<AuditEntry> = {}): AuditEntry {
   return {
@@ -119,23 +121,29 @@ it("p10c shows approval outcomes without treating them as call errors", async ()
   getAuditStats.mockResolvedValue({ total: 2, errors: 1, errorRate: 0.5, servers: [] });
   render(<ActivityView refreshKey={0} registry={null} />);
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-  await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+  await screen.findByRole("button", { name: /recent calls/i, expanded: true });
   expect(screen.getByText("calls recorded").parentElement).toHaveTextContent(
     /2\s*calls recorded/,
   );
   expect(screen.getByText("errors (50%)").parentElement).toHaveTextContent(/1\s*errors/);
   for (const [, label] of outcomes) expect(screen.getByText(label)).toBeInTheDocument();
-  // Approvals are rows but not calls, so the shown rows are counted as entries.
-  expect(screen.getByText(/2 calls recorded on this computer/)).toHaveTextContent(
-    `2 calls recorded on this computer. Showing the latest ${outcomes.length + initialLog.length} entries.`,
-  );
+  // Approvals are rows but not calls, so the shown rows are counted as entries,
+  // and 2 calls are not set beside more entries.
+  expect(
+    screen.getByText(
+      `Showing the latest ${outcomes.length + initialLog.length} entries.`,
+    ),
+  ).toBeInTheDocument();
+  expect(screen.queryByText(/calls recorded on this computer/)).not.toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: /errors only/i }));
   expect(screen.getByText("merge_pr")).toBeInTheDocument();
   for (const [, label] of outcomes)
     expect(screen.queryByText(label)).not.toBeInTheDocument();
-  expect(screen.getByText(/2 calls recorded on this computer/)).toHaveTextContent(
-    `2 calls recorded on this computer. Showing 1 matching entry from the latest ${outcomes.length + initialLog.length}.`,
-  );
+  expect(
+    screen.getByText(
+      `Showing 1 matching entry from the latest ${outcomes.length + initialLog.length}.`,
+    ),
+  ).toBeInTheDocument();
 });
 
 it("counts Activity rows as entries in singular and plural", async () => {
@@ -143,15 +151,19 @@ it("counts Activity rows as entries in singular and plural", async () => {
   getAuditStats.mockResolvedValue({ total: 2, errors: 0, errorRate: 0, servers: [] });
   const view = render(<ActivityView refreshKey={0} registry={null} />);
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-  const toggle = await screen.findByRole("button", { name: /recent calls/i });
-  expect(screen.getByText(/2 calls recorded on this computer/)).toHaveTextContent(
-    "2 calls recorded on this computer. Latest 2 entries available.",
-  );
+  // The list starts open; closed, the line says how many entries it holds.
+  const toggle = await screen.findByRole("button", {
+    name: /recent calls/i,
+    expanded: true,
+  });
+  expect(screen.getByText("Showing the latest 2 entries.")).toBeInTheDocument();
+  await user.click(toggle);
+  expect(screen.getByText("Latest 2 entries available.")).toBeInTheDocument();
   await user.click(toggle);
   await user.click(screen.getByRole("button", { name: /errors only/i }));
-  expect(screen.getByText(/2 calls recorded on this computer/)).toHaveTextContent(
-    "2 calls recorded on this computer. Showing 0 matching entries from the latest 2.",
-  );
+  expect(
+    screen.getByText("Showing 0 matching entries from the latest 2."),
+  ).toBeInTheDocument();
   expect(screen.getByText("No errors in the latest 2 entries.")).toBeInTheDocument();
   view.unmount();
 
@@ -159,9 +171,9 @@ it("counts Activity rows as entries in singular and plural", async () => {
   getAuditStats.mockResolvedValue({ total: 1, errors: 0, errorRate: 0, servers: [] });
   render(<ActivityView refreshKey={0} registry={null} />);
   const single = await screen.findByRole("button", { name: /recent calls/i });
-  expect(screen.getByText(/1 call recorded on this computer/)).toHaveTextContent(
-    "1 call recorded on this computer. Latest entry available.",
-  );
+  expect(screen.getByText("Showing the latest entry.")).toBeInTheDocument();
+  await user.click(single);
+  expect(screen.getByText("Latest entry available.")).toBeInTheDocument();
   await user.click(single);
   await user.click(screen.getByRole("button", { name: /errors only/i }));
   expect(screen.getByText("No errors in the latest entry.")).toBeInTheDocument();
@@ -173,8 +185,7 @@ it("p10c shows an approval-only history even when no tools ran", async () => {
   ]);
   getAuditStats.mockResolvedValue({ total: 0, errors: 0, errorRate: 0, servers: [] });
   render(<ActivityView refreshKey={0} registry={null} />);
-  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-  await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+  await screen.findByRole("button", { name: /recent calls/i, expanded: true });
   expect(screen.getByText("Withdrawn")).toBeInTheDocument();
   expect(screen.queryByText("No activity yet")).not.toBeInTheDocument();
   expect(screen.queryByText("calls recorded")).not.toBeInTheDocument();
@@ -400,14 +411,14 @@ describe("ActivityView trust-state loading", () => {
 
     render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
-    expect(screen.getByText(/latest 2/)).toBeInTheDocument();
+    expect(screen.getByText("latest 2")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Clear" }));
     fireEvent.click(screen.getByRole("button", { name: "Clear activity" }));
     await act(async () => {});
 
     expect(toast.success).toHaveBeenCalledWith("Cleared retained activity");
-    expect(screen.queryByText(/latest 2/)).not.toBeInTheDocument();
+    expect(screen.queryByText("latest 2")).not.toBeInTheDocument();
     expect(
       screen.getByText(/can't verify that the log is still empty/i),
     ).toBeInTheDocument();
@@ -429,7 +440,7 @@ describe("ActivityView trust-state loading", () => {
 
     render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
-    expect(screen.getByText(/latest 2/)).toBeInTheDocument();
+    expect(screen.getByText("latest 2")).toBeInTheDocument();
 
     // A live tick starts a refetch that is still in flight when the user clears.
     await act(async () => {
@@ -444,7 +455,7 @@ describe("ActivityView trust-state loading", () => {
     await act(async () => {});
 
     expect(toast.success).toHaveBeenCalledWith("Cleared retained activity");
-    expect(screen.queryByText(/latest 2/)).not.toBeInTheDocument();
+    expect(screen.queryByText("latest 2")).not.toBeInTheDocument();
     expect(
       screen.getByText(/can't verify that the log is still empty/i),
     ).toBeInTheDocument();
@@ -473,9 +484,6 @@ describe("ActivityView trust-state loading", () => {
   });
 
   it("preserves last-known calls and offers retry when a live refresh fails", async () => {
-    const user = userEvent.setup({
-      advanceTimers: (ms) => vi.advanceTimersByTime(ms),
-    });
     getAuditLog
       .mockResolvedValueOnce(initialLog)
       .mockResolvedValueOnce(initialLog)
@@ -483,7 +491,7 @@ describe("ActivityView trust-state loading", () => {
 
     render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
-    await user.click(screen.getByRole("button", { name: /recent calls/i }));
+    await screen.findByRole("button", { name: /recent calls/i, expanded: true });
 
     await act(async () => {
       vi.advanceTimersByTime(3000);
@@ -501,16 +509,22 @@ describe("ActivityView trust-state loading", () => {
     const user = userEvent.setup({
       advanceTimers: (ms) => vi.advanceTimersByTime(ms),
     });
+    const cause = "Couldn't read the activity log: Is a directory (os error 21)";
     getAuditLog
-      .mockRejectedValueOnce(new Error("offline"))
-      .mockRejectedValueOnce(new Error("offline"))
+      .mockRejectedValueOnce(cause)
+      .mockRejectedValueOnce(cause)
       .mockResolvedValueOnce([]);
 
     render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
 
     expect(screen.getByText("Couldn't load activity")).toBeInTheDocument();
+    // The real cause, as GTK shows it, not a fixed sentence.
+    expect(screen.getByText(cause)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "View log" })).toBeInTheDocument();
     expect(screen.queryByText("No activity yet")).not.toBeInTheDocument();
+    // Protection still shows its real state while the log is unreadable.
+    expect(screen.getByText("Protection active.")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Retry activity log" }));
     await act(async () => {});
@@ -537,8 +551,7 @@ describe("ActivityView recent calls", () => {
       }),
     ]);
     render(<ActivityView refreshKey={0} registry={null} />);
-    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-    await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+    await screen.findByRole("button", { name: /recent calls/i, expanded: true });
     expect(screen.getByText("Searched tools")).toBeInTheDocument();
     expect(screen.queryByText(/Nothing searched yet/)).not.toBeInTheDocument();
     expect(screen.queryByText(/warm catalog|dispatch 3/)).not.toBeInTheDocument();
@@ -574,7 +587,7 @@ describe("ActivityView recent calls", () => {
     ]);
     render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
-    await user.click(screen.getByRole("button", { name: /recent calls/i }));
+    await screen.findByRole("button", { name: /recent calls/i, expanded: true });
     expect(screen.queryByText(`Run: ${runId}`)).not.toBeInTheDocument();
     await user.click(screen.getByText("run_script"));
     expect(screen.getByText("script exception", { exact: true })).toBeInTheDocument();
@@ -582,12 +595,9 @@ describe("ActivityView recent calls", () => {
   });
 
   it("gives each call row one status color, on its chip", async () => {
-    const user = userEvent.setup({
-      advanceTimers: (ms) => vi.advanceTimersByTime(ms),
-    });
     const { container } = render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
-    await user.click(screen.getByRole("button", { name: /recent calls/i }));
+    await screen.findByRole("button", { name: /recent calls/i, expanded: true });
     const list = container.querySelector(".toolport-list")!;
     const chips = [...list.querySelectorAll('[data-slot="badge"]')];
     expect(chips.map((chip) => chip.textContent)).toEqual(["Failed", "Succeeded"]);
@@ -606,7 +616,7 @@ describe("ActivityView recent calls", () => {
     render(<ActivityView refreshKey={0} registry={null} />);
 
     await act(async () => {});
-    await user.click(screen.getByRole("button", { name: /recent calls/i }));
+    await screen.findByRole("button", { name: /recent calls/i, expanded: true });
 
     // Expand the failed call's error detail.
     await user.click(screen.getByText("merge_pr"));
@@ -623,9 +633,6 @@ describe("ActivityView recent calls", () => {
   });
 
   it("shows the pseudonymization count, and flags a pass that did not fully apply", async () => {
-    const user = userEvent.setup({
-      advanceTimers: (ms) => vi.advanceTimersByTime(ms),
-    });
     getAuditLog.mockResolvedValue([
       entry({ tool: "redacted_call", piiReplaced: 3 }),
       entry({
@@ -640,7 +647,7 @@ describe("ActivityView recent calls", () => {
     render(<ActivityView refreshKey={0} registry={null} />);
 
     await act(async () => {});
-    await user.click(screen.getByRole("button", { name: /recent calls/i }));
+    await screen.findByRole("button", { name: /recent calls/i, expanded: true });
 
     expect(screen.getByText("3 values masked")).toBeInTheDocument();
 
@@ -825,9 +832,11 @@ it("keeps contradictory pre-session history outside all measured totals", async 
   expect(screen.getByText(/100 baseline tokens/)).toHaveTextContent(
     "100 baseline tokens − 50 catalog response tokens − 60 search response tokens = -10 net token change. A negative change means responses used more tokens than the baseline.",
   );
-  expect(screen.getByText(/-10/, { selector: "span.text-3xl" })).toHaveTextContent(
-    "-10 net token change",
-  );
+  const net = screen.getByText(/-10/, { selector: "span.text-3xl" });
+  expect(net).toHaveTextContent("-10 net token change");
+  // A net cost is not drawn as a saving: no green.
+  expect(net).not.toHaveClass("text-success");
+  expect(net.closest(".toolport-alert")).not.toHaveClass("border-success");
   expect(screen.queryByText("net tokens saved")).not.toBeInTheDocument();
   expect(screen.getByText(/1 client sessions/)).toHaveTextContent("2 catalog responses");
   expect(screen.getByText(/1.2 KB baseline catalog text/)).toHaveTextContent(
@@ -1354,7 +1363,7 @@ it("uses one server filter and one identity, time and wait meta line", async () 
   ]);
   render(<ActivityView refreshKey={0} registry={null} />);
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-  await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+  await screen.findByRole("button", { name: /recent calls/i, expanded: true });
   const meta = screen
     .getAllByText("Claude Code")
     .map((name) => name.parentElement!)
@@ -1379,8 +1388,7 @@ it("names a Tools tab Run as Toolport and shows its whole duration", async () =>
     }),
   ]);
   render(<ActivityView refreshKey={0} registry={null} />);
-  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-  await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+  await screen.findByRole("button", { name: /recent calls/i, expanded: true });
   expect(detailLine("Toolport Tools tab · 2m ago · 9.2 s")).toBeVisible();
   expect(
     screen.queryByText(/toolport-gtk|toolport-gateway|reports/),
@@ -1408,8 +1416,7 @@ it("keeps the time and duration visible when the client name is long", async () 
     entry({ ts, clientName: longName, client: "adapter:long", durationMs: 850 }),
   ]);
   render(<ActivityView refreshKey={0} registry={null} />);
-  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-  await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+  await screen.findByRole("button", { name: /recent calls/i, expanded: true });
   const name = screen.getByText(longName);
   // On a wide row only the name truncates; the time and duration sit beside it and
   // never shrink. A narrow row wraps the whole line instead.
@@ -1440,7 +1447,7 @@ it("uses one server option for hyphenated call and approval identities", async (
   ]);
   render(<ActivityView refreshKey={0} registry={null} />);
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-  await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+  await screen.findByRole("button", { name: /recent calls/i, expanded: true });
   await user.click(screen.getByRole("combobox"));
   expect(screen.getAllByRole("option", { name: /^team_slack$/ })).toHaveLength(1);
   expect(screen.queryByRole("option", { name: /^team-slack$/ })).not.toBeInTheDocument();
@@ -1497,7 +1504,7 @@ it.each(["success", "cancellation"] as const)(
     getAuditLog.mockResolvedValue(refreshedLog);
     const fresh = render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
-    fireEvent.click(screen.getByRole("button", { name: /recent calls/i }));
+    await screen.findByRole("button", { name: /recent calls/i, expanded: true });
     expect(screen.getByText("list_issues")).toBeInTheDocument();
     const reads = getAuditLog.mock.calls.length;
     await act(async () => {
@@ -1529,7 +1536,7 @@ it("reconciles a write between initial panel snapshot and first revision baselin
   await act(async () => {});
   const calls = getAuditLog.mock.calls.length;
   expect(calls).toBe(1);
-  fireEvent.click(screen.getByRole("button", { name: /recent calls/i }));
+  await screen.findByRole("button", { name: /recent calls/i, expanded: true });
   // A real new append is now available to panel readers. The queued initial
   // digest observes it, after the first panel reader has returned older bytes.
   getAuditLog.mockResolvedValue(refreshedLog);
@@ -1557,7 +1564,7 @@ it("reconciles after an initial revision error and rejects obsolete panel comple
   await act(async () => {});
   expect(screen.getByText(/Activity change checks are unavailable/)).toBeInTheDocument();
   await act(() => vi.advanceTimersByTimeAsync(3000));
-  fireEvent.click(screen.getByRole("button", { name: /recent calls/i }));
+  await screen.findByRole("button", { name: /recent calls/i, expanded: true });
   expect(screen.getByText("list_issues")).toBeInTheDocument();
   await act(async () => finishOld(initialLog));
   expect(screen.getByText("list_issues")).toBeInTheDocument();
@@ -1586,7 +1593,7 @@ it("reconciles hide/show with a delayed first revision and no overlapping checks
   expect(getActivityRevision).toHaveBeenCalledTimes(1);
   await act(async () => finish("obsolete"));
   await act(() => vi.advanceTimersByTimeAsync(3000));
-  fireEvent.click(screen.getByRole("button", { name: /recent calls/i }));
+  await screen.findByRole("button", { name: /recent calls/i, expanded: true });
   expect(screen.getByText("list_issues")).toBeInTheDocument();
   const calls = getAuditLog.mock.calls.length;
   await act(() => vi.advanceTimersByTimeAsync(60_000));
@@ -1617,8 +1624,7 @@ it("names calls made through T3 Code and shows their thread", async () => {
     entry({ ts, tool: "plain", clientName: "Claude Code" }),
   ]);
   render(<ActivityView refreshKey={0} registry={null} />);
-  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-  await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+  await screen.findByRole("button", { name: /recent calls/i, expanded: true });
   expect(detailLine("Codex via T3 Code · 2m ago · 120 ms")).toBeVisible();
   const chip = screen.getByText("Thread 0f8e2c1a");
   expect(chip).toHaveAttribute("title", `T3 Code thread ${thread}`);
@@ -1636,4 +1642,37 @@ it("names calls made through T3 Code and shows their thread", async () => {
   expect(detailLine("Zed · 2m ago · 120 ms")).toBeVisible();
   expect(detailLine("Claude Code · 2m ago · 120 ms")).toBeVisible();
   expect(screen.queryByText(/Zed via/)).not.toBeInTheDocument();
+});
+
+describe("ActivityView header actions", () => {
+  it("offers Export and Clear on an empty log, as on a busy one", async () => {
+    getAuditLog.mockResolvedValue([]);
+    render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    expect(screen.getByText("No activity yet")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clear" })).toBeInTheDocument();
+  });
+
+  it("exports the format picked from the Export menu", async () => {
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    save.mockResolvedValue("/tmp/toolport-activity.json");
+    exportAuditToPath.mockResolvedValue(undefined);
+    render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    await user.click(screen.getByRole("button", { name: "Export" }));
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
+      "Export JSON",
+      "Export CSV",
+    ]);
+    await user.click(screen.getByRole("menuitem", { name: "Export JSON" }));
+    await act(async () => {});
+    expect(save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        defaultPath: "toolport-activity.json",
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      }),
+    );
+    expect(exportAuditToPath).toHaveBeenCalledWith("/tmp/toolport-activity.json", "json");
+  });
 });

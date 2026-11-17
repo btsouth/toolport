@@ -276,7 +276,13 @@ pub fn probe_one_bounded(server: &ServerEntry) -> ProbeResult {
 /// Test Connection for a saved server: a user action, so it may ask to unlock
 /// the store.
 pub fn probe_registered(server_id: &str) -> Result<ProbeResult, String> {
-    Ok(probe_one_bounded(&registered_server(server_id)?))
+    let (server, enabled) = registered_server_state(server_id)?;
+    // A team or shared server still waiting for review runs nothing: no secret
+    // is read and no command starts until the user consents in Teams.
+    if !enabled && server.needs_team_enable_review() {
+        return Err(crate::registry::TEAM_REVIEW_REQUIRED.to_string());
+    }
+    Ok(probe_one_bounded(&server))
 }
 
 /// The health check a shell runs on its own: at start, after a change, when a
@@ -465,15 +471,22 @@ pub fn recheck_locked_once_open(
 }
 
 fn registered_server(server_id: &str) -> Result<ServerEntry, String> {
+    registered_server_state(server_id).map(|(server, _)| server)
+}
+
+/// A saved server and whether its switch is on.
+fn registered_server_state(server_id: &str) -> Result<(ServerEntry, bool), String> {
     let path = crate::registry::resolved_path().ok_or("could not resolve the registry path")?;
     let contents = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read the registry: {error}"))?;
     let registry = crate::registry::parse_registry_contents(&contents)
         .map_err(|error| format!("could not parse the registry: {error}"))?;
+    let enabled = registry.enabled_here(server_id);
     registry
         .servers
         .into_iter()
         .find(|server| server.id == server_id)
+        .map(|server| (server, enabled))
         .ok_or_else(|| format!("server '{server_id}' not found"))
 }
 
@@ -800,6 +813,38 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|result| !result.ok));
+    }
+
+    #[test]
+    fn test_connection_starts_nothing_for_a_team_server_awaiting_review() {
+        let data = crate::registry::DataDirTestEnv::new("probe-registered-team-review");
+        let marker = data.dir.join("started");
+        let registry = serde_json::json!({
+            "version": 3,
+            "servers": [{
+                "id": "team-cmd",
+                "name": "Team command",
+                "transport": "stdio",
+                "command": "sh",
+                "args": ["-c", format!("touch '{}'", marker.display())],
+                "env": [],
+                "enabled": false,
+                "source": "team:t",
+                "teamEnableReview": true
+            }],
+            "profiles": [{ "id": "default", "name": "Default", "enabledServerIds": [] }],
+            "activeProfileId": "default"
+        });
+        std::fs::write(
+            crate::registry::resolved_path().unwrap(),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+
+        let error = probe_registered("team-cmd").unwrap_err();
+
+        assert_eq!(error, crate::registry::TEAM_REVIEW_REQUIRED);
+        assert!(!marker.exists(), "the team command must not start");
     }
 
     #[test]

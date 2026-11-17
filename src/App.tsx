@@ -26,6 +26,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  Server,
   ServerOff,
   Store,
   TriangleAlert,
@@ -894,9 +895,8 @@ function App() {
     }
   }
 
-  async function handleToggleAll() {
+  async function handleToggleAll(enable: boolean) {
     if (!profileId || togglingAll) return;
-    const enable = enabledCount < servers.length;
     const pendingReview =
       enable && registry
         ? servers.filter((s) => needsTeamEnableReview(s) && !isEnabled(registry, s.id))
@@ -1137,7 +1137,7 @@ function App() {
                         <Button
                           variant="ghost"
                           size="icon"
-                          aria-label={translate("More actions")}
+                          aria-label={translate("Import and server actions")}
                           title={translate("Import and server actions")}
                         >
                           <MoreHorizontal className="size-4" />
@@ -1150,43 +1150,51 @@ function App() {
                           <span>{t("Import")}</span>
                         </DropdownMenuItem>
 
+                        {/* Both bulk actions, named as in the GTK menu. They act on
+                            every server, so they stay off while a search hides some,
+                            and while a bulk change is running. */}
                         {servers.length > 0 && (
-                          <DropdownMenuItem
-                            onClick={() => {
-                              // "Disable all" only shows when every server is enabled,
-                              // so it turns off `servers.length`. Confirm when that's
-                              // more than a couple; "Enable all" and small sets go
-                              // straight through.
-                              const disabling = enabledCount >= servers.length;
-                              if (
-                                disabling &&
-                                servers.length > BULK_DISABLE_CONFIRM_MIN
-                              ) {
-                                setConfirmDisableAll(true);
-                              } else {
-                                void handleToggleAll();
+                          <>
+                            <DropdownMenuItem
+                              onClick={() => void handleToggleAll(true)}
+                              disabled={
+                                togglingAll ||
+                                busyId !== null ||
+                                query.trim() !== "" ||
+                                enabledCount >= servers.length
                               }
-                            }}
-                            // Gate on the flag handleToggleAll actually sets (togglingAll),
-                            // not just busyId, so it can't be re-fired mid-run. Disabled
-                            // while a search is active: it acts on ALL servers, so it must
-                            // not silently toggle ones hidden by the filter.
-                            disabled={
-                              togglingAll || busyId !== null || query.trim() !== ""
-                            }
-                            title={
-                              query.trim() !== ""
-                                ? t("Clear the search to enable or disable all servers")
-                                : undefined
-                            }
-                          >
-                            <ServerOff className="mr-2 size-4" />
-                            <span>
-                              {enabledCount < servers.length
-                                ? t("Enable all")
-                                : t("Disable all")}
-                            </span>
-                          </DropdownMenuItem>
+                              title={
+                                query.trim() !== ""
+                                  ? t("Clear the search to enable or disable all servers")
+                                  : undefined
+                              }
+                            >
+                              <Server className="mr-2 size-4" />
+                              <span>{t("Enable all reviewed servers")}</span>
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onClick={() => {
+                                // Turning off more than a couple asks first.
+                                if (enabledCount > BULK_DISABLE_CONFIRM_MIN)
+                                  setConfirmDisableAll(true);
+                                else void handleToggleAll(false);
+                              }}
+                              disabled={
+                                togglingAll ||
+                                busyId !== null ||
+                                query.trim() !== "" ||
+                                enabledCount === 0
+                              }
+                              title={
+                                query.trim() !== ""
+                                  ? t("Clear the search to enable or disable all servers")
+                                  : undefined
+                              }
+                            >
+                              <ServerOff className="mr-2 size-4" />
+                              <span>{t("Disable all servers")}</span>
+                            </DropdownMenuItem>
+                          </>
                         )}
                       </DropdownMenuContent>
                     </DropdownMenu>
@@ -1221,7 +1229,13 @@ function App() {
                   <Button
                     variant="ghost"
                     size="icon"
-                    aria-label={t("Refresh")}
+                    aria-label={
+                      view === "servers"
+                        ? t("Check servers again")
+                        : view === "activity"
+                          ? t("Refresh activity")
+                          : t("Refresh")
+                    }
                     data-client-refresh={view === "clients" ? "" : undefined}
                     title={
                       isMac
@@ -1531,11 +1545,11 @@ function App() {
         title={translate("Disable all servers?")}
         description={translate(
           "This turns off all {value1} servers for every client. Clients will lose their tools until you re-enable them.",
-          { value1: String(servers.length) },
+          { value1: String(enabledCount) },
         )}
         confirmLabel={translate("Disable all")}
         destructive
-        onConfirm={handleToggleAll}
+        onConfirm={() => handleToggleAll(false)}
       />
       <ConfirmDialog
         open={confirmEnableTeam !== null}
@@ -1802,7 +1816,7 @@ function ServersEmptyState({
   return (
     <SharedEmptyState
       icon={<ServerOff />}
-      title={t("No servers in Toolport yet")}
+      title={t("No servers yet")}
       description={
         importable > 0
           ? importable === 1
@@ -1814,7 +1828,7 @@ function ServersEmptyState({
                 "Found {value1} servers in your installed clients. Import them to get started.",
                 { value1: importable },
               )
-          : t("Browse the catalog to add one, or import servers from a client.")
+          : t("Connect a local command or a remote endpoint once; every client gets it.")
       }
       action={
         <>

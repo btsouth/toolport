@@ -1,1 +1,22 @@
-[]
+[
+  {
+    "screen": "activity",
+    "region": "body",
+    "kind": "text",
+    "type": "only-gtk",
+    "gtk": "Couldn't read the activity log: *",
+    "reason": "Same cause text in both shells. React's error card puts View log and Retry before the cause in page order, GTK's after it; both draw the buttons beside the title, so only the reading order differs.",
+    "scenario": "activity-unreadable",
+    "moved": true
+  },
+  {
+    "screen": "activity",
+    "region": "body",
+    "kind": "text",
+    "type": "only-react",
+    "react": "Couldn't read the activity log: *",
+    "reason": "Same cause text in both shells. React's error card puts View log and Retry before the cause in page order, GTK's after it; both draw the buttons beside the title, so only the reading order differs.",
+    "scenario": "activity-unreadable",
+    "moved": true
+  }
+]

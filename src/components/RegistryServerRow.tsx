@@ -14,11 +14,11 @@ import {
   type KeyboardEvent,
 } from "react";
 import {
-  ChevronDown,
   Copy,
   RefreshCw,
   KeyRound,
   LogIn,
+  MoreHorizontal,
   Pencil,
   Trash2,
   Users,
@@ -37,7 +37,21 @@ import { LazyServerDialog as ServerDialog } from "@/components/LazyServerDialog"
 import { LaunchSetupDialog } from "@/components/LaunchSetupDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ServerLogo } from "@/components/ServerLogo";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { probeRegistered } from "@/lib/api";
+import { needsTeamEnableReview } from "@/lib/importReview";
 
+// Opened from the row menu only, so it loads in its own chunk.
+const SyncSettingsDialog = lazy(() =>
+  import("@/components/SyncSettingsDialog").then((m) => ({
+    default: m.SyncSettingsDialog,
+  })),
+);
 const ServerToolsPanel = lazy(() =>
   import("@/components/ServerToolsPanel").then((m) => ({ default: m.ServerToolsPanel })),
 );
@@ -237,6 +251,55 @@ export function RegistryServerRow({
   }
 
   const stop = (e: { stopPropagation: () => void }) => e.stopPropagation();
+  // The row menu's dialogs, opened one at a time (as the GTK row's menu).
+  const [dialog, setDialog] = useState<
+    null | "edit" | "duplicate" | "sync" | "auth" | "credentials" | "remove"
+  >(null);
+  const closeDialog = () => setDialog(null);
+  const editable = !isTeam && ["stdio", "http", "sse"].includes(server.transport);
+  const open = () => (onOpen ? onOpen("overview") : setExpanded((v) => !v));
+
+  // Test connection: the GTK row menu's check of the saved server, with its messages.
+  async function testConnection() {
+    const id = toast.loading(t("Testing {value0}…", { value0: server.name }));
+    try {
+      const probe = await probeRegistered(server.id);
+      if (probe.ok)
+        toast.success(
+          probe.toolCount === 1
+            ? t("{value0} connected and exposed {value1} tool", {
+                value0: server.name,
+                value1: probe.toolCount,
+              })
+            : t("{value0} connected and exposed {value1} tools", {
+                value0: server.name,
+                value1: probe.toolCount,
+              }),
+          { id },
+        );
+      else if (probe.authRequired)
+        toast.error(
+          t("{value0} needs credentials before it can connect", { value0: server.name }),
+          { id },
+        );
+      else
+        toast.error(
+          t("Could not connect to {value0}: {value1}", {
+            value0: server.name,
+            value1: probe.error ?? "unknown connection error",
+          }),
+          { id },
+        );
+    } catch (error) {
+      toast.error(
+        t("Could not test {value0}: {value1}", {
+          value0: server.name,
+          value1: String(error),
+        }),
+        { id },
+      );
+    }
+  }
 
   // Where it comes from, how it runs and where its keys live: the row's second line.
   const origin = isTeam
@@ -280,11 +343,7 @@ export function RegistryServerRow({
     >
       {/* Row navigation stays separate from the switch and authentication controls. */}
       <div
-        onClick={
-          detail
-            ? undefined
-            : () => (onOpen ? onOpen("overview") : setExpanded((v) => !v))
-        }
+        onClick={detail ? undefined : open}
         className={`flex min-h-14 cursor-pointer items-center gap-3 px-4 py-3 transition-colors hover:bg-foreground/[0.04] ${detail ? "" : "flex-wrap gap-y-2"}`}
       >
         {detail && (
@@ -299,7 +358,24 @@ export function RegistryServerRow({
           // actions wrap onto the next line.
           <span className="min-w-0 flex-1 basis-[220px]">
             <span title={server.name} className="flex min-w-0 items-center gap-1.5">
-              <span className="truncate text-sm font-semibold">{server.name}</span>
+              {/* The name opens the details, as in the GTK row. */}
+              <button
+                type="button"
+                data-detail-open={server.id}
+                aria-expanded={onOpen ? undefined : expanded}
+                aria-label={
+                  expanded
+                    ? t("Hide {value1} details", { value1: server.name })
+                    : t("Show {value1} details", { value1: server.name })
+                }
+                onClick={(e) => {
+                  stop(e);
+                  open();
+                }}
+                className="min-w-0 truncate rounded-sm text-left text-sm font-semibold focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              >
+                {server.name}
+              </button>
               {isTeam && (
                 <Users
                   className="size-3.5 shrink-0 text-muted-foreground"
@@ -350,7 +426,8 @@ export function RegistryServerRow({
             <StatusLabel status={status} label={label} error={health?.error ?? null} />
           )}
 
-          {health && !health.ok && health.error && (
+          {/* A locked keyring has no error to show, but Retry may unlock it. */}
+          {health && !health.ok && (health.error || status === "locked") && (
             <span className="flex gap-1">
               {(status === "error" || status === "locked") && onReprobe && (
                 <button
@@ -367,21 +444,23 @@ export function RegistryServerRow({
                   {translate("Retry")}
                 </button>
               )}
-              <button
-                type="button"
-                title={translate("View the connection error and server output")}
-                className={ACTION}
-                onClick={(e) => {
-                  stop(e);
-                  if (onOpen && !detail) onOpen("overview");
-                  else {
-                    setExpanded(true);
-                    setDetailTab("overview");
-                  }
-                }}
-              >
-                {translate("View log")}
-              </button>
+              {health.error && (
+                <button
+                  type="button"
+                  title={translate("View the connection error and server output")}
+                  className={ACTION}
+                  onClick={(e) => {
+                    stop(e);
+                    if (onOpen && !detail) onOpen("overview");
+                    else {
+                      setExpanded(true);
+                      setDetailTab("overview");
+                    }
+                  }}
+                >
+                  {translate("View log")}
+                </button>
+              )}
             </span>
           )}
           <span className="flex items-center" onClick={stop}>
@@ -395,39 +474,128 @@ export function RegistryServerRow({
               onCheckedChange={(next) => {
                 if (!busy) onToggle(next);
               }}
-              aria-label={t("Toggle {value1}", { value1: server.name })}
+              // Names what the switch does now, as the GTK switch does.
+              aria-label={
+                enabled
+                  ? t("Disable {server}", { server: server.name })
+                  : t("Enable {server}", { server: server.name })
+              }
             />
           </span>
           {!detail && (
-            <button
-              type="button"
-              title={
-                expanded
-                  ? translate("Hide server details")
-                  : translate("Show server details")
-              }
-              onClick={(e) => {
-                e.stopPropagation();
-                if (onOpen) onOpen("overview");
-                else setExpanded((v) => !v);
-              }}
-              data-detail-open={server.id}
-              aria-expanded={onOpen ? undefined : expanded}
-              aria-label={
-                expanded
-                  ? t("Hide {value1} details", { value1: server.name })
-                  : t("Show {value1} details", { value1: server.name })
-              }
-              className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-            >
-              <ChevronDown
-                className={`size-4 transition-transform ${expanded ? "rotate-180" : ""}`}
-                aria-hidden="true"
-              />
-            </button>
+            // The row's actions (spec 9 and the mockup: chip, switch, then ⋯),
+            // the same as the GTK row menu.
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="size-7 text-muted-foreground"
+                  aria-label={t("Actions for {value0}", { value0: server.name })}
+                  title={t("Actions for {value0}", { value0: server.name })}
+                  onClick={stop}
+                >
+                  <MoreHorizontal className="size-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              {/* As wide as its longest item: no item wraps onto two lines. */}
+              <DropdownMenuContent align="end" className="w-max" onClick={stop}>
+                {/* A team server awaiting review starts nothing until the user consents. */}
+                <DropdownMenuItem
+                  disabled={!enabled && needsTeamEnableReview(server)}
+                  onSelect={() => void testConnection()}
+                >
+                  {t("Test connection")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={() => (onOpen ? onOpen("tools") : setExpanded(true))}
+                >
+                  {t("Server details and tools")}
+                </DropdownMenuItem>
+                <DropdownMenuItem disabled={!editable} onSelect={() => setDialog("edit")}>
+                  {t("Edit")}
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => setDialog("sync")}>
+                  {t("Sync settings")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  disabled={!editable}
+                  title={t(
+                    "Add another account: a new entry with the same connection, named separately",
+                  )}
+                  onSelect={() => setDialog("duplicate")}
+                >
+                  {t("Duplicate")}
+                </DropdownMenuItem>
+                {(server.transport === "http" || server.transport === "sse") && (
+                  <DropdownMenuItem onSelect={() => setDialog("auth")}>
+                    {t("Authentication")}
+                  </DropdownMenuItem>
+                )}
+                <DropdownMenuItem onSelect={() => setDialog("credentials")}>
+                  {t("Credentials")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  variant="destructive"
+                  disabled={busy || isTeam}
+                  onSelect={() => setDialog("remove")}
+                >
+                  {t("Remove")}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           )}
         </span>
       </div>
+
+      {(dialog === "edit" || dialog === "duplicate") && (
+        <ServerDialog
+          autoOpen
+          onClose={closeDialog}
+          onSaved={onRegistryChange}
+          editId={dialog === "edit" ? server.id : undefined}
+          initial={dialog === "edit" ? server : { ...server, name: duplicateName }}
+          existingNames={registry?.servers.map((s) => s.name) ?? []}
+        />
+      )}
+      {dialog === "sync" && (
+        <Suspense fallback={null}>
+          <SyncSettingsDialog
+            server={server}
+            registry={registry}
+            onSaved={onRegistryChange}
+            onClose={closeDialog}
+          />
+        </Suspense>
+      )}
+      {(dialog === "auth" || dialog === "credentials") && (
+        <SecretsDialog
+          autoOpen
+          onClose={closeDialog}
+          server={server}
+          onSaved={onRegistryChange}
+          onChanged={onReprobe}
+        />
+      )}
+      {dialog === "remove" && (
+        <ConfirmDialog
+          open
+          onOpenChange={(next) => !next && closeDialog()}
+          title={translate("Remove {value0}?", { value0: server.name })}
+          description={
+            personalSync && !server.syncLocalOnly
+              ? translate(
+                  "This removes the server from Toolport and your other machines. Any saved secrets stay in your keychain.",
+                )
+              : translate(
+                  "This deletes the server from Toolport on this machine. Any saved secrets stay in your keychain.",
+                )
+          }
+          confirmLabel={translate("Remove")}
+          destructive
+          onConfirm={onRemove}
+        />
+      )}
 
       {!enabled && server.teamRouteRemoved && (
         <p className="pr-4 pb-2.5 pl-14 text-meta text-muted-foreground">

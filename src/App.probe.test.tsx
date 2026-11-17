@@ -361,7 +361,7 @@ describe("App health visibility", () => {
     render(<App />);
     await waitFor(() => expect(probeServers).toHaveBeenCalledWith(false));
 
-    await user.click(await screen.findByRole("button", { name: "Refresh" }));
+    await user.click(await screen.findByRole("button", { name: "Check servers again" }));
     act(() => finishAutomatic(locked));
     await waitFor(() => expect(probeServers).toHaveBeenCalledTimes(2));
     expect(probeServers).toHaveBeenLastCalledWith(true);
@@ -417,12 +417,12 @@ describe("App health visibility", () => {
     expect(
       await screen.findByRole("status", { name: /^Ready, 1 tool$/i }),
     ).toBeInTheDocument();
-    await userEvent.click(screen.getByLabelText("Toggle Example"));
+    await userEvent.click(screen.getByLabelText(/^(Enable|Disable) Example$/));
     await waitFor(() =>
       expect(setServerEnabled).toHaveBeenCalledWith("default", "server-1", false, false),
     );
 
-    await userEvent.click(screen.getByLabelText("Toggle Example"));
+    await userEvent.click(screen.getByLabelText(/^(Enable|Disable) Example$/));
 
     expect(
       await screen.findByRole("status", { name: "Checking connection" }),
@@ -478,12 +478,16 @@ describe("App health visibility", () => {
     expect(
       await screen.findByRole("status", { name: /^Ready, 1 tool$/i }),
     ).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "More actions" }));
-    await userEvent.click(screen.getByText("Disable all"));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Import and server actions" }),
+    );
+    await userEvent.click(screen.getByText("Disable all servers"));
     await waitFor(() => expect(setAllEnabled).toHaveBeenCalledWith("default", false));
 
-    await userEvent.click(screen.getByRole("button", { name: "More actions" }));
-    await userEvent.click(screen.getByText("Enable all"));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Import and server actions" }),
+    );
+    await userEvent.click(screen.getByText("Enable all reviewed servers"));
 
     expect(
       await screen.findByRole("status", { name: "Checking connection" }),
@@ -571,17 +575,23 @@ describe("server list stability and automatic prompts", () => {
       }),
     );
     render(<App />);
-    await screen.findByRole("switch", { name: "Toggle Alpha" });
+    await screen.findByRole("switch", { name: /^(Enable|Disable) Alpha$/ });
     const order = () =>
-      screen.getAllByRole("switch").map((row) => row.getAttribute("aria-label"));
+      screen
+        .getAllByRole("switch")
+        .map((row) => row.getAttribute("aria-label")?.replace(/^(Enable|Disable) /, ""));
     const before = order();
-    await userEvent.click(screen.getByRole("switch", { name: "Toggle Alpha" }));
+    await userEvent.click(
+      screen.getByRole("switch", { name: /^(Enable|Disable) Alpha$/ }),
+    );
     await waitFor(() => expect(setServerEnabled).toHaveBeenCalled());
     await waitFor(() =>
-      expect(screen.getByRole("switch", { name: "Toggle Alpha" })).toBeChecked(),
+      expect(
+        screen.getByRole("switch", { name: /^(Enable|Disable) Alpha$/ }),
+      ).toBeChecked(),
     );
     expect(order()).toEqual(before);
-    expect(before).toEqual(["Toggle Alpha", "Toggle Beta", "Toggle Zulu"]);
+    expect(before).toEqual(["Alpha", "Beta", "Zulu"]);
   });
   it("never asks for a star after finishing onboarding or returning", async () => {
     probeServers.mockResolvedValue([]);

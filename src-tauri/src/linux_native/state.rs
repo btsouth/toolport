@@ -82,7 +82,22 @@ pub(super) struct ActivitySnapshot {
     /// busiest first; each row carries its per-tool breakdown.
     pub(super) server_stats: Vec<serde_json::Value>,
     pub(super) telemetry_notices: Vec<String>,
+    /// Why the audit log could not be read. The other panels still load, as in React.
+    pub(super) audit_error: Option<String>,
+    /// The audit read failed and the rows shown are the last ones read successfully.
+    pub(super) audit_stale: bool,
+    /// Why security events could not be read: unknown, never an all-clear.
+    pub(super) security_error: Option<String>,
+    /// The security read failed and the events shown are the last ones read successfully.
+    pub(super) security_stale: bool,
+    pub(super) search_traces_error: Option<String>,
+    pub(super) inspect_error: Option<String>,
+    /// Live inspection is on, so the inspector panel shows (React reads `liveInspect`).
+    pub(super) live_inspect: bool,
 }
+
+/// How many recent entries Activity reads and lists: React's `getAuditLog(200)`.
+pub(super) const ACTIVITY_ROW_LIMIT: usize = 200;
 
 impl ActivitySnapshot {
     fn from_entries(entries: Vec<serde_json::Value>, recent_limit: usize) -> Self {
@@ -155,7 +170,7 @@ impl ActivitySnapshot {
                         .get("error")
                         .and_then(serde_json::Value::as_str)
                         .filter(|value| !value.is_empty())
-                        .map(activity_error_summary),
+                        .map(activity_error_text),
                     pii_replaced: entry.get("piiReplaced").and_then(serde_json::Value::as_u64),
                     pii_incomplete: entry
                         .get("piiIncomplete")
@@ -202,6 +217,13 @@ impl ActivitySnapshot {
             tool_identities_error: None,
             server_stats: Vec::new(),
             telemetry_notices: Vec::new(),
+            audit_error: None,
+            audit_stale: false,
+            security_error: None,
+            security_stale: false,
+            search_traces_error: None,
+            inspect_error: None,
+            live_inspect: false,
         }
     }
 }
@@ -272,19 +294,16 @@ pub(super) fn format_token_count(tokens: u64) -> String {
     }
 }
 
-fn activity_error_summary(error: &str) -> String {
-    const MAX_CHARS: usize = 180;
-    let readable = serde_json::from_str::<serde_json::Value>(error)
+/// A failed call's error, read out of a JSON body when it is one. The whole
+/// text: the expanded row wraps it, as React shows `error` in full (the audit
+/// log already bounds its length).
+fn activity_error_text(error: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(error)
         .ok()
         .and_then(|value| activity_error_message(&value).map(str::to_string))
-        .unwrap_or_else(|| error.to_string());
-    let collapsed = readable.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= MAX_CHARS {
-        return collapsed;
-    }
-    let mut summary = collapsed.chars().take(MAX_CHARS).collect::<String>();
-    summary.push('…');
-    summary
+        .unwrap_or_else(|| error.to_string())
+        .trim()
+        .to_string()
 }
 
 fn activity_error_message(value: &serde_json::Value) -> Option<&str> {
@@ -305,35 +324,59 @@ fn activity_error_message(value: &serde_json::Value) -> Option<&str> {
 }
 
 pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
-    let mut entries = crate::audit::read_all()
-        .map_err(|error| format!("could not read retained activity: {error}"))?;
-    for entry in &mut entries {
-        let server = activity_server(entry);
-        let needs_server = entry
-            .get("server")
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(|server| server.trim().is_empty());
-        if needs_server {
-            if let Some(object) = entry.as_object_mut() {
-                object.insert("server".to_string(), serde_json::Value::String(server));
+    // Each panel reads on its own, as React's do: an unreadable audit log shows its
+    // error where the calls go, while protection, discovery and identities still
+    // show their real state.
+    let (mut snapshot, audit_error) = match crate::audit::read_all() {
+        Ok(mut entries) => {
+            for entry in &mut entries {
+                let server = activity_server(entry);
+                let needs_server = entry
+                    .get("server")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|server| server.trim().is_empty());
+                if needs_server {
+                    if let Some(object) = entry.as_object_mut() {
+                        object.insert("server".to_string(), serde_json::Value::String(server));
+                    }
+                }
             }
+            let server_stats = crate::audit::stats_for_entries(&entries)
+                .get("servers")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut snapshot = ActivitySnapshot::from_entries(entries, ACTIVITY_ROW_LIMIT);
+            snapshot.server_stats = server_stats;
+            (snapshot, None)
         }
-    }
-    let server_stats = crate::audit::stats_for_entries(&entries)
-        .get("servers")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut snapshot = ActivitySnapshot::from_entries(entries, 100);
-    snapshot.server_stats = server_stats;
+        // The same words the Tauri command rejects with, so both shells show one cause.
+        Err(error) => (
+            ActivitySnapshot::from_entries(Vec::new(), ACTIVITY_ROW_LIMIT),
+            Some(format!("Couldn't read the activity log: {error}")),
+        ),
+    };
+    snapshot.audit_error = audit_error;
     snapshot.telemetry_notices =
         crate::telemetry::activity_notices(&crate::telemetry::activity_health());
-    snapshot.security_events = crate::integrity::review_events(2000)
-        .map_err(|error| format!("could not read security events: {error}"))?;
-    snapshot.search_traces = crate::searchtrace::read_recent(25)
-        .map_err(|error| format!("could not read discovery traces: {error}"))?;
-    snapshot.inspect_calls = crate::inspect::read_recent(25)
-        .map_err(|error| format!("could not read inspector captures: {error}"))?;
+    match crate::integrity::review_events(2000) {
+        Ok(events) => snapshot.security_events = events,
+        Err(error) => {
+            snapshot.security_error = Some(format!("could not read security events: {error}"))
+        }
+    }
+    match crate::searchtrace::read_recent(100) {
+        Ok(traces) => snapshot.search_traces = traces,
+        Err(error) => {
+            snapshot.search_traces_error = Some(format!("could not read discovery traces: {error}"))
+        }
+    }
+    match crate::inspect::read_recent(50) {
+        Ok(calls) => snapshot.inspect_calls = calls,
+        Err(error) => {
+            snapshot.inspect_error = Some(format!("could not read inspector captures: {error}"))
+        }
+    }
     let savings = crate::savings::try_summary()
         .map_err(|error| format!("could not read catalog telemetry: {error}"))?;
     let savings_number = |key: &str| {
@@ -375,6 +418,7 @@ pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
     match crate::registry::load()
         .map_err(|error| format!("could not read the registry for tool identities: {error}"))
         .and_then(|registry| {
+            snapshot.live_inspect = registry.live_inspect;
             annotate_security_server_names(&mut snapshot.security_events, &registry.servers);
             crate::integrity::tool_identities(&registry.servers, &registry.profiles)
                 .map_err(|error| format!("could not read the tool identity stores: {error}"))
@@ -1528,15 +1572,14 @@ mod tests {
     }
 
     #[test]
-    fn activity_errors_are_single_line_and_bounded_for_cards() {
+    fn activity_errors_keep_their_whole_text_for_the_expanded_row() {
         let error = format!("first line\n{}", "private-ish detail ".repeat(30));
-        let summary = activity_error_summary(&error);
+        let text = activity_error_text(&error);
 
-        assert!(!summary.contains('\n'));
-        assert!(summary.chars().count() <= 181);
-        assert!(summary.ends_with('…'));
+        assert_eq!(text, error.trim());
+        assert!(!text.ends_with('…'));
         assert_eq!(
-            activity_error_summary(r#"{"errors":[{"message":"Authentication error"}]}"#),
+            activity_error_text(r#"{"errors":[{"message":"Authentication error"}]}"#),
             "Authentication error"
         );
     }

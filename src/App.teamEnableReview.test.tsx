@@ -102,12 +102,16 @@ describe("server switch keyboard focus", () => {
       Promise.resolve(personalRegistry(enabled)),
     );
     render(<App />);
-    const toggle = await screen.findByRole("switch", { name: "Toggle Team tool" });
+    const toggle = await screen.findByRole("switch", {
+      name: /^(Enable|Disable) Team tool$/,
+    });
     toggle.focus();
     for (const checked of ["false", "true"]) {
       await user.keyboard(" ");
       await waitFor(() => {
-        const current = screen.getByRole("switch", { name: "Toggle Team tool" });
+        const current = screen.getByRole("switch", {
+          name: /^(Enable|Disable) Team tool$/,
+        });
         expect(current).toHaveAttribute("aria-checked", checked);
         expect(current).toHaveFocus();
       });
@@ -125,22 +129,25 @@ describe("server switch keyboard focus", () => {
         }),
     );
     render(<App />);
-    const toggle = await screen.findByRole("switch", { name: "Toggle Team tool" });
+    const toggle = await screen.findByRole("switch", {
+      name: /^(Enable|Disable) Team tool$/,
+    });
     toggle.focus();
     await user.keyboard(" ");
     expect(toggle).toHaveAttribute("aria-disabled", "true");
     expect(toggle).toHaveFocus();
     await user.keyboard(" ");
     expect(setServerEnabled).toHaveBeenCalledTimes(1);
-    // Shift+Tab leaves the row for a header control that survives the move.
-    await user.tab({ shift: true });
+    // Shift+Tab past the row's name leaves the row for a header control that
+    // survives the move.
+    do await user.tab({ shift: true });
+    while (document.activeElement?.closest("[data-server-id]"));
     const nextFocus = document.activeElement;
     expect(nextFocus).not.toBe(toggle);
     await act(async () => finish(personalRegistry(false)));
-    expect(screen.getByRole("switch", { name: "Toggle Team tool" })).toHaveAttribute(
-      "aria-checked",
-      "false",
-    );
+    expect(
+      screen.getByRole("switch", { name: /^(Enable|Disable) Team tool$/ }),
+    ).toHaveAttribute("aria-checked", "false");
     expect(document.activeElement).toBe(nextFocus);
   });
 });
@@ -189,7 +196,7 @@ describe("team enable review dialog", () => {
     getRegistry.mockResolvedValue(registry);
     render(<App />);
     await userEvent.click(
-      await screen.findByRole("switch", { name: "Toggle Team tool" }),
+      await screen.findByRole("switch", { name: /^(Enable|Disable) Team tool$/ }),
     );
     const dialog = within(await screen.findByRole("dialog"));
     expect(await dialog.findByText("Command: npx\\u{202E}")).toBeInTheDocument();
@@ -216,7 +223,7 @@ describe("team enable review dialog", () => {
     getRegistry.mockResolvedValue(registry);
     render(<App />);
     await userEvent.click(
-      await screen.findByRole("switch", { name: "Toggle Team tool" }),
+      await screen.findByRole("switch", { name: /^(Enable|Disable) Team tool$/ }),
     );
     const dialog = within(await screen.findByRole("dialog"));
     await dialog.findByText("Show full definition");
@@ -240,7 +247,9 @@ describe("team enable review dialog", () => {
     getRegistry.mockResolvedValue(registry);
     setServerEnabled.mockRejectedValueOnce(message);
     render(<App />);
-    const toggle = await screen.findByRole("switch", { name: "Toggle Plain values" });
+    const toggle = await screen.findByRole("switch", {
+      name: /^(Enable|Disable) Plain values$/,
+    });
     await userEvent.click(toggle);
     const dialog = within(await screen.findByRole("dialog"));
     await waitFor(() =>
@@ -266,7 +275,9 @@ describe("team enable review dialog", () => {
       )
       .mockResolvedValueOnce(registry);
     render(<App />);
-    const toggle = await screen.findByRole("switch", { name: "Toggle Team tool" });
+    const toggle = await screen.findByRole("switch", {
+      name: /^(Enable|Disable) Team tool$/,
+    });
     await userEvent.click(toggle);
     const dialog = within(await screen.findByRole("dialog"));
     const enable = dialog.getByRole("button", { name: "Enable" });
@@ -277,12 +288,13 @@ describe("team enable review dialog", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(screen.queryByRole("alert")).toBeNull();
     // Enabling moves the row from Turned off to Servers, replacing its switch.
-    expect(screen.getByRole("switch", { name: "Toggle Team tool" })).toHaveAttribute(
-      "aria-checked",
-      "true",
-    );
+    expect(
+      screen.getByRole("switch", { name: /^(Enable|Disable) Team tool$/ }),
+    ).toHaveAttribute("aria-checked", "true");
     await waitFor(() =>
-      expect(screen.getByRole("switch", { name: "Toggle Team tool" })).toHaveFocus(),
+      expect(
+        screen.getByRole("switch", { name: /^(Enable|Disable) Team tool$/ }),
+      ).toHaveFocus(),
     );
     expect(setServerEnabled).toHaveBeenLastCalledWith(
       "default",
@@ -301,7 +313,9 @@ describe("team enable review dialog", () => {
     { timeout: 20000 },
     async () => {
       render(<App />);
-      const toggle = await screen.findByRole("switch", { name: "Toggle Team tool" });
+      const toggle = await screen.findByRole("switch", {
+        name: /^(Enable|Disable) Team tool$/,
+      });
       await userEvent.click(toggle);
       expect(await screen.findByText("Command: npx")).toBeInTheDocument();
       expect(

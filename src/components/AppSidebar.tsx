@@ -679,10 +679,13 @@ export function AppSidebar({
         {savings && (savings.tokenizedLoads ?? 0) > 0 && (
           <button
             onClick={() => onSelectView("activity")}
-            className="sidebar-savings mx-3 mt-2 flex items-center gap-2 rounded-lg border border-success/30 bg-success/5 px-3 py-2 text-left text-meta transition-colors hover:bg-success/10"
+            // Green only for a real saving; extra tokens read neutral, as in GTK.
+            className={`sidebar-savings mx-3 mt-2 flex items-center gap-2 rounded-lg border px-3 py-2 text-left text-meta transition-colors ${savings.tokensSaved < 0 ? "border-border bg-muted/20 hover:bg-muted/40" : "border-success/30 bg-success/5 hover:bg-success/10"}`}
             title={`${savingsStale ? t("Catalog telemetry unavailable; showing the last loaded measurement. ") : ""}${t("cl100k_base tokenizer; one full catalog baseline per client session minus every catalog and search response. Sessionless HTTP and unverifiable history excluded; not model usage or billing. Click for the breakdown.")}`}
           >
-            <Zap className="size-3.5 shrink-0 text-success" />
+            <Zap
+              className={`size-3.5 shrink-0 ${savings.tokensSaved < 0 ? "text-muted-foreground" : "text-success"}`}
+            />
             <span className="text-muted-foreground">
               {/* A negative net saving is overhead: show its size as extra tokens. */}
               <span className="font-semibold text-foreground">

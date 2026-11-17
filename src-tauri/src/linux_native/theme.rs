@@ -925,12 +925,17 @@ dropdown popover row:selected {{
   margin-bottom: 8px;
 }}
 
+/* Activity's stat tiles (spec 9): a surface card, as React draws them. */
 .toolport-summary-item {{
-  background-color: transparent;
-  border: none;
-  border-bottom: 1px solid @toolport_border;
-  border-radius: 0;
-  padding: 10px 13px;
+  background-color: @toolport_card;
+  border: 1px solid @toolport_border;
+  border-radius: 12px;
+  padding: 12px 13px;
+}}
+
+.toolport-summary-item.error {{
+  background-color: alpha(@toolport_error, 0.08);
+  border-color: alpha(@toolport_error, 0.5);
 }}
 
 .toolport-security-status {{
@@ -1092,6 +1097,127 @@ button.toolport-activity-filter {{
 
 .toolport-stat-metrics {{
   font-variant-numeric: tabular-nums;
+}}
+
+/* A failed Activity call and a breakdown server open in place; the button keeps
+   the row's look instead of a button's. */
+button.toolport-activity-row-button {{
+  padding: 0;
+  margin: 0;
+  min-height: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  font-weight: normal;
+}}
+
+.toolport-activity-detail {{
+  margin-top: 10px;
+  padding-top: 8px;
+  padding-left: 52px;
+  border-top: 1px solid @toolport_border;
+}}
+
+.toolport-activity-error {{
+  color: @toolport_error;
+}}
+
+/* The weight `.toolport-native button` gives would make a whole row bold. */
+.toolport-native button.toolport-activity-row-button {{
+  font-weight: normal;
+}}
+
+/* React's savings banner: a green leading bar over a green tint, the number in green. */
+.toolport-savings-card {{
+  padding: 16px;
+  border-left: 3px solid @toolport_success;
+  border-radius: 0 12px 12px 0;
+  background-color: alpha(@toolport_success, 0.08);
+}}
+
+.toolport-savings-card.cost {{
+  border-left-color: @toolport_border;
+  background-color: alpha(@toolport_fg, 0.03);
+}}
+
+.toolport-savings-card.cost image,
+.toolport-sidebar-savings.cost image {{
+  color: @toolport_text_secondary;
+}}
+
+.toolport-savings-card.cost .toolport-savings-value {{
+  color: @toolport_fg;
+}}
+
+.toolport-sidebar-savings.cost {{
+  border-color: @toolport_border;
+  background: alpha(@toolport_fg, 0.03);
+}}
+
+.toolport-savings-title {{
+  color: @toolport_text_secondary;
+  font-weight: 500;
+}}
+
+.toolport-native button.toolport-savings-share {{
+  min-height: 26px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: normal;
+  color: @toolport_text_secondary;
+}}
+
+.toolport-savings-value {{
+  color: @toolport_success;
+  font-size: 30px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}}
+
+/* Stat tile numbers (spec 9): 22px, weight 600. */
+.toolport-native label.toolport-summary-value {{
+  font-size: 22px;
+  font-weight: 600;
+}}
+
+/* Tiles line up with the cards above: no flow box child inset. */
+.toolport-summary > flowboxchild {{
+  padding: 0;
+}}
+
+/* Errors only: plain text, and red while on, as React's toggle. */
+.toolport-native button.toolport-activity-filter {{
+  font-weight: normal;
+}}
+
+.toolport-native button.toolport-activity-filter:checked {{
+  color: @toolport_error;
+  background-color: alpha(@toolport_error, 0.10);
+  border-color: alpha(@toolport_error, 0.5);
+}}
+
+/* Remove in a row menu is red text; a fill only on hover, like the other items. */
+.toolport-action-menu button.toolport-destructive {{
+  padding: 0 10px;
+  background-color: transparent;
+}}
+
+.toolport-action-menu button.toolport-destructive:hover {{
+  background-color: alpha(@toolport_error, 0.10);
+}}
+
+.toolport-row-group .toolport-card.toolport-stat-header {{
+  min-height: 0;
+  padding-top: 8px;
+  padding-bottom: 8px;
+  background-color: alpha(@toolport_fg, 0.03);
+}}
+
+/* Server rows: one line each, as in React's table. */
+.toolport-row-group .toolport-card.toolport-stat-server {{
+  min-height: 0;
+  padding-top: 8px;
+  padding-bottom: 8px;
 }}
 
 .toolport-settings-parent {{ font-weight: 600; }}
@@ -1311,10 +1437,14 @@ button.toolport-catalog-action {{
 .toolport-status-card {{ background: @toolport_card; border: 1px solid @toolport_border; border-radius: 12px; padding: 16px; }}
 .toolport-status-card.status-success {{ border-left: 3px solid @toolport_success; }}
 .toolport-status-card.status-warning {{ border-left: 3px solid @toolport_warning; }}
+.toolport-status-card.status-danger {{ border-left: 3px solid @toolport_error; }}
+.toolport-card.toolport-activity-panel {{ background-color: @toolport_card; border: 1px solid @toolport_border; border-radius: 12px; padding: 12px 16px; }}
+.toolport-card.toolport-activity-panel:hover {{ background-color: @toolport_card; }}
 .toolport-status-card .toolport-status-tile {{ border-radius: 8px; }}
 .toolport-status-card.status-info .toolport-status-tile {{ background: alpha(@toolport_fg, 0.06); color: @toolport_text_secondary; }}
 .toolport-status-card.status-success .toolport-status-tile {{ background: alpha(@toolport_success, 0.12); color: @toolport_success; }}
 .toolport-status-card.status-warning .toolport-status-tile {{ background: alpha(@toolport_warning, 0.12); color: @toolport_warning; }}
+.toolport-status-card.status-danger .toolport-status-tile {{ background: alpha(@toolport_error, 0.12); color: @toolport_error; }}
 .toolport-status-title {{ font-size: 14px; font-weight: 600; }}
 .toolport-status-detail {{ font-size: 13px; }}
 .toolport-error-callout {{ background: @toolport_card; border: 1px solid @toolport_border; border-left: 3px solid @toolport_error; border-radius: 12px; padding: 16px; }}

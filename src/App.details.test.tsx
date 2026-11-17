@@ -163,7 +163,7 @@ describe("pushed detail navigation", () => {
       .mockResolvedValueOnce(enabled);
     render(<App />);
     await user.click(await screen.findByRole("button", { name: "Show Files details" }));
-    const toggle = screen.getByRole("switch", { name: "Toggle Files" });
+    const toggle = screen.getByRole("switch", { name: /^(Enable|Disable) Files$/ });
     toggle.focus();
     await user.keyboard(" ");
     let dialog = within(await screen.findByRole("dialog"));
@@ -175,7 +175,9 @@ describe("pushed detail navigation", () => {
     expect(toggle).toHaveAttribute("aria-checked", "false");
     await user.click(dialog.getByRole("button", { name: "Cancel" }));
     await waitFor(() =>
-      expect(screen.getByRole("switch", { name: "Toggle Files" })).toHaveFocus(),
+      expect(
+        screen.getByRole("switch", { name: /^(Enable|Disable) Files$/ }),
+      ).toHaveFocus(),
     );
     await user.keyboard(" ");
     dialog = within(await screen.findByRole("dialog"));
@@ -184,7 +186,7 @@ describe("pushed detail navigation", () => {
     );
     await user.click(dialog.getByRole("button", { name: "Enable" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-    const live = screen.getByRole("switch", { name: "Toggle Files" });
+    const live = screen.getByRole("switch", { name: /^(Enable|Disable) Files$/ });
     expect(live).toHaveAttribute("aria-checked", "true");
     await waitFor(() => expect(live).toHaveFocus());
     expect(live).toBeInTheDocument();
@@ -197,10 +199,14 @@ describe("pushed detail navigation", () => {
     const next = registryWithServer();
     next.servers[0].args = ["new-argument"];
     getRegistry.mockResolvedValue(next);
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await user.click(
+      screen.getByRole("button", { name: /^(Refresh|Check servers again)$/ }),
+    );
     expect(await screen.findByText("npx new-argument")).toBeInTheDocument();
     getRegistry.mockResolvedValue({ ...next, servers: [] });
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await user.click(
+      screen.getByRole("button", { name: /^(Refresh|Check servers again)$/ }),
+    );
     expect(await screen.findByText("Server is no longer available")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Edit" })).not.toBeInTheDocument();
     expect(screen.queryByText("Couldn't reach the backend")).not.toBeInTheDocument();
@@ -253,14 +259,18 @@ describe("pushed detail navigation", () => {
       document.querySelector<HTMLButtonElement>(`[data-client-id="${selected.id}"]`)!,
     );
     detectClients.mockRejectedValue(new Error("scan failed"));
-    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await user.click(
+      screen.getByRole("button", { name: /^(Refresh|Check servers again)$/ }),
+    );
     expect(
       await screen.findByText("Error: scan failed", { exact: true }),
     ).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Disconnect" })).not.toBeInTheDocument();
     detectClients.mockResolvedValue([]);
     await act(async () => {
-      await user.click(screen.getByRole("button", { name: "Refresh" }));
+      await user.click(
+        screen.getByRole("button", { name: /^(Refresh|Check servers again)$/ }),
+      );
     });
     expect(await screen.findByText("Client is no longer available")).toBeInTheDocument();
     expect(screen.queryByText("Couldn't reach the backend")).not.toBeInTheDocument();
@@ -290,9 +300,13 @@ describe("pushed detail navigation", () => {
       (view === "servers" ? getRegistry : detectClients).mockRejectedValueOnce(
         new Error("list refresh failed"),
       );
-      await user.click(screen.getByRole("button", { name: "Refresh" }));
+      await user.click(
+        screen.getByRole("button", { name: /^(Refresh|Check servers again)$/ }),
+      );
       await waitFor(() =>
-        expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled(),
+        expect(
+          screen.getByRole("button", { name: /^(Refresh|Check servers again)$/ }),
+        ).toBeEnabled(),
       );
       await user.click(document.querySelector<HTMLButtonElement>(selector)!);
       expect(
@@ -305,7 +319,9 @@ describe("pushed detail navigation", () => {
       (view === "servers" ? getRegistry : detectClients).mockRejectedValueOnce(
         new Error("detail refresh failed"),
       );
-      await user.click(screen.getByRole("button", { name: "Refresh" }));
+      await user.click(
+        screen.getByRole("button", { name: /^(Refresh|Check servers again)$/ }),
+      );
       expect(
         await screen.findByText("Error: detail refresh failed", { exact: true }),
       ).toBeInTheDocument();

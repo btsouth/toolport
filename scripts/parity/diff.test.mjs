@@ -187,6 +187,49 @@ test("known differences move out of drift; unmatched ones become notes", () => {
   ]);
 });
 
+test("a moved known difference needs the same text in the other shell", () => {
+  const line = (type, text) => ({
+    screen: "activity",
+    scenario: "activity-unreadable",
+    region: "body",
+    kind: "text",
+    type,
+    gtk: type === "only-gtk" ? text : null,
+    react: type === "only-react" ? text : null,
+  });
+  const known = [
+    {
+      screen: "activity",
+      region: "body",
+      type: "only-gtk",
+      gtk: "Cause: *",
+      moved: true,
+      reason: "order",
+    },
+    {
+      screen: "activity",
+      region: "body",
+      type: "only-react",
+      react: "Cause: *",
+      moved: true,
+      reason: "order",
+    },
+  ];
+  // Both shells show the cause, in a different order: known.
+  const moved = applyKnown(
+    [line("only-gtk", "Cause: x"), line("only-react", "Cause: x")],
+    known,
+  );
+  assert.equal(moved.drift.length, 0);
+  // One shell drops the cause, or shows another one: drift.
+  assert.equal(applyKnown([line("only-gtk", "Cause: x")], known).drift.length, 1);
+  assert.equal(
+    applyKnown([line("only-gtk", "Cause: x"), line("only-react", "Cause: y")], known)
+      .drift.length,
+    2,
+  );
+});
+
 test("a scenario that failed to extract is reported as not compared", () => {
   const text = formatReport({
     scenarios: [
