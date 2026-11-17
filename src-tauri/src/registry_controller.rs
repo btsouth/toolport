@@ -464,7 +464,8 @@ pub(crate) fn server_from_detected(server: &clients::McpServer, client_id: &str)
     }
 }
 
-/// An opaque id for a connection, stable for this process. The connection can hold a
+/// An opaque id for a connection (and, for an entry with env or header keys, the
+/// account name it is listed under), stable for this process. The connection can hold a
 /// secret (a token in a URL or argument), so the hash is salted per process and the
 /// id reveals nothing that could be checked against a guess.
 pub(crate) fn import_connection_key(server: &ServerEntry) -> String {
@@ -474,19 +475,25 @@ pub(crate) fn import_connection_key(server: &ServerEntry) -> String {
         getrandom::getrandom(&mut bytes).expect("CSPRNG unavailable");
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     });
+    // Credentials in env or headers are not part of the connection, so two accounts
+    // of one server (a personal and a work token) under different names are two
+    // servers, as `existing_connection` treats them. Without such keys the names
+    // cannot differ in anything that matters, so one connection is one server.
+    let account = if server.env.is_empty() {
+        String::new()
+    } else {
+        server.name.to_ascii_lowercase()
+    };
     format!(
         "connection:{}",
         registry::sha256_hex(&format!(
-            "{salt}\n{}\n{}",
+            "{salt}\n{}\n{account}",
             clients::connection_key(
                 &server.transport,
                 server.command.as_deref(),
                 &server.args,
                 server.url.as_deref()
-            ),
-            // Two accounts of one package under different names (a personal and a
-            // work token) are two servers, as before identity matching.
-            server.name.to_ascii_lowercase()
+            )
         ))
     )
 }
@@ -518,7 +525,8 @@ pub(crate) struct ImportCandidate {
     pub(crate) name: String,
 }
 
-/// Client servers Import may offer, deduped by connection, minus those already in
+/// Client servers Import may offer, deduped by connection (and by name for an entry
+/// with env or header keys, one per account), minus those already in
 /// Toolport under the one identity rule (`existing_connection`). An entry whose
 /// identity cannot be confirmed is kept with its reason, so review shows it as
 /// unsupported instead of hiding it or counting it as new. New entries get their
@@ -665,7 +673,13 @@ fn preview_client_imports_scoped(
     }
     // A review may read the keychain to confirm identity, but never ask to unlock it:
     // a locked keyring leaves the row unconfirmed with its reason. The import may ask.
-    crate::secrets::without_prompts(|| import_candidates(&detected, &registry, Confirm::WithVault))
+    // One keychain session for the whole review, so a hung daemon costs one wait.
+    let candidates = crate::secrets::with_backup_batch(|| {
+        crate::secrets::without_prompts(|| {
+            import_candidates(&detected, &registry, Confirm::WithVault)
+        })
+    });
+    candidates
         .into_iter()
         .map(
             |ImportCandidate {
@@ -974,7 +988,7 @@ pub(crate) fn existing_connection(
     }
     match (locked, unresolved) {
         (true, _) => ConnectionState::Unknown(format!(
-            "Could not read the keyring to compare {} with a server in Toolport. Unlock your keyring, then review again. Client config unchanged.",
+            "Keychain unavailable, so {} could not be compared with a server in Toolport. Unlock it and review again. Client config unchanged.",
             detected.name
         )),
         (false, Some(name)) => {
@@ -4945,6 +4959,23 @@ API_KEY = "synthetic-first-origin"
         import_review_key(&entry, name)
     }
 
+    /// The review key of a client entry that has env keys: those keys put the
+    /// account name in its identity.
+    fn stdio_key_with_env(command: &str, name: &str, env: &[&str]) -> String {
+        let mut entry = server(name);
+        entry.command = Some(command.into());
+        entry.env = env
+            .iter()
+            .map(|key| registry::EnvVar {
+                key: (*key).into(),
+                value: None,
+                secret: false,
+                unknown_fields: Default::default(),
+            })
+            .collect();
+        import_review_key(&entry, name)
+    }
+
     fn detected_client(id: &str) -> clients::DetectedClient {
         clients::detect_clients()
             .into_iter()
@@ -5975,7 +6006,9 @@ API_KEY = "synthetic-first-origin"
         let fixture = MoveFixture::new(&Registry::default());
         let original = r#"{"mcpServers":{"one":{"command":"fixture","env":{"PAT":"synthetic-native-pat","PORT":3000}}}}"#;
         std::fs::write(fixture.claude(), original).unwrap();
-        let (registry, count) = import_client_servers(vec![stdio_key("fixture", "one")]).unwrap();
+        let (registry, count) =
+            import_client_servers(vec![stdio_key_with_env("fixture", "one", &["PAT", "PORT"])])
+                .unwrap();
         assert_eq!(count, 1);
         let entry = &registry.servers[0];
         assert!(entry.enabled);
@@ -6007,7 +6040,7 @@ API_KEY = "synthetic-first-origin"
         );
         assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
         assert_eq!(
-            import_client_servers(vec![stdio_key("fixture", "one")])
+            import_client_servers(vec![stdio_key_with_env("fixture", "one", &["PAT", "PORT"])])
                 .unwrap()
                 .1,
             0
@@ -6047,7 +6080,8 @@ API_KEY = "synthetic-first-origin"
         assert!(error.contains("needs credentials"));
         assert!(!error.contains("Keychain unavailable"));
         assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
-        let (registry, _) = import_client_servers(vec![stdio_key("fixture", "one")]).unwrap();
+        let (registry, _) =
+            import_client_servers(vec![stdio_key_with_env("fixture", "one", &["PAT"])]).unwrap();
         assert!(!registry.servers[0].enabled);
         assert!(registry.servers[0].env[0].value.is_none());
     }
@@ -10103,7 +10137,7 @@ DOCS_TOKEN = "tok"
         assert_eq!(shown.len(), 2, "{shown:?}");
         for (name, reason) in &shown {
             let reason = reason.as_deref().unwrap_or_default();
-            assert!(reason.contains("Unlock your keyring"), "{name}: {reason}");
+            assert!(reason.contains("Keychain unavailable"), "{name}: {reason}");
             assert!(
                 !reason.contains("missing a required value"),
                 "{name}: {reason}"

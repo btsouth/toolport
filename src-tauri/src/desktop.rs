@@ -5944,14 +5944,16 @@ mod tests {
     #[test]
     fn servers_to_import_keeps_same_package_under_distinct_names() {
         // A multi-account setup runs the SAME package twice under different
-        // names (e.g. a personal and a work token). Keying on the package alone
-        // would collapse them and silently drop one; the name tiebreaker keeps
-        // both while still distinguishing different packages (see the test above).
+        // names, each with its own token in env (a personal and a work token).
+        // Keying on the package alone would collapse them and silently drop one;
+        // the name tiebreaker keeps both while still distinguishing different
+        // packages (see the test above).
+        let account = |name: &str| clients::McpServer {
+            env_keys: vec!["GITHUB_TOKEN".into()],
+            ..detected_mcp_server_with_args(name, "npx", &["-y", "@mcp/server-github"])
+        };
         let mut client = detected_client("claude", vec![], vec![]);
-        client.servers = vec![
-            detected_mcp_server_with_args("github-personal", "npx", &["-y", "@mcp/server-github"]),
-            detected_mcp_server_with_args("github-work", "npx", &["-y", "@mcp/server-github"]),
-        ];
+        client.servers = vec![account("github-personal"), account("github-work")];
         let picked = servers_to_import(&[client], &Registry::default());
         assert_eq!(picked.len(), 2);
         let names: std::collections::HashSet<_> =
@@ -5959,6 +5961,25 @@ mod tests {
         assert_eq!(
             names,
             std::collections::HashSet::from(["github-personal", "github-work"])
+        );
+    }
+
+    #[test]
+    fn servers_to_import_offers_one_server_listed_twice_without_credentials() {
+        // With nothing in env or headers the two entries cannot differ, so one
+        // connection imports once whatever the names, in one pass or two.
+        let mut client = detected_client("claude", vec![], vec![]);
+        client.servers = vec![
+            detected_mcp_server_with_args("gh", "npx", &["-y", "@mcp/server-github"]),
+            detected_mcp_server_with_args("github", "npx", &["-y", "@mcp/server-github"]),
+        ];
+        let picked = servers_to_import(&[client], &Registry::default());
+        assert_eq!(
+            picked
+                .iter()
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>(),
+            ["gh"]
         );
     }
 

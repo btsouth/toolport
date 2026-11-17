@@ -4205,7 +4205,8 @@ pub fn managed_server_names(
         .collect()
 }
 
-/// The client's servers Import would add, deduped by connection and named as they
+/// The client's servers Import would add, deduped by connection (and by name when
+/// they carry env or header keys) and named as they
 /// would be saved (`github (2)` beside an unrelated `github`). Each is paired with its
 /// index in `servers` followed by `plugin_servers`. Only servers that are certainly new
 /// count: an unconfirmed identity is not claimed as importable. The last field is the
