@@ -9279,7 +9279,10 @@ fn handle_request_with_cancel(
                     ));
                 }
             }
-            let client_meta = params.and_then(|p| p.get("_meta")).cloned();
+            // The start notices ask is for the gateway alone; never relay it.
+            let client_meta = params
+                .and_then(|p| p.get("_meta"))
+                .map(without_start_notices);
             let mrtr = MrtrRequest::from_params(params);
             let (_progress_route, relay_owned) = match router.resource_server(uri) {
                 Some(owner) => prepare_progress(client_meta.as_ref(), params, owner),
@@ -9435,7 +9438,10 @@ fn handle_request_with_cancel(
                     ));
                 }
             }
-            let client_meta = params.and_then(|p| p.get("_meta")).cloned();
+            // The start notices ask is for the gateway alone; never relay it.
+            let client_meta = params
+                .and_then(|p| p.get("_meta"))
+                .map(without_start_notices);
             let mrtr = MrtrRequest::from_params(params);
             let (_progress_route, relay_owned) = match router.prompt_server(name) {
                 Some(owner) => prepare_progress(client_meta.as_ref(), params, owner),

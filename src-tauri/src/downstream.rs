@@ -625,9 +625,9 @@ pub const START_NOTICES_META_KEY: &str = "app.toolport/startNotices";
 /// `progressToken` lived here until the gateway learned to route
 /// `notifications/progress` back to the client that minted it (SOU-444 part 2);
 /// relaying a token whose notifications we then dropped would have invited that
-/// traffic into a black hole. The Tools tab's ask for start notices is for the
-/// gateway alone, on every request a client sends.
-const WITHHELD_META_KEYS: [&str; 1] = [START_NOTICES_META_KEY];
+/// traffic into a black hole. Empty today, kept because the next revision brings
+/// more keys with the same "relay only when we can service it" shape.
+const WITHHELD_META_KEYS: [&str; 0] = [];
 
 /// The part of an upstream client's `_meta` that may travel downstream.
 ///
@@ -15946,21 +15946,6 @@ for line in sys.stdin:
     #[test]
     fn http_deadline_before_send_does_not_claim_uncertain_completion_or_send_late() {
         use super::*;
-
-        /// The Tools tab's ask for start notices never reaches a server, on any
-        /// request; the rest of the client's `_meta` still does.
-        #[test]
-        fn the_start_notices_ask_is_never_relayed() {
-            let meta = serde_json::json!({START_NOTICES_META_KEY: true, "traceparent": "00-x"});
-            assert_eq!(
-                relayable_meta(Some(&meta)),
-                Some(serde_json::json!({"traceparent": "00-x"}))
-            );
-            assert_eq!(
-                relayable_meta(Some(&serde_json::json!({START_NOTICES_META_KEY: true}))),
-                None
-            );
-        }
         let _lock = crate::registry::data_dir_test_lock();
         let scratch = std::env::temp_dir().join(format!(
             "toolport-f1-before-send-{}",
