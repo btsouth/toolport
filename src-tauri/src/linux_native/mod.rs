@@ -15588,6 +15588,7 @@ fn open_server_editor_prefilled(
         let generation = generation_for_test.clone();
         let server_id = server_id_for_test.clone();
         let feedback = feedback_for_test.clone();
+        let test_shown = test_shown_for_test.clone();
         let busy = busy_for_test.clone();
         let validate = validate_for_test.clone();
         gtk::glib::spawn_future_local(async move {
@@ -15632,6 +15633,9 @@ fn open_server_editor_prefilled(
                 return;
             }
             feedback.set_visible(true);
+            // The result replaces whatever showed meanwhile, such as a paste
+            // refusal, so only connection edits make it stale again.
+            test_shown.set(true);
             match result {
                 Ok(Ok(probe)) if probe.ok => {
                     l10n::bind_formatted_label(
@@ -21920,6 +21924,34 @@ mod tests {
         assert!(
             feedback.is_visible(),
             "a snippet edit cleared a Test result"
+        );
+        // A paste refused while a Test runs is replaced by the Test result,
+        // which then stays when the snippet changes again.
+        let fill = paste_box
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Button>())
+            .find(|b| b.label().as_deref() == Some("Fill from snippet"))
+            .unwrap()
+            .clone();
+        let (release, gate) = std::sync::mpsc::channel::<String>();
+        *editor_gate::GATE.lock().unwrap() = Some(gate);
+        test.emit_clicked();
+        snippet
+            .buffer()
+            .set_text("claude mcp add -t http demo https://example.com/mcp -H 'X-API-Key: abc'");
+        fill.emit_clicked();
+        assert!(
+            feedback.label().contains("Authorization: Bearer"),
+            "{}",
+            feedback.label()
+        );
+        release.send("synthetic test failure".into()).unwrap();
+        settle(&|| save.is_sensitive());
+        assert_eq!(feedback.label(), "Could not test: synthetic test failure");
+        snippet.buffer().set_text("claude mcp add");
+        assert!(
+            feedback.is_visible(),
+            "a snippet edit hid the Test result that replaced a refusal"
         );
         inherit_env.set_active(!inherit_env.is_active());
         assert!(!feedback.is_visible(), "a probe setting changed");
