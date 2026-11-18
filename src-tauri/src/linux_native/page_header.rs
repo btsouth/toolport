@@ -117,12 +117,39 @@ mod imp {
             };
             let (title_min, title_nat, _, _) = title.measure(gtk::Orientation::Horizontal, -1);
             let (actions_min, actions_nat) = action_width(&actions);
+            // Room the actions can use past their natural width (a label shown
+            // whole), only once the line is decided from natural widths.
+            let wanted = actions
+                .downcast_ref::<super::ActionFlow>()
+                .map_or(0, |flow| flow.imp().wanted_extra());
             if self.fits(title_min, title_nat, actions_nat, width) {
-                let title_width = (width - row_gap(actions_nat) - actions_nat).max(title_min);
+                let gap = row_gap(actions_nat);
+                // Spare room is what the title can give up without growing
+                // taller than it is beside the actions at their natural width.
+                let base = (width - gap - actions_nat).max(title_min);
+                let extra = if wanted > 0 {
+                    let height = |w: i32| title.measure(gtk::Orientation::Vertical, w).1;
+                    let base_height = height(base);
+                    let keep = title_min.max(self.min_title.get());
+                    let (mut lo, mut hi) = (0, wanted.min(base - keep).max(0));
+                    while lo < hi {
+                        let mid = (lo + hi + 1) / 2;
+                        if height(base - mid) <= base_height {
+                            lo = mid;
+                        } else {
+                            hi = mid - 1;
+                        }
+                    }
+                    lo
+                } else {
+                    0
+                };
+                let actions_width = actions_nat + extra;
+                let title_width = (width - gap - actions_width).max(title_min);
                 title.size_allocate(&gtk::Allocation::new(0, 0, title_width, height), -1);
                 if actions_nat > 0 {
                     actions.size_allocate(
-                        &gtk::Allocation::new(width - actions_nat, 0, actions_nat, height),
+                        &gtk::Allocation::new(width - actions_width, 0, actions_width, height),
                         -1,
                     );
                 }
@@ -131,7 +158,7 @@ mod imp {
             let (_, title_height, _, _) = title.measure(gtk::Orientation::Vertical, width);
             title.size_allocate(&gtk::Allocation::new(0, 0, width, title_height), -1);
             let indent = self.indent();
-            let actions_width = (width - indent).min(actions_nat).max(actions_min);
+            let actions_width = (width - indent).min(actions_nat + wanted).max(actions_min);
             let top = title_height + ROW_GAP;
             // Actions that keep to the right edge (server rows, as React's) sit
             // there on their own line too.
@@ -240,6 +267,9 @@ mod flow_imp {
     pub struct ActionFlow {
         /// Each line sits at the right edge, as React's row controls do.
         pub(super) lines_end: std::cell::Cell<bool>,
+        /// A child that takes room left over on its line, up to what its label
+        /// needs to show its whole text (the client access menu).
+        pub(super) grow: std::cell::RefCell<Option<(gtk::Widget, gtk::Label)>>,
     }
 
     #[glib::object_subclass]
@@ -278,12 +308,23 @@ mod flow_imp {
 
         fn size_allocate(&self, width: i32, _height: i32, _baseline: i32) {
             let children = self.children();
+            let grow = self.grow.borrow().clone();
+            let wanted = self.wanted_extra();
             let mut top = 0;
-            for line in lines(&children, width, self.lines_end.get()) {
+            for mut line in lines(&children, width, self.lines_end.get()) {
+                let mut used = line.items.iter().map(|(_, w, _)| *w).sum::<i32>()
+                    + super::ACTION_SPACING * (line.items.len() as i32 - 1).max(0);
+                // Lines are laid out first, then room left on the grow child's
+                // line goes to it, so where controls go never changes.
+                if let Some((grow_child, _)) = &grow {
+                    if let Some(item) = line.items.iter_mut().find(|(c, _, _)| c == grow_child) {
+                        let extra = wanted.min(width - used).max(0);
+                        item.1 += extra;
+                        used += extra;
+                    }
+                }
                 let mut left = 0;
                 if self.lines_end.get() {
-                    let used = line.items.iter().map(|(_, w, _)| *w).sum::<i32>()
-                        + super::ACTION_SPACING * (line.items.len() as i32 - 1).max(0);
                     left = (width - used).max(0);
                 }
                 for (child, child_width, child_height) in line.items {
@@ -304,6 +345,23 @@ mod flow_imp {
     }
 
     impl ActionFlow {
+        /// How much wider than its natural width the grow child's label needs to
+        /// be to show its whole text on one line.
+        pub(super) fn wanted_extra(&self) -> i32 {
+            let Some((child, label)) = self.grow.borrow().clone() else {
+                return 0;
+            };
+            if !child.should_layout() {
+                return 0;
+            }
+            let whole = label
+                .create_pango_layout(Some(&label.text()))
+                .pixel_size()
+                .0;
+            let (_, natural, _, _) = label.measure(gtk::Orientation::Horizontal, -1);
+            (whole - natural).max(0)
+        }
+
         /// The visible children with their minimum and natural widths.
         fn children(&self) -> Vec<(gtk::Widget, i32, i32)> {
             let mut out = Vec::new();
@@ -441,6 +499,24 @@ impl ActionFlow {
     pub(super) fn set_lines_end(&self, end: bool) {
         self.imp().lines_end.set(end);
         self.queue_allocate();
+    }
+
+    /// Let `child` (a direct child) take room left over on its line, up to what
+    /// `label` inside it needs to show its whole text. Measuring is unchanged,
+    /// so the controls wrap and move at the same widths; only spare room goes
+    /// to the label. `child` must pass the room on (an expanding label).
+    pub(super) fn set_grow(&self, child: &impl IsA<gtk::Widget>, label: &gtk::Label) {
+        self.imp()
+            .grow
+            .replace(Some((child.clone().upcast(), label.clone())));
+        self.queue_allocate();
+    }
+
+    /// Give no spare room to the label again, as rows did before `set_grow`.
+    #[cfg(test)]
+    pub(super) fn clear_grow(&self) {
+        self.imp().grow.replace(None);
+        self.queue_resize();
     }
 }
 

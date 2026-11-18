@@ -29,6 +29,8 @@ struct ToolPolicy {
     disabled: std::collections::HashSet<String>,
     pinned: std::collections::HashSet<String>,
     overrides: std::collections::HashMap<String, crate::registry::ToolOverride>,
+    /// The global switch that hides destructive tools, as React reads it.
+    deny_destructive: bool,
 }
 
 impl ServerToolsPanel {
@@ -182,6 +184,7 @@ impl ServerToolsPanel {
                         disabled,
                         pinned,
                         overrides,
+                        deny_destructive: registry.deny_destructive,
                     },
                 ))
             })
@@ -297,6 +300,7 @@ impl ServerToolsPanel {
                 !policy.disabled.contains(&name),
                 policy.pinned.contains(&name),
                 policy.overrides.get(&name).cloned(),
+                policy.deny_destructive && hints_destructive(tool),
                 self.clone(),
             ));
         }
@@ -415,11 +419,24 @@ fn insert_state_badge(badges: &gtk::FlowBox, badge: &gtk::Label) {
     });
 }
 
+/// A tool that says it is destructive, by the rule React's tool list uses.
+fn hints_destructive(tool: &serde_json::Value) -> bool {
+    [
+        tool.pointer("/annotations/destructiveHint"),
+        tool.get("destructiveHint"),
+    ]
+    .into_iter()
+    .any(|hint| hint.and_then(serde_json::Value::as_bool) == Some(true))
+}
+
+/// `blocked`: the global switch hides this destructive tool whatever its own
+/// switch says.
 fn tool_row(
     tool: serde_json::Value,
     enabled: bool,
     pinned: bool,
     exposure_override: Option<crate::registry::ToolOverride>,
+    blocked: bool,
     page: ServerToolsPanel,
 ) -> gtk::Box {
     let name = tool
@@ -546,7 +563,7 @@ fn tool_row(
         .valign(gtk::Align::Center)
         .build();
     visibility.update_property(&[gtk::accessible::Property::Label(&name)]);
-    set_visibility_look(&visibility, enabled);
+    set_visibility_look(&visibility, enabled, blocked);
     // Reverting a failed write re-enters this handler, so the guard keeps the
     // revert from being treated as a fresh toggle.
     let reverting = Rc::new(Cell::new(false));
@@ -581,7 +598,7 @@ fn tool_row(
             match result {
                 Ok(Ok(_)) => {
                     page.remember_tool_enabled(&name, enabled);
-                    set_visibility_look(&button, enabled);
+                    set_visibility_look(&button, enabled, blocked);
                     badge.remove_css_class(if enabled { "off" } else { "success" });
                     badge.add_css_class(if enabled { "success" } else { "off" });
                     run.set_sensitive(enabled);
@@ -727,8 +744,13 @@ fn pin_label(pinned: bool) -> &'static str {
     }
 }
 
-fn set_visibility_look(button: &gtk::Switch, enabled: bool) {
-    button.set_tooltip_text(Some(&if enabled {
+fn set_visibility_look(button: &gtk::Switch, enabled: bool, blocked: bool) {
+    button.set_tooltip_text(Some(&if blocked {
+        // A click changes only the tool's own setting while the switch hides it.
+        crate::i18n::tr(
+            "Destructive tools are hidden from clients by the global switch even when individually enabled.",
+        )
+    } else if enabled {
         crate::i18n::tr("Exposed to clients. Hide it.")
     } else {
         crate::i18n::tr("Hidden from clients. Expose it.")
@@ -1905,6 +1927,65 @@ mod tests {
         );
     }
     #[test]
+    fn destructive_tools_are_the_ones_react_marks() {
+        use super::*;
+        let tool = |value: serde_json::Value| hints_destructive(&value);
+        assert!(tool(
+            serde_json::json!({"annotations": {"destructiveHint": true}})
+        ));
+        assert!(tool(serde_json::json!({"destructiveHint": true})));
+        assert!(!tool(
+            serde_json::json!({"annotations": {"destructiveHint": false}})
+        ));
+        assert!(!tool(
+            serde_json::json!({"annotations": {"readOnlyHint": true}})
+        ));
+    }
+
+    /// While the global switch hides a destructive tool, its switch's tooltip
+    /// says so whichever way it is set, as in React.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn a_tool_hidden_by_the_destructive_switch_says_so() {
+        use super::*;
+        adw::init().unwrap();
+        let _data = crate::registry::DataDirTestEnv::new("tool-blocked-tooltip");
+        crate::i18n::set_language("en").unwrap();
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.BlockedToolTooltip")
+            .build();
+        app.register(gtk::gio::Cancellable::NONE).unwrap();
+        let panel = ServerToolsPanel::new(&app, "fixture");
+        let tooltip = |enabled: bool, blocked: bool| {
+            let row = tool_row(
+                serde_json::json!({"name":"remove", "toolportQuarantine":"clear", "annotations":{"destructiveHint":true}}),
+                enabled,
+                false,
+                None,
+                blocked,
+                panel.clone(),
+            );
+            let mut stack = vec![row.upcast::<gtk::Widget>()];
+            while let Some(widget) = stack.pop() {
+                if let Some(switch) = widget.downcast_ref::<gtk::Switch>() {
+                    return switch.tooltip_text().unwrap().to_string();
+                }
+                let mut child = widget.first_child();
+                while let Some(node) = child {
+                    child = node.next_sibling();
+                    stack.push(node);
+                }
+            }
+            panic!("no switch");
+        };
+        let blocked = "Destructive tools are hidden from clients by the global switch even when individually enabled.";
+        assert_eq!(tooltip(true, true), blocked);
+        assert_eq!(tooltip(false, true), blocked);
+        assert_eq!(tooltip(true, false), "Exposed to clients. Hide it.");
+        assert_eq!(tooltip(false, false), "Hidden from clients. Expose it.");
+    }
+
+    #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn b5_static_tool_badges_retranslate_live_without_touching_user_names() {
         use super::*;
@@ -1923,6 +2004,7 @@ mod tests {
                 true,
                 true,
                 None,
+                false,
                 panel.clone(),
             )
         };
@@ -2044,7 +2126,7 @@ mod tests {
         app.register(gtk::gio::Cancellable::NONE).unwrap();
         let panel = ServerToolsPanel::new(&app, "selected");
         let tool = serde_json::json!({"name":"read", "description":"Read a record", "toolportQuarantine":"clear"});
-        let row = tool_row(tool.clone(), true, false, None, panel.clone());
+        let row = tool_row(tool.clone(), true, false, None, false, panel.clone());
         fn find_switch(root: &gtk::Widget) -> Option<gtk::Switch> {
             if let Some(switch) = root.downcast_ref::<gtk::Switch>() {
                 return Some(switch.clone());
@@ -2077,7 +2159,7 @@ mod tests {
         let registry = crate::registry::load().unwrap();
         assert_eq!(registry.servers[0].disabled_tools, vec!["read"]);
         let failed_panel = ServerToolsPanel::new(&app, "missing");
-        let failed_row = tool_row(tool, true, false, None, failed_panel.clone());
+        let failed_row = tool_row(tool, true, false, None, false, failed_panel.clone());
         let failed_switch = find_switch(failed_row.upcast_ref()).unwrap();
         failed_switch.set_active(false);
         settle(&failed_switch);

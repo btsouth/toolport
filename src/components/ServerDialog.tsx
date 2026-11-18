@@ -26,6 +26,7 @@ import {
   updateServer,
 } from "@/lib/api";
 import { ImportReviewDialog } from "@/components/ImportReviewDialog";
+import { Callout } from "@/components/Callout";
 import { formatArgs, parseArgs } from "@/lib/args";
 import { isDownloadLauncher } from "@/lib/launcher";
 import { riskySyncEnv } from "@/lib/personalSync";
@@ -174,6 +175,25 @@ export function ServerDialog({
   const [reviewText, setReviewText] = useState("");
   const [busy, setBusy] = useState(false);
   const [test, setTest] = useState<TestState>(IDLE_TEST);
+  // A failed save or a refused paste, shown in the footer above the buttons
+  // as GTK's editor does, so no toast covers them.
+  const [footerError, setFooterError] = useState("");
+  // Whether the dialog is on screen, read when a save or paste settles: one
+  // that closed meanwhile has no footer to show its failure, so a toast says it.
+  const shown = useRef(open);
+  useEffect(() => {
+    shown.current = open;
+    return () => {
+      shown.current = false;
+    };
+  }, [open]);
+  // Counts each opening and closing, so a save or paste that settles knows
+  // whether the dialog on screen is still the one it started in.
+  const session = useRef(0);
+  function showFailure(message: string, started: number) {
+    if (shown.current && session.current === started) setFooterError(message);
+    else toastError(message);
+  }
   const testRequestId = useRef(0);
   const formRef = useRef(form);
   useEffect(() => {
@@ -192,6 +212,8 @@ export function ServerDialog({
   // A completed result clears immediately when the connection details change. An in-flight
   // test stays visibly busy until it settles, but its result is then discarded as stale.
   function clearTest() {
+    // An edit makes a failed save stale too, as in GTK.
+    setFooterError("");
     setTest((current) => {
       if (current.status === "idle") return current;
       if (current.status === "testing") {
@@ -205,7 +227,12 @@ export function ServerDialog({
   // button), so reset the form each time it opens - otherwise it keeps the last
   // entry's values instead of starting blank (or re-deriving from `initial`).
   function onOpenChange(next: boolean) {
+    shown.current = next;
+    session.current += 1;
+    // A paste still parsing belongs to the dialog as it was; its result is dropped.
+    setParsing(false);
     if (!next) setTest(IDLE_TEST);
+    setFooterError("");
     if (!next && onClose) {
       onClose();
       return;
@@ -278,11 +305,14 @@ export function ServerDialog({
 
   async function handleParse() {
     if (!pasteText.trim()) return;
+    setFooterError("");
     setParsing(true);
+    const started = session.current;
     try {
       const servers = await parseServerSnippet(pasteText);
+      if (session.current !== started) return;
       if (servers.length === 0) {
-        toast.error(t("No servers found in the pasted config"));
+        setFooterError(t("No servers found in the pasted config."));
         return;
       }
       if (servers.length > 1) {
@@ -319,8 +349,9 @@ export function ServerDialog({
       setPasteText("");
     } catch (e) {
       // The backend message is already in the user's language and never holds
-      // pasted text; GTK shows the same sentence.
-      toastError(String(e));
+      // pasted text; GTK shows the same sentence in the same place.
+      if (session.current !== started) return;
+      setFooterError(String(e));
       // The form stays as it was before this paste, and the refusal is its only
       // message: an empty field it left the user in shows no error yet.
       // Read the form as it is now: the user may have edited it while the
@@ -328,7 +359,7 @@ export function ServerDialog({
       const quiet = emptyFieldErrorIds(formRef.current);
       setTouched((previous) => new Set([...previous].filter((id) => !quiet.has(id))));
     } finally {
-      setParsing(false);
+      if (session.current === started) setParsing(false);
     }
   }
 
@@ -497,7 +528,9 @@ export function ServerDialog({
       return;
     }
     const entry = buildEntry(false);
+    const started = session.current;
     const declared = envRows.filter((r) => r.key.trim());
+    setFooterError("");
     setBusy(true);
     try {
       let result = await updateServer(entry);
@@ -536,8 +569,9 @@ export function ServerDialog({
       toast.success(translate("Saved {name}", { name: entry.name }));
       onOpenChange(false);
     } catch (e) {
-      toastError(
+      showFailure(
         t("Couldn't save {value1}: {value2}", { value1: entry.name, value2: String(e) }),
+        started,
       );
     } finally {
       setBusy(false);
@@ -548,6 +582,8 @@ export function ServerDialog({
   // at all: on an error the dialog stays open with what was typed.
   async function handleAdd() {
     const entry = buildEntry(true);
+    const started = session.current;
+    setFooterError("");
     setBusy(true);
     try {
       const { registry: result, declaredWithoutValue } = await addServerWithRows(entry);
@@ -563,8 +599,9 @@ export function ServerDialog({
       );
       onOpenChange(false);
     } catch (e) {
-      toastError(
+      showFailure(
         t("Couldn't save {value1}: {value2}", { value1: entry.name, value2: String(e) }),
+        started,
       );
     } finally {
       setBusy(false);
@@ -668,7 +705,11 @@ export function ServerDialog({
                     'Paste a config snippet from any client:\n\n• Claude Code: claude mcp add ... / claude mcp add-json ...\n• Cursor/Devin/Antigravity: {"mcpServers": ...}\n• VS Code: {"servers": ...}\n• Codex: [mcp_servers.name]\n• Zed: {"context_servers": ...}',
                   )}
                   value={pasteText}
-                  onChange={(e) => setPasteText(e.target.value)}
+                  onChange={(e) => {
+                    setPasteText(e.target.value);
+                    // A refused paste is stale once the snippet changes, as in GTK.
+                    setFooterError("");
+                  }}
                 />
                 <Button
                   variant="secondary"
@@ -993,7 +1034,7 @@ export function ServerDialog({
                     })}
                     className="rounded border bg-background p-1 text-xs"
                     value={row.source ? "reference" : "paste"}
-                    onChange={(e) =>
+                    onChange={(e) => {
                       setEnvRows((rows) =>
                         rows.map((r, j) =>
                           j === i
@@ -1007,8 +1048,9 @@ export function ServerDialog({
                               }
                             : r,
                         ),
-                      )
-                    }
+                      );
+                      clearTest();
+                    }}
                   >
                     <option value="paste">{t("Paste a key")}</option>
                     <option value="reference">{t("From a password manager")}</option>
@@ -1018,11 +1060,12 @@ export function ServerDialog({
                   <SecretReferenceField
                     serverId={currentEditId ?? ""}
                     value={row.source.ref}
-                    onChange={(ref) =>
+                    onChange={(ref) => {
                       setEnvRows((rows) =>
                         rows.map((r, j) => (j === i ? { ...r, source: { ref } } : r)),
-                      )
-                    }
+                      );
+                      clearTest();
+                    }}
                   />
                 ) : (
                   <Input
@@ -1043,7 +1086,7 @@ export function ServerDialog({
                       value1: row.key || "variable",
                     })}
                     checked={row.secret !== false}
-                    onChange={(e) =>
+                    onChange={(e) => {
                       setEnvRows((rows) =>
                         rows.map((r, j) =>
                           j === i
@@ -1054,8 +1097,9 @@ export function ServerDialog({
                               }
                             : r,
                         ),
-                      )
-                    }
+                      );
+                      clearTest();
+                    }}
                   />
                   {t("Keychain")}
                 </label>
@@ -1074,13 +1118,14 @@ export function ServerDialog({
                       type="checkbox"
                       disabled={riskySyncEnv(row.key)}
                       checked={envRowSyncs(row, editing ? (initial?.env ?? []) : [])}
-                      onChange={(e) =>
+                      onChange={(e) => {
                         setEnvRows((rows) =>
                           rows.map((r, j) =>
                             j === i ? { ...r, portable: e.target.checked } : r,
                           ),
-                        )
-                      }
+                        );
+                        clearTest();
+                      }}
                     />{" "}
                     {t("Same on every machine")}
                   </label>
@@ -1148,6 +1193,17 @@ export function ServerDialog({
           )}
         </div>
         <DialogFooter className="sm:justify-between">
+          {footerError && (
+            // GTK's editor feedback (`.toolport-feedback.error`): the same danger
+            // callout, 3px bar, tint and radius.
+            <Callout
+              variant="danger"
+              role="alert"
+              className="w-full [overflow-wrap:anywhere]"
+            >
+              {footerError}
+            </Callout>
+          )}
           <Button
             variant="ghost"
             onClick={handleTest}

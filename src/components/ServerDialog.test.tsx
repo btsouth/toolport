@@ -16,6 +16,7 @@ const api = vi.hoisted(() => ({
 const toast = vi.hoisted(() => ({
   success: vi.fn(),
   warning: vi.fn(),
+  error: vi.fn(),
 }));
 
 vi.mock("@/lib/api", () => api);
@@ -82,6 +83,18 @@ function savedRegistry(id: string): Registry {
 async function fillServer(user: ReturnType<typeof userEvent.setup>, command: string) {
   await user.type(screen.getByLabelText("Name"), "demo");
   await user.type(screen.getByLabelText("Command"), command);
+}
+
+// A refused paste or failed save: one danger callout in the footer, over no
+// button, and no toast.
+async function expectFooterError(text: string) {
+  await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(text));
+  const alert = screen.getByRole("alert");
+  expect(alert.textContent).toBe(text);
+  expect(alert.closest('[data-slot="dialog-footer"]')).not.toBeNull();
+  expect(alert).toHaveClass("toolport-alert", "border-destructive");
+  expect(toastError).not.toHaveBeenCalled();
+  expect(toast.error).not.toHaveBeenCalled();
 }
 
 describe("ServerDialog", () => {
@@ -287,6 +300,27 @@ describe("ServerDialog", () => {
     );
   });
 
+  it("shows a failed edit in the footer, not over it", async () => {
+    const initial = {
+      id: "local",
+      name: "Local",
+      transport: "stdio",
+      command: "local-server",
+      args: [],
+      env: [],
+      url: null,
+      source: "manual",
+    } as ServerEntry;
+    api.updateServer.mockRejectedValueOnce("disk full");
+    const user = userEvent.setup();
+
+    render(<ServerDialog autoOpen editId="local" initial={initial} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await expectFooterError("Couldn't save Local: disk full");
+    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+  });
+
   it("turns the shell environment off for a server", async () => {
     const initial: ServerEntry = {
       id: "local",
@@ -375,6 +409,152 @@ describe("ServerDialog", () => {
     );
   });
 
+  it("says in a toast when a save fails after its dialog closed", async () => {
+    const initial = {
+      id: "local",
+      name: "Local",
+      transport: "stdio",
+      command: "local-server",
+      args: [],
+      env: [],
+      url: null,
+      source: "manual",
+    } as ServerEntry;
+    const user = userEvent.setup();
+    // Each way the editor is opened: Ctrl+N and Edit unmount it on close
+    // (onClose); the header button keeps it mounted and closed.
+    const cases = [
+      {
+        name: "Ctrl+N",
+        pending: api.addServerWithRows,
+        message: "Couldn't save demo: disk full",
+        open: async () => {
+          const onClose = vi.fn();
+          const view = render(
+            <ServerDialog autoOpen onClose={onClose} onSaved={vi.fn()} />,
+          );
+          await fillServer(user, "npx");
+          await user.click(screen.getByRole("button", { name: "Add" }));
+          return () => {
+            expect(onClose).toHaveBeenCalledTimes(1);
+            view.unmount();
+          };
+        },
+      },
+      {
+        name: "Edit",
+        pending: api.updateServer,
+        message: "Couldn't save Local: disk full",
+        open: async () => {
+          const onClose = vi.fn();
+          const view = render(
+            <ServerDialog
+              autoOpen
+              editId="local"
+              initial={initial}
+              onClose={onClose}
+              onSaved={vi.fn()}
+            />,
+          );
+          await user.click(screen.getByRole("button", { name: "Save" }));
+          return () => {
+            expect(onClose).toHaveBeenCalledTimes(1);
+            view.unmount();
+          };
+        },
+      },
+      {
+        name: "header",
+        pending: api.addServerWithRows,
+        message: "Couldn't save demo: disk full",
+        open: async () => {
+          render(
+            <ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />,
+          );
+          await user.click(screen.getByRole("button", { name: "Add server" }));
+          await fillServer(user, "npx");
+          await user.click(screen.getByRole("button", { name: "Add" }));
+          return () => {};
+        },
+      },
+    ];
+    for (const { name, pending, message, open } of cases) {
+      vi.mocked(toastError).mockClear();
+      const save = deferred<never>();
+      pending.mockReturnValueOnce(save.promise);
+      const closed = await open();
+      await user.keyboard("{Escape}");
+      // The parent unmounts an onClose editor, as App does.
+      closed();
+      await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+      await act(async () => save.reject("disk full"));
+      expect(toastError, name).toHaveBeenCalledWith(message);
+      expect(screen.queryByRole("alert"), name).not.toBeInTheDocument();
+    }
+  });
+
+  it("keeps a save or paste from before a close out of the reopened dialog", async () => {
+    const user = userEvent.setup();
+    render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
+    const reopen = async () => {
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+      await user.click(screen.getByRole("button", { name: "Add server" }));
+    };
+
+    // A save: the dialog it was sent from is gone, so a toast says it failed.
+    const save = deferred<never>();
+    api.addServerWithRows.mockReturnValueOnce(save.promise);
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    await fillServer(user, "npx");
+    await user.click(screen.getByRole("button", { name: "Add" }));
+    await reopen();
+    await act(async () => save.reject("disk full"));
+    expect(toastError).toHaveBeenCalledWith("Couldn't save demo: disk full");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    // A paste: its result is for a form that no longer exists, so it is dropped
+    // and the new dialog's paste box is not left parsing.
+    vi.mocked(toastError).mockClear();
+    const parse = deferred<never>();
+    api.parseServerSnippet.mockReturnValueOnce(parse.promise);
+    await user.click(screen.getByRole("button", { name: "Paste from client config" }));
+    await user.type(screen.getByPlaceholderText(/claude mcp add \.\.\. \//), "bad");
+    await user.click(screen.getByRole("button", { name: "Parse & fill" }));
+    expect(screen.getByRole("button", { name: "Parsing…" })).toBeDisabled();
+    await reopen();
+    await user.click(screen.getByRole("button", { name: "Paste from client config" }));
+    await user.type(screen.getByPlaceholderText(/claude mcp add \.\.\. \//), "next");
+    expect(screen.getByRole("button", { name: "Parse & fill" })).toBeEnabled();
+    await act(async () => parse.reject("Write each -e value as KEY=value."));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(toastError).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Parse & fill" })).toBeEnabled();
+  });
+
+  it("names the submitted server when a save fails after a rename", async () => {
+    const initial = {
+      id: "local",
+      name: "Local",
+      transport: "stdio",
+      command: "local-server",
+      args: [],
+      env: [],
+      url: null,
+      source: "manual",
+    } as ServerEntry;
+    const save = deferred<never>();
+    api.updateServer.mockReturnValueOnce(save.promise);
+    const user = userEvent.setup();
+    render(<ServerDialog autoOpen editId="local" initial={initial} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await user.type(screen.getByLabelText("Name"), " renamed");
+    await act(async () => save.reject("disk full"));
+    // The failure is still said, as GTK does, and names what was sent.
+    await expectFooterError("Couldn't save Local: disk full");
+    expect(screen.getByLabelText("Name")).toHaveValue("Local renamed");
+  });
+
   it("closes on Cancel when it owns its open state (header add flow)", async () => {
     render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
     await userEvent.click(screen.getByRole("button", { name: "Add server" }));
@@ -426,11 +606,13 @@ describe("ServerDialog", () => {
 
     await user.click(screen.getByRole("button", { name: "Add" }));
 
-    await waitFor(() =>
-      expect(toastError).toHaveBeenCalledWith(
-        "Couldn't save demo: Keychain unavailable. Unlock it and retry importing. Client config unchanged.",
-      ),
+    // The error sits in the footer above the buttons, which stay usable; no toast
+    // covers them.
+    await expectFooterError(
+      "Couldn't save demo: Keychain unavailable. Unlock it and retry importing. Client config unchanged.",
     );
+    expect(screen.getByRole("button", { name: "Add" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled();
     expect(api.addServerWithRows).toHaveBeenCalledTimes(1);
     const sent = api.addServerWithRows.mock.calls[0][0] as ServerEntry;
     expect(sent.env).toEqual([
@@ -447,6 +629,11 @@ describe("ServerDialog", () => {
       screen.getAllByPlaceholderText("value").map((i) => (i as HTMLInputElement).value),
     ).toEqual(["secret-0", "secret-1", "secret-2"]);
 
+    // An edit makes the error stale, as in GTK.
+    await user.type(valueInputs[2], "x");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    await user.type(valueInputs[2], "{Backspace}");
+
     await user.click(screen.getByRole("button", { name: "Add" }));
 
     await waitFor(() => expect(api.addServerWithRows).toHaveBeenCalledTimes(2));
@@ -454,6 +641,42 @@ describe("ServerDialog", () => {
     expect(onSaved).toHaveBeenLastCalledWith(added);
     expect(toast.success).toHaveBeenCalledWith("Added demo");
     expect(screen.queryByText("Add MCP server")).not.toBeInTheDocument();
+  });
+
+  it("clears a failed save when the variable's key source or keychain choice changes", async () => {
+    const user = userEvent.setup();
+    render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    await fillServer(user, "npx");
+    await user.click(screen.getByRole("button", { name: "Add variable" }));
+    await user.type(screen.getByPlaceholderText("ENV_NAME"), "KEY_A");
+    await user.type(screen.getByPlaceholderText("value"), "secret");
+    const failed = "Couldn't save demo: Keychain unavailable.";
+    const fail = async () => {
+      api.addServerWithRows.mockRejectedValueOnce("Keychain unavailable.");
+      await user.click(screen.getByRole("button", { name: "Add" }));
+      await expectFooterError(failed);
+    };
+
+    await fail();
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Key source for KEY_A" }),
+      "reference",
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    await fail();
+    await user.type(screen.getByRole("textbox", { name: "Secret reference" }), "x");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    await fail();
+    await user.click(screen.getByRole("checkbox", { name: "Keep KEY_A in keychain" }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    await user.type(screen.getByPlaceholderText("value"), "plain");
+    await fail();
+    await user.click(screen.getByRole("checkbox", { name: "Same on every machine" }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("names the keys a new server was saved without", async () => {
@@ -724,7 +947,35 @@ describe("ServerDialog", () => {
     await user.type(screen.getByPlaceholderText(/claude mcp add \.\.\. \//), "bad");
     await user.click(screen.getByRole("button", { name: "Parse & fill" }));
 
-    await waitFor(() => expect(toastError).toHaveBeenCalledWith(message));
+    await expectFooterError(message);
+    expect(screen.getByRole("button", { name: "Add" })).toBeVisible();
+  });
+
+  it("clears a refused paste when the snippet changes", async () => {
+    const message = "Write each -e value as KEY=value.";
+    api.parseServerSnippet.mockRejectedValueOnce(message);
+    const user = userEvent.setup();
+    render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    await user.click(screen.getByRole("button", { name: "Paste from client config" }));
+    const snippet = screen.getByPlaceholderText(/claude mcp add \.\.\. \//);
+    await user.type(snippet, "bad");
+    await user.click(screen.getByRole("button", { name: "Parse & fill" }));
+    await expectFooterError(message);
+
+    await user.type(snippet, "x");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("says in the footer when a paste holds no servers", async () => {
+    api.parseServerSnippet.mockResolvedValueOnce([]);
+    const user = userEvent.setup();
+    render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    await user.click(screen.getByRole("button", { name: "Paste from client config" }));
+    await user.type(screen.getByPlaceholderText(/claude mcp add \.\.\. \//), "none");
+    await user.click(screen.getByRole("button", { name: "Parse & fill" }));
+    await expectFooterError("No servers found in the pasted config.");
   });
 
   it("leaves the form as it was when a paste is refused", async () => {
@@ -760,14 +1011,16 @@ describe("ServerDialog", () => {
       await user.click(screen.getByRole("button", { name: "Parse & fill" }));
     };
     await paste("refused header");
-    await waitFor(() => expect(toastError).toHaveBeenCalledWith(header));
+    await expectFooterError(header);
     expect(screen.queryByText("Give the server a name.")).not.toBeInTheDocument();
     expect(screen.getByLabelText("Name")).toHaveValue("");
 
     await paste("good");
     await waitFor(() => expect(screen.getByLabelText("Name")).toHaveValue("first"));
+    // A good paste clears the earlier refusal.
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     await paste("refused variable");
-    await waitFor(() => expect(toastError).toHaveBeenCalledWith(variable));
+    await expectFooterError(variable);
     // The earlier paste's fields stay, as they were before the refused one.
     expect(screen.getByLabelText("Name")).toHaveValue("first");
     expect(screen.getByLabelText("Command")).toHaveValue("npx");
@@ -787,8 +1040,7 @@ describe("ServerDialog", () => {
         );
       await user.type(screen.getByPlaceholderText(/claude mcp add \.\.\. \//), "x");
       await user.click(screen.getByRole("button", { name: "Parse & fill" }));
-      await waitFor(() => expect(toastError).toHaveBeenCalledWith(header));
-      vi.mocked(toastError).mockClear();
+      await expectFooterError(header);
     };
     // Arguments shows the empty command's error once visited.
     await user.click(screen.getByLabelText("Arguments"));
@@ -821,7 +1073,7 @@ describe("ServerDialog", () => {
     await user.click(screen.getByPlaceholderText(/claude mcp add \.\.\. \//));
     expect(screen.getByText("Give the server a name.")).toBeVisible();
     await act(async () => refusal.reject("refused"));
-    await waitFor(() => expect(toastError).toHaveBeenCalledWith("refused"));
+    await expectFooterError("refused");
     expect(screen.queryByText("Give the server a name.")).not.toBeInTheDocument();
   });
 

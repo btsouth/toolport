@@ -1323,7 +1323,20 @@ export function ServerToolsPanel({
                           checked={!perToolOff}
                           onCheckedChange={(on) => toggleTool(t.name, on)}
                           disabled={policyBusy}
-                          aria-label={translate("Enable {value0}", { value0: t.name })}
+                          // The name stays the tool's; the switch state says on or
+                          // off, and the tooltip says what a click does, as in GTK.
+                          // While the global switch hides a destructive tool, a
+                          // click changes only its own setting, so it says that.
+                          aria-label={t.name}
+                          title={
+                            denyDestructive && destructive
+                              ? translate(
+                                  "Destructive tools are hidden from clients by the global switch even when individually enabled.",
+                                )
+                              : perToolOff
+                                ? translate("Hidden from clients. Expose it.")
+                                : translate("Exposed to clients. Hide it.")
+                          }
                         />
                       </div>
                     );

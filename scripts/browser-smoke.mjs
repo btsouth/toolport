@@ -168,6 +168,37 @@ try {
   await expect(page.getByRole("option", { name: "Work", exact: true })).toBeVisible();
   await page.screenshot({ path: path.join(output, "client-access.png") });
   await page.keyboard.press("Escape");
+  // Disconnect answers in the fixture and the client then reads as not connected.
+  await page.getByRole("button", { name: "Disconnect", exact: true }).click();
+  await page
+    .getByRole("dialog", { name: "Disconnect Toolport from Codex?", exact: true })
+    .getByRole("button", { name: "Disconnect", exact: true })
+    .click();
+  await expect(page.getByText("Disconnected Toolport from Codex.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Disconnect", exact: true })).toHaveCount(
+    0,
+  );
+  await page.screenshot({ path: path.join(output, "client-disconnected.png") });
+  expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
+  // Connect puts the gateway back with the access chosen for it.
+  await page.getByRole("combobox", { name: "Access", exact: true }).click();
+  await page.getByRole("option", { name: "Work", exact: true }).click();
+  await page.getByRole("button", { name: "Connect to Toolport", exact: true }).click();
+  const review = page.getByRole("dialog", { name: "Review and connect Codex" });
+  await review.getByRole("button", { name: "Connect to Toolport", exact: true }).click();
+  await page
+    .getByRole("dialog", { name: "Codex connected" })
+    .getByRole("button", { name: "Done", exact: true })
+    .click();
+  await expect(review).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Disconnect", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "Access", exact: true })).toHaveText(
+    "Work",
+  );
+  // Back to the fixture's connected Codex for the steps below.
+  await page.goto(`${baseURL}/fixtures/`);
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   await page.getByRole("button", { name: "Access", exact: true }).click();
   await expect(
@@ -429,6 +460,28 @@ try {
     await expect(
       page.getByRole("heading", { name: "Review and connect Codex" }),
     ).toBeVisible();
+    // Each card's 3px focus ring and selection ring fit inside every box that
+    // clips it on the way up to the dialog, so neither is cut at the sides.
+    const clipped = await page.evaluate(() =>
+      [...document.querySelectorAll('[role="dialog"] button[aria-pressed]')].flatMap(
+        (card) => {
+          const box = card.getBoundingClientRect();
+          const cuts = [];
+          for (let el = card.parentElement; el && el.getAttribute("role") !== "dialog";) {
+            if (getComputedStyle(el).overflowX !== "visible") {
+              const clip = el.getBoundingClientRect();
+              if (box.left - clip.left < 3 || clip.right - box.right < 3)
+                cuts.push(
+                  `${card.textContent.trim().slice(0, 20)} in ${el.dataset.slot ?? el.className}`,
+                );
+            }
+            el = el.parentElement;
+          }
+          return cuts;
+        },
+      ),
+    );
+    expect(clipped).toEqual([]);
     await page.getByText("Details", { exact: true }).click();
     await expect(page.getByText(/Backups will be saved/)).toBeVisible();
     await page.getByText("Details", { exact: true }).click();
