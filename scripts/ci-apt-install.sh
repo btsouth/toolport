@@ -94,8 +94,10 @@ archives=/var/cache/apt/archives
 # deb goes in only when its SHA256 matches the record the just-updated index has
 # for the package, version and architecture its filename names. apt looks debs
 # up by filename and checks only their size, so the filename is what has to
-# match. Anything else (an old version, another package set, a corrupt file) is
-# left out, which also prunes the cache when it is saved again.
+# match. Anything that fails that check (an old version, a corrupt file) is left
+# out, which also prunes the cache when it is saved again. A valid deb from
+# another package set passes it and stays, so caches restored across sets carry
+# their union; seeding never limits itself to the requested packages.
 #
 # Partial downloads are never carried across runs. A copied partial gets a new
 # mtime, apt sends that as If-Range, and the mirror answers with the whole file
@@ -147,7 +149,6 @@ save_deb_cache_on_exit() {
 
 if [ -n "$deb_cache" ]; then
   mkdir -p "$deb_cache"
-  trap save_deb_cache_on_exit EXIT
 fi
 
 run_apt() {
@@ -175,8 +176,12 @@ if [ -z "$updated" ]; then
   exit 1
 fi
 
+# The cache is rebuilt from what apt holds only once seeding has run. Before
+# that, apt's archive holds none of the restored debs, so a run whose index
+# refresh failed would replace a warm cache with an empty one.
 if [ -n "$deb_cache" ]; then
   seed_deb_cache
+  trap save_deb_cache_on_exit EXIT
 fi
 
 # Fetch first, on a bound, so a stalled mirror is interrupted and retried. This
