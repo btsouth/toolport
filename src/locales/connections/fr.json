@@ -1135,5 +1135,7 @@
   "Not connected: {names}.": "Non connectés : {names}.",
   "Skip": "Ignorer",
   "No servers moved, so your agent has no new tools.": "Aucun serveur n’a été déplacé, votre agent n’a donc aucun nouvel outil.",
-  "{value0} tool-change records": "{value0} enregistrements de changement d'outil"
+  "{value0} tool-change records": "{value0} enregistrements de changement d'outil",
+  "Safety is Off.": "La sécurité est désactivée.",
+  "Toolport records tool changes but blocks nothing.": "Toolport enregistre les changements d'outils, mais ne bloque rien."
 }

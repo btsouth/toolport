@@ -250,13 +250,23 @@ fn activity_metadata(dir: &std::path::Path) -> Result<(String, Vec<std::path::Pa
         let name = entry.file_name().to_string_lossy().into_owned();
         if activity_file(&name) {
             let metadata = std::fs::metadata(entry.path()).map_err(|error| error.to_string())?;
-            stores.push((name, metadata));
+            stores.push((entry.path(), metadata));
+        }
+    }
+    // A registry override outside the data directory still decides what
+    // Activity shows (its safety level), so its changes count too.
+    if let Some(registry) =
+        crate::registry::resolved_path().filter(|path| path.parent() != Some(dir))
+    {
+        if let Ok(metadata) = std::fs::metadata(&registry) {
+            stores.push((registry, metadata));
         }
     }
     stores.sort_by(|a, b| a.0.cmp(&b.0));
     let mut hash = std::collections::hash_map::DefaultHasher::new();
-    let paths = stores.iter().map(|(name, _)| dir.join(name)).collect();
-    for (name, metadata) in stores {
+    let paths = stores.iter().map(|(path, _)| path.clone()).collect();
+    for (path, metadata) in stores {
+        let name = path.to_string_lossy();
         if !metadata.is_file() {
             return Err(format!("Activity store {name} is not a regular file"));
         }
@@ -281,7 +291,7 @@ fn activity_metadata(dir: &std::path::Path) -> Result<(String, Vec<std::path::Pa
             use windows_sys::Win32::Storage::FileSystem::{
                 GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
             };
-            let file = std::fs::File::open(dir.join(name)).map_err(|error| error.to_string())?;
+            let file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
             // SAFETY: the handle belongs to this open file and info is a valid output buffer.
             let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
             if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
@@ -517,6 +527,35 @@ mod tests {
             cache.revision().is_err(),
             "broken targets must not reuse cached success"
         );
+    }
+
+    #[test]
+    fn activity_revision_covers_a_registry_override_outside_the_data_dir() {
+        let data = crate::registry::DataDirTestEnv::new("activity-revision-registry-override");
+        let _env = crate::registry::REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let elsewhere = data.dir.with_extension("registry-override");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let registry = elsewhere.join("registry.json");
+        std::fs::write(&registry, r#"{"safetyLevel":"off"}"#).unwrap();
+        std::fs::write(data.dir.join("security.jsonl"), "{}\n").unwrap();
+        struct Restore(Option<std::ffi::OsString>, std::path::PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("TOOLPORT_REGISTRY", value),
+                    None => std::env::remove_var("TOOLPORT_REGISTRY"),
+                }
+                let _ = std::fs::remove_dir_all(&self.1);
+            }
+        }
+        let _restore = Restore(std::env::var_os("TOOLPORT_REGISTRY"), elsewhere.clone());
+        std::env::set_var("TOOLPORT_REGISTRY", &registry);
+        let mut cache = RevisionCache::new(data.dir.clone());
+        let before = cache.revision().unwrap();
+        std::fs::write(&registry, r#"{"safetyLevel":"strict"}"#).unwrap();
+        assert_ne!(cache.revision().unwrap(), before);
     }
 
     #[test]

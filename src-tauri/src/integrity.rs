@@ -4974,8 +4974,19 @@ fn event_matches_profile(event: &Value, profile: &str) -> bool {
 
 fn review_events_uncached(limit: usize) -> std::io::Result<Vec<Value>> {
     let mut events = read_recent(limit.min(KEEP_LINES))?;
-    let quarantines = all_quarantined();
-    for event in &mut events {
+    annotate_review_status(&mut events, &all_quarantined());
+    attach_drift_poison_signatures(&mut events);
+    // Preview.6 showed 50 recent records in React. Reading the full retention
+    // window for complete refreshes must not turn older, fingerprint-less history
+    // into a new wall of findings. Keep every blocked or unverifiable block visible.
+    mark_older_drift_history(&mut events);
+    Ok(events)
+}
+
+/// Set `blocked`, `blocked_profiles` and `review_required` on raw security
+/// events from the quarantine store. An unreadable store leaves `blocked` null.
+pub fn annotate_review_status(events: &mut [Value], quarantines: &Result<Vec<Value>, String>) {
+    for event in events {
         match &quarantines {
             Ok(records) => {
                 // Older findings and quarantines did not capture fingerprints or
@@ -5042,12 +5053,6 @@ fn review_events_uncached(limit: usize) -> std::io::Result<Vec<Value>> {
             }
         }
     }
-    attach_drift_poison_signatures(&mut events);
-    // Preview.6 showed 50 recent records in React. Reading the full retention
-    // window for complete refreshes must not turn older, fingerprint-less history
-    // into a new wall of findings. Keep every blocked or unverifiable block visible.
-    mark_older_drift_history(&mut events);
-    Ok(events)
 }
 
 fn mark_older_drift_history(events: &mut [Value]) {
@@ -5119,10 +5124,11 @@ pub struct ToolChangeGroup {
 }
 
 /// Whether a tool change asks the user to review or accept it. With reviews off
-/// (`Registry::tool_change_reviews_enabled`) only a change that was actually
-/// blocked asks; the rest stay as plain history.
+/// (`Registry::tool_change_reviews_enabled`) only a change verified unblocked,
+/// with no pending definition review, becomes plain history. Blocked, unknown
+/// (`blocked` missing or null) and review-required changes still ask.
 pub fn tool_change_asks_review(event: &Value, reviews_enabled: bool) -> bool {
-    reviews_enabled || event["blocked"] == true
+    reviews_enabled || event["blocked"] != false || event["review_required"] == true
 }
 
 /// One server refresh is one event, even when it changed hundreds of definitions.

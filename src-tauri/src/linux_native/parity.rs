@@ -510,6 +510,9 @@ fn materialize(command: &str, args: &Value) -> Result<Result<Value, String>, Str
             crate::integrity::review_events(limit()?),
             "Couldn't read security events",
         ),
+        "tool_change_reviews_enabled" => {
+            Ok(Value::Bool(crate::registry::tool_change_reviews_now()))
+        }
         "get_search_traces" => list(
             crate::searchtrace::read_recent(limit()?),
             "Couldn't read search traces",

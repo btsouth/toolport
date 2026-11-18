@@ -5,9 +5,9 @@ import {
   eventSeverity,
   securityKey,
   selectSecurityEvents,
+  toolChangeAsksReview,
 } from "@/lib/securityReview";
 import { ToolChanges } from "./ToolChanges";
-import { toolChangeAsksReview, toolChangeReviewsEnabled } from "@/lib/safety";
 import { activityClientSegments, clientIdentityTooltip } from "@/lib/clientIdentity";
 import { hostedClientName } from "@/lib/hostAttribution";
 import { HostThreadChip } from "@/components/HostThreadChip";
@@ -27,6 +27,7 @@ import {
   Share2,
   ShieldAlert,
   ShieldCheck,
+  ShieldOff,
   ShieldX,
   Clock,
   Undo2,
@@ -66,6 +67,7 @@ import {
   getSavingsSummary,
   getSearchTraces,
   getSecurityEvents,
+  getToolChangeReviewsEnabled,
   getToolIdentities,
   openGatewayLog,
   type SecurityEvent,
@@ -209,8 +211,20 @@ function addDismissed(prev: Set<string>, keys: string[]): Set<string> {
 /** Calm, always-on "you're protected" state, shown whenever there are no live
  * security notices. A protection the user never sees builds no trust, so we make
  * the integrity + content-defense watch visible even when nothing is wrong. */
-function SecurityResting() {
+function SecurityResting({ safetyOff }: { safetyOff: boolean }) {
   const { t: tr } = useI18n();
+  if (safetyOff)
+    return (
+      <div className="mb-4 flex items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-4 py-2.5 text-meta text-muted-foreground">
+        <ShieldOff className="size-4 shrink-0" />
+        <span>
+          <span className="block font-semibold text-foreground">
+            {tr("Safety is Off.")}
+          </span>{" "}
+          {tr("Toolport records tool changes but blocks nothing.")}
+        </span>
+      </div>
+    );
   return (
     <div className="mb-4 flex items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-4 py-2.5 text-meta text-muted-foreground">
       <ShieldCheck className="size-4 shrink-0 text-owned" />
@@ -1911,6 +1925,7 @@ export function ActivityView({
   const [errorsOnly, setErrorsOnly] = useState(false);
   const [security, setSecurity] = useState<SecurityEvent[]>([]);
   const [securityLoadStatus, setSecurityLoadStatus] = useState<LoadStatus>("loading");
+  const [reviewsEnabled, setReviewsEnabled] = useState(true);
   const [dismissed, setDismissed] = useState<Set<string>>(loadDismissed);
   // The call list is the page's main content: open by default, as in GTK.
   const [logOpen, setLogOpen] = useState(true);
@@ -2079,6 +2094,10 @@ export function ActivityView({
           status === "ready" || status === "stale" ? "stale" : "error",
         );
       });
+    // Rust decides from the registry on disk; any failure keeps reviews on.
+    getToolChangeReviewsEnabled()
+      .then((enabled) => alive && setReviewsEnabled(enabled !== false))
+      .catch(() => alive && setReviewsEnabled(true));
     getSecurityEvents(2000)
       .then((s) => {
         if (!alive) return;
@@ -2137,8 +2156,7 @@ export function ActivityView({
     e.type !== "tool_poison_flag" &&
     e.type !== "result_injection" &&
     e.type !== "result_injection_blocked";
-  // With nothing able to block, unblocked tool changes are plain history.
-  const reviewsEnabled = toolChangeReviewsEnabled(registry);
+  // With nothing able to block, verified-unblocked tool changes are plain history.
   const toolChanges = useMemo(
     () =>
       liveSecurity.filter(
@@ -2231,7 +2249,7 @@ export function ActivityView({
       {highSecurity.length > 0 ? (
         <SecurityNotices events={highSecurity} onDismiss={dismissSecurity} />
       ) : securityLoadStatus === "ready" && toolChanges.length === 0 ? (
-        <SecurityResting />
+        <SecurityResting safetyOff={!reviewsEnabled} />
       ) : null}
       {infoSecurity.length > 0 ? (
         <QuietDriftHistory

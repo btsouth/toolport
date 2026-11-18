@@ -2743,9 +2743,9 @@ impl Registry {
     }
     /// Whether Activity asks the user to review or accept tool changes. Only when
     /// nothing can be blocked (effective level Off, no kept or team-forced
-    /// quarantine or injection block) are changes shown as plain history. A change
-    /// that was actually blocked still asks, whatever this returns. The React shell
-    /// keeps the same rule in `src/lib/safety.ts`.
+    /// quarantine or injection block) are changes shown as plain history, and only
+    /// those verified unblocked (`integrity::tool_change_asks_review`). Both shells
+    /// read it through `tool_change_reviews_now`.
     pub fn tool_change_reviews_enabled(&self) -> bool {
         self.safety_level_effective() != SafetyLevel::Off
             || self.quarantine_on_drift_effective()
@@ -4909,6 +4909,14 @@ pub fn update_at<T>(
     crate::personal_sync::record(&before, &mut reg)?;
     save_to(path, &reg)?;
     Ok((reg, out))
+}
+
+/// `Registry::tool_change_reviews_enabled` for the registry on disk. Any load
+/// failure keeps reviews on, so an unreadable registry never hides one.
+pub fn tool_change_reviews_now() -> bool {
+    load_resolved()
+        .map(|registry| registry.tool_change_reviews_enabled())
+        .unwrap_or(true)
 }
 
 /// The path the registry actually resolves to, honoring `TOOLPORT_REGISTRY`

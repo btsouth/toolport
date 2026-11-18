@@ -3,7 +3,7 @@ import { render, screen, act, fireEvent, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ActivityView } from "./ActivityView";
 import { setLanguage } from "@/lib/i18n";
-import type { AuditEntry, Registry, SearchTrace } from "@/lib/types";
+import type { AuditEntry, SearchTrace } from "@/lib/types";
 import type { SecurityEvent } from "@/lib/api";
 
 let windowVisible = true;
@@ -15,6 +15,7 @@ const releaseActivityRevision = vi.fn();
 const getAuditLog = vi.fn();
 const getSearchTraces = vi.fn();
 const getSecurityEvents = vi.fn();
+const getToolChangeReviewsEnabled = vi.fn();
 const getToolIdentities = vi.fn();
 const getInspectLog = vi.fn();
 const getSavingsSummary = vi.fn();
@@ -37,6 +38,7 @@ vi.mock("@/lib/api", () => ({
   getSavingsSummary: (...a: unknown[]) => getSavingsSummary(...a),
   getSearchTraces: (...a: unknown[]) => getSearchTraces(...a),
   getSecurityEvents: (...a: unknown[]) => getSecurityEvents(...a),
+  getToolChangeReviewsEnabled: (...a: unknown[]) => getToolChangeReviewsEnabled(...a),
   getToolIdentities: (...a: unknown[]) => getToolIdentities(...a),
 }));
 
@@ -89,6 +91,7 @@ beforeEach(() => {
   getAuditLog.mockResolvedValue(initialLog);
   getSearchTraces.mockResolvedValue([]);
   getSecurityEvents.mockResolvedValue([]);
+  getToolChangeReviewsEnabled.mockResolvedValue(true);
   getToolIdentities.mockResolvedValue([]);
   getInspectLog.mockResolvedValue([]);
   getSavingsSummary.mockResolvedValue(null);
@@ -1247,11 +1250,9 @@ describe("ActivityView security drift dismissals", () => {
     );
   });
 
-  it("keeps unblocked tool changes as history when Safety is effectively Off", async () => {
+  it("keeps verified-unblocked tool changes as history when Safety is effectively Off", async () => {
     localStorage.clear();
-    const registry = (over: Partial<Registry>) =>
-      ({ version: 3, servers: [], ...over }) as unknown as Registry;
-    const change = (tool: string, blocked: boolean, historical = false) => ({
+    const change = (tool: string, blocked: boolean | null, historical = false) => ({
       ...warnEvent(1_700_000_000_000),
       tool: `srv__${tool}`,
       new_fp: `v2:${tool}`,
@@ -1260,9 +1261,13 @@ describe("ActivityView security drift dismissals", () => {
       ...(historical ? { historical: true } : {}),
     });
     const unblocked = [change("read", false), change("list", false, true)];
-    const shown = async (reg: Registry, events: SecurityEvent[]) => {
+    // The registry prop no longer decides: Rust answers through the command.
+    const shown = async (reviews: boolean | Error, events: SecurityEvent[]) => {
+      if (reviews instanceof Error)
+        getToolChangeReviewsEnabled.mockRejectedValue(reviews);
+      else getToolChangeReviewsEnabled.mockResolvedValue(reviews);
       getSecurityEvents.mockResolvedValue(events);
-      const view = render(<ActivityView refreshKey={0} registry={reg} />);
+      const view = render(<ActivityView refreshKey={0} registry={null} />);
       await act(async () => {});
       const text = view.container.textContent ?? "";
       const accept = screen.queryAllByRole("button", {
@@ -1272,31 +1277,40 @@ describe("ActivityView security drift dismissals", () => {
       return { text, accept };
     };
 
-    const off = await shown(registry({ safetyLevel: "off" }), unblocked);
+    const off = await shown(false, unblocked);
     expect(off.accept).toBe(0);
     expect(off.text).not.toContain("Review the changes or accept them");
     expect(off.text).not.toContain("Open history to review them");
     expect(off.text).toContain("2 tool-change records");
+    expect(off.text).toContain("Safety is Off.");
+    expect(off.text).toContain("Toolport records tool changes but blocks nothing.");
+    expect(off.text).not.toContain("Protection active.");
 
-    const blocked = await shown(registry({ safetyLevel: "off" }), [
-      ...unblocked,
-      change("delete", true),
-    ]);
+    const blocked = await shown(false, [...unblocked, change("delete", true)]);
     expect(blocked.accept).toBe(1);
     expect(blocked.text).toContain("1 tool is blocked");
     expect(blocked.text).toContain("2 tool-change records");
 
-    for (const reg of [
-      registry({ safetyLevel: "ask" }),
-      registry({ safetyLevel: "off", teamMinSafetyLevel: "ask" }),
-      registry({ safetyLevel: "off", teamForcedQuarantineOnDrift: true }),
-      registry({ safetyLevel: "off", keptV1Safety: { quarantineOnDrift: true } }),
-    ]) {
-      const ask = await shown(reg, unblocked);
+    // Unknown status and pending definition reviews stay actionable at Off.
+    const unknown = await shown(false, [change("read", null)]);
+    expect(unknown.text).toContain("Blocking status unavailable");
+    expect(unknown.text).not.toContain("tool-change records");
+    const review = await shown(false, [
+      { ...change("read", false), review_required: true },
+    ]);
+    expect(review.text).toContain("Review the captured definition in Settings");
+    expect(review.text).not.toContain("tool-change records");
+
+    // Reviews on, or an unanswered check, keep the cards as before.
+    for (const reviews of [true, new Error("registry unreadable")]) {
+      const ask = await shown(reviews, unblocked);
       expect(ask.text).toContain("Not blocked. Review the changes or accept them.");
       expect(ask.text).toContain("1 older tool-change records");
       expect(ask.text).not.toContain("2 tool-change records");
+      expect(ask.text).not.toContain("Safety is Off.");
     }
+    const resting = await shown(true, []);
+    expect(resting.text).toContain("Protection active.");
   });
 });
 

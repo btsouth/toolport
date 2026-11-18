@@ -1873,9 +1873,13 @@ fn read_security_watch_snapshot() -> Result<SecurityWatchSnapshot, String> {
     // Keep the error distinct from a known-empty quarantine. The badge displays
     // unknown, while this watcher still announces new security findings.
     let quarantined = crate::integrity::all_quarantined_summaries();
-    let tool_change_reviews = crate::registry::load()
-        .map(|registry| registry.tool_change_reviews_enabled())
-        .unwrap_or(true);
+    let tool_change_reviews = crate::registry::tool_change_reviews_now();
+    // Raw records carry no block status. Off stays quiet only for changes the
+    // quarantine store verifies as unblocked; an unreadable store keeps alerts.
+    let mut events = events;
+    if !tool_change_reviews {
+        crate::integrity::annotate_review_status(&mut events, &crate::integrity::all_quarantined());
+    }
     Ok((events, quarantined, tool_change_reviews))
 }
 
@@ -5943,15 +5947,22 @@ impl ActivityPage {
             });
             self.security_list.append(&notices);
         } else if snapshot.security_error.is_none() && !has_changes {
-            // A protection the user never sees builds no trust.
-            self.security_list.append(
-                &activity_status_card(
+            // A protection the user never sees builds no trust. With nothing able
+            // to block, say so instead of claiming protection.
+            let card = if snapshot.tool_change_reviews {
+                activity_status_card(
                     StatusTone::Success,
                     crate::i18n::msg("Protection active."),
                     crate::i18n::msg("Toolport is watching tool definitions and results. Nothing needs your attention right now."),
                 )
-                .root,
-            );
+            } else {
+                activity_status_card(
+                    StatusTone::Info,
+                    crate::i18n::msg("Safety is Off."),
+                    crate::i18n::msg("Toolport records tool changes but blocks nothing."),
+                )
+            };
+            self.security_list.append(&card.root);
         }
         if !info.is_empty() {
             let count = gtk::Label::new(Some(&info.len().to_string()));
@@ -18818,6 +18829,24 @@ mod tests {
         let off = render(SafetyLevel::Off, SafetyLevel::Off, &unblocked);
         assert!(!asks(&off), "Off must not ask for a review:\n{off}");
         assert!(off.contains("2 tool-change records"), "{off}");
+        assert!(off.contains("Safety is Off."), "{off}");
+        assert!(off.contains("Toolport records tool changes but blocks nothing."));
+        assert!(!off.contains("Protection active."), "{off}");
+
+        // Unknown status and pending definition reviews stay actionable at Off.
+        let mut unknown = change("get_issue", false, false);
+        unknown["blocked"] = serde_json::Value::Null;
+        let held = render(SafetyLevel::Off, SafetyLevel::Off, &[unknown]);
+        assert!(held.contains("Blocking status unavailable"), "{held}");
+        assert!(!held.contains("tool-change records"), "{held}");
+        let mut review = change("search", false, false);
+        review["review_required"] = serde_json::json!(true);
+        let held = render(SafetyLevel::Off, SafetyLevel::Off, &[review]);
+        assert!(
+            held.contains("Review the captured definition in Settings"),
+            "{held}"
+        );
+        assert!(!held.contains("tool-change records"), "{held}");
 
         let off_blocked = render(SafetyLevel::Off, SafetyLevel::Off, &with_blocked);
         assert!(
@@ -18830,6 +18859,9 @@ mod tests {
             "{off_blocked}"
         );
 
+        let resting = render(SafetyLevel::Ask, SafetyLevel::Off, &[]);
+        assert!(resting.contains("Protection active."), "{resting}");
+        assert!(!resting.contains("Safety is Off."), "{resting}");
         for (level, floor) in [
             (SafetyLevel::Ask, SafetyLevel::Off),
             (SafetyLevel::Off, SafetyLevel::Ask),
@@ -22728,6 +22760,55 @@ mod tests {
         };
         assert_eq!(tools(true), ["srv__open", "srv__held"]);
         assert_eq!(tools(false), ["srv__held"]);
+    }
+
+    #[test]
+    fn safety_off_watch_alerts_unless_the_store_verifies_unblocked() {
+        use crate::registry::SafetyLevel;
+        let data = crate::registry::DataDirTestEnv::new("gtk-safety-off-watch");
+        let raw = |tool: &str, review: bool| {
+            let mut event = serde_json::json!({
+                "ts": 1000, "type": "tool_drift", "server": "srv", "tool": tool,
+                "change": "changed", "severity": "high", "new_fp": format!("v3:{tool}"),
+            });
+            if review {
+                event["review_required"] = serde_json::json!(true);
+            }
+            event
+        };
+        let lines = [raw("srv__open", false), raw("srv__review", true)]
+            .iter()
+            .map(|event| format!("{event}\n"))
+            .collect::<String>();
+        std::fs::write(data.dir.join("security.jsonl"), lines).unwrap();
+        let alerts = |level: SafetyLevel| {
+            let mut registry = crate::registry::Registry::default();
+            registry.set_safety_level(level);
+            std::fs::write(
+                data.dir.join("registry.json"),
+                serde_json::to_vec(&registry).unwrap(),
+            )
+            .unwrap();
+            let (events, quarantined, reviews) = read_security_watch_snapshot().unwrap();
+            let mut tools = newly_observed_security_events(
+                Some(&std::collections::HashSet::new()),
+                &events,
+                quarantined.as_deref().unwrap_or_default(),
+                reviews,
+            )
+            .1
+            .iter()
+            .map(|event| event["tool"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+            tools.sort();
+            tools
+        };
+        // No quarantine store: the open change is verified unblocked.
+        assert_eq!(alerts(SafetyLevel::Ask), ["srv__open", "srv__review"]);
+        assert_eq!(alerts(SafetyLevel::Off), ["srv__review"]);
+        // A damaged store cannot verify anything, so Off alerts as before.
+        std::fs::write(data.dir.join("quarantine.json"), "{ not json").unwrap();
+        assert_eq!(alerts(SafetyLevel::Off), ["srv__open", "srv__review"]);
     }
 
     #[test]

@@ -111,6 +111,7 @@
         "limit": 2000
       }
     ],
+    ["tool_change_reviews_enabled", {}],
     [
       "get_search_traces",
       {

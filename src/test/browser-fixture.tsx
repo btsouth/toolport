@@ -1349,6 +1349,8 @@ mockIPC(
         return null;
       case "get_security_events":
         return driftEvents;
+      case "tool_change_reviews_enabled":
+        return registry.safetyLevel !== "off";
       case "release_quarantine": {
         const event = driftEvents.find(
           (event) => event.profile === args.profile && event.tool === args.tool,

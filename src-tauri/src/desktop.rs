@@ -1300,6 +1300,15 @@ async fn get_security_events(limit: usize) -> Result<Vec<serde_json::Value>, Str
     .map_err(|e| format!("security events task join failed: {e}"))?
 }
 
+/// Whether Activity asks for tool-change reviews, decided by the registry on
+/// disk (`registry::tool_change_reviews_now`); true when it cannot be read.
+#[tauri::command]
+async fn tool_change_reviews_enabled() -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(crate::registry::tool_change_reviews_now)
+        .await
+        .map_err(|e| format!("tool change review task join failed: {e}"))
+}
+
 /// Most recent unresolved baseline warning for the current profile and policy.
 #[tauri::command]
 async fn get_baseline_notice() -> Result<Option<serde_json::Value>, String> {
@@ -4889,6 +4898,7 @@ pub fn run() {
             get_client_sessions,
             audit_stats,
             get_security_events,
+            tool_change_reviews_enabled,
             get_baseline_notice,
             savings_summary,
             gather_diagnostics,

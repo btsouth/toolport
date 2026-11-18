@@ -1135,5 +1135,7 @@
   "Not connected: {names}.": "未連線：{names}。",
   "Skip": "略過",
   "No servers moved, so your agent has no new tools.": "沒有移動任何伺服器，因此你的智慧體沒有新工具。",
-  "{value0} tool-change records": "{value0} 條工具變更記錄"
+  "{value0} tool-change records": "{value0} 條工具變更記錄",
+  "Safety is Off.": "安全已關閉。",
+  "Toolport records tool changes but blocks nothing.": "Toolport 會記錄工具變更，但不會封鎖任何內容。"
 }

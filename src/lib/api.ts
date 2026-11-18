@@ -120,6 +120,12 @@ export function getSecurityEvents(limit = 100): Promise<SecurityEvent[]> {
   return invoke<SecurityEvent[]>("get_security_events", { limit });
 }
 
+/** Whether Activity asks for tool-change reviews. The backend decides from the
+ * registry on disk and answers true when it cannot read it. */
+export function getToolChangeReviewsEnabled(): Promise<boolean> {
+  return invoke<boolean>("tool_change_reviews_enabled");
+}
+
 /** Net cl100k_base savings, exact MCP bytes, and separate historical estimates. */
 export function getSavingsSummary(): Promise<SavingsSummary> {
   return invoke<SavingsSummary>("savings_summary");
