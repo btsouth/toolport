@@ -470,6 +470,44 @@ it("shows protections kept from 1.x and drops them on request", async () => {
   );
 });
 
+it("carries the switches a level rewrites, so Strict to Ask unhides destructive tools", async () => {
+  const user = userEvent.setup();
+  const onRegistryChange = vi.fn();
+  const strict = {
+    ...registry,
+    safetyLevel: "strict" as const,
+    denyDestructive: true,
+    quarantineOnDrift: true,
+    blockOnInjection: true,
+    humanApproval: true,
+  };
+  vi.mocked(setSafetyLevel).mockResolvedValueOnce({
+    ...strict,
+    safetyLevel: "ask",
+    denyDestructive: false,
+    quarantineOnDrift: false,
+    blockOnInjection: false,
+  });
+  render(
+    <ThemeProvider>
+      <SettingsView page="safety" registry={strict} onRegistryChange={onRegistryChange} />
+    </ThemeProvider>,
+  );
+  await user.click(screen.getByRole("radio", { name: "Ask" }));
+  expect(setSafetyLevel).toHaveBeenCalledWith("ask");
+  await waitFor(() =>
+    expect(onRegistryChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        safetyLevel: "ask",
+        denyDestructive: false,
+        quarantineOnDrift: false,
+        blockOnInjection: false,
+        humanApproval: true,
+      }),
+    ),
+  );
+});
+
 it("selects and persists one safety level", async () => {
   const user = userEvent.setup();
   const onRegistryChange = vi.fn();
