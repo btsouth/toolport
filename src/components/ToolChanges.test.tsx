@@ -228,6 +228,41 @@ describe("server tool changes", () => {
       screen.getByRole("button", { name: "Review in Settings" }),
     ).toBeInTheDocument();
   });
+  it("keeps Review in Settings for a captured tool beside one being captured", () => {
+    const event = {
+      ...securityFixture()[0],
+      blocked: true,
+      blocked_profiles: [""],
+      new_fp: "v3:new",
+      review_required: true,
+    };
+    const capturing =
+      "Toolport is capturing this tool's new definition. It stays blocked until then.";
+    const review = vi.fn();
+    render(
+      <ToolChanges
+        events={[event, { ...event, tool: `${event.tool}_2`, pending_capture: true }]}
+        registry={registry}
+        onAccept={vi.fn()}
+        onReview={review}
+      />,
+    );
+    expect(
+      screen.getByText("Review the captured definition in Settings before accepting it."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(capturing)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Accept all for this server" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: "Review in Settings" })[0]);
+    expect(review).toHaveBeenCalledOnce();
+    // Expanded: the captured tool routes to Settings, the capturing tool says
+    // it is being captured, and neither offers an accept.
+    fireEvent.click(screen.getByRole("button", { name: /Cloudflare \(Full API\):/ }));
+    expect(screen.getAllByRole("button", { name: "Review in Settings" })).toHaveLength(2);
+    expect(screen.getByText(capturing)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Accept/ })).not.toBeInTheDocument();
+  });
   it("explains an unknown status before a block in a mixed group", () => {
     const event = securityFixture()[0];
     render(

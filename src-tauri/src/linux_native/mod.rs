@@ -1781,26 +1781,35 @@ fn security_event_covered_by_quarantine(
         Some("pins_load_failed") => quarantined.iter().any(|record| {
             record.get("change").and_then(serde_json::Value::as_str) == Some("tamper")
         }),
-        // The same tool in the same store and, when both carry one, the same
-        // fingerprint. A hold elsewhere must not silence a new finding.
+        // Every store the event was recorded in (persisted `profiles`, or a legacy
+        // scalar `profile`) needs a hold for the same tool and fingerprint. When
+        // the fields cannot establish that, alert.
         Some("tool_drift" | "tool_poison_flag") => {
             let tool = event.get("tool").and_then(serde_json::Value::as_str);
-            let store = event["profile"].as_str().unwrap_or("");
+            let new_fp = event["new_fp"].as_str();
+            let stores: Vec<&str> = match event["profiles"].as_array() {
+                Some(profiles) => profiles
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect(),
+                None => event["profile"].as_str().into_iter().collect(),
+            };
             tool.is_some_and(|tool| {
-                quarantined.iter().any(|record| {
-                    let fp = record["pending_pin"]["fp"]
-                        .as_str()
-                        .or_else(|| record["definition_fp"].as_str());
-                    record.get("tool").and_then(serde_json::Value::as_str) == Some(tool)
-                        && crate::integrity::same_integrity_store(
-                            store,
-                            record["profile"].as_str().unwrap_or(""),
-                        )
-                        && match (fp, event["new_fp"].as_str()) {
-                            (Some(held), Some(new)) => held == new,
-                            _ => true,
-                        }
-                })
+                new_fp.is_some()
+                    && !stores.is_empty()
+                    && stores.iter().all(|store| {
+                        quarantined.iter().any(|record| {
+                            let held = record["pending_pin"]["fp"]
+                                .as_str()
+                                .or_else(|| record["definition_fp"].as_str());
+                            record.get("tool").and_then(serde_json::Value::as_str) == Some(tool)
+                                && held == new_fp
+                                && crate::integrity::same_integrity_store(
+                                    store,
+                                    record["profile"].as_str().unwrap_or(""),
+                                )
+                        })
+                    })
             })
         }
         _ => false,
@@ -7200,11 +7209,13 @@ fn tool_change_group_card(
         .tools
         .iter()
         .any(|event| event["review_required"] == true);
-    // Nothing to review in Settings until the gateway captures the definition.
-    let capturing = group
-        .tools
-        .iter()
-        .any(|event| event["pending_capture"] == true);
+    // Capture status belongs to each tool: any captured review keeps the Settings
+    // route; the group waits only when every review is still being captured.
+    let capturing = review_required
+        && group
+            .tools
+            .iter()
+            .all(|event| event["review_required"] != true || event["pending_capture"] == true);
     let status = if capturing {
         crate::i18n::tr(
             "Toolport is capturing this tool's new definition. It stays blocked until then.",
@@ -21640,6 +21651,49 @@ mod tests {
             "{text}"
         );
         assert!(review);
+        // A mixed group keeps the Settings route for its captured tool; the
+        // capturing tool says so on its own row and neither can be accepted here.
+        let mut other = pending.clone();
+        other["tool"] = serde_json::json!("srv__other");
+        let group = crate::integrity::group_tool_changes(&[held.clone(), other.clone()]).remove(0);
+        assert_eq!(group.tools.len(), 2);
+        assert!(!group_can_be_accepted(&group));
+        let card = tool_change_group_card(&group, page.clone(), false);
+        let mut labels = Vec::new();
+        collect_labels(card.upcast_ref(), &mut labels);
+        let text = labels
+            .iter()
+            .map(|label| label.text().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("Review the captured definition in Settings before accepting it."),
+            "{text}"
+        );
+        assert!(!text.contains(capturing_line), "{text}");
+        let mut review = false;
+        let mut stack = vec![card.clone().upcast::<gtk::Widget>()];
+        while let Some(widget) = stack.pop() {
+            let mut child = widget.first_child();
+            while let Some(next) = child {
+                child = next.next_sibling();
+                if let Some(button) = next.downcast_ref::<gtk::Button>() {
+                    review |= button.label().as_deref() == Some("Review in Settings");
+                    assert_ne!(
+                        button.label().as_deref(),
+                        Some("Accept all for this server")
+                    );
+                }
+                stack.push(next);
+            }
+        }
+        assert!(review, "the captured tool keeps Review in Settings");
+        assert!(security_review_lines(&other)
+            .iter()
+            .any(|line| line == capturing_line));
+        assert!(!security_review_lines(&held)
+            .iter()
+            .any(|line| line == capturing_line));
     }
 
     #[test]
@@ -21668,6 +21722,69 @@ mod tests {
         // The same incident in the same store, including its alias: covered.
         assert_eq!(alerts(finding("@default-access:", "v3:held")), 0);
         assert_eq!(alerts(finding("@all-enabled:", "v3:held")), 0);
+    }
+
+    #[test]
+    fn duplicate_alerts_need_every_recorded_store_and_the_same_incident() {
+        let _data = crate::registry::DataDirTestEnv::new("gtk-duplicate-stores");
+        let hold = |profile: &str, fp: Option<&str>| {
+            let mut record = serde_json::json!({"server":"srv", "tool":"srv__read",
+                "change":"changed", "profile":profile});
+            if let Some(fp) = fp {
+                record["definition_fp"] = serde_json::json!(fp);
+            }
+            record
+        };
+        // Persisted form: definition events carry a `profiles` array.
+        let finding = |profiles: serde_json::Value, fp: Option<&str>| {
+            let mut event = serde_json::json!({"ts":1000, "type":"tool_poison_flag",
+                "server":"srv", "tool":"srv__read", "severity":"high", "profiles":profiles});
+            if let Some(fp) = fp {
+                event["new_fp"] = serde_json::json!(fp);
+            }
+            event
+        };
+        let covered = |event: serde_json::Value, holds: &[serde_json::Value]| {
+            security_event_covered_by_quarantine(&event, holds)
+        };
+        let f = Some("v3:f");
+        // A scoped hold covers its own persisted event, and an alias of its store.
+        assert!(covered(
+            finding(serde_json::json!(["work"]), f),
+            &[hold("work", f)]
+        ));
+        assert!(covered(
+            finding(serde_json::json!(["@all-enabled:"]), f),
+            &[hold("@default-access:", f)]
+        ));
+        // A global hold does not cover a scoped event, nor the reverse.
+        assert!(!covered(
+            finding(serde_json::json!(["work"]), f),
+            &[hold("", f)]
+        ));
+        assert!(!covered(
+            finding(serde_json::json!([""]), f),
+            &[hold("work", f)]
+        ));
+        // An event recorded in two stores needs a hold in each.
+        let both = finding(serde_json::json!(["", "work"]), f);
+        assert!(!covered(both.clone(), &[hold("", f)]));
+        assert!(covered(both, &[hold("", f), hold("work", f)]));
+        // No fingerprint on either side cannot establish the same incident.
+        assert!(!covered(
+            finding(serde_json::json!([""]), f),
+            &[hold("", None)]
+        ));
+        assert!(!covered(
+            finding(serde_json::json!([""]), None),
+            &[hold("", f)]
+        ));
+        // A legacy scalar-profile event without a fingerprint, against a hold in
+        // the access store the watcher now reads: alert, as before this change.
+        let legacy = serde_json::json!({"ts":1000, "type":"tool_drift", "server":"srv",
+            "tool":"srv__read", "change":"changed", "severity":"high",
+            "profile":"@default-access:"});
+        assert!(!covered(legacy, &[hold("@default-access:", None)]));
     }
 
     #[test]
@@ -23166,10 +23283,13 @@ mod tests {
 
     #[test]
     fn quarantine_suppresses_duplicate_drift_alerts_but_not_injection_alerts() {
+        let _data = crate::registry::DataDirTestEnv::new("gtk-duplicate-drift");
         let quarantine = serde_json::json!({
             "server": "linear",
             "tool": "linear__save_issue",
-            "change": "changed"
+            "change": "changed",
+            "profile": "",
+            "definition_fp": "v3:held"
         });
         let drift = serde_json::json!({
             "ts": 1000,
@@ -23177,7 +23297,9 @@ mod tests {
             "server": "linear",
             "tool": "linear__save_issue",
             "change": "changed",
-            "severity": "high"
+            "severity": "high",
+            "profiles": [""],
+            "new_fp": "v3:held"
         });
         let injection = serde_json::json!({
             "ts": 1001,

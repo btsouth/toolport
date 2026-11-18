@@ -5088,12 +5088,31 @@ pub fn annotate_review_status(events: &mut [Value], quarantines: &Result<Vec<Val
                     event["review_required"] = json!(true);
                 }
                 // Held by a pending pin whose definition is not captured yet: there
-                // is nothing in Settings to review until the gateway captures it.
-                if records.iter().any(|record| {
-                    record["pending_capture"] == true
+                // is nothing in Settings to review until the gateway captures it. A
+                // captured review for the same finding in another store still has
+                // one, so that review wins and the pending store stays held.
+                let captured_review = records.iter().any(|record| {
+                    record["pending_capture"] != true
+                        && record["review_required"] == true
                         && record["tool"] == event["tool"]
                         && event_matches_profile(event, record["profile"].as_str().unwrap_or(""))
-                }) {
+                        && event["new_fp"].as_str().is_some_and(|fp| {
+                            record["pending_pin"]["fp"]
+                                .as_str()
+                                .or_else(|| record["definition_fp"].as_str())
+                                == Some(fp)
+                        })
+                });
+                if !captured_review
+                    && records.iter().any(|record| {
+                        record["pending_capture"] == true
+                            && record["tool"] == event["tool"]
+                            && event_matches_profile(
+                                event,
+                                record["profile"].as_str().unwrap_or(""),
+                            )
+                    })
+                {
                     event["pending_capture"] = json!(true);
                 }
                 event["blocked_profiles"] = json!(profiles);
@@ -5853,6 +5872,61 @@ mod tests {
         }
         assert!(same_integrity_store("@default-access:", "@all-enabled:"));
         assert!(!same_integrity_store("", "@default-access:"));
+    }
+
+    #[test]
+    fn a_captured_review_in_one_store_outranks_capture_in_another() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data = TestDataDir::new("merged-capture-and-review");
+        let mut registry = crate::registry::Registry::default();
+        registry.profiles.push(crate::registry::Profile {
+            id: "work".into(),
+            name: "Work".into(),
+            enabled_server_ids: vec![],
+            tool_scope: Default::default(),
+            instructions: None,
+            unknown_fields: Default::default(),
+        });
+        crate::registry::save(&registry).unwrap();
+        // One finding recorded in both stores, merged into one event.
+        for profile in ["", "work"] {
+            record_event(
+                &json!({"type":"tool_drift", "tool":"srv__update", "server":"srv",
+                "change":"changed", "new_fp":"v2:f", "profile":profile, "ts":1}),
+            );
+        }
+        // Global: a released legacy block awaiting capture. Work: a captured review.
+        let legacy = json!({"tool":"srv__update", "change":"changed"});
+        save_quarantine(None, &BTreeMap::from([("srv__update".into(), legacy)])).unwrap();
+        assert!(release(None, "srv__update").unwrap());
+        let captured = json!({"tool":"srv__update", "change":"changed",
+            "definition_fp":"v2:f", "review_required":true});
+        save_quarantine(
+            Some("work"),
+            &BTreeMap::from([("srv__update".into(), captured)]),
+        )
+        .unwrap();
+        let events = review_events(2000).unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let event = &events[0];
+        assert_eq!(event["profiles"], json!(["", "work"]));
+        assert_eq!(event["review_required"], true);
+        assert!(
+            event.get("pending_capture").is_none(),
+            "Settings has a review"
+        );
+        // Both stores stay held; acceptance stays behind the captured review.
+        let mut held: Vec<&str> = event["blocked_profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        held.sort_unstable();
+        assert_eq!(held, ["", "work"]);
+        // Without the captured review the event waits for capture.
+        save_quarantine(Some("work"), &Quarantine::new()).unwrap();
+        assert_eq!(review_events(2000).unwrap()[0]["pending_capture"], true);
     }
 
     #[test]

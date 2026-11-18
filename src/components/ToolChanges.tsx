@@ -141,8 +141,11 @@ export function ToolChanges({
         {groups.map((group) => {
           const blocked = group.tools.filter((tool) => tool.blocked === true).length;
           const reviewRequired = group.tools.some((tool) => tool.review_required);
-          // Nothing to review in Settings until the gateway captures the definition.
-          const capturing = group.tools.some((tool) => tool.pending_capture);
+          // Capture status belongs to each tool: any captured review keeps the
+          // Settings route; the group waits only when every review is being captured.
+          const capturing =
+            reviewRequired &&
+            group.tools.every((tool) => !tool.review_required || tool.pending_capture);
           const unknown = group.tools.some((tool) => tool.blocked == null);
           const server =
             registry?.servers.find(
@@ -303,6 +306,13 @@ export function ToolChanges({
                                 : translate(
                                     "Blocking status unavailable. Review in Settings > Quarantined tools.",
                                   )}
+                          </p>
+                        )}
+                        {event.pending_capture && (
+                          <p>
+                            {translate(
+                              "Toolport is capturing this tool's new definition. It stays blocked until then.",
+                            )}
                           </p>
                         )}
                         {event.signatures !== undefined && (
