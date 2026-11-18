@@ -5837,7 +5837,11 @@ mod tests {
     fn off_holds_only_active_and_readable_review_pins() {
         let _data_dir_lock = crate::registry::data_dir_test_lock();
         let _data = TestDataDir::new("off-active-pins");
+        // Only "work": a "default" profile with no v2 store would read the global
+        // pin file as its unmigrated legacy store, which holds by design.
         let mut registry = crate::registry::Registry::default();
+        registry.profiles.clear();
+        registry.active_profile_id = Some("work".into());
         registry.profiles.push(crate::registry::Profile {
             id: "work".into(),
             name: "Work".into(),
