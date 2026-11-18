@@ -1323,7 +1323,14 @@ export function ServerToolsPanel({
                           checked={!perToolOff}
                           onCheckedChange={(on) => toggleTool(t.name, on)}
                           disabled={policyBusy}
-                          aria-label={translate("Enable {value0}", { value0: t.name })}
+                          // The name stays the tool's; the switch state says on or
+                          // off, and the tooltip says what a click does, as in GTK.
+                          aria-label={t.name}
+                          title={
+                            perToolOff
+                              ? translate("Hidden from clients. Expose it.")
+                              : translate("Exposed to clients. Hide it.")
+                          }
                         />
                       </div>
                     );

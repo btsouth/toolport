@@ -80,6 +80,40 @@ describe("server Tools panel", () => {
     expect(screen.queryByText("Pick a server…")).not.toBeInTheDocument();
   });
 
+  it("names each tool switch by its tool and describes its current state", async () => {
+    const { rerender } = render(
+      <ServerToolsPanel
+        serverId="alpha"
+        registry={registry}
+        onRegistryChange={vi.fn()}
+      />,
+    );
+    const on = await screen.findByRole("switch", { name: "read" });
+    const off = screen.getByRole("switch", { name: "remove" });
+    expect(on).toBeChecked();
+    expect(on).toHaveAttribute("title", "Exposed to clients. Hide it.");
+    expect(off).not.toBeChecked();
+    expect(off).toHaveAttribute("title", "Hidden from clients. Expose it.");
+
+    rerender(
+      <ServerToolsPanel
+        serverId="alpha"
+        registry={{
+          ...registry,
+          servers: [{ ...registry.servers[0], disabledTools: ["read"] }],
+        }}
+        onRegistryChange={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("switch", { name: "read" })).not.toBeChecked();
+    expect(screen.getByRole("switch", { name: "read" })).toHaveAttribute(
+      "title",
+      "Hidden from clients. Expose it.",
+    );
+    expect(screen.getByRole("switch", { name: "remove" })).toBeChecked();
+    expect(screen.queryByRole("switch", { name: /^Enable / })).not.toBeInTheDocument();
+  });
+
   it("validates schema arguments, calls the selected server and renders the result", async () => {
     render(
       <ServerToolsPanel
