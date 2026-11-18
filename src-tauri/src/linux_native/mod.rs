@@ -15829,30 +15829,17 @@ fn open_server_editor_prefilled(
                     }
                     editor.close();
                 }
-                // Closed while the save ran: the Servers page says it instead,
-                // as React's toast does.
+                // Closed while the save ran: a window toast says it on whatever
+                // page shows (a server's Overview hides the Servers list), as
+                // React's toast does.
                 Ok(Err(error)) if !editor.is_visible() => {
-                    page.show_feedback(
-                        &crate::i18n::trf(
-                            "Couldn't save {value1}: {value2}",
-                            &[
-                                ("value1", display_name.as_str()),
-                                ("value2", error.as_str()),
-                            ],
-                        ),
-                        true,
-                    );
+                    closed_save_failed(&page, &display_name, &error);
                 }
                 Err(_) if !editor.is_visible() => {
-                    page.show_feedback(
-                        &crate::i18n::trf(
-                            "Couldn't save {value1}: {value2}",
-                            &[
-                                ("value1", display_name.as_str()),
-                                ("value2", crate::i18n::tr("the operation stopped").as_str()),
-                            ],
-                        ),
-                        true,
+                    closed_save_failed(
+                        &page,
+                        &display_name,
+                        &crate::i18n::tr("the operation stopped"),
                     );
                 }
                 // The same wording as the React dialog's error.
@@ -15894,6 +15881,18 @@ fn open_server_editor_prefilled(
     editor_handlers.keep(&save, id);
     editor.present();
     Some(editor)
+}
+
+/// A save whose editor closed before it failed. Only a window without its
+/// toast overlay falls back to the Servers page's own line.
+fn closed_save_failed(page: &ServerPage, name: &str, error: &str) {
+    let message = crate::i18n::trf(
+        "Couldn't save {value1}: {value2}",
+        &[("value1", name), ("value2", error)],
+    );
+    if !show_toast(&page.list, &message) {
+        page.show_feedback(&message, true);
+    }
 }
 
 fn apply_launch_probe_value(input: &mut crate::registry::LaunchInput, value: &str) {
@@ -21716,9 +21715,13 @@ mod tests {
         app.register(gtk::gio::Cancellable::NONE).unwrap();
         let parent = adw::ApplicationWindow::builder().application(&app).build();
         let (content, page, _) = build_content(&app, crate::approval_broker::start_native());
-        parent.set_content(Some(&content));
+        // The app window's toast overlay, as `build_ui` sets it up.
+        let toasts = adw::ToastOverlay::new();
+        toasts.set_child(Some(&content));
+        parent.set_content(Some(&toasts));
         parent.present();
         let page_feedback = page.feedback.clone();
+        let details = page.details.clone();
         let editor = open_server_editor_prefilled(None, None, page, None).unwrap();
         fn widgets(widget: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
             out.push(widget.clone());
@@ -21943,19 +21946,27 @@ mod tests {
         assert!(editor.is_visible(), "a failed save keeps the editor open");
         assert!(crate::registry::load().unwrap().servers.is_empty());
 
-        // An editor closed while its save runs leaves the failure on the
-        // Servers page, not on the closed window.
+        // An editor closed while its save runs says the failure in a window
+        // toast, seen on a server's Overview, which hides the Servers list.
         let (release, gate) = std::sync::mpsc::channel::<String>();
         *editor_gate::GATE.lock().unwrap() = Some(gate);
         save.emit_clicked();
         editor.close();
+        details.push("fixture", &gtk::Box::new(gtk::Orientation::Vertical, 0));
         release.send("synthetic save failure".into()).unwrap();
-        settle(&|| page_feedback.is_visible());
-        assert_eq!(
-            page_feedback.label(),
-            "Couldn't save edited while busy: synthetic save failure"
+        let message = "Couldn't save edited while busy: synthetic save failure";
+        let toast_shown = || {
+            let mut all = Vec::new();
+            widgets(toasts.upcast_ref(), &mut all);
+            all.iter()
+                .filter_map(|w| w.downcast_ref::<gtk::Label>())
+                .any(|l| l.label() == message && l.is_drawable())
+        };
+        settle(&toast_shown);
+        assert!(
+            !page_feedback.is_visible(),
+            "the hidden Servers list took it"
         );
-        assert!(page_feedback.has_css_class("error"));
         assert!(crate::registry::load().unwrap().servers.is_empty());
         parent.close();
     }
