@@ -4965,9 +4965,12 @@ fn review_stamp() -> Option<ReviewStamp> {
         );
     }
     // The resolved registry decides which rows Off enforces, wherever it lives.
-    if let Some(path) = crate::registry::resolved_path().filter(|path| !files.contains_key(path)) {
-        if let Ok(metadata) = std::fs::metadata(&path) {
-            files.insert(path.clone(), review_file_stamp(&path, &metadata)?);
+    // Stamp its target, so a symlinked registry's edits refresh blocking status.
+    if let Some(target) =
+        crate::registry::resolved_path().and_then(|path| std::fs::canonicalize(path).ok())
+    {
+        if let Ok(metadata) = std::fs::metadata(&target) {
+            files.insert(target.clone(), review_file_stamp(&target, &metadata)?);
         }
     }
     Some(ReviewStamp { dir, files })
@@ -5224,11 +5227,11 @@ pub fn off_holds_any_tool() -> bool {
     let Ok(stores) = quarantine_scan_stores() else {
         return true;
     };
-    // Active reviews only: a retired name (its server was removed) holds nothing
-    // now. An unreadable pin store cannot show that nothing is held.
+    // Retired review names count too: a returning tool whose reactivation fails
+    // stays blocked. An unreadable pin store cannot show that nothing is held.
     stores.iter().any(|(profile, _)| {
         let pins = cached_review_pins((!profile.is_empty()).then_some(profile.as_str()));
-        pins.unreadable || !pins.active.is_empty()
+        pins.unreadable || !pins.names.is_empty()
     })
 }
 
@@ -5834,7 +5837,7 @@ mod tests {
     }
 
     #[test]
-    fn off_holds_only_active_and_readable_review_pins() {
+    fn off_holds_review_pins_including_retired_and_unreadable() {
         let _data_dir_lock = crate::registry::data_dir_test_lock();
         let _data = TestDataDir::new("off-active-pins");
         // Only "work": a "default" profile with no v2 store would read the global
@@ -5842,6 +5845,7 @@ mod tests {
         let mut registry = crate::registry::Registry::default();
         registry.profiles.clear();
         registry.active_profile_id = Some("work".into());
+        registry.set_safety_level(crate::registry::SafetyLevel::Off);
         registry.profiles.push(crate::registry::Profile {
             id: "work".into(),
             name: "Work".into(),
@@ -5851,28 +5855,64 @@ mod tests {
             unknown_fields: Default::default(),
         });
         crate::registry::save(&registry).unwrap();
-        for scope in [None, Some("work")] {
+        let scopes = [None, Some("work")];
+        // Every store readable and empty: nothing is held.
+        for scope in scopes {
             save_quarantine(scope, &Quarantine::new()).unwrap();
+            save_pins(scope, &Pins::new()).unwrap();
+        }
+        assert!(!off_holds_any_tool());
+        for scope in scopes {
+            // An unreadable pin store cannot show that nothing is held.
+            let path = pins_path(scope).unwrap();
+            std::fs::write(&path, "{ not json").unwrap();
+            assert!(off_holds_any_tool(), "{scope:?}");
+            assert!(!activity_safety().blocks_nothing, "{scope:?}");
+            let _ = std::fs::remove_file(pins_backup_path(&path));
+            save_pins(scope, &Pins::new()).unwrap();
+            assert!(!off_holds_any_tool(), "{scope:?}");
+        }
+        for scope in scopes {
             let mut pin = pin_of(&destructive_tool("srv__wipe", "Captured definition."));
             pin.review_pending = true;
             pin.review_retired = true;
             save_pins(scope, &BTreeMap::from([("srv__wipe".into(), pin.clone())])).unwrap();
-            // Its server was removed: nothing is held now.
-            assert!(!off_holds_any_tool(), "{scope:?}");
+            // Its server was removed, but a returning tool whose reactivation fails
+            // stays blocked, so a retired review still rules out the Off card.
+            assert!(off_holds_any_tool(), "{scope:?}");
+            assert!(!activity_safety().blocks_nothing, "{scope:?}");
             pin.review_retired = false;
             save_pins(scope, &BTreeMap::from([("srv__wipe".into(), pin)])).unwrap();
             assert!(off_holds_any_tool(), "{scope:?}");
-            // An unreadable pin store cannot show that nothing is held.
-            save_pins(scope, &Pins::new()).unwrap();
-            assert!(!off_holds_any_tool(), "{scope:?}");
-            let path = pins_path(scope).unwrap();
-            let _ = std::fs::remove_file(pins_backup_path(&path));
-            std::fs::write(&path, "{ not json").unwrap();
-            assert!(off_holds_any_tool(), "{scope:?}");
-            std::fs::remove_file(&path).unwrap();
-            let _ = std::fs::remove_file(pins_backup_path(&path));
             save_pins(scope, &Pins::new()).unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_cache_follows_a_symlinked_registry_target() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let data = TestDataDir::new("symlinked-registry");
+        let target = data.path.with_extension("registry-target.json");
+        std::fs::write(&target, r#"{"safetyLevel":"strict"}"#).unwrap();
+        std::os::unix::fs::symlink(&target, data.path.join("registry.json")).unwrap();
+        let reads = std::cell::Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Ok(vec![])
+        };
+        review_events_cached(2000, read).unwrap();
+        review_events_cached(2000, read).unwrap();
+        assert_eq!(reads.get(), 1, "an unchanged registry reuses the cache");
+        // Edit only the target: the link itself is unchanged.
+        std::fs::write(&target, r#"{"safetyLevel":"off"}"#).unwrap();
+        review_events_cached(2000, read).unwrap();
+        assert_eq!(
+            reads.get(),
+            2,
+            "a symlinked registry's edit refreshes Activity"
+        );
+        let _ = std::fs::remove_file(&target);
     }
 
     #[test]
