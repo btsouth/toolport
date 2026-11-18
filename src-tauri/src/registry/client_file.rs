@@ -406,18 +406,39 @@ fn exchange(_: &Path, _: &Path, _: &Path) -> Result<bool, String> {
 
 /// Write or remove a client config. An operating system error names the file.
 pub(crate) fn commit(path: &Path, expected: &Revision, output: Option<&str>) -> Result<(), String> {
-    commit_revision(path, expected, output)
+    commit_revision(path, expected, output, None)
         .map_err(|error| crate::clients::name_file_in_error(path, error))
 }
 
-fn commit_revision(path: &Path, expected: &Revision, output: Option<&str>) -> Result<(), String> {
+/// [`commit`] for a client whose folder Toolport never creates. When the folder that
+/// would hold the file (after following a config link) is missing, or disappears
+/// before the file is written, the commit stops with `missing` and creates nothing.
+pub(crate) fn commit_in_existing_folder(
+    path: &Path,
+    expected: &Revision,
+    output: Option<&str>,
+    missing: &str,
+) -> Result<(), String> {
+    commit_revision(path, expected, output, Some(missing))
+}
+
+fn commit_revision(
+    path: &Path,
+    expected: &Revision,
+    output: Option<&str>,
+    folder_missing: Option<&str>,
+) -> Result<(), String> {
     let dest = resolve_atomic_write_dest(path)?;
     if output.is_none() {
         return remove(&dest, expected);
     }
     let output = output.unwrap();
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        match folder_missing {
+            None => fs::create_dir_all(parent).map_err(|e| e.to_string())?,
+            Some(missing) if !parent.is_dir() => return Err(missing.into()),
+            Some(_) => {}
+        }
     }
     let tmp = sibling(&dest);
     let mut cleanup = TempFileCleanup::new(tmp.clone());
@@ -428,7 +449,10 @@ fn commit_revision(path: &Path, expected: &Revision, output: Option<&str>) -> Re
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&tmp).map_err(|e| e.to_string())?;
+    let mut file = options.open(&tmp).map_err(|e| match folder_missing {
+        Some(missing) if e.kind() == std::io::ErrorKind::NotFound => missing.to_string(),
+        _ => e.to_string(),
+    })?;
     cleanup.arm();
     file.write_all(output.as_bytes())
         .map_err(|e| e.to_string())?;

@@ -92,6 +92,7 @@ const CLIENT_LOGO: Record<string, string> = {
   witsy: "witsy",
   zcode: "zcode",
   workbuddy: "workbuddy",
+  "workbuddy-ai": "workbuddy",
 };
 
 /** Initials for the monogram fallback: two letters for multi-word names, else two chars. */

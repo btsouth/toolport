@@ -6,9 +6,9 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
-- WorkBuddy is a supported client. Toolport finds it, connects it through
-  `~/.workbuddy/mcp.json` (`~/.workbuddy-ai/mcp.json` for WorkBuddy AI), and
-  imports the servers already set up there.
+- WorkBuddy and WorkBuddy AI are supported clients. Toolport finds each one,
+  connects it through its own `mcp.json` (`~/.workbuddy` or `~/.workbuddy-ai`),
+  and imports the servers already set up there.
 
 ## [2.3.7] - 2026-11-16
 

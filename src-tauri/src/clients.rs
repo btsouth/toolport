@@ -1054,6 +1054,7 @@ fn resolve_client_config_path(
         "nanobot" => home.join(".nanobot").join("config.json"),
         "command-code" => home.join(".commandcode").join("mcp.json"),
         "workbuddy" => home.join(".workbuddy").join("mcp.json"),
+        "workbuddy-ai" => home.join(".workbuddy-ai").join("mcp.json"),
         "tabnine" => home.join(".tabnine").join("mcp_servers.json"),
         "tabnine-cli" => home.join(".tabnine").join("agent").join("settings.json"),
         "lm-studio" => home.join(".lmstudio").join("mcp.json"),
@@ -1754,6 +1755,7 @@ fn resolve_client_config_path_linux_in(
         "nanobot" => home.join(".nanobot").join("config.json"),
         "command-code" => home.join(".commandcode").join("mcp.json"),
         "workbuddy" => home.join(".workbuddy").join("mcp.json"),
+        "workbuddy-ai" => home.join(".workbuddy-ai").join("mcp.json"),
         "tabnine" => home.join(".tabnine").join("mcp_servers.json"),
         "tabnine-cli" => home.join(".tabnine").join("agent").join("settings.json"),
         "lm-studio" => home.join(".lmstudio").join("mcp.json"),
@@ -2711,49 +2713,22 @@ fn lm_studio_default_homes(home: &Path) -> [PathBuf; 2] {
     ]
 }
 
-fn workbuddy_path() -> Option<PathBuf> {
-    Some(resolve_workbuddy_dir(&home()?).join("mcp.json"))
-}
-
-/// WorkBuddy's data folder. Its `product.json` names it: `.workbuddy` for the China
-/// build (`com.tencent.workbuddy.mac`) and `.workbuddy-ai` for the international
-/// WorkBuddy AI build (`com.workbuddy.workbuddy-ai`), both directly under the home
-/// folder on every OS. Only one is managed: the one whose `mcp.json` holds Toolport's
-/// entry, so Disconnect and import stay on the file Connect wrote; otherwise the folder
-/// that exists; when both do, the one that already has an `mcp.json`, and `.workbuddy`
-/// when that does not decide it.
-fn resolve_workbuddy_dir(home: &Path) -> PathBuf {
-    let [china, international] = [home.join(".workbuddy"), home.join(".workbuddy-ai")];
-    let connected = |dir: &Path| {
-        read_config_file(&dir.join("mcp.json"))
-            .and_then(|text| parse_client_content(Format::JsonMcpServers, &text))
-            .is_ok_and(|servers| gateway_entry_for_client("workbuddy", &servers).is_some())
-    };
-    let prefer_international = match (connected(&china), connected(&international)) {
-        (false, true) => true,
-        (true, false) => false,
-        _ => match (china.is_dir(), international.is_dir()) {
-            (false, true) => true,
-            (true, true) => {
-                !china.join("mcp.json").is_file() && international.join("mcp.json").is_file()
-            }
-            _ => false,
-        },
-    };
-    if prefer_international {
-        international
-    } else {
-        china
+/// The plain message a write gets when a client's data folder is gone. WorkBuddy and
+/// WorkBuddy AI are desktop apps that create their own folder; Toolport never creates
+/// it, even when it disappears after the Clients page found it.
+pub(crate) fn folder_gone_message(client_id: &str) -> Option<&'static str> {
+    match client_id {
+        "workbuddy" => Some("WorkBuddy's folder is gone. Client config unchanged."),
+        "workbuddy-ai" => Some("WorkBuddy AI's folder is gone. Client config unchanged."),
+        _ => None,
     }
 }
 
-/// WorkBuddy's data folder must still exist when a write commits: Toolport never
-/// creates it, even when it was removed after the Clients page found it.
-pub(super) fn require_client_folder(client_id: &str, path: &Path) -> Result<(), String> {
-    if client_id == "workbuddy" && !path.parent().is_some_and(Path::is_dir) {
-        return Err("WorkBuddy's folder is gone. Client config unchanged.".into());
-    }
-    Ok(())
+/// A client from [`folder_gone_message`] is installed only when its data folder is a
+/// real folder; a stray file with that name is not an install.
+fn data_folder_missing(client_id: &str, config_path: &str) -> bool {
+    folder_gone_message(client_id).is_some()
+        && !Path::new(config_path).parent().is_some_and(Path::is_dir)
 }
 
 fn amazon_q_dir(home: &Path) -> PathBuf {
@@ -3554,10 +3529,25 @@ fn defs() -> Vec<ClientDef> {
             name: "WorkBuddy",
             format: Format::JsonMcpServers,
             uses_connectors: false,
-            // WorkBuddy (Tencent's desktop agent) reads `mcp.json` (`mcpServers`) in its
-            // data folder. Per-project `.workbuddy/mcp.json` files are left alone. See
-            // `resolve_workbuddy_dir` for the international build's folder.
-            path: workbuddy_path,
+            // WorkBuddy, Tencent's desktop agent (China build, `com.tencent.workbuddy.mac`),
+            // reads `mcp.json` (`mcpServers`) in its `product.json` data folder,
+            // `~/.workbuddy` on every OS. Per-project `.workbuddy/mcp.json` files are left
+            // alone. Toolport never creates the folder (see `folder_gone_message`).
+            path: || client_config_path("workbuddy"),
+            plugin_scan: None,
+        },
+        ClientDef {
+            location: None,
+            id: "workbuddy-ai",
+            discovery: discovery::capabilities("workbuddy-ai"),
+            tool_names: None,
+            name: "WorkBuddy AI",
+            format: Format::JsonMcpServers,
+            uses_connectors: false,
+            // WorkBuddy AI, the international build (`com.workbuddy.workbuddy-ai`), is a
+            // separate app with its own data folder, `~/.workbuddy-ai`, and the same
+            // `mcp.json` shape. It never reads the China build's file.
+            path: || client_config_path("workbuddy-ai"),
             plugin_scan: None,
         },
         ClientDef {
@@ -5076,7 +5066,8 @@ fn read_client(def: &ClientDef) -> DetectedClient {
         let app_present =
             !def.location.as_ref().is_some_and(|row| {
                 locations::is_t3_home(row) && !t3code::path_is_safe(&row.config_path)
-            }) && app_present_with_override(&config_path, config_exists, install_marker.as_deref());
+            }) && app_present_with_override(&config_path, config_exists, install_marker.as_deref())
+                && !data_folder_missing(def.id, &config_path);
         DetectedClient {
             id: def
                 .location
@@ -5470,7 +5461,8 @@ pub fn client_metadata() -> Vec<DetectedClient> {
                 location_removable: def.location.as_ref().is_some_and(|row| row.manual),
                 location_kept_by_t3_code: false,
                 discovery: def.discovery,
-                app_present: app_present_for(&config_path, config_exists),
+                app_present: app_present_for(&config_path, config_exists)
+                    && !data_folder_missing(def.id, &config_path),
                 config_path,
                 config_exists,
                 servers: Vec::new(),
@@ -16810,6 +16802,7 @@ command = "npx"
             "devin-cli",
             "command-code",
             "workbuddy",
+            "workbuddy-ai",
             "tabnine",
         ] {
             let d = defs()
