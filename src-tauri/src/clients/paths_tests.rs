@@ -1669,8 +1669,9 @@ fn workbuddy_disconnect_restores_a_blank_original_exactly() {
 }
 
 /// Detection checks the folder through the native path, so a home folder whose name
-/// is not valid UTF-8 still finds both builds in both scans.
-#[cfg(unix)]
+/// is not valid UTF-8 still finds both builds in both scans. macOS file systems refuse
+/// such names (EILSEQ), so the case cannot arise there.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn workbuddy_detection_checks_the_native_folder_path() {
     use std::os::unix::ffi::OsStrExt;
