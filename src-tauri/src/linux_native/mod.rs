@@ -7637,13 +7637,17 @@ fn security_review_lines(event: &serde_json::Value) -> Vec<String> {
                     .to_string(),
             );
         }
-        lines.push(match event["blocked"].as_bool() {
-            Some(true) => crate::i18n::tr("Blocked until you accept the changes."),
-            Some(false) => crate::i18n::tr("Not blocked."),
-            None => crate::i18n::tr(
-                "Blocking status unavailable. Review in Settings > Quarantined tools.",
-            ),
-        });
+        // A tool still being captured has nothing to accept yet; its capture
+        // line already says it stays blocked.
+        if event["pending_capture"] != true {
+            lines.push(match event["blocked"].as_bool() {
+                Some(true) => crate::i18n::tr("Blocked until you accept the changes."),
+                Some(false) => crate::i18n::tr("Not blocked."),
+                None => crate::i18n::tr(
+                    "Blocking status unavailable. Review in Settings > Quarantined tools.",
+                ),
+            });
+        }
     }
 
     if let Some(signatures) = event
@@ -21694,6 +21698,10 @@ mod tests {
         assert!(!security_review_lines(&held)
             .iter()
             .any(|line| line == capturing_line));
+        // Nothing to accept yet, so no line asks the user to accept it.
+        assert!(!security_review_lines(&other)
+            .iter()
+            .any(|line| line.contains("until you accept")));
     }
 
     #[test]

@@ -297,17 +297,19 @@ export function ToolChanges({
                                 )}
                               </p>
                             )}
-                        {!(history && event.blocked == null) && (
-                          <p>
-                            {event.blocked === true
-                              ? translate("Blocked until you accept the changes.")
-                              : event.blocked === false
-                                ? translate("Not blocked.")
-                                : translate(
-                                    "Blocking status unavailable. Review in Settings > Quarantined tools.",
-                                  )}
-                          </p>
-                        )}
+                        {/* A tool still being captured has nothing to accept yet. */}
+                        {!(history && event.blocked == null) &&
+                          !event.pending_capture && (
+                            <p>
+                              {event.blocked === true
+                                ? translate("Blocked until you accept the changes.")
+                                : event.blocked === false
+                                  ? translate("Not blocked.")
+                                  : translate(
+                                      "Blocking status unavailable. Review in Settings > Quarantined tools.",
+                                    )}
+                            </p>
+                          )}
                         {event.pending_capture && (
                           <p>
                             {translate(

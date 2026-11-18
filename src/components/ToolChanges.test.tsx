@@ -262,6 +262,8 @@ describe("server tool changes", () => {
     expect(screen.getAllByRole("button", { name: "Review in Settings" })).toHaveLength(2);
     expect(screen.getByText(capturing)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Accept/ })).not.toBeInTheDocument();
+    // Only the captured tool says it is blocked until accepted.
+    expect(screen.getAllByText("Blocked until you accept the changes.")).toHaveLength(1);
   });
   it("explains an unknown status before a block in a mixed group", () => {
     const event = securityFixture()[0];
