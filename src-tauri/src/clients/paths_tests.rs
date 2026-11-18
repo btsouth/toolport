@@ -1336,6 +1336,13 @@ fn workbuddy_manages_the_folder_its_build_uses() {
     // Both have one: the China build's default.
     std::fs::write(china.join("mcp.json"), "{}").unwrap();
     assert_eq!(resolve_workbuddy_dir(&home), china);
+    // The file holding Toolport's entry wins over every other rule.
+    std::fs::write(
+        international.join("mcp.json"),
+        r#"{"mcpServers": {"toolport": {"command": "toolport-gateway"}}}"#,
+    )
+    .unwrap();
+    assert_eq!(resolve_workbuddy_dir(&home), international);
     // Only the China build.
     std::fs::remove_dir_all(&international).unwrap();
     assert_eq!(resolve_workbuddy_dir(&home), china);
@@ -1419,4 +1426,58 @@ fn workbuddy_connects_one_file_and_disconnect_restores_its_bytes() {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
     assert!(!china.join("mcp.json").exists());
     drop(fixture);
+}
+
+/// Connect wrote WorkBuddy AI's file; the China build's `mcp.json` showing up later
+/// must not move the row, a second Connect or Disconnect over to it.
+#[test]
+fn workbuddy_stays_on_the_file_connect_wrote() {
+    let fixture = Fixture::new("workbuddy-flip");
+    let international = fixture.home.join(".workbuddy-ai").join("mcp.json");
+    std::fs::create_dir_all(international.parent().unwrap()).unwrap();
+    let original = "{\n  \"mcpServers\": {\"files\": {\"command\": \"npx\"}}\n}\n";
+    std::fs::write(&international, original).unwrap();
+    install_gateway("workbuddy", None).unwrap();
+
+    let china = fixture.home.join(".workbuddy").join("mcp.json");
+    std::fs::create_dir_all(china.parent().unwrap()).unwrap();
+    let china_bytes = "{\"mcpServers\":{}}";
+    std::fs::write(&china, china_bytes).unwrap();
+
+    let def = find_def("workbuddy").unwrap();
+    let row = read_client(&def);
+    assert_eq!(Path::new(&row.config_path), international);
+    assert!(row.gateway_installed);
+    install_gateway("workbuddy", None).unwrap();
+    assert_eq!(std::fs::read_to_string(&china).unwrap(), china_bytes);
+
+    uninstall_gateway("workbuddy").unwrap();
+    assert_eq!(std::fs::read_to_string(&international).unwrap(), original);
+    assert_eq!(std::fs::read_to_string(&china).unwrap(), china_bytes);
+}
+
+/// The data folder can go away after the Clients page found it: Connect then
+/// refuses and never creates it again.
+#[test]
+fn workbuddy_connect_never_recreates_its_folder() {
+    let fixture = Fixture::new("workbuddy-gone");
+    let folder = fixture.home.join(".workbuddy");
+    std::fs::create_dir_all(&folder).unwrap();
+    assert!(read_client(&find_def("workbuddy").unwrap()).app_present);
+
+    let removed = folder.clone();
+    mutation::BEFORE_COMMIT.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |_| {
+            std::fs::remove_dir_all(&removed).unwrap();
+        }));
+    });
+    let error = install_gateway("workbuddy", None).unwrap_err();
+    assert!(error.contains("WorkBuddy's folder is gone"), "{error}");
+    assert!(!folder.exists(), "the folder was created again");
+
+    // Gone before Connect started, too.
+    let error = install_gateway("workbuddy", None).unwrap_err();
+    assert!(error.contains("WorkBuddy's folder is gone"), "{error}");
+    assert!(!folder.exists());
+    assert!(!fixture.home.join(".workbuddy-ai").exists());
 }

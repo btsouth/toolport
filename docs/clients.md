@@ -355,9 +355,9 @@ manual setup. Toolport checks these before importing or migrating a ZCode config
 WorkBuddy keeps its MCP servers in `mcp.json` in its data folder: `~/.workbuddy`
 for WorkBuddy (the China build) and `~/.workbuddy-ai` for WorkBuddy AI (the
 international build), under `%USERPROFILE%` on Windows. Toolport manages one of
-them: the folder that exists, or, when both do, the one that already has an
-`mcp.json` (`~/.workbuddy` if both have one). The **Clients** view shows which
-file it uses. Connect adds one `toolport` entry and leaves the rest of the file
+them: the one it is connected to, else the folder that exists, or, when both do,
+the one that already has an `mcp.json` (`~/.workbuddy` if both have one). The
+**Clients** view shows which file it uses. Toolport never creates either folder. Connect adds one `toolport` entry and leaves the rest of the file
 as it was; restart WorkBuddy afterward. Per-project `.workbuddy/mcp.json` files
 are left alone. WorkBuddy is a separate product from CodeBuddy Code, which reads
 `~/.codebuddy/.mcp.json`.

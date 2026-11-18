@@ -2718,22 +2718,42 @@ fn workbuddy_path() -> Option<PathBuf> {
 /// WorkBuddy's data folder. Its `product.json` names it: `.workbuddy` for the China
 /// build (`com.tencent.workbuddy.mac`) and `.workbuddy-ai` for the international
 /// WorkBuddy AI build (`com.workbuddy.workbuddy-ai`), both directly under the home
-/// folder on every OS. Only one is managed: the folder that exists; when both do, the
-/// one that already has an `mcp.json`, and `.workbuddy` when that does not decide it.
+/// folder on every OS. Only one is managed: the one whose `mcp.json` holds Toolport's
+/// entry, so Disconnect and import stay on the file Connect wrote; otherwise the folder
+/// that exists; when both do, the one that already has an `mcp.json`, and `.workbuddy`
+/// when that does not decide it.
 fn resolve_workbuddy_dir(home: &Path) -> PathBuf {
     let [china, international] = [home.join(".workbuddy"), home.join(".workbuddy-ai")];
-    let prefer_international = match (china.is_dir(), international.is_dir()) {
+    let connected = |dir: &Path| {
+        read_config_file(&dir.join("mcp.json"))
+            .and_then(|text| parse_client_content(Format::JsonMcpServers, &text))
+            .is_ok_and(|servers| gateway_entry_for_client("workbuddy", &servers).is_some())
+    };
+    let prefer_international = match (connected(&china), connected(&international)) {
         (false, true) => true,
-        (true, true) => {
-            !china.join("mcp.json").is_file() && international.join("mcp.json").is_file()
-        }
-        _ => false,
+        (true, false) => false,
+        _ => match (china.is_dir(), international.is_dir()) {
+            (false, true) => true,
+            (true, true) => {
+                !china.join("mcp.json").is_file() && international.join("mcp.json").is_file()
+            }
+            _ => false,
+        },
     };
     if prefer_international {
         international
     } else {
         china
     }
+}
+
+/// WorkBuddy's data folder must still exist when a write commits: Toolport never
+/// creates it, even when it was removed after the Clients page found it.
+pub(super) fn require_client_folder(client_id: &str, path: &Path) -> Result<(), String> {
+    if client_id == "workbuddy" && !path.parent().is_some_and(Path::is_dir) {
+        return Err("WorkBuddy's folder is gone. Client config unchanged.".into());
+    }
+    Ok(())
 }
 
 fn amazon_q_dir(home: &Path) -> PathBuf {

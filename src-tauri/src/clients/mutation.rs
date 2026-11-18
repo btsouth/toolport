@@ -375,9 +375,11 @@ fn run_inner<T>(
                 pending.disconnecting,
                 jsonc_settings,
             )?;
-            let commit = super::locations::validate_mutation(client_id, path).and_then(|()| {
-                crate::registry::client_file::commit(path, &revision, output.as_deref())
-            });
+            let commit = super::locations::validate_mutation(client_id, path)
+                .and_then(|()| super::require_client_folder(client_id, path))
+                .and_then(|()| {
+                    crate::registry::client_file::commit(path, &revision, output.as_deref())
+                });
             if commit.is_err() {
                 recovery.rollback()?;
             }
