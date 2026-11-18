@@ -4,14 +4,23 @@ import { securityFixture } from "./security-fixture";
 import { applySkillState, skillsFixture } from "./skills-fixture";
 import { withParity } from "./parity-fixture";
 const fixtureLocations: import("@/lib/types").DetectedClient[] = [];
-// Clients Disconnect took the gateway out of, until Connect puts it back.
-const disconnectedClients = new Set<string>();
+// Clients Disconnect took the gateway out of ("absent") and Connect then put
+// back ("managed"). Clients never disconnected keep their seeded state.
+const reconnectedClients = new Map<string, "absent" | "managed">();
 const withDisconnects = <T extends object>(clients: T[]): T[] =>
-  clients.map((client) =>
-    disconnectedClients.has(String((client as { id?: unknown }).id))
-      ? { ...client, gatewayInstalled: false, entryState: "absent" }
-      : client,
-  );
+  clients.map((client) => {
+    const entryState = reconnectedClients.get(String((client as { id?: unknown }).id));
+    return entryState
+      ? { ...client, gatewayInstalled: entryState === "managed", entryState }
+      : client;
+  });
+// The access Connect chose, removed for the default as the native app does.
+const saveClientScope = (clientId: string, profile: unknown) => {
+  const scopes = { ...registry.clientScopes };
+  if (profile) scopes[clientId] = String(profile);
+  else delete scopes[clientId];
+  registry.clientScopes = scopes;
+};
 // Separate development entry. Never imported by the shipping application.
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { useState } from "react";
@@ -768,7 +777,6 @@ mockIPC(
           : [];
       case "migrate_client":
         if (setupVerifying) return new Promise(() => {});
-        disconnectedClients.delete(String(args.clientId));
         if (setupFailure && setupFailure !== "optional")
           throw new Error(
             setupFailure === "vault"
@@ -777,6 +785,10 @@ mockIPC(
                 ? "Calendar needs credentials. Open Credentials and retry. Client config unchanged."
                 : "Notes could not start. Check its command and retry. Client config unchanged.",
           );
+        // Only a migration that went through reconnects the client.
+        if (reconnectedClients.has(String(args.clientId)))
+          reconnectedClients.set(String(args.clientId), "managed");
+        saveClientScope(String(args.clientId), args.profile);
         setupConnected = true;
         fixtureAdd({
           id: "calendar",
@@ -970,7 +982,7 @@ mockIPC(
         return registry;
       case "uninstall_gateway": {
         const clientId = String(args.clientId);
-        disconnectedClients.add(clientId);
+        reconnectedClients.set(clientId, "absent");
         registry.clientScopes = Object.fromEntries(
           Object.entries(registry.clientScopes ?? {}).filter(([id]) => id !== clientId),
         );
@@ -980,11 +992,9 @@ mockIPC(
         };
       }
       case "install_gateway":
-        disconnectedClients.delete(String(args.clientId));
-        registry.clientScopes = {
-          ...registry.clientScopes,
-          [String(args.clientId)]: String(args.profile || ""),
-        };
+        if (reconnectedClients.has(String(args.clientId)))
+          reconnectedClients.set(String(args.clientId), "managed");
+        saveClientScope(String(args.clientId), args.profile);
         return registry;
       case "set_server_enabled": {
         const server = registry.servers.find((server) => server.id === args.serverId);

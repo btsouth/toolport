@@ -180,6 +180,23 @@ try {
   );
   await page.screenshot({ path: path.join(output, "client-disconnected.png") });
   expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
+  // Connect puts the gateway back with the access chosen for it.
+  await page.getByRole("combobox", { name: "Access", exact: true }).click();
+  await page.getByRole("option", { name: "Work", exact: true }).click();
+  await page.getByRole("button", { name: "Connect to Toolport", exact: true }).click();
+  const review = page.getByRole("dialog", { name: "Review and connect Codex" });
+  await review.getByRole("button", { name: "Connect to Toolport", exact: true }).click();
+  await page
+    .getByRole("dialog", { name: "Codex connected" })
+    .getByRole("button", { name: "Done", exact: true })
+    .click();
+  await expect(review).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Disconnect", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "Access", exact: true })).toHaveText(
+    "Work",
+  );
   // Back to the fixture's connected Codex for the steps below.
   await page.goto(`${baseURL}/fixtures/`);
   await page.getByRole("button", { name: "Settings", exact: true }).click();
