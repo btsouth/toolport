@@ -151,7 +151,9 @@ jobs:
         # by the Secret Service keychain backend; without them the Linux build
         # fails to compile. squashfs-tools is for the post-bundle AppImage patch
         # below (mksquashfs / unsquashfs); nothing in the build itself needs it.
-        run: scripts/ci-apt-install.sh libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev squashfs-tools
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev squashfs-tools
 
       - name: Add the macOS Rust target
         if: matrix.target
