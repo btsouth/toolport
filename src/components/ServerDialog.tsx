@@ -705,7 +705,11 @@ export function ServerDialog({
                     'Paste a config snippet from any client:\n\n• Claude Code: claude mcp add ... / claude mcp add-json ...\n• Cursor/Devin/Antigravity: {"mcpServers": ...}\n• VS Code: {"servers": ...}\n• Codex: [mcp_servers.name]\n• Zed: {"context_servers": ...}',
                   )}
                   value={pasteText}
-                  onChange={(e) => setPasteText(e.target.value)}
+                  onChange={(e) => {
+                    setPasteText(e.target.value);
+                    // A refused paste is stale once the snippet changes, as in GTK.
+                    setFooterError("");
+                  }}
                 />
                 <Button
                   variant="secondary"
@@ -1030,7 +1034,7 @@ export function ServerDialog({
                     })}
                     className="rounded border bg-background p-1 text-xs"
                     value={row.source ? "reference" : "paste"}
-                    onChange={(e) =>
+                    onChange={(e) => {
                       setEnvRows((rows) =>
                         rows.map((r, j) =>
                           j === i
@@ -1044,8 +1048,9 @@ export function ServerDialog({
                               }
                             : r,
                         ),
-                      )
-                    }
+                      );
+                      clearTest();
+                    }}
                   >
                     <option value="paste">{t("Paste a key")}</option>
                     <option value="reference">{t("From a password manager")}</option>
@@ -1055,11 +1060,12 @@ export function ServerDialog({
                   <SecretReferenceField
                     serverId={currentEditId ?? ""}
                     value={row.source.ref}
-                    onChange={(ref) =>
+                    onChange={(ref) => {
                       setEnvRows((rows) =>
                         rows.map((r, j) => (j === i ? { ...r, source: { ref } } : r)),
-                      )
-                    }
+                      );
+                      clearTest();
+                    }}
                   />
                 ) : (
                   <Input
@@ -1080,7 +1086,7 @@ export function ServerDialog({
                       value1: row.key || "variable",
                     })}
                     checked={row.secret !== false}
-                    onChange={(e) =>
+                    onChange={(e) => {
                       setEnvRows((rows) =>
                         rows.map((r, j) =>
                           j === i
@@ -1091,8 +1097,9 @@ export function ServerDialog({
                               }
                             : r,
                         ),
-                      )
-                    }
+                      );
+                      clearTest();
+                    }}
                   />
                   {t("Keychain")}
                 </label>
@@ -1111,13 +1118,14 @@ export function ServerDialog({
                       type="checkbox"
                       disabled={riskySyncEnv(row.key)}
                       checked={envRowSyncs(row, editing ? (initial?.env ?? []) : [])}
-                      onChange={(e) =>
+                      onChange={(e) => {
                         setEnvRows((rows) =>
                           rows.map((r, j) =>
                             j === i ? { ...r, portable: e.target.checked } : r,
                           ),
-                        )
-                      }
+                        );
+                        clearTest();
+                      }}
                     />{" "}
                     {t("Same on every machine")}
                   </label>

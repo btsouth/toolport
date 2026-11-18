@@ -643,6 +643,42 @@ describe("ServerDialog", () => {
     expect(screen.queryByText("Add MCP server")).not.toBeInTheDocument();
   });
 
+  it("clears a failed save when the variable's key source or keychain choice changes", async () => {
+    const user = userEvent.setup();
+    render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    await fillServer(user, "npx");
+    await user.click(screen.getByRole("button", { name: "Add variable" }));
+    await user.type(screen.getByPlaceholderText("ENV_NAME"), "KEY_A");
+    await user.type(screen.getByPlaceholderText("value"), "secret");
+    const failed = "Couldn't save demo: Keychain unavailable.";
+    const fail = async () => {
+      api.addServerWithRows.mockRejectedValueOnce("Keychain unavailable.");
+      await user.click(screen.getByRole("button", { name: "Add" }));
+      await expectFooterError(failed);
+    };
+
+    await fail();
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Key source for KEY_A" }),
+      "reference",
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    await fail();
+    await user.type(screen.getByRole("textbox", { name: "Secret reference" }), "x");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    await fail();
+    await user.click(screen.getByRole("checkbox", { name: "Keep KEY_A in keychain" }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    await user.type(screen.getByPlaceholderText("value"), "plain");
+    await fail();
+    await user.click(screen.getByRole("checkbox", { name: "Same on every machine" }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("names the keys a new server was saved without", async () => {
     api.addServerWithRows.mockResolvedValueOnce(
       rowsResult(savedRegistry("demo"), ["KEY_B"]),
@@ -913,6 +949,22 @@ describe("ServerDialog", () => {
 
     await expectFooterError(message);
     expect(screen.getByRole("button", { name: "Add" })).toBeVisible();
+  });
+
+  it("clears a refused paste when the snippet changes", async () => {
+    const message = "Write each -e value as KEY=value.";
+    api.parseServerSnippet.mockRejectedValueOnce(message);
+    const user = userEvent.setup();
+    render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    await user.click(screen.getByRole("button", { name: "Paste from client config" }));
+    const snippet = screen.getByPlaceholderText(/claude mcp add \.\.\. \//);
+    await user.type(snippet, "bad");
+    await user.click(screen.getByRole("button", { name: "Parse & fill" }));
+    await expectFooterError(message);
+
+    await user.type(snippet, "x");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("says in the footer when a paste holds no servers", async () => {
