@@ -40,6 +40,9 @@ runs:
           ${{ steps.key.outputs.image }}-
           ${{ steps.key.outputs.os }}
 
+    # The manifest is the sorted sha256 of every cached deb. It decides whether
+    # to save and names the saved cache, so a deb repaired under the same
+    # filename still counts as a change.
     - name: Record the restored downloads
       shell: bash
       env:
@@ -47,7 +50,7 @@ runs:
       run: |
         set -euo pipefail
         mkdir -p "$DIR"
-        find "$DIR" -type f -name '*.deb' -printf '%P\n' | sort >"${RUNNER_TEMP}/apt-debs-before"
+        (cd "$DIR" && find . -maxdepth 1 -type f -name '*.deb' -print0 | sort -z | xargs -0 -r sha256sum) >"${RUNNER_TEMP}/apt-debs-before"
         echo "restored $(wc -l <"${RUNNER_TEMP}/apt-debs-before") cached debs"
 
     - name: Install packages
@@ -61,8 +64,8 @@ runs:
         "${GITHUB_ACTION_PATH}/../../../scripts/ci-apt-install.sh" $PACKAGES
 
     # Runs after a failed install too, so the debs a throttled run did fetch are
-    # kept and the next run resumes from them. Skipped when nothing new arrived,
-    # which keeps a warm cache from writing a copy of itself every run.
+    # kept and the next run resumes from them. Skipped when the manifest matches
+    # what was restored, which keeps a warm cache from writing a copy of itself.
     - name: Check for new downloads
       id: new
       if: always()
@@ -73,13 +76,13 @@ runs:
       run: |
         set -euo pipefail
         [ -d "$DIR" ] || exit 0
-        find "$DIR" -type f -name '*.deb' -printf '%P\n' | sort >"${RUNNER_TEMP}/apt-debs-after"
-        fresh=$(comm -13 "${RUNNER_TEMP}/apt-debs-before" "${RUNNER_TEMP}/apt-debs-after" | wc -l)
-        partial=$(find "$DIR/partial" -type f -size +0 2>/dev/null | wc -l)
-        echo "${fresh} new debs and ${partial} partial downloads to keep"
-        if [ "$fresh" -gt 0 ] || [ "$partial" -gt 0 ]; then
-          content=$(find "$DIR" -type f -printf '%P %s\n' | sort | sha256sum | cut -c1-16)
-          echo "key=${PREFIX}-${content}" >>"$GITHUB_OUTPUT"
+        after="${RUNNER_TEMP}/apt-debs-after"
+        (cd "$DIR" && find . -maxdepth 1 -type f -name '*.deb' -print0 | sort -z | xargs -0 -r sha256sum) >"$after"
+        if cmp -s "${RUNNER_TEMP}/apt-debs-before" "$after"; then
+          echo "cache unchanged ($(wc -l <"$after") debs); not saving"
+        else
+          echo "cache changed ($(wc -l <"$after") debs); saving"
+          echo "key=${PREFIX}-$(sha256sum <"$after" | cut -c1-16)" >>"$GITHUB_OUTPUT"
         fi
 
     - name: Save apt downloads

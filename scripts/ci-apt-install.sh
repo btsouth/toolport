@@ -95,8 +95,13 @@ archives=/var/cache/apt/archives
 # for the package, version and architecture its filename names. apt looks debs
 # up by filename and checks only their size, so the filename is what has to
 # match. Anything else (an old version, another package set, a corrupt file) is
-# left out, which also prunes the cache when it is saved again. Partial
-# downloads go back too: apt resumes them and hashes the finished file.
+# left out, which also prunes the cache when it is saved again.
+#
+# Partial downloads are never carried across runs. A copied partial gets a new
+# mtime, apt sends that as If-Range, and the mirror answers with the whole file
+# from byte zero, so it bought nothing and left junk in the cache. Inside one
+# run apt still resumes its partials across the bounded attempts below, because
+# /var/cache/apt/archives/partial stays put.
 seed_deb_cache() {
   local deb name pkg ver arch sum records seeded=0 skipped=0
   for deb in "$deb_cache"/*.deb; do
@@ -115,28 +120,34 @@ seed_deb_cache() {
       skipped=$((skipped + 1))
     fi
   done
-  if [ -d "$deb_cache/partial" ]; then
-    sudo cp -r "$deb_cache/partial/." "$archives/partial/" || true
-  fi
   echo "deb cache: ${seeded} debs reused, ${skipped} not in the current index"
 }
 
-# Copy what apt holds back into the cache directory, on every exit, so a run the
-# mirror defeated still leaves its progress for the next one. Rebuilt rather
-# than merged, so stale debs dropped by the seed step do not come back.
+# Copy the complete debs apt holds back into the cache directory, on every exit,
+# so a run the mirror defeated still leaves its progress for the next one. Every
+# deb there passed a SHA256 check against the index: the seed step's, or apt's
+# own before it moves a download out of partial/. Rebuilt rather than merged, so
+# stale debs dropped by the seed step do not come back.
 save_deb_cache() {
   [ -n "$deb_cache" ] || return 0
   rm -rf "$deb_cache"
-  mkdir -p "$deb_cache/partial"
+  mkdir -p "$deb_cache"
   sudo find "$archives" -maxdepth 1 -name '*.deb' -exec cp -t "$deb_cache/" {} + || true
-  sudo find "$archives/partial" -maxdepth 1 -type f -size +0 -exec cp -t "$deb_cache/partial/" {} + || true
   sudo chown -R "$(id -u):$(id -g)" "$deb_cache" || true
   echo "deb cache: kept $(find "$deb_cache" -maxdepth 1 -name '*.deb' | wc -l) debs"
 }
 
+# Saving is best effort and must not change the result: keep the status the
+# script was exiting with, success or failure.
+save_deb_cache_on_exit() {
+  local status=$?
+  save_deb_cache || echo "deb cache: could not save" >&2
+  exit "$status"
+}
+
 if [ -n "$deb_cache" ]; then
   mkdir -p "$deb_cache"
-  trap save_deb_cache EXIT
+  trap save_deb_cache_on_exit EXIT
 fi
 
 run_apt() {
