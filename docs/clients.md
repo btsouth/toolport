@@ -358,7 +358,8 @@ WorkBuddy (the China build) keeps its MCP servers in `~/.workbuddy/mcp.json`, an
 WorkBuddy AI (the international build) in `~/.workbuddy-ai/mcp.json`, under
 `%USERPROFILE%` on Windows. Each is found only when its own folder exists, and
 each Connect and Disconnect touches only its own file. Connect adds one `toolport`
-entry and leaves the rest of the file as it was; restart the app afterward.
+entry and keeps your other server definitions and settings; restart the app
+afterward. Disconnect puts the file back byte for byte.
 Toolport never creates either folder. Per-project `.workbuddy/mcp.json` files are
 left alone. WorkBuddy is a separate product from CodeBuddy Code, which reads
 `~/.codebuddy/.mcp.json`.

@@ -1543,3 +1543,96 @@ fn workbuddy_disconnect_succeeds_once_its_folder_is_gone() {
         }
     }
 }
+
+/// A stray file with a build's folder name: the full scan and the quick inventory
+/// agree that there is no install and no config, with no error.
+#[test]
+fn a_file_named_like_a_workbuddy_folder_is_no_install_in_either_scan() {
+    let fixture = Fixture::new("workbuddy-file");
+    for (id, own) in [
+        ("workbuddy", ".workbuddy"),
+        ("workbuddy-ai", ".workbuddy-ai"),
+    ] {
+        std::fs::write(fixture.home.join(own), "not a folder").unwrap();
+        let full = read_client(&find_def(id).unwrap());
+        assert!(!full.app_present && !full.config_exists, "{id} full scan");
+        assert_eq!(full.error, None, "{id}");
+        let quick = client_metadata()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(
+            (quick.app_present, quick.config_exists),
+            (full.app_present, full.config_exists),
+            "{id}: both scans agree"
+        );
+    }
+}
+
+/// Servers moved into the gateway are owed back. With the folder gone, Disconnect
+/// refuses and keeps the move record and recovery copies; once the folder is back,
+/// a retry puts the original file back.
+#[test]
+fn workbuddy_disconnect_keeps_moved_servers_until_the_folder_is_back() {
+    for (id, own, message) in [
+        ("workbuddy", ".workbuddy", "WorkBuddy's folder is gone"),
+        (
+            "workbuddy-ai",
+            ".workbuddy-ai",
+            "WorkBuddy AI's folder is gone",
+        ),
+    ] {
+        let fixture = Fixture::new("workbuddy-moved");
+        let folder = fixture.home.join(own);
+        let file = folder.join("mcp.json");
+        std::fs::create_dir_all(&folder).unwrap();
+        let original = "{\n  \"mcpServers\": {\"files\": {\"command\": \"npx\", \"args\": [\"files-mcp\"]}}\n}\n";
+        std::fs::write(&file, original).unwrap();
+        let revision = setup_revision(id).unwrap();
+        migrate_reviewed(id, None, &["files".to_string()], &revision, || Ok(())).unwrap();
+        let moved_in = read(&file);
+        assert!(moved_in["mcpServers"].get("files").is_none(), "{moved_in}");
+        assert!(moved::matches_path(id, &file).unwrap());
+        let copies = restore::recovery_copies(id, &file).unwrap();
+
+        let away = fixture.home.join(format!("{own}-trash"));
+        std::fs::rename(&folder, &away).unwrap();
+        let error = uninstall_gateway(id).unwrap_err();
+        assert!(error.contains(message), "{id}: {error}");
+        assert!(!folder.exists(), "{id}");
+        assert!(
+            moved::matches_path(id, &file).unwrap(),
+            "{id}: move record kept"
+        );
+        assert_eq!(restore::recovery_copies(id, &file).unwrap(), copies, "{id}");
+
+        std::fs::rename(&away, &folder).unwrap();
+        let outcome = uninstall_gateway(id).unwrap();
+        finish_uninstall(id, &outcome).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original, "{id}");
+        drop(fixture);
+    }
+}
+
+/// The registry update fails after Disconnect, with the folder removed meanwhile:
+/// the rollback reports it instead of creating the folder again.
+#[test]
+fn workbuddy_disconnect_rollback_never_creates_its_folder() {
+    for (id, own) in [
+        ("workbuddy", ".workbuddy"),
+        ("workbuddy-ai", ".workbuddy-ai"),
+    ] {
+        let fixture = Fixture::new("workbuddy-rollback");
+        let folder = fixture.home.join(own);
+        std::fs::create_dir_all(&folder).unwrap();
+        crate::registry_controller::connect_client_stdio(id, None, false).unwrap();
+        let removed = folder.clone();
+        let result = crate::registry_controller::disconnect_client_stdio_with(id, false, |_| {
+            std::fs::remove_dir_all(&removed).unwrap();
+            Err("registry write failed".into())
+        });
+        assert!(result.is_err(), "{id}");
+        assert!(!folder.exists(), "{id}: rollback created the folder");
+        drop(fixture);
+    }
+}

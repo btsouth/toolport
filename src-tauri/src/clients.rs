@@ -2724,6 +2724,14 @@ pub(crate) fn folder_gone_message(client_id: &str) -> Option<&'static str> {
     }
 }
 
+/// [`folder_gone_message`] for the client whose fixed config file is `path`.
+pub(crate) fn folder_gone_message_for_path(path: &Path) -> Option<&'static str> {
+    ["workbuddy", "workbuddy-ai"]
+        .into_iter()
+        .find(|id| client_config_path(id).is_some_and(|own| own == path))
+        .and_then(folder_gone_message)
+}
+
 /// A client from [`folder_gone_message`] is installed only when its data folder is a
 /// real folder; a stray file with that name is not an install.
 fn data_folder_missing(client_id: &str, config_path: &str) -> bool {
@@ -5140,6 +5148,18 @@ fn read_client(def: &ClientDef) -> DetectedClient {
                 Some(error),
             ),
         };
+    }
+
+    // A client from `folder_gone_message` is there only when its data folder is a real
+    // folder: a missing folder, or a stray file with its name, is no install and no config.
+    if folder_gone_message(def.id).is_some() && mutation::read(&path).is_none() {
+        match path.parent().map(std::fs::metadata) {
+            Some(Ok(meta)) if !meta.is_dir() => return build(config_path, false, Vec::new(), None),
+            Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return build(config_path, false, Vec::new(), None)
+            }
+            _ => {}
+        }
     }
 
     if mutation::read(&path).is_none() {
