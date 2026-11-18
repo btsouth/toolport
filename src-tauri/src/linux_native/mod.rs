@@ -19977,21 +19977,24 @@ mod tests {
             }
         }
 
-        // Match React: Connect remains available so the shared backend can
-        // explain a config error rather than leaving an inert client row.
+        // A config Toolport cannot read safely is not connectable (#1249):
+        // the row says why, with React's row wording, and Connect is shown but
+        // off, as React turns off Connect to Toolport for it.
         client.gateway_state = state::ClientGatewayState::Disconnected;
         client.config_error = true;
         {
             let row = client_row(&client, page.clone(), RowStyle::Line);
-            let (_, _, controls) = parts(&row, true);
+            let (_, detail, controls) = parts(&row, true);
+            assert_eq!(detail.text(), "Configuration could not be read safely");
+            let controls = controls.expect("Connect stays in view");
+            assert!(!controls.is_sensitive());
             let button = controls
-                .unwrap()
                 .first_child()
                 .unwrap()
                 .downcast::<gtk::Button>()
                 .unwrap();
             assert_eq!(button.label().as_deref(), Some("Connect"));
-            assert!(button.is_sensitive());
+            assert!(!button.is_sensitive());
         }
         client.config_error = false;
 
@@ -20020,7 +20023,10 @@ mod tests {
             .downcast::<gtk::Label>()
             .unwrap();
         assert_eq!(account.text(), "me@home.example");
-        assert_eq!(detail.text(), "~/.claude2");
+        // Since #1342 a profile row also counts its local servers (pinned by
+        // client_rows::caption_tests); React shows the folder alone, which
+        // the planned Clients rows PR (39) settles for both shells.
+        assert_eq!(detail.text(), "~/.claude2 · 2 local MCP servers");
         // Narrower than the name and its chips: the chips wrap to a second line and the
         // name keeps its full width instead of being squeezed.
         let (_, name_width, _, _) = command.measure(gtk::Orientation::Horizontal, -1);
@@ -20060,7 +20066,8 @@ mod tests {
             .unwrap();
         assert_eq!(command.text(), "codex-work");
         assert!(command.next_sibling().is_none());
-        assert_eq!(detail.text(), "~/Codex-Work/.codex");
+        // With its local servers, as the Claude profile row above (#1342).
+        assert_eq!(detail.text(), "~/Codex-Work/.codex · 2 local MCP servers");
         let mut main = client.clone();
         main.id = "codex".into();
         main.name = "Codex".into();
