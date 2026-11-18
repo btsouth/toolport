@@ -329,6 +329,9 @@ if (memberReviewFixture) {
   } as NonNullable<Registry["team"]>;
 }
 
+const fixtureSafety = new URLSearchParams(location.search).get("safety");
+if (fixtureSafety === "off" || fixtureSafety === "ask" || fixtureSafety === "strict")
+  registry.safetyLevel = fixtureSafety;
 const driftFixture = new URLSearchParams(location.search).has("tool-changes");
 const profileDriftFixture = new URLSearchParams(location.search).has("profile-drift");
 const driftEvents = profileDriftFixture

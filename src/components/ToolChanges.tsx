@@ -90,16 +90,19 @@ function toolName(event: SecurityEvent) {
   return name.charAt(0).toUpperCase() + name.slice(1);
 }
 
+/** `history` renders records only: no status, accept or review actions. */
 export function ToolChanges({
   events,
   registry,
   onAccept,
   onReview,
+  history = false,
 }: {
   events: SecurityEvent[];
   registry: Registry | null;
   onAccept: (events: SecurityEvent[]) => void;
   onReview?: () => void;
+  history?: boolean;
 }) {
   const { t } = useI18n();
   const groups = useMemo(() => groupToolChanges(events), [events]);
@@ -128,10 +131,12 @@ export function ToolChanges({
       aria-label={t("Tool changes")}
       className="mb-4 rounded-lg border border-border bg-muted/20 p-4"
     >
-      <h3 className="mb-3 flex items-center gap-2 text-sm font-medium">
-        <ShieldCheck className="size-4 text-muted-foreground" />
-        {t("Tool changes")}
-      </h3>
+      {!history && (
+        <h3 className="mb-3 flex items-center gap-2 text-sm font-medium">
+          <ShieldCheck className="size-4 text-muted-foreground" />
+          {t("Tool changes")}
+        </h3>
+      )}
       <div className="space-y-3">
         {groups.map((group) => {
           const blocked = group.tools.filter((tool) => tool.blocked === true).length;
@@ -181,46 +186,48 @@ export function ToolChanges({
                   {ago(group.ts)}
                 </span>
               </button>
-              <div className="mt-2 flex flex-wrap items-center gap-2 text-meta">
-                <p className={blocked ? "text-destructive" : "text-muted-foreground"}>
-                  {reviewRequired
-                    ? translate(
-                        "Review the captured definition in Settings before accepting it.",
-                      )
-                    : blocked
+              {!history && (
+                <div className="mt-2 flex flex-wrap items-center gap-2 text-meta">
+                  <p className={blocked ? "text-destructive" : "text-muted-foreground"}>
+                    {reviewRequired
                       ? translate(
-                          blocked === 1
-                            ? msg(
-                                "{count} tool is blocked. Review the changes or accept them.",
-                              )
-                            : msg(
-                                "{count} tools are blocked. Review the changes or accept them.",
-                              ),
-                          { count: blocked },
+                          "Review the captured definition in Settings before accepting it.",
                         )
-                      : unknown
+                      : blocked
                         ? translate(
-                            "Blocking status unavailable. Review in Settings > Quarantined tools.",
+                            blocked === 1
+                              ? msg(
+                                  "{count} tool is blocked. Review the changes or accept them.",
+                                )
+                              : msg(
+                                  "{count} tools are blocked. Review the changes or accept them.",
+                                ),
+                            { count: blocked },
                           )
-                        : translate("Not blocked. Review the changes or accept them.")}
-                </p>
-                {reviewRequired && (
+                        : unknown
+                          ? translate(
+                              "Blocking status unavailable. Review in Settings > Quarantined tools.",
+                            )
+                          : translate("Not blocked. Review the changes or accept them.")}
+                  </p>
+                  {reviewRequired && (
+                    <button
+                      onClick={onReview}
+                      className="rounded border border-border px-2 py-1 text-foreground"
+                    >
+                      {translate("Review in Settings")}
+                    </button>
+                  )}
                   <button
-                    onClick={onReview}
-                    className="rounded border border-border px-2 py-1 text-foreground"
+                    disabled={busy || !canAccept}
+                    onClick={() => void accept(group.tools)}
+                    className="ml-auto rounded border border-border px-2 py-1 text-foreground disabled:opacity-50"
                   >
-                    {translate("Review in Settings")}
+                    {translate("Accept all for this server")}
                   </button>
-                )}
-                <button
-                  disabled={busy || !canAccept}
-                  onClick={() => void accept(group.tools)}
-                  className="ml-auto rounded border border-border px-2 py-1 text-foreground disabled:opacity-50"
-                >
-                  {translate("Accept all for this server")}
-                </button>
-              </div>
-              {group.tools.some((tool) => tool.signatures !== undefined) && (
+                </div>
+              )}
+              {!history && group.tools.some((tool) => tool.signatures !== undefined) && (
                 <p className="mt-2 text-meta text-destructive">
                   {translate(
                     "Suspicious content found. Review and accept each tool separately.",
@@ -273,15 +280,17 @@ export function ToolChanges({
                                 )}
                               </p>
                             )}
-                        <p>
-                          {event.blocked === true
-                            ? translate("Blocked until you accept the changes.")
-                            : event.blocked === false
-                              ? translate("Not blocked.")
-                              : translate(
-                                  "Blocking status unavailable. Review in Settings > Quarantined tools.",
-                                )}
-                        </p>
+                        {!(history && event.blocked == null) && (
+                          <p>
+                            {event.blocked === true
+                              ? translate("Blocked until you accept the changes.")
+                              : event.blocked === false
+                                ? translate("Not blocked.")
+                                : translate(
+                                    "Blocking status unavailable. Review in Settings > Quarantined tools.",
+                                  )}
+                          </p>
+                        )}
                         {event.signatures !== undefined && (
                           <p className="text-destructive">
                             {translate(
@@ -294,7 +303,7 @@ export function ToolChanges({
                             )}
                           </p>
                         )}
-                        {event.review_required ? (
+                        {history ? null : event.review_required ? (
                           <button
                             onClick={onReview}
                             className="mt-1 rounded border border-border px-2 py-1 text-foreground"

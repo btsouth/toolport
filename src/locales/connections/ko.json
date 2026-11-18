@@ -1134,5 +1134,6 @@
   "Connected {connected} of {total} T3 Code instances.": "T3 Code 인스턴스 {total}개 중 {connected}개를 연결했습니다.",
   "Not connected: {names}.": "연결되지 않음: {names}.",
   "Skip": "건너뛰기",
-  "No servers moved, so your agent has no new tools.": "옮겨진 서버가 없어 에이전트에 새 도구가 없습니다."
+  "No servers moved, so your agent has no new tools.": "옮겨진 서버가 없어 에이전트에 새 도구가 없습니다.",
+  "{value0} tool-change records": "도구 변경 기록 {value0}개"
 }

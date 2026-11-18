@@ -5118,6 +5118,13 @@ pub struct ToolChangeGroup {
     pub tools: Vec<Value>,
 }
 
+/// Whether a tool change asks the user to review or accept it. With reviews off
+/// (`Registry::tool_change_reviews_enabled`) only a change that was actually
+/// blocked asks; the rest stay as plain history.
+pub fn tool_change_asks_review(event: &Value, reviews_enabled: bool) -> bool {
+    reviews_enabled || event["blocked"] == true
+}
+
 /// One server refresh is one event, even when it changed hundreds of definitions.
 /// Keep updates more than a minute apart separate, and retain distinct changes to each tool.
 pub fn group_tool_changes(events: &[Value]) -> Vec<ToolChangeGroup> {

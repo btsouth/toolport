@@ -3,7 +3,7 @@ import { render, screen, act, fireEvent, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ActivityView } from "./ActivityView";
 import { setLanguage } from "@/lib/i18n";
-import type { AuditEntry, SearchTrace } from "@/lib/types";
+import type { AuditEntry, Registry, SearchTrace } from "@/lib/types";
 import type { SecurityEvent } from "@/lib/api";
 
 let windowVisible = true;
@@ -1245,6 +1245,58 @@ describe("ActivityView security drift dismissals", () => {
     expect(screen.getAllByRole("button", { name: /srv: 1 tool changed/ })).toHaveLength(
       2,
     );
+  });
+
+  it("keeps unblocked tool changes as history when Safety is effectively Off", async () => {
+    localStorage.clear();
+    const registry = (over: Partial<Registry>) =>
+      ({ version: 3, servers: [], ...over }) as unknown as Registry;
+    const change = (tool: string, blocked: boolean, historical = false) => ({
+      ...warnEvent(1_700_000_000_000),
+      tool: `srv__${tool}`,
+      new_fp: `v2:${tool}`,
+      blocked,
+      ...(blocked ? { blocked_profiles: ["work"] } : {}),
+      ...(historical ? { historical: true } : {}),
+    });
+    const unblocked = [change("read", false), change("list", false, true)];
+    const shown = async (reg: Registry, events: SecurityEvent[]) => {
+      getSecurityEvents.mockResolvedValue(events);
+      const view = render(<ActivityView refreshKey={0} registry={reg} />);
+      await act(async () => {});
+      const text = view.container.textContent ?? "";
+      const accept = screen.queryAllByRole("button", {
+        name: "Accept all for this server",
+      }).length;
+      view.unmount();
+      return { text, accept };
+    };
+
+    const off = await shown(registry({ safetyLevel: "off" }), unblocked);
+    expect(off.accept).toBe(0);
+    expect(off.text).not.toContain("Review the changes or accept them");
+    expect(off.text).not.toContain("Open history to review them");
+    expect(off.text).toContain("2 tool-change records");
+
+    const blocked = await shown(registry({ safetyLevel: "off" }), [
+      ...unblocked,
+      change("delete", true),
+    ]);
+    expect(blocked.accept).toBe(1);
+    expect(blocked.text).toContain("1 tool is blocked");
+    expect(blocked.text).toContain("2 tool-change records");
+
+    for (const reg of [
+      registry({ safetyLevel: "ask" }),
+      registry({ safetyLevel: "off", teamMinSafetyLevel: "ask" }),
+      registry({ safetyLevel: "off", teamForcedQuarantineOnDrift: true }),
+      registry({ safetyLevel: "off", keptV1Safety: { quarantineOnDrift: true } }),
+    ]) {
+      const ask = await shown(reg, unblocked);
+      expect(ask.text).toContain("Not blocked. Review the changes or accept them.");
+      expect(ask.text).toContain("1 older tool-change records");
+      expect(ask.text).not.toContain("2 tool-change records");
+    }
   });
 });
 

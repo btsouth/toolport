@@ -1134,5 +1134,6 @@
   "Connected {connected} of {total} T3 Code instances.": "已連線 {connected}/{total} 個 T3 Code 執行個體。",
   "Not connected: {names}.": "未連線：{names}。",
   "Skip": "略過",
-  "No servers moved, so your agent has no new tools.": "沒有移動任何伺服器，因此你的智慧體沒有新工具。"
+  "No servers moved, so your agent has no new tools.": "沒有移動任何伺服器，因此你的智慧體沒有新工具。",
+  "{value0} tool-change records": "{value0} 條工具變更記錄"
 }

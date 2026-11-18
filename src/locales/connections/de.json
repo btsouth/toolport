@@ -1134,5 +1134,6 @@
   "Connected {connected} of {total} T3 Code instances.": "{connected} von {total} T3 Code-Instanzen verbunden.",
   "Not connected: {names}.": "Nicht verbunden: {names}.",
   "Skip": "Überspringen",
-  "No servers moved, so your agent has no new tools.": "Es wurden keine Server verschoben, daher hat Ihr Agent keine neuen Tools."
+  "No servers moved, so your agent has no new tools.": "Es wurden keine Server verschoben, daher hat Ihr Agent keine neuen Tools.",
+  "{value0} tool-change records": "{value0} Tool-Änderungsprotokolle"
 }

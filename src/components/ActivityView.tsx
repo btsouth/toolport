@@ -7,6 +7,7 @@ import {
   selectSecurityEvents,
 } from "@/lib/securityReview";
 import { ToolChanges } from "./ToolChanges";
+import { toolChangeAsksReview, toolChangeReviewsEnabled } from "@/lib/safety";
 import { activityClientSegments, clientIdentityTooltip } from "@/lib/clientIdentity";
 import { hostedClientName } from "@/lib/hostAttribution";
 import { HostThreadChip } from "@/components/HostThreadChip";
@@ -2136,13 +2137,34 @@ export function ActivityView({
     e.type !== "tool_poison_flag" &&
     e.type !== "result_injection" &&
     e.type !== "result_injection_blocked";
+  // With nothing able to block, unblocked tool changes are plain history.
+  const reviewsEnabled = toolChangeReviewsEnabled(registry);
   const toolChanges = useMemo(
-    () => liveSecurity.filter((e) => e.type === "tool_drift" && !e.historical),
-    [liveSecurity],
+    () =>
+      liveSecurity.filter(
+        (e) =>
+          e.type === "tool_drift" &&
+          !e.historical &&
+          toolChangeAsksReview(e, reviewsEnabled),
+      ),
+    [liveSecurity, reviewsEnabled],
   );
   const olderToolChanges = useMemo(
-    () => liveSecurity.filter((e) => e.type === "tool_drift" && e.historical),
-    [liveSecurity],
+    () =>
+      liveSecurity.filter(
+        (e) =>
+          e.type === "tool_drift" &&
+          e.historical &&
+          toolChangeAsksReview(e, reviewsEnabled),
+      ),
+    [liveSecurity, reviewsEnabled],
+  );
+  const recordedToolChanges = useMemo(
+    () =>
+      liveSecurity.filter(
+        (e) => e.type === "tool_drift" && !toolChangeAsksReview(e, reviewsEnabled),
+      ),
+    [liveSecurity, reviewsEnabled],
   );
   const highSecurity = liveSecurity.filter(
     (e) => e.type !== "tool_drift" && eventSeverity(e) === "high" && !isNewTool(e),
@@ -2190,6 +2212,19 @@ export function ActivityView({
             registry={registry}
             onAccept={dismissAllSecurity}
             onReview={onReviewQuarantine}
+          />
+        </details>
+      ) : null}
+      {recordedToolChanges.length > 0 ? (
+        <details className="mb-4 rounded-lg border border-border p-4">
+          <summary className="cursor-pointer text-sm">
+            {tr("{value0} tool-change records", { value0: recordedToolChanges.length })}
+          </summary>
+          <ToolChanges
+            events={recordedToolChanges}
+            registry={registry}
+            onAccept={dismissAllSecurity}
+            history
           />
         </details>
       ) : null}

@@ -2741,6 +2741,16 @@ impl Registry {
             || self.team_forced_block_on_injection
             || self.kept().block_on_injection
     }
+    /// Whether Activity asks the user to review or accept tool changes. Only when
+    /// nothing can be blocked (effective level Off, no kept or team-forced
+    /// quarantine or injection block) are changes shown as plain history. A change
+    /// that was actually blocked still asks, whatever this returns. The React shell
+    /// keeps the same rule in `src/lib/safety.ts`.
+    pub fn tool_change_reviews_enabled(&self) -> bool {
+        self.safety_level_effective() != SafetyLevel::Off
+            || self.quarantine_on_drift_effective()
+            || self.block_on_injection_effective()
+    }
     /// Whether this server should fail closed on a high-confidence injection hit:
     /// block mode effective, and the server is not on the exempt list.
     pub fn should_block_injection_for(&self, server: &str) -> bool {
@@ -9237,6 +9247,60 @@ mod safety_level_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tool_change_reviews_stop_only_when_nothing_can_block() {
+        let off = || {
+            let mut r = Registry::default();
+            r.set_safety_level(SafetyLevel::Off);
+            r
+        };
+        assert!(!off().tool_change_reviews_enabled());
+        for level in [SafetyLevel::Ask, SafetyLevel::Strict] {
+            let mut r = Registry::default();
+            r.set_safety_level(level);
+            assert!(r.tool_change_reviews_enabled(), "{level:?}");
+        }
+        for floor in [SafetyLevel::Ask, SafetyLevel::Strict] {
+            let mut r = off();
+            r.team_min_safety_level = floor;
+            assert!(r.tool_change_reviews_enabled(), "team floor {floor:?}");
+        }
+        let mut r = off();
+        r.team_forced_human_approval = true;
+        assert!(r.tool_change_reviews_enabled());
+        let mut r = off();
+        r.team_forced_quarantine_on_drift = true;
+        assert!(r.tool_change_reviews_enabled());
+        let mut r = off();
+        r.team_forced_block_on_injection = true;
+        assert!(r.tool_change_reviews_enabled());
+        for kept in [
+            KeptV1Safety {
+                quarantine_on_drift: true,
+                ..Default::default()
+            },
+            KeptV1Safety {
+                block_on_injection: true,
+                ..Default::default()
+            },
+        ] {
+            let mut r = off();
+            r.kept_v1_safety = Some(kept);
+            assert!(r.tool_change_reviews_enabled(), "{kept:?}");
+        }
+        // A 1.x registry that has not migrated: approval off, quarantine on.
+        let mut v1 = Registry {
+            version: 1,
+            safety_level: None,
+            human_approval: false,
+            confirm_destructive: false,
+            ..Registry::default()
+        };
+        assert!(!v1.tool_change_reviews_enabled());
+        v1.quarantine_on_drift = true;
+        assert!(v1.tool_change_reviews_enabled());
     }
 
     #[test]

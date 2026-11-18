@@ -1134,5 +1134,6 @@
   "Connected {connected} of {total} T3 Code instances.": "Connected {connected} of {total} T3 Code instances.",
   "Not connected: {names}.": "Not connected: {names}.",
   "Skip": "Skip",
-  "No servers moved, so your agent has no new tools.": "No servers moved, so your agent has no new tools."
+  "No servers moved, so your agent has no new tools.": "No servers moved, so your agent has no new tools.",
+  "{value0} tool-change records": "{value0} tool-change records"
 }

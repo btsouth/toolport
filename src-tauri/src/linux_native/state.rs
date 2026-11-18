@@ -94,6 +94,8 @@ pub(super) struct ActivitySnapshot {
     pub(super) inspect_error: Option<String>,
     /// Live inspection is on, so the inspector panel shows (React reads `liveInspect`).
     pub(super) live_inspect: bool,
+    /// `Registry::tool_change_reviews_enabled`; true when the registry is unreadable.
+    pub(super) tool_change_reviews: bool,
 }
 
 /// How many recent entries Activity reads and lists: React's `getAuditLog(200)`.
@@ -224,6 +226,7 @@ impl ActivitySnapshot {
             search_traces_error: None,
             inspect_error: None,
             live_inspect: false,
+            tool_change_reviews: true,
         }
     }
 }
@@ -419,6 +422,7 @@ pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
         .map_err(|error| format!("could not read the registry for tool identities: {error}"))
         .and_then(|registry| {
             snapshot.live_inspect = registry.live_inspect;
+            snapshot.tool_change_reviews = registry.tool_change_reviews_enabled();
             annotate_security_server_names(&mut snapshot.security_events, &registry.servers);
             crate::integrity::tool_identities(&registry.servers, &registry.profiles)
                 .map_err(|error| format!("could not read the tool identity stores: {error}"))
