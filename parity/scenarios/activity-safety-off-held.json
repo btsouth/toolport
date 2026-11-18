@@ -1,6 +1,6 @@
 {
   "screen": "activity",
-  "description": "Safety Off with the same records plus one tool held for a definition review.",
+  "description": "Safety Off with the same records plus one tool held for a definition review in the Local profile.",
   "now_ms": 1790000000000,
   "viewport": {
     "width": 1240,
@@ -248,7 +248,7 @@
           }
         ]
       },
-      "quarantine.json": {
+      "quarantine-v2-99e3590be20aac089bcb00f60b97769ece3eab8f816aa6dcb8dade452c6dfb76.json": {
         "lines": [
           {
             "atlassian__delete_issue": {
