@@ -351,6 +351,10 @@ jobs:
           GSK_RENDERER: cairo
           GTK_A11Y: none
         run: |
+          # The credential reprobe test starts this mock; it looks for it in the
+          # Cargo target folder above its own test binary.
+          cargo build --manifest-path src-tauri/Cargo.toml --no-default-features \
+            --features gtk-desktop,test-support --bin mock-mcp-server
           for case in \
             catalog::tests::escape_closes_the_suggestions_and_then_clears_the_search \
             teams::tests::member_review_native_shows_diff_labels_and_both_decisions \
@@ -375,7 +379,8 @@ jobs:
             credential_dialog_tests::a_locked_keyring_asks_once_per_click_and_unknown_is_not_absent \
             credential_dialog_tests::a_reference_saved_from_add_updates_a_launch_input_row \
             credential_dialog_tests::remove_client_credentials_shows_when_the_secret_is_unknown \
-            tests::connect_shows_reacts_restart_reminder
+            tests::connect_shows_reacts_restart_reminder \
+            details::tests::b5_credential_save_reprobes_unchanged_detail_without_refresh
           do
             xvfb-run -a dbus-run-session -- cargo test \
               --manifest-path src-tauri/Cargo.toml --no-default-features \
