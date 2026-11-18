@@ -112,6 +112,32 @@ describe("server Tools panel", () => {
     );
     expect(screen.getByRole("switch", { name: "remove" })).toBeChecked();
     expect(screen.queryByRole("switch", { name: /^Enable / })).not.toBeInTheDocument();
+
+    // With destructive tools hidden by the global switch, a destructive tool's
+    // switch says so whichever way it is set; other tools keep their wording.
+    const blocked =
+      "Destructive tools are hidden from clients by the global switch even when individually enabled.";
+    for (const disabledTools of [["read"], ["read", "remove"]]) {
+      rerender(
+        <ServerToolsPanel
+          serverId="alpha"
+          registry={{
+            ...registry,
+            denyDestructive: true,
+            servers: [{ ...registry.servers[0], disabledTools }],
+          }}
+          onRegistryChange={vi.fn()}
+        />,
+      );
+      expect(screen.getByRole("switch", { name: "remove" })).toHaveAttribute(
+        "title",
+        blocked,
+      );
+      expect(screen.getByRole("switch", { name: "read" })).toHaveAttribute(
+        "title",
+        "Hidden from clients. Expose it.",
+      );
+    }
   });
 
   it("validates schema arguments, calls the selected server and renders the result", async () => {
