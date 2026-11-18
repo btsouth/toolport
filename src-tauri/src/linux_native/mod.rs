@@ -7205,7 +7205,7 @@ fn tool_change_group_card(
     label.add_css_class("toolport-tool-change-status");
     label.set_hexpand(false);
     // Keep the line whole beside the buttons; it still wraps on a narrow window.
-    label.set_max_width_chars(100);
+    label.set_natural_wrap_mode(gtk::NaturalWrapMode::None);
     if blocked > 0 {
         card.add_css_class("blocked");
         label.add_css_class("error");
