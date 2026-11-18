@@ -7243,9 +7243,13 @@ fn tool_change_group_card(
         .iter()
         .any(|event| event.get("signatures").is_some())
     {
-        card.append(&empty_activity_source_label(crate::i18n::msg(
+        let warning = empty_activity_source_label(crate::i18n::msg(
             "Suspicious content found. Review and accept each tool separately.",
-        )));
+        ));
+        // Red, as React draws it.
+        warning.add_css_class("toolport-tool-change-status");
+        warning.add_css_class("error");
+        card.append(&warning);
     }
     card.append(&reveal);
     card
