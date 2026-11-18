@@ -2272,6 +2272,43 @@
       }
     },
     {
+      "id": "workbuddy",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://www.workbuddy.ai/docs/zh/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/Connector",
+      "observedSessionKind": null,
+      "clientVersion": null,
+      "recordedAt": null,
+      "uncaptured": {
+        "recordedAt": "2026-11-18",
+        "clientVersion": null,
+        "reason": "WorkBuddy is a signed-in desktop app with no headless CLI, so no unattended capture was recorded."
+      },
+      "evidenceLevel": "documentation only",
+      "features": {
+        "roots": {
+          "status": "unverified"
+        },
+        "sampling": {
+          "status": "unverified"
+        },
+        "elicitation": {
+          "status": "unverified"
+        },
+        "resources": {
+          "status": "unverified"
+        },
+        "prompts": {
+          "status": "unverified"
+        }
+      }
+    },
+    {
       "id": "tabnine",
       "evidence": "documentation only",
       "initialize": null,

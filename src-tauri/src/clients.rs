@@ -1053,6 +1053,7 @@ fn resolve_client_config_path(
         "openhands" => home.join(".openhands").join("mcp.json"),
         "nanobot" => home.join(".nanobot").join("config.json"),
         "command-code" => home.join(".commandcode").join("mcp.json"),
+        "workbuddy" => home.join(".workbuddy").join("mcp.json"),
         "tabnine" => home.join(".tabnine").join("mcp_servers.json"),
         "tabnine-cli" => home.join(".tabnine").join("agent").join("settings.json"),
         "lm-studio" => home.join(".lmstudio").join("mcp.json"),
@@ -1752,6 +1753,7 @@ fn resolve_client_config_path_linux_in(
         "openhands" => home.join(".openhands").join("mcp.json"),
         "nanobot" => home.join(".nanobot").join("config.json"),
         "command-code" => home.join(".commandcode").join("mcp.json"),
+        "workbuddy" => home.join(".workbuddy").join("mcp.json"),
         "tabnine" => home.join(".tabnine").join("mcp_servers.json"),
         "tabnine-cli" => home.join(".tabnine").join("agent").join("settings.json"),
         "lm-studio" => home.join(".lmstudio").join("mcp.json"),
@@ -2709,6 +2711,31 @@ fn lm_studio_default_homes(home: &Path) -> [PathBuf; 2] {
     ]
 }
 
+fn workbuddy_path() -> Option<PathBuf> {
+    Some(resolve_workbuddy_dir(&home()?).join("mcp.json"))
+}
+
+/// WorkBuddy's data folder. Its `product.json` names it: `.workbuddy` for the China
+/// build (`com.tencent.workbuddy.mac`) and `.workbuddy-ai` for the international
+/// WorkBuddy AI build (`com.workbuddy.workbuddy-ai`), both directly under the home
+/// folder on every OS. Only one is managed: the folder that exists; when both do, the
+/// one that already has an `mcp.json`, and `.workbuddy` when that does not decide it.
+fn resolve_workbuddy_dir(home: &Path) -> PathBuf {
+    let [china, international] = [home.join(".workbuddy"), home.join(".workbuddy-ai")];
+    let prefer_international = match (china.is_dir(), international.is_dir()) {
+        (false, true) => true,
+        (true, true) => {
+            !china.join("mcp.json").is_file() && international.join("mcp.json").is_file()
+        }
+        _ => false,
+    };
+    if prefer_international {
+        international
+    } else {
+        china
+    }
+}
+
 fn amazon_q_dir(home: &Path) -> PathBuf {
     home.join(".aws").join("amazonq")
 }
@@ -3497,6 +3524,20 @@ fn defs() -> Vec<ClientDef> {
             // manage the user one so the gateway is available everywhere. Bare `command` and
             // `url` entries read as stdio and http, and `type` is accepted for `transport`.
             path: || client_config_path("command-code"),
+            plugin_scan: None,
+        },
+        ClientDef {
+            location: None,
+            id: "workbuddy",
+            discovery: discovery::capabilities("workbuddy"),
+            tool_names: None,
+            name: "WorkBuddy",
+            format: Format::JsonMcpServers,
+            uses_connectors: false,
+            // WorkBuddy (Tencent's desktop agent) reads `mcp.json` (`mcpServers`) in its
+            // data folder. Per-project `.workbuddy/mcp.json` files are left alone. See
+            // `resolve_workbuddy_dir` for the international build's folder.
+            path: workbuddy_path,
             plugin_scan: None,
         },
         ClientDef {
@@ -16748,6 +16789,7 @@ command = "npx"
             "junie",
             "devin-cli",
             "command-code",
+            "workbuddy",
             "tabnine",
         ] {
             let d = defs()

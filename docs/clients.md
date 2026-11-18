@@ -39,6 +39,7 @@ below for you, so you never have to edit these by hand.
 | nanobot (HKUDS)         | `~/.nanobot/config.json`                                                                                                                                                     | JSON (`tools.mcpServers`)          |
 | ZCode                   | `~/.zcode/cli/config.json`                                                                                                                                                   | JSON (`mcp.servers`)               |
 | Command Code            | `~/.commandcode/mcp.json`                                                                                                                                                    | JSON (`mcpServers`)                |
+| WorkBuddy               | `~/.workbuddy/mcp.json`, or `~/.workbuddy-ai/mcp.json` for WorkBuddy AI (Windows: under `%USERPROFILE%`)                                                                     | JSON (`mcpServers`)                |
 | Tabnine Agent           | `~/.tabnine/mcp_servers.json`                                                                                                                                                | JSON (`mcpServers`)                |
 | Tabnine CLI             | `~/.tabnine/agent/settings.json`                                                                                                                                             | JSON (`mcpServers`)                |
 | Zed                     | `~/.config/zed/settings.json`                                                                                                                                                | JSON (`context_servers`)           |
@@ -348,6 +349,18 @@ disabled for review. Migration and pasted imports refuse disabled ZCode
 entries. Settings that the import model cannot preserve, such as a working
 directory, custom timeout, protocol version, or OAuth configuration, require
 manual setup. Toolport checks these before importing or migrating a ZCode config.
+
+### WorkBuddy setup
+
+WorkBuddy keeps its MCP servers in `mcp.json` in its data folder: `~/.workbuddy`
+for WorkBuddy (the China build) and `~/.workbuddy-ai` for WorkBuddy AI (the
+international build), under `%USERPROFILE%` on Windows. Toolport manages one of
+them: the folder that exists, or, when both do, the one that already has an
+`mcp.json` (`~/.workbuddy` if both have one). The **Clients** view shows which
+file it uses. Connect adds one `toolport` entry and leaves the rest of the file
+as it was; restart WorkBuddy afterward. Per-project `.workbuddy/mcp.json` files
+are left alone. WorkBuddy is a separate product from CodeBuddy Code, which reads
+`~/.codebuddy/.mcp.json`.
 
 ### Tabnine Agent setup
 
