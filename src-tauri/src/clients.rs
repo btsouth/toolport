@@ -2734,9 +2734,9 @@ pub(crate) fn folder_gone_message_for_path(path: &Path) -> Option<&'static str> 
 
 /// A client from [`folder_gone_message`] is installed only when its data folder is a
 /// real folder; a stray file with that name is not an install.
-fn data_folder_missing(client_id: &str, config_path: &str) -> bool {
+fn data_folder_missing(client_id: &str, config_path: Option<&Path>) -> bool {
     folder_gone_message(client_id).is_some()
-        && !Path::new(config_path).parent().is_some_and(Path::is_dir)
+        && !config_path.and_then(Path::parent).is_some_and(Path::is_dir)
 }
 
 fn amazon_q_dir(home: &Path) -> PathBuf {
@@ -3539,7 +3539,8 @@ fn defs() -> Vec<ClientDef> {
             uses_connectors: false,
             // WorkBuddy, Tencent's desktop agent (China build, `com.tencent.workbuddy.mac`),
             // reads `mcp.json` (`mcpServers`) in its `product.json` data folder,
-            // `~/.workbuddy` on every OS. Per-project `.workbuddy/mcp.json` files are left
+            // `~/.workbuddy` on every OS (`dataFolderName` in the 5.11.3 app bundle's
+            // `cli/product.json`; MCP setup: the Connector guide, workbuddy.ai/docs). Per-project `.workbuddy/mcp.json` files are left
             // alone. Toolport never creates the folder (see `folder_gone_message`).
             path: || client_config_path("workbuddy"),
             plugin_scan: None,
@@ -3553,8 +3554,9 @@ fn defs() -> Vec<ClientDef> {
             format: Format::JsonMcpServers,
             uses_connectors: false,
             // WorkBuddy AI, the international build (`com.workbuddy.workbuddy-ai`), is a
-            // separate app with its own data folder, `~/.workbuddy-ai`, and the same
-            // `mcp.json` shape. It never reads the China build's file.
+            // separate app with its own data folder, `~/.workbuddy-ai` (`dataFolderName`
+            // in the 5.11.4 app bundle's `cli/product.json`), and the same `mcp.json`
+            // shape. It never reads the China build's file.
             path: || client_config_path("workbuddy-ai"),
             plugin_scan: None,
         },
@@ -5046,6 +5048,8 @@ fn read_client(def: &ClientDef) -> DetectedClient {
         Vec::new()
     };
 
+    // The native path for the folder check; `config_path` below is only for display.
+    let native_path = resolved_definition_path(def).ok();
     let build = |config_path: String,
                  config_exists: bool,
                  servers: Vec<McpServer>,
@@ -5075,7 +5079,7 @@ fn read_client(def: &ClientDef) -> DetectedClient {
             !def.location.as_ref().is_some_and(|row| {
                 locations::is_t3_home(row) && !t3code::path_is_safe(&row.config_path)
             }) && app_present_with_override(&config_path, config_exists, install_marker.as_deref())
-                && !data_folder_missing(def.id, &config_path);
+                && !data_folder_missing(def.id, native_path.as_deref());
         DetectedClient {
             id: def
                 .location
@@ -5469,7 +5473,7 @@ pub fn client_metadata() -> Vec<DetectedClient> {
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_default();
-            let config_exists = path.is_some_and(|path| path.is_file());
+            let config_exists = path.as_ref().is_some_and(|path| path.is_file());
             DetectedClient {
                 id: def.client_id().into(),
                 name: def
@@ -5482,7 +5486,7 @@ pub fn client_metadata() -> Vec<DetectedClient> {
                 location_kept_by_t3_code: false,
                 discovery: def.discovery,
                 app_present: app_present_for(&config_path, config_exists)
-                    && !data_folder_missing(def.id, &config_path),
+                    && !data_folder_missing(def.id, path.as_deref()),
                 config_path,
                 config_exists,
                 servers: Vec::new(),

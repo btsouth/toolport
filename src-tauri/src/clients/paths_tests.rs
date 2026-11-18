@@ -1667,3 +1667,60 @@ fn workbuddy_disconnect_restores_a_blank_original_exactly() {
         }
     }
 }
+
+/// Detection checks the folder through the native path, so a home folder whose name
+/// is not valid UTF-8 still finds both builds in both scans.
+#[cfg(unix)]
+#[test]
+fn workbuddy_detection_checks_the_native_folder_path() {
+    use std::os::unix::ffi::OsStrExt;
+    let fixture = Fixture::new("workbuddy-native");
+    let home = fixture.home.join(std::ffi::OsStr::from_bytes(b"h\xffome"));
+    let _home = TestHome::set(&home);
+    for (id, own) in [
+        ("workbuddy", ".workbuddy"),
+        ("workbuddy-ai", ".workbuddy-ai"),
+    ] {
+        std::fs::create_dir_all(home.join(own)).unwrap();
+        std::fs::write(home.join(own).join("mcp.json"), "{}").unwrap();
+        let full = read_client(&find_def(id).unwrap());
+        assert!(full.app_present && full.config_exists, "{id} full scan");
+        let quick = client_metadata()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert!(
+            quick.app_present && quick.config_exists,
+            "{id} quick inventory"
+        );
+    }
+}
+
+/// The folder disappears after the temp file is written, just before the first
+/// config is published: Connect reports the folder-gone message and creates nothing.
+#[test]
+fn workbuddy_connect_reports_a_folder_removed_while_publishing() {
+    for (id, own, message) in [
+        ("workbuddy", ".workbuddy", "WorkBuddy's folder is gone"),
+        (
+            "workbuddy-ai",
+            ".workbuddy-ai",
+            "WorkBuddy AI's folder is gone",
+        ),
+    ] {
+        let fixture = Fixture::new("workbuddy-publish");
+        let folder = fixture.home.join(own);
+        std::fs::create_dir_all(&folder).unwrap();
+        let removed = folder.clone();
+        crate::registry::client_file::HOOK.with(|slot| {
+            *slot.borrow_mut() = Some((
+                "commit",
+                Box::new(move |_| std::fs::remove_dir_all(&removed).unwrap()),
+            ))
+        });
+        let error = install_gateway(id, None).unwrap_err();
+        assert!(error.contains(message), "{id}: {error}");
+        assert!(!folder.exists(), "{id}");
+        drop(fixture);
+    }
+}

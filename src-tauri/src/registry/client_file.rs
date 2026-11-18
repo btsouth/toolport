@@ -422,6 +422,14 @@ pub(crate) fn commit_in_existing_folder(
     commit_revision(path, expected, output, Some(missing))
 }
 
+/// The folder-gone message for a write that failed because the folder that would
+/// hold `dest` is gone; any other failure keeps its own error.
+fn folder_gone(folder_missing: Option<&str>, dest: &Path) -> Option<String> {
+    folder_missing
+        .filter(|_| !dest.parent().is_some_and(Path::is_dir))
+        .map(str::to_string)
+}
+
 fn commit_revision(
     path: &Path,
     expected: &Revision,
@@ -449,10 +457,9 @@ fn commit_revision(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&tmp).map_err(|e| match folder_missing {
-        Some(missing) if e.kind() == std::io::ErrorKind::NotFound => missing.to_string(),
-        _ => e.to_string(),
-    })?;
+    let mut file = options
+        .open(&tmp)
+        .map_err(|e| folder_gone(folder_missing, &dest).unwrap_or_else(|| e.to_string()))?;
     cleanup.arm();
     file.write_all(output.as_bytes())
         .map_err(|e| e.to_string())?;
@@ -473,7 +480,7 @@ fn commit_revision(
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 CHANGED.into()
             } else {
-                e.to_string()
+                folder_gone(folder_missing, &dest).unwrap_or_else(|| e.to_string())
             }
         })?;
         cleanup.disarm();
