@@ -150,7 +150,11 @@ impl Writer {
         let (tx, rx) = mpsc::sync_channel(capacity);
         let tx = std::thread::Builder::new()
             .name("toolport-telemetry".into())
-            .spawn(move || writer_loop(rx, &worker_counters, append))
+            .spawn(move || {
+                // A batch that gives up on a busy lock is lost; see the helper.
+                crate::registry::wait_for_locks_on_this_thread();
+                writer_loop(rx, &worker_counters, append)
+            })
             .ok()
             .map(|_| tx);
         Self {

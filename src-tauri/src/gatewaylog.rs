@@ -101,13 +101,11 @@ pub(crate) fn append_to(path: &Path, msg: &str) {
 ///
 /// Every line is written under the lock or not at all. An unlocked append can
 /// be lost to the scrub's replace, or carry a secret the scrub learned after
-/// this line was formatted, so it is never a fallback. The wait is the store
-/// deadline (`TOOLPORT_LOCK_TIMEOUT_MS`, five seconds by default), not a short
-/// one: this runs only on the telemetry writer thread, which no connection
-/// waits on ([`append`] only queues, and the startup path that once waited here
-/// (SBS-1019) queues too), and every holder of this lock (another appender's
-/// write and trim, or a scrub) keeps it for one bounded read and rewrite. Past
-/// the deadline the batch is reported as failed records in telemetry health.
+/// this line was formatted, so it is never a fallback. This runs only on the
+/// telemetry writer thread, which no connection waits on ([`append`] only
+/// queues, and the startup path that once waited here (SBS-1019) queues too), so
+/// it waits for the lock to be free rather than dropping the batch at a deadline
+/// ([`crate::registry::wait_for_locks_on_this_thread`]).
 pub(crate) fn append_batch_to(
     path: &Path,
     lines: &[String],

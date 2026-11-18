@@ -4886,7 +4886,46 @@ pub fn update_authoritative<T>(
 /// agent toggle (which interleaves audit + early returns), and the integrity pins/quarantine
 /// stores (SOU-165). Hold the returned guard across the entire read-decide-write.
 pub fn lock_at(path: &Path) -> Result<FileLock, String> {
+    if WAITS_FOR_LOCKS.get() {
+        return lock_when_free(path);
+    }
     lock_for(path, registry_lock_timeout())
+}
+
+thread_local! {
+    static WAITS_FOR_LOCKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Make [`lock_at`] on the calling thread wait out contention instead of giving up
+/// at the store deadline. Only the telemetry writer sets this: no request waits on
+/// it, and giving up there drops the batch. A holder rotating a log fsyncs the
+/// rewrite under the lock, and on slow storage (macOS `F_FULLFSYNC` on a loaded
+/// disk) a few of those queued behind each other outlast any fixed deadline. The
+/// kernel releases the lock when its holder exits, so the wait ends unless a holder
+/// is stuck in filesystem IO, which this thread would be stuck in anyway; flush and
+/// shutdown stay bounded and report it.
+pub(crate) fn wait_for_locks_on_this_thread() {
+    WAITS_FOR_LOCKS.set(true);
+}
+
+fn lock_when_free(path: &Path) -> Result<FileLock, String> {
+    let lock_error = |error| {
+        format!(
+            "Could not open the lock at {}: {error}",
+            lock_path(path).display()
+        )
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(lock_error)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path(path))
+        .map_err(lock_error)?;
+    file.lock_exclusive().map_err(lock_error)?;
+    Ok(FileLock(file))
 }
 
 /// Acquire an explicit-path lock with a caller-appropriate contention deadline.
