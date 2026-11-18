@@ -19787,9 +19787,8 @@ mod tests {
         // it: one line ending in "…", and no wider than before so
         // the controls move under the name at the same window widths.
         adw::init().unwrap();
-        let scratch =
-            std::env::temp_dir().join(format!("toolport-access-label-{}", std::process::id()));
-        let _data = crate::registry::DataDirOverride::set(&scratch);
+        // Holds the data-dir test lock; setting the language writes settings.
+        let _data = crate::registry::DataDirTestEnv::new("gtk-access-label");
         for language in [
             "en", "de", "es", "fr", "pt-BR", "ja", "ko", "zh-CN", "zh-TW",
         ] {
@@ -19879,9 +19878,8 @@ mod tests {
             last_used_ms: None,
             same_as: None,
         });
-        let scratch =
-            std::env::temp_dir().join(format!("toolport-access-room-{}", std::process::id()));
-        let _data = crate::registry::DataDirOverride::set(&scratch);
+        // Holds the data-dir test lock; setting the language writes settings.
+        let _data = crate::registry::DataDirTestEnv::new("gtk-access-room");
         let label_of = |row: &gtk::Box| {
             fixture_descendants(row.upcast_ref())
                 .into_iter()
@@ -19908,8 +19906,6 @@ mod tests {
                 let label = label_of(&row);
                 let whole = label.create_pango_layout(Some(&text)).pixel_size().0;
                 let capped = label.measure(gtk::Orientation::Horizontal, -1).1;
-                // The row asks for what it asked before: the label's capped width.
-                let (_, row_nat, _, _) = row.measure(gtk::Orientation::Horizontal, -1);
                 let one_line = row.measure(gtk::Orientation::Vertical, 4000).1;
                 // With room to spare, the label is whole on one line.
                 assert_eq!(lay_out(&row, 4000), one_line);
@@ -19919,14 +19915,19 @@ mod tests {
                     label.width()
                 );
                 // Where the controls move under the name is decided from the
-                // capped label, as before; find that width.
-                let controls = fixture_descendants(row.upcast_ref())
-                    .into_iter()
-                    .find(|w| w.has_css_class("toolport-client-controls"))
-                    .expect("row controls");
-                let lead = controls.prev_sibling().expect("the name and detail");
-                let under = |width: i32| {
-                    lay_out(&row, width);
+                // capped label, as before: the same row without the label's
+                // growth (main's row) moves them at the same width.
+                let parts = |row: &gtk::Box| {
+                    let controls = fixture_descendants(row.upcast_ref())
+                        .into_iter()
+                        .find(|w| w.has_css_class("toolport-client-controls"))
+                        .expect("row controls");
+                    let lead = controls.prev_sibling().expect("the name and detail");
+                    (controls, lead)
+                };
+                let under_in = |row: &gtk::Box, width: i32| {
+                    let (controls, lead) = parts(row);
+                    lay_out(row, width);
                     // The label never takes room the name and detail need.
                     let needed = lead.measure(gtk::Orientation::Vertical, lead.width()).0;
                     assert!(needed <= lead.height(), "{language} {style:?} at {width}");
@@ -19936,10 +19937,35 @@ mod tests {
                         .y();
                     top >= lead.height() as f32
                 };
-                let mut beside = row_nat;
-                while !under(beside - 1) {
-                    beside -= 1;
-                }
+                // The widest width whose controls are beside the name while one
+                // pixel narrower moves them under it, searched only between
+                // the row's narrowest and natural widths.
+                let breakpoint = |row: &gtk::Box| {
+                    let (row_min, row_nat, _, _) = row.measure(gtk::Orientation::Horizontal, -1);
+                    (row_min + 1..=row_nat)
+                        .rev()
+                        .find(|&width| under_in(row, width - 1))
+                        .filter(|&width| !under_in(row, width))
+                        .unwrap_or_else(|| panic!("{language} {style:?}: no breakpoint"))
+                };
+                let baseline = client_rows::client_row(&client, page.clone(), style);
+                parts(&baseline)
+                    .0
+                    .downcast::<page_header::ActionFlow>()
+                    .expect("the row's action flow")
+                    .clear_grow();
+                lay_out(&baseline, 4000);
+                assert!(
+                    label_of(&baseline).width() <= capped,
+                    "{language} {style:?}: the baseline label still grew"
+                );
+                let beside = breakpoint(&baseline);
+                assert_eq!(
+                    breakpoint(&row),
+                    beside,
+                    "{language} {style:?}: the label's room moved where the controls drop"
+                );
+                let under = |width: i32| under_in(&row, width);
                 assert!(!under(beside));
                 assert!(label.width() >= capped.min(whole), "{language} {style:?}");
                 // One pixel narrower, the controls move under the name and the

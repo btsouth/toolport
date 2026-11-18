@@ -511,6 +511,13 @@ impl ActionFlow {
             .replace(Some((child.clone().upcast(), label.clone())));
         self.queue_allocate();
     }
+
+    /// Give no spare room to the label again, as rows did before `set_grow`.
+    #[cfg(test)]
+    pub(super) fn clear_grow(&self) {
+        self.imp().grow.replace(None);
+        self.queue_resize();
+    }
 }
 
 /// Whether the title and the actions both fit on one line at natural width.
