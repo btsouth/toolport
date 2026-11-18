@@ -133,6 +133,12 @@ const CLIENT_PATHS: &[(&str, &str, Expect)] = &[
     ("command-code", "JsonMcpServers", |h, _| {
         h.join(".commandcode/mcp.json")
     }),
+    ("workbuddy", "JsonMcpServers", |h, _| {
+        h.join(".workbuddy/mcp.json")
+    }),
+    ("workbuddy-ai", "JsonMcpServers", |h, _| {
+        h.join(".workbuddy-ai/mcp.json")
+    }),
     ("tabnine", "JsonMcpServers", |h, _| {
         h.join(".tabnine/mcp_servers.json")
     }),
@@ -1308,4 +1314,414 @@ fn an_upgraders_goose_connection_moves_from_application_support_on_macos() {
         .expect("Toolport's Goose connection is in the file Goose reads");
     assert_eq!(gateway.command.as_deref(), Some(fixture.gateway()));
     assert_eq!(names(&legacy), vec!["native".to_string()]);
+}
+
+#[test]
+fn each_workbuddy_build_is_detected_only_from_its_own_folder() {
+    let fixture = Fixture::new("workbuddy-detect");
+    let present = |id: &str| read_client(&find_def(id).unwrap()).app_present;
+    let china = fixture.home.join(".workbuddy");
+    let international = fixture.home.join(".workbuddy-ai");
+    assert!(!present("workbuddy") && !present("workbuddy-ai"));
+    assert!(
+        !china.exists() && !international.exists(),
+        "detection creates nothing"
+    );
+
+    std::fs::create_dir_all(&china).unwrap();
+    assert!(present("workbuddy") && !present("workbuddy-ai"));
+    std::fs::create_dir_all(&international).unwrap();
+    assert!(present("workbuddy") && present("workbuddy-ai"));
+    std::fs::remove_dir_all(&china).unwrap();
+    assert!(!present("workbuddy") && present("workbuddy-ai"));
+
+    // A stray file with the folder's name is not an install.
+    std::fs::write(&china, "not a folder").unwrap();
+    assert!(!present("workbuddy"));
+    assert!(client_metadata()
+        .iter()
+        .any(|row| row.id == "workbuddy" && !row.app_present));
+    for row in client_metadata() {
+        if row.id == "workbuddy-ai" {
+            assert!(row.app_present);
+        }
+    }
+}
+
+/// Each build connects, imports and disconnects only its own file. The other build's
+/// file holds an older Toolport entry and keeps it, byte for byte, and each row shows
+/// its own file's state.
+#[test]
+fn each_workbuddy_build_connects_only_its_own_file() {
+    for (id, own, other) in [
+        ("workbuddy", ".workbuddy", ".workbuddy-ai"),
+        ("workbuddy-ai", ".workbuddy-ai", ".workbuddy"),
+    ] {
+        let fixture = Fixture::new("workbuddy-own");
+        let file = fixture.home.join(own).join("mcp.json");
+        let other_file = fixture.home.join(other).join("mcp.json");
+        for path in [&file, &other_file] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        let original = concat!(
+            "{\n",
+            "    \"mcpServers\": {\n",
+            "        \"files\": {\"command\": \"npx\", \"args\": [\"-y\", \"files-mcp\"], \"env\": {\"ROOT\": \"/tmp\"}},\n",
+            "        \"map\": {\"url\": \"https://mcp.map.example/sse?key=k\"},\n",
+            "        \"mail\": {\"type\": \"streamableHttp\", \"url\": \"https://mail.example/mcp\",\n",
+            "                 \"headers\": {\"Authorization\": \"Bearer t\"}, \"timeout\": 30000},\n",
+            "        \"feed\": {\"type\": \"sse\", \"url\": \"https://feed.example/sse\"}\n",
+            "    }\n",
+            "}\n"
+        );
+        std::fs::write(&file, original).unwrap();
+        let stale = format!(
+            "{{\"mcpServers\": {{\"toolport\": {{\"command\": \"/opt/old/toolport-gateway\", \"env\": {{\"TOOLPORT_CLIENT_ID\": \"{id}\"}}}}}}}}\n"
+        );
+        std::fs::write(&other_file, &stale).unwrap();
+        let other_id = if id == "workbuddy" {
+            "workbuddy-ai"
+        } else {
+            "workbuddy"
+        };
+
+        let def = find_def(id).unwrap();
+        let row = read_client(&def);
+        assert!(row.app_present && row.config_exists, "{id}");
+        assert_eq!(Path::new(&row.config_path), file, "{id}");
+        assert!(!row.gateway_installed, "{id} reads only its own file");
+        assert!(read_client(&find_def(other_id).unwrap()).gateway_installed);
+        let server = |name: &str| {
+            row.servers
+                .iter()
+                .find(|server| server.name == name)
+                .unwrap_or_else(|| panic!("{name} in {:?}", row.servers))
+                .clone()
+        };
+        let files = server("files");
+        assert_eq!(files.transport, "stdio");
+        assert_eq!(files.command.as_deref(), Some("npx"));
+        assert_eq!(files.args, ["-y", "files-mcp"]);
+        assert_eq!(files.env_keys, ["ROOT"]);
+        for (name, transport, url) in [
+            ("map", "http", "https://mcp.map.example/sse?key=k"),
+            ("mail", "http", "https://mail.example/mcp"),
+            ("feed", "sse", "https://feed.example/sse"),
+        ] {
+            assert_eq!(server(name).transport, transport, "{id} {name}");
+            assert_eq!(server(name).url.as_deref(), Some(url), "{id} {name}");
+        }
+
+        install_gateway(id, None).unwrap();
+        let connected = read(&file);
+        let entry = &connected["mcpServers"]["toolport"];
+        assert!(entry["command"].as_str().is_some(), "{id}: {connected}");
+        assert_eq!(entry["env"]["TOOLPORT_CLIENT_ID"], id);
+        let before: serde_json::Value = serde_json::from_str(original).unwrap();
+        for name in ["files", "map", "mail", "feed"] {
+            assert_eq!(connected["mcpServers"][name], before["mcpServers"][name]);
+        }
+        assert!(read_client(&def).gateway_installed);
+        assert_eq!(std::fs::read_to_string(&other_file).unwrap(), stale, "{id}");
+
+        uninstall_gateway(id).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original, "{id}");
+        assert_eq!(std::fs::read_to_string(&other_file).unwrap(), stale, "{id}");
+        drop(fixture);
+    }
+}
+
+/// The data folder can go away after the Clients page found it, or the config can be
+/// a link into a folder that does not exist: Connect then refuses and creates nothing.
+#[test]
+fn workbuddy_connect_never_creates_a_folder() {
+    for (id, own, other, message) in [
+        (
+            "workbuddy",
+            ".workbuddy",
+            ".workbuddy-ai",
+            "WorkBuddy's folder is gone",
+        ),
+        (
+            "workbuddy-ai",
+            ".workbuddy-ai",
+            ".workbuddy",
+            "WorkBuddy AI's folder is gone",
+        ),
+    ] {
+        let fixture = Fixture::new("workbuddy-gone");
+        let folder = fixture.home.join(own);
+        std::fs::create_dir_all(&folder).unwrap();
+        assert!(read_client(&find_def(id).unwrap()).app_present);
+
+        let removed = folder.clone();
+        mutation::BEFORE_COMMIT.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |_| {
+                std::fs::remove_dir_all(&removed).unwrap();
+            }));
+        });
+        let error = install_gateway(id, None).unwrap_err();
+        assert!(error.contains(message), "{error}");
+        assert!(!folder.exists(), "{id}: the folder was created again");
+
+        // Gone before Connect started, too.
+        let error = install_gateway(id, None).unwrap_err();
+        assert!(error.contains(message), "{error}");
+        assert!(
+            !folder.exists() && !fixture.home.join(other).exists(),
+            "{id}"
+        );
+
+        drop(fixture);
+    }
+}
+
+/// A config that is a dangling link into a folder that does not exist: Connect follows
+/// the link, then refuses instead of creating the link target's folder.
+#[cfg(unix)]
+#[test]
+fn workbuddy_connect_never_creates_a_link_targets_folder() {
+    for (id, own, other, message) in [
+        (
+            "workbuddy",
+            ".workbuddy",
+            ".workbuddy-ai",
+            "WorkBuddy's folder is gone",
+        ),
+        (
+            "workbuddy-ai",
+            ".workbuddy-ai",
+            ".workbuddy",
+            "WorkBuddy AI's folder is gone",
+        ),
+    ] {
+        let fixture = Fixture::new("workbuddy-link");
+        let folder = fixture.home.join(own);
+        std::fs::create_dir_all(&folder).unwrap();
+        let target = fixture.home.join(other).join("mcp.json");
+        std::os::unix::fs::symlink(&target, folder.join("mcp.json")).unwrap();
+        let error = install_gateway(id, None).unwrap_err();
+        assert!(error.contains(message), "{error}");
+        assert!(
+            !fixture.home.join(other).exists(),
+            "{id}: the link target's folder"
+        );
+        drop(fixture);
+    }
+}
+
+/// WorkBuddy was uninstalled after Connect: Disconnect has nothing to put back, so it
+/// succeeds, clears Toolport's record and writes and creates nothing.
+#[test]
+fn workbuddy_disconnect_succeeds_once_its_folder_is_gone() {
+    for (id, own) in [
+        ("workbuddy", ".workbuddy"),
+        ("workbuddy-ai", ".workbuddy-ai"),
+    ] {
+        for original in [
+            None,
+            Some("{\"mcpServers\": {}}\n"),
+            Some(""),
+            Some(" \n\t"),
+        ] {
+            let fixture = Fixture::new("workbuddy-uninstalled");
+            let folder = fixture.home.join(own);
+            std::fs::create_dir_all(&folder).unwrap();
+            if let Some(text) = original {
+                std::fs::write(folder.join("mcp.json"), text).unwrap();
+            }
+            crate::registry_controller::connect_client_stdio(id, None, false).unwrap();
+            assert!(crate::registry::load()
+                .unwrap()
+                .client_managed_entries
+                .contains_key(id));
+
+            std::fs::remove_dir_all(&folder).unwrap();
+            crate::registry_controller::disconnect_client(id)
+                .unwrap_or_else(|error| panic!("{id} {original:?}: {error}"));
+            assert!(!crate::registry::load()
+                .unwrap()
+                .client_managed_entries
+                .contains_key(id));
+            assert!(!folder.exists(), "{id} {original:?}");
+            drop(fixture);
+        }
+    }
+}
+
+/// A stray file with a build's folder name: the full scan and the quick inventory
+/// agree that there is no install and no config, with no error.
+#[test]
+fn a_file_named_like_a_workbuddy_folder_is_no_install_in_either_scan() {
+    let fixture = Fixture::new("workbuddy-file");
+    for (id, own) in [
+        ("workbuddy", ".workbuddy"),
+        ("workbuddy-ai", ".workbuddy-ai"),
+    ] {
+        std::fs::write(fixture.home.join(own), "not a folder").unwrap();
+        let full = read_client(&find_def(id).unwrap());
+        assert!(!full.app_present && !full.config_exists, "{id} full scan");
+        assert_eq!(full.error, None, "{id}");
+        let quick = client_metadata()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(
+            (quick.app_present, quick.config_exists),
+            (full.app_present, full.config_exists),
+            "{id}: both scans agree"
+        );
+    }
+}
+
+/// Servers moved into the gateway are owed back. With the folder gone, Disconnect
+/// refuses and keeps the move record and recovery copies; once the folder is back,
+/// a retry puts the original file back.
+#[test]
+fn workbuddy_disconnect_keeps_moved_servers_until_the_folder_is_back() {
+    for (id, own, message) in [
+        ("workbuddy", ".workbuddy", "WorkBuddy's folder is gone"),
+        (
+            "workbuddy-ai",
+            ".workbuddy-ai",
+            "WorkBuddy AI's folder is gone",
+        ),
+    ] {
+        let fixture = Fixture::new("workbuddy-moved");
+        let folder = fixture.home.join(own);
+        let file = folder.join("mcp.json");
+        std::fs::create_dir_all(&folder).unwrap();
+        let original = "{\n  \"mcpServers\": {\"files\": {\"command\": \"npx\", \"args\": [\"files-mcp\"]}}\n}\n";
+        std::fs::write(&file, original).unwrap();
+        let revision = setup_revision(id).unwrap();
+        migrate_reviewed(id, None, &["files".to_string()], &revision, || Ok(())).unwrap();
+        let moved_in = read(&file);
+        assert!(moved_in["mcpServers"].get("files").is_none(), "{moved_in}");
+        assert!(moved::matches_path(id, &file).unwrap());
+        let copies = restore::recovery_copies(id, &file).unwrap();
+
+        let away = fixture.home.join(format!("{own}-trash"));
+        std::fs::rename(&folder, &away).unwrap();
+        let error = uninstall_gateway(id).unwrap_err();
+        assert!(error.contains(message), "{id}: {error}");
+        assert!(!folder.exists(), "{id}");
+        assert!(
+            moved::matches_path(id, &file).unwrap(),
+            "{id}: move record kept"
+        );
+        assert_eq!(restore::recovery_copies(id, &file).unwrap(), copies, "{id}");
+
+        std::fs::rename(&away, &folder).unwrap();
+        let outcome = uninstall_gateway(id).unwrap();
+        finish_uninstall(id, &outcome).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original, "{id}");
+        drop(fixture);
+    }
+}
+
+/// The registry update fails after Disconnect, with the folder removed meanwhile:
+/// the rollback reports it instead of creating the folder again.
+#[test]
+fn workbuddy_disconnect_rollback_never_creates_its_folder() {
+    for (id, own) in [
+        ("workbuddy", ".workbuddy"),
+        ("workbuddy-ai", ".workbuddy-ai"),
+    ] {
+        let fixture = Fixture::new("workbuddy-rollback");
+        let folder = fixture.home.join(own);
+        std::fs::create_dir_all(&folder).unwrap();
+        crate::registry_controller::connect_client_stdio(id, None, false).unwrap();
+        let removed = folder.clone();
+        let result = crate::registry_controller::disconnect_client_stdio_with(id, false, |_| {
+            std::fs::remove_dir_all(&removed).unwrap();
+            Err("registry write failed".into())
+        });
+        assert!(result.is_err(), "{id}");
+        assert!(!folder.exists(), "{id}: rollback created the folder");
+        drop(fixture);
+    }
+}
+
+/// A blank original file comes back with its exact bytes on Disconnect.
+#[test]
+fn workbuddy_disconnect_restores_a_blank_original_exactly() {
+    for (id, own) in [
+        ("workbuddy", ".workbuddy"),
+        ("workbuddy-ai", ".workbuddy-ai"),
+    ] {
+        for original in ["", " \n\t"] {
+            let fixture = Fixture::new("workbuddy-blank");
+            let file = fixture.home.join(own).join("mcp.json");
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, original).unwrap();
+            install_gateway(id, None).unwrap();
+            assert!(read(&file)["mcpServers"].get("toolport").is_some(), "{id}");
+            let outcome = uninstall_gateway(id).unwrap();
+            finish_uninstall(id, &outcome).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                original,
+                "{id} {original:?}"
+            );
+            drop(fixture);
+        }
+    }
+}
+
+/// Detection checks the folder through the native path, so a home folder whose name
+/// is not valid UTF-8 still finds both builds in both scans. macOS file systems refuse
+/// such names (EILSEQ), so the case cannot arise there.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn workbuddy_detection_checks_the_native_folder_path() {
+    use std::os::unix::ffi::OsStrExt;
+    let fixture = Fixture::new("workbuddy-native");
+    let home = fixture.home.join(std::ffi::OsStr::from_bytes(b"h\xffome"));
+    let _home = TestHome::set(&home);
+    for (id, own) in [
+        ("workbuddy", ".workbuddy"),
+        ("workbuddy-ai", ".workbuddy-ai"),
+    ] {
+        std::fs::create_dir_all(home.join(own)).unwrap();
+        std::fs::write(home.join(own).join("mcp.json"), "{}").unwrap();
+        let full = read_client(&find_def(id).unwrap());
+        assert!(full.app_present && full.config_exists, "{id} full scan");
+        let quick = client_metadata()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert!(
+            quick.app_present && quick.config_exists,
+            "{id} quick inventory"
+        );
+    }
+}
+
+/// The folder disappears after the temp file is written, just before the first
+/// config is published: Connect reports the folder-gone message and creates nothing.
+#[test]
+fn workbuddy_connect_reports_a_folder_removed_while_publishing() {
+    for (id, own, message) in [
+        ("workbuddy", ".workbuddy", "WorkBuddy's folder is gone"),
+        (
+            "workbuddy-ai",
+            ".workbuddy-ai",
+            "WorkBuddy AI's folder is gone",
+        ),
+    ] {
+        let fixture = Fixture::new("workbuddy-publish");
+        let folder = fixture.home.join(own);
+        std::fs::create_dir_all(&folder).unwrap();
+        let removed = folder.clone();
+        crate::registry::client_file::HOOK.with(|slot| {
+            *slot.borrow_mut() = Some((
+                "commit",
+                Box::new(move |_| std::fs::remove_dir_all(&removed).unwrap()),
+            ))
+        });
+        let error = install_gateway(id, None).unwrap_err();
+        assert!(error.contains(message), "{id}: {error}");
+        assert!(!folder.exists(), "{id}");
+        drop(fixture);
+    }
 }

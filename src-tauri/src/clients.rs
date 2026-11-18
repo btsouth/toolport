@@ -1053,6 +1053,8 @@ fn resolve_client_config_path(
         "openhands" => home.join(".openhands").join("mcp.json"),
         "nanobot" => home.join(".nanobot").join("config.json"),
         "command-code" => home.join(".commandcode").join("mcp.json"),
+        "workbuddy" => home.join(".workbuddy").join("mcp.json"),
+        "workbuddy-ai" => home.join(".workbuddy-ai").join("mcp.json"),
         "tabnine" => home.join(".tabnine").join("mcp_servers.json"),
         "tabnine-cli" => home.join(".tabnine").join("agent").join("settings.json"),
         "lm-studio" => home.join(".lmstudio").join("mcp.json"),
@@ -1752,6 +1754,8 @@ fn resolve_client_config_path_linux_in(
         "openhands" => home.join(".openhands").join("mcp.json"),
         "nanobot" => home.join(".nanobot").join("config.json"),
         "command-code" => home.join(".commandcode").join("mcp.json"),
+        "workbuddy" => home.join(".workbuddy").join("mcp.json"),
+        "workbuddy-ai" => home.join(".workbuddy-ai").join("mcp.json"),
         "tabnine" => home.join(".tabnine").join("mcp_servers.json"),
         "tabnine-cli" => home.join(".tabnine").join("agent").join("settings.json"),
         "lm-studio" => home.join(".lmstudio").join("mcp.json"),
@@ -2709,6 +2713,32 @@ fn lm_studio_default_homes(home: &Path) -> [PathBuf; 2] {
     ]
 }
 
+/// The plain message a write gets when a client's data folder is gone. WorkBuddy and
+/// WorkBuddy AI are desktop apps that create their own folder; Toolport never creates
+/// it, even when it disappears after the Clients page found it.
+pub(crate) fn folder_gone_message(client_id: &str) -> Option<&'static str> {
+    match client_id {
+        "workbuddy" => Some("WorkBuddy's folder is gone. Client config unchanged."),
+        "workbuddy-ai" => Some("WorkBuddy AI's folder is gone. Client config unchanged."),
+        _ => None,
+    }
+}
+
+/// [`folder_gone_message`] for the client whose fixed config file is `path`.
+pub(crate) fn folder_gone_message_for_path(path: &Path) -> Option<&'static str> {
+    ["workbuddy", "workbuddy-ai"]
+        .into_iter()
+        .find(|id| client_config_path(id).is_some_and(|own| own == path))
+        .and_then(folder_gone_message)
+}
+
+/// A client from [`folder_gone_message`] is installed only when its data folder is a
+/// real folder; a stray file with that name is not an install.
+fn data_folder_missing(client_id: &str, config_path: Option<&Path>) -> bool {
+    folder_gone_message(client_id).is_some()
+        && !config_path.and_then(Path::parent).is_some_and(Path::is_dir)
+}
+
 fn amazon_q_dir(home: &Path) -> PathBuf {
     home.join(".aws").join("amazonq")
 }
@@ -3497,6 +3527,37 @@ fn defs() -> Vec<ClientDef> {
             // manage the user one so the gateway is available everywhere. Bare `command` and
             // `url` entries read as stdio and http, and `type` is accepted for `transport`.
             path: || client_config_path("command-code"),
+            plugin_scan: None,
+        },
+        ClientDef {
+            location: None,
+            id: "workbuddy",
+            discovery: discovery::capabilities("workbuddy"),
+            tool_names: None,
+            name: "WorkBuddy",
+            format: Format::JsonMcpServers,
+            uses_connectors: false,
+            // WorkBuddy, Tencent's desktop agent (China build, `com.tencent.workbuddy.mac`),
+            // reads `mcp.json` (`mcpServers`) in its `product.json` data folder,
+            // `~/.workbuddy` on every OS (`dataFolderName` in the 5.11.3 app bundle's
+            // `cli/product.json`; MCP setup: the Connector guide, workbuddy.ai/docs). Per-project `.workbuddy/mcp.json` files are left
+            // alone. Toolport never creates the folder (see `folder_gone_message`).
+            path: || client_config_path("workbuddy"),
+            plugin_scan: None,
+        },
+        ClientDef {
+            location: None,
+            id: "workbuddy-ai",
+            discovery: discovery::capabilities("workbuddy-ai"),
+            tool_names: None,
+            name: "WorkBuddy AI",
+            format: Format::JsonMcpServers,
+            uses_connectors: false,
+            // WorkBuddy AI, the international build (`com.workbuddy.workbuddy-ai`), is a
+            // separate app with its own data folder, `~/.workbuddy-ai` (`dataFolderName`
+            // in the 5.11.4 app bundle's `cli/product.json`), and the same `mcp.json`
+            // shape. It never reads the China build's file.
+            path: || client_config_path("workbuddy-ai"),
             plugin_scan: None,
         },
         ClientDef {
@@ -4987,6 +5048,8 @@ fn read_client(def: &ClientDef) -> DetectedClient {
         Vec::new()
     };
 
+    // The native path for the folder check; `config_path` below is only for display.
+    let native_path = resolved_definition_path(def).ok();
     let build = |config_path: String,
                  config_exists: bool,
                  servers: Vec<McpServer>,
@@ -5015,7 +5078,8 @@ fn read_client(def: &ClientDef) -> DetectedClient {
         let app_present =
             !def.location.as_ref().is_some_and(|row| {
                 locations::is_t3_home(row) && !t3code::path_is_safe(&row.config_path)
-            }) && app_present_with_override(&config_path, config_exists, install_marker.as_deref());
+            }) && app_present_with_override(&config_path, config_exists, install_marker.as_deref())
+                && !data_folder_missing(def.id, native_path.as_deref());
         DetectedClient {
             id: def
                 .location
@@ -5088,6 +5152,18 @@ fn read_client(def: &ClientDef) -> DetectedClient {
                 Some(error),
             ),
         };
+    }
+
+    // A client from `folder_gone_message` is there only when its data folder is a real
+    // folder: a missing folder, or a stray file with its name, is no install and no config.
+    if folder_gone_message(def.id).is_some() && mutation::read(&path).is_none() {
+        match path.parent().map(std::fs::metadata) {
+            Some(Ok(meta)) if !meta.is_dir() => return build(config_path, false, Vec::new(), None),
+            Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return build(config_path, false, Vec::new(), None)
+            }
+            _ => {}
+        }
     }
 
     if mutation::read(&path).is_none() {
@@ -5397,7 +5473,7 @@ pub fn client_metadata() -> Vec<DetectedClient> {
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_default();
-            let config_exists = path.is_some_and(|path| path.is_file());
+            let config_exists = path.as_ref().is_some_and(|path| path.is_file());
             DetectedClient {
                 id: def.client_id().into(),
                 name: def
@@ -5409,7 +5485,8 @@ pub fn client_metadata() -> Vec<DetectedClient> {
                 location_removable: def.location.as_ref().is_some_and(|row| row.manual),
                 location_kept_by_t3_code: false,
                 discovery: def.discovery,
-                app_present: app_present_for(&config_path, config_exists),
+                app_present: app_present_for(&config_path, config_exists)
+                    && !data_folder_missing(def.id, path.as_deref()),
                 config_path,
                 config_exists,
                 servers: Vec::new(),
@@ -16748,6 +16825,8 @@ command = "npx"
             "junie",
             "devin-cli",
             "command-code",
+            "workbuddy",
+            "workbuddy-ai",
             "tabnine",
         ] {
             let d = defs()

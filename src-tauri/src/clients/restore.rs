@@ -111,6 +111,11 @@ fn refuse_started(file: &Path) -> Result<(), String> {
 // Every caller of `load` is part of a restore, Connect, reconnect, uninstall
 // or move path. Read-only listing (`recorded_paths`, recovery inventory) checks
 // the phase itself and never reaches this refusal.
+/// The config text recorded before Toolport first changed this file, if it existed.
+pub(super) fn original_text(client_id: &str, path: &Path) -> Result<Option<String>, String> {
+    Ok(load(client_id, path)?.and_then(|record| record.original))
+}
+
 fn load(client_id: &str, path: &Path) -> Result<Option<Snapshot>, String> {
     let file = record_path(client_id, path)?;
     refuse_started(&file)?;

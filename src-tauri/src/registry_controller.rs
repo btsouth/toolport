@@ -329,7 +329,17 @@ impl ClientConfigReceipt {
             .as_ref()
             .map(|path| clients::read_client_backup(path, &self.target))
             .transpose()?;
-        registry::client_file::commit(&self.target, &revision, original.as_deref())?;
+        // A client whose folder Toolport never creates keeps that rule in rollback too:
+        // with the folder gone, the backup stays and the rollback reports it.
+        match clients::folder_gone_message_for_path(&self.target) {
+            Some(missing) => registry::client_file::commit_in_existing_folder(
+                &self.target,
+                &revision,
+                original.as_deref(),
+                missing,
+            )?,
+            None => registry::client_file::commit(&self.target, &revision, original.as_deref())?,
+        }
         if let Some(file) = &self.recovery_path {
             clients::record_config_rollback(file, &self.target, original.as_deref())?;
         }

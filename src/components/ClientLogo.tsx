@@ -3,7 +3,7 @@ import { cn } from "@/lib/utils";
 
 // Vendored official marks from @lobehub/icons-static-svg (MIT), simple-icons
 // (CC0), devicon (MIT), and vendor-published marks for Factory Droid, BoltAI,
-// AnythingLLM, Continue, Oh My Pi, Crush, Jan, Witsy and ZCode.
+// AnythingLLM, Continue, Oh My Pi, Crush, Jan, Witsy, WorkBuddy and ZCode.
 // External local assets load only for clients actually on screen and can be
 // cached by the webview. Keep the mixed-color Amazon mark inline because its
 // orange accent and inherited foreground cannot both be expressed by a mask.
@@ -91,6 +91,8 @@ const CLIENT_LOGO: Record<string, string> = {
   jan: "jan",
   witsy: "witsy",
   zcode: "zcode",
+  workbuddy: "workbuddy",
+  "workbuddy-ai": "workbuddy",
 };
 
 /** Initials for the monogram fallback: two letters for multi-word names, else two chars. */

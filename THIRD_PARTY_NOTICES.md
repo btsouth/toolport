@@ -96,8 +96,8 @@ It is used only to identify the corresponding server and remains the property of
 
 ## Client vendor marks
 
-The Crush, Jan, Witsy and ZCode client icons are taken from each project's own
-website or repository. They are used only to identify the corresponding client
+The Crush, Jan, Witsy, WorkBuddy (also used for WorkBuddy AI) and ZCode client icons are taken from each
+project's own website or repository. They are used only to identify the corresponding client
 and remain the property of their owners.
 
 ## RevenueCat

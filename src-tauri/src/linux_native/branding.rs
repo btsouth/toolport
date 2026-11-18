@@ -98,6 +98,9 @@ pub(super) fn client_logo(id: &str) -> gtk::Image {
         "jan" => Some(include_bytes!("../../icons/client-logos/jan.png")),
         "witsy" => Some(include_bytes!("../../icons/client-logos/witsy.png")),
         "zcode" => Some(include_bytes!("../../icons/client-logos/zcode.png")),
+        "workbuddy" | "workbuddy-ai" => {
+            Some(include_bytes!("../../icons/client-logos/workbuddy.png"))
+        }
         _ => None,
     };
     bytes.map_or_else(

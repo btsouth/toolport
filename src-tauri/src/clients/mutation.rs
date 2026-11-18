@@ -101,14 +101,15 @@ pub(super) fn strict_json(path: &Path) -> bool {
 }
 
 pub(super) fn write(path: &Path, contents: &str) -> Result<(), String> {
+    let leave_absent = nothing_left_in_a_gone_folder(path, contents)?;
     let staged = PENDING.with(|slot| -> Result<bool, String> {
         let mut slot = slot.borrow_mut();
         let Some(pending) = slot.as_mut() else {
             return Ok(false);
         };
         if path == pending.path {
-            pending.output = Some(contents.into());
-            pending.remove = false;
+            pending.output = (!leave_absent).then(|| contents.into());
+            pending.remove = leave_absent;
         } else {
             let dir = crate::registry::conduit_dir().ok_or("Could not resolve data dir")?;
             let parent = path.parent().ok_or("Auxiliary path has no parent")?;
@@ -376,7 +377,17 @@ fn run_inner<T>(
                 jsonc_settings,
             )?;
             let commit = super::locations::validate_mutation(client_id, path).and_then(|()| {
-                crate::registry::client_file::commit(path, &revision, output.as_deref())
+                match super::folder_gone_message(client_id) {
+                    Some(missing) => crate::registry::client_file::commit_in_existing_folder(
+                        path,
+                        &revision,
+                        output.as_deref(),
+                        missing,
+                    ),
+                    None => {
+                        crate::registry::client_file::commit(path, &revision, output.as_deref())
+                    }
+                }
             });
             if commit.is_err() {
                 recovery.rollback()?;
@@ -412,6 +423,55 @@ fn run_inner<T>(
         }
     }
     Err(format!("Client config {} keeps changing; retry after the client finishes saving. Config unchanged.", path.display()))
+}
+
+/// A Disconnect of a client from [`super::folder_gone_message`] whose folder is gone,
+/// when the file was absent and would be put back with no servers and no settings,
+/// and Toolport owes it nothing: no servers moved into the gateway and no original
+/// text with content. The app and its folder were removed, so the file stays absent.
+/// When something is owed, the write goes ahead and stops at the missing folder, which
+/// keeps the move record and recovery copies for a retry once the folder is back.
+fn nothing_left_in_a_gone_folder(path: &Path, contents: &str) -> Result<bool, String> {
+    let Some((client_id, original_absent, disconnecting)) = PENDING.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|pending| pending.path == path)
+            .map(|pending| {
+                (
+                    pending.client_id.clone(),
+                    pending.original.is_none(),
+                    pending.disconnecting,
+                )
+            })
+    }) else {
+        return Ok(false);
+    };
+    if !disconnecting
+        || !original_absent
+        || super::folder_gone_message(&client_id).is_none()
+        || path.parent().is_some_and(Path::is_dir)
+        || !empty_config(contents)
+        || super::moved::matches_path(&client_id, path)?
+    {
+        return Ok(false);
+    }
+    Ok(super::restore::original_text(&client_id, path)?.is_none_or(|text| empty_config(&text)))
+}
+
+/// A blank file, `{}` or `{"mcpServers": {}}`: a config with no servers and no
+/// settings. Blank text counts as empty, as it does when Connect reads it.
+fn empty_config(text: &str) -> bool {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    text.trim().is_empty()
+        || serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|root| root.as_object().cloned())
+            .is_some_and(|root| {
+                root.iter().all(|(key, value)| {
+                    key == "mcpServers"
+                        && value.as_object().is_some_and(|servers| servers.is_empty())
+                })
+            })
 }
 
 #[cfg(test)]
