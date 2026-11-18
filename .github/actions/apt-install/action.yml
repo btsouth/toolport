@@ -1,0 +1,90 @@
+name: Install apt packages with a .deb cache
+description: >
+  Runs scripts/ci-apt-install.sh with the downloaded .deb files carried across
+  runs, so a throttled mirror only has to serve what earlier runs did not get.
+inputs:
+  packages:
+    description: Space-separated apt package names.
+    required: true
+runs:
+  using: composite
+  steps:
+    # The key names the runner image and the package set. Restoring a cache from
+    # another set or an older image is fine: the script hands apt only the debs
+    # whose SHA256 matches the freshly updated index, and drops the rest.
+    - name: Name the apt cache
+      id: key
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        set -euo pipefail
+        dir="${RUNNER_TEMP}/apt-debs"
+        set_hash=$(printf '%s\n' $PACKAGES | sort -u | sha256sum | cut -c1-16)
+        {
+          echo "dir=${dir}"
+          echo "image=apt-debs-${ImageOS:-unknown}-${ImageVersion:-unknown}"
+          echo "os=apt-debs-${ImageOS:-unknown}-"
+          echo "set=${set_hash}"
+        } >>"$GITHUB_OUTPUT"
+
+    - name: Restore cached apt downloads
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        # Never an exact hit: saved keys end in a content hash, so the newest
+        # cache for this set wins, then any for this image, then any for this OS.
+        key: ${{ steps.key.outputs.image }}-${{ steps.key.outputs.set }}
+        restore-keys: |
+          ${{ steps.key.outputs.image }}-${{ steps.key.outputs.set }}-
+          ${{ steps.key.outputs.image }}-
+          ${{ steps.key.outputs.os }}
+
+    - name: Record the restored downloads
+      shell: bash
+      env:
+        DIR: ${{ steps.key.outputs.dir }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$DIR"
+        find "$DIR" -type f -name '*.deb' -printf '%P\n' | sort >"${RUNNER_TEMP}/apt-debs-before"
+        echo "restored $(wc -l <"${RUNNER_TEMP}/apt-debs-before") cached debs"
+
+    - name: Install packages
+      shell: bash
+      env:
+        TOOLPORT_APT_DEB_CACHE: ${{ steps.key.outputs.dir }}
+        PACKAGES: ${{ inputs.packages }}
+      # Word splitting is the point: PACKAGES is a list of package names.
+      run: |
+        # shellcheck disable=SC2086
+        "${GITHUB_ACTION_PATH}/../../../scripts/ci-apt-install.sh" $PACKAGES
+
+    # Runs after a failed install too, so the debs a throttled run did fetch are
+    # kept and the next run resumes from them. Skipped when nothing new arrived,
+    # which keeps a warm cache from writing a copy of itself every run.
+    - name: Check for new downloads
+      id: new
+      if: always()
+      shell: bash
+      env:
+        DIR: ${{ steps.key.outputs.dir }}
+        PREFIX: ${{ steps.key.outputs.image }}-${{ steps.key.outputs.set }}
+      run: |
+        set -euo pipefail
+        [ -d "$DIR" ] || exit 0
+        find "$DIR" -type f -name '*.deb' -printf '%P\n' | sort >"${RUNNER_TEMP}/apt-debs-after"
+        fresh=$(comm -13 "${RUNNER_TEMP}/apt-debs-before" "${RUNNER_TEMP}/apt-debs-after" | wc -l)
+        partial=$(find "$DIR/partial" -type f -size +0 2>/dev/null | wc -l)
+        echo "${fresh} new debs and ${partial} partial downloads to keep"
+        if [ "$fresh" -gt 0 ] || [ "$partial" -gt 0 ]; then
+          content=$(find "$DIR" -type f -printf '%P %s\n' | sort | sha256sum | cut -c1-16)
+          echo "key=${PREFIX}-${content}" >>"$GITHUB_OUTPUT"
+        fi
+
+    - name: Save apt downloads
+      if: always() && steps.new.outputs.key != ''
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: ${{ steps.new.outputs.key }}
