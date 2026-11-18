@@ -18,6 +18,14 @@
 # each time burning the full 45-minute budget. Only the heavy WebKitGTK job hit
 # it; the jobs asking for four packages finished in three minutes.
 #
+# The bounds stop a hang, but they cannot make a mirror that serves small debs
+# at seconds each finish the WebKitGTK set inside three attempts. That failed
+# "Rust Clippy (desktop)" on main and twice on PR #1419. So the downloads carry
+# across runs: .github/actions/apt-install restores a directory of earlier debs
+# and saves it again afterwards, failed runs included. Set
+# TOOLPORT_APT_DEB_CACHE to that directory. Each run then only fetches what
+# no earlier run got, and a slow-but-progressing mirror finishes eventually.
+#
 # Usage: scripts/ci-apt-install.sh <package>...
 set -euo pipefail
 
@@ -42,6 +50,10 @@ per_attempt_secs=120
 # docker-publish.yml allow 30. Those jobs pull a handful of small debs, so they
 # reach the bounds only if the mirror is dead, in which case they were losing the
 # job anyway. Re-check this arithmetic before raising either budget.
+#
+# The deb cache does not change these bounds. Seeding it costs one hash and one
+# index lookup per cached deb after the update, a few seconds for the WebKitGTK
+# set, and copying it back on exit is a local copy of at most a few hundred MB.
 download_attempt_secs=300
 # SIGTERM is the polite ask. An apt wedged on a dead socket can sit through it,
 # which would put the unbounded wait straight back; follow up with SIGKILL.
@@ -75,6 +87,70 @@ if ! printf '%s\n' \
   echo "could not write ${apt_conf}; apt keeps its default timeouts" >&2
 fi
 
+deb_cache="${TOOLPORT_APT_DEB_CACHE:-}"
+archives=/var/cache/apt/archives
+
+# Hand apt the cached debs it can trust. A cache is written by other runs, so a
+# deb goes in only when its SHA256 matches the record the just-updated index has
+# for the package, version and architecture its filename names. apt looks debs
+# up by filename and checks only their size, so the filename is what has to
+# match. Anything that fails that check (an old version, a corrupt file) is left
+# out, which also prunes the cache when it is saved again. A valid deb from
+# another package set passes it and stays, so caches restored across sets carry
+# their union; seeding never limits itself to the requested packages.
+#
+# Partial downloads are never carried across runs. A copied partial gets a new
+# mtime, apt sends that as If-Range, and the mirror answers with the whole file
+# from byte zero, so it bought nothing and left junk in the cache. Inside one
+# run apt still resumes its partials across the bounded attempts below, because
+# /var/cache/apt/archives/partial stays put.
+seed_deb_cache() {
+  local deb name pkg ver arch sum records seeded=0 skipped=0
+  for deb in "$deb_cache"/*.deb; do
+    [ -f "$deb" ] || continue
+    name=$(basename "$deb" .deb)
+    IFS=_ read -r pkg ver arch <<<"$name"
+    ver=${ver//%3a/:}
+    sum=$(sha256sum "$deb" | cut -d' ' -f1)
+    # Captured rather than piped into grep -q, which can exit early and fail the
+    # pipeline on SIGPIPE under pipefail.
+    records=$(apt-cache show "${pkg}:${arch}=${ver}" 2>/dev/null || true)
+    if [ -n "$arch" ] && grep -qx "SHA256: ${sum}" <<<"$records"; then
+      sudo cp "$deb" "$archives/"
+      seeded=$((seeded + 1))
+    else
+      skipped=$((skipped + 1))
+    fi
+  done
+  echo "deb cache: ${seeded} debs reused, ${skipped} not in the current index"
+}
+
+# Copy the complete debs apt holds back into the cache directory, on every exit,
+# so a run the mirror defeated still leaves its progress for the next one. Every
+# deb there passed a SHA256 check against the index: the seed step's, or apt's
+# own before it moves a download out of partial/. Rebuilt rather than merged, so
+# stale debs dropped by the seed step do not come back.
+save_deb_cache() {
+  [ -n "$deb_cache" ] || return 0
+  rm -rf "$deb_cache"
+  mkdir -p "$deb_cache"
+  sudo find "$archives" -maxdepth 1 -name '*.deb' -exec cp -t "$deb_cache/" {} + || true
+  sudo chown -R "$(id -u):$(id -g)" "$deb_cache" || true
+  echo "deb cache: kept $(find "$deb_cache" -maxdepth 1 -name '*.deb' | wc -l) debs"
+}
+
+# Saving is best effort and must not change the result: keep the status the
+# script was exiting with, success or failure.
+save_deb_cache_on_exit() {
+  local status=$?
+  save_deb_cache || echo "deb cache: could not save" >&2
+  exit "$status"
+}
+
+if [ -n "$deb_cache" ]; then
+  mkdir -p "$deb_cache"
+fi
+
 run_apt() {
   local budget="$1"
   shift
@@ -98,6 +174,14 @@ done
 if [ -z "$updated" ]; then
   echo "apt-get update failed ${attempts} times; see the apt error above" >&2
   exit 1
+fi
+
+# The cache is rebuilt from what apt holds only once seeding has run. Before
+# that, apt's archive holds none of the restored debs, so a run whose index
+# refresh failed would replace a warm cache with an empty one.
+if [ -n "$deb_cache" ]; then
+  seed_deb_cache
+  trap save_deb_cache_on_exit EXIT
 fi
 
 # Fetch first, on a bound, so a stalled mirror is interrupted and retried. This
