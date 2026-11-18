@@ -443,6 +443,28 @@ try {
     await expect(
       page.getByRole("heading", { name: "Review and connect Codex" }),
     ).toBeVisible();
+    // Each card's 3px focus ring and selection ring fit inside every box that
+    // clips it on the way up to the dialog, so neither is cut at the sides.
+    const clipped = await page.evaluate(() =>
+      [...document.querySelectorAll('[role="dialog"] button[aria-pressed]')].flatMap(
+        (card) => {
+          const box = card.getBoundingClientRect();
+          const cuts = [];
+          for (let el = card.parentElement; el && el.getAttribute("role") !== "dialog";) {
+            if (getComputedStyle(el).overflowX !== "visible") {
+              const clip = el.getBoundingClientRect();
+              if (box.left - clip.left < 3 || clip.right - box.right < 3)
+                cuts.push(
+                  `${card.textContent.trim().slice(0, 20)} in ${el.dataset.slot ?? el.className}`,
+                );
+            }
+            el = el.parentElement;
+          }
+          return cuts;
+        },
+      ),
+    );
+    expect(clipped).toEqual([]);
     await page.getByText("Details", { exact: true }).click();
     await expect(page.getByText(/Backups will be saved/)).toBeVisible();
     await page.getByText("Details", { exact: true }).click();

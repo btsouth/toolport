@@ -251,8 +251,8 @@ function ImportReviewContent({
           </p>
         )}
         {/* The inset keeps each card's selection and focus rings inside the
-            scroller, which would clip them, while the cards stay aligned. */}
-        <div className="-m-1 flex max-h-72 flex-col gap-2 overflow-y-auto p-1">
+            scroller and the dialog body, which both clip them. */}
+        <div className="-my-1 flex max-h-72 flex-col gap-2 overflow-y-auto p-1">
           {keyedItems.map(({ item, key }) => {
             const isSelected = selected.has(key);
             return (
