@@ -478,15 +478,37 @@ pub(crate) fn append_lines_at(
     max_bytes: u64,
     keep_lines: usize,
 ) -> Result<(), crate::telemetry::AppendError> {
-    // Deferred texts exist only in the bounded in-memory queue, never on disk.
-    let lines: Vec<String> = lines.iter().map(|line| tokenize_line(line)).collect();
-    append_lines_at_with_hook(path, &lines, max_bytes, keep_lines, None)
+    let lines: Vec<String> = lines.iter().map(|line| prepare_line(line)).collect();
+    append_prepared_lines_at(path, &lines, max_bytes, keep_lines)
 }
 
-fn tokenize_line(line: &str) -> String {
+/// Append rows already passed through [`prepare_line`]. The telemetry writer
+/// prepares each row once, so a retry on a busy lock never tokenizes it again.
+/// Redaction still runs under the lock, with every secret known by then.
+pub(crate) fn append_prepared_lines_at(
+    path: &Path,
+    lines: &[String],
+    max_bytes: u64,
+    keep_lines: usize,
+) -> Result<(), crate::telemetry::AppendError> {
+    append_lines_at_with_hook(path, lines, max_bytes, keep_lines, None)
+}
+
+/// Replace a row's deferred texts with their token counts. Deferred texts exist
+/// only in the bounded in-memory queue, never on disk.
+pub(crate) fn prepare_line(line: &str) -> String {
     let Ok(mut row) = serde_json::from_str::<Value>(line) else {
         return line.to_owned();
     };
+    #[cfg(test)]
+    if let Some(text) = row["_fullText"].as_str() {
+        if text.starts_with("tokenize-probe-") {
+            TOKENIZED_PROBES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(text.to_owned());
+        }
+    }
     for (text_key, count_key) in [
         ("_fullText", "fullTokens"),
         ("_exposedText", "exposedTokens"),
@@ -528,6 +550,21 @@ fn tokenize_line(line: &str) -> String {
         row["byServer"] = json!(shares);
     }
     row.to_string()
+}
+
+/// `_fullText` values starting with `tokenize-probe-` that [`prepare_line`] has
+/// tokenized, so a test can count the work for its own row.
+#[cfg(test)]
+static TOKENIZED_PROBES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn tokenized_probe_count(probe: &str) -> usize {
+    TOKENIZED_PROBES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|text| *text == probe)
+        .count()
 }
 
 fn append_lines_at_with_hook(

@@ -66,7 +66,9 @@ struct Record {
 
 enum Msg {
     Record(Record),
-    Flush(SyncSender<()>),
+    /// A FIFO barrier, answered once every record queued before it has landed or
+    /// been counted, and forgotten once its caller's deadline passes.
+    Flush(SyncSender<()>, Option<Instant>),
 }
 
 #[derive(Default)]
@@ -218,7 +220,8 @@ impl Writer {
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         #[cfg(any(test, feature = "test-support"))]
         let started = Instant::now();
-        let queued = tx.try_send(Msg::Flush(done_tx)).is_ok();
+        let deadline = Instant::now().checked_add(budget);
+        let queued = tx.try_send(Msg::Flush(done_tx, deadline)).is_ok();
         if queued && done_rx.recv_timeout(budget).is_ok() {
             return true;
         }
@@ -376,6 +379,8 @@ pub fn activity_notices(value: &serde_json::Value) -> Vec<String> {
 
 /// Lines for one log, in arrival order.
 struct Batch {
+    /// Arrival number of the oldest line, so a flush knows whether it waits on it.
+    first_seq: u64,
     path: std::path::PathBuf,
     rotation: Rotation,
     lines: Vec<String>,
@@ -397,13 +402,16 @@ fn writer_loop(
         }
     };
     let mut pending = Vec::new();
+    // Arrival number of the next record received; `pending[i]` is `pending_seq + i`.
+    let (mut next_seq, mut pending_seq) = (0u64, 0u64);
     // Batches for logs whose lock another process held, retried every pass.
     let mut kept: Vec<Batch> = Vec::new();
-    // Flushes are answered only once nothing queued before them is still kept.
-    let mut waiters: Vec<SyncSender<()>> = Vec::new();
+    // Flushes waiting on kept lines that arrived before them, with the arrival
+    // number they wait up to and their caller's deadline.
+    let mut waiters: Vec<(u64, SyncSender<()>, Option<Instant>)> = Vec::new();
     let mut gaps = GapState::default();
     loop {
-        let first = if kept.is_empty() {
+        let first = if kept.is_empty() && !gaps.busy {
             rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
         } else {
             rx.recv_timeout(RETRY_INTERVAL)
@@ -413,9 +421,10 @@ fn writer_loop(
             Ok(Msg::Record(record)) => {
                 received(&record);
                 pending.push(record);
+                next_seq += 1;
             }
-            Ok(Msg::Flush(waiter)) => {
-                waiters.push(waiter);
+            Ok(Msg::Flush(waiter, deadline)) => {
+                waiters.push((next_seq, waiter, deadline));
                 flushing = true;
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -428,9 +437,10 @@ fn writer_loop(
                     Ok(Msg::Record(record)) => {
                         received(&record);
                         pending.push(record);
+                        next_seq += 1;
                     }
-                    Ok(Msg::Flush(waiter)) => {
-                        waiters.push(waiter);
+                    Ok(Msg::Flush(waiter, deadline)) => {
+                        waiters.push((next_seq, waiter, deadline));
                         break;
                     }
                     Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
@@ -440,13 +450,29 @@ fn writer_loop(
         if let Some(record) = pending.first() {
             gaps.dir = record.path.parent().map(Path::to_path_buf);
         }
-        deliver(&mut pending, &mut kept, counters, capacity, &mut append);
+        deliver(
+            &mut pending,
+            pending_seq,
+            &mut kept,
+            counters,
+            capacity,
+            &mut append,
+        );
+        pending_seq = next_seq;
         gaps.deliver(counters, &mut append);
-        if kept.is_empty() {
-            for waiter in waiters.drain(..) {
+        // Kept lines are in arrival order within a batch, so a batch's first line
+        // says whether a barrier still waits on it. A busy gap marker holds every
+        // barrier, so an exit before it lands reports an incomplete flush.
+        let oldest_kept = kept.iter().map(|batch| batch.first_seq).min();
+        let now = Instant::now();
+        waiters.retain(|(upto, waiter, deadline)| {
+            let settled = !gaps.busy && oldest_kept.is_none_or(|oldest| oldest >= *upto);
+            if settled {
                 let _ = waiter.send(());
+                return false;
             }
-        }
+            deadline.is_none_or(|deadline| deadline > now)
+        });
     }
 }
 
@@ -456,25 +482,33 @@ fn writer_loop(
 /// audit reserve; anything past them is counted as dropped.
 fn deliver(
     pending: &mut Vec<Record>,
+    pending_seq: u64,
     kept: &mut Vec<Batch>,
     counters: &Counters,
     capacity: usize,
     append: &mut impl FnMut(&Path, &[String], Rotation) -> Result<(), AppendError>,
 ) {
     let mut batches = std::mem::take(kept);
-    for record in pending.drain(..) {
+    for (seq, record) in (pending_seq..).zip(pending.drain(..)) {
+        // Prepare savings rows once, so a retry on a busy lock reuses them.
+        let line = match record.rotation {
+            Rotation::Savings { .. } => crate::savings::prepare_line(&record.line),
+            _ => record.line,
+        };
         match batches.iter_mut().find(|batch| batch.path == record.path) {
-            Some(batch) => batch.lines.push(record.line),
+            Some(batch) => batch.lines.push(line),
             None => batches.push(Batch {
+                first_seq: seq,
                 path: record.path,
                 rotation: record.rotation,
-                lines: vec![record.line],
+                lines: vec![line],
             }),
         }
     }
     let non_audit_limit = capacity.saturating_sub((capacity / 4).max(1));
     let (mut kept_lines, mut kept_non_audit) = (0, 0);
     for Batch {
+        first_seq,
         path,
         rotation,
         mut lines,
@@ -502,6 +536,7 @@ fn deliver(
             }
             if !lines.is_empty() {
                 kept.push(Batch {
+                    first_seq,
                     path,
                     rotation,
                     lines,
@@ -535,6 +570,8 @@ fn now_ms() -> u64 {
 
 #[derive(Default)]
 struct GapState {
+    /// A marker found its log busy and is retried on the kept-batch schedule.
+    busy: bool,
     dir: Option<std::path::PathBuf>,
     audit_reported: u64,
     log_reported: u64,
@@ -546,6 +583,7 @@ impl GapState {
         counters: &Counters,
         append: &mut impl FnMut(&Path, &[String], Rotation) -> Result<(), AppendError>,
     ) {
+        self.busy = false;
         let dropped = counters.queue_dropped.load(Ordering::Relaxed);
         let Some(dir) = &self.dir else { return };
         #[cfg(any(test, feature = "test-support"))]
@@ -584,7 +622,9 @@ impl GapState {
             match append(&dir.join(name), &[line], rotation) {
                 Ok(()) => *reported = dropped,
                 // A busy log gets the marker on a later pass.
-                Err(error) if error.unconfirmed.is_none() && crate::registry::take_lock_busy() => {}
+                Err(error) if error.unconfirmed.is_none() && crate::registry::take_lock_busy() => {
+                    self.busy = true;
+                }
                 Err(error) => {
                     counters.write_failures.fetch_add(1, Ordering::Relaxed);
                     let unconfirmed = error.unconfirmed.unwrap_or(1);
@@ -614,7 +654,7 @@ fn append_batch(path: &Path, lines: &[String], rotation: Rotation) -> Result<(),
         Rotation::Savings {
             max_bytes,
             keep_lines,
-        } => crate::savings::append_lines_at(path, lines, max_bytes, keep_lines),
+        } => crate::savings::append_prepared_lines_at(path, lines, max_bytes, keep_lines),
     }
 }
 
@@ -704,7 +744,7 @@ mod tests {
             .tx
             .as_ref()
             .unwrap()
-            .try_send(Msg::Flush(done_tx))
+            .try_send(Msg::Flush(done_tx, None))
             .unwrap_or_else(|_| panic!("flush queue full"));
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         // Counter traffic exhausts only its share. An approval still fits.
@@ -803,6 +843,7 @@ mod tests {
             with_atomic_failure(Rename, || {
                 deliver(
                     &mut records,
+                    0,
                     &mut Vec::new(),
                     &counters,
                     QUEUE_CAPACITY,
@@ -1023,7 +1064,7 @@ mod tests {
             .tx
             .as_ref()
             .unwrap()
-            .try_send(Msg::Flush(barrier_tx))
+            .try_send(Msg::Flush(barrier_tx, None))
             .unwrap_or_else(|_| panic!("barrier queue full"));
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let (returned_tx, returned_rx) = mpsc::sync_channel(1);
@@ -1096,6 +1137,7 @@ mod tests {
                 }
                 deliver(
                     &mut pending,
+                    0,
                     &mut Vec::new(),
                     &counters,
                     QUEUE_CAPACITY,
@@ -1377,5 +1419,146 @@ mod tests {
             stderr.contains("telemetry shutdown budget exhausted"),
             "held log not reported:\n{stderr}"
         );
+    }
+
+    fn wait_for(label: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {label}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn gateway_record(path: &Path, line: &str) -> Record {
+        Record {
+            path: path.to_path_buf(),
+            line: line.into(),
+            rotation: Rotation::Gateway,
+        }
+    }
+
+    /// Queue a flush barrier without waiting on it.
+    fn barrier(writer: &Writer) -> Receiver<()> {
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        writer
+            .tx
+            .as_ref()
+            .unwrap()
+            .try_send(Msg::Flush(done_tx, None))
+            .unwrap();
+        done_rx
+    }
+
+    /// Only contention is retried. Any other lock failure is a failed write, as
+    /// it was before busy logs were kept, so health shows it and flush returns.
+    #[test]
+    fn a_lock_error_other_than_contention_counts_as_a_failed_write() {
+        let dir = scratch("lock-error");
+        let path = dir.join("audit.jsonl");
+        #[cfg(unix)]
+        let code = libc::ENOLCK;
+        #[cfg(windows)]
+        let code = 8; // ERROR_NOT_ENOUGH_MEMORY
+        crate::registry::inject_lock_error_for_test(&path, code);
+        let writer = Writer::spawn(QUEUE_CAPACITY, append_batch);
+        writer.record(Record {
+            path: path.clone(),
+            line: "{\"i\":1}".into(),
+            rotation: trimmed(1 << 20, 100),
+        });
+        assert!(
+            writer.flush(Duration::from_secs(5)),
+            "a lock error was retried as contention"
+        );
+        let health = writer.counters.health();
+        assert_eq!((health.write_failures, health.write_failed_records), (1, 1));
+        assert!(!path.exists());
+        assert!(retire_dir_for_test(&dir, Duration::from_secs(5)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A savings row kept for a busy log is tokenized once, not on every retry.
+    #[test]
+    fn a_kept_savings_row_is_tokenized_once() {
+        let dir = scratch("savings-prepared");
+        let path = dir.join("savings-v4.jsonl");
+        let probe = format!("tokenize-probe-{}", dir.display());
+        let held = crate::registry::lock_at(&path).expect("hold the savings lock");
+        let writer = Writer::spawn(QUEUE_CAPACITY, append_batch);
+        writer.record(Record {
+            path: path.clone(),
+            line: serde_json::json!({"v": 2, "kind": "list", "_fullText": probe}).to_string(),
+            rotation: Rotation::Savings {
+                max_bytes: 1 << 20,
+                keep_lines: 100,
+            },
+        });
+        // The writer retries every 20 ms while the lock is held.
+        assert!(!writer.flush(Duration::from_millis(300)));
+        drop(held);
+        assert!(writer.flush(Duration::from_secs(5)));
+        assert_eq!(crate::savings::tokenized_probe_count(&probe), 1);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("fullTokens") && !content.contains(&probe));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A flush waits on what was queued before it, not on a busy log whose lines
+    /// arrived after it.
+    #[test]
+    fn a_flush_does_not_wait_on_records_queued_after_it() {
+        let dir = scratch("barrier-order");
+        let (a, b, c) = (dir.join("a.log"), dir.join("b.log"), dir.join("c.log"));
+        let held_a = crate::registry::lock_at(&a).expect("hold a");
+        let held_b = crate::registry::lock_at(&b).expect("hold b");
+        let writer = Writer::spawn(QUEUE_CAPACITY, append_batch);
+        writer.record(gateway_record(&a, "before"));
+        let done = barrier(&writer);
+        writer.record(gateway_record(&b, "after"));
+        writer.record(gateway_record(&c, "marker"));
+        // c lands in the pass that kept "after" for b, or a later one.
+        wait_for("the free log", || file_has(&c, "marker"));
+        drop(held_a);
+        assert!(
+            done.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "flush waited on a record queued after it"
+        );
+        assert!(file_has(&a, "before"));
+        assert!(!b.exists());
+        drop(held_b);
+        assert!(writer.flush(Duration::from_secs(5)));
+        assert!(file_has(&b, "after"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A gap marker whose log is busy is retried on the kept-batch schedule and
+    /// holds flush until it lands, even when no record batch is kept.
+    #[test]
+    fn a_busy_gap_marker_is_retried_and_holds_flush() {
+        let dir = scratch("busy-gap");
+        let held = dir.join("x.log");
+        let gateway = dir.join("gateway.log");
+        let held_x = crate::registry::lock_at(&held).expect("hold x");
+        let held_gateway = crate::registry::lock_at(&gateway).expect("hold gateway.log");
+        // Room for three kept non-audit lines; the rest are counted as dropped.
+        let writer = Writer::spawn(4, append_batch);
+        for i in 0..10 {
+            writer.record(gateway_record(&held, &format!("x-{i}")));
+        }
+        wait_for("the audit gap marker", || {
+            file_has(&dir.join("audit.jsonl"), "telemetry_gap")
+        });
+        drop(held_x);
+        wait_for("the kept lines", || file_has(&held, "x-0"));
+        assert!(
+            !writer.flush(Duration::from_millis(300)),
+            "flush passed with a gap marker unwritten"
+        );
+        drop(held_gateway);
+        wait_for("the gateway gap marker without another flush", || {
+            file_has(&gateway, "telemetry gap")
+        });
+        assert!(writer.flush(Duration::from_secs(5)));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

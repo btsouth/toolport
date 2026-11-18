@@ -4920,11 +4920,48 @@ pub(crate) fn take_lock_busy() -> bool {
 
 fn try_lock_once(path: &Path) -> Result<FileLock, String> {
     let file = open_lock_file(path)?;
-    file.try_lock_exclusive().map_err(|error| {
-        LOCK_BUSY.set(true);
-        format!("The lock at {} is busy: {error}", lock_path(path).display())
+    #[cfg(any(test, feature = "test-support"))]
+    let result = match injected_lock_error(path) {
+        Some(error) => Err(error),
+        None => file.try_lock_exclusive(),
+    };
+    #[cfg(not(any(test, feature = "test-support")))]
+    let result = file.try_lock_exclusive();
+    result.map_err(|error| {
+        // Only contention is worth a retry. Any other failure (ENOLCK on a
+        // network share, for one) is a failed write and is counted as one.
+        let busy = error.raw_os_error().is_some()
+            && error.raw_os_error() == fs2::lock_contended_error().raw_os_error();
+        LOCK_BUSY.set(busy);
+        format!(
+            "Could not take the lock at {}: {error}",
+            lock_path(path).display()
+        )
     })?;
     Ok(FileLock(file))
+}
+
+/// Lock paths whose next try-once attempts fail with the given OS error.
+#[cfg(any(test, feature = "test-support"))]
+static INJECTED_LOCK_ERRORS: std::sync::Mutex<Vec<(PathBuf, i32)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn inject_lock_error_for_test(path: &Path, raw_os_error: i32) {
+    INJECTED_LOCK_ERRORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((path.to_path_buf(), raw_os_error));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn injected_lock_error(path: &Path) -> Option<std::io::Error> {
+    INJECTED_LOCK_ERRORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(injected, _)| injected == path)
+        .map(|(_, code)| std::io::Error::from_raw_os_error(*code))
 }
 
 /// Acquire an explicit-path lock with a caller-appropriate contention deadline.
