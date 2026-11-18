@@ -1590,12 +1590,18 @@ mod tests {
         window.close();
     }
     /// The mock MCP server this test probes: `TOOLPORT_MOCK_BIN`, else the one Cargo
-    /// built next to this test binary (`--features test-support --bin mock-mcp-server`),
-    /// else `~/bin/mock-mcp-server` as an omabox copy has it.
+    /// built in a folder above this test binary (`--features test-support --bin
+    /// mock-mcp-server`), else `~/bin/mock-mcp-server` as an omabox copy has it.
     fn mock_mcp_server() -> String {
         let built = std::env::current_exe()
             .ok()
-            .and_then(|exe| Some(exe.parent()?.parent()?.join("mock-mcp-server")));
+            .map(|exe| {
+                exe.ancestors()
+                    .skip(1)
+                    .map(|dir| dir.join("mock-mcp-server"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let home = std::env::var_os("HOME")
             .map(|home| std::path::Path::new(&home).join("bin/mock-mcp-server"));
         std::env::var_os("TOOLPORT_MOCK_BIN")

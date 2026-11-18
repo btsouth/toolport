@@ -351,8 +351,8 @@ jobs:
           GSK_RENDERER: cairo
           GTK_A11Y: none
         run: |
-          # The credential reprobe test starts this mock; Cargo puts it next to the
-          # test binary, where the test looks for it.
+          # The credential reprobe test starts this mock; it looks for it in the
+          # Cargo target folder above its own test binary.
           cargo build --manifest-path src-tauri/Cargo.toml --no-default-features \
             --features gtk-desktop,test-support --bin mock-mcp-server
           for case in \
