@@ -118,3 +118,10 @@ export function selectSecurityEvents(
 ): SecurityEvent[] {
   return dedupeSecurity(events).filter((event) => !isDismissed(event, dismissed, index));
 }
+
+/** Same rule as `integrity::tool_change_asks_review`: with reviews off only a change
+ * verified unblocked, with no pending definition review, becomes plain history.
+ * Blocked, unknown (`blocked` missing or null) and review-required changes still ask. */
+export function toolChangeAsksReview(e: SecurityEvent, reviewsEnabled: boolean): boolean {
+  return reviewsEnabled || e.blocked !== false || e.review_required === true;
+}

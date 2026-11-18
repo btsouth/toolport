@@ -15,6 +15,7 @@ const releaseActivityRevision = vi.fn();
 const getAuditLog = vi.fn();
 const getSearchTraces = vi.fn();
 const getSecurityEvents = vi.fn();
+const getActivitySafety = vi.fn();
 const getToolIdentities = vi.fn();
 const getInspectLog = vi.fn();
 const getSavingsSummary = vi.fn();
@@ -37,6 +38,7 @@ vi.mock("@/lib/api", () => ({
   getSavingsSummary: (...a: unknown[]) => getSavingsSummary(...a),
   getSearchTraces: (...a: unknown[]) => getSearchTraces(...a),
   getSecurityEvents: (...a: unknown[]) => getSecurityEvents(...a),
+  getActivitySafety: (...a: unknown[]) => getActivitySafety(...a),
   getToolIdentities: (...a: unknown[]) => getToolIdentities(...a),
 }));
 
@@ -89,6 +91,11 @@ beforeEach(() => {
   getAuditLog.mockResolvedValue(initialLog);
   getSearchTraces.mockResolvedValue([]);
   getSecurityEvents.mockResolvedValue([]);
+  getActivitySafety.mockResolvedValue({
+    toolChangeReviews: true,
+    blocksNothing: false,
+    reviewsConfirmed: true,
+  });
   getToolIdentities.mockResolvedValue([]);
   getInspectLog.mockResolvedValue([]);
   getSavingsSummary.mockResolvedValue(null);
@@ -1184,8 +1191,8 @@ describe("ActivityView security drift dismissals", () => {
       expect(screen.getByText(/Settings > Quarantined tools/)).toBeInTheDocument();
       const card = within(row.parentElement!);
       expect(
-        card.getByRole("button", { name: "Accept all for this server" }),
-      ).toBeDisabled();
+        card.queryByRole("button", { name: "Accept all for this server" }),
+      ).not.toBeInTheDocument();
       fireEvent.click(row);
       const accept = card.getByRole("button", { name: "Accept this tool" });
       expect(accept).toBeDisabled();
@@ -1245,6 +1252,123 @@ describe("ActivityView security drift dismissals", () => {
     expect(screen.getAllByRole("button", { name: /srv: 1 tool changed/ })).toHaveLength(
       2,
     );
+  });
+
+  it("keeps verified-unblocked tool changes as history when Safety is effectively Off", async () => {
+    localStorage.clear();
+    const change = (tool: string, blocked: boolean | null, historical = false) => ({
+      ...warnEvent(1_700_000_000_000),
+      tool: `srv__${tool}`,
+      new_fp: `v2:${tool}`,
+      blocked,
+      ...(blocked ? { blocked_profiles: ["work"] } : {}),
+      ...(historical ? { historical: true } : {}),
+    });
+    const unblocked = [change("read", false), change("list", false, true)];
+    const OFF = {
+      toolChangeReviews: false,
+      blocksNothing: true,
+      reviewsConfirmed: false,
+    };
+    // The registry prop no longer decides: Rust answers through the command.
+    const shown = async (
+      safety:
+        | {
+            toolChangeReviews: boolean;
+            blocksNothing: boolean;
+            reviewsConfirmed: boolean;
+          }
+        | Error,
+      events: SecurityEvent[],
+    ) => {
+      if (safety instanceof Error) getActivitySafety.mockRejectedValue(safety);
+      else getActivitySafety.mockResolvedValue(safety);
+      getSecurityEvents.mockResolvedValue(events);
+      const view = render(<ActivityView refreshKey={0} registry={null} />);
+      await act(async () => {});
+      const text = view.container.textContent ?? "";
+      const accept = screen.queryAllByRole("button", {
+        name: "Accept all for this server",
+      }).length;
+      view.unmount();
+      return { text, accept };
+    };
+    const offCard = "Toolport records tool changes but does not block them.";
+
+    const off = await shown(OFF, unblocked);
+    expect(off.accept).toBe(0);
+    expect(off.text).not.toContain("Review the changes or accept them");
+    expect(off.text).not.toContain("Open history to review them");
+    expect(off.text).toContain("2 tool-change records");
+    expect(off.text).toContain("Safety is Off.");
+    expect(off.text).toContain(offCard);
+    expect(off.text).not.toContain("Protection active.");
+    // The state comes first, then the records.
+    expect(off.text.indexOf("Safety is Off.")).toBeLessThan(
+      off.text.indexOf("2 tool-change records"),
+    );
+
+    // A blocked, unknown or held change on screen: never the Off card.
+    const blocked = await shown(OFF, [...unblocked, change("delete", true)]);
+    expect(blocked.accept).toBe(1);
+    expect(blocked.text).toContain("1 tool is blocked");
+    expect(blocked.text).toContain("2 tool-change records");
+    expect(blocked.text).not.toContain(offCard);
+    expect(blocked.text).not.toContain("Protection active.");
+    const olderBlocked = await shown(OFF, [change("old", true, true)]);
+    expect(olderBlocked.text).toContain("1 older tool-change records");
+    expect(olderBlocked.text).not.toContain(offCard);
+    const unknown = await shown(OFF, [change("read", null)]);
+    expect(unknown.text).toContain("Blocking status unavailable");
+    expect(unknown.text).not.toContain("tool-change records");
+    expect(unknown.text).not.toContain(offCard);
+    const review = await shown(OFF, [
+      { ...change("read", false), review_required: true },
+    ]);
+    expect(review.text).toContain("Review the captured definition in Settings");
+    expect(review.text).not.toContain("tool-change records");
+    expect(review.text).not.toContain(offCard);
+    // A tool held in a store but not on screen: Rust says Off does not block nothing.
+    const held = await shown(
+      { toolChangeReviews: false, blocksNothing: false, reviewsConfirmed: false },
+      unblocked,
+    );
+    expect(held.text).toContain("2 tool-change records");
+    expect(held.text).not.toContain(offCard);
+    expect(held.text).not.toContain("Protection active.");
+
+    // Reviews on, or an unanswered check, keep the cards as before.
+    for (const safety of [
+      { toolChangeReviews: true, blocksNothing: false, reviewsConfirmed: true },
+      new Error("registry unreadable"),
+    ]) {
+      const ask = await shown(safety, unblocked);
+      expect(ask.text).toContain("Not blocked. Review the changes or accept them.");
+      expect(ask.text).toContain("1 older tool-change records");
+      expect(ask.text).not.toContain("2 tool-change records");
+      expect(ask.text).not.toContain("Safety is Off.");
+    }
+    const resting = await shown(
+      { toolChangeReviews: true, blocksNothing: false, reviewsConfirmed: true },
+      [],
+    );
+    expect(resting.text).toContain("Protection active.");
+    // Only a successful read that confirmed reviews may claim protection: not
+    // after a failed read, an unconfirmed answer, or while the read is pending.
+    for (const safety of [
+      new Error("registry unreadable"),
+      { toolChangeReviews: true, blocksNothing: false, reviewsConfirmed: false },
+    ]) {
+      const unknown = await shown(safety, []);
+      expect(unknown.text).not.toContain("Protection active.");
+      expect(unknown.text).not.toContain("Safety is Off.");
+    }
+    getActivitySafety.mockReturnValue(new Promise(() => {}));
+    getSecurityEvents.mockResolvedValue([]);
+    const pending = render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    expect(pending.container.textContent).not.toContain("Protection active.");
+    pending.unmount();
   });
 });
 

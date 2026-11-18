@@ -2741,6 +2741,16 @@ impl Registry {
             || self.team_forced_block_on_injection
             || self.kept().block_on_injection
     }
+    /// Whether Activity asks the user to review or accept tool changes. Only when
+    /// nothing can be blocked (effective level Off, no kept or team-forced
+    /// quarantine or injection block) are changes shown as plain history, and only
+    /// those verified unblocked (`integrity::tool_change_asks_review`). Both shells
+    /// read it through `tool_change_reviews_now`.
+    pub fn tool_change_reviews_enabled(&self) -> bool {
+        self.safety_level_effective() != SafetyLevel::Off
+            || self.quarantine_on_drift_effective()
+            || self.block_on_injection_effective()
+    }
     /// Whether this server should fail closed on a high-confidence injection hit:
     /// block mode effective, and the server is not on the exempt list.
     pub fn should_block_injection_for(&self, server: &str) -> bool {
@@ -4899,6 +4909,105 @@ pub fn update_at<T>(
     crate::personal_sync::record(&before, &mut reg)?;
     save_to(path, &reg)?;
     Ok((reg, out))
+}
+
+/// `Registry::tool_change_reviews_enabled` for the registry on disk. Reviews stop
+/// only when the primary registry file itself was read: a load failure, a backup
+/// or a first-run default keeps them on, so an older saved Off never hides one.
+pub fn tool_change_reviews_now() -> bool {
+    tool_change_reviews_state().0
+}
+
+/// `(reviews, confirmed)` from one load. `reviews` is [`tool_change_reviews_now`];
+/// `confirmed` is true only when an authoritative read (the file, or a genuine
+/// first run) found reviews on, so Activity may say protection is active.
+pub fn tool_change_reviews_state() -> (bool, bool) {
+    match load_resolved_with_source() {
+        Ok((registry, LoadSource::File)) => {
+            let reviews = registry.tool_change_reviews_enabled();
+            (reviews, reviews)
+        }
+        Ok((registry, LoadSource::FirstRun)) => (true, registry.tool_change_reviews_enabled()),
+        _ => (true, false),
+    }
+}
+
+/// Largest registry read whole for change detection; a bigger file contributes
+/// its length plus its first and last chunks.
+const REGISTRY_STAMP_CAP: u64 = 4 * 1024 * 1024;
+const REGISTRY_STAMP_CHUNK: usize = 64 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes [`registry_content_stamp`] read on this thread, for the size cap test.
+    pub(crate) static REGISTRY_STAMP_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A digest of the resolved registry's content for Activity change detection.
+/// A Safety change can keep the file's length and land in one timestamp tick, so
+/// metadata alone can miss it. Never blocks (non-blocking open, regular files only)
+/// and never reads more than the cap. A missing registry is stable; anything that
+/// cannot be read safely returns a fresh value, so caches re-read instead of
+/// trusting stale state.
+pub fn registry_content_stamp() -> u64 {
+    use std::hash::{Hash, Hasher};
+    use std::io::{Read, Seek, SeekFrom};
+    static CHANGED: AtomicU64 = AtomicU64::new(0);
+    let changed = || {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        ("unreadable", CHANGED.fetch_add(1, Ordering::Relaxed)).hash(&mut hash);
+        hash.finish()
+    };
+    let Some(path) = resolved_path() else {
+        return 0;
+    };
+    let mut options = std::fs::File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A FIFO or device at the registry path must not block Activity.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = match options.open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(_) => return changed(),
+    };
+    // Check the opened handle, not the path, so a swap cannot slip in a FIFO.
+    let Ok(metadata) = file.metadata() else {
+        return changed();
+    };
+    if !metadata.is_file() {
+        return changed();
+    }
+    let len = metadata.len();
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    len.hash(&mut hash);
+    let capped = len > REGISTRY_STAMP_CAP;
+    if capped {
+        metadata.modified().ok().hash(&mut hash);
+    }
+    let mut read = |file: &mut std::fs::File, limit: u64| -> std::io::Result<()> {
+        let mut bytes = Vec::new();
+        file.take(limit).read_to_end(&mut bytes)?;
+        #[cfg(test)]
+        REGISTRY_STAMP_READ.with(|read| read.set(read.get() + bytes.len() as u64));
+        bytes.hash(&mut hash);
+        Ok(())
+    };
+    let chunk = REGISTRY_STAMP_CHUNK as u64;
+    let result = if !capped {
+        read(&mut file, REGISTRY_STAMP_CAP)
+    } else {
+        read(&mut file, chunk)
+            .and_then(|()| file.seek(SeekFrom::End(-(chunk as i64))).map(|_| ()))
+            .and_then(|()| read(&mut file, chunk))
+    };
+    match result {
+        Ok(()) => hash.finish(),
+        Err(_) => changed(),
+    }
 }
 
 /// The path the registry actually resolves to, honoring `TOOLPORT_REGISTRY`
@@ -7897,6 +8006,76 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn registry_content_stamp_never_blocks_and_caps_its_read() {
+        let _data = data_dir_test_lock();
+        let (dir, _override) = scratch_data_dir("reg-content-stamp");
+        let path = dir.join("registry.json");
+        assert_eq!(resolved_path().as_deref(), Some(path.as_path()));
+        // Missing is stable; content changes of the same length count.
+        assert_eq!(registry_content_stamp(), registry_content_stamp());
+        std::fs::write(&path, r#"{"safetyLevel":"ask"}"#).unwrap();
+        let ask = registry_content_stamp();
+        assert_eq!(registry_content_stamp(), ask);
+        std::fs::write(&path, r#"{"safetyLevel":"off"}"#).unwrap();
+        assert_ne!(registry_content_stamp(), ask);
+        // A FIFO at the registry path returns at once, as "changed" each time.
+        std::fs::remove_file(&path).unwrap();
+        let fifo = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (done, finished) = std::sync::mpsc::channel();
+        // The override is process-global, so the worker sees the scratch dir.
+        std::thread::spawn(move || {
+            let _ = done.send((registry_content_stamp(), registry_content_stamp()));
+        });
+        let (first, second) = finished
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a FIFO registry must not block the stamp");
+        assert_ne!(first, second);
+        std::fs::remove_file(&path).unwrap();
+        // An oversized file reads only its first and last chunks.
+        let big = std::fs::File::create(&path).unwrap();
+        big.set_len(REGISTRY_STAMP_CAP + 1024 * 1024).unwrap();
+        drop(big);
+        REGISTRY_STAMP_READ.with(|read| read.set(0));
+        let stamp = registry_content_stamp();
+        assert_eq!(
+            REGISTRY_STAMP_READ.with(std::cell::Cell::get),
+            2 * REGISTRY_STAMP_CHUNK as u64
+        );
+        assert_eq!(registry_content_stamp(), stamp);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tool_change_reviews_stay_on_unless_the_primary_registry_was_read() {
+        let _data = data_dir_test_lock();
+        let (dir, _override) = scratch_data_dir("reg-reviews-source");
+        let path = dir.join("registry.json");
+        assert_eq!(resolved_path().as_deref(), Some(path.as_path()));
+        let mut reg = Registry::default();
+        reg.set_safety_level(SafetyLevel::Off);
+        save_to(&path, &reg).unwrap();
+        assert!(
+            !tool_change_reviews_now(),
+            "a read Off primary stops reviews"
+        );
+        reg.set_safety_level(SafetyLevel::Ask);
+        save_to(&path, &reg).unwrap();
+        assert!(tool_change_reviews_now());
+        // The backup now holds the earlier Off. An unreadable Ask primary (here a
+        // directory, so the read fails without root bypassing it) must not let
+        // that backup turn reviews off.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let (backup, source) = load_resolved_with_source().unwrap();
+        assert_eq!(source, LoadSource::Backup);
+        assert!(!backup.tool_change_reviews_enabled());
+        assert!(tool_change_reviews_now(), "a backup read keeps reviews on");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn failed_quarantine_keeps_primary_and_last_good_during_load_and_repair() {
         let _data = data_dir_test_lock();
@@ -9237,6 +9416,60 @@ mod safety_level_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tool_change_reviews_stop_only_when_nothing_can_block() {
+        let off = || {
+            let mut r = Registry::default();
+            r.set_safety_level(SafetyLevel::Off);
+            r
+        };
+        assert!(!off().tool_change_reviews_enabled());
+        for level in [SafetyLevel::Ask, SafetyLevel::Strict] {
+            let mut r = Registry::default();
+            r.set_safety_level(level);
+            assert!(r.tool_change_reviews_enabled(), "{level:?}");
+        }
+        for floor in [SafetyLevel::Ask, SafetyLevel::Strict] {
+            let mut r = off();
+            r.team_min_safety_level = floor;
+            assert!(r.tool_change_reviews_enabled(), "team floor {floor:?}");
+        }
+        let mut r = off();
+        r.team_forced_human_approval = true;
+        assert!(r.tool_change_reviews_enabled());
+        let mut r = off();
+        r.team_forced_quarantine_on_drift = true;
+        assert!(r.tool_change_reviews_enabled());
+        let mut r = off();
+        r.team_forced_block_on_injection = true;
+        assert!(r.tool_change_reviews_enabled());
+        for kept in [
+            KeptV1Safety {
+                quarantine_on_drift: true,
+                ..Default::default()
+            },
+            KeptV1Safety {
+                block_on_injection: true,
+                ..Default::default()
+            },
+        ] {
+            let mut r = off();
+            r.kept_v1_safety = Some(kept);
+            assert!(r.tool_change_reviews_enabled(), "{kept:?}");
+        }
+        // A 1.x registry that has not migrated: approval off, quarantine on.
+        let mut v1 = Registry {
+            version: 1,
+            safety_level: None,
+            human_approval: false,
+            confirm_destructive: false,
+            ..Registry::default()
+        };
+        assert!(!v1.tool_change_reviews_enabled());
+        v1.quarantine_on_drift = true;
+        assert!(v1.tool_change_reviews_enabled());
     }
 
     #[test]

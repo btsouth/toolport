@@ -88,6 +88,8 @@ export interface SecurityEvent {
   new_fp?: string;
   /** Captured definition requires review in Settings before bound approval. */
   review_required?: boolean;
+  /** Held by a pending pin whose new definition is not captured yet. */
+  pending_capture?: boolean;
   /** Older unblocked records without a captured fingerprint, shown in history. */
   historical?: boolean;
   parameters?: { added: string[]; removed: string[]; changed: string[] };
@@ -118,6 +120,19 @@ export function getBaselineNotice(): Promise<{ ts: number; detail: string } | nu
 /** Recent tool-definition integrity events (newest first). */
 export function getSecurityEvents(limit = 100): Promise<SecurityEvent[]> {
   return invoke<SecurityEvent[]>("get_security_events", { limit });
+}
+
+/** What Activity says about Safety (`integrity::activity_safety`): whether tool
+ * changes ask for review (true when the registry cannot be read) and whether Safety
+ * Off holds nothing. */
+export interface ActivitySafety {
+  toolChangeReviews: boolean;
+  blocksNothing: boolean;
+  /** An authoritative registry read found reviews on: Activity may say protection is active. */
+  reviewsConfirmed: boolean;
+}
+export function getActivitySafety(): Promise<ActivitySafety> {
+  return invoke<ActivitySafety>("activity_safety");
 }
 
 /** Net cl100k_base savings, exact MCP bytes, and separate historical estimates. */

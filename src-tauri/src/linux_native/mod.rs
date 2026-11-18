@@ -1781,12 +1781,35 @@ fn security_event_covered_by_quarantine(
         Some("pins_load_failed") => quarantined.iter().any(|record| {
             record.get("change").and_then(serde_json::Value::as_str) == Some("tamper")
         }),
+        // Every store the event was recorded in (persisted `profiles`, or a legacy
+        // scalar `profile`) needs a hold for the same tool and fingerprint. When
+        // the fields cannot establish that, alert.
         Some("tool_drift" | "tool_poison_flag") => {
             let tool = event.get("tool").and_then(serde_json::Value::as_str);
+            let new_fp = event["new_fp"].as_str();
+            let stores: Vec<&str> = match event["profiles"].as_array() {
+                Some(profiles) => profiles
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect(),
+                None => event["profile"].as_str().into_iter().collect(),
+            };
             tool.is_some_and(|tool| {
-                quarantined.iter().any(|record| {
-                    record.get("tool").and_then(serde_json::Value::as_str) == Some(tool)
-                })
+                new_fp.is_some()
+                    && !stores.is_empty()
+                    && stores.iter().all(|store| {
+                        quarantined.iter().any(|record| {
+                            let held = record["pending_pin"]["fp"]
+                                .as_str()
+                                .or_else(|| record["definition_fp"].as_str());
+                            record.get("tool").and_then(serde_json::Value::as_str) == Some(tool)
+                                && held == new_fp
+                                && crate::integrity::same_integrity_store(
+                                    store,
+                                    record["profile"].as_str().unwrap_or(""),
+                                )
+                        })
+                    })
             })
         }
         _ => false,
@@ -1830,6 +1853,7 @@ fn newly_observed_security_events(
     previous: Option<&std::collections::HashSet<String>>,
     events: &[serde_json::Value],
     quarantined: &[serde_json::Value],
+    tool_change_reviews: bool,
 ) -> (std::collections::HashSet<String>, Vec<serde_json::Value>) {
     let current = events
         .iter()
@@ -1842,6 +1866,10 @@ fn newly_observed_security_events(
         .iter()
         .filter(|event| !previous.contains(&security_event_instance_key(event)))
         .filter(|event| security_event_needs_attention(event))
+        .filter(|event| {
+            event["type"] != "tool_drift"
+                || crate::integrity::tool_change_asks_review(event, tool_change_reviews)
+        })
         .filter(|event| !security_event_covered_by_quarantine(event, quarantined))
         .cloned()
         .collect::<Vec<_>>();
@@ -1851,9 +1879,11 @@ fn newly_observed_security_events(
 /// A damaged quarantine store makes duplicate suppression uncertain, but it
 /// must not stop the independent security-event feed. The quarantine badge
 /// reports its own read failure as unknown.
+/// The flag is `Registry::tool_change_reviews_enabled`, true when unreadable.
 type SecurityWatchSnapshot = (
     Vec<serde_json::Value>,
     Result<Vec<serde_json::Value>, String>,
+    bool,
 );
 
 fn read_security_watch_snapshot() -> Result<SecurityWatchSnapshot, String> {
@@ -1866,7 +1896,17 @@ fn read_security_watch_snapshot() -> Result<SecurityWatchSnapshot, String> {
     // Keep the error distinct from a known-empty quarantine. The badge displays
     // unknown, while this watcher still announces new security findings.
     let quarantined = crate::integrity::all_quarantined_summaries();
-    Ok((events, quarantined))
+    let tool_change_reviews = crate::registry::tool_change_reviews_now();
+    // Raw records carry no block status. Off stays quiet only for changes the
+    // quarantine store verifies as unblocked; an unreadable store keeps alerts.
+    let mut events = events;
+    if !tool_change_reviews {
+        crate::integrity::annotate_review_status(
+            &mut events,
+            &crate::integrity::review_quarantines(),
+        );
+    }
+    Ok((events, quarantined, tool_change_reviews))
 }
 
 fn security_attention_incidents(events: &[serde_json::Value]) -> Vec<serde_json::Value> {
@@ -1909,7 +1949,7 @@ fn start_security_event_watch(
     let seen: std::rc::Rc<std::cell::RefCell<Option<std::collections::HashSet<String>>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let reader = io::SnapshotReader::new(read_security_watch_snapshot, move |result| {
-        let Ok((events, quarantined)) = result else {
+        let Ok((events, quarantined, tool_change_reviews)) = result else {
             return;
         };
         let mut guard = seen.borrow_mut();
@@ -1917,6 +1957,7 @@ fn start_security_event_watch(
             guard.as_ref(),
             &events,
             quarantined.as_deref().unwrap_or_default(),
+            tool_change_reviews,
         );
         *guard = Some(current);
         if newcomers.is_empty() {
@@ -5711,8 +5752,19 @@ impl ActivityPage {
                 activity_section_changed(
                     previous.map(|snapshot| snapshot.security_events.as_slice()),
                     &snapshot.security_events,
-                ) || previous.map(|snapshot| (&snapshot.security_error, snapshot.security_stale))
-                    != Some((&snapshot.security_error, snapshot.security_stale)),
+                ) || previous.map(|snapshot| {
+                    (
+                        &snapshot.security_error,
+                        snapshot.security_stale,
+                        snapshot.tool_change_reviews,
+                        snapshot.blocks_nothing,
+                    )
+                }) != Some((
+                    &snapshot.security_error,
+                    snapshot.security_stale,
+                    snapshot.tool_change_reviews,
+                    snapshot.blocks_nothing,
+                )),
                 activity_section_changed(
                     previous.map(|snapshot| snapshot.tool_identities.as_slice()),
                     &snapshot.tool_identities,
@@ -5830,42 +5882,90 @@ impl ActivityPage {
                 .filter(|event| !security_event_is_dismissed(event, &dismissed))
                 .collect()
         };
+        // With nothing able to block, unblocked tool changes are plain history.
+        let (live, recorded): (Vec<_>, Vec<_>) = live.into_iter().partition(|event| {
+            event["type"] != "tool_drift"
+                || crate::integrity::tool_change_asks_review(event, snapshot.tool_change_reviews)
+        });
         let (older, live): (Vec<_>, Vec<_>) = live
             .into_iter()
             .partition(|event| event["historical"] == true);
-        // The loud lane: tool changes to review, then findings that need a person.
         let groups = crate::integrity::group_tool_changes(&live);
         let has_changes = !groups.is_empty();
-        for group in groups {
-            self.security_list
-                .append(&tool_change_group_card(&group, self.clone()));
+        let (high, info): (Vec<_>, Vec<_>) = live
+            .into_iter()
+            .filter(|event| event["type"] != "tool_drift")
+            .partition(security_event_needs_attention);
+        // Safety Off says what state you are in first, and only while nothing on
+        // this screen or in the stores is blocked or held.
+        if !snapshot.tool_change_reviews
+            && snapshot.blocks_nothing
+            && snapshot.security_error.is_none()
+            && !has_changes
+            && older.is_empty()
+            && high.is_empty()
+        {
+            let card = activity_status_card(
+                StatusTone::Info,
+                crate::i18n::msg("Safety is Off."),
+                crate::i18n::msg("Toolport records tool changes but does not block them."),
+            );
+            // Spec §4: Off is `ban` in React and action-unavailable here.
+            card.tile.set_icon_name(Some("action-unavailable-symbolic"));
+            self.security_list.append(&card.root);
+        }
+        // The loud lane: tool changes to review, then findings that need a person,
+        // in one bordered "Tool changes" section as React draws it.
+        if has_changes {
+            let section = gtk::Box::new(gtk::Orientation::Vertical, 12);
+            section.add_css_class("toolport-card");
+            section.add_css_class("toolport-activity-panel");
+            section.append(&activity_panel_title(
+                "security-high-symbolic",
+                crate::i18n::msg("Tool changes"),
+                None,
+            ));
+            for group in groups {
+                section.append(&tool_change_group_card(&group, self.clone(), false));
+            }
+            self.security_list.append(&section);
         }
         if !older.is_empty() {
-            let history = {
-                let widget = gtk::Expander::builder().build();
-                widget.set_label_widget(Some(&l10n::formatted_label(
-                    "{value0} older tool-change records. Open history to review them.",
-                    &[("value0", &format!("{}", older.len()))],
-                )));
-                widget
-            };
+            let history = tool_change_records_panel(l10n::formatted_label(
+                "{value0} older tool-change records. Open history to review them.",
+                &[("value0", &format!("{}", older.len()))],
+            ));
             let rows = gtk::Box::new(gtk::Orientation::Vertical, 8);
             let page = self.clone();
             let history_rows = rows.clone();
             history.connect_expanded_notify(move |history| {
                 if history.is_expanded() && history_rows.first_child().is_none() {
                     for group in crate::integrity::group_tool_changes(&older) {
-                        history_rows.append(&tool_change_group_card(&group, page.clone()));
+                        history_rows.append(&tool_change_group_card(&group, page.clone(), false));
                     }
                 }
             });
             history.set_child(Some(&rows));
             self.security_list.append(&history);
         }
-        let (high, info): (Vec<_>, Vec<_>) = live
-            .into_iter()
-            .filter(|event| event["type"] != "tool_drift")
-            .partition(security_event_needs_attention);
+        if !recorded.is_empty() {
+            let history = tool_change_records_panel(l10n::formatted_label(
+                "{value0} tool-change records",
+                &[("value0", &format!("{}", recorded.len()))],
+            ));
+            let rows = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            let page = self.clone();
+            let history_rows = rows.clone();
+            history.connect_expanded_notify(move |history| {
+                if history.is_expanded() && history_rows.first_child().is_none() {
+                    for group in crate::integrity::group_tool_changes(&recorded) {
+                        history_rows.append(&tool_change_group_card(&group, page.clone(), true));
+                    }
+                }
+            });
+            history.set_child(Some(&rows));
+            self.security_list.append(&history);
+        }
         if !high.is_empty() {
             let collapsed = crate::integrity::collapse_security_by_identity(&high);
             let count = gtk::Label::new(Some(&collapsed.len().to_string()));
@@ -5898,8 +5998,9 @@ impl ActivityPage {
                 );
             });
             self.security_list.append(&notices);
-        } else if snapshot.security_error.is_none() && !has_changes {
-            // A protection the user never sees builds no trust.
+        } else if snapshot.reviews_confirmed && snapshot.security_error.is_none() && !has_changes {
+            // A protection the user never sees builds no trust. Claim it only
+            // when the registry read confirmed reviews are on.
             self.security_list.append(
                 &activity_status_card(
                     StatusTone::Success,
@@ -7003,12 +7104,23 @@ fn group_can_be_accepted(group: &crate::integrity::ToolChangeGroup) -> bool {
         .all(|event| event.get("signatures").is_none() && change_can_be_accepted(event))
 }
 
+/// The collapsed tool-change records line, a bordered panel like React's.
+fn tool_change_records_panel(label: gtk::Label) -> gtk::Expander {
+    let panel = gtk::Expander::builder().build();
+    panel.add_css_class("toolport-card");
+    panel.add_css_class("toolport-activity-panel");
+    panel.set_label_widget(Some(&label));
+    panel
+}
+
+/// `history` renders a record only: no status, accept or review actions.
 fn tool_change_group_card(
     group: &crate::integrity::ToolChangeGroup,
     page: ActivityPage,
+    history: bool,
 ) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    card.add_css_class("toolport-card");
+    card.add_css_class("toolport-tool-change-group");
     let name = group
         .tools
         .first()
@@ -7022,20 +7134,28 @@ fn tool_change_group_card(
     heading_row.append(
         &gtk::Label::builder()
             .label(format!(
-                "{name}: {}, {}",
-                crate::integrity::tool_change_summary(&group.tools),
-                relative_activity_time(group.ts)
+                "{name}: {}",
+                crate::integrity::tool_change_summary(&group.tools)
             ))
             .xalign(0.0)
             .hexpand(true)
             .wrap(true)
-            .css_classes(["heading"])
+            .css_classes(["toolport-tool-change-title"])
+            .build(),
+    );
+    // The time sits at the end of the row, as React draws it.
+    heading_row.append(
+        &gtk::Label::builder()
+            .label(relative_activity_time(group.ts))
+            .css_classes(["toolport-muted", "caption"])
             .build(),
     );
     heading.set_child(Some(&heading_row));
     heading.add_css_class("flat");
     heading.set_halign(gtk::Align::Fill);
-    l10n::bind_tooltip(&heading, "Expand to review the changed tools");
+    if !history {
+        l10n::bind_tooltip(&heading, "Expand to review the changed tools");
+    }
     let tools = gtk::Box::new(gtk::Orientation::Vertical, 8);
     tools.set_margin_top(8);
     let reveal = gtk::Revealer::new();
@@ -7050,7 +7170,7 @@ fn tool_change_group_card(
     let detail_page = page.clone();
     if reveal.reveals_child() {
         for event in &detail_events {
-            tools.append(&security_notice_card(event, 1, detail_page.clone()));
+            tools.append(&tool_change_detail_card(event, &detail_page, history));
         }
     }
     arrow.set_icon_name(Some(if reveal.reveals_child() {
@@ -7063,7 +7183,7 @@ fn tool_change_group_card(
         let expanded = !reveal_for_toggle.reveals_child();
         if expanded && tools.first_child().is_none() {
             for event in &detail_events {
-                tools.append(&security_notice_card(event, 1, detail_page.clone()));
+                tools.append(&tool_change_detail_card(event, &detail_page, history));
             }
         }
         reveal_for_toggle.set_reveal_child(expanded);
@@ -7075,6 +7195,10 @@ fn tool_change_group_card(
         remember_activity_expansion(&mut expanded_rows.borrow_mut(), &expansion_key, expanded);
     });
     card.append(&heading);
+    if history {
+        card.append(&reveal);
+        return card;
+    }
     let blocked = group
         .tools
         .iter()
@@ -7085,8 +7209,24 @@ fn tool_change_group_card(
         .tools
         .iter()
         .any(|event| event["review_required"] == true);
-    let status = if review_required {
+    // Capture status belongs to each tool: any captured review keeps the Settings
+    // route; the group waits only when every review is still being captured.
+    let capturing = review_required
+        && group
+            .tools
+            .iter()
+            .all(|event| event["review_required"] != true || event["pending_capture"] == true);
+    let status = if capturing {
+        crate::i18n::tr(
+            "Toolport is capturing this tool's new definition. It stays blocked until then.",
+        )
+        .to_string()
+    } else if review_required {
         crate::i18n::tr("Review the captured definition in Settings before accepting it.")
+            .to_string()
+    } else if unknown {
+        // Unknown wins over blocked: the group cannot be accepted here.
+        crate::i18n::tr("Blocking status unavailable. Review in Settings > Quarantined tools.")
             .to_string()
     } else if blocked > 0 {
         crate::i18n::trf(
@@ -7097,43 +7237,152 @@ fn tool_change_group_card(
             },
             &[("value0", &format!("{}", blocked))],
         )
-    } else if unknown {
-        crate::i18n::tr("Blocking status unavailable. Review in Settings > Quarantined tools.")
-            .to_string()
     } else {
         crate::i18n::tr("Not blocked. Review the changes or accept them.").to_string()
     };
     let label = empty_activity_label(&status);
+    label.add_css_class("toolport-tool-change-status");
+    label.set_hexpand(false);
+    // Keep the line whole beside the buttons; it still wraps on a narrow window.
+    label.set_natural_wrap_mode(gtk::NaturalWrapMode::None);
     if blocked > 0 {
+        card.add_css_class("blocked");
         label.add_css_class("error");
     }
-    card.append(&label);
-    let accept = l10n::button("Accept all for this server");
-    accept.set_halign(gtk::Align::Start);
-    accept.set_sensitive(group_can_be_accepted(group));
+    // React's row: status, Review in Settings beside it, Accept all at the end,
+    // then any warning.
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.append(&label);
+    if review_required && !capturing {
+        let review = l10n::button("Review in Settings");
+        review.add_css_class("toolport-secondary-action");
+        review.set_valign(gtk::Align::Center);
+        review.set_action_name(Some("app.review-quarantine"));
+        actions.append(&review);
+    }
+    // Shown only when it can be used; the sentence beside it or the
+    // suspicious-content line says what to do otherwise.
+    if group_can_be_accepted(group) {
+        let accept = l10n::button("Accept all for this server");
+        accept.add_css_class("toolport-secondary-action");
+        accept.set_hexpand(true);
+        accept.set_halign(gtk::Align::End);
+        accept.set_valign(gtk::Align::Center);
+        let events = group.tools.clone();
+        accept.connect_clicked(move |button| {
+            button.set_sensitive(false);
+            page.accept_security(events.clone());
+        });
+        actions.append(&accept);
+    }
+    card.append(&actions);
     if group
         .tools
         .iter()
         .any(|event| event.get("signatures").is_some())
     {
-        card.append(&empty_activity_source_label(crate::i18n::msg(
+        let warning = empty_activity_source_label(crate::i18n::msg(
             "Suspicious content found. Review and accept each tool separately.",
-        )));
-    }
-    let events = group.tools.clone();
-    accept.connect_clicked(move |button| {
-        button.set_sensitive(false);
-        page.accept_security(events.clone());
-    });
-    card.append(&accept);
-    if review_required {
-        let review = l10n::button("Review in Settings");
-        review.set_halign(gtk::Align::Start);
-        review.set_action_name(Some("app.review-quarantine"));
-        card.append(&review);
+        ));
+        // Red, as React draws it.
+        warning.add_css_class("toolport-tool-change-status");
+        warning.add_css_class("error");
+        card.append(&warning);
     }
     card.append(&reveal);
     card
+}
+
+fn tool_change_detail_card(
+    event: &serde_json::Value,
+    page: &ActivityPage,
+    history: bool,
+) -> gtk::Expander {
+    if history {
+        tool_change_record_card(event, page)
+    } else {
+        security_notice_card(event, 1, page.clone())
+    }
+}
+
+/// One tool change kept as a record: what changed, without accept or review actions.
+fn tool_change_record_card(event: &serde_json::Value, page: &ActivityPage) -> gtk::Expander {
+    let card = gtk::Expander::new(None);
+    card.add_css_class("toolport-card");
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    row.append(
+        &gtk::Label::builder()
+            .label(tool_change_subject(event))
+            .halign(gtk::Align::Fill)
+            .hexpand(true)
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["heading"])
+            .build(),
+    );
+    row.append(
+        &gtk::Label::builder()
+            .label(relative_activity_time(
+                event
+                    .get("ts")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            ))
+            .css_classes(["toolport-muted", "caption"])
+            .build(),
+    );
+    card.set_label_widget(Some(&row));
+    let details = gtk::Box::new(gtk::Orientation::Vertical, 5);
+    details.set_margin_top(10);
+    for line in tool_change_record_lines(event) {
+        details.append(
+            &gtk::Label::builder()
+                .label(line)
+                .halign(gtk::Align::Fill)
+                .xalign(0.0)
+                .wrap(true)
+                .selectable(true)
+                .css_classes(["toolport-muted", "caption"])
+                .build(),
+        );
+    }
+    card.set_child(Some(&details));
+    bind_activity_expander(
+        &card,
+        format!("security:record:{}", security_dismissal_key(event)),
+        page.expanded_activity_rows.clone(),
+        false,
+    );
+    card
+}
+
+fn tool_change_subject(event: &serde_json::Value) -> String {
+    let subject = ["tool", "server"]
+        .into_iter()
+        .filter_map(|field| event.get(field).and_then(serde_json::Value::as_str))
+        .find(|value| !value.is_empty())
+        .unwrap_or("integrity baseline");
+    subject
+        .split_once("__")
+        .map(|(_, tool)| tool)
+        .unwrap_or(subject)
+        .replace('_', " ")
+}
+
+/// The details of a recorded tool change, without lines that ask for a review
+/// or acceptance.
+fn tool_change_record_lines(event: &serde_json::Value) -> Vec<String> {
+    let asks = [
+        crate::i18n::tr("This tool changed since it was last accepted.").to_string(),
+        crate::i18n::tr("Review the captured definition in Settings before accepting it.")
+            .to_string(),
+        crate::i18n::tr("Blocking status unavailable. Review in Settings > Quarantined tools.")
+            .to_string(),
+    ];
+    security_review_lines(event)
+        .into_iter()
+        .filter(|line| !asks.contains(line))
+        .collect()
 }
 
 /// One loud (or quiet-lane) security finding. The summary stays compact; expanding
@@ -7253,6 +7502,8 @@ fn security_notice_card(
             page_for_dismiss.dismiss_security(vec![key.clone()]);
         }
     });
+    // A tool still awaiting capture has nothing to review or accept yet.
+    dismiss.set_visible(!(is_change && event["pending_capture"] == true));
     row.append(&dismiss);
     card.set_label_widget(Some(&row));
 
@@ -7351,7 +7602,14 @@ fn security_review_lines(event: &serde_json::Value) -> Vec<String> {
     }
 
     if event_type == "tool_drift" {
-        if event["review_required"] == true {
+        if event["pending_capture"] == true {
+            lines.push(
+                crate::i18n::tr(
+                    "Toolport is capturing this tool's new definition. It stays blocked until then.",
+                )
+                .to_string(),
+            );
+        } else if event["review_required"] == true {
             lines.push(
                 crate::i18n::tr("Review the captured definition in Settings before accepting it.")
                     .to_string(),
@@ -7379,13 +7637,17 @@ fn security_review_lines(event: &serde_json::Value) -> Vec<String> {
                     .to_string(),
             );
         }
-        lines.push(match event["blocked"].as_bool() {
-            Some(true) => crate::i18n::tr("Blocked until you accept the changes."),
-            Some(false) => crate::i18n::tr("Not blocked."),
-            None => crate::i18n::tr(
-                "Blocking status unavailable. Review in Settings > Quarantined tools.",
-            ),
-        });
+        // A tool still being captured has nothing to accept yet; its capture
+        // line already says it stays blocked.
+        if event["pending_capture"] != true {
+            lines.push(match event["blocked"].as_bool() {
+                Some(true) => crate::i18n::tr("Blocked until you accept the changes."),
+                Some(false) => crate::i18n::tr("Not blocked."),
+                None => crate::i18n::tr(
+                    "Blocking status unavailable. Review in Settings > Quarantined tools.",
+                ),
+            });
+        }
     }
 
     if let Some(signatures) = event
@@ -18609,6 +18871,166 @@ mod tests {
 
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn safety_off_shows_unblocked_tool_changes_as_history_only() {
+        use super::*;
+        use crate::registry::SafetyLevel;
+        let data = crate::registry::DataDirTestEnv::new("gtk-safety-off-tool-changes");
+        adw::init().unwrap();
+        let app = adw::Application::builder().build();
+        let page = ActivityPage::new(&app);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let change = |tool: &str, blocked: bool, historical: bool| {
+            let mut event = serde_json::json!({
+                "type": "tool_drift", "server": "atlassian", "tool": format!("atlassian__{tool}"),
+                "change": "changed", "changed_fields": ["description"], "severity": "info",
+                "ts": now, "blocked": blocked, "new_fp": format!("v3:{tool}"),
+            });
+            if blocked {
+                event["blocked_profiles"] = serde_json::json!(["work"]);
+            }
+            if historical {
+                event["historical"] = serde_json::json!(true);
+            }
+            event
+        };
+        let unblocked = vec![
+            change("get_issue", false, false),
+            change("search", false, true),
+        ];
+        let mut with_blocked = unblocked.clone();
+        with_blocked.push(change("delete_issue", true, false));
+        let render = |level: SafetyLevel, floor: SafetyLevel, events: &[serde_json::Value]| {
+            let mut registry = crate::registry::Registry::default();
+            registry.set_safety_level(level);
+            registry.team_min_safety_level = floor;
+            std::fs::write(
+                data.dir.join("registry.json"),
+                serde_json::to_vec(&registry).unwrap(),
+            )
+            .unwrap();
+            let mut snapshot = state::load_activity_snapshot().unwrap();
+            assert_eq!(
+                snapshot.tool_change_reviews,
+                level.max(floor) != SafetyLevel::Off
+            );
+            snapshot.security_events = events.to_vec();
+            *page.last_snapshot.borrow_mut() = Some(snapshot);
+            page.render_security();
+            let mut labels = Vec::new();
+            collect_labels(page.security_list.upcast_ref(), &mut labels);
+            labels
+                .iter()
+                .map(|label| label.text().to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let asks = |text: &str| {
+            text.contains("Accept all for this server")
+                || text.contains("Review the changes or accept them")
+                || text.contains("Open history to review them")
+        };
+
+        let off = render(SafetyLevel::Off, SafetyLevel::Off, &unblocked);
+        assert!(!asks(&off), "Off must not ask for a review:\n{off}");
+        assert!(off.contains("2 tool-change records"), "{off}");
+        assert!(off.contains("Safety is Off."), "{off}");
+        let off_card = "Toolport records tool changes but does not block them.";
+        assert!(off.contains(off_card));
+        assert!(!off.contains("Protection active."), "{off}");
+        // The state comes first, then the records.
+        assert!(
+            off.find("Safety is Off.") < off.find("2 tool-change records"),
+            "{off}"
+        );
+
+        // Unknown status and pending definition reviews stay actionable at Off.
+        let mut unknown = change("get_issue", false, false);
+        unknown["blocked"] = serde_json::Value::Null;
+        let held = render(SafetyLevel::Off, SafetyLevel::Off, &[unknown]);
+        assert!(held.contains("Blocking status unavailable"), "{held}");
+        assert!(!held.contains("tool-change records"), "{held}");
+        assert!(!held.contains(off_card), "{held}");
+        let mut review = change("search", false, false);
+        review["review_required"] = serde_json::json!(true);
+        let held = render(SafetyLevel::Off, SafetyLevel::Off, &[review]);
+        assert!(
+            held.contains("Review the captured definition in Settings"),
+            "{held}"
+        );
+        assert!(!held.contains("tool-change records"), "{held}");
+        assert!(!held.contains(off_card), "{held}");
+        // A definition review held in the store but not on screen.
+        std::fs::write(
+            data.dir.join("quarantine.json"),
+            r#"{"atlassian__hidden":{"tool":"atlassian__hidden","change":"changed","definition_fp":"v3:hidden","review_required":true}}"#,
+        )
+        .unwrap();
+        let held = render(SafetyLevel::Off, SafetyLevel::Off, &unblocked);
+        assert!(held.contains("2 tool-change records"), "{held}");
+        assert!(!held.contains(off_card), "{held}");
+        assert!(!held.contains("Protection active."), "{held}");
+        std::fs::remove_file(data.dir.join("quarantine.json")).unwrap();
+
+        let off_blocked = render(SafetyLevel::Off, SafetyLevel::Off, &with_blocked);
+        assert!(
+            off_blocked.contains("Accept all for this server"),
+            "{off_blocked}"
+        );
+        assert!(off_blocked.contains("1 tool is blocked"), "{off_blocked}");
+        assert!(!off_blocked.contains(off_card), "{off_blocked}");
+        assert!(!off_blocked.contains("Protection active."), "{off_blocked}");
+        let older_blocked = render(
+            SafetyLevel::Off,
+            SafetyLevel::Off,
+            &[change("old_tool", true, true)],
+        );
+        assert!(
+            older_blocked.contains("1 older tool-change records"),
+            "{older_blocked}"
+        );
+        assert!(!older_blocked.contains(off_card), "{older_blocked}");
+        assert!(
+            off_blocked.contains("2 tool-change records"),
+            "{off_blocked}"
+        );
+
+        let resting = render(SafetyLevel::Ask, SafetyLevel::Off, &[]);
+        assert!(resting.contains("Protection active."), "{resting}");
+        assert!(!resting.contains("Safety is Off."), "{resting}");
+        // An unreadable registry keeps reviews on but cannot claim protection.
+        std::fs::remove_file(data.dir.join("registry.json")).unwrap();
+        std::fs::create_dir(data.dir.join("registry.json")).unwrap();
+        let mut snapshot = state::load_activity_snapshot().unwrap();
+        assert!(snapshot.tool_change_reviews);
+        assert!(!snapshot.reviews_confirmed);
+        snapshot.security_events = Vec::new();
+        *page.last_snapshot.borrow_mut() = Some(snapshot);
+        page.render_security();
+        let mut labels = Vec::new();
+        collect_labels(page.security_list.upcast_ref(), &mut labels);
+        assert!(!labels
+            .iter()
+            .any(|label| label.text() == "Protection active."));
+        std::fs::remove_dir(data.dir.join("registry.json")).unwrap();
+        for (level, floor) in [
+            (SafetyLevel::Ask, SafetyLevel::Off),
+            (SafetyLevel::Off, SafetyLevel::Ask),
+        ] {
+            let shown = render(level, floor, &unblocked);
+            assert!(
+                shown.contains("Not blocked. Review the changes or accept them."),
+                "{level:?} {floor:?}:\n{shown}"
+            );
+            assert!(shown.contains("1 older tool-change records"), "{shown}");
+            assert!(!shown.contains("2 tool-change records"), "{shown}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn tool_change_history_and_details_build_only_on_expand() {
         use super::*;
         let _data = crate::registry::DataDirTestEnv::new("gtk-lazy-security-history");
@@ -21093,19 +21515,30 @@ mod tests {
         let page = ActivityPage::new(&app);
         let event = serde_json::json!({"type":"tool_drift", "server":"srv", "tool":"srv__update", "ts":100, "change":"changed", "blocked":true, "blocked_profiles":["work"], "new_fp":"v3:captured", "review_required":true});
         let group = crate::integrity::group_tool_changes(std::slice::from_ref(&event)).remove(0);
-        let card = tool_change_group_card(&group, page.clone());
+        let card = tool_change_group_card(&group, page.clone(), false);
         let window = adw::ApplicationWindow::builder()
             .application(&app)
             .content(&card)
             .build();
-        let mut child = card.first_child();
+        // The buttons sit in the card's action row, as React's do.
+        fn descendants(widget: &gtk::Widget, found: &mut Vec<gtk::Widget>) {
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                found.push(widget.clone());
+                descendants(&widget, found);
+            }
+        }
+        let mut all = Vec::new();
+        descendants(card.upcast_ref(), &mut all);
         let mut found = false;
-        while let Some(widget) = child {
-            child = widget.next_sibling();
+        for widget in all {
             if let Ok(button) = widget.downcast::<gtk::Button>() {
-                if button.label().as_deref() == Some("Accept all for this server") {
-                    assert!(!button.is_sensitive());
-                }
+                // Never usable while a review is pending, so never shown.
+                assert_ne!(
+                    button.label().as_deref(),
+                    Some("Accept all for this server")
+                );
                 if button.label().as_deref() == Some("Review in Settings") {
                     button.emit_clicked();
                     found = true;
@@ -21118,6 +21551,263 @@ mod tests {
         page.accept_security(vec![event]);
         assert_eq!(reviewed.get(), 2);
         window.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn accept_all_shows_only_when_it_can_be_used() {
+        let _data = crate::registry::DataDirTestEnv::new("gtk-accept-all-usable");
+        adw::init().unwrap();
+        let app = adw::Application::builder().build();
+        let page = ActivityPage::new(&app);
+        let base = serde_json::json!({"type":"tool_drift", "server":"srv", "tool":"srv__update", "ts":100, "change":"changed", "blocked":true, "blocked_profiles":["work"], "new_fp":"v3:a"});
+        let card_for = |events: Vec<serde_json::Value>| {
+            let group = crate::integrity::group_tool_changes(&events).remove(0);
+            let card = tool_change_group_card(&group, page.clone(), false);
+            let mut labels = Vec::new();
+            collect_labels(card.upcast_ref(), &mut labels);
+            let text = labels
+                .iter()
+                .map(|label| label.text().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut accept = None;
+            let mut stack = vec![card.clone().upcast::<gtk::Widget>()];
+            while let Some(widget) = stack.pop() {
+                let mut child = widget.first_child();
+                while let Some(next) = child {
+                    child = next.next_sibling();
+                    if let Some(button) = next.downcast_ref::<gtk::Button>() {
+                        if button.label().as_deref() == Some("Accept all for this server") {
+                            accept = Some(button.is_sensitive());
+                        }
+                    }
+                    stack.push(next);
+                }
+            }
+            (text, accept)
+        };
+        // Usable: shown and enabled.
+        let (_, accept) = card_for(vec![base.clone()]);
+        assert_eq!(accept, Some(true));
+        // Suspicious: hidden, and the line says to accept each tool.
+        let mut suspicious = base.clone();
+        suspicious["signatures"] = serde_json::json!(["instruction_override"]);
+        let (text, accept) = card_for(vec![suspicious]);
+        assert_eq!(accept, None);
+        assert!(
+            text.contains("Review and accept each tool separately."),
+            "{text}"
+        );
+        // Unknown status, alone or beside a blocked tool: hidden, and it says where to look.
+        let mut unknown = base.clone();
+        unknown["tool"] = serde_json::json!("srv__other");
+        unknown["blocked"] = serde_json::Value::Null;
+        for events in [vec![unknown.clone()], vec![base.clone(), unknown]] {
+            let (text, accept) = card_for(events);
+            assert_eq!(accept, None);
+            assert!(
+                text.contains(
+                    "Blocking status unavailable. Review in Settings > Quarantined tools."
+                ),
+                "{text}"
+            );
+            assert!(
+                !text.contains("Review the changes or accept them"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn a_tool_awaiting_capture_waits_without_a_settings_review() {
+        let _data = crate::registry::DataDirTestEnv::new("gtk-pending-capture");
+        adw::init().unwrap();
+        let app = adw::Application::builder().build();
+        let page = ActivityPage::new(&app);
+        let held = serde_json::json!({"type":"tool_drift", "server":"srv", "tool":"srv__update", "ts":100, "change":"changed", "blocked":true, "blocked_profiles":[""], "new_fp":"v3:a", "review_required":true});
+        let card_for = |event: &serde_json::Value| {
+            let group = crate::integrity::group_tool_changes(std::slice::from_ref(event)).remove(0);
+            let card = tool_change_group_card(&group, page.clone(), false);
+            let mut labels = Vec::new();
+            collect_labels(card.upcast_ref(), &mut labels);
+            let text = labels
+                .iter()
+                .map(|label| label.text().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut review = false;
+            let mut stack = vec![card.clone().upcast::<gtk::Widget>()];
+            while let Some(widget) = stack.pop() {
+                let mut child = widget.first_child();
+                while let Some(next) = child {
+                    child = next.next_sibling();
+                    if let Some(button) = next.downcast_ref::<gtk::Button>() {
+                        review |= button.label().as_deref() == Some("Review in Settings")
+                            && button.is_visible();
+                    }
+                    stack.push(next);
+                }
+            }
+            (text, review)
+        };
+        let capturing_line =
+            "Toolport is capturing this tool's new definition. It stays blocked until then.";
+        let mut pending = held.clone();
+        pending["pending_capture"] = serde_json::json!(true);
+        let (text, review) = card_for(&pending);
+        assert!(text.contains(capturing_line), "{text}");
+        assert!(!text.contains("Review the captured definition"), "{text}");
+        assert!(!review, "nothing to review in Settings yet");
+        assert!(security_review_lines(&pending)
+            .iter()
+            .any(|line| line == capturing_line));
+        // Once captured, the normal review card returns.
+        let (text, review) = card_for(&held);
+        assert!(
+            text.contains("Review the captured definition in Settings before accepting it."),
+            "{text}"
+        );
+        assert!(review);
+        // A mixed group keeps the Settings route for its captured tool; the
+        // capturing tool says so on its own row and neither can be accepted here.
+        let mut other = pending.clone();
+        other["tool"] = serde_json::json!("srv__other");
+        let group = crate::integrity::group_tool_changes(&[held.clone(), other.clone()]).remove(0);
+        assert_eq!(group.tools.len(), 2);
+        assert!(!group_can_be_accepted(&group));
+        let card = tool_change_group_card(&group, page.clone(), false);
+        let mut labels = Vec::new();
+        collect_labels(card.upcast_ref(), &mut labels);
+        let text = labels
+            .iter()
+            .map(|label| label.text().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("Review the captured definition in Settings before accepting it."),
+            "{text}"
+        );
+        assert!(!text.contains(capturing_line), "{text}");
+        let mut review = false;
+        let mut stack = vec![card.clone().upcast::<gtk::Widget>()];
+        while let Some(widget) = stack.pop() {
+            let mut child = widget.first_child();
+            while let Some(next) = child {
+                child = next.next_sibling();
+                if let Some(button) = next.downcast_ref::<gtk::Button>() {
+                    review |= button.label().as_deref() == Some("Review in Settings");
+                    assert_ne!(
+                        button.label().as_deref(),
+                        Some("Accept all for this server")
+                    );
+                }
+                stack.push(next);
+            }
+        }
+        assert!(review, "the captured tool keeps Review in Settings");
+        assert!(security_review_lines(&other)
+            .iter()
+            .any(|line| line == capturing_line));
+        assert!(!security_review_lines(&held)
+            .iter()
+            .any(|line| line == capturing_line));
+        // Nothing to accept yet, so no line asks the user to accept it.
+        assert!(!security_review_lines(&other)
+            .iter()
+            .any(|line| line.contains("until you accept")));
+    }
+
+    #[test]
+    fn a_hold_in_another_store_does_not_silence_a_new_finding() {
+        let _data = crate::registry::DataDirTestEnv::new("gtk-other-store-finding");
+        let held = serde_json::json!({"server":"srv", "tool":"srv__read", "change":"changed",
+            "profile":"@default-access:", "definition_fp":"v3:held", "review_required":true});
+        let finding = |profile: &str, fp: &str| {
+            serde_json::json!({"ts":1000, "type":"tool_poison_flag", "server":"srv",
+                "tool":"srv__read", "severity":"high", "profile":profile, "new_fp":fp})
+        };
+        let alerts = |event: serde_json::Value| {
+            newly_observed_security_events(
+                Some(&std::collections::HashSet::new()),
+                &[event],
+                std::slice::from_ref(&held),
+                false,
+            )
+            .1
+            .len()
+        };
+        // Store B, or the global store, or a new fingerprint in store A: alert.
+        assert_eq!(alerts(finding("work", "v3:new")), 1);
+        assert_eq!(alerts(finding("", "v3:held")), 1);
+        assert_eq!(alerts(finding("@default-access:", "v3:new")), 1);
+        // The same incident in the same store, including its alias: covered.
+        assert_eq!(alerts(finding("@default-access:", "v3:held")), 0);
+        assert_eq!(alerts(finding("@all-enabled:", "v3:held")), 0);
+    }
+
+    #[test]
+    fn duplicate_alerts_need_every_recorded_store_and_the_same_incident() {
+        let _data = crate::registry::DataDirTestEnv::new("gtk-duplicate-stores");
+        let hold = |profile: &str, fp: Option<&str>| {
+            let mut record = serde_json::json!({"server":"srv", "tool":"srv__read",
+                "change":"changed", "profile":profile});
+            if let Some(fp) = fp {
+                record["definition_fp"] = serde_json::json!(fp);
+            }
+            record
+        };
+        // Persisted form: definition events carry a `profiles` array.
+        let finding = |profiles: serde_json::Value, fp: Option<&str>| {
+            let mut event = serde_json::json!({"ts":1000, "type":"tool_poison_flag",
+                "server":"srv", "tool":"srv__read", "severity":"high", "profiles":profiles});
+            if let Some(fp) = fp {
+                event["new_fp"] = serde_json::json!(fp);
+            }
+            event
+        };
+        let covered = |event: serde_json::Value, holds: &[serde_json::Value]| {
+            security_event_covered_by_quarantine(&event, holds)
+        };
+        let f = Some("v3:f");
+        // A scoped hold covers its own persisted event, and an alias of its store.
+        assert!(covered(
+            finding(serde_json::json!(["work"]), f),
+            &[hold("work", f)]
+        ));
+        assert!(covered(
+            finding(serde_json::json!(["@all-enabled:"]), f),
+            &[hold("@default-access:", f)]
+        ));
+        // A global hold does not cover a scoped event, nor the reverse.
+        assert!(!covered(
+            finding(serde_json::json!(["work"]), f),
+            &[hold("", f)]
+        ));
+        assert!(!covered(
+            finding(serde_json::json!([""]), f),
+            &[hold("work", f)]
+        ));
+        // An event recorded in two stores needs a hold in each.
+        let both = finding(serde_json::json!(["", "work"]), f);
+        assert!(!covered(both.clone(), &[hold("", f)]));
+        assert!(covered(both, &[hold("", f), hold("work", f)]));
+        // No fingerprint on either side cannot establish the same incident.
+        assert!(!covered(
+            finding(serde_json::json!([""]), f),
+            &[hold("", None)]
+        ));
+        assert!(!covered(
+            finding(serde_json::json!([""]), None),
+            &[hold("", f)]
+        ));
+        // A legacy scalar-profile event without a fingerprint, against a hold in
+        // the access store the watcher now reads: alert, as before this change.
+        let legacy = serde_json::json!({"ts":1000, "type":"tool_drift", "server":"srv",
+            "tool":"srv__read", "change":"changed", "severity":"high",
+            "profile":"@default-access:"});
+        assert!(!covered(legacy, &[hold("@default-access:", None)]));
     }
 
     #[test]
@@ -22456,16 +23146,90 @@ mod tests {
             "severity": "high"
         });
         let (baseline, startup) =
-            newly_observed_security_events(None, std::slice::from_ref(&injection), &[]);
+            newly_observed_security_events(None, std::slice::from_ref(&injection), &[], true);
         assert!(startup.is_empty());
-        let (_, unchanged) =
-            newly_observed_security_events(Some(&baseline), std::slice::from_ref(&injection), &[]);
+        let (_, unchanged) = newly_observed_security_events(
+            Some(&baseline),
+            std::slice::from_ref(&injection),
+            &[],
+            true,
+        );
         assert!(unchanged.is_empty());
 
         let mut later = injection.clone();
         later["ts"] = serde_json::json!(2000);
-        let (_, newcomers) = newly_observed_security_events(Some(&baseline), &[later], &[]);
+        let (_, newcomers) = newly_observed_security_events(Some(&baseline), &[later], &[], true);
         assert_eq!(newcomers.len(), 1);
+    }
+
+    #[test]
+    fn safety_off_alerts_only_for_blocked_tool_changes() {
+        let change = |tool: &str, blocked: bool| {
+            serde_json::json!({
+                "ts": 1000, "type": "tool_drift", "server": "srv", "tool": tool,
+                "change": "changed", "severity": "high", "blocked": blocked,
+            })
+        };
+        let events = [change("srv__open", false), change("srv__held", true)];
+        let seen = std::collections::HashSet::new();
+        let tools = |reviews| {
+            newly_observed_security_events(Some(&seen), &events, &[], reviews)
+                .1
+                .iter()
+                .map(|event| event["tool"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tools(true), ["srv__open", "srv__held"]);
+        assert_eq!(tools(false), ["srv__held"]);
+    }
+
+    #[test]
+    fn safety_off_watch_alerts_unless_the_store_verifies_unblocked() {
+        use crate::registry::SafetyLevel;
+        let data = crate::registry::DataDirTestEnv::new("gtk-safety-off-watch");
+        let raw = |tool: &str, review: bool| {
+            let mut event = serde_json::json!({
+                "ts": 1000, "type": "tool_drift", "server": "srv", "tool": tool,
+                "change": "changed", "severity": "high", "new_fp": format!("v3:{tool}"),
+            });
+            if review {
+                event["review_required"] = serde_json::json!(true);
+            }
+            event
+        };
+        let lines = [raw("srv__open", false), raw("srv__review", true)]
+            .iter()
+            .map(|event| format!("{event}\n"))
+            .collect::<String>();
+        std::fs::write(data.dir.join("security.jsonl"), lines).unwrap();
+        let alerts = |level: SafetyLevel| {
+            let mut registry = crate::registry::Registry::default();
+            registry.set_safety_level(level);
+            std::fs::write(
+                data.dir.join("registry.json"),
+                serde_json::to_vec(&registry).unwrap(),
+            )
+            .unwrap();
+            let (events, quarantined, reviews) = read_security_watch_snapshot().unwrap();
+            let mut tools = newly_observed_security_events(
+                Some(&std::collections::HashSet::new()),
+                &events,
+                quarantined.as_deref().unwrap_or_default(),
+                reviews,
+            )
+            .1
+            .iter()
+            .map(|event| event["tool"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+            tools.sort();
+            tools
+        };
+        // No quarantine store: the open change is verified unblocked.
+        assert_eq!(alerts(SafetyLevel::Ask), ["srv__open", "srv__review"]);
+        assert_eq!(alerts(SafetyLevel::Off), ["srv__review"]);
+        // A damaged store cannot verify anything, so Off alerts as before.
+        std::fs::write(data.dir.join("quarantine.json"), "{ not json").unwrap();
+        assert_eq!(alerts(SafetyLevel::Off), ["srv__open", "srv__review"]);
     }
 
     #[test]
@@ -22499,7 +23263,7 @@ mod tests {
         std::fs::write(dir.join("security.jsonl"), format!("{event}\n")).unwrap();
         std::fs::write(dir.join("quarantine.json"), "{ not json").unwrap();
 
-        let (events, quarantined) =
+        let (events, quarantined, tool_change_reviews) =
             read_security_watch_snapshot().expect("the security feed remains readable");
         assert_eq!(events, vec![event]);
         assert!(quarantined.is_err(), "quarantine state remains unknown");
@@ -22507,6 +23271,7 @@ mod tests {
             Some(&std::collections::HashSet::new()),
             &events,
             quarantined.as_deref().unwrap_or_default(),
+            tool_change_reviews,
         );
         assert_eq!(newcomers.len(), 1, "a new finding must still alert");
 
@@ -22541,10 +23306,13 @@ mod tests {
 
     #[test]
     fn quarantine_suppresses_duplicate_drift_alerts_but_not_injection_alerts() {
+        let _data = crate::registry::DataDirTestEnv::new("gtk-duplicate-drift");
         let quarantine = serde_json::json!({
             "server": "linear",
             "tool": "linear__save_issue",
-            "change": "changed"
+            "change": "changed",
+            "profile": "",
+            "definition_fp": "v3:held"
         });
         let drift = serde_json::json!({
             "ts": 1000,
@@ -22552,7 +23320,9 @@ mod tests {
             "server": "linear",
             "tool": "linear__save_issue",
             "change": "changed",
-            "severity": "high"
+            "severity": "high",
+            "profiles": [""],
+            "new_fp": "v3:held"
         });
         let injection = serde_json::json!({
             "ts": 1001,

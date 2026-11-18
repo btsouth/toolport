@@ -510,6 +510,8 @@ fn materialize(command: &str, args: &Value) -> Result<Result<Value, String>, Str
             crate::integrity::review_events(limit()?),
             "Couldn't read security events",
         ),
+        "activity_safety" => serde_json::to_value(crate::integrity::activity_safety())
+            .map_err(|error| error.to_string()),
         "get_search_traces" => list(
             crate::searchtrace::read_recent(limit()?),
             "Couldn't read search traces",

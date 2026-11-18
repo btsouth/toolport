@@ -1,0 +1,281 @@
+{
+  "screen": "activity",
+  "description": "Safety Off: Atlassian changed 9 tools 3h ago (verified unblocked) plus 5 older records.",
+  "now_ms": 1790000000000,
+  "viewport": {
+    "width": 1240,
+    "height": 900
+  },
+  "ipc": {
+    "get_registry": {
+      "version": 3,
+      "servers": [
+        {
+          "id": "github",
+          "name": "GitHub",
+          "enabled": true,
+          "transport": "stdio",
+          "command": "fixture-only",
+          "args": [],
+          "env": [],
+          "url": null,
+          "source": "manual"
+        },
+        {
+          "id": "linear",
+          "name": "Linear",
+          "enabled": true,
+          "transport": "stdio",
+          "command": "fixture-only",
+          "args": [],
+          "env": [],
+          "url": null,
+          "source": "manual"
+        },
+        {
+          "id": "stripe",
+          "name": "Stripe",
+          "enabled": true,
+          "transport": "stdio",
+          "command": "fixture-only",
+          "args": [],
+          "env": [],
+          "url": null,
+          "source": "manual"
+        },
+        {
+          "id": "atlassian",
+          "name": "Atlassian",
+          "enabled": true,
+          "transport": "stdio",
+          "command": "fixture-only",
+          "args": [],
+          "env": [],
+          "url": null,
+          "source": "manual"
+        }
+      ],
+      "profiles": [
+        {
+          "id": "local",
+          "name": "Local",
+          "enabledServerIds": ["github", "linear", "stripe", "atlassian"]
+        }
+      ],
+      "activeProfileId": "local",
+      "defaultAccessContextId": "local",
+      "defaultAccessLegacyPolicy": true,
+      "accessUpgradeNoticeDismissed": true,
+      "safetyLevel": "off"
+    },
+    "probe_servers": [
+      {
+        "serverId": "github",
+        "ok": true,
+        "toolCount": 25,
+        "error": null,
+        "authRequired": false,
+        "failure": null,
+        "authTarget": null,
+        "keyringLocked": false
+      },
+      {
+        "serverId": "linear",
+        "ok": true,
+        "toolCount": 25,
+        "error": null,
+        "authRequired": false,
+        "failure": null,
+        "authTarget": null,
+        "keyringLocked": false
+      },
+      {
+        "serverId": "stripe",
+        "ok": true,
+        "toolCount": 25,
+        "error": null,
+        "authRequired": false,
+        "failure": null,
+        "authTarget": null,
+        "keyringLocked": false
+      }
+    ]
+  },
+  "seeds": {
+    "files": {
+      "security.jsonl": {
+        "lines": [
+          {
+            "ts": 1789989200000,
+            "type": "tool_drift",
+            "server": "atlassian",
+            "tool": "atlassian__get_issue",
+            "change": "changed",
+            "changed_fields": ["description"],
+            "severity": "warn",
+            "new_fp": "v3:get_issue"
+          },
+          {
+            "ts": 1789989200000,
+            "type": "tool_drift",
+            "server": "atlassian",
+            "tool": "atlassian__search",
+            "change": "changed",
+            "changed_fields": ["description"],
+            "severity": "warn",
+            "new_fp": "v3:search"
+          },
+          {
+            "ts": 1789989200000,
+            "type": "tool_drift",
+            "server": "atlassian",
+            "tool": "atlassian__create_issue",
+            "change": "changed",
+            "changed_fields": ["description"],
+            "severity": "warn",
+            "new_fp": "v3:create_issue"
+          },
+          {
+            "ts": 1789989200000,
+            "type": "tool_drift",
+            "server": "atlassian",
+            "tool": "atlassian__update_issue",
+            "change": "changed",
+            "changed_fields": ["description"],
+            "severity": "warn",
+            "new_fp": "v3:update_issue"
+          },
+          {
+            "ts": 1789989200000,
+            "type": "tool_drift",
+            "server": "atlassian",
+            "tool": "atlassian__get_page",
+            "change": "changed",
+            "changed_fields": ["description"],
+            "severity": "warn",
+            "new_fp": "v3:get_page"
+          },
+          {
+            "ts": 1789989200000,
+            "type": "tool_drift",
+            "server": "atlassian",
+            "tool": "atlassian__create_page",
+            "change": "changed",
+            "changed_fields": ["description"],
+            "severity": "warn",
+            "new_fp": "v3:create_page"
+          },
+          {
+            "ts": 1789989200000,
+            "type": "tool_drift",
+            "server": "atlassian",
+            "tool": "atlassian__update_page",
+            "change": "changed",
+            "changed_fields": ["description"],
+            "severity": "warn",
+            "new_fp": "v3:update_page"
+          },
+          {
+            "ts": 1789989200000,
+            "type": "tool_drift",
+            "server": "atlassian",
+            "tool": "atlassian__list_spaces",
+            "change": "changed",
+            "changed_fields": ["description"],
+            "severity": "warn",
+            "new_fp": "v3:list_spaces"
+          },
+          {
+            "ts": 1789989200000,
+            "type": "tool_drift",
+            "server": "atlassian",
+            "tool": "atlassian__add_comment",
+            "change": "changed",
+            "changed_fields": ["description"],
+            "severity": "warn",
+            "new_fp": "v3:add_comment"
+          },
+          {
+            "ts": 1789218800000,
+            "type": "tool_drift",
+            "server": "atlassian",
+            "tool": "atlassian__old_0",
+            "change": "changed",
+            "severity": "info"
+          },
+          {
+            "ts": 1789218800001,
+            "type": "tool_drift",
+            "server": "atlassian",
+            "tool": "atlassian__old_1",
+            "change": "changed",
+            "severity": "info"
+          },
+          {
+            "ts": 1789218800002,
+            "type": "tool_drift",
+            "server": "atlassian",
+            "tool": "atlassian__old_2",
+            "change": "changed",
+            "severity": "info"
+          },
+          {
+            "ts": 1789218800003,
+            "type": "tool_drift",
+            "server": "atlassian",
+            "tool": "atlassian__old_3",
+            "change": "changed",
+            "severity": "info"
+          },
+          {
+            "ts": 1789218800004,
+            "type": "tool_drift",
+            "server": "atlassian",
+            "tool": "atlassian__old_4",
+            "change": "changed",
+            "severity": "info"
+          }
+        ]
+      }
+    }
+  },
+  "calls": [
+    [
+      "get_audit_log",
+      {
+        "limit": 200
+      }
+    ],
+    [
+      "get_audit_log",
+      {
+        "limit": 2147483647
+      }
+    ],
+    ["audit_stats", {}],
+    ["savings_summary", {}],
+    [
+      "get_security_events",
+      {
+        "limit": 2000
+      }
+    ],
+    ["activity_safety", {}],
+    [
+      "get_search_traces",
+      {
+        "limit": 100
+      }
+    ],
+    [
+      "get_inspect_log",
+      {
+        "limit": 50
+      }
+    ],
+    ["list_tool_identities", {}],
+    ["activity_health", {}],
+    ["activity_revision", {}],
+    ["release_activity_revision", {}]
+  ]
+}

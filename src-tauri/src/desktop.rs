@@ -1300,6 +1300,15 @@ async fn get_security_events(limit: usize) -> Result<Vec<serde_json::Value>, Str
     .map_err(|e| format!("security events task join failed: {e}"))?
 }
 
+/// Whether Activity asks for tool-change reviews and whether Safety Off holds
+/// nothing (`integrity::activity_safety`), the same answer GTK reads.
+#[tauri::command]
+async fn activity_safety() -> Result<integrity::ActivitySafety, String> {
+    tauri::async_runtime::spawn_blocking(integrity::activity_safety)
+        .await
+        .map_err(|e| format!("activity safety task join failed: {e}"))
+}
+
 /// Most recent unresolved baseline warning for the current profile and policy.
 #[tauri::command]
 async fn get_baseline_notice() -> Result<Option<serde_json::Value>, String> {
@@ -4889,6 +4898,7 @@ pub fn run() {
             get_client_sessions,
             audit_stats,
             get_security_events,
+            activity_safety,
             get_baseline_notice,
             savings_summary,
             gather_diagnostics,

@@ -329,6 +329,9 @@ if (memberReviewFixture) {
   } as NonNullable<Registry["team"]>;
 }
 
+const fixtureSafety = new URLSearchParams(location.search).get("safety");
+if (fixtureSafety === "off" || fixtureSafety === "ask" || fixtureSafety === "strict")
+  registry.safetyLevel = fixtureSafety;
 const driftFixture = new URLSearchParams(location.search).has("tool-changes");
 const profileDriftFixture = new URLSearchParams(location.search).has("profile-drift");
 const driftEvents = profileDriftFixture
@@ -1346,6 +1349,14 @@ mockIPC(
         return null;
       case "get_security_events":
         return driftEvents;
+      case "activity_safety": {
+        const off = registry.safetyLevel === "off";
+        return {
+          toolChangeReviews: !off,
+          blocksNothing: off && !driftEvents.some((event) => event.blocked !== false),
+          reviewsConfirmed: !off,
+        };
+      }
       case "release_quarantine": {
         const event = driftEvents.find(
           (event) => event.profile === args.profile && event.tool === args.tool,

@@ -109,6 +109,10 @@ describe("server tool changes", () => {
       }));
     const accept = vi.fn();
     render(<ToolChanges events={events} registry={registry} onAccept={accept} />);
+    // Usable, so shown and enabled.
+    expect(
+      screen.getByRole("button", { name: "Accept all for this server" }),
+    ).toBeEnabled();
     fireEvent.click(screen.getByRole("button", { name: "Accept all for this server" }));
     await waitFor(() => expect(accept).toHaveBeenCalledWith(events));
     expect(release).toHaveBeenCalledTimes(4);
@@ -127,9 +131,15 @@ describe("server tool changes", () => {
     ];
     const accept = vi.fn();
     render(<ToolChanges events={events} registry={registry} onAccept={accept} />);
+    // Never usable for a suspicious group: hidden, and the line says what to do.
     expect(
-      screen.getByRole("button", { name: "Accept all for this server" }),
-    ).toBeDisabled();
+      screen.queryByRole("button", { name: "Accept all for this server" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Suspicious content found. Review and accept each tool separately.",
+      ),
+    ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Cloudflare \(Full API\):/ }));
     expect(screen.getByText(/Matched signals: instruction_override/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Accept this tool" }));
@@ -158,8 +168,11 @@ describe("server tool changes", () => {
       />,
     );
     expect(
-      screen.getByRole("button", { name: "Accept all for this server" }),
-    ).toBeDisabled();
+      screen.queryByRole("button", { name: "Accept all for this server" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText("Review the captured definition in Settings before accepting it."),
+    ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Cloudflare \(Full API\):/ }));
     expect(
       screen.queryByRole("button", { name: "Accept this tool" }),
@@ -172,6 +185,110 @@ describe("server tool changes", () => {
     expect(release).not.toHaveBeenCalled();
     expect(accept).not.toHaveBeenCalled();
   });
+  it("waits for capture without a Settings review, then routes the captured review", () => {
+    const event = {
+      ...securityFixture()[0],
+      blocked: true,
+      blocked_profiles: [""],
+      new_fp: "v3:new",
+      review_required: true,
+    };
+    const capturing =
+      "Toolport is capturing this tool's new definition. It stays blocked until then.";
+    const { unmount } = render(
+      <ToolChanges
+        events={[{ ...event, pending_capture: true }]}
+        registry={registry}
+        onAccept={vi.fn()}
+        onReview={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(capturing)).toBeInTheDocument();
+    expect(screen.queryByText(/Review the captured definition/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Cloudflare \(Full API\):/ }));
+    expect(
+      screen.queryByRole("button", { name: "Review in Settings" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Accept/ })).not.toBeInTheDocument();
+    unmount();
+    // Once captured, the normal review card returns.
+    render(
+      <ToolChanges
+        events={[event]}
+        registry={registry}
+        onAccept={vi.fn()}
+        onReview={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText(capturing)).not.toBeInTheDocument();
+    expect(
+      screen.getByText("Review the captured definition in Settings before accepting it."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Review in Settings" }),
+    ).toBeInTheDocument();
+  });
+  it("keeps Review in Settings for a captured tool beside one being captured", () => {
+    const event = {
+      ...securityFixture()[0],
+      blocked: true,
+      blocked_profiles: [""],
+      new_fp: "v3:new",
+      review_required: true,
+    };
+    const capturing =
+      "Toolport is capturing this tool's new definition. It stays blocked until then.";
+    const review = vi.fn();
+    render(
+      <ToolChanges
+        events={[event, { ...event, tool: `${event.tool}_2`, pending_capture: true }]}
+        registry={registry}
+        onAccept={vi.fn()}
+        onReview={review}
+      />,
+    );
+    expect(
+      screen.getByText("Review the captured definition in Settings before accepting it."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(capturing)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Accept all for this server" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: "Review in Settings" })[0]);
+    expect(review).toHaveBeenCalledOnce();
+    // Expanded: the captured tool routes to Settings, the capturing tool says
+    // it is being captured, and neither offers an accept.
+    fireEvent.click(screen.getByRole("button", { name: /Cloudflare \(Full API\):/ }));
+    expect(screen.getAllByRole("button", { name: "Review in Settings" })).toHaveLength(2);
+    expect(screen.getByText(capturing)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Accept/ })).not.toBeInTheDocument();
+    // Only the captured tool says it is blocked until accepted.
+    expect(screen.getAllByText("Blocked until you accept the changes.")).toHaveLength(1);
+  });
+  it("explains an unknown status before a block in a mixed group", () => {
+    const event = securityFixture()[0];
+    render(
+      <ToolChanges
+        events={[
+          { ...event, blocked: true, blocked_profiles: ["work"], new_fp: "v2:a" },
+          { ...event, tool: `${event.tool}_2`, blocked: null },
+        ]}
+        registry={registry}
+        onAccept={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByText(
+        "Blocking status unavailable. Review in Settings > Quarantined tools.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/Review the changes or accept them/),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Accept all for this server" }),
+    ).not.toBeInTheDocument();
+  });
   it("keeps unknown blocking state visible and disables acceptance", () => {
     render(
       <ToolChanges
@@ -181,8 +298,13 @@ describe("server tool changes", () => {
       />,
     );
     expect(
-      screen.getByRole("button", { name: "Accept all for this server" }),
-    ).toBeDisabled();
+      screen.queryByRole("button", { name: "Accept all for this server" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Blocking status unavailable. Review in Settings > Quarantined tools.",
+      ),
+    ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Cloudflare \(Full API\):/ }));
     expect(screen.getByRole("button", { name: "Accept this tool" })).toBeDisabled();
   });

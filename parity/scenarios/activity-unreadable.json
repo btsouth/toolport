@@ -117,6 +117,7 @@
         "limit": 2000
       }
     ],
+    ["activity_safety", {}],
     [
       "get_search_traces",
       {

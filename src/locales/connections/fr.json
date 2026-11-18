@@ -1134,5 +1134,9 @@
   "Connected {connected} of {total} T3 Code instances.": "{connected} instances T3 Code sur {total} connectées.",
   "Not connected: {names}.": "Non connectés : {names}.",
   "Skip": "Ignorer",
-  "No servers moved, so your agent has no new tools.": "Aucun serveur n’a été déplacé, votre agent n’a donc aucun nouvel outil."
+  "No servers moved, so your agent has no new tools.": "Aucun serveur n’a été déplacé, votre agent n’a donc aucun nouvel outil.",
+  "{value0} tool-change records": "{value0} enregistrements de changement d'outil",
+  "Safety is Off.": "La sécurité est désactivée.",
+  "Toolport records tool changes but does not block them.": "Toolport enregistre les changements d'outils, mais ne les bloque pas.",
+  "Toolport is capturing this tool's new definition. It stays blocked until then.": "Toolport capture la nouvelle définition de cet outil. Il reste bloqué jusque-là."
 }

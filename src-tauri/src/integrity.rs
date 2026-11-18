@@ -517,14 +517,21 @@ fn quarantine_scan_stores() -> Result<Vec<(String, PathBuf)>, String> {
         .ok_or_else(|| "Could not resolve the quarantine data directory".to_string())?;
     let registry = crate::registry::load_resolved()?;
     let mut stores = vec![(String::new(), dir.join("quarantine.json"))];
-    for profile in &registry.profiles {
-        if let Some(path) = quarantine_path(Some(&profile.id)) {
-            stores.push((profile.id.clone(), path));
-        }
-    }
-    for scope in load_root_scopes()? {
+    // The gateway also enforces under the synthesized Default access and All
+    // enabled servers ids, so their stores belong to the same union. Both share
+    // one store keyed by the access context, which can also be a profile's own
+    // store; read each file once.
+    let scopes = registry
+        .profiles
+        .iter()
+        .map(|profile| profile.id.clone())
+        .chain([registry.default_access_id(), registry.all_access_id()])
+        .chain(load_root_scopes()?);
+    for scope in scopes {
         if let Some(path) = quarantine_path(Some(&scope)) {
-            stores.push((scope, path));
+            if !stores.iter().any(|(_, seen)| *seen == path) {
+                stores.push((scope, path));
+            }
         }
     }
     Ok(stores)
@@ -2504,6 +2511,37 @@ pub fn quarantine_notification(newcomers: &[&Value]) -> (String, String) {
 /// store contributes nothing; a damaged one is an `Err` rather than a shorter list.
 pub fn all_quarantined() -> Result<Vec<Value>, String> {
     all_quarantined_inner(false)
+}
+
+/// The quarantine union plus each live pending review pin that has no quarantine
+/// row yet (a released legacy block awaiting recapture). The gateway holds those
+/// tools too, so Activity must not show their changes as plain history.
+pub fn review_quarantines() -> Result<Vec<Value>, String> {
+    let mut rows = all_quarantined()?;
+    // With reviews off the gateway enforces only definition reviews and pending
+    // pins, so ordinary rows (from an earlier Ask or Strict) block nothing now.
+    // They stay on disk and count again when reviews return.
+    if !crate::registry::tool_change_reviews_now() {
+        rows.retain(|row| row["review_required"] == true);
+    }
+    for (profile, _) in quarantine_scan_stores()? {
+        let scope = (!profile.is_empty()).then_some(profile.as_str());
+        for name in active_definition_review_names(scope) {
+            if rows
+                .iter()
+                .any(|row| row["tool"] == name.as_str() && row["profile"] == profile.as_str())
+            {
+                continue;
+            }
+            rows.push(json!({
+                "tool": name,
+                "profile": profile,
+                "review_required": true,
+                "pending_capture": true,
+            }));
+        }
+    }
+    Ok(rows)
 }
 
 fn all_quarantined_inner(summary: bool) -> Result<Vec<Value>, String> {
@@ -4808,6 +4846,9 @@ pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
 struct ReviewStamp {
     dir: PathBuf,
     files: BTreeMap<PathBuf, ReviewFileStamp>,
+    /// `registry::registry_content_stamp`: a same-length Safety change within one
+    /// timestamp tick still refreshes blocked annotations.
+    registry: u64,
 }
 
 #[derive(Clone, PartialEq)]
@@ -4866,7 +4907,16 @@ fn quarantine_summary_stamp() -> Option<ReviewStamp> {
             Err(_) => return None,
         }
     }
-    Some(ReviewStamp { dir, files })
+    Some(ReviewStamp {
+        dir,
+        files,
+        registry: 0,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static REVIEW_SAME_TICK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn review_file_stamp(path: &Path, metadata: &std::fs::Metadata) -> Option<ReviewFileStamp> {
@@ -4893,15 +4943,24 @@ fn review_file_stamp(path: &Path, metadata: &std::fs::Metadata) -> Option<Review
     };
     #[cfg(not(windows))]
     let _ = path;
+    // Tests can stand in for a filesystem whose timestamps did not tick.
+    #[cfg(test)]
+    let times = !REVIEW_SAME_TICK.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let times = true;
     Some(ReviewFileStamp {
-        modified: metadata.modified().ok()?,
+        modified: if times {
+            metadata.modified().ok()?
+        } else {
+            SystemTime::UNIX_EPOCH
+        },
         len: metadata.len(),
         #[cfg(unix)]
         identity: (
             metadata.dev(),
             metadata.ino(),
-            metadata.ctime(),
-            metadata.ctime_nsec(),
+            if times { metadata.ctime() } else { 0 },
+            if times { metadata.ctime_nsec() } else { 0 },
         ),
         #[cfg(windows)]
         identity,
@@ -4926,7 +4985,20 @@ fn review_stamp() -> Option<ReviewStamp> {
             review_file_stamp(&entry.path(), &entry.metadata().ok()?)?,
         );
     }
-    Some(ReviewStamp { dir, files })
+    // The resolved registry decides which rows Off enforces, wherever it lives.
+    // Stamp its target, so a symlinked registry's edits refresh blocking status.
+    if let Some(target) =
+        crate::registry::resolved_path().and_then(|path| std::fs::canonicalize(path).ok())
+    {
+        if let Ok(metadata) = std::fs::metadata(&target) {
+            files.insert(target.clone(), review_file_stamp(&target, &metadata)?);
+        }
+    }
+    Some(ReviewStamp {
+        dir,
+        files,
+        registry: crate::registry::registry_content_stamp(),
+    })
 }
 
 /// Attach current blocking state to retained findings. A damaged quarantine store is
@@ -4962,20 +5034,37 @@ fn review_events_cached(
     Ok(events)
 }
 
+/// Whether two scope ids name the same quarantine file. Aliases that share a
+/// store match; the global scope ("") is its own file, never an empty access context.
+pub fn same_integrity_store(a: &str, b: &str) -> bool {
+    let path = |id: &str| quarantine_path((!id.is_empty()).then_some(id));
+    a == b || path(a).is_some_and(|path_a| Some(path_a) == path(b))
+}
+
 fn event_matches_profile(event: &Value, profile: &str) -> bool {
+    let same = |value: &str| same_integrity_store(value, profile);
     if let Some(profiles) = event["profiles"].as_array() {
-        profiles.iter().any(|value| value.as_str() == Some(profile))
+        profiles.iter().filter_map(Value::as_str).any(same)
     } else {
-        event["profile"]
-            .as_str()
-            .is_none_or(|value| value == profile)
+        event["profile"].as_str().is_none_or(same)
     }
 }
 
 fn review_events_uncached(limit: usize) -> std::io::Result<Vec<Value>> {
     let mut events = read_recent(limit.min(KEEP_LINES))?;
-    let quarantines = all_quarantined();
-    for event in &mut events {
+    annotate_review_status(&mut events, &review_quarantines());
+    attach_drift_poison_signatures(&mut events);
+    // Preview.6 showed 50 recent records in React. Reading the full retention
+    // window for complete refreshes must not turn older, fingerprint-less history
+    // into a new wall of findings. Keep every blocked or unverifiable block visible.
+    mark_older_drift_history(&mut events);
+    Ok(events)
+}
+
+/// Set `blocked`, `blocked_profiles` and `review_required` on raw security
+/// events from the quarantine store. An unreadable store leaves `blocked` null.
+pub fn annotate_review_status(events: &mut [Value], quarantines: &Result<Vec<Value>, String>) {
+    for event in events {
         match &quarantines {
             Ok(records) => {
                 // Older findings and quarantines did not capture fingerprints or
@@ -4983,6 +5072,7 @@ fn review_events_uncached(limit: usize) -> std::io::Result<Vec<Value>> {
                 let unknown = records.iter().any(|record| {
                     let profile = record["profile"].as_str();
                     record["tool"].as_str().is_some()
+                        && record["pending_capture"] != true
                         && record["tool"] == event["tool"]
                         && event_matches_profile(event, profile.unwrap_or(""))
                         && (event["new_fp"].as_str().is_none()
@@ -5000,12 +5090,13 @@ fn review_events_uncached(limit: usize) -> std::io::Result<Vec<Value>> {
                                 event,
                                 record["profile"].as_str().unwrap_or(""),
                             )
-                            && event["new_fp"].as_str().is_some_and(|fp| {
-                                record["pending_pin"]["fp"]
-                                    .as_str()
-                                    .or_else(|| record["definition_fp"].as_str())
-                                    == Some(fp)
-                            })
+                            && (record["pending_capture"] == true
+                                || event["new_fp"].as_str().is_some_and(|fp| {
+                                    record["pending_pin"]["fp"]
+                                        .as_str()
+                                        .or_else(|| record["definition_fp"].as_str())
+                                        == Some(fp)
+                                }))
                     })
                     .filter_map(|record| record["profile"].as_str())
                     .collect();
@@ -5026,14 +5117,43 @@ fn review_events_uncached(limit: usize) -> std::io::Result<Vec<Value>> {
                     record["review_required"] == true
                         && record["tool"] == event["tool"]
                         && event_matches_profile(event, record["profile"].as_str().unwrap_or(""))
+                        && (record["pending_capture"] == true
+                            || event["new_fp"].as_str().is_some_and(|fp| {
+                                record["pending_pin"]["fp"]
+                                    .as_str()
+                                    .or_else(|| record["definition_fp"].as_str())
+                                    == Some(fp)
+                            }))
+                }) {
+                    event["review_required"] = json!(true);
+                }
+                // Held by a pending pin whose definition is not captured yet: there
+                // is nothing in Settings to review until the gateway captures it. A
+                // captured review for the same finding in another store still has
+                // one, so that review wins and the pending store stays held.
+                let captured_review = records.iter().any(|record| {
+                    record["pending_capture"] != true
+                        && record["review_required"] == true
+                        && record["tool"] == event["tool"]
+                        && event_matches_profile(event, record["profile"].as_str().unwrap_or(""))
                         && event["new_fp"].as_str().is_some_and(|fp| {
                             record["pending_pin"]["fp"]
                                 .as_str()
                                 .or_else(|| record["definition_fp"].as_str())
                                 == Some(fp)
                         })
-                }) {
-                    event["review_required"] = json!(true);
+                });
+                if !captured_review
+                    && records.iter().any(|record| {
+                        record["pending_capture"] == true
+                            && record["tool"] == event["tool"]
+                            && event_matches_profile(
+                                event,
+                                record["profile"].as_str().unwrap_or(""),
+                            )
+                    })
+                {
+                    event["pending_capture"] = json!(true);
                 }
                 event["blocked_profiles"] = json!(profiles);
             }
@@ -5042,12 +5162,6 @@ fn review_events_uncached(limit: usize) -> std::io::Result<Vec<Value>> {
             }
         }
     }
-    attach_drift_poison_signatures(&mut events);
-    // Preview.6 showed 50 recent records in React. Reading the full retention
-    // window for complete refreshes must not turn older, fingerprint-less history
-    // into a new wall of findings. Keep every blocked or unverifiable block visible.
-    mark_older_drift_history(&mut events);
-    Ok(events)
 }
 
 fn mark_older_drift_history(events: &mut [Value]) {
@@ -5118,6 +5232,56 @@ pub struct ToolChangeGroup {
     pub tools: Vec<Value>,
 }
 
+/// Whether a tool change asks the user to review or accept it. With reviews off
+/// (`Registry::tool_change_reviews_enabled`) only a change verified unblocked,
+/// with no pending definition review, becomes plain history. Blocked, unknown
+/// (`blocked` missing or null) and review-required changes still ask.
+pub fn tool_change_asks_review(event: &Value, reviews_enabled: bool) -> bool {
+    reviews_enabled || event["blocked"] != false || event["review_required"] == true
+}
+
+/// Whether Safety Off still holds a tool: a definition review in any quarantine
+/// store or a pending review pin. Unreadable stores count as holding one.
+pub fn off_holds_any_tool() -> bool {
+    let Ok(rows) = all_quarantined() else {
+        return true;
+    };
+    if rows.iter().any(|row| row["review_required"] == true) {
+        return true;
+    }
+    let Ok(stores) = quarantine_scan_stores() else {
+        return true;
+    };
+    // Retired review names count too: a returning tool whose reactivation fails
+    // stays blocked. An unreadable pin store cannot show that nothing is held.
+    stores.iter().any(|(profile, _)| {
+        let pins = cached_review_pins((!profile.is_empty()).then_some(profile.as_str()));
+        pins.unreadable || !pins.names.is_empty()
+    })
+}
+
+/// What Activity says about Safety, decided once for both shells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivitySafety {
+    /// `Registry::tool_change_reviews_enabled`, true when the registry is unreadable.
+    pub tool_change_reviews: bool,
+    /// No tool change can be blocked and none is held: Activity may say Safety is Off.
+    pub blocks_nothing: bool,
+    /// An authoritative registry read found reviews on: Activity may say
+    /// protection is active. False while unknown, even though reviews stay on.
+    pub reviews_confirmed: bool,
+}
+
+pub fn activity_safety() -> ActivitySafety {
+    let (tool_change_reviews, reviews_confirmed) = crate::registry::tool_change_reviews_state();
+    ActivitySafety {
+        tool_change_reviews,
+        blocks_nothing: !tool_change_reviews && !off_holds_any_tool(),
+        reviews_confirmed,
+    }
+}
+
 /// One server refresh is one event, even when it changed hundreds of definitions.
 /// Keep updates more than a minute apart separate, and retain distinct changes to each tool.
 pub fn group_tool_changes(events: &[Value]) -> Vec<ToolChangeGroup> {
@@ -5158,42 +5322,45 @@ pub fn group_tool_changes(events: &[Value]) -> Vec<ToolChangeGroup> {
 }
 
 pub fn tool_change_summary(events: &[Value]) -> String {
-    let inputs = events
-        .iter()
-        .filter(|event| {
-            event["changed_fields"]
-                .as_array()
-                .is_some_and(|fields| fields.iter().any(|field| field == "input_schema"))
-        })
-        .count();
-    if inputs == events.len() {
-        format!(
-            "{} {} changed their inputs",
-            inputs,
-            if inputs == 1 { "tool" } else { "tools" }
-        )
-    } else if events.iter().all(|event| event["change"] == "added") {
-        format!(
-            "{} new {}",
-            events.len(),
-            if events.len() == 1 { "tool" } else { "tools" }
-        )
+    // Same messages and order as React's `ToolChanges` summary.
+    let count = events.len();
+    let one = count == 1;
+    let fields = |event: &Value| {
+        event["changed_fields"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    };
+    let source = if events.iter().all(|event| event["change"] == "added") {
+        if one {
+            crate::i18n::msg("{count} new tool")
+        } else {
+            crate::i18n::msg("{count} new tools")
+        }
     } else if events
         .iter()
-        .all(|event| event["changed_fields"] == json!(["description"]))
+        .all(|event| fields(event).iter().any(|field| field == "input_schema"))
     {
-        format!(
-            "{} {} changed their descriptions",
-            events.len(),
-            if events.len() == 1 { "tool" } else { "tools" }
-        )
+        if one {
+            crate::i18n::msg("{count} tool changed its inputs")
+        } else {
+            crate::i18n::msg("{count} tools changed their inputs")
+        }
+    } else if events
+        .iter()
+        .all(|event| fields(event) == vec![json!("description")])
+    {
+        if one {
+            crate::i18n::msg("{count} tool changed its description")
+        } else {
+            crate::i18n::msg("{count} tools changed their descriptions")
+        }
+    } else if one {
+        crate::i18n::msg("{count} tool changed")
     } else {
-        format!(
-            "{} {} changed",
-            events.len(),
-            if events.len() == 1 { "tool" } else { "tools" }
-        )
-    }
+        crate::i18n::msg("{count} tools changed")
+    };
+    crate::i18n::trf(source, &[("count", &count.to_string())])
 }
 
 /// One tool definition as the offline ecosystem tracker records it: both fingerprints,
@@ -5628,6 +5795,374 @@ mod tests {
         assert!(events[55..]
             .iter()
             .all(|event| event.get("historical").is_none()));
+    }
+
+    #[test]
+    fn safety_off_holds_a_tool_only_for_reviews_or_an_unreadable_store() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data = TestDataDir::new("off-holds-any-tool");
+        assert!(!off_holds_any_tool());
+        let ordinary =
+            json!({"tool":"srv__update", "change":"changed", "definition_fp":"v2:current"});
+        save_quarantine(
+            None,
+            &BTreeMap::from([("srv__update".to_string(), ordinary.clone())]),
+        )
+        .unwrap();
+        assert!(
+            !off_holds_any_tool(),
+            "Off does not enforce ordinary quarantine"
+        );
+        let mut review = ordinary;
+        review["review_required"] = json!(true);
+        save_quarantine(None, &BTreeMap::from([("srv__update".to_string(), review)])).unwrap();
+        assert!(off_holds_any_tool());
+        std::fs::write(quarantine_path(None).unwrap(), "{broken").unwrap();
+        assert!(
+            off_holds_any_tool(),
+            "an unreadable store is not an all-clear"
+        );
+    }
+
+    #[test]
+    fn off_marks_only_enforced_rows_as_blocked() {
+        use crate::registry::SafetyLevel;
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data = TestDataDir::new("off-enforced-rows");
+        let level = |level: SafetyLevel| {
+            let mut registry = crate::registry::Registry::default();
+            registry.set_safety_level(level);
+            crate::registry::save(&registry).unwrap();
+        };
+        // Strict quarantined an ordinary change.
+        level(SafetyLevel::Strict);
+        let ordinary = json!({"tool":"srv__update", "change":"changed", "definition_fp":"v2:f"});
+        save_quarantine(None, &BTreeMap::from([("srv__update".into(), ordinary)])).unwrap();
+        record_event(
+            &json!({"type":"tool_drift", "tool":"srv__update", "server":"srv",
+            "change":"changed", "new_fp":"v2:f", "profile":"", "ts":1}),
+        );
+        let event = || review_events(2000).unwrap().remove(0);
+        assert_eq!(event()["blocked"], true);
+        // Off does not enforce it: plain history, the row kept on disk.
+        level(SafetyLevel::Off);
+        assert_eq!(event()["blocked"], false);
+        assert!(!tool_change_asks_review(&event(), false));
+        assert!(load_quarantine(None).unwrap().contains_key("srv__update"));
+        // Back to Ask: the card returns.
+        level(SafetyLevel::Ask);
+        assert_eq!(event()["blocked"], true);
+        // A definition review is enforced at Off too.
+        level(SafetyLevel::Off);
+        let review = json!({"tool":"srv__update", "change":"changed",
+            "definition_fp":"v2:f", "review_required":true});
+        save_quarantine(None, &BTreeMap::from([("srv__update".into(), review)])).unwrap();
+        assert_eq!(event()["blocked"], true);
+        assert_eq!(event()["review_required"], true);
+    }
+
+    #[test]
+    fn off_holds_review_pins_including_retired_and_unreadable() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data = TestDataDir::new("off-active-pins");
+        // Only "work": a "default" profile with no v2 store would read the global
+        // pin file as its unmigrated legacy store, which holds by design.
+        let mut registry = crate::registry::Registry::default();
+        registry.profiles.clear();
+        registry.active_profile_id = Some("work".into());
+        registry.set_safety_level(crate::registry::SafetyLevel::Off);
+        registry.profiles.push(crate::registry::Profile {
+            id: "work".into(),
+            name: "Work".into(),
+            enabled_server_ids: vec![],
+            tool_scope: Default::default(),
+            instructions: None,
+            unknown_fields: Default::default(),
+        });
+        crate::registry::save(&registry).unwrap();
+        let scopes = [None, Some("work")];
+        // Every store readable and empty: nothing is held.
+        for scope in scopes {
+            save_quarantine(scope, &Quarantine::new()).unwrap();
+            save_pins(scope, &Pins::new()).unwrap();
+        }
+        assert!(!off_holds_any_tool());
+        for scope in scopes {
+            // An unreadable pin store cannot show that nothing is held.
+            let path = pins_path(scope).unwrap();
+            std::fs::write(&path, "{ not json").unwrap();
+            assert!(off_holds_any_tool(), "{scope:?}");
+            assert!(!activity_safety().blocks_nothing, "{scope:?}");
+            let _ = std::fs::remove_file(pins_backup_path(&path));
+            save_pins(scope, &Pins::new()).unwrap();
+            assert!(!off_holds_any_tool(), "{scope:?}");
+        }
+        for scope in scopes {
+            let mut pin = pin_of(&destructive_tool("srv__wipe", "Captured definition."));
+            pin.review_pending = true;
+            pin.review_retired = true;
+            save_pins(scope, &BTreeMap::from([("srv__wipe".into(), pin.clone())])).unwrap();
+            // Its server was removed, but a returning tool whose reactivation fails
+            // stays blocked, so a retired review still rules out the Off card.
+            assert!(off_holds_any_tool(), "{scope:?}");
+            assert!(!activity_safety().blocks_nothing, "{scope:?}");
+            pin.review_retired = false;
+            save_pins(scope, &BTreeMap::from([("srv__wipe".into(), pin)])).unwrap();
+            assert!(off_holds_any_tool(), "{scope:?}");
+            save_pins(scope, &Pins::new()).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_cache_follows_a_symlinked_registry_target() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let data = TestDataDir::new("symlinked-registry");
+        let target = data.path.with_extension("registry-target.json");
+        std::fs::write(&target, r#"{"safetyLevel":"strict"}"#).unwrap();
+        std::os::unix::fs::symlink(&target, data.path.join("registry.json")).unwrap();
+        let reads = std::cell::Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Ok(vec![])
+        };
+        review_events_cached(2000, read).unwrap();
+        review_events_cached(2000, read).unwrap();
+        assert_eq!(reads.get(), 1, "an unchanged registry reuses the cache");
+        // Edit only the target: the link itself is unchanged.
+        std::fs::write(&target, r#"{"safetyLevel":"off"}"#).unwrap();
+        review_events_cached(2000, read).unwrap();
+        assert_eq!(
+            reads.get(),
+            2,
+            "a symlinked registry's edit refreshes Activity"
+        );
+        let _ = std::fs::remove_file(&target);
+    }
+
+    #[test]
+    fn review_cache_sees_a_same_length_safety_change_within_one_tick() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let data = TestDataDir::new("same-tick-registry");
+        let registry = data.path.join("registry.json");
+        std::fs::write(&registry, r#"{"safetyLevel":"ask"}"#).unwrap();
+        let reads = std::cell::Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Ok(vec![])
+        };
+        REVIEW_SAME_TICK.with(|same| same.set(true));
+        review_events_cached(2000, read).unwrap();
+        review_events_cached(2000, read).unwrap();
+        let unchanged = reads.get();
+        // Same length, same inode, and no timestamp tick: only content differs.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&registry)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, br#"{"safetyLevel":"off"}"#))
+            .unwrap();
+        review_events_cached(2000, read).unwrap();
+        let after = reads.get();
+        REVIEW_SAME_TICK.with(|same| same.set(false));
+        assert_eq!(unchanged, 1, "an unchanged registry reuses the cache");
+        assert_eq!(
+            after, 2,
+            "an Ask to Off rewrite refreshes blocked annotations"
+        );
+    }
+
+    #[test]
+    fn synthesized_access_scopes_hold_list_and_annotate_their_reviews() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data = TestDataDir::new("synthesized-access-scopes");
+        crate::registry::save(&crate::registry::Registry::default()).unwrap();
+        let registry = crate::registry::load_resolved().unwrap();
+        for id in [registry.default_access_id(), registry.all_access_id()] {
+            let scope = Some(id.as_str());
+            let captured = json!({"tool":"srv__update", "change":"changed",
+                "definition_fp":"v2:current", "review_required":true});
+            save_quarantine(scope, &BTreeMap::from([("srv__update".into(), captured)])).unwrap();
+            // Off with no retained event: the hold alone rules out the all-clear.
+            assert!(off_holds_any_tool(), "{id}");
+            // Settings lists the row at every level, through the same union. Both
+            // synthesized ids share one store, listed once under either id.
+            let rows = all_quarantined_summaries().unwrap();
+            assert_eq!(rows.len(), 1, "{id}");
+            assert_eq!(
+                crate::registry::access_integrity_id(rows[0]["profile"].as_str().unwrap()),
+                crate::registry::access_integrity_id(&id),
+            );
+            assert_eq!(rows[0]["tool"], "srv__update");
+            record_event(
+                &json!({"type":"tool_drift", "tool":"srv__update", "server":"srv",
+                "change":"changed", "new_fp":"v2:current", "profile":id, "ts":1}),
+            );
+            let event = review_events(2000).unwrap().remove(0);
+            assert_eq!(event["blocked"], true, "{id}");
+            assert_eq!(event["review_required"], true, "{id}");
+            save_quarantine(scope, &Quarantine::new()).unwrap();
+            assert!(!off_holds_any_tool(), "{id}");
+            std::fs::remove_file(security_path().unwrap()).unwrap();
+        }
+        // An access context that is also a profile id shares that profile's
+        // store: one held tool is one row, not one per id.
+        let mut registry = registry;
+        registry.default_access_context_id = Some("work".into());
+        registry.profiles.push(crate::registry::Profile {
+            id: "work".into(),
+            name: "Work".into(),
+            enabled_server_ids: vec![],
+            tool_scope: Default::default(),
+            instructions: None,
+            unknown_fields: Default::default(),
+        });
+        crate::registry::save(&registry).unwrap();
+        let row = json!({"tool":"srv__update", "change":"changed",
+            "definition_fp":"v2:current", "review_required":true});
+        save_quarantine(Some("work"), &BTreeMap::from([("srv__update".into(), row)])).unwrap();
+        assert_eq!(all_quarantined().unwrap().len(), 1);
+        assert_eq!(all_quarantined_summaries().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn global_and_access_stores_never_share_an_event() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data = TestDataDir::new("global-vs-access-store");
+        crate::registry::save(&crate::registry::Registry::default()).unwrap();
+        let access = crate::registry::load_resolved()
+            .unwrap()
+            .default_access_id();
+        assert_eq!(
+            access, "@default-access:",
+            "a fresh registry has no access context"
+        );
+        let row = json!({"tool":"srv__update", "change":"changed", "definition_fp":"v2:same"});
+        // Same tool and fingerprint, one store held, the event logged in the other.
+        for (held, logged) in [(Some(access.as_str()), ""), (None, access.as_str())] {
+            save_quarantine(held, &BTreeMap::from([("srv__update".into(), row.clone())])).unwrap();
+            record_event(
+                &json!({"type":"tool_drift", "tool":"srv__update", "server":"srv",
+                "change":"changed", "new_fp":"v2:same", "profile":logged, "ts":1}),
+            );
+            let event = review_events(2000).unwrap().remove(0);
+            assert_eq!(event["blocked"], false, "{held:?}");
+            assert_eq!(event["blocked_profiles"], json!([]), "{held:?}");
+            // Accepting releases only the event's own store, so the hold stays.
+            for profile in event["blocked_profiles"].as_array().unwrap() {
+                let profile = profile.as_str().unwrap();
+                release((!profile.is_empty()).then_some(profile), "srv__update").unwrap();
+            }
+            assert!(load_quarantine(held).unwrap().contains_key("srv__update"));
+            save_quarantine(held, &Quarantine::new()).unwrap();
+            // A pending pin in one store does not hold the other store's change.
+            let legacy = json!({"tool":"srv__update", "change":"changed"});
+            save_quarantine(held, &BTreeMap::from([("srv__update".into(), legacy)])).unwrap();
+            assert!(release(held, "srv__update").unwrap());
+            let event = review_events(2000).unwrap().remove(0);
+            assert_eq!(event["blocked"], false, "{held:?}");
+            assert!(event.get("pending_capture").is_none(), "{held:?}");
+            save_pins(held, &Pins::new()).unwrap();
+            std::fs::remove_file(security_path().unwrap()).unwrap();
+        }
+        assert!(same_integrity_store("@default-access:", "@all-enabled:"));
+        assert!(!same_integrity_store("", "@default-access:"));
+    }
+
+    #[test]
+    fn a_captured_review_in_one_store_outranks_capture_in_another() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data = TestDataDir::new("merged-capture-and-review");
+        let mut registry = crate::registry::Registry::default();
+        registry.profiles.push(crate::registry::Profile {
+            id: "work".into(),
+            name: "Work".into(),
+            enabled_server_ids: vec![],
+            tool_scope: Default::default(),
+            instructions: None,
+            unknown_fields: Default::default(),
+        });
+        crate::registry::save(&registry).unwrap();
+        // One finding recorded in both stores, merged into one event.
+        for profile in ["", "work"] {
+            record_event(
+                &json!({"type":"tool_drift", "tool":"srv__update", "server":"srv",
+                "change":"changed", "new_fp":"v2:f", "profile":profile, "ts":1}),
+            );
+        }
+        // Global: a released legacy block awaiting capture. Work: a captured review.
+        let legacy = json!({"tool":"srv__update", "change":"changed"});
+        save_quarantine(None, &BTreeMap::from([("srv__update".into(), legacy)])).unwrap();
+        assert!(release(None, "srv__update").unwrap());
+        let captured = json!({"tool":"srv__update", "change":"changed",
+            "definition_fp":"v2:f", "review_required":true});
+        save_quarantine(
+            Some("work"),
+            &BTreeMap::from([("srv__update".into(), captured)]),
+        )
+        .unwrap();
+        let events = review_events(2000).unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let event = &events[0];
+        assert_eq!(event["profiles"], json!(["", "work"]));
+        assert_eq!(event["review_required"], true);
+        assert!(
+            event.get("pending_capture").is_none(),
+            "Settings has a review"
+        );
+        // Both stores stay held; acceptance stays behind the captured review.
+        let mut held: Vec<&str> = event["blocked_profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        held.sort_unstable();
+        assert_eq!(held, ["", "work"]);
+        // Without the captured review the event waits for capture.
+        save_quarantine(Some("work"), &Quarantine::new()).unwrap();
+        assert_eq!(review_events(2000).unwrap()[0]["pending_capture"], true);
+    }
+
+    #[test]
+    fn a_pending_pin_without_a_quarantine_row_keeps_its_change_held() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data = TestDataDir::new("pending-pin-annotation");
+        crate::registry::save(&crate::registry::Registry::default()).unwrap();
+        let registry = crate::registry::load_resolved().unwrap();
+        for id in [None, Some(registry.default_access_id())] {
+            let scope = id.as_deref();
+            // A legacy block without a captured definition, released: the gateway
+            // keeps the tool held by its pending pin until recapture succeeds.
+            let legacy = json!({"tool":"srv__update", "change":"changed"});
+            save_quarantine(scope, &BTreeMap::from([("srv__update".into(), legacy)])).unwrap();
+            record_event(
+                &json!({"type":"tool_drift", "tool":"srv__update", "server":"srv",
+                "change":"changed", "new_fp":"v2:current", "profile":scope.unwrap_or(""), "ts":1}),
+            );
+            assert!(release(scope, "srv__update").unwrap());
+            assert!(load_quarantine(scope).unwrap().is_empty());
+            assert!(pending_definition_review(scope));
+            let event = review_events(2000).unwrap().remove(0);
+            assert_eq!(event["blocked"], true, "{id:?}");
+            assert_eq!(event["review_required"], true, "{id:?}");
+            assert_eq!(event["pending_capture"], true, "{id:?}");
+            assert!(tool_change_asks_review(&event, false), "{id:?}");
+            let mut raw = read_recent(25).unwrap();
+            annotate_review_status(&mut raw, &review_quarantines());
+            assert_eq!(raw[0]["review_required"], true, "watcher path {id:?}");
+            assert!(off_holds_any_tool());
+            // Once the gateway captures the definition, the event is an ordinary
+            // review bound to that record.
+            let captured = json!({"tool":"srv__update", "change":"changed",
+                "definition_fp":"v2:current", "review_required":true});
+            save_quarantine(scope, &BTreeMap::from([("srv__update".into(), captured)])).unwrap();
+            let event = review_events(2000).unwrap().remove(0);
+            assert_eq!(event["review_required"], true, "{id:?}");
+            assert!(event.get("pending_capture").is_none(), "{id:?}");
+            save_quarantine(scope, &Quarantine::new()).unwrap();
+            save_pins(scope, &Pins::new()).unwrap();
+            std::fs::remove_file(security_path().unwrap()).unwrap();
+        }
     }
 
     #[test]

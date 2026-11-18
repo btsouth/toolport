@@ -94,6 +94,12 @@ pub(super) struct ActivitySnapshot {
     pub(super) inspect_error: Option<String>,
     /// Live inspection is on, so the inspector panel shows (React reads `liveInspect`).
     pub(super) live_inspect: bool,
+    /// `Registry::tool_change_reviews_enabled`; true when the registry is unreadable.
+    pub(super) tool_change_reviews: bool,
+    /// `integrity::ActivitySafety::blocks_nothing`: Activity may say Safety is Off.
+    pub(super) blocks_nothing: bool,
+    /// `integrity::ActivitySafety::reviews_confirmed`: Activity may say protection is active.
+    pub(super) reviews_confirmed: bool,
 }
 
 /// How many recent entries Activity reads and lists: React's `getAuditLog(200)`.
@@ -224,6 +230,9 @@ impl ActivitySnapshot {
             search_traces_error: None,
             inspect_error: None,
             live_inspect: false,
+            tool_change_reviews: true,
+            blocks_nothing: false,
+            reviews_confirmed: false,
         }
     }
 }
@@ -419,6 +428,11 @@ pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
         .map_err(|error| format!("could not read the registry for tool identities: {error}"))
         .and_then(|registry| {
             snapshot.live_inspect = registry.live_inspect;
+            // The same source-aware decision React reads through `activity_safety`.
+            let safety = crate::integrity::activity_safety();
+            snapshot.tool_change_reviews = safety.tool_change_reviews;
+            snapshot.blocks_nothing = safety.blocks_nothing;
+            snapshot.reviews_confirmed = safety.reviews_confirmed;
             annotate_security_server_names(&mut snapshot.security_events, &registry.servers);
             crate::integrity::tool_identities(&registry.servers, &registry.profiles)
                 .map_err(|error| format!("could not read the tool identity stores: {error}"))

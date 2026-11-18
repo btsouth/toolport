@@ -1134,5 +1134,9 @@
   "Connected {connected} of {total} T3 Code instances.": "已连接 {connected}/{total} 个 T3 Code 实例。",
   "Not connected: {names}.": "未连接：{names}。",
   "Skip": "跳过",
-  "No servers moved, so your agent has no new tools.": "没有移动任何服务器，因此你的智能体没有新工具。"
+  "No servers moved, so your agent has no new tools.": "没有移动任何服务器，因此你的智能体没有新工具。",
+  "{value0} tool-change records": "{value0} 条工具变更记录",
+  "Safety is Off.": "安全已关闭。",
+  "Toolport records tool changes but does not block them.": "Toolport 会记录工具变更，但不会阻止这些变更。",
+  "Toolport is capturing this tool's new definition. It stays blocked until then.": "Toolport 正在获取此工具的新定义。在此之前它将保持阻止状态。"
 }
