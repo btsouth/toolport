@@ -178,7 +178,9 @@ jobs:
           cache: npm
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - name: Install Linux build dependencies
-        run: scripts/ci-apt-install.sh libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev squashfs-tools
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev squashfs-tools
       - name: Give the runner headroom (the app crate links WebKitGTK)
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/share/swift 2>/dev/null || true
@@ -329,7 +331,9 @@ jobs:
       # The native shell deliberately skips WebKit/Tauri. Ubuntu 24.04 provides
       # GTK >= 4.10 and libadwaita >= 1.4, the floor for adaptive navigation.
       - name: Install GTK build dependencies
-        run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev libgtk-4-dev libadwaita-1-dev xvfb xauth dbus-daemon xdotool
+        uses: ./.github/actions/apt-install
+        with:
+          packages: build-essential libssl-dev pkg-config libdbus-1-dev libgtk-4-dev libadwaita-1-dev xvfb xauth dbus-daemon xdotool
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -453,7 +457,9 @@ jobs:
 
       # Each shell is linted with its test fixtures and all targets.
       - name: Install Linux build dependencies
-        run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev ${{ matrix.packages }}
+        uses: ./.github/actions/apt-install
+        with:
+          packages: build-essential libssl-dev pkg-config libdbus-1-dev ${{ matrix.packages }}
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -502,7 +508,9 @@ jobs:
       - name: Install Linux build dependencies
         # Same set as the release workflow: WebKitGTK + the Secret Service
         # (libdbus) deps the Tauri lib needs to compile on Linux.
-        run: scripts/ci-apt-install.sh libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev dbus-daemon
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev dbus-daemon
 
       - name: Give the runner headroom (a cold build links WebKitGTK)
         run: |
@@ -554,7 +562,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
       - name: Install Linux build dependencies
-        run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev
+        uses: ./.github/actions/apt-install
+        with:
+          packages: build-essential libssl-dev pkg-config libdbus-1-dev
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -620,7 +630,9 @@ jobs:
       # needs libdbus headers and pkg-config at compile time.
       - name: Install Linux build dependencies
         if: matrix.os == 'ubuntu-22.04'
-        run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev
+        uses: ./.github/actions/apt-install
+        with:
+          packages: build-essential libssl-dev pkg-config libdbus-1-dev
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
