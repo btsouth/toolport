@@ -4,6 +4,14 @@ import { securityFixture } from "./security-fixture";
 import { applySkillState, skillsFixture } from "./skills-fixture";
 import { withParity } from "./parity-fixture";
 const fixtureLocations: import("@/lib/types").DetectedClient[] = [];
+// Clients Disconnect took the gateway out of, until Connect puts it back.
+const disconnectedClients = new Set<string>();
+const withDisconnects = <T extends object>(clients: T[]): T[] =>
+  clients.map((client) =>
+    disconnectedClients.has(String((client as { id?: unknown }).id))
+      ? { ...client, gatewayInstalled: false, entryState: "absent" }
+      : client,
+  );
 // Separate development entry. Never imported by the shipping application.
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { useState } from "react";
@@ -760,6 +768,7 @@ mockIPC(
           : [];
       case "migrate_client":
         if (setupVerifying) return new Promise(() => {});
+        disconnectedClients.delete(String(args.clientId));
         if (setupFailure && setupFailure !== "optional")
           throw new Error(
             setupFailure === "vault"
@@ -959,7 +968,19 @@ mockIPC(
       case "delete_profile":
         registry.profiles = registry.profiles.filter((p) => p.id !== args.id);
         return registry;
+      case "uninstall_gateway": {
+        const clientId = String(args.clientId);
+        disconnectedClients.add(clientId);
+        registry.clientScopes = Object.fromEntries(
+          Object.entries(registry.clientScopes ?? {}).filter(([id]) => id !== clientId),
+        );
+        return {
+          path: `/fixture/${clientId}.json`,
+          backup: `/fixture/Toolport/backups/${clientId}/previous.json`,
+        };
+      }
       case "install_gateway":
+        disconnectedClients.delete(String(args.clientId));
         registry.clientScopes = {
           ...registry.clientScopes,
           [String(args.clientId)]: String(args.profile || ""),
@@ -1080,50 +1101,52 @@ mockIPC(
       case "discard_client_recovery":
         return "Fixture recovery copies were deleted.";
       case "detect_clients":
-        return [
-          ...fixtureLocations,
-          ...(detailStates ? detailClients : []),
-          ...(claudeProfiles ? claudeProfileClients : []),
-          ...(args.inspectConfigs && !claudeProfiles
-            ? [
-                {
-                  id: "claude-code@claude2",
-                  name: "Claude Code (claude2)",
-                  usesConnectors: false,
-                  configPath: "/fixture/.claude2/.claude.json",
-                  configExists: true,
-                  appPresent: true,
-                  servers: [],
-                  pluginServers: [],
-                  gatewayInstalled: true,
-                  entryState: "managed",
-                  error: null,
-                },
-              ]
-            : []),
-          {
-            id: "codex",
-            name: "Codex",
-            usesConnectors: false,
-            configPath: "/fixture/codex.toml",
-            configExists: true,
-            appPresent: true,
-            servers: setupFixture || connectedImportFixture ? setupItems : [],
-            pluginServers: [],
-            gatewayInstalled: !setupFixture || setupConnected,
-            entryState: !setupFixture || setupConnected ? "managed" : "absent",
-            discovery: {
-              autoMode: "full",
-              nativeToolSearch: true,
-              toolsListChanged: null,
-              evidence: "fixture",
+        return withDisconnects(
+          [
+            ...fixtureLocations,
+            ...(detailStates ? detailClients : []),
+            ...(claudeProfiles ? claudeProfileClients : []),
+            ...(args.inspectConfigs && !claudeProfiles
+              ? [
+                  {
+                    id: "claude-code@claude2",
+                    name: "Claude Code (claude2)",
+                    usesConnectors: false,
+                    configPath: "/fixture/.claude2/.claude.json",
+                    configExists: true,
+                    appPresent: true,
+                    servers: [],
+                    pluginServers: [],
+                    gatewayInstalled: true,
+                    entryState: "managed",
+                    error: null,
+                  },
+                ]
+              : []),
+            {
+              id: "codex",
+              name: "Codex",
+              usesConnectors: false,
+              configPath: "/fixture/codex.toml",
+              configExists: true,
+              appPresent: true,
+              servers: setupFixture || connectedImportFixture ? setupItems : [],
+              pluginServers: [],
+              gatewayInstalled: !setupFixture || setupConnected,
+              entryState: !setupFixture || setupConnected ? "managed" : "absent",
+              discovery: {
+                autoMode: "full",
+                nativeToolSearch: true,
+                toolsListChanged: null,
+                evidence: "fixture",
+              },
+              error: null,
             },
-            error: null,
-          },
-        ].filter(
-          // The Codex home in the profile set replaces the plain Codex row.
-          (client, index, all) =>
-            all.findIndex((other) => other.id === client.id) === index,
+          ].filter(
+            // The Codex home in the profile set replaces the plain Codex row.
+            (client, index, all) =>
+              all.findIndex((other) => other.id === client.id) === index,
+          ),
         );
       case "team_sync_status":
         return { state: "offline", lastSuccessMs: 1791504000000 };
