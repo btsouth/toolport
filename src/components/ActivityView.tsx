@@ -2251,13 +2251,13 @@ export function ActivityView({
         <SecurityLoadNotice status={securityLoadStatus} onRetry={retryLoads} />
       ) : null}
       {/* Safety Off says what state you are in first, and only while nothing on this
-          screen or in the stores is blocked or held. */}
+          screen or in the stores is blocked or held. Notices block nothing at Off,
+          so they follow the card. */}
       {!reviewsEnabled &&
       safety.blocksNothing &&
       securityLoadStatus === "ready" &&
       toolChanges.length === 0 &&
-      olderToolChanges.length === 0 &&
-      highSecurity.length === 0 ? (
+      olderToolChanges.length === 0 ? (
         <SafetyOffNotice />
       ) : null}
       {toolChanges.length > 0 ? (
