@@ -458,16 +458,20 @@ fn nothing_left_in_a_gone_folder(path: &Path, contents: &str) -> Result<bool, St
     Ok(super::restore::original_text(&client_id, path)?.is_none_or(|text| empty_config(&text)))
 }
 
-/// `{}` or `{"mcpServers": {}}`: a config with no servers and no settings.
+/// A blank file, `{}` or `{"mcpServers": {}}`: a config with no servers and no
+/// settings. Blank text counts as empty, as it does when Connect reads it.
 fn empty_config(text: &str) -> bool {
-    serde_json::from_str::<Value>(text)
-        .ok()
-        .and_then(|root| root.as_object().cloned())
-        .is_some_and(|root| {
-            root.iter().all(|(key, value)| {
-                key == "mcpServers" && value.as_object().is_some_and(|servers| servers.is_empty())
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    text.trim().is_empty()
+        || serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|root| root.as_object().cloned())
+            .is_some_and(|root| {
+                root.iter().all(|(key, value)| {
+                    key == "mcpServers"
+                        && value.as_object().is_some_and(|servers| servers.is_empty())
+                })
             })
-        })
 }
 
 #[cfg(test)]

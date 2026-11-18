@@ -1518,7 +1518,12 @@ fn workbuddy_disconnect_succeeds_once_its_folder_is_gone() {
         ("workbuddy", ".workbuddy"),
         ("workbuddy-ai", ".workbuddy-ai"),
     ] {
-        for original in [None, Some("{\"mcpServers\": {}}\n")] {
+        for original in [
+            None,
+            Some("{\"mcpServers\": {}}\n"),
+            Some(""),
+            Some(" \n\t"),
+        ] {
             let fixture = Fixture::new("workbuddy-uninstalled");
             let folder = fixture.home.join(own);
             std::fs::create_dir_all(&folder).unwrap();
@@ -1634,5 +1639,31 @@ fn workbuddy_disconnect_rollback_never_creates_its_folder() {
         assert!(result.is_err(), "{id}");
         assert!(!folder.exists(), "{id}: rollback created the folder");
         drop(fixture);
+    }
+}
+
+/// A blank original file comes back with its exact bytes on Disconnect.
+#[test]
+fn workbuddy_disconnect_restores_a_blank_original_exactly() {
+    for (id, own) in [
+        ("workbuddy", ".workbuddy"),
+        ("workbuddy-ai", ".workbuddy-ai"),
+    ] {
+        for original in ["", " \n\t"] {
+            let fixture = Fixture::new("workbuddy-blank");
+            let file = fixture.home.join(own).join("mcp.json");
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, original).unwrap();
+            install_gateway(id, None).unwrap();
+            assert!(read(&file)["mcpServers"].get("toolport").is_some(), "{id}");
+            let outcome = uninstall_gateway(id).unwrap();
+            finish_uninstall(id, &outcome).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                original,
+                "{id} {original:?}"
+            );
+            drop(fixture);
+        }
     }
 }
