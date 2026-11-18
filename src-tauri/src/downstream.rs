@@ -10360,10 +10360,9 @@ pub(crate) mod p09_child {
                             }
                             Some("tools/call") => {
                                 let path = calls.as_ref().expect("calls file");
-                                let mut file = std::fs::OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open(path)?;
+                                let mut file = crate::registry::open_append_private(
+                                    std::path::Path::new(path),
+                                )?;
                                 file.write_all(b"dispatch\n")?;
                                 flood(&mut out, FLOOD)?;
                                 out.write_all(b"\n")?;
