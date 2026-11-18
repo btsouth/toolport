@@ -84,6 +84,17 @@ async function fillServer(user: ReturnType<typeof userEvent.setup>, command: str
   await user.type(screen.getByLabelText("Command"), command);
 }
 
+// A failed save: one danger callout in the footer, over no
+// button, and no toast.
+async function expectFooterError(text: string) {
+  await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(text));
+  const alert = screen.getByRole("alert");
+  expect(alert.textContent).toBe(text);
+  expect(alert.closest('[data-slot="dialog-footer"]')).not.toBeNull();
+  expect(alert).toHaveClass("toolport-alert", "border-destructive");
+  expect(toastError).not.toHaveBeenCalled();
+}
+
 describe("ServerDialog", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -287,6 +298,27 @@ describe("ServerDialog", () => {
     );
   });
 
+  it("shows a failed edit in the footer, not over it", async () => {
+    const initial = {
+      id: "local",
+      name: "Local",
+      transport: "stdio",
+      command: "local-server",
+      args: [],
+      env: [],
+      url: null,
+      source: "manual",
+    } as ServerEntry;
+    api.updateServer.mockRejectedValueOnce("disk full");
+    const user = userEvent.setup();
+
+    render(<ServerDialog autoOpen editId="local" initial={initial} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await expectFooterError("Couldn't save Local: disk full");
+    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+  });
+
   it("turns the shell environment off for a server", async () => {
     const initial: ServerEntry = {
       id: "local",
@@ -426,11 +458,13 @@ describe("ServerDialog", () => {
 
     await user.click(screen.getByRole("button", { name: "Add" }));
 
-    await waitFor(() =>
-      expect(toastError).toHaveBeenCalledWith(
-        "Couldn't save demo: Keychain unavailable. Unlock it and retry importing. Client config unchanged.",
-      ),
+    // The error sits in the footer above the buttons, which stay usable; no toast
+    // covers them.
+    await expectFooterError(
+      "Couldn't save demo: Keychain unavailable. Unlock it and retry importing. Client config unchanged.",
     );
+    expect(screen.getByRole("button", { name: "Add" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled();
     expect(api.addServerWithRows).toHaveBeenCalledTimes(1);
     const sent = api.addServerWithRows.mock.calls[0][0] as ServerEntry;
     expect(sent.env).toEqual([
@@ -446,6 +480,11 @@ describe("ServerDialog", () => {
     expect(
       screen.getAllByPlaceholderText("value").map((i) => (i as HTMLInputElement).value),
     ).toEqual(["secret-0", "secret-1", "secret-2"]);
+
+    // An edit makes the error stale, as in GTK.
+    await user.type(valueInputs[2], "x");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    await user.type(valueInputs[2], "{Backspace}");
 
     await user.click(screen.getByRole("button", { name: "Add" }));
 

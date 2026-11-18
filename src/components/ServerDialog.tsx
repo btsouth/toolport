@@ -26,6 +26,7 @@ import {
   updateServer,
 } from "@/lib/api";
 import { ImportReviewDialog } from "@/components/ImportReviewDialog";
+import { Callout } from "@/components/Callout";
 import { formatArgs, parseArgs } from "@/lib/args";
 import { isDownloadLauncher } from "@/lib/launcher";
 import { riskySyncEnv } from "@/lib/personalSync";
@@ -174,6 +175,9 @@ export function ServerDialog({
   const [reviewText, setReviewText] = useState("");
   const [busy, setBusy] = useState(false);
   const [test, setTest] = useState<TestState>(IDLE_TEST);
+  // A failed save, shown in the footer above the buttons as GTK's editor does,
+  // so no toast covers them.
+  const [footerError, setFooterError] = useState("");
   const testRequestId = useRef(0);
   const formRef = useRef(form);
   useEffect(() => {
@@ -192,6 +196,8 @@ export function ServerDialog({
   // A completed result clears immediately when the connection details change. An in-flight
   // test stays visibly busy until it settles, but its result is then discarded as stale.
   function clearTest() {
+    // An edit makes a failed save stale too, as in GTK.
+    setFooterError("");
     setTest((current) => {
       if (current.status === "idle") return current;
       if (current.status === "testing") {
@@ -206,6 +212,7 @@ export function ServerDialog({
   // entry's values instead of starting blank (or re-deriving from `initial`).
   function onOpenChange(next: boolean) {
     if (!next) setTest(IDLE_TEST);
+    setFooterError("");
     if (!next && onClose) {
       onClose();
       return;
@@ -498,6 +505,7 @@ export function ServerDialog({
     }
     const entry = buildEntry(false);
     const declared = envRows.filter((r) => r.key.trim());
+    setFooterError("");
     setBusy(true);
     try {
       let result = await updateServer(entry);
@@ -536,7 +544,7 @@ export function ServerDialog({
       toast.success(translate("Saved {name}", { name: entry.name }));
       onOpenChange(false);
     } catch (e) {
-      toastError(
+      setFooterError(
         t("Couldn't save {value1}: {value2}", { value1: entry.name, value2: String(e) }),
       );
     } finally {
@@ -548,6 +556,7 @@ export function ServerDialog({
   // at all: on an error the dialog stays open with what was typed.
   async function handleAdd() {
     const entry = buildEntry(true);
+    setFooterError("");
     setBusy(true);
     try {
       const { registry: result, declaredWithoutValue } = await addServerWithRows(entry);
@@ -563,7 +572,7 @@ export function ServerDialog({
       );
       onOpenChange(false);
     } catch (e) {
-      toastError(
+      setFooterError(
         t("Couldn't save {value1}: {value2}", { value1: entry.name, value2: String(e) }),
       );
     } finally {
@@ -1148,6 +1157,17 @@ export function ServerDialog({
           )}
         </div>
         <DialogFooter className="sm:justify-between">
+          {footerError && (
+            // GTK's editor feedback (`.toolport-feedback.error`): the same danger
+            // callout, 3px bar, tint and radius.
+            <Callout
+              variant="danger"
+              role="alert"
+              className="w-full [overflow-wrap:anywhere]"
+            >
+              {footerError}
+            </Callout>
+          )}
           <Button
             variant="ghost"
             onClick={handleTest}
