@@ -5897,13 +5897,13 @@ impl ActivityPage {
             .filter(|event| event["type"] != "tool_drift")
             .partition(security_event_needs_attention);
         // Safety Off says what state you are in first, and only while nothing on
-        // this screen or in the stores is blocked or held.
+        // this screen or in the stores is blocked or held. Notices block nothing
+        // at Off, so they follow the card.
         if !snapshot.tool_change_reviews
             && snapshot.blocks_nothing
             && snapshot.security_error.is_none()
             && !has_changes
             && older.is_empty()
-            && high.is_empty()
         {
             let card = activity_status_card(
                 StatusTone::Info,
@@ -18946,6 +18946,27 @@ mod tests {
             "{off}"
         );
 
+        // Tool security notices block nothing at Off: with nothing held the card
+        // stays, first, then the records, then the notices.
+        let mut with_notices = unblocked.clone();
+        with_notices.push(serde_json::json!({"ts": now, "type": "tool_poison_flag",
+            "server": "atlassian", "tool": "atlassian__poisoned", "change": "poison",
+            "severity": "high", "new_fp": "v3:poisoned"}));
+        with_notices.push(serde_json::json!({"ts": now, "type": "result_injection",
+            "server": "atlassian", "tool": "atlassian__fetch", "severity": "high"}));
+        let notices = render(SafetyLevel::Off, SafetyLevel::Off, &with_notices);
+        assert!(notices.contains(off_card), "{notices}");
+        assert!(!notices.contains("Protection active."), "{notices}");
+        let at = |text: &str| notices.find(text).unwrap();
+        assert!(
+            at("Safety is Off.") < at("2 tool-change records"),
+            "{notices}"
+        );
+        assert!(
+            at("2 tool-change records") < at("Tool security notices"),
+            "{notices}"
+        );
+
         // Unknown status and pending definition reviews stay actionable at Off.
         let mut unknown = change("get_issue", false, false);
         unknown["blocked"] = serde_json::Value::Null;
@@ -18972,7 +18993,19 @@ mod tests {
         assert!(held.contains("2 tool-change records"), "{held}");
         assert!(!held.contains(off_card), "{held}");
         assert!(!held.contains("Protection active."), "{held}");
+        // Notices or not, a held tool hides the card.
+        let held = render(SafetyLevel::Off, SafetyLevel::Off, &with_notices);
+        assert!(held.contains("Tool security notices"), "{held}");
+        assert!(!held.contains(off_card), "{held}");
         std::fs::remove_file(data.dir.join("quarantine.json")).unwrap();
+        let mut blocked_notices = with_notices.clone();
+        blocked_notices.push(change("delete_issue", true, false));
+        let blocked_notices = render(SafetyLevel::Off, SafetyLevel::Off, &blocked_notices);
+        assert!(
+            blocked_notices.contains("Tool security notices"),
+            "{blocked_notices}"
+        );
+        assert!(!blocked_notices.contains(off_card), "{blocked_notices}");
 
         let off_blocked = render(SafetyLevel::Off, SafetyLevel::Off, &with_blocked);
         assert!(

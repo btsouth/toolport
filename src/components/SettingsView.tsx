@@ -774,11 +774,18 @@ export function SettingsView({
     setSafetyBusy(true);
     try {
       const updated = await setSafetyLevel(level);
+      // Every field the level rewrites, so screens that read the switches it
+      // mirrors (the Tools panel's destructive filter) are right at once.
       const reconciled = latestRegistry.current
         ? {
             ...latestRegistry.current,
             safetyLevel: updated.safetyLevel,
             keptV1Safety: updated.keptV1Safety,
+            denyDestructive: updated.denyDestructive,
+            quarantineOnDrift: updated.quarantineOnDrift,
+            blockOnInjection: updated.blockOnInjection,
+            humanApproval: updated.humanApproval,
+            confirmDestructive: updated.confirmDestructive,
           }
         : updated;
       latestRegistry.current = reconciled;
