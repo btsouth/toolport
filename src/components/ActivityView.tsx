@@ -12,7 +12,7 @@ import { activityClientSegments, clientIdentityTooltip } from "@/lib/clientIdent
 import { hostedClientName } from "@/lib/hostAttribution";
 import { HostThreadChip } from "@/components/HostThreadChip";
 import { useWindowVisible } from "@/lib/windowVisible";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -27,7 +27,8 @@ import {
   Share2,
   ShieldAlert,
   ShieldCheck,
-  ShieldOff,
+  Ban,
+  Check,
   ShieldX,
   Clock,
   Undo2,
@@ -67,9 +68,10 @@ import {
   getSavingsSummary,
   getSearchTraces,
   getSecurityEvents,
-  getToolChangeReviewsEnabled,
+  getActivitySafety,
   getToolIdentities,
   openGatewayLog,
+  type ActivitySafety,
   type SecurityEvent,
 } from "@/lib/api";
 import { EmptyState } from "@/components/ui/empty-state";
@@ -211,32 +213,45 @@ function addDismissed(prev: Set<string>, keys: string[]): Set<string> {
 /** Calm, always-on "you're protected" state, shown whenever there are no live
  * security notices. A protection the user never sees builds no trust, so we make
  * the integrity + content-defense watch visible even when nothing is wrong. */
-function SecurityResting({ safetyOff }: { safetyOff: boolean }) {
+function SecurityResting() {
   const { t: tr } = useI18n();
-  if (safetyOff)
-    return (
-      <div className="mb-4 flex items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-4 py-2.5 text-meta text-muted-foreground">
-        <ShieldOff className="size-4 shrink-0" />
-        <span>
-          <span className="block font-semibold text-foreground">
-            {tr("Safety is Off.")}
-          </span>{" "}
-          {tr("Toolport records tool changes but blocks nothing.")}
-        </span>
-      </div>
-    );
   return (
-    <div className="mb-4 flex items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-4 py-2.5 text-meta text-muted-foreground">
-      <ShieldCheck className="size-4 shrink-0 text-owned" />
-      <span>
-        <span className="block font-semibold text-foreground">
-          {tr("Protection active.")}
-        </span>{" "}
-        {tr(
-          "Toolport is watching tool definitions and results. Nothing needs your attention right now.",
-        )}
-      </span>
-    </div>
+    <StatusCard
+      variant="success"
+      icon={<Check />}
+      title={tr("Protection active.")}
+      detail={tr(
+        "Toolport is watching tool definitions and results. Nothing needs your attention right now.",
+      )}
+      className="mb-4"
+    />
+  );
+}
+
+/** Safety Off with nothing blocked or held: say the state, never claim protection.
+ * Spec §4: Off is `ban`. */
+function SafetyOffNotice() {
+  const { t: tr } = useI18n();
+  return (
+    <StatusCard
+      icon={<Ban />}
+      title={tr("Safety is Off.")}
+      detail={tr("Toolport records tool changes but blocks nothing.")}
+      className="mb-4"
+    />
+  );
+}
+
+/** A collapsed list of tool-change records, the same bordered panel GTK draws. */
+function ToolChangeRecords({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <details className="group mb-4 rounded-xl border border-border bg-card px-4 py-3">
+      <summary className="flex cursor-pointer list-none items-center gap-2 text-sm [&::-webkit-details-marker]:hidden">
+        <ChevronRight className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-90" />
+        {label}
+      </summary>
+      <div className="mt-3">{children}</div>
+    </details>
   );
 }
 
@@ -1925,7 +1940,12 @@ export function ActivityView({
   const [errorsOnly, setErrorsOnly] = useState(false);
   const [security, setSecurity] = useState<SecurityEvent[]>([]);
   const [securityLoadStatus, setSecurityLoadStatus] = useState<LoadStatus>("loading");
-  const [reviewsEnabled, setReviewsEnabled] = useState(true);
+  // Unknown keeps reviews on and never claims Safety Off.
+  const [safety, setSafety] = useState<ActivitySafety>({
+    toolChangeReviews: true,
+    blocksNothing: false,
+  });
+  const reviewsEnabled = safety.toolChangeReviews;
   const [dismissed, setDismissed] = useState<Set<string>>(loadDismissed);
   // The call list is the page's main content: open by default, as in GTK.
   const [logOpen, setLogOpen] = useState(true);
@@ -2095,9 +2115,17 @@ export function ActivityView({
         );
       });
     // Rust decides from the registry on disk; any failure keeps reviews on.
-    getToolChangeReviewsEnabled()
-      .then((enabled) => alive && setReviewsEnabled(enabled !== false))
-      .catch(() => alive && setReviewsEnabled(true));
+    getActivitySafety()
+      .then(
+        (answer) =>
+          alive &&
+          setSafety({
+            toolChangeReviews: answer?.toolChangeReviews !== false,
+            blocksNothing:
+              answer?.toolChangeReviews === false && answer.blocksNothing === true,
+          }),
+      )
+      .catch(() => alive && setSafety({ toolChangeReviews: true, blocksNothing: false }));
     getSecurityEvents(2000)
       .then((s) => {
         if (!alive) return;
@@ -2211,6 +2239,16 @@ export function ActivityView({
       {securityLoadStatus !== "ready" ? (
         <SecurityLoadNotice status={securityLoadStatus} onRetry={retryLoads} />
       ) : null}
+      {/* Safety Off says what state you are in first, and only while nothing on this
+          screen or in the stores is blocked or held. */}
+      {!reviewsEnabled &&
+      safety.blocksNothing &&
+      securityLoadStatus === "ready" &&
+      toolChanges.length === 0 &&
+      olderToolChanges.length === 0 &&
+      highSecurity.length === 0 ? (
+        <SafetyOffNotice />
+      ) : null}
       {toolChanges.length > 0 ? (
         <ToolChanges
           events={toolChanges}
@@ -2220,36 +2258,35 @@ export function ActivityView({
         />
       ) : null}
       {olderToolChanges.length > 0 ? (
-        <details className="mb-4 rounded-lg border border-border p-4">
-          <summary className="cursor-pointer text-sm">
-            {olderToolChanges.length}{" "}
-            {tr("older tool-change records. Open history to review them.")}
-          </summary>
+        <ToolChangeRecords
+          label={`${olderToolChanges.length} ${tr("older tool-change records. Open history to review them.")}`}
+        >
           <ToolChanges
             events={olderToolChanges}
             registry={registry}
             onAccept={dismissAllSecurity}
             onReview={onReviewQuarantine}
           />
-        </details>
+        </ToolChangeRecords>
       ) : null}
       {recordedToolChanges.length > 0 ? (
-        <details className="mb-4 rounded-lg border border-border p-4">
-          <summary className="cursor-pointer text-sm">
-            {tr("{value0} tool-change records", { value0: recordedToolChanges.length })}
-          </summary>
+        <ToolChangeRecords
+          label={tr("{value0} tool-change records", {
+            value0: recordedToolChanges.length,
+          })}
+        >
           <ToolChanges
             events={recordedToolChanges}
             registry={registry}
             onAccept={dismissAllSecurity}
             history
           />
-        </details>
+        </ToolChangeRecords>
       ) : null}
       {highSecurity.length > 0 ? (
         <SecurityNotices events={highSecurity} onDismiss={dismissSecurity} />
-      ) : securityLoadStatus === "ready" && toolChanges.length === 0 ? (
-        <SecurityResting safetyOff={!reviewsEnabled} />
+      ) : reviewsEnabled && securityLoadStatus === "ready" && toolChanges.length === 0 ? (
+        <SecurityResting />
       ) : null}
       {infoSecurity.length > 0 ? (
         <QuietDriftHistory

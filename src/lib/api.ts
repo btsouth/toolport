@@ -120,10 +120,15 @@ export function getSecurityEvents(limit = 100): Promise<SecurityEvent[]> {
   return invoke<SecurityEvent[]>("get_security_events", { limit });
 }
 
-/** Whether Activity asks for tool-change reviews. The backend decides from the
- * registry on disk and answers true when it cannot read it. */
-export function getToolChangeReviewsEnabled(): Promise<boolean> {
-  return invoke<boolean>("tool_change_reviews_enabled");
+/** What Activity says about Safety (`integrity::activity_safety`): whether tool
+ * changes ask for review (true when the registry cannot be read) and whether Safety
+ * Off holds nothing. */
+export interface ActivitySafety {
+  toolChangeReviews: boolean;
+  blocksNothing: boolean;
+}
+export function getActivitySafety(): Promise<ActivitySafety> {
+  return invoke<ActivitySafety>("activity_safety");
 }
 
 /** Net cl100k_base savings, exact MCP bytes, and separate historical estimates. */

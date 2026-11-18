@@ -1300,13 +1300,13 @@ async fn get_security_events(limit: usize) -> Result<Vec<serde_json::Value>, Str
     .map_err(|e| format!("security events task join failed: {e}"))?
 }
 
-/// Whether Activity asks for tool-change reviews, decided by the registry on
-/// disk (`registry::tool_change_reviews_now`); true when it cannot be read.
+/// Whether Activity asks for tool-change reviews and whether Safety Off holds
+/// nothing (`integrity::activity_safety`), the same answer GTK reads.
 #[tauri::command]
-async fn tool_change_reviews_enabled() -> Result<bool, String> {
-    tauri::async_runtime::spawn_blocking(crate::registry::tool_change_reviews_now)
+async fn activity_safety() -> Result<integrity::ActivitySafety, String> {
+    tauri::async_runtime::spawn_blocking(integrity::activity_safety)
         .await
-        .map_err(|e| format!("tool change review task join failed: {e}"))
+        .map_err(|e| format!("activity safety task join failed: {e}"))
 }
 
 /// Most recent unresolved baseline warning for the current profile and policy.
@@ -4898,7 +4898,7 @@ pub fn run() {
             get_client_sessions,
             audit_stats,
             get_security_events,
-            tool_change_reviews_enabled,
+            activity_safety,
             get_baseline_notice,
             savings_summary,
             gather_diagnostics,

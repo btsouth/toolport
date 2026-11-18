@@ -5731,11 +5731,13 @@ impl ActivityPage {
                         &snapshot.security_error,
                         snapshot.security_stale,
                         snapshot.tool_change_reviews,
+                        snapshot.blocks_nothing,
                     )
                 }) != Some((
                     &snapshot.security_error,
                     snapshot.security_stale,
                     snapshot.tool_change_reviews,
+                    snapshot.blocks_nothing,
                 )),
                 activity_section_changed(
                     previous.map(|snapshot| snapshot.tool_identities.as_slice()),
@@ -5862,22 +5864,40 @@ impl ActivityPage {
         let (older, live): (Vec<_>, Vec<_>) = live
             .into_iter()
             .partition(|event| event["historical"] == true);
-        // The loud lane: tool changes to review, then findings that need a person.
         let groups = crate::integrity::group_tool_changes(&live);
         let has_changes = !groups.is_empty();
+        let (high, info): (Vec<_>, Vec<_>) = live
+            .into_iter()
+            .filter(|event| event["type"] != "tool_drift")
+            .partition(security_event_needs_attention);
+        // Safety Off says what state you are in first, and only while nothing on
+        // this screen or in the stores is blocked or held.
+        if !snapshot.tool_change_reviews
+            && snapshot.blocks_nothing
+            && snapshot.security_error.is_none()
+            && !has_changes
+            && older.is_empty()
+            && high.is_empty()
+        {
+            let card = activity_status_card(
+                StatusTone::Info,
+                crate::i18n::msg("Safety is Off."),
+                crate::i18n::msg("Toolport records tool changes but blocks nothing."),
+            );
+            // Spec §4: Off is `ban` in React and action-unavailable here.
+            card.tile.set_icon_name(Some("action-unavailable-symbolic"));
+            self.security_list.append(&card.root);
+        }
+        // The loud lane: tool changes to review, then findings that need a person.
         for group in groups {
             self.security_list
                 .append(&tool_change_group_card(&group, self.clone(), false));
         }
         if !older.is_empty() {
-            let history = {
-                let widget = gtk::Expander::builder().build();
-                widget.set_label_widget(Some(&l10n::formatted_label(
-                    "{value0} older tool-change records. Open history to review them.",
-                    &[("value0", &format!("{}", older.len()))],
-                )));
-                widget
-            };
+            let history = tool_change_records_panel(l10n::formatted_label(
+                "{value0} older tool-change records. Open history to review them.",
+                &[("value0", &format!("{}", older.len()))],
+            ));
             let rows = gtk::Box::new(gtk::Orientation::Vertical, 8);
             let page = self.clone();
             let history_rows = rows.clone();
@@ -5892,11 +5912,10 @@ impl ActivityPage {
             self.security_list.append(&history);
         }
         if !recorded.is_empty() {
-            let history = gtk::Expander::builder().build();
-            history.set_label_widget(Some(&l10n::formatted_label(
+            let history = tool_change_records_panel(l10n::formatted_label(
                 "{value0} tool-change records",
                 &[("value0", &format!("{}", recorded.len()))],
-            )));
+            ));
             let rows = gtk::Box::new(gtk::Orientation::Vertical, 8);
             let page = self.clone();
             let history_rows = rows.clone();
@@ -5910,10 +5929,6 @@ impl ActivityPage {
             history.set_child(Some(&rows));
             self.security_list.append(&history);
         }
-        let (high, info): (Vec<_>, Vec<_>) = live
-            .into_iter()
-            .filter(|event| event["type"] != "tool_drift")
-            .partition(security_event_needs_attention);
         if !high.is_empty() {
             let collapsed = crate::integrity::collapse_security_by_identity(&high);
             let count = gtk::Label::new(Some(&collapsed.len().to_string()));
@@ -5946,23 +5961,17 @@ impl ActivityPage {
                 );
             });
             self.security_list.append(&notices);
-        } else if snapshot.security_error.is_none() && !has_changes {
-            // A protection the user never sees builds no trust. With nothing able
-            // to block, say so instead of claiming protection.
-            let card = if snapshot.tool_change_reviews {
-                activity_status_card(
+        } else if snapshot.tool_change_reviews && snapshot.security_error.is_none() && !has_changes
+        {
+            // A protection the user never sees builds no trust.
+            self.security_list.append(
+                &activity_status_card(
                     StatusTone::Success,
                     crate::i18n::msg("Protection active."),
                     crate::i18n::msg("Toolport is watching tool definitions and results. Nothing needs your attention right now."),
                 )
-            } else {
-                activity_status_card(
-                    StatusTone::Info,
-                    crate::i18n::msg("Safety is Off."),
-                    crate::i18n::msg("Toolport records tool changes but blocks nothing."),
-                )
-            };
-            self.security_list.append(&card.root);
+                .root,
+            );
         }
         if !info.is_empty() {
             let count = gtk::Label::new(Some(&info.len().to_string()));
@@ -7056,6 +7065,15 @@ fn group_can_be_accepted(group: &crate::integrity::ToolChangeGroup) -> bool {
         .tools
         .iter()
         .all(|event| event.get("signatures").is_none() && change_can_be_accepted(event))
+}
+
+/// The collapsed tool-change records line, a bordered panel like React's.
+fn tool_change_records_panel(label: gtk::Label) -> gtk::Expander {
+    let panel = gtk::Expander::builder().build();
+    panel.add_css_class("toolport-card");
+    panel.add_css_class("toolport-activity-panel");
+    panel.set_label_widget(Some(&label));
+    panel
 }
 
 /// `history` renders a record only: no status, accept or review actions.
@@ -18830,8 +18848,14 @@ mod tests {
         assert!(!asks(&off), "Off must not ask for a review:\n{off}");
         assert!(off.contains("2 tool-change records"), "{off}");
         assert!(off.contains("Safety is Off."), "{off}");
-        assert!(off.contains("Toolport records tool changes but blocks nothing."));
+        let off_card = "Toolport records tool changes but blocks nothing.";
+        assert!(off.contains(off_card));
         assert!(!off.contains("Protection active."), "{off}");
+        // The state comes first, then the records.
+        assert!(
+            off.find("Safety is Off.") < off.find("2 tool-change records"),
+            "{off}"
+        );
 
         // Unknown status and pending definition reviews stay actionable at Off.
         let mut unknown = change("get_issue", false, false);
@@ -18839,6 +18863,7 @@ mod tests {
         let held = render(SafetyLevel::Off, SafetyLevel::Off, &[unknown]);
         assert!(held.contains("Blocking status unavailable"), "{held}");
         assert!(!held.contains("tool-change records"), "{held}");
+        assert!(!held.contains(off_card), "{held}");
         let mut review = change("search", false, false);
         review["review_required"] = serde_json::json!(true);
         let held = render(SafetyLevel::Off, SafetyLevel::Off, &[review]);
@@ -18847,6 +18872,18 @@ mod tests {
             "{held}"
         );
         assert!(!held.contains("tool-change records"), "{held}");
+        assert!(!held.contains(off_card), "{held}");
+        // A definition review held in the store but not on screen.
+        std::fs::write(
+            data.dir.join("quarantine.json"),
+            r#"{"atlassian__hidden":{"tool":"atlassian__hidden","change":"changed","definition_fp":"v3:hidden","review_required":true}}"#,
+        )
+        .unwrap();
+        let held = render(SafetyLevel::Off, SafetyLevel::Off, &unblocked);
+        assert!(held.contains("2 tool-change records"), "{held}");
+        assert!(!held.contains(off_card), "{held}");
+        assert!(!held.contains("Protection active."), "{held}");
+        std::fs::remove_file(data.dir.join("quarantine.json")).unwrap();
 
         let off_blocked = render(SafetyLevel::Off, SafetyLevel::Off, &with_blocked);
         assert!(
@@ -18854,6 +18891,18 @@ mod tests {
             "{off_blocked}"
         );
         assert!(off_blocked.contains("1 tool is blocked"), "{off_blocked}");
+        assert!(!off_blocked.contains(off_card), "{off_blocked}");
+        assert!(!off_blocked.contains("Protection active."), "{off_blocked}");
+        let older_blocked = render(
+            SafetyLevel::Off,
+            SafetyLevel::Off,
+            &[change("old_tool", true, true)],
+        );
+        assert!(
+            older_blocked.contains("1 older tool-change records"),
+            "{older_blocked}"
+        );
+        assert!(!older_blocked.contains(off_card), "{older_blocked}");
         assert!(
             off_blocked.contains("2 tool-change records"),
             "{off_blocked}"

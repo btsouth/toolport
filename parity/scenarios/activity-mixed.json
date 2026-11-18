@@ -164,7 +164,7 @@
         "limit": 2000
       }
     ],
-    ["tool_change_reviews_enabled", {}],
+    ["activity_safety", {}],
     [
       "get_search_traces",
       {

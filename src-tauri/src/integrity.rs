@@ -5131,6 +5131,41 @@ pub fn tool_change_asks_review(event: &Value, reviews_enabled: bool) -> bool {
     reviews_enabled || event["blocked"] != false || event["review_required"] == true
 }
 
+/// Whether Safety Off still holds a tool: a definition review in any quarantine
+/// store or a pending review pin. Unreadable stores count as holding one.
+pub fn off_holds_any_tool() -> bool {
+    let Ok(rows) = all_quarantined() else {
+        return true;
+    };
+    if rows.iter().any(|row| row["review_required"] == true) {
+        return true;
+    }
+    let Ok(stores) = quarantine_scan_stores() else {
+        return true;
+    };
+    stores.iter().any(|(profile, _)| {
+        !definition_review_names((!profile.is_empty()).then_some(profile.as_str())).is_empty()
+    })
+}
+
+/// What Activity says about Safety, decided once for both shells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivitySafety {
+    /// `Registry::tool_change_reviews_enabled`, true when the registry is unreadable.
+    pub tool_change_reviews: bool,
+    /// Nothing can block and nothing is held: Activity may say Safety is Off.
+    pub blocks_nothing: bool,
+}
+
+pub fn activity_safety() -> ActivitySafety {
+    let tool_change_reviews = crate::registry::tool_change_reviews_now();
+    ActivitySafety {
+        tool_change_reviews,
+        blocks_nothing: !tool_change_reviews && !off_holds_any_tool(),
+    }
+}
+
 /// One server refresh is one event, even when it changed hundreds of definitions.
 /// Keep updates more than a minute apart separate, and retain distinct changes to each tool.
 pub fn group_tool_changes(events: &[Value]) -> Vec<ToolChangeGroup> {
@@ -5641,6 +5676,33 @@ mod tests {
         assert!(events[55..]
             .iter()
             .all(|event| event.get("historical").is_none()));
+    }
+
+    #[test]
+    fn safety_off_holds_a_tool_only_for_reviews_or_an_unreadable_store() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data = TestDataDir::new("off-holds-any-tool");
+        assert!(!off_holds_any_tool());
+        let ordinary =
+            json!({"tool":"srv__update", "change":"changed", "definition_fp":"v2:current"});
+        save_quarantine(
+            None,
+            &BTreeMap::from([("srv__update".to_string(), ordinary.clone())]),
+        )
+        .unwrap();
+        assert!(
+            !off_holds_any_tool(),
+            "Off does not enforce ordinary quarantine"
+        );
+        let mut review = ordinary;
+        review["review_required"] = json!(true);
+        save_quarantine(None, &BTreeMap::from([("srv__update".to_string(), review)])).unwrap();
+        assert!(off_holds_any_tool());
+        std::fs::write(quarantine_path(None).unwrap(), "{broken").unwrap();
+        assert!(
+            off_holds_any_tool(),
+            "an unreadable store is not an all-clear"
+        );
     }
 
     #[test]
