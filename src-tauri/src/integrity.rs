@@ -518,7 +518,9 @@ fn quarantine_scan_stores() -> Result<Vec<(String, PathBuf)>, String> {
     let registry = crate::registry::load_resolved()?;
     let mut stores = vec![(String::new(), dir.join("quarantine.json"))];
     // The gateway also enforces under the synthesized Default access and All
-    // enabled servers ids, so their stores belong to the same union.
+    // enabled servers ids, so their stores belong to the same union. Both share
+    // one store keyed by the access context, which can also be a profile's own
+    // store; read each file once.
     let scopes = registry
         .profiles
         .iter()
@@ -526,11 +528,10 @@ fn quarantine_scan_stores() -> Result<Vec<(String, PathBuf)>, String> {
         .chain([registry.default_access_id(), registry.all_access_id()])
         .chain(load_root_scopes()?);
     for scope in scopes {
-        if stores.iter().any(|(seen, _)| *seen == scope) {
-            continue;
-        }
         if let Some(path) = quarantine_path(Some(&scope)) {
-            stores.push((scope, path));
+            if !stores.iter().any(|(_, seen)| *seen == path) {
+                stores.push((scope, path));
+            }
         }
     }
     Ok(stores)
@@ -5774,6 +5775,24 @@ mod tests {
             assert!(!off_holds_any_tool(), "{id}");
             std::fs::remove_file(security_path().unwrap()).unwrap();
         }
+        // An access context that is also a profile id shares that profile's
+        // store: one held tool is one row, not one per id.
+        let mut registry = registry;
+        registry.default_access_context_id = Some("work".into());
+        registry.profiles.push(crate::registry::Profile {
+            id: "work".into(),
+            name: "Work".into(),
+            enabled_server_ids: vec![],
+            tool_scope: Default::default(),
+            instructions: None,
+            unknown_fields: Default::default(),
+        });
+        crate::registry::save(&registry).unwrap();
+        let row = json!({"tool":"srv__update", "change":"changed",
+            "definition_fp":"v2:current", "review_required":true});
+        save_quarantine(Some("work"), &BTreeMap::from([("srv__update".into(), row)])).unwrap();
+        assert_eq!(all_quarantined().unwrap().len(), 1);
+        assert_eq!(all_quarantined_summaries().unwrap().len(), 1);
     }
 
     #[test]
