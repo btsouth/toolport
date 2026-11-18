@@ -22,6 +22,8 @@ interface Step {
   name?: string;
   if?: string;
   run?: string;
+  uses?: string;
+  with?: Record<string, string>;
   env?: Record<string, string>;
 }
 interface Job {
@@ -218,7 +220,8 @@ describe("release.yml runs the AppImage patch and re-signs", () => {
     const deps = (build?.steps ?? []).find(
       (s) => s.name === "Install Linux build dependencies",
     );
-    expect(deps?.run).toContain("squashfs-tools");
+    expect(deps?.uses).toBe("./.github/actions/apt-install");
+    expect(deps?.with?.packages).toContain("squashfs-tools");
   });
 });
 
