@@ -480,6 +480,7 @@ it("carries the switches a level rewrites, so Strict to Ask unhides destructive 
     quarantineOnDrift: true,
     blockOnInjection: true,
     humanApproval: true,
+    confirmDestructive: true,
   };
   vi.mocked(setSafetyLevel).mockResolvedValueOnce({
     ...strict,
@@ -487,6 +488,7 @@ it("carries the switches a level rewrites, so Strict to Ask unhides destructive 
     denyDestructive: false,
     quarantineOnDrift: false,
     blockOnInjection: false,
+    confirmDestructive: false,
   });
   render(
     <ThemeProvider>
@@ -503,6 +505,7 @@ it("carries the switches a level rewrites, so Strict to Ask unhides destructive 
         quarantineOnDrift: false,
         blockOnInjection: false,
         humanApproval: true,
+        confirmDestructive: false,
       }),
     ),
   );

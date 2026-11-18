@@ -2115,44 +2115,35 @@ export function ActivityView({
           status === "ready" || status === "stale" ? "stale" : "error",
         );
       });
-    // Rust decides from the registry on disk; any failure keeps reviews on.
-    getActivitySafety()
-      .then(
-        (answer) =>
-          alive &&
-          setSafety({
-            toolChangeReviews: answer?.toolChangeReviews !== false,
-            blocksNothing:
-              answer?.toolChangeReviews === false && answer.blocksNothing === true,
-            reviewsConfirmed:
-              answer?.toolChangeReviews === true && answer.reviewsConfirmed === true,
-          }),
-      )
-      .catch(
-        () =>
-          alive &&
-          setSafety({
-            toolChangeReviews: true,
-            blocksNothing: false,
-            reviewsConfirmed: false,
-          }),
-      );
-    getSecurityEvents(2000)
-      .then((s) => {
+    // Safety and security events land in one render: the Off card hides when a
+    // tool is held, so it must never pair fresh events with an older Safety
+    // answer. Rust decides from the registry on disk; any failure keeps reviews on.
+    void Promise.allSettled([getActivitySafety(), getSecurityEvents(2000)]).then(
+      ([safetyResult, eventsResult]) => {
         if (!alive) return;
-        setSecurity((previous) =>
-          JSON.stringify(previous) === JSON.stringify(s) ? previous : s,
-        );
-        setSecurityLoadStatus("ready");
-      })
-      .catch(() => {
-        if (!alive) return;
-        // A failed refresh must preserve prior findings and must never produce the
-        // reassuring verified-empty state.
-        setSecurityLoadStatus((status) =>
-          status === "ready" || status === "stale" ? "stale" : "error",
-        );
-      });
+        const answer = safetyResult.status === "fulfilled" ? safetyResult.value : null;
+        setSafety({
+          toolChangeReviews: answer?.toolChangeReviews !== false,
+          blocksNothing:
+            answer?.toolChangeReviews === false && answer.blocksNothing === true,
+          reviewsConfirmed:
+            answer?.toolChangeReviews === true && answer.reviewsConfirmed === true,
+        });
+        if (eventsResult.status === "fulfilled") {
+          const s = eventsResult.value;
+          setSecurity((previous) =>
+            JSON.stringify(previous) === JSON.stringify(s) ? previous : s,
+          );
+          setSecurityLoadStatus("ready");
+        } else {
+          // A failed refresh must preserve prior findings and must never produce
+          // the reassuring verified-empty state.
+          setSecurityLoadStatus((status) =>
+            status === "ready" || status === "stale" ? "stale" : "error",
+          );
+        }
+      },
+    );
     return () => {
       alive = false;
     };

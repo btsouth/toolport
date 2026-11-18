@@ -1381,6 +1381,47 @@ describe("ActivityView security drift dismissals", () => {
     expect(noticesBlocked.text).toContain("Tool security notices");
     expect(noticesBlocked.text).not.toContain(offCard);
 
+    // A refresh never pairs fresh events with the previous Safety answer: a block
+    // that arrives before Safety does must not appear under the Off card.
+    getActivitySafety.mockResolvedValue(OFF);
+    getSecurityEvents.mockResolvedValue(unblocked);
+    const racing = render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    expect(racing.container.textContent).toContain(offCard);
+    let answerSafety: (value: typeof OFF) => void = () => {};
+    getActivitySafety.mockReturnValue(
+      new Promise((resolve) => {
+        answerSafety = resolve;
+      }),
+    );
+    getSecurityEvents.mockResolvedValue([
+      ...unblocked,
+      {
+        ts: 1_700_000_000_000,
+        type: "result_injection_blocked",
+        server: "srv",
+        tool: "srv__fetch",
+        change: "result",
+        severity: "high" as const,
+      },
+    ]);
+    racing.rerender(<ActivityView refreshKey={1} registry={null} />);
+    await act(async () => {});
+    const between = racing.container.textContent ?? "";
+    expect(between.includes(offCard) && between.includes("Tool security notices")).toBe(
+      false,
+    );
+    await act(async () => {
+      answerSafety({
+        toolChangeReviews: false,
+        blocksNothing: false,
+        reviewsConfirmed: false,
+      });
+    });
+    expect(racing.container.textContent).toContain("Tool security notices");
+    expect(racing.container.textContent).not.toContain(offCard);
+    racing.unmount();
+
     // Reviews on, or an unanswered check, keep the cards as before.
     for (const safety of [
       { toolChangeReviews: true, blocksNothing: false, reviewsConfirmed: true },
