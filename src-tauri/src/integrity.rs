@@ -5206,42 +5206,45 @@ pub fn group_tool_changes(events: &[Value]) -> Vec<ToolChangeGroup> {
 }
 
 pub fn tool_change_summary(events: &[Value]) -> String {
-    let inputs = events
-        .iter()
-        .filter(|event| {
-            event["changed_fields"]
-                .as_array()
-                .is_some_and(|fields| fields.iter().any(|field| field == "input_schema"))
-        })
-        .count();
-    if inputs == events.len() {
-        format!(
-            "{} {} changed their inputs",
-            inputs,
-            if inputs == 1 { "tool" } else { "tools" }
-        )
-    } else if events.iter().all(|event| event["change"] == "added") {
-        format!(
-            "{} new {}",
-            events.len(),
-            if events.len() == 1 { "tool" } else { "tools" }
-        )
+    // Same messages and order as React's `ToolChanges` summary.
+    let count = events.len();
+    let one = count == 1;
+    let fields = |event: &Value| {
+        event["changed_fields"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    };
+    let source = if events.iter().all(|event| event["change"] == "added") {
+        if one {
+            crate::i18n::msg("{count} new tool")
+        } else {
+            crate::i18n::msg("{count} new tools")
+        }
     } else if events
         .iter()
-        .all(|event| event["changed_fields"] == json!(["description"]))
+        .all(|event| fields(event).iter().any(|field| field == "input_schema"))
     {
-        format!(
-            "{} {} changed their descriptions",
-            events.len(),
-            if events.len() == 1 { "tool" } else { "tools" }
-        )
+        if one {
+            crate::i18n::msg("{count} tool changed its inputs")
+        } else {
+            crate::i18n::msg("{count} tools changed their inputs")
+        }
+    } else if events
+        .iter()
+        .all(|event| fields(event) == vec![json!("description")])
+    {
+        if one {
+            crate::i18n::msg("{count} tool changed its description")
+        } else {
+            crate::i18n::msg("{count} tools changed their descriptions")
+        }
+    } else if one {
+        crate::i18n::msg("{count} tool changed")
     } else {
-        format!(
-            "{} {} changed",
-            events.len(),
-            if events.len() == 1 { "tool" } else { "tools" }
-        )
-    }
+        crate::i18n::msg("{count} tools changed")
+    };
+    crate::i18n::trf(source, &[("count", &count.to_string())])
 }
 
 /// One tool definition as the offline ecosystem tracker records it: both fingerprints,

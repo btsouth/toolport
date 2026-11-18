@@ -5888,10 +5888,21 @@ impl ActivityPage {
             card.tile.set_icon_name(Some("action-unavailable-symbolic"));
             self.security_list.append(&card.root);
         }
-        // The loud lane: tool changes to review, then findings that need a person.
-        for group in groups {
-            self.security_list
-                .append(&tool_change_group_card(&group, self.clone(), false));
+        // The loud lane: tool changes to review, then findings that need a person,
+        // in one bordered "Tool changes" section as React draws it.
+        if has_changes {
+            let section = gtk::Box::new(gtk::Orientation::Vertical, 12);
+            section.add_css_class("toolport-card");
+            section.add_css_class("toolport-activity-panel");
+            section.append(&activity_panel_title(
+                "security-high-symbolic",
+                crate::i18n::msg("Tool changes"),
+                None,
+            ));
+            for group in groups {
+                section.append(&tool_change_group_card(&group, self.clone(), false));
+            }
+            self.security_list.append(&section);
         }
         if !older.is_empty() {
             let history = tool_change_records_panel(l10n::formatted_label(
@@ -7097,14 +7108,20 @@ fn tool_change_group_card(
     heading_row.append(
         &gtk::Label::builder()
             .label(format!(
-                "{name}: {}, {}",
-                crate::integrity::tool_change_summary(&group.tools),
-                relative_activity_time(group.ts)
+                "{name}: {}",
+                crate::integrity::tool_change_summary(&group.tools)
             ))
             .xalign(0.0)
             .hexpand(true)
             .wrap(true)
             .css_classes(["heading"])
+            .build(),
+    );
+    // The time sits at the end of the row, as React draws it.
+    heading_row.append(
+        &gtk::Label::builder()
+            .label(relative_activity_time(group.ts))
+            .css_classes(["toolport-muted", "caption"])
             .build(),
     );
     heading.set_child(Some(&heading_row));
@@ -7189,9 +7206,22 @@ fn tool_change_group_card(
         label.add_css_class("error");
     }
     card.append(&label);
+    // React's order: Review in Settings, then Accept all, then any warning.
+    if review_required {
+        let review = l10n::button("Review in Settings");
+        review.set_halign(gtk::Align::Start);
+        review.set_action_name(Some("app.review-quarantine"));
+        card.append(&review);
+    }
     let accept = l10n::button("Accept all for this server");
     accept.set_halign(gtk::Align::Start);
     accept.set_sensitive(group_can_be_accepted(group));
+    let events = group.tools.clone();
+    accept.connect_clicked(move |button| {
+        button.set_sensitive(false);
+        page.accept_security(events.clone());
+    });
+    card.append(&accept);
     if group
         .tools
         .iter()
@@ -7200,18 +7230,6 @@ fn tool_change_group_card(
         card.append(&empty_activity_source_label(crate::i18n::msg(
             "Suspicious content found. Review and accept each tool separately.",
         )));
-    }
-    let events = group.tools.clone();
-    accept.connect_clicked(move |button| {
-        button.set_sensitive(false);
-        page.accept_security(events.clone());
-    });
-    card.append(&accept);
-    if review_required {
-        let review = l10n::button("Review in Settings");
-        review.set_halign(gtk::Align::Start);
-        review.set_action_name(Some("app.review-quarantine"));
-        card.append(&review);
     }
     card.append(&reveal);
     card
