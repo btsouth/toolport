@@ -277,18 +277,22 @@ fn activity_metadata(dir: &std::path::Path) -> Result<(String, Vec<std::path::Pa
         }
         name.hash(&mut hash);
         metadata.len().hash(&mut hash);
-        metadata.modified().ok().hash(&mut hash);
-        metadata.created().ok().hash(&mut hash);
+        // Tests can stand in for a filesystem whose timestamps did not tick.
+        #[cfg(test)]
+        let times = !SAME_TICK.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let times = true;
+        if times {
+            metadata.modified().ok().hash(&mut hash);
+            metadata.created().ok().hash(&mut hash);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            (
-                metadata.dev(),
-                metadata.ino(),
-                metadata.ctime(),
-                metadata.ctime_nsec(),
-            )
-                .hash(&mut hash);
+            (metadata.dev(), metadata.ino()).hash(&mut hash);
+            if times {
+                (metadata.ctime(), metadata.ctime_nsec()).hash(&mut hash);
+            }
         }
         #[cfg(windows)]
         {
@@ -310,7 +314,21 @@ fn activity_metadata(dir: &std::path::Path) -> Result<(String, Vec<std::path::Pa
                 .hash(&mut hash);
         }
     }
+    // A Safety change can keep the registry's length ("ask" to "off") and land in
+    // one timestamp tick, and a registry outside the data directory has no
+    // directory watch. The file is small, so hash its content: any rewrite counts.
+    if let Some(registry) = crate::registry::resolved_path() {
+        match std::fs::read(&registry) {
+            Ok(bytes) => bytes.hash(&mut hash),
+            Err(error) => error.kind().hash(&mut hash),
+        }
+    }
     Ok((format!("{:x}", hash.finish()), paths))
+}
+
+#[cfg(test)]
+thread_local! {
+    static SAME_TICK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(target_os = "linux")]
@@ -567,6 +585,16 @@ mod tests {
             std::fs::write(&registry, r#"{"safetyLevel":"ask"}"#).unwrap();
             assert_ne!(cache.revision().unwrap(), before, "{registry:?}");
         }
+        // A same-length rewrite in place, within one timestamp tick, still counts.
+        std::env::set_var("TOOLPORT_REGISTRY", &registry);
+        std::fs::write(&registry, r#"{"safetyLevel":"off"}"#).unwrap();
+        SAME_TICK.with(|same| same.set(true));
+        let mut cache = RevisionCache::new(data.dir.clone());
+        let before = cache.revision().unwrap();
+        std::fs::write(&registry, r#"{"safetyLevel":"ask"}"#).unwrap();
+        let after = cache.revision();
+        SAME_TICK.with(|same| same.set(false));
+        assert_ne!(after.unwrap(), before, "same-length Safety change");
         // No Activity directory yet: the external registry still counts.
         std::env::set_var("TOOLPORT_REGISTRY", &registry);
         let mut absent = RevisionCache::new(data.dir.join("absent"));
