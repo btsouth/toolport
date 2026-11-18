@@ -643,7 +643,7 @@
   "No saved definition. Approving captures the current definition for one more review. The tool stays blocked until then.": "保存された定義はありません。承認すると、もう 1 回のレビューのために現在の定義がキャプチャされます。それまでツールはブロックされたままになります。",
   "No server or tool matches \"{value1}\".": "「{value1}」に一致するサーバーやツールはありません。",
   "No servers enabled": "有効なサーバーがありません",
-  "No servers found in the pasted config": "貼り付けた設定にサーバーが見つかりませんでした",
+  "No servers found in the pasted config.": "貼り付けた構成にサーバーが見つかりませんでした。",
   "No servers to test": "テストするサーバーがありません",
   "No supported clients installed": "サポートされているクライアントがインストールされていません",
   "No system keyring found. Toolport keeps secrets in your OS keyring; on Linux that needs a running Secret Service (e.g. gnome-keyring or KWallet). Start and unlock one, then retry.": "システム キーリングが見つかりません。 Toolport は OS キーリングにシークレットを保持します。 Linux では、Secret Service の実行が必要です (例: gnome-keyring または KWallet)。 1 つを起動してロックを解除してから、再試行してください。",

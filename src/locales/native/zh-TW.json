@@ -454,7 +454,6 @@
   "No resources advertised": "沒有發布任何資源",
   "No saved definition. Approving captures the current definition for one more review.": "未儲存定義。核准後會捕獲當前定義，供再次審核。",
   "No scoped HTTP clients are registered.": "尚未註冊限定存取範圍的 HTTP 用戶端。",
-  "No servers found in the pasted config.": "在貼上的設定中找不到伺服器。",
   "No servers yet": "還沒有伺服器",
   "No supported clients are installed yet. You can finish setup and connect one later from Clients.": "尚未安裝支援的用戶端。您可以完成設定並稍後從用戶端連線。",
   "No supported clients detected": "未偵測到支援的用戶端",

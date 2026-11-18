@@ -175,8 +175,8 @@ export function ServerDialog({
   const [reviewText, setReviewText] = useState("");
   const [busy, setBusy] = useState(false);
   const [test, setTest] = useState<TestState>(IDLE_TEST);
-  // A failed save, shown in the footer above the buttons as GTK's editor does,
-  // so no toast covers them.
+  // A failed save or a refused paste, shown in the footer above the buttons
+  // as GTK's editor does, so no toast covers them.
   const [footerError, setFooterError] = useState("");
   const testRequestId = useRef(0);
   const formRef = useRef(form);
@@ -285,11 +285,12 @@ export function ServerDialog({
 
   async function handleParse() {
     if (!pasteText.trim()) return;
+    setFooterError("");
     setParsing(true);
     try {
       const servers = await parseServerSnippet(pasteText);
       if (servers.length === 0) {
-        toast.error(t("No servers found in the pasted config"));
+        setFooterError(t("No servers found in the pasted config."));
         return;
       }
       if (servers.length > 1) {
@@ -326,8 +327,8 @@ export function ServerDialog({
       setPasteText("");
     } catch (e) {
       // The backend message is already in the user's language and never holds
-      // pasted text; GTK shows the same sentence.
-      toastError(String(e));
+      // pasted text; GTK shows the same sentence in the same place.
+      setFooterError(String(e));
       // The form stays as it was before this paste, and the refusal is its only
       // message: an empty field it left the user in shows no error yet.
       // Read the form as it is now: the user may have edited it while the

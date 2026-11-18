@@ -16,6 +16,7 @@ const api = vi.hoisted(() => ({
 const toast = vi.hoisted(() => ({
   success: vi.fn(),
   warning: vi.fn(),
+  error: vi.fn(),
 }));
 
 vi.mock("@/lib/api", () => api);
@@ -84,7 +85,7 @@ async function fillServer(user: ReturnType<typeof userEvent.setup>, command: str
   await user.type(screen.getByLabelText("Command"), command);
 }
 
-// A failed save: one danger callout in the footer, over no
+// A refused paste or failed save: one danger callout in the footer, over no
 // button, and no toast.
 async function expectFooterError(text: string) {
   await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(text));
@@ -763,7 +764,20 @@ describe("ServerDialog", () => {
     await user.type(screen.getByPlaceholderText(/claude mcp add \.\.\. \//), "bad");
     await user.click(screen.getByRole("button", { name: "Parse & fill" }));
 
-    await waitFor(() => expect(toastError).toHaveBeenCalledWith(message));
+    await expectFooterError(message);
+    expect(screen.getByRole("button", { name: "Add" })).toBeVisible();
+  });
+
+  it("says in the footer when a paste holds no servers", async () => {
+    api.parseServerSnippet.mockResolvedValueOnce([]);
+    const user = userEvent.setup();
+    render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    await user.click(screen.getByRole("button", { name: "Paste from client config" }));
+    await user.type(screen.getByPlaceholderText(/claude mcp add \.\.\. \//), "none");
+    await user.click(screen.getByRole("button", { name: "Parse & fill" }));
+    await expectFooterError("No servers found in the pasted config.");
+    expect(toast.error).not.toHaveBeenCalled();
   });
 
   it("leaves the form as it was when a paste is refused", async () => {
@@ -799,14 +813,16 @@ describe("ServerDialog", () => {
       await user.click(screen.getByRole("button", { name: "Parse & fill" }));
     };
     await paste("refused header");
-    await waitFor(() => expect(toastError).toHaveBeenCalledWith(header));
+    await expectFooterError(header);
     expect(screen.queryByText("Give the server a name.")).not.toBeInTheDocument();
     expect(screen.getByLabelText("Name")).toHaveValue("");
 
     await paste("good");
     await waitFor(() => expect(screen.getByLabelText("Name")).toHaveValue("first"));
+    // A good paste clears the earlier refusal.
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     await paste("refused variable");
-    await waitFor(() => expect(toastError).toHaveBeenCalledWith(variable));
+    await expectFooterError(variable);
     // The earlier paste's fields stay, as they were before the refused one.
     expect(screen.getByLabelText("Name")).toHaveValue("first");
     expect(screen.getByLabelText("Command")).toHaveValue("npx");
@@ -826,8 +842,7 @@ describe("ServerDialog", () => {
         );
       await user.type(screen.getByPlaceholderText(/claude mcp add \.\.\. \//), "x");
       await user.click(screen.getByRole("button", { name: "Parse & fill" }));
-      await waitFor(() => expect(toastError).toHaveBeenCalledWith(header));
-      vi.mocked(toastError).mockClear();
+      await expectFooterError(header);
     };
     // Arguments shows the empty command's error once visited.
     await user.click(screen.getByLabelText("Arguments"));
@@ -860,7 +875,7 @@ describe("ServerDialog", () => {
     await user.click(screen.getByPlaceholderText(/claude mcp add \.\.\. \//));
     expect(screen.getByText("Give the server a name.")).toBeVisible();
     await act(async () => refusal.reject("refused"));
-    await waitFor(() => expect(toastError).toHaveBeenCalledWith("refused"));
+    await expectFooterError("refused");
     expect(screen.queryByText("Give the server a name.")).not.toBeInTheDocument();
   });
 

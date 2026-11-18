@@ -643,7 +643,7 @@
   "No saved definition. Approving captures the current definition for one more review. The tool stays blocked until then.": "未儲存定義。核准後會捕獲當前定義，供再次審核。在此之前，工具會保持攔截狀態。",
   "No server or tool matches \"{value1}\".": "沒有伺服器或工具符合「{value1}」。",
   "No servers enabled": "未啟用伺服器",
-  "No servers found in the pasted config": "在貼上的設定中找不到伺服器",
+  "No servers found in the pasted config.": "在貼上的設定中找不到伺服器。",
   "No servers to test": "沒有伺服器可供測試",
   "No supported clients installed": "未安裝支援的使用者端",
   "No system keyring found. Toolport keeps secrets in your OS keyring; on Linux that needs a running Secret Service (e.g. gnome-keyring or KWallet). Start and unlock one, then retry.": "未找到系統鑰匙圈。Toolport 將機密值儲存在作業系統鑰匙圈中；在 Linux 上，需要執行 Secret Service（如 gnome-keyring 或 KWallet）。請啟動並解鎖相應服務後重試。",

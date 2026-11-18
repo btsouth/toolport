@@ -454,7 +454,6 @@
   "No resources advertised": "公開されたリソースはありません",
   "No saved definition. Approving captures the current definition for one more review.": "保存された定義はありません。承認すると、もう 1 回のレビューのために現在の定義がキャプチャされます。",
   "No scoped HTTP clients are registered.": "スコープ指定された HTTP クライアントは登録されていません。",
-  "No servers found in the pasted config.": "貼り付けた構成にサーバーが見つかりませんでした。",
   "No servers yet": "まだサーバーがありません",
   "No supported clients are installed yet. You can finish setup and connect one later from Clients.": "サポートされているクライアントはまだインストールされていません。セットアップを完了し、後でクライアントから接続できます。",
   "No supported clients detected": "サポートされているクライアントが検出されませんでした",

@@ -643,7 +643,7 @@
   "No saved definition. Approving captures the current definition for one more review. The tool stays blocked until then.": "저장된 정의가 없습니다. 승인하면 추가 검토를 위해 현재 정의가 캡처됩니다. 도구는 그때까지 차단된 상태로 유지됩니다.",
   "No server or tool matches \"{value1}\".": "“{value1}”와 일치하는 서버나 도구가 없습니다.",
   "No servers enabled": "활성화된 서버가 없습니다.",
-  "No servers found in the pasted config": "붙여넣은 구성에서 서버를 찾을 수 없습니다.",
+  "No servers found in the pasted config.": "붙여넣은 구성에서 서버를 찾을 수 없습니다.",
   "No servers to test": "테스트할 서버가 없습니다.",
   "No supported clients installed": "지원되는 클라이언트가 설치되지 않았습니다.",
   "No system keyring found. Toolport keeps secrets in your OS keyring; on Linux that needs a running Secret Service (e.g. gnome-keyring or KWallet). Start and unlock one, then retry.": "시스템 키링을 찾을 수 없습니다. Toolport OS 키링에 비밀을 유지합니다. Linux에서는 Secret Service(예: gnome-keyring 또는 KWallet)을 실행해야 합니다. 하나를 시작하고 잠금을 해제한 후 다시 시도하세요.",

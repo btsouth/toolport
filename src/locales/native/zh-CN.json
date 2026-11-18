@@ -454,7 +454,6 @@
   "No resources advertised": "没有发布任何资源",
   "No saved definition. Approving captures the current definition for one more review.": "未保存定义。批准后会捕获当前定义，供再次审核。",
   "No scoped HTTP clients are registered.": "尚未注册限定访问范围的 HTTP 客户端。",
-  "No servers found in the pasted config.": "在粘贴的配置中找不到服务器。",
   "No servers yet": "还没有服务器",
   "No supported clients are installed yet. You can finish setup and connect one later from Clients.": "尚未安装支持的客户端。您可以完成设置并稍后从客户端连接。",
   "No supported clients detected": "未检测到支持的客户端",

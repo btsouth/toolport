@@ -643,7 +643,7 @@
   "No saved definition. Approving captures the current definition for one more review. The tool stays blocked until then.": "Aucune définition enregistrée. L'approbation capture la définition actuelle pour une révision supplémentaire. L'outil reste bloqué jusque-là.",
   "No server or tool matches \"{value1}\".": "Aucun serveur ou outil ne correspond à « {value1} ».",
   "No servers enabled": "Aucun serveur activé",
-  "No servers found in the pasted config": "Aucun serveur trouvé dans la configuration collée",
+  "No servers found in the pasted config.": "Aucun serveur trouvé dans la configuration collée.",
   "No servers to test": "Aucun serveur à tester",
   "No supported clients installed": "Aucun client pris en charge installé",
   "No system keyring found. Toolport keeps secrets in your OS keyring; on Linux that needs a running Secret Service (e.g. gnome-keyring or KWallet). Start and unlock one, then retry.": "Aucun trousseau système trouvé. Toolport garde des secrets dans le trousseau de clés de votre système d'exploitation ; sous Linux qui nécessite un Secret Service en cours d'exécution (par exemple gnome-keyring ou KWallet). Démarrez et déverrouillez-en un, puis réessayez.",

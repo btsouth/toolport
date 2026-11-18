@@ -454,7 +454,6 @@
   "No resources advertised": "Aucune ressource annoncée",
   "No saved definition. Approving captures the current definition for one more review.": "Aucune définition enregistrée. L'approbation capture la définition actuelle pour une révision supplémentaire.",
   "No scoped HTTP clients are registered.": "Aucun client HTTP à accès limité n'est enregistré.",
-  "No servers found in the pasted config.": "Aucun serveur trouvé dans la configuration collée.",
   "No servers yet": "Pas encore de serveurs",
   "No supported clients are installed yet. You can finish setup and connect one later from Clients.": "Aucun client pris en charge n'est encore installé. Vous pouvez terminer la configuration et vous en connecter un plus tard à partir des clients.",
   "No supported clients detected": "Aucun client pris en charge détecté",

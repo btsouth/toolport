@@ -643,7 +643,7 @@
   "No saved definition. Approving captures the current definition for one more review. The tool stays blocked until then.": "No saved definition. Approving captures the current definition for one more review. The tool stays blocked until then.",
   "No server or tool matches \"{value1}\".": "No server or tool matches \"{value1}\".",
   "No servers enabled": "No servers enabled",
-  "No servers found in the pasted config": "No servers found in the pasted config",
+  "No servers found in the pasted config.": "No servers found in the pasted config.",
   "No servers to test": "No servers to test",
   "No supported clients installed": "No supported clients installed",
   "No system keyring found. Toolport keeps secrets in your OS keyring; on Linux that needs a running Secret Service (e.g. gnome-keyring or KWallet). Start and unlock one, then retry.": "No system keyring found. Toolport keeps secrets in your OS keyring; on Linux that needs a running Secret Service (e.g. gnome-keyring or KWallet). Start and unlock one, then retry.",
