@@ -98,6 +98,8 @@ pub(super) struct ActivitySnapshot {
     pub(super) tool_change_reviews: bool,
     /// `integrity::ActivitySafety::blocks_nothing`: Activity may say Safety is Off.
     pub(super) blocks_nothing: bool,
+    /// `integrity::ActivitySafety::reviews_confirmed`: Activity may say protection is active.
+    pub(super) reviews_confirmed: bool,
 }
 
 /// How many recent entries Activity reads and lists: React's `getAuditLog(200)`.
@@ -230,6 +232,7 @@ impl ActivitySnapshot {
             live_inspect: false,
             tool_change_reviews: true,
             blocks_nothing: false,
+            reviews_confirmed: false,
         }
     }
 }
@@ -429,6 +432,7 @@ pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
             let safety = crate::integrity::activity_safety();
             snapshot.tool_change_reviews = safety.tool_change_reviews;
             snapshot.blocks_nothing = safety.blocks_nothing;
+            snapshot.reviews_confirmed = safety.reviews_confirmed;
             annotate_security_server_names(&mut snapshot.security_events, &registry.servers);
             crate::integrity::tool_identities(&registry.servers, &registry.profiles)
                 .map_err(|error| format!("could not read the tool identity stores: {error}"))

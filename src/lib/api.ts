@@ -128,6 +128,8 @@ export function getSecurityEvents(limit = 100): Promise<SecurityEvent[]> {
 export interface ActivitySafety {
   toolChangeReviews: boolean;
   blocksNothing: boolean;
+  /** An authoritative registry read found reviews on: Activity may say protection is active. */
+  reviewsConfirmed: boolean;
 }
 export function getActivitySafety(): Promise<ActivitySafety> {
   return invoke<ActivitySafety>("activity_safety");

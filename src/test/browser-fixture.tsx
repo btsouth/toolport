@@ -1354,6 +1354,7 @@ mockIPC(
         return {
           toolChangeReviews: !off,
           blocksNothing: off && !driftEvents.some((event) => event.blocked !== false),
+          reviewsConfirmed: !off,
         };
       }
       case "release_quarantine": {

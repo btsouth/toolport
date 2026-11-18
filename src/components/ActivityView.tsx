@@ -1940,10 +1940,11 @@ export function ActivityView({
   const [errorsOnly, setErrorsOnly] = useState(false);
   const [security, setSecurity] = useState<SecurityEvent[]>([]);
   const [securityLoadStatus, setSecurityLoadStatus] = useState<LoadStatus>("loading");
-  // Unknown keeps reviews on and never claims Safety Off.
+  // Unknown keeps reviews on and claims neither Safety Off nor active protection.
   const [safety, setSafety] = useState<ActivitySafety>({
     toolChangeReviews: true,
     blocksNothing: false,
+    reviewsConfirmed: false,
   });
   const reviewsEnabled = safety.toolChangeReviews;
   const [dismissed, setDismissed] = useState<Set<string>>(loadDismissed);
@@ -2123,9 +2124,19 @@ export function ActivityView({
             toolChangeReviews: answer?.toolChangeReviews !== false,
             blocksNothing:
               answer?.toolChangeReviews === false && answer.blocksNothing === true,
+            reviewsConfirmed:
+              answer?.toolChangeReviews === true && answer.reviewsConfirmed === true,
           }),
       )
-      .catch(() => alive && setSafety({ toolChangeReviews: true, blocksNothing: false }));
+      .catch(
+        () =>
+          alive &&
+          setSafety({
+            toolChangeReviews: true,
+            blocksNothing: false,
+            reviewsConfirmed: false,
+          }),
+      );
     getSecurityEvents(2000)
       .then((s) => {
         if (!alive) return;
@@ -2285,7 +2296,9 @@ export function ActivityView({
       ) : null}
       {highSecurity.length > 0 ? (
         <SecurityNotices events={highSecurity} onDismiss={dismissSecurity} />
-      ) : reviewsEnabled && securityLoadStatus === "ready" && toolChanges.length === 0 ? (
+      ) : safety.reviewsConfirmed &&
+        securityLoadStatus === "ready" &&
+        toolChanges.length === 0 ? (
         <SecurityResting />
       ) : null}
       {infoSecurity.length > 0 ? (

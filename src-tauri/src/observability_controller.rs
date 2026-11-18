@@ -237,15 +237,16 @@ fn activity_digest(paths: &[std::path::PathBuf]) -> Result<String, String> {
 
 fn activity_metadata(dir: &std::path::Path) -> Result<(String, Vec<std::path::PathBuf>), String> {
     use std::hash::{Hash, Hasher};
+    // A missing directory is an empty store list; the resolved registry may still
+    // exist elsewhere and decide what Activity shows.
     let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(("missing".into(), Vec::new()))
-        }
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(format!("Could not check Activity stores: {error}")),
     };
+    let dir_missing = entries.is_none();
     let mut stores = Vec::new();
-    for entry in entries {
+    for entry in entries.into_iter().flatten() {
         let entry = entry.map_err(|error| error.to_string())?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if activity_file(&name) {
@@ -262,6 +263,9 @@ fn activity_metadata(dir: &std::path::Path) -> Result<(String, Vec<std::path::Pa
         if let Ok(metadata) = std::fs::metadata(&registry) {
             stores.push((registry, metadata));
         }
+    }
+    if dir_missing && stores.is_empty() {
+        return Ok(("missing".into(), Vec::new()));
     }
     stores.sort_by(|a, b| a.0.cmp(&b.0));
     let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -555,7 +559,7 @@ mod tests {
         // Outside the data dir, and inside it under a name the store scan skips.
         let policy = data.dir.join("policy.json");
         std::fs::write(&policy, r#"{"safetyLevel":"off"}"#).unwrap();
-        for registry in [registry, policy] {
+        for registry in [registry.clone(), policy] {
             std::env::set_var("TOOLPORT_REGISTRY", &registry);
             let mut cache = RevisionCache::new(data.dir.clone());
             let before = cache.revision().unwrap();
@@ -563,6 +567,15 @@ mod tests {
             std::fs::write(&registry, r#"{"safetyLevel":"ask"}"#).unwrap();
             assert_ne!(cache.revision().unwrap(), before, "{registry:?}");
         }
+        // No Activity directory yet: the external registry still counts.
+        std::env::set_var("TOOLPORT_REGISTRY", &registry);
+        let mut absent = RevisionCache::new(data.dir.join("absent"));
+        let before = absent.revision().unwrap();
+        assert_ne!(before, "missing");
+        std::fs::write(&registry, r#"{"safetyLevel":"off"}"#).unwrap();
+        assert_ne!(absent.revision().unwrap(), before);
+        std::fs::remove_file(&registry).unwrap();
+        assert_eq!(absent.revision().unwrap(), "missing");
     }
 
     #[test]

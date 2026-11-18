@@ -91,7 +91,11 @@ beforeEach(() => {
   getAuditLog.mockResolvedValue(initialLog);
   getSearchTraces.mockResolvedValue([]);
   getSecurityEvents.mockResolvedValue([]);
-  getActivitySafety.mockResolvedValue({ toolChangeReviews: true, blocksNothing: false });
+  getActivitySafety.mockResolvedValue({
+    toolChangeReviews: true,
+    blocksNothing: false,
+    reviewsConfirmed: true,
+  });
   getToolIdentities.mockResolvedValue([]);
   getInspectLog.mockResolvedValue([]);
   getSavingsSummary.mockResolvedValue(null);
@@ -1261,10 +1265,20 @@ describe("ActivityView security drift dismissals", () => {
       ...(historical ? { historical: true } : {}),
     });
     const unblocked = [change("read", false), change("list", false, true)];
-    const OFF = { toolChangeReviews: false, blocksNothing: true };
+    const OFF = {
+      toolChangeReviews: false,
+      blocksNothing: true,
+      reviewsConfirmed: false,
+    };
     // The registry prop no longer decides: Rust answers through the command.
     const shown = async (
-      safety: { toolChangeReviews: boolean; blocksNothing: boolean } | Error,
+      safety:
+        | {
+            toolChangeReviews: boolean;
+            blocksNothing: boolean;
+            reviewsConfirmed: boolean;
+          }
+        | Error,
       events: SecurityEvent[],
     ) => {
       if (safety instanceof Error) getActivitySafety.mockRejectedValue(safety);
@@ -1316,7 +1330,7 @@ describe("ActivityView security drift dismissals", () => {
     expect(review.text).not.toContain(offCard);
     // A tool held in a store but not on screen: Rust says Off does not block nothing.
     const held = await shown(
-      { toolChangeReviews: false, blocksNothing: false },
+      { toolChangeReviews: false, blocksNothing: false, reviewsConfirmed: false },
       unblocked,
     );
     expect(held.text).toContain("2 tool-change records");
@@ -1325,7 +1339,7 @@ describe("ActivityView security drift dismissals", () => {
 
     // Reviews on, or an unanswered check, keep the cards as before.
     for (const safety of [
-      { toolChangeReviews: true, blocksNothing: false },
+      { toolChangeReviews: true, blocksNothing: false, reviewsConfirmed: true },
       new Error("registry unreadable"),
     ]) {
       const ask = await shown(safety, unblocked);
@@ -1334,8 +1348,27 @@ describe("ActivityView security drift dismissals", () => {
       expect(ask.text).not.toContain("2 tool-change records");
       expect(ask.text).not.toContain("Safety is Off.");
     }
-    const resting = await shown({ toolChangeReviews: true, blocksNothing: false }, []);
+    const resting = await shown(
+      { toolChangeReviews: true, blocksNothing: false, reviewsConfirmed: true },
+      [],
+    );
     expect(resting.text).toContain("Protection active.");
+    // Only a successful read that confirmed reviews may claim protection: not
+    // after a failed read, an unconfirmed answer, or while the read is pending.
+    for (const safety of [
+      new Error("registry unreadable"),
+      { toolChangeReviews: true, blocksNothing: false, reviewsConfirmed: false },
+    ]) {
+      const unknown = await shown(safety, []);
+      expect(unknown.text).not.toContain("Protection active.");
+      expect(unknown.text).not.toContain("Safety is Off.");
+    }
+    getActivitySafety.mockReturnValue(new Promise(() => {}));
+    getSecurityEvents.mockResolvedValue([]);
+    const pending = render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    expect(pending.container.textContent).not.toContain("Protection active.");
+    pending.unmount();
   });
 });
 

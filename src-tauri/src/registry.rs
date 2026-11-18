@@ -4915,9 +4915,20 @@ pub fn update_at<T>(
 /// only when the primary registry file itself was read: a load failure, a backup
 /// or a first-run default keeps them on, so an older saved Off never hides one.
 pub fn tool_change_reviews_now() -> bool {
+    tool_change_reviews_state().0
+}
+
+/// `(reviews, confirmed)` from one load. `reviews` is [`tool_change_reviews_now`];
+/// `confirmed` is true only when an authoritative read (the file, or a genuine
+/// first run) found reviews on, so Activity may say protection is active.
+pub fn tool_change_reviews_state() -> (bool, bool) {
     match load_resolved_with_source() {
-        Ok((registry, LoadSource::File)) => registry.tool_change_reviews_enabled(),
-        _ => true,
+        Ok((registry, LoadSource::File)) => {
+            let reviews = registry.tool_change_reviews_enabled();
+            (reviews, reviews)
+        }
+        Ok((registry, LoadSource::FirstRun)) => (true, registry.tool_change_reviews_enabled()),
+        _ => (true, false),
     }
 }
 

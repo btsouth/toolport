@@ -2518,6 +2518,12 @@ pub fn all_quarantined() -> Result<Vec<Value>, String> {
 /// tools too, so Activity must not show their changes as plain history.
 pub fn review_quarantines() -> Result<Vec<Value>, String> {
     let mut rows = all_quarantined()?;
+    // With reviews off the gateway enforces only definition reviews and pending
+    // pins, so ordinary rows (from an earlier Ask or Strict) block nothing now.
+    // They stay on disk and count again when reviews return.
+    if !crate::registry::tool_change_reviews_now() {
+        rows.retain(|row| row["review_required"] == true);
+    }
     for (profile, _) in quarantine_scan_stores()? {
         let scope = (!profile.is_empty()).then_some(profile.as_str());
         for name in active_definition_review_names(scope) {
@@ -4958,6 +4964,12 @@ fn review_stamp() -> Option<ReviewStamp> {
             review_file_stamp(&entry.path(), &entry.metadata().ok()?)?,
         );
     }
+    // The resolved registry decides which rows Off enforces, wherever it lives.
+    if let Some(path) = crate::registry::resolved_path().filter(|path| !files.contains_key(path)) {
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            files.insert(path.clone(), review_file_stamp(&path, &metadata)?);
+        }
+    }
     Some(ReviewStamp { dir, files })
 }
 
@@ -5212,8 +5224,11 @@ pub fn off_holds_any_tool() -> bool {
     let Ok(stores) = quarantine_scan_stores() else {
         return true;
     };
+    // Active reviews only: a retired name (its server was removed) holds nothing
+    // now. An unreadable pin store cannot show that nothing is held.
     stores.iter().any(|(profile, _)| {
-        !definition_review_names((!profile.is_empty()).then_some(profile.as_str())).is_empty()
+        let pins = cached_review_pins((!profile.is_empty()).then_some(profile.as_str()));
+        pins.unreadable || !pins.active.is_empty()
     })
 }
 
@@ -5225,13 +5240,17 @@ pub struct ActivitySafety {
     pub tool_change_reviews: bool,
     /// No tool change can be blocked and none is held: Activity may say Safety is Off.
     pub blocks_nothing: bool,
+    /// An authoritative registry read found reviews on: Activity may say
+    /// protection is active. False while unknown, even though reviews stay on.
+    pub reviews_confirmed: bool,
 }
 
 pub fn activity_safety() -> ActivitySafety {
-    let tool_change_reviews = crate::registry::tool_change_reviews_now();
+    let (tool_change_reviews, reviews_confirmed) = crate::registry::tool_change_reviews_state();
     ActivitySafety {
         tool_change_reviews,
         blocks_nothing: !tool_change_reviews && !off_holds_any_tool(),
+        reviews_confirmed,
     }
 }
 
@@ -5775,6 +5794,81 @@ mod tests {
             off_holds_any_tool(),
             "an unreadable store is not an all-clear"
         );
+    }
+
+    #[test]
+    fn off_marks_only_enforced_rows_as_blocked() {
+        use crate::registry::SafetyLevel;
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data = TestDataDir::new("off-enforced-rows");
+        let level = |level: SafetyLevel| {
+            let mut registry = crate::registry::Registry::default();
+            registry.set_safety_level(level);
+            crate::registry::save(&registry).unwrap();
+        };
+        // Strict quarantined an ordinary change.
+        level(SafetyLevel::Strict);
+        let ordinary = json!({"tool":"srv__update", "change":"changed", "definition_fp":"v2:f"});
+        save_quarantine(None, &BTreeMap::from([("srv__update".into(), ordinary)])).unwrap();
+        record_event(
+            &json!({"type":"tool_drift", "tool":"srv__update", "server":"srv",
+            "change":"changed", "new_fp":"v2:f", "profile":"", "ts":1}),
+        );
+        let event = || review_events(2000).unwrap().remove(0);
+        assert_eq!(event()["blocked"], true);
+        // Off does not enforce it: plain history, the row kept on disk.
+        level(SafetyLevel::Off);
+        assert_eq!(event()["blocked"], false);
+        assert!(!tool_change_asks_review(&event(), false));
+        assert!(load_quarantine(None).unwrap().contains_key("srv__update"));
+        // Back to Ask: the card returns.
+        level(SafetyLevel::Ask);
+        assert_eq!(event()["blocked"], true);
+        // A definition review is enforced at Off too.
+        level(SafetyLevel::Off);
+        let review = json!({"tool":"srv__update", "change":"changed",
+            "definition_fp":"v2:f", "review_required":true});
+        save_quarantine(None, &BTreeMap::from([("srv__update".into(), review)])).unwrap();
+        assert_eq!(event()["blocked"], true);
+        assert_eq!(event()["review_required"], true);
+    }
+
+    #[test]
+    fn off_holds_only_active_and_readable_review_pins() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data = TestDataDir::new("off-active-pins");
+        let mut registry = crate::registry::Registry::default();
+        registry.profiles.push(crate::registry::Profile {
+            id: "work".into(),
+            name: "Work".into(),
+            enabled_server_ids: vec![],
+            tool_scope: Default::default(),
+            instructions: None,
+            unknown_fields: Default::default(),
+        });
+        crate::registry::save(&registry).unwrap();
+        for scope in [None, Some("work")] {
+            save_quarantine(scope, &Quarantine::new()).unwrap();
+            let mut pin = pin_of(&destructive_tool("srv__wipe", "Captured definition."));
+            pin.review_pending = true;
+            pin.review_retired = true;
+            save_pins(scope, &BTreeMap::from([("srv__wipe".into(), pin.clone())])).unwrap();
+            // Its server was removed: nothing is held now.
+            assert!(!off_holds_any_tool(), "{scope:?}");
+            pin.review_retired = false;
+            save_pins(scope, &BTreeMap::from([("srv__wipe".into(), pin)])).unwrap();
+            assert!(off_holds_any_tool(), "{scope:?}");
+            // An unreadable pin store cannot show that nothing is held.
+            save_pins(scope, &Pins::new()).unwrap();
+            assert!(!off_holds_any_tool(), "{scope:?}");
+            let path = pins_path(scope).unwrap();
+            let _ = std::fs::remove_file(pins_backup_path(&path));
+            std::fs::write(&path, "{ not json").unwrap();
+            assert!(off_holds_any_tool(), "{scope:?}");
+            std::fs::remove_file(&path).unwrap();
+            let _ = std::fs::remove_file(pins_backup_path(&path));
+            save_pins(scope, &Pins::new()).unwrap();
+        }
     }
 
     #[test]

@@ -5998,9 +5998,9 @@ impl ActivityPage {
                 );
             });
             self.security_list.append(&notices);
-        } else if snapshot.tool_change_reviews && snapshot.security_error.is_none() && !has_changes
-        {
-            // A protection the user never sees builds no trust.
+        } else if snapshot.reviews_confirmed && snapshot.security_error.is_none() && !has_changes {
+            // A protection the user never sees builds no trust. Claim it only
+            // when the registry read confirmed reviews are on.
             self.security_list.append(
                 &activity_status_card(
                     StatusTone::Success,
@@ -19000,6 +19000,21 @@ mod tests {
         let resting = render(SafetyLevel::Ask, SafetyLevel::Off, &[]);
         assert!(resting.contains("Protection active."), "{resting}");
         assert!(!resting.contains("Safety is Off."), "{resting}");
+        // An unreadable registry keeps reviews on but cannot claim protection.
+        std::fs::remove_file(data.dir.join("registry.json")).unwrap();
+        std::fs::create_dir(data.dir.join("registry.json")).unwrap();
+        let mut snapshot = state::load_activity_snapshot().unwrap();
+        assert!(snapshot.tool_change_reviews);
+        assert!(!snapshot.reviews_confirmed);
+        snapshot.security_events = Vec::new();
+        *page.last_snapshot.borrow_mut() = Some(snapshot);
+        page.render_security();
+        let mut labels = Vec::new();
+        collect_labels(page.security_list.upcast_ref(), &mut labels);
+        assert!(!labels
+            .iter()
+            .any(|label| label.text() == "Protection active."));
+        std::fs::remove_dir(data.dir.join("registry.json")).unwrap();
         for (level, floor) in [
             (SafetyLevel::Ask, SafetyLevel::Off),
             (SafetyLevel::Off, SafetyLevel::Ask),
