@@ -4994,13 +4994,16 @@ fn review_events_cached(
     Ok(events)
 }
 
+/// Access ids that share one store (a profile, and Default access or All enabled
+/// servers over its context) are the same hold.
 fn event_matches_profile(event: &Value, profile: &str) -> bool {
+    let same = |value: &str| {
+        crate::registry::access_integrity_id(value) == crate::registry::access_integrity_id(profile)
+    };
     if let Some(profiles) = event["profiles"].as_array() {
-        profiles.iter().any(|value| value.as_str() == Some(profile))
+        profiles.iter().filter_map(Value::as_str).any(same)
     } else {
-        event["profile"]
-            .as_str()
-            .is_none_or(|value| value == profile)
+        event["profile"].as_str().is_none_or(same)
     }
 }
 
@@ -5756,14 +5759,15 @@ mod tests {
             save_quarantine(scope, &BTreeMap::from([("srv__update".into(), captured)])).unwrap();
             // Off with no retained event: the hold alone rules out the all-clear.
             assert!(off_holds_any_tool(), "{id}");
-            // Settings lists the row at every level, through the same union.
-            assert!(
-                all_quarantined_summaries()
-                    .unwrap()
-                    .iter()
-                    .any(|row| row["profile"] == id.as_str() && row["tool"] == "srv__update"),
-                "{id}"
+            // Settings lists the row at every level, through the same union. Both
+            // synthesized ids share one store, listed once under either id.
+            let rows = all_quarantined_summaries().unwrap();
+            assert_eq!(rows.len(), 1, "{id}");
+            assert_eq!(
+                crate::registry::access_integrity_id(rows[0]["profile"].as_str().unwrap()),
+                crate::registry::access_integrity_id(&id),
             );
+            assert_eq!(rows[0]["tool"], "srv__update");
             record_event(
                 &json!({"type":"tool_drift", "tool":"srv__update", "server":"srv",
                 "change":"changed", "new_fp":"v2:current", "profile":id, "ts":1}),
