@@ -10219,6 +10219,168 @@ fn fetch_paginated_list_with_deadline(
     ))
 }
 
+/// Scripted stdio servers for the oversized frame (P09) tests.
+///
+/// The child is this test binary run again with only the
+/// `downstream::tests::p09_stdio_child` test selected, so the tests depend on no
+/// interpreter. They used `/usr/bin/python3`, which on macOS is an `xcrun` shim
+/// whose first launch on a fresh runner can take most of the ten second connect
+/// budget, so whichever test ran it first timed out waiting for its handshake.
+/// The libtest banner lines the child prints first are not JSON, which the
+/// transport ignores like any other stray line.
+#[cfg(all(test, unix))]
+pub(crate) mod p09_child {
+    use serde_json::{json, Value};
+    use std::io::{BufRead, Write};
+
+    const MODE: &str = "TOOLPORT_TEST_P09_CHILD_MODE";
+    const CALLS: &str = "TOOLPORT_TEST_P09_CHILD_CALLS";
+    /// One byte over `MAX_RESPONSE_BYTES`.
+    const OVER_LIMIT: usize = super::MAX_RESPONSE_BYTES as usize + 1;
+    /// What the router tests write: 2049 chunks of 8 KiB, past the limit.
+    const FLOOD: usize = 2049 * 8192;
+
+    #[derive(Clone, Copy)]
+    pub(crate) enum Mode {
+        /// Answer the first request as a readiness ping, read two more, write an
+        /// oversized frame and then the answer to the second, then answer the rest.
+        OwnedCalls,
+        /// Answer every request with `{"ok": true}`.
+        Echo,
+        /// A minimal MCP server whose `tools/call` records the dispatch in the
+        /// calls file, writes an oversized frame, then answers.
+        RouterDispatch,
+        /// Like `RouterDispatch`, but `tools/call` writes an oversized frame and
+        /// never answers.
+        RouterAlwaysOversized,
+    }
+
+    impl Mode {
+        fn name(self) -> &'static str {
+            match self {
+                Mode::OwnedCalls => "owned-calls",
+                Mode::Echo => "echo",
+                Mode::RouterDispatch => "router-dispatch",
+                Mode::RouterAlwaysOversized => "router-always-oversized",
+            }
+        }
+    }
+
+    /// Spawn the scripted child through the production stdio transport.
+    pub(crate) fn spawn(mode: Mode, calls: Option<&std::path::Path>) -> super::StdioTransport {
+        let exe = std::env::current_exe().unwrap();
+        let mut env = vec![(MODE.to_string(), mode.name().to_string())];
+        if let Some(calls) = calls {
+            env.push((CALLS.to_string(), calls.to_string_lossy().into_owned()));
+        }
+        super::StdioTransport::spawn(
+            &exe.to_string_lossy(),
+            &[
+                "--exact".to_string(),
+                "downstream::tests::p09_stdio_child".to_string(),
+                "--nocapture".to_string(),
+                "--test-threads=1".to_string(),
+            ],
+            &env,
+            None,
+            false,
+        )
+        .unwrap()
+    }
+
+    /// The child body. Returns at once in an ordinary test run.
+    pub(crate) fn serve_if_requested() {
+        let Ok(mode) = std::env::var(MODE) else {
+            return;
+        };
+        let calls = std::env::var_os(CALLS);
+        let stdin = std::io::stdin();
+        let mut requests = stdin
+            .lock()
+            .lines()
+            .map_while(Result::ok)
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap());
+        let mut out = std::io::stdout().lock();
+        // A write fails once the parent resets the connection; stop quietly then.
+        let _ = (|| -> std::io::Result<()> {
+            // libtest has printed `test <name> ... ` without a newline; end that
+            // line so the first reply starts a frame of its own.
+            out.write_all(b"\n")?;
+            let reply = |out: &mut std::io::StdoutLock<'_>, id: &Value, result: Value| {
+                writeln!(
+                    out,
+                    "{}",
+                    json!({"jsonrpc": "2.0", "id": id, "result": result})
+                )?;
+                out.flush()
+            };
+            let flood = |out: &mut std::io::StdoutLock<'_>, mut bytes: usize| {
+                let chunk = [b'x'; 8192];
+                while bytes > 0 {
+                    let count = bytes.min(chunk.len());
+                    out.write_all(&chunk[..count])?;
+                    bytes -= count;
+                }
+                out.flush()
+            };
+            match mode.as_str() {
+                "owned-calls" => {
+                    let Some(ready) = requests.next() else {
+                        return Ok(());
+                    };
+                    reply(&mut out, &ready["id"], json!({"ready": true}))?;
+                    let (Some(_first), Some(second)) = (requests.next(), requests.next()) else {
+                        return Ok(());
+                    };
+                    flood(&mut out, OVER_LIMIT)?;
+                    out.write_all(b"\n")?;
+                    reply(&mut out, &second["id"], json!({"ok": true}))?;
+                    for request in requests {
+                        reply(&mut out, &request["id"], json!({"ok": true}))?;
+                    }
+                }
+                "echo" => {
+                    for request in requests {
+                        reply(&mut out, &request["id"], json!({"ok": true}))?;
+                    }
+                }
+                "router-dispatch" | "router-always-oversized" => {
+                    for request in requests {
+                        let Some(id) = request.get("id") else {
+                            continue;
+                        };
+                        let result = match request["method"].as_str() {
+                            Some("initialize") => {
+                                json!({"protocolVersion": "2025-06-18", "capabilities": {}})
+                            }
+                            Some("tools/list") => json!({"tools": [{"name": "echo"}]}),
+                            Some("tools/call") if mode == "router-always-oversized" => {
+                                flood(&mut out, FLOOD)?;
+                                continue;
+                            }
+                            Some("tools/call") => {
+                                let path = calls.as_ref().expect("calls file");
+                                let mut file = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(path)?;
+                                file.write_all(b"dispatch\n")?;
+                                flood(&mut out, FLOOD)?;
+                                out.write_all(b"\n")?;
+                                json!({"ok": true})
+                            }
+                            _ => json!({}),
+                        };
+                        reply(&mut out, id, result)?;
+                    }
+                }
+                other => panic!("unknown p09 child mode {other}"),
+            }
+            Ok(())
+        })();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -13815,39 +13977,18 @@ mod tests {
         }
     }
 
+    /// Entry point for the scripted child in [`super::p09_child`]; a no-op in
+    /// an ordinary run.
+    #[cfg(unix)]
+    #[test]
+    fn p09_stdio_child() {
+        super::p09_child::serve_if_requested();
+    }
+
     #[cfg(unix)]
     #[test]
     fn p09_oversized_stdio_frame_fails_owned_calls_and_allows_explicit_reconnect() {
-        struct Scratch(std::path::PathBuf);
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let dir = Scratch(
-            std::env::temp_dir().join(format!("toolport-p09-downstream-{}", std::process::id())),
-        );
-        std::fs::create_dir_all(&dir.0).unwrap();
-        let bad = dir.0.join("oversized.py");
-        std::fs::write(&bad, r#"import json, sys
-ready = json.loads(sys.stdin.readline())
-print(json.dumps({'jsonrpc':'2.0','id':ready['id'],'result':{'ready':True}}), flush=True)
-requests = [json.loads(sys.stdin.readline()) for _ in range(2)]
-sys.stdout.buffer.write(b'x' * (16 * 1024 * 1024 + 1))
-sys.stdout.buffer.write(b'\n' + json.dumps({'jsonrpc':'2.0','id':requests[1]['id'],'result':{'ok':True}}).encode() + b'\n')
-sys.stdout.buffer.flush()
-for line in sys.stdin:
-    request = json.loads(line)
-    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':{'ok':True}}), flush=True)
-"#).unwrap();
-        let mut transport = super::StdioTransport::spawn(
-            "/usr/bin/python3",
-            &[bad.to_string_lossy().into_owned()],
-            &[],
-            None,
-            false,
-        )
-        .unwrap();
+        let mut transport = super::p09_child::spawn(super::p09_child::Mode::OwnedCalls, None);
         // Establish child readiness before measuring the bounded call phase.
         transport.set_read_timeout(super::STDIO_CONNECT_TIMEOUT);
         assert_eq!(transport.request("ping", json!({})).unwrap()["ready"], true);
@@ -13899,24 +14040,7 @@ for line in sys.stdin:
             .is_err());
         drop(handle);
         drop(transport);
-        let good = dir.0.join("bounded.py");
-        std::fs::write(
-            &good,
-            r#"import json, sys
-for line in sys.stdin:
-    request = json.loads(line)
-    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':{'ok':True}}), flush=True)
-"#,
-        )
-        .unwrap();
-        let mut fresh = super::StdioTransport::spawn(
-            "/usr/bin/python3",
-            &[good.to_string_lossy().into_owned()],
-            &[],
-            None,
-            false,
-        )
-        .unwrap();
+        let mut fresh = super::p09_child::spawn(super::p09_child::Mode::Echo, None);
         assert_eq!(
             fresh
                 .request("tools/call", json!({"name":"later"}))

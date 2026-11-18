@@ -6450,44 +6450,11 @@ mod tests {
             std::env::temp_dir().join(format!("toolport-p09-router-{}", std::process::id())),
         );
         std::fs::create_dir_all(&dir.0).unwrap();
-        let script = dir.0.join("oversized.py");
         let calls = dir.0.join("calls");
-        std::fs::write(
-            &script,
-            r#"import json, os, sys
-for line in sys.stdin:
-    request = json.loads(line)
-    if 'id' not in request:
-        continue
-    method = request['method']
-    if method == 'initialize':
-        result = {'protocolVersion':'2025-06-18','capabilities':{}}
-    elif method == 'tools/list':
-        result = {'tools':[{'name':'echo'}]}
-    elif method == 'tools/call':
-        with open(sys.argv[1], 'a') as calls:
-            calls.write('dispatch\n')
-        for _ in range(2049):
-            os.write(1, b'x' * 8192)
-        os.write(1, b'\n')
-        result = {'ok':True}
-    else:
-        result = {}
-    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
-"#,
-        )
-        .unwrap();
-        let transport = crate::downstream::StdioTransport::spawn(
-            "/usr/bin/python3",
-            &[
-                script.to_string_lossy().into_owned(),
-                calls.to_string_lossy().into_owned(),
-            ],
-            &[],
-            None,
-            false,
-        )
-        .unwrap();
+        let transport = crate::downstream::p09_child::spawn(
+            crate::downstream::p09_child::Mode::RouterDispatch,
+            Some(&calls),
+        );
         struct ObservedReset {
             inner: crate::downstream::StdioTransport,
             seen: std::sync::mpsc::Sender<()>,
@@ -6615,34 +6582,6 @@ for line in sys.stdin:
         let _data = crate::registry::DataDirTestEnv::new(
             "f3-p09-always-oversized-server-trips-breaker-until-cooldown",
         );
-        struct Scratch(std::path::PathBuf);
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let dir = Scratch(
-            std::env::temp_dir().join(format!("toolport-p09-breaker-{}", std::process::id())),
-        );
-        std::fs::create_dir_all(&dir.0).unwrap();
-        let script = dir.0.join("oversized.py");
-        std::fs::write(
-            &script,
-            r#"import json, os, sys
-for line in sys.stdin:
-    request = json.loads(line)
-    if 'id' not in request: continue
-    method = request['method']
-    if method == 'initialize': result = {'protocolVersion':'2025-06-18','capabilities':{}}
-    elif method == 'tools/list': result = {'tools':[{'name':'echo'}]}
-    elif method == 'tools/call':
-        for _ in range(2049): os.write(1, b'x' * 8192)
-        continue
-    else: result = {}
-    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
-"#,
-        )
-        .unwrap();
         let spawns = Arc::new(AtomicUsize::new(0));
         let counted = spawns.clone();
         let fail_reconnect = Arc::new(AtomicBool::new(false));
@@ -6652,14 +6591,10 @@ for line in sys.stdin:
                 return None;
             }
             counted.fetch_add(1, Ordering::SeqCst);
-            let transport = crate::downstream::StdioTransport::spawn(
-                "/usr/bin/python3",
-                &[script.to_string_lossy().into_owned()],
-                &[],
+            let transport = crate::downstream::p09_child::spawn(
+                crate::downstream::p09_child::Mode::RouterAlwaysOversized,
                 None,
-                false,
-            )
-            .unwrap();
+            );
             Some(DownstreamServer::connect("s".into(), Box::new(transport)).unwrap())
         };
         let mut router = Router::new();
