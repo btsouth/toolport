@@ -425,9 +425,10 @@ pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
         .map_err(|error| format!("could not read the registry for tool identities: {error}"))
         .and_then(|registry| {
             snapshot.live_inspect = registry.live_inspect;
-            snapshot.tool_change_reviews = registry.tool_change_reviews_enabled();
-            snapshot.blocks_nothing =
-                !snapshot.tool_change_reviews && !crate::integrity::off_holds_any_tool();
+            // The same source-aware decision React reads through `activity_safety`.
+            let safety = crate::integrity::activity_safety();
+            snapshot.tool_change_reviews = safety.tool_change_reviews;
+            snapshot.blocks_nothing = safety.blocks_nothing;
             annotate_security_server_names(&mut snapshot.security_events, &registry.servers);
             crate::integrity::tool_identities(&registry.servers, &registry.profiles)
                 .map_err(|error| format!("could not read the tool identity stores: {error}"))

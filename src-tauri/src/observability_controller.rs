@@ -253,10 +253,11 @@ fn activity_metadata(dir: &std::path::Path) -> Result<(String, Vec<std::path::Pa
             stores.push((entry.path(), metadata));
         }
     }
-    // A registry override outside the data directory still decides what
-    // Activity shows (its safety level), so its changes count too.
-    if let Some(registry) =
-        crate::registry::resolved_path().filter(|path| path.parent() != Some(dir))
+    // The resolved registry decides what Activity shows (its safety level), so
+    // its changes count whatever its name or directory, such as an override at
+    // <data-dir>/policy.json.
+    if let Some(registry) = crate::registry::resolved_path()
+        .filter(|path| !stores.iter().any(|(selected, _)| selected == path))
     {
         if let Ok(metadata) = std::fs::metadata(&registry) {
             stores.push((registry, metadata));
@@ -530,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn activity_revision_covers_a_registry_override_outside_the_data_dir() {
+    fn activity_revision_covers_a_registry_override_by_its_resolved_path() {
         let data = crate::registry::DataDirTestEnv::new("activity-revision-registry-override");
         let _env = crate::registry::REGISTRY_ENV_LOCK
             .lock()
@@ -551,11 +552,17 @@ mod tests {
             }
         }
         let _restore = Restore(std::env::var_os("TOOLPORT_REGISTRY"), elsewhere.clone());
-        std::env::set_var("TOOLPORT_REGISTRY", &registry);
-        let mut cache = RevisionCache::new(data.dir.clone());
-        let before = cache.revision().unwrap();
-        std::fs::write(&registry, r#"{"safetyLevel":"strict"}"#).unwrap();
-        assert_ne!(cache.revision().unwrap(), before);
+        // Outside the data dir, and inside it under a name the store scan skips.
+        let policy = data.dir.join("policy.json");
+        std::fs::write(&policy, r#"{"safetyLevel":"off"}"#).unwrap();
+        for registry in [registry, policy] {
+            std::env::set_var("TOOLPORT_REGISTRY", &registry);
+            let mut cache = RevisionCache::new(data.dir.clone());
+            let before = cache.revision().unwrap();
+            assert_eq!(cache.revision().unwrap(), before, "{registry:?} unchanged");
+            std::fs::write(&registry, r#"{"safetyLevel":"ask"}"#).unwrap();
+            assert_ne!(cache.revision().unwrap(), before, "{registry:?}");
+        }
     }
 
     #[test]

@@ -1279,7 +1279,7 @@ describe("ActivityView security drift dismissals", () => {
       view.unmount();
       return { text, accept };
     };
-    const offCard = "Toolport records tool changes but blocks nothing.";
+    const offCard = "Toolport records tool changes but does not block them.";
 
     const off = await shown(OFF, unblocked);
     expect(off.accept).toBe(0);
@@ -1294,7 +1294,7 @@ describe("ActivityView security drift dismissals", () => {
       off.text.indexOf("2 tool-change records"),
     );
 
-    // A blocked, unknown or held change on screen: never "blocks nothing".
+    // A blocked, unknown or held change on screen: never the Off card.
     const blocked = await shown(OFF, [...unblocked, change("delete", true)]);
     expect(blocked.accept).toBe(1);
     expect(blocked.text).toContain("1 tool is blocked");

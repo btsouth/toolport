@@ -4911,12 +4911,14 @@ pub fn update_at<T>(
     Ok((reg, out))
 }
 
-/// `Registry::tool_change_reviews_enabled` for the registry on disk. Any load
-/// failure keeps reviews on, so an unreadable registry never hides one.
+/// `Registry::tool_change_reviews_enabled` for the registry on disk. Reviews stop
+/// only when the primary registry file itself was read: a load failure, a backup
+/// or a first-run default keeps them on, so an older saved Off never hides one.
 pub fn tool_change_reviews_now() -> bool {
-    load_resolved()
-        .map(|registry| registry.tool_change_reviews_enabled())
-        .unwrap_or(true)
+    match load_resolved_with_source() {
+        Ok((registry, LoadSource::File)) => registry.tool_change_reviews_enabled(),
+        _ => true,
+    }
 }
 
 /// The path the registry actually resolves to, honoring `TOOLPORT_REGISTRY`
@@ -7912,6 +7914,32 @@ pub(crate) mod tests {
             std::fs::read_to_string(backup_path(&path)).unwrap(),
             good_bytes
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tool_change_reviews_stay_on_unless_the_primary_registry_was_read() {
+        let _data = data_dir_test_lock();
+        let (dir, _override) = scratch_data_dir("reg-reviews-source");
+        let path = dir.join("registry.json");
+        assert_eq!(resolved_path().as_deref(), Some(path.as_path()));
+        let mut reg = Registry::default();
+        reg.set_safety_level(SafetyLevel::Off);
+        save_to(&path, &reg).unwrap();
+        assert!(
+            !tool_change_reviews_now(),
+            "a read Off primary stops reviews"
+        );
+        reg.set_safety_level(SafetyLevel::Ask);
+        save_to(&path, &reg).unwrap();
+        assert!(tool_change_reviews_now());
+        // The backup now holds the earlier Off. An unreadable Ask primary must
+        // not let that backup turn reviews off.
+        std::fs::write(&path, "{ not json").unwrap();
+        let (backup, source) = load_resolved_with_source().unwrap();
+        assert_eq!(source, LoadSource::Backup);
+        assert!(!backup.tool_change_reviews_enabled());
+        assert!(tool_change_reviews_now(), "a backup read keeps reviews on");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

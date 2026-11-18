@@ -1878,7 +1878,10 @@ fn read_security_watch_snapshot() -> Result<SecurityWatchSnapshot, String> {
     // quarantine store verifies as unblocked; an unreadable store keeps alerts.
     let mut events = events;
     if !tool_change_reviews {
-        crate::integrity::annotate_review_status(&mut events, &crate::integrity::all_quarantined());
+        crate::integrity::annotate_review_status(
+            &mut events,
+            &crate::integrity::review_quarantines(),
+        );
     }
     Ok((events, quarantined, tool_change_reviews))
 }
@@ -5882,7 +5885,7 @@ impl ActivityPage {
             let card = activity_status_card(
                 StatusTone::Info,
                 crate::i18n::msg("Safety is Off."),
-                crate::i18n::msg("Toolport records tool changes but blocks nothing."),
+                crate::i18n::msg("Toolport records tool changes but does not block them."),
             );
             // Spec §4: Off is `ban` in React and action-unavailable here.
             card.tile.set_icon_name(Some("action-unavailable-symbolic"));
@@ -18886,7 +18889,7 @@ mod tests {
         assert!(!asks(&off), "Off must not ask for a review:\n{off}");
         assert!(off.contains("2 tool-change records"), "{off}");
         assert!(off.contains("Safety is Off."), "{off}");
-        let off_card = "Toolport records tool changes but blocks nothing.";
+        let off_card = "Toolport records tool changes but does not block them.";
         assert!(off.contains(off_card));
         assert!(!off.contains("Protection active."), "{off}");
         // The state comes first, then the records.

@@ -236,7 +236,7 @@ function SafetyOffNotice() {
     <StatusCard
       icon={<Ban />}
       title={tr("Safety is Off.")}
-      detail={tr("Toolport records tool changes but blocks nothing.")}
+      detail={tr("Toolport records tool changes but does not block them.")}
       className="mb-4"
     />
   );
