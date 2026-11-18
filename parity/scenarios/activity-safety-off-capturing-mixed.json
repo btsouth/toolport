@@ -250,11 +250,11 @@
             "ts": 1789989260000,
             "type": "tool_drift",
             "server": "atlassian",
-            "tool": "atlassian__update_issue",
+            "tool": "atlassian__transition_issue",
             "change": "changed",
             "changed_fields": ["description"],
             "severity": "high",
-            "new_fp": "v3:update_issue",
+            "new_fp": "v3:transition_issue",
             "review_required": true
           }
         ]
@@ -262,11 +262,11 @@
       "quarantine-v2-99e3590be20aac089bcb00f60b97769ece3eab8f816aa6dcb8dade452c6dfb76.json": {
         "lines": [
           {
-            "atlassian__update_issue": {
-              "tool": "atlassian__update_issue",
+            "atlassian__transition_issue": {
+              "tool": "atlassian__transition_issue",
               "server": "atlassian",
               "change": "changed",
-              "definition_fp": "v3:update_issue",
+              "definition_fp": "v3:transition_issue",
               "review_required": true,
               "reason": "Tool definition changed",
               "ts": 1789989260000
