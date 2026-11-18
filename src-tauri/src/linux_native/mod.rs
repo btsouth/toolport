@@ -19550,18 +19550,11 @@ mod tests {
     fn connect_all_summary_stays_until_dismissed_focus_returns_and_it_waits_for_a_later_scan() {
         use super::*;
         adw::init().unwrap();
-        let _lock = crate::registry::data_dir_test_lock();
-        let root = std::env::temp_dir().join(format!(
-            "toolport-gtk-connect-all-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(root.join("home")).unwrap();
-        let _data = crate::registry::DataDirOverride::set(root.join("data"));
-        let _home = crate::clients::TestHome::set(&root.join("home"));
+        // Holds the data-dir test lock and removes the scratch data on drop.
+        let data = crate::registry::DataDirTestEnv::new("gtk-connect-all");
+        let home = data.dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = crate::clients::TestHome::set(&home);
         let app = adw::Application::builder()
             .application_id("com.tsout.Toolport.ConnectAllFixture")
             .build();
@@ -19770,7 +19763,6 @@ mod tests {
         assert!(page.lasting.is_visible(), "that scan shows the summary");
         assert_eq!(page.lasting_card.title.text(), "Connect all stopped.");
         window.close();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn fixture_descendants(widget: &gtk::Widget) -> Vec<gtk::Widget> {
@@ -20045,9 +20037,8 @@ mod tests {
         client.gateway_state = state::ClientGatewayState::Connected;
         client.shared_http = true;
         client.legacy_bearer_argv = true;
-        let scratch =
-            std::env::temp_dir().join(format!("toolport-migration-row-{}", std::process::id()));
-        let _data = crate::registry::DataDirOverride::set(&scratch);
+        // Holds the data-dir test lock; setting the language writes settings.
+        let _data = crate::registry::DataDirTestEnv::new("gtk-migration-row");
         for language in [
             "en", "de", "es", "fr", "pt-BR", "ja", "ko", "zh-CN", "zh-TW",
         ] {
@@ -23228,9 +23219,8 @@ mod tests {
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn server_status_chips_keep_whole_words_on_one_line_in_narrow_windows() {
         adw::init().unwrap();
-        let scratch =
-            std::env::temp_dir().join(format!("toolport-status-chips-{}", std::process::id()));
-        let _data = crate::registry::DataDirOverride::set(&scratch);
+        // Holds the data-dir test lock; setting the language writes settings.
+        let _data = crate::registry::DataDirTestEnv::new("gtk-status-chips");
         let app = adw::Application::builder()
             .application_id("com.tsout.Toolport.StatusChips")
             .build();
