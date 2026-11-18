@@ -1137,5 +1137,6 @@
   "No servers moved, so your agent has no new tools.": "옮겨진 서버가 없어 에이전트에 새 도구가 없습니다.",
   "{value0} tool-change records": "도구 변경 기록 {value0}개",
   "Safety is Off.": "안전이 꺼져 있습니다.",
-  "Toolport records tool changes but does not block them.": "Toolport는 도구 변경을 기록하지만 차단하지 않습니다."
+  "Toolport records tool changes but does not block them.": "Toolport는 도구 변경을 기록하지만 차단하지 않습니다.",
+  "Toolport is capturing this tool's new definition. It stays blocked until then.": "Toolport가 이 도구의 새 정의를 캡처하고 있습니다. 그때까지 차단된 상태로 유지됩니다."
 }

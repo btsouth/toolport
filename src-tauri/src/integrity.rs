@@ -4994,12 +4994,15 @@ fn review_events_cached(
     Ok(events)
 }
 
-/// Access ids that share one store (a profile, and Default access or All enabled
-/// servers over its context) are the same hold.
+/// Whether two scope ids name the same quarantine file. Aliases that share a
+/// store match; the global scope ("") is its own file, never an empty access context.
+pub fn same_integrity_store(a: &str, b: &str) -> bool {
+    let path = |id: &str| quarantine_path((!id.is_empty()).then_some(id));
+    a == b || path(a).is_some_and(|path_a| Some(path_a) == path(b))
+}
+
 fn event_matches_profile(event: &Value, profile: &str) -> bool {
-    let same = |value: &str| {
-        crate::registry::access_integrity_id(value) == crate::registry::access_integrity_id(profile)
-    };
+    let same = |value: &str| same_integrity_store(value, profile);
     if let Some(profiles) = event["profiles"].as_array() {
         profiles.iter().filter_map(Value::as_str).any(same)
     } else {
@@ -5083,6 +5086,15 @@ pub fn annotate_review_status(events: &mut [Value], quarantines: &Result<Vec<Val
                             }))
                 }) {
                     event["review_required"] = json!(true);
+                }
+                // Held by a pending pin whose definition is not captured yet: there
+                // is nothing in Settings to review until the gateway captures it.
+                if records.iter().any(|record| {
+                    record["pending_capture"] == true
+                        && record["tool"] == event["tool"]
+                        && event_matches_profile(event, record["profile"].as_str().unwrap_or(""))
+                }) {
+                    event["pending_capture"] = json!(true);
                 }
                 event["blocked_profiles"] = json!(profiles);
             }
@@ -5800,6 +5812,50 @@ mod tests {
     }
 
     #[test]
+    fn global_and_access_stores_never_share_an_event() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data = TestDataDir::new("global-vs-access-store");
+        crate::registry::save(&crate::registry::Registry::default()).unwrap();
+        let access = crate::registry::load_resolved()
+            .unwrap()
+            .default_access_id();
+        assert_eq!(
+            access, "@default-access:",
+            "a fresh registry has no access context"
+        );
+        let row = json!({"tool":"srv__update", "change":"changed", "definition_fp":"v2:same"});
+        // Same tool and fingerprint, one store held, the event logged in the other.
+        for (held, logged) in [(Some(access.as_str()), ""), (None, access.as_str())] {
+            save_quarantine(held, &BTreeMap::from([("srv__update".into(), row.clone())])).unwrap();
+            record_event(
+                &json!({"type":"tool_drift", "tool":"srv__update", "server":"srv",
+                "change":"changed", "new_fp":"v2:same", "profile":logged, "ts":1}),
+            );
+            let event = review_events(2000).unwrap().remove(0);
+            assert_eq!(event["blocked"], false, "{held:?}");
+            assert_eq!(event["blocked_profiles"], json!([]), "{held:?}");
+            // Accepting releases only the event's own store, so the hold stays.
+            for profile in event["blocked_profiles"].as_array().unwrap() {
+                let profile = profile.as_str().unwrap();
+                release((!profile.is_empty()).then_some(profile), "srv__update").unwrap();
+            }
+            assert!(load_quarantine(held).unwrap().contains_key("srv__update"));
+            save_quarantine(held, &Quarantine::new()).unwrap();
+            // A pending pin in one store does not hold the other store's change.
+            let legacy = json!({"tool":"srv__update", "change":"changed"});
+            save_quarantine(held, &BTreeMap::from([("srv__update".into(), legacy)])).unwrap();
+            assert!(release(held, "srv__update").unwrap());
+            let event = review_events(2000).unwrap().remove(0);
+            assert_eq!(event["blocked"], false, "{held:?}");
+            assert!(event.get("pending_capture").is_none(), "{held:?}");
+            save_pins(held, &Pins::new()).unwrap();
+            std::fs::remove_file(security_path().unwrap()).unwrap();
+        }
+        assert!(same_integrity_store("@default-access:", "@all-enabled:"));
+        assert!(!same_integrity_store("", "@default-access:"));
+    }
+
+    #[test]
     fn a_pending_pin_without_a_quarantine_row_keeps_its_change_held() {
         let _data_dir_lock = crate::registry::data_dir_test_lock();
         let _data = TestDataDir::new("pending-pin-annotation");
@@ -5821,11 +5877,21 @@ mod tests {
             let event = review_events(2000).unwrap().remove(0);
             assert_eq!(event["blocked"], true, "{id:?}");
             assert_eq!(event["review_required"], true, "{id:?}");
+            assert_eq!(event["pending_capture"], true, "{id:?}");
             assert!(tool_change_asks_review(&event, false), "{id:?}");
             let mut raw = read_recent(25).unwrap();
             annotate_review_status(&mut raw, &review_quarantines());
             assert_eq!(raw[0]["review_required"], true, "watcher path {id:?}");
             assert!(off_holds_any_tool());
+            // Once the gateway captures the definition, the event is an ordinary
+            // review bound to that record.
+            let captured = json!({"tool":"srv__update", "change":"changed",
+                "definition_fp":"v2:current", "review_required":true});
+            save_quarantine(scope, &BTreeMap::from([("srv__update".into(), captured)])).unwrap();
+            let event = review_events(2000).unwrap().remove(0);
+            assert_eq!(event["review_required"], true, "{id:?}");
+            assert!(event.get("pending_capture").is_none(), "{id:?}");
+            save_quarantine(scope, &Quarantine::new()).unwrap();
             save_pins(scope, &Pins::new()).unwrap();
             std::fs::remove_file(security_path().unwrap()).unwrap();
         }

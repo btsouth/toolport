@@ -1781,11 +1781,25 @@ fn security_event_covered_by_quarantine(
         Some("pins_load_failed") => quarantined.iter().any(|record| {
             record.get("change").and_then(serde_json::Value::as_str) == Some("tamper")
         }),
+        // The same tool in the same store and, when both carry one, the same
+        // fingerprint. A hold elsewhere must not silence a new finding.
         Some("tool_drift" | "tool_poison_flag") => {
             let tool = event.get("tool").and_then(serde_json::Value::as_str);
+            let store = event["profile"].as_str().unwrap_or("");
             tool.is_some_and(|tool| {
                 quarantined.iter().any(|record| {
+                    let fp = record["pending_pin"]["fp"]
+                        .as_str()
+                        .or_else(|| record["definition_fp"].as_str());
                     record.get("tool").and_then(serde_json::Value::as_str) == Some(tool)
+                        && crate::integrity::same_integrity_store(
+                            store,
+                            record["profile"].as_str().unwrap_or(""),
+                        )
+                        && match (fp, event["new_fp"].as_str()) {
+                            (Some(held), Some(new)) => held == new,
+                            _ => true,
+                        }
                 })
             })
         }
@@ -7186,7 +7200,17 @@ fn tool_change_group_card(
         .tools
         .iter()
         .any(|event| event["review_required"] == true);
-    let status = if review_required {
+    // Nothing to review in Settings until the gateway captures the definition.
+    let capturing = group
+        .tools
+        .iter()
+        .any(|event| event["pending_capture"] == true);
+    let status = if capturing {
+        crate::i18n::tr(
+            "Toolport is capturing this tool's new definition. It stays blocked until then.",
+        )
+        .to_string()
+    } else if review_required {
         crate::i18n::tr("Review the captured definition in Settings before accepting it.")
             .to_string()
     } else if unknown {
@@ -7218,7 +7242,7 @@ fn tool_change_group_card(
     // then any warning.
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     actions.append(&label);
-    if review_required {
+    if review_required && !capturing {
         let review = l10n::button("Review in Settings");
         review.add_css_class("toolport-secondary-action");
         review.set_valign(gtk::Align::Center);
@@ -7467,6 +7491,8 @@ fn security_notice_card(
             page_for_dismiss.dismiss_security(vec![key.clone()]);
         }
     });
+    // A tool still awaiting capture has nothing to review or accept yet.
+    dismiss.set_visible(!(is_change && event["pending_capture"] == true));
     row.append(&dismiss);
     card.set_label_widget(Some(&row));
 
@@ -7565,7 +7591,14 @@ fn security_review_lines(event: &serde_json::Value) -> Vec<String> {
     }
 
     if event_type == "tool_drift" {
-        if event["review_required"] == true {
+        if event["pending_capture"] == true {
+            lines.push(
+                crate::i18n::tr(
+                    "Toolport is capturing this tool's new definition. It stays blocked until then.",
+                )
+                .to_string(),
+            );
+        } else if event["review_required"] == true {
             lines.push(
                 crate::i18n::tr("Review the captured definition in Settings before accepting it.")
                     .to_string(),
@@ -21554,6 +21587,87 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn a_tool_awaiting_capture_waits_without_a_settings_review() {
+        let _data = crate::registry::DataDirTestEnv::new("gtk-pending-capture");
+        adw::init().unwrap();
+        let app = adw::Application::builder().build();
+        let page = ActivityPage::new(&app);
+        let held = serde_json::json!({"type":"tool_drift", "server":"srv", "tool":"srv__update", "ts":100, "change":"changed", "blocked":true, "blocked_profiles":[""], "new_fp":"v3:a", "review_required":true});
+        let card_for = |event: &serde_json::Value| {
+            let group = crate::integrity::group_tool_changes(std::slice::from_ref(event)).remove(0);
+            let card = tool_change_group_card(&group, page.clone(), false);
+            let mut labels = Vec::new();
+            collect_labels(card.upcast_ref(), &mut labels);
+            let text = labels
+                .iter()
+                .map(|label| label.text().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut review = false;
+            let mut stack = vec![card.clone().upcast::<gtk::Widget>()];
+            while let Some(widget) = stack.pop() {
+                let mut child = widget.first_child();
+                while let Some(next) = child {
+                    child = next.next_sibling();
+                    if let Some(button) = next.downcast_ref::<gtk::Button>() {
+                        review |= button.label().as_deref() == Some("Review in Settings")
+                            && button.is_visible();
+                    }
+                    stack.push(next);
+                }
+            }
+            (text, review)
+        };
+        let capturing_line =
+            "Toolport is capturing this tool's new definition. It stays blocked until then.";
+        let mut pending = held.clone();
+        pending["pending_capture"] = serde_json::json!(true);
+        let (text, review) = card_for(&pending);
+        assert!(text.contains(capturing_line), "{text}");
+        assert!(!text.contains("Review the captured definition"), "{text}");
+        assert!(!review, "nothing to review in Settings yet");
+        assert!(security_review_lines(&pending)
+            .iter()
+            .any(|line| line == capturing_line));
+        // Once captured, the normal review card returns.
+        let (text, review) = card_for(&held);
+        assert!(
+            text.contains("Review the captured definition in Settings before accepting it."),
+            "{text}"
+        );
+        assert!(review);
+    }
+
+    #[test]
+    fn a_hold_in_another_store_does_not_silence_a_new_finding() {
+        let _data = crate::registry::DataDirTestEnv::new("gtk-other-store-finding");
+        let held = serde_json::json!({"server":"srv", "tool":"srv__read", "change":"changed",
+            "profile":"@default-access:", "definition_fp":"v3:held", "review_required":true});
+        let finding = |profile: &str, fp: &str| {
+            serde_json::json!({"ts":1000, "type":"tool_poison_flag", "server":"srv",
+                "tool":"srv__read", "severity":"high", "profile":profile, "new_fp":fp})
+        };
+        let alerts = |event: serde_json::Value| {
+            newly_observed_security_events(
+                Some(&std::collections::HashSet::new()),
+                &[event],
+                std::slice::from_ref(&held),
+                false,
+            )
+            .1
+            .len()
+        };
+        // Store B, or the global store, or a new fingerprint in store A: alert.
+        assert_eq!(alerts(finding("work", "v3:new")), 1);
+        assert_eq!(alerts(finding("", "v3:held")), 1);
+        assert_eq!(alerts(finding("@default-access:", "v3:new")), 1);
+        // The same incident in the same store, including its alias: covered.
+        assert_eq!(alerts(finding("@default-access:", "v3:held")), 0);
+        assert_eq!(alerts(finding("@all-enabled:", "v3:held")), 0);
     }
 
     #[test]

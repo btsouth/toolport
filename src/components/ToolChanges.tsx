@@ -141,6 +141,8 @@ export function ToolChanges({
         {groups.map((group) => {
           const blocked = group.tools.filter((tool) => tool.blocked === true).length;
           const reviewRequired = group.tools.some((tool) => tool.review_required);
+          // Nothing to review in Settings until the gateway captures the definition.
+          const capturing = group.tools.some((tool) => tool.pending_capture);
           const unknown = group.tools.some((tool) => tool.blocked == null);
           const server =
             registry?.servers.find(
@@ -191,28 +193,34 @@ export function ToolChanges({
                   <p className={blocked ? "text-destructive" : "text-muted-foreground"}>
                     {/* Unknown wins over blocked: a group with any unknown status
                         cannot be accepted here, so say where to look instead. */}
-                    {reviewRequired
+                    {capturing
                       ? translate(
-                          "Review the captured definition in Settings before accepting it.",
+                          "Toolport is capturing this tool's new definition. It stays blocked until then.",
                         )
-                      : unknown
+                      : reviewRequired
                         ? translate(
-                            "Blocking status unavailable. Review in Settings > Quarantined tools.",
+                            "Review the captured definition in Settings before accepting it.",
                           )
-                        : blocked
+                        : unknown
                           ? translate(
-                              blocked === 1
-                                ? msg(
-                                    "{count} tool is blocked. Review the changes or accept them.",
-                                  )
-                                : msg(
-                                    "{count} tools are blocked. Review the changes or accept them.",
-                                  ),
-                              { count: blocked },
+                              "Blocking status unavailable. Review in Settings > Quarantined tools.",
                             )
-                          : translate("Not blocked. Review the changes or accept them.")}
+                          : blocked
+                            ? translate(
+                                blocked === 1
+                                  ? msg(
+                                      "{count} tool is blocked. Review the changes or accept them.",
+                                    )
+                                  : msg(
+                                      "{count} tools are blocked. Review the changes or accept them.",
+                                    ),
+                                { count: blocked },
+                              )
+                            : translate(
+                                "Not blocked. Review the changes or accept them.",
+                              )}
                   </p>
-                  {reviewRequired && (
+                  {reviewRequired && !capturing && (
                     <button
                       onClick={onReview}
                       className="rounded border border-border px-2 py-1 text-foreground"
@@ -309,7 +317,8 @@ export function ToolChanges({
                             )}
                           </p>
                         )}
-                        {history ? null : event.review_required ? (
+                        {history ||
+                        event.pending_capture ? null : event.review_required ? (
                           <button
                             onClick={onReview}
                             className="mt-1 rounded border border-border px-2 py-1 text-foreground"

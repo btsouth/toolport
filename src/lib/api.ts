@@ -88,6 +88,8 @@ export interface SecurityEvent {
   new_fp?: string;
   /** Captured definition requires review in Settings before bound approval. */
   review_required?: boolean;
+  /** Held by a pending pin whose new definition is not captured yet. */
+  pending_capture?: boolean;
   /** Older unblocked records without a captured fingerprint, shown in history. */
   historical?: boolean;
   parameters?: { added: string[]; removed: string[]; changed: string[] };
