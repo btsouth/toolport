@@ -398,7 +398,12 @@ pub(super) fn client_row(
     controls.add_css_class("toolport-client-controls");
     controls.set_sensitive(!client.config_error && (client.app_present || client.config_exists));
     controls.set_valign(gtk::Align::Center);
-    controls.set_halign(gtk::Align::End);
+    // Fill, not End: the row and the flow put each line at the right edge
+    // themselves, and End would cut the flow back to its natural width, so the
+    // access label could never take the room left on its line.
+    controls.set_halign(gtk::Align::Fill);
+    // A growing access menu must not make the row ask for extra room.
+    controls.set_hexpand(false);
     // The status chip, as on React's rows; an unconnected row's Connect button
     // already says it is not connected.
     if client.gateway_state != state::ClientGatewayState::Disconnected {
@@ -440,9 +445,17 @@ pub(super) fn client_row(
         state::ClientGatewayState::Connected => {
             // The access menu and ⋮ stay side by side on one line.
             let menus = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            menus.append(&client_scope_menu(client.clone(), page.clone()));
+            let scope = client_scope_menu(client.clone(), page.clone());
+            menus.append(&scope);
             menus.append(&connected_client_actions_menu(client.clone(), page.clone()));
             controls.append(&menus);
+            // The controls move at the widths the capped label gives; room left
+            // on their line then goes to the label, so it is whole when it fits.
+            if let Some(label) = scope.child().and_downcast::<gtk::Label>() {
+                label.set_hexpand(true);
+                scope.set_hexpand(true);
+                controls.set_grow(&menus, &label);
+            }
         }
     }
     if shows_remove_location(client)

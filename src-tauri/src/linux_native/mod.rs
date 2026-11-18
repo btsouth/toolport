@@ -4394,12 +4394,13 @@ fn connected_client_actions_menu(client: state::ClientView, page: ClientPage) ->
     menu
 }
 
-/// A client row's access menu label: one line, ending in "…" (the tooltip and
-/// the details page show all of it). It keeps the width it asked for when it
-/// wrapped, its widest line at 24 characters, because the row moves its
-/// controls under the name once they do not fit beside it: any wider and they
-/// move down at wider windows. Wrapping put "Default access (from" /
-/// "Settings)" on two lines.
+/// A client row's access menu label: one line, ending in "…" only when there
+/// is no room for all of it (the tooltip and the details page show all of it).
+/// It asks for the width it had when it wrapped, its widest line at 24
+/// characters, because the row moves its controls under the name once they do
+/// not fit beside it: any wider and they would move down at wider windows.
+/// The row then gives it the room left on its line (`ActionFlow::set_grow`).
+/// Wrapping put "Default access (from" / "Settings)" on two lines.
 fn client_access_menu_label(label: &str) -> gtk::Label {
     gtk::Label::builder()
         .label(label)
@@ -19598,6 +19599,154 @@ mod tests {
             let choice = super::details::checked_list_label();
             assert!(!choice.wraps() && choice.is_single_line_mode());
             assert_eq!(choice.ellipsize(), gtk::pango::EllipsizeMode::None);
+        }
+        crate::i18n::set_language("en").unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn client_access_label_takes_spare_room_in_every_language() {
+        use super::*;
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.AccessRoomFixture")
+            .build();
+        let server_page = ServerPage {
+            details: Default::default(),
+            app: app.clone(),
+            share_requests: Default::default(),
+            server_count: gtk::Label::new(None),
+            section_title: gtk::Label::new(None),
+            posture: gtk::Label::new(None),
+            search: gtk::SearchEntry::new(),
+            feedback: gtk::Label::new(None),
+            list: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            last_snapshot: Default::default(),
+            feedback_timer: Default::default(),
+            health_rows: Default::default(),
+            rows: Default::default(),
+            no_matches: Default::default(),
+            off_heading: Default::default(),
+            health: Default::default(),
+            registry_reload: Default::default(),
+        };
+        let page = ClientPage::new(&app, server_page);
+        let mut client = state::ClientView {
+            detected: None,
+            imported_names: Vec::new(),
+            id: "cursor".into(),
+            name: "Cursor".into(),
+            app_present: true,
+            config_exists: true,
+            uses_connectors: false,
+            server_count: 2,
+            movable_server_count: 0,
+            other_server_count: 2,
+            gateway_state: state::ClientGatewayState::Disconnected,
+            shared_http: false,
+            legacy_bearer_argv: false,
+            scope_id: None,
+            scope_name: None,
+            discovery_mode: None,
+            inherited_discovery: None,
+            config_error: false,
+            location_removable: false,
+            location_kept_by_t3_code: false,
+            claude_profile: None,
+            t3_code: Vec::new(),
+        };
+        client.gateway_state = state::ClientGatewayState::Connected;
+        client.shared_http = true;
+        client.legacy_bearer_argv = true;
+        client.shared_http = false;
+        client.legacy_bearer_argv = false;
+        // A long detail line, which wraps before the controls move, as on a
+        // real Claude profile row.
+        client.claude_profile = Some(crate::clients::ClaudeProfile {
+            command: Some("claude".into()),
+            account: None,
+            folder: "~/.claude-profile-with-a-long-folder-name".into(),
+            last_used_ms: None,
+            same_as: None,
+        });
+        let scratch =
+            std::env::temp_dir().join(format!("toolport-access-room-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&scratch);
+        let label_of = |row: &gtk::Box| {
+            fixture_descendants(row.upcast_ref())
+                .into_iter()
+                .find_map(|w| {
+                    w.downcast::<gtk::MenuButton>()
+                        .ok()
+                        .and_then(|menu| menu.child().and_downcast::<gtk::Label>())
+                })
+                .expect("the access menu label")
+        };
+        let lay_out = |row: &gtk::Box, width: i32| {
+            let height = row.measure(gtk::Orientation::Vertical, width).1;
+            row.size_allocate(&gtk::Allocation::new(0, 0, width, height), -1);
+            height
+        };
+        for language in [
+            "en", "de", "es", "fr", "pt-BR", "ja", "ko", "zh-CN", "zh-TW",
+        ] {
+            crate::i18n::set_language(language).unwrap();
+            let text = crate::i18n::tr("Default access (from Settings)");
+            client.scope_name = Some(text.to_string());
+            for style in [client_rows::RowStyle::Line, client_rows::RowStyle::Profile] {
+                let row = client_rows::client_row(&client, page.clone(), style);
+                let label = label_of(&row);
+                let whole = label.create_pango_layout(Some(&text)).pixel_size().0;
+                let capped = label.measure(gtk::Orientation::Horizontal, -1).1;
+                // The row asks for what it asked before: the label's capped width.
+                let (_, row_nat, _, _) = row.measure(gtk::Orientation::Horizontal, -1);
+                let one_line = row.measure(gtk::Orientation::Vertical, 4000).1;
+                // With room to spare, the label is whole on one line.
+                assert_eq!(lay_out(&row, 4000), one_line);
+                assert!(
+                    label.width() >= whole && !label.layout().is_ellipsized(),
+                    "{language} {style:?}: \"{text}\" got {} of {whole} px",
+                    label.width()
+                );
+                // Where the controls move under the name is decided from the
+                // capped label, as before; find that width.
+                let controls = fixture_descendants(row.upcast_ref())
+                    .into_iter()
+                    .find(|w| w.has_css_class("toolport-client-controls"))
+                    .expect("row controls");
+                let lead = controls.prev_sibling().expect("the name and detail");
+                let under = |width: i32| {
+                    lay_out(&row, width);
+                    // The label never takes room the name and detail need.
+                    let needed = lead.measure(gtk::Orientation::Vertical, lead.width()).0;
+                    assert!(needed <= lead.height(), "{language} {style:?} at {width}");
+                    let top = controls
+                        .compute_bounds(&lead.parent().unwrap())
+                        .unwrap()
+                        .y();
+                    top >= lead.height() as f32
+                };
+                let mut beside = row_nat;
+                while !under(beside - 1) {
+                    beside -= 1;
+                }
+                assert!(!under(beside));
+                assert!(label.width() >= capped.min(whole), "{language} {style:?}");
+                // One pixel narrower, the controls move under the name and the
+                // label has their line, whole when that line has room.
+                assert!(under(beside - 1), "{language} {style:?}");
+                assert!(
+                    label.width() >= whole && !label.layout().is_ellipsized(),
+                    "{language} {style:?}: under the name \"{text}\" got {} of {whole} px",
+                    label.width()
+                );
+                // At the row's narrowest it ends in "…" rather than widening it.
+                let (row_min, _, _, _) = row.measure(gtk::Orientation::Horizontal, -1);
+                assert!(row_min <= 300, "{language} {style:?}: {row_min}");
+                lay_out(&row, row_min);
+                assert!(label.width() < whole, "{language} {style:?}");
+                assert!(label.layout().is_ellipsized(), "{language} {style:?}");
+            }
         }
         crate::i18n::set_language("en").unwrap();
     }
