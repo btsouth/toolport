@@ -4808,19 +4808,23 @@ impl Drop for LockTimeoutOverride {
     }
 }
 
-fn lock_for(path: &Path, timeout: std::time::Duration) -> Result<FileLock, String> {
+fn open_lock_file(path: &Path) -> Result<std::fs::File, String> {
     let lock_error = |error| {
         format!("Could not open the registry lock at {}: {error}. Toolport requires a writable data directory to load safely. Check directory permissions or choose a writable TOOLPORT_DATA_DIR, then try again.", lock_path(path).display())
     };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(lock_error)?;
     }
-    let file = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(lock_path(path))
-        .map_err(lock_error)?;
+        .map_err(lock_error)
+}
+
+fn lock_for(path: &Path, timeout: std::time::Duration) -> Result<FileLock, String> {
+    let file = open_lock_file(path)?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match file.try_lock_exclusive() {
@@ -4886,45 +4890,40 @@ pub fn update_authoritative<T>(
 /// agent toggle (which interleaves audit + early returns), and the integrity pins/quarantine
 /// stores (SOU-165). Hold the returned guard across the entire read-decide-write.
 pub fn lock_at(path: &Path) -> Result<FileLock, String> {
-    if WAITS_FOR_LOCKS.get() {
-        return lock_when_free(path);
+    if TRIES_LOCKS_ONCE.get() {
+        return try_lock_once(path);
     }
     lock_for(path, registry_lock_timeout())
 }
 
 thread_local! {
-    static WAITS_FOR_LOCKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TRIES_LOCKS_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LOCK_BUSY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Make [`lock_at`] on the calling thread wait out contention instead of giving up
-/// at the store deadline. Only the telemetry writer sets this: no request waits on
-/// it, and giving up there drops the batch. A holder rotating a log fsyncs the
-/// rewrite under the lock, and on slow storage (macOS `F_FULLFSYNC` on a loaded
-/// disk) a few of those queued behind each other outlast any fixed deadline. The
-/// kernel releases the lock when its holder exits, so the wait ends unless a holder
-/// is stuck in filesystem IO, which this thread would be stuck in anyway; flush and
-/// shutdown stay bounded and report it.
-pub(crate) fn wait_for_locks_on_this_thread() {
-    WAITS_FOR_LOCKS.set(true);
+/// Make [`lock_at`] on the calling thread try each lock once instead of waiting
+/// up to the store deadline. Only the telemetry writer sets this. A holder that
+/// rotates a log fsyncs the rewrite under the lock, which on slow storage (macOS
+/// `F_FULLFSYNC` on a busy disk) can outlast any fixed deadline. Giving up there
+/// dropped the batch, and waiting there stalled every other log behind it. The
+/// writer instead keeps a busy log's batch for a later pass, checking
+/// [`take_lock_busy`] to tell contention apart from a failed write.
+pub(crate) fn try_locks_once_on_this_thread() {
+    TRIES_LOCKS_ONCE.set(true);
 }
 
-fn lock_when_free(path: &Path) -> Result<FileLock, String> {
-    let lock_error = |error| {
-        format!(
-            "Could not open the lock at {}: {error}",
-            lock_path(path).display()
-        )
-    };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(lock_error)?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(lock_path(path))
-        .map_err(lock_error)?;
-    file.lock_exclusive().map_err(lock_error)?;
+/// Whether the last [`lock_at`] on this thread found its lock held elsewhere,
+/// clearing the flag. Meaningful only after [`try_locks_once_on_this_thread`].
+pub(crate) fn take_lock_busy() -> bool {
+    LOCK_BUSY.replace(false)
+}
+
+fn try_lock_once(path: &Path) -> Result<FileLock, String> {
+    let file = open_lock_file(path)?;
+    file.try_lock_exclusive().map_err(|error| {
+        LOCK_BUSY.set(true);
+        format!("The lock at {} is busy: {error}", lock_path(path).display())
+    })?;
     Ok(FileLock(file))
 }
 

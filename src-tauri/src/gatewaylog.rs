@@ -103,9 +103,9 @@ pub(crate) fn append_to(path: &Path, msg: &str) {
 /// be lost to the scrub's replace, or carry a secret the scrub learned after
 /// this line was formatted, so it is never a fallback. This runs only on the
 /// telemetry writer thread, which no connection waits on ([`append`] only
-/// queues, and the startup path that once waited here (SBS-1019) queues too), so
-/// it waits for the lock to be free rather than dropping the batch at a deadline
-/// ([`crate::registry::wait_for_locks_on_this_thread`]).
+/// queues, and the startup path that once waited here (SBS-1019) queues too).
+/// There the lock is tried once; a busy log keeps its batch for a later pass
+/// while other logs drain ([`crate::registry::try_locks_once_on_this_thread`]).
 pub(crate) fn append_batch_to(
     path: &Path,
     lines: &[String],

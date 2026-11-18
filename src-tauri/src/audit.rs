@@ -1856,6 +1856,11 @@ mod tests {
                     .env("TOOLPORT_AUDIT_STRESS_PATH", &path)
                     .env("TOOLPORT_AUDIT_STRESS_READY", ready)
                     .env("TOOLPORT_AUDIT_STRESS_GO", &go)
+                    // The writer must wait out a sibling's rotation however long
+                    // its fsync takes, never fall back to the store deadline and
+                    // drop the batch. A tiny deadline makes any fallback show here
+                    // instead of only on a slow disk.
+                    .env("TOOLPORT_LOCK_TIMEOUT_MS", "1")
                     .stdout(std::process::Stdio::null())
                     .stderr(stderr)
                     .spawn()
