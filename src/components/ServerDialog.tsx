@@ -178,6 +178,22 @@ export function ServerDialog({
   // A failed save or a refused paste, shown in the footer above the buttons
   // as GTK's editor does, so no toast covers them.
   const [footerError, setFooterError] = useState("");
+  // Whether the dialog is on screen, read when a save or paste settles: one
+  // that closed meanwhile has no footer to show its failure, so a toast says it.
+  const shown = useRef(open);
+  useEffect(() => {
+    shown.current = open;
+    return () => {
+      shown.current = false;
+    };
+  }, [open]);
+  // Counts each opening and closing, so a save or paste that settles knows
+  // whether the dialog on screen is still the one it started in.
+  const session = useRef(0);
+  function showFailure(message: string, started: number) {
+    if (shown.current && session.current === started) setFooterError(message);
+    else toastError(message);
+  }
   const testRequestId = useRef(0);
   const formRef = useRef(form);
   useEffect(() => {
@@ -211,6 +227,10 @@ export function ServerDialog({
   // button), so reset the form each time it opens - otherwise it keeps the last
   // entry's values instead of starting blank (or re-deriving from `initial`).
   function onOpenChange(next: boolean) {
+    shown.current = next;
+    session.current += 1;
+    // A paste still parsing belongs to the dialog as it was; its result is dropped.
+    setParsing(false);
     if (!next) setTest(IDLE_TEST);
     setFooterError("");
     if (!next && onClose) {
@@ -287,8 +307,10 @@ export function ServerDialog({
     if (!pasteText.trim()) return;
     setFooterError("");
     setParsing(true);
+    const started = session.current;
     try {
       const servers = await parseServerSnippet(pasteText);
+      if (session.current !== started) return;
       if (servers.length === 0) {
         setFooterError(t("No servers found in the pasted config."));
         return;
@@ -328,6 +350,7 @@ export function ServerDialog({
     } catch (e) {
       // The backend message is already in the user's language and never holds
       // pasted text; GTK shows the same sentence in the same place.
+      if (session.current !== started) return;
       setFooterError(String(e));
       // The form stays as it was before this paste, and the refusal is its only
       // message: an empty field it left the user in shows no error yet.
@@ -336,7 +359,7 @@ export function ServerDialog({
       const quiet = emptyFieldErrorIds(formRef.current);
       setTouched((previous) => new Set([...previous].filter((id) => !quiet.has(id))));
     } finally {
-      setParsing(false);
+      if (session.current === started) setParsing(false);
     }
   }
 
@@ -505,6 +528,7 @@ export function ServerDialog({
       return;
     }
     const entry = buildEntry(false);
+    const started = session.current;
     const declared = envRows.filter((r) => r.key.trim());
     setFooterError("");
     setBusy(true);
@@ -545,8 +569,9 @@ export function ServerDialog({
       toast.success(translate("Saved {name}", { name: entry.name }));
       onOpenChange(false);
     } catch (e) {
-      setFooterError(
+      showFailure(
         t("Couldn't save {value1}: {value2}", { value1: entry.name, value2: String(e) }),
+        started,
       );
     } finally {
       setBusy(false);
@@ -557,6 +582,7 @@ export function ServerDialog({
   // at all: on an error the dialog stays open with what was typed.
   async function handleAdd() {
     const entry = buildEntry(true);
+    const started = session.current;
     setFooterError("");
     setBusy(true);
     try {
@@ -573,8 +599,9 @@ export function ServerDialog({
       );
       onOpenChange(false);
     } catch (e) {
-      setFooterError(
+      showFailure(
         t("Couldn't save {value1}: {value2}", { value1: entry.name, value2: String(e) }),
+        started,
       );
     } finally {
       setBusy(false);
