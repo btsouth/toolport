@@ -316,13 +316,8 @@ fn activity_metadata(dir: &std::path::Path) -> Result<(String, Vec<std::path::Pa
     }
     // A Safety change can keep the registry's length ("ask" to "off") and land in
     // one timestamp tick, and a registry outside the data directory has no
-    // directory watch. The file is small, so hash its content: any rewrite counts.
-    if let Some(registry) = crate::registry::resolved_path() {
-        match std::fs::read(&registry) {
-            Ok(bytes) => bytes.hash(&mut hash),
-            Err(error) => error.kind().hash(&mut hash),
-        }
-    }
+    // directory watch. Hash its content (capped, never blocking): any rewrite counts.
+    crate::registry::registry_content_stamp().hash(&mut hash);
     Ok((format!("{:x}", hash.finish()), paths))
 }
 

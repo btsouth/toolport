@@ -4846,6 +4846,9 @@ pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
 struct ReviewStamp {
     dir: PathBuf,
     files: BTreeMap<PathBuf, ReviewFileStamp>,
+    /// `registry::registry_content_stamp`: a same-length Safety change within one
+    /// timestamp tick still refreshes blocked annotations.
+    registry: u64,
 }
 
 #[derive(Clone, PartialEq)]
@@ -4904,7 +4907,16 @@ fn quarantine_summary_stamp() -> Option<ReviewStamp> {
             Err(_) => return None,
         }
     }
-    Some(ReviewStamp { dir, files })
+    Some(ReviewStamp {
+        dir,
+        files,
+        registry: 0,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static REVIEW_SAME_TICK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn review_file_stamp(path: &Path, metadata: &std::fs::Metadata) -> Option<ReviewFileStamp> {
@@ -4931,15 +4943,24 @@ fn review_file_stamp(path: &Path, metadata: &std::fs::Metadata) -> Option<Review
     };
     #[cfg(not(windows))]
     let _ = path;
+    // Tests can stand in for a filesystem whose timestamps did not tick.
+    #[cfg(test)]
+    let times = !REVIEW_SAME_TICK.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let times = true;
     Some(ReviewFileStamp {
-        modified: metadata.modified().ok()?,
+        modified: if times {
+            metadata.modified().ok()?
+        } else {
+            SystemTime::UNIX_EPOCH
+        },
         len: metadata.len(),
         #[cfg(unix)]
         identity: (
             metadata.dev(),
             metadata.ino(),
-            metadata.ctime(),
-            metadata.ctime_nsec(),
+            if times { metadata.ctime() } else { 0 },
+            if times { metadata.ctime_nsec() } else { 0 },
         ),
         #[cfg(windows)]
         identity,
@@ -4973,7 +4994,11 @@ fn review_stamp() -> Option<ReviewStamp> {
             files.insert(target.clone(), review_file_stamp(&target, &metadata)?);
         }
     }
-    Some(ReviewStamp { dir, files })
+    Some(ReviewStamp {
+        dir,
+        files,
+        registry: crate::registry::registry_content_stamp(),
+    })
 }
 
 /// Attach current blocking state to retained findings. A damaged quarantine store is
@@ -5913,6 +5938,37 @@ mod tests {
             "a symlinked registry's edit refreshes Activity"
         );
         let _ = std::fs::remove_file(&target);
+    }
+
+    #[test]
+    fn review_cache_sees_a_same_length_safety_change_within_one_tick() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let data = TestDataDir::new("same-tick-registry");
+        let registry = data.path.join("registry.json");
+        std::fs::write(&registry, r#"{"safetyLevel":"ask"}"#).unwrap();
+        let reads = std::cell::Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Ok(vec![])
+        };
+        REVIEW_SAME_TICK.with(|same| same.set(true));
+        review_events_cached(2000, read).unwrap();
+        review_events_cached(2000, read).unwrap();
+        let unchanged = reads.get();
+        // Same length, same inode, and no timestamp tick: only content differs.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&registry)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, br#"{"safetyLevel":"off"}"#))
+            .unwrap();
+        review_events_cached(2000, read).unwrap();
+        let after = reads.get();
+        REVIEW_SAME_TICK.with(|same| same.set(false));
+        assert_eq!(unchanged, 1, "an unchanged registry reuses the cache");
+        assert_eq!(
+            after, 2,
+            "an Ask to Off rewrite refreshes blocked annotations"
+        );
     }
 
     #[test]

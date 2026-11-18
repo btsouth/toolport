@@ -4932,6 +4932,84 @@ pub fn tool_change_reviews_state() -> (bool, bool) {
     }
 }
 
+/// Largest registry read whole for change detection; a bigger file contributes
+/// its length plus its first and last chunks.
+const REGISTRY_STAMP_CAP: u64 = 4 * 1024 * 1024;
+const REGISTRY_STAMP_CHUNK: usize = 64 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes [`registry_content_stamp`] read on this thread, for the size cap test.
+    pub(crate) static REGISTRY_STAMP_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A digest of the resolved registry's content for Activity change detection.
+/// A Safety change can keep the file's length and land in one timestamp tick, so
+/// metadata alone can miss it. Never blocks (non-blocking open, regular files only)
+/// and never reads more than the cap. A missing registry is stable; anything that
+/// cannot be read safely returns a fresh value, so caches re-read instead of
+/// trusting stale state.
+pub fn registry_content_stamp() -> u64 {
+    use std::hash::{Hash, Hasher};
+    use std::io::{Read, Seek, SeekFrom};
+    static CHANGED: AtomicU64 = AtomicU64::new(0);
+    let changed = || {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        ("unreadable", CHANGED.fetch_add(1, Ordering::Relaxed)).hash(&mut hash);
+        hash.finish()
+    };
+    let Some(path) = resolved_path() else {
+        return 0;
+    };
+    let mut options = std::fs::File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A FIFO or device at the registry path must not block Activity.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = match options.open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(_) => return changed(),
+    };
+    // Check the opened handle, not the path, so a swap cannot slip in a FIFO.
+    let Ok(metadata) = file.metadata() else {
+        return changed();
+    };
+    if !metadata.is_file() {
+        return changed();
+    }
+    let len = metadata.len();
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    len.hash(&mut hash);
+    let capped = len > REGISTRY_STAMP_CAP;
+    if capped {
+        metadata.modified().ok().hash(&mut hash);
+    }
+    let mut read = |file: &mut std::fs::File, limit: u64| -> std::io::Result<()> {
+        let mut bytes = Vec::new();
+        file.take(limit).read_to_end(&mut bytes)?;
+        #[cfg(test)]
+        REGISTRY_STAMP_READ.with(|read| read.set(read.get() + bytes.len() as u64));
+        bytes.hash(&mut hash);
+        Ok(())
+    };
+    let chunk = REGISTRY_STAMP_CHUNK as u64;
+    let result = if !capped {
+        read(&mut file, REGISTRY_STAMP_CAP)
+    } else {
+        read(&mut file, chunk)
+            .and_then(|()| file.seek(SeekFrom::End(-(chunk as i64))).map(|_| ()))
+            .and_then(|()| read(&mut file, chunk))
+    };
+    match result {
+        Ok(()) => hash.finish(),
+        Err(_) => changed(),
+    }
+}
+
 /// The path the registry actually resolves to, honoring `TOOLPORT_REGISTRY`
 /// (legacy: `CONDUIT_REGISTRY`).
 pub fn resolved_path() -> Option<PathBuf> {
@@ -7925,6 +8003,48 @@ pub(crate) mod tests {
             std::fs::read_to_string(backup_path(&path)).unwrap(),
             good_bytes
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_content_stamp_never_blocks_and_caps_its_read() {
+        let _data = data_dir_test_lock();
+        let (dir, _override) = scratch_data_dir("reg-content-stamp");
+        let path = dir.join("registry.json");
+        assert_eq!(resolved_path().as_deref(), Some(path.as_path()));
+        // Missing is stable; content changes of the same length count.
+        assert_eq!(registry_content_stamp(), registry_content_stamp());
+        std::fs::write(&path, r#"{"safetyLevel":"ask"}"#).unwrap();
+        let ask = registry_content_stamp();
+        assert_eq!(registry_content_stamp(), ask);
+        std::fs::write(&path, r#"{"safetyLevel":"off"}"#).unwrap();
+        assert_ne!(registry_content_stamp(), ask);
+        // A FIFO at the registry path returns at once, as "changed" each time.
+        std::fs::remove_file(&path).unwrap();
+        let fifo = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (done, finished) = std::sync::mpsc::channel();
+        // The override is process-global, so the worker sees the scratch dir.
+        std::thread::spawn(move || {
+            let _ = done.send((registry_content_stamp(), registry_content_stamp()));
+        });
+        let (first, second) = finished
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a FIFO registry must not block the stamp");
+        assert_ne!(first, second);
+        std::fs::remove_file(&path).unwrap();
+        // An oversized file reads only its first and last chunks.
+        let big = std::fs::File::create(&path).unwrap();
+        big.set_len(REGISTRY_STAMP_CAP + 1024 * 1024).unwrap();
+        drop(big);
+        REGISTRY_STAMP_READ.with(|read| read.set(0));
+        let stamp = registry_content_stamp();
+        assert_eq!(
+            REGISTRY_STAMP_READ.with(std::cell::Cell::get),
+            2 * REGISTRY_STAMP_CHUNK as u64
+        );
+        assert_eq!(registry_content_stamp(), stamp);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
