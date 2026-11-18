@@ -1187,8 +1187,8 @@ describe("ActivityView security drift dismissals", () => {
       expect(screen.getByText(/Settings > Quarantined tools/)).toBeInTheDocument();
       const card = within(row.parentElement!);
       expect(
-        card.getByRole("button", { name: "Accept all for this server" }),
-      ).toBeDisabled();
+        card.queryByRole("button", { name: "Accept all for this server" }),
+      ).not.toBeInTheDocument();
       fireEvent.click(row);
       const accept = card.getByRole("button", { name: "Accept this tool" });
       expect(accept).toBeDisabled();

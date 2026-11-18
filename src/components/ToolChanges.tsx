@@ -189,24 +189,26 @@ export function ToolChanges({
               {!history && (
                 <div className="mt-2 flex flex-wrap items-center gap-2 text-meta">
                   <p className={blocked ? "text-destructive" : "text-muted-foreground"}>
+                    {/* Unknown wins over blocked: a group with any unknown status
+                        cannot be accepted here, so say where to look instead. */}
                     {reviewRequired
                       ? translate(
                           "Review the captured definition in Settings before accepting it.",
                         )
-                      : blocked
+                      : unknown
                         ? translate(
-                            blocked === 1
-                              ? msg(
-                                  "{count} tool is blocked. Review the changes or accept them.",
-                                )
-                              : msg(
-                                  "{count} tools are blocked. Review the changes or accept them.",
-                                ),
-                            { count: blocked },
+                            "Blocking status unavailable. Review in Settings > Quarantined tools.",
                           )
-                        : unknown
+                        : blocked
                           ? translate(
-                              "Blocking status unavailable. Review in Settings > Quarantined tools.",
+                              blocked === 1
+                                ? msg(
+                                    "{count} tool is blocked. Review the changes or accept them.",
+                                  )
+                                : msg(
+                                    "{count} tools are blocked. Review the changes or accept them.",
+                                  ),
+                              { count: blocked },
                             )
                           : translate("Not blocked. Review the changes or accept them.")}
                   </p>
@@ -218,13 +220,17 @@ export function ToolChanges({
                       {translate("Review in Settings")}
                     </button>
                   )}
-                  <button
-                    disabled={busy || !canAccept}
-                    onClick={() => void accept(group.tools)}
-                    className="ml-auto rounded border border-border px-2 py-1 text-foreground disabled:opacity-50"
-                  >
-                    {translate("Accept all for this server")}
-                  </button>
+                  {/* Shown only when it can be used; the sentence beside it or the
+                      suspicious-content line says what to do otherwise. */}
+                  {canAccept && (
+                    <button
+                      disabled={busy}
+                      onClick={() => void accept(group.tools)}
+                      className="ml-auto rounded border border-border px-2 py-1 text-foreground disabled:opacity-50"
+                    >
+                      {translate("Accept all for this server")}
+                    </button>
+                  )}
                 </div>
               )}
               {!history && group.tools.some((tool) => tool.signatures !== undefined) && (

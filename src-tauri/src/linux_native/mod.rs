@@ -7186,6 +7186,10 @@ fn tool_change_group_card(
     let status = if review_required {
         crate::i18n::tr("Review the captured definition in Settings before accepting it.")
             .to_string()
+    } else if unknown {
+        // Unknown wins over blocked: the group cannot be accepted here.
+        crate::i18n::tr("Blocking status unavailable. Review in Settings > Quarantined tools.")
+            .to_string()
     } else if blocked > 0 {
         crate::i18n::trf(
             if blocked == 1 {
@@ -7195,9 +7199,6 @@ fn tool_change_group_card(
             },
             &[("value0", &format!("{}", blocked))],
         )
-    } else if unknown {
-        crate::i18n::tr("Blocking status unavailable. Review in Settings > Quarantined tools.")
-            .to_string()
     } else {
         crate::i18n::tr("Not blocked. Review the changes or accept them.").to_string()
     };
@@ -7221,18 +7222,21 @@ fn tool_change_group_card(
         review.set_action_name(Some("app.review-quarantine"));
         actions.append(&review);
     }
-    let accept = l10n::button("Accept all for this server");
-    accept.add_css_class("toolport-secondary-action");
-    accept.set_hexpand(true);
-    accept.set_halign(gtk::Align::End);
-    accept.set_valign(gtk::Align::Center);
-    accept.set_sensitive(group_can_be_accepted(group));
-    let events = group.tools.clone();
-    accept.connect_clicked(move |button| {
-        button.set_sensitive(false);
-        page.accept_security(events.clone());
-    });
-    actions.append(&accept);
+    // Shown only when it can be used; the sentence beside it or the
+    // suspicious-content line says what to do otherwise.
+    if group_can_be_accepted(group) {
+        let accept = l10n::button("Accept all for this server");
+        accept.add_css_class("toolport-secondary-action");
+        accept.set_hexpand(true);
+        accept.set_halign(gtk::Align::End);
+        accept.set_valign(gtk::Align::Center);
+        let events = group.tools.clone();
+        accept.connect_clicked(move |button| {
+            button.set_sensitive(false);
+            page.accept_security(events.clone());
+        });
+        actions.append(&accept);
+    }
     card.append(&actions);
     if group
         .tools
@@ -21460,9 +21464,11 @@ mod tests {
         let mut found = false;
         for widget in all {
             if let Ok(button) = widget.downcast::<gtk::Button>() {
-                if button.label().as_deref() == Some("Accept all for this server") {
-                    assert!(!button.is_sensitive());
-                }
+                // Never usable while a review is pending, so never shown.
+                assert_ne!(
+                    button.label().as_deref(),
+                    Some("Accept all for this server")
+                );
                 if button.label().as_deref() == Some("Review in Settings") {
                     button.emit_clicked();
                     found = true;
@@ -21475,6 +21481,72 @@ mod tests {
         page.accept_security(vec![event]);
         assert_eq!(reviewed.get(), 2);
         window.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn accept_all_shows_only_when_it_can_be_used() {
+        let _data = crate::registry::DataDirTestEnv::new("gtk-accept-all-usable");
+        adw::init().unwrap();
+        let app = adw::Application::builder().build();
+        let page = ActivityPage::new(&app);
+        let base = serde_json::json!({"type":"tool_drift", "server":"srv", "tool":"srv__update", "ts":100, "change":"changed", "blocked":true, "blocked_profiles":["work"], "new_fp":"v3:a"});
+        let card_for = |events: Vec<serde_json::Value>| {
+            let group = crate::integrity::group_tool_changes(&events).remove(0);
+            let card = tool_change_group_card(&group, page.clone(), false);
+            let mut labels = Vec::new();
+            collect_labels(card.upcast_ref(), &mut labels);
+            let text = labels
+                .iter()
+                .map(|label| label.text().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut accept = None;
+            let mut stack = vec![card.clone().upcast::<gtk::Widget>()];
+            while let Some(widget) = stack.pop() {
+                let mut child = widget.first_child();
+                while let Some(next) = child {
+                    child = next.next_sibling();
+                    if let Some(button) = next.downcast_ref::<gtk::Button>() {
+                        if button.label().as_deref() == Some("Accept all for this server") {
+                            accept = Some(button.is_sensitive());
+                        }
+                    }
+                    stack.push(next);
+                }
+            }
+            (text, accept)
+        };
+        // Usable: shown and enabled.
+        let (_, accept) = card_for(vec![base.clone()]);
+        assert_eq!(accept, Some(true));
+        // Suspicious: hidden, and the line says to accept each tool.
+        let mut suspicious = base.clone();
+        suspicious["signatures"] = serde_json::json!(["instruction_override"]);
+        let (text, accept) = card_for(vec![suspicious]);
+        assert_eq!(accept, None);
+        assert!(
+            text.contains("Review and accept each tool separately."),
+            "{text}"
+        );
+        // Unknown status, alone or beside a blocked tool: hidden, and it says where to look.
+        let mut unknown = base.clone();
+        unknown["tool"] = serde_json::json!("srv__other");
+        unknown["blocked"] = serde_json::Value::Null;
+        for events in [vec![unknown.clone()], vec![base.clone(), unknown]] {
+            let (text, accept) = card_for(events);
+            assert_eq!(accept, None);
+            assert!(
+                text.contains(
+                    "Blocking status unavailable. Review in Settings > Quarantined tools."
+                ),
+                "{text}"
+            );
+            assert!(
+                !text.contains("Review the changes or accept them"),
+                "{text}"
+            );
+        }
     }
 
     #[test]
