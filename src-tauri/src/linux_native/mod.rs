@@ -20690,17 +20690,21 @@ mod tests {
             .application_id("com.tsout.ActivityRowsTest")
             .build();
         let page = ActivityPage::new(&app);
-        let text_of = |widget: &gtk::Box| {
+        // A card's title is its first label: compared whole, as the titles were
+        // before the cards replaced them.
+        let texts_of = |widget: &gtk::Box| {
             let mut labels = Vec::new();
             collect_labels(widget.upcast_ref(), &mut labels);
             labels
                 .iter()
                 .map(|label| label.text().to_string())
                 .collect::<Vec<_>>()
-                .join("\n")
         };
-        assert!(text_of(&page.security_list).contains("Checking protection status…"));
-        assert!(!text_of(&page.security_list).contains("Protection active."));
+        let title_of = |widget: &gtk::Box| texts_of(widget).first().cloned().unwrap_or_default();
+        assert_eq!(title_of(&page.security_list), "Checking protection status…");
+        assert!(!texts_of(&page.security_list)
+            .iter()
+            .any(|text| text == "Protection active."));
         std::fs::write(
             data.dir.join("audit.jsonl"),
             "{\"ts\":1,\"tool\":\"server__first\",\"server\":\"server\",\"ok\":true}\n",
@@ -20759,10 +20763,13 @@ mod tests {
         assert!(page.recent_rows.borrow().is_empty());
         assert!(page.stat_rows.borrow().is_empty());
         assert!(page.list.first_child().is_none());
-        assert!(text_of(&page.security_list).contains("Checking protection status…"));
+        assert_eq!(title_of(&page.security_list), "Checking protection status…");
         page.show_error("unreadable");
-        assert!(text_of(&page.security_list).contains("Couldn't verify protection status."));
-        assert!(text_of(&page.audit_state).contains("Couldn't load activity"));
+        assert_eq!(
+            title_of(&page.security_list),
+            "Couldn't verify protection status."
+        );
+        assert_eq!(title_of(&page.audit_state), "Couldn't load activity");
     }
 
     #[test]
