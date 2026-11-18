@@ -7933,9 +7933,11 @@ pub(crate) mod tests {
         reg.set_safety_level(SafetyLevel::Ask);
         save_to(&path, &reg).unwrap();
         assert!(tool_change_reviews_now());
-        // The backup now holds the earlier Off. An unreadable Ask primary must
-        // not let that backup turn reviews off.
-        std::fs::write(&path, "{ not json").unwrap();
+        // The backup now holds the earlier Off. An unreadable Ask primary (here a
+        // directory, so the read fails without root bypassing it) must not let
+        // that backup turn reviews off.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
         let (backup, source) = load_resolved_with_source().unwrap();
         assert_eq!(source, LoadSource::Backup);
         assert!(!backup.tool_change_reviews_enabled());
