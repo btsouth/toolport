@@ -196,7 +196,7 @@
             "new_fp": "v3:add_comment"
           },
           {
-            "ts": 1789222400000,
+            "ts": 1789218800000,
             "type": "tool_drift",
             "server": "atlassian",
             "tool": "atlassian__old_0",
@@ -204,7 +204,7 @@
             "severity": "info"
           },
           {
-            "ts": 1789222400001,
+            "ts": 1789218800001,
             "type": "tool_drift",
             "server": "atlassian",
             "tool": "atlassian__old_1",
@@ -212,7 +212,7 @@
             "severity": "info"
           },
           {
-            "ts": 1789222400002,
+            "ts": 1789218800002,
             "type": "tool_drift",
             "server": "atlassian",
             "tool": "atlassian__old_2",
@@ -220,7 +220,7 @@
             "severity": "info"
           },
           {
-            "ts": 1789222400003,
+            "ts": 1789218800003,
             "type": "tool_drift",
             "server": "atlassian",
             "tool": "atlassian__old_3",
@@ -228,7 +228,7 @@
             "severity": "info"
           },
           {
-            "ts": 1789222400004,
+            "ts": 1789218800004,
             "type": "tool_drift",
             "server": "atlassian",
             "tool": "atlassian__old_4",

@@ -7094,7 +7094,7 @@ fn tool_change_group_card(
     history: bool,
 ) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    card.add_css_class("toolport-card");
+    card.add_css_class("toolport-tool-change-group");
     let name = group
         .tools
         .first()
@@ -7202,26 +7202,34 @@ fn tool_change_group_card(
         crate::i18n::tr("Not blocked. Review the changes or accept them.").to_string()
     };
     let label = empty_activity_label(&status);
+    label.add_css_class("toolport-tool-change-status");
+    label.set_hexpand(false);
     if blocked > 0 {
+        card.add_css_class("blocked");
         label.add_css_class("error");
     }
-    card.append(&label);
-    // React's order: Review in Settings, then Accept all, then any warning.
+    // React's row: status, Review in Settings beside it, Accept all at the end,
+    // then any warning.
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.append(&label);
     if review_required {
         let review = l10n::button("Review in Settings");
-        review.set_halign(gtk::Align::Start);
+        review.set_valign(gtk::Align::Center);
         review.set_action_name(Some("app.review-quarantine"));
-        card.append(&review);
+        actions.append(&review);
     }
     let accept = l10n::button("Accept all for this server");
-    accept.set_halign(gtk::Align::Start);
+    accept.set_hexpand(true);
+    accept.set_halign(gtk::Align::End);
+    accept.set_valign(gtk::Align::Center);
     accept.set_sensitive(group_can_be_accepted(group));
     let events = group.tools.clone();
     accept.connect_clicked(move |button| {
         button.set_sensitive(false);
         page.accept_security(events.clone());
     });
-    card.append(&accept);
+    actions.append(&accept);
+    card.append(&actions);
     if group
         .tools
         .iter()
@@ -21434,10 +21442,19 @@ mod tests {
             .application(&app)
             .content(&card)
             .build();
-        let mut child = card.first_child();
+        // The buttons sit in the card's action row, as React's do.
+        fn descendants(widget: &gtk::Widget, found: &mut Vec<gtk::Widget>) {
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                found.push(widget.clone());
+                descendants(&widget, found);
+            }
+        }
+        let mut all = Vec::new();
+        descendants(card.upcast_ref(), &mut all);
         let mut found = false;
-        while let Some(widget) = child {
-            child = widget.next_sibling();
+        for widget in all {
             if let Ok(button) = widget.downcast::<gtk::Button>() {
                 if button.label().as_deref() == Some("Accept all for this server") {
                     assert!(!button.is_sensitive());
