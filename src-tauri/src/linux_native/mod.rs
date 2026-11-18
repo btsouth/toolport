@@ -7114,7 +7114,7 @@ fn tool_change_group_card(
             .xalign(0.0)
             .hexpand(true)
             .wrap(true)
-            .css_classes(["heading"])
+            .css_classes(["toolport-tool-change-title"])
             .build(),
     );
     // The time sits at the end of the row, as React draws it.
@@ -7204,6 +7204,8 @@ fn tool_change_group_card(
     let label = empty_activity_label(&status);
     label.add_css_class("toolport-tool-change-status");
     label.set_hexpand(false);
+    // Keep the line whole beside the buttons; it still wraps on a narrow window.
+    label.set_max_width_chars(100);
     if blocked > 0 {
         card.add_css_class("blocked");
         label.add_css_class("error");
@@ -7214,11 +7216,13 @@ fn tool_change_group_card(
     actions.append(&label);
     if review_required {
         let review = l10n::button("Review in Settings");
+        review.add_css_class("toolport-secondary-action");
         review.set_valign(gtk::Align::Center);
         review.set_action_name(Some("app.review-quarantine"));
         actions.append(&review);
     }
     let accept = l10n::button("Accept all for this server");
+    accept.add_css_class("toolport-secondary-action");
     accept.set_hexpand(true);
     accept.set_halign(gtk::Align::End);
     accept.set_valign(gtk::Align::Center);

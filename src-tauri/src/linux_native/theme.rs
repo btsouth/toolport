@@ -1442,6 +1442,8 @@ button.toolport-catalog-action {{
 .toolport-tool-change-group {{ border: 1px solid @toolport_border; border-radius: 8px; padding: 12px; }}
 .toolport-tool-change-group.blocked {{ border-color: alpha(@toolport_error, 0.4); background-color: alpha(@toolport_error, 0.05); }}
 .toolport-tool-change-group label.toolport-tool-change-status.error {{ color: @toolport_error; }}
+.toolport-tool-change-group button.toolport-secondary-action {{ background-color: @toolport_raised; border: 1px solid @toolport_border; }}
+.toolport-tool-change-title {{ font-weight: 400; }}
 .toolport-card.toolport-activity-panel {{ background-color: @toolport_card; border: 1px solid @toolport_border; border-radius: 12px; padding: 12px 16px; }}
 .toolport-card.toolport-activity-panel:hover {{ background-color: @toolport_card; }}
 .toolport-status-card .toolport-status-tile {{ border-radius: 8px; }}
