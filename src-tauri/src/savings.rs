@@ -468,11 +468,12 @@ fn append_line_at(
     .map_err(|error| error.message)
 }
 
-/// Append a batch of already-serialized JSONL `lines` under ONE acquisition of the
-/// path's cross-process lock, then apply the savings cap. Used by the background
-/// telemetry writer ([`crate::telemetry`]) so neither the lock nor a fold-rotation
-/// runs on the request thread.
-pub(crate) fn append_lines_at(
+/// Prepare and append a batch of JSONL `lines` under ONE acquisition of the
+/// path's cross-process lock, then apply the savings cap. The background writer
+/// ([`crate::telemetry`]) prepares rows itself and calls
+/// [`append_prepared_lines_at`].
+#[cfg(test)]
+fn append_lines_at(
     path: &Path,
     lines: &[String],
     max_bytes: u64,

@@ -4920,12 +4920,12 @@ pub(crate) fn take_lock_busy() -> bool {
 
 fn try_lock_once(path: &Path) -> Result<FileLock, String> {
     let file = open_lock_file(path)?;
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     let result = match injected_lock_error(path) {
         Some(error) => Err(error),
         None => file.try_lock_exclusive(),
     };
-    #[cfg(not(any(test, feature = "test-support")))]
+    #[cfg(not(test))]
     let result = file.try_lock_exclusive();
     result.map_err(|error| {
         // Only contention is worth a retry. Any other failure (ENOLCK on a
@@ -4942,11 +4942,11 @@ fn try_lock_once(path: &Path) -> Result<FileLock, String> {
 }
 
 /// Lock paths whose next try-once attempts fail with the given OS error.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 static INJECTED_LOCK_ERRORS: std::sync::Mutex<Vec<(PathBuf, i32)>> =
     std::sync::Mutex::new(Vec::new());
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) fn inject_lock_error_for_test(path: &Path, raw_os_error: i32) {
     INJECTED_LOCK_ERRORS
         .lock()
@@ -4954,7 +4954,7 @@ pub(crate) fn inject_lock_error_for_test(path: &Path, raw_os_error: i32) {
         .push((path.to_path_buf(), raw_os_error));
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 fn injected_lock_error(path: &Path) -> Option<std::io::Error> {
     INJECTED_LOCK_ERRORS
         .lock()
