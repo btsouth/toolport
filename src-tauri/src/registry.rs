@@ -4808,19 +4808,23 @@ impl Drop for LockTimeoutOverride {
     }
 }
 
-fn lock_for(path: &Path, timeout: std::time::Duration) -> Result<FileLock, String> {
+fn open_lock_file(path: &Path) -> Result<std::fs::File, String> {
     let lock_error = |error| {
         format!("Could not open the registry lock at {}: {error}. Toolport requires a writable data directory to load safely. Check directory permissions or choose a writable TOOLPORT_DATA_DIR, then try again.", lock_path(path).display())
     };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(lock_error)?;
     }
-    let file = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(lock_path(path))
-        .map_err(lock_error)?;
+        .map_err(lock_error)
+}
+
+fn lock_for(path: &Path, timeout: std::time::Duration) -> Result<FileLock, String> {
+    let file = open_lock_file(path)?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match file.try_lock_exclusive() {
@@ -4886,7 +4890,78 @@ pub fn update_authoritative<T>(
 /// agent toggle (which interleaves audit + early returns), and the integrity pins/quarantine
 /// stores (SOU-165). Hold the returned guard across the entire read-decide-write.
 pub fn lock_at(path: &Path) -> Result<FileLock, String> {
+    if TRIES_LOCKS_ONCE.get() {
+        return try_lock_once(path);
+    }
     lock_for(path, registry_lock_timeout())
+}
+
+thread_local! {
+    static TRIES_LOCKS_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LOCK_BUSY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Make [`lock_at`] on the calling thread try each lock once instead of waiting
+/// up to the store deadline. Only the telemetry writer sets this. A holder that
+/// rotates a log fsyncs the rewrite under the lock, which on slow storage (macOS
+/// `F_FULLFSYNC` on a busy disk) can outlast any fixed deadline. Giving up there
+/// dropped the batch, and waiting there stalled every other log behind it. The
+/// writer instead keeps a busy log's batch for a later pass, checking
+/// [`take_lock_busy`] to tell contention apart from a failed write.
+pub(crate) fn try_locks_once_on_this_thread() {
+    TRIES_LOCKS_ONCE.set(true);
+}
+
+/// Whether the last [`lock_at`] on this thread found its lock held elsewhere,
+/// clearing the flag. Meaningful only after [`try_locks_once_on_this_thread`].
+pub(crate) fn take_lock_busy() -> bool {
+    LOCK_BUSY.replace(false)
+}
+
+fn try_lock_once(path: &Path) -> Result<FileLock, String> {
+    let file = open_lock_file(path)?;
+    #[cfg(test)]
+    let result = match injected_lock_error(path) {
+        Some(error) => Err(error),
+        None => file.try_lock_exclusive(),
+    };
+    #[cfg(not(test))]
+    let result = file.try_lock_exclusive();
+    result.map_err(|error| {
+        // Only contention is worth a retry. Any other failure (ENOLCK on a
+        // network share, for one) is a failed write and is counted as one.
+        let busy = error.raw_os_error().is_some()
+            && error.raw_os_error() == fs2::lock_contended_error().raw_os_error();
+        LOCK_BUSY.set(busy);
+        format!(
+            "Could not take the lock at {}: {error}",
+            lock_path(path).display()
+        )
+    })?;
+    Ok(FileLock(file))
+}
+
+/// Lock paths whose next try-once attempts fail with the given OS error.
+#[cfg(test)]
+static INJECTED_LOCK_ERRORS: std::sync::Mutex<Vec<(PathBuf, i32)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn inject_lock_error_for_test(path: &Path, raw_os_error: i32) {
+    INJECTED_LOCK_ERRORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((path.to_path_buf(), raw_os_error));
+}
+
+#[cfg(test)]
+fn injected_lock_error(path: &Path) -> Option<std::io::Error> {
+    INJECTED_LOCK_ERRORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(injected, _)| injected == path)
+        .map(|(_, code)| std::io::Error::from_raw_os_error(*code))
 }
 
 /// Acquire an explicit-path lock with a caller-appropriate contention deadline.

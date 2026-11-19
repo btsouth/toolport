@@ -1815,10 +1815,17 @@ mod tests {
                 );
             }
             // The parent reads only after this process exits, so land every queued
-            // line here instead of relying on the writer's next interval.
-            assert!(crate::telemetry::flush_for_test(
-                std::time::Duration::from_secs(5)
-            ));
+            // line here instead of relying on the writer's next interval. Wait for
+            // the writer to finish rather than guess how long a sibling's rotation
+            // fsync takes; the parent bounds this process if it hangs.
+            assert!(crate::telemetry::flush_for_test(std::time::Duration::MAX));
+            // A completed flush only means the writer finished; a failed locked
+            // append is counted, not raised. Report it here, where it happened.
+            assert_eq!(
+                crate::telemetry::health(),
+                crate::telemetry::Health::default(),
+                "audit stress child {child_id} did not persist every record"
+            );
             return;
         }
 
@@ -1835,6 +1842,9 @@ mod tests {
         let executable = std::env::current_exe().unwrap();
         for child_id in 0..CHILDREN {
             let ready = root.join(format!("ready-{child_id}"));
+            // Keep each child's panic message; the parent reports it on failure.
+            let stderr = std::fs::File::create(root.join(format!("child-{child_id}.stderr")))
+                .expect("create audit stress child stderr");
             fixture.children.push(
                 std::process::Command::new(&executable)
                     .args([
@@ -1846,8 +1856,13 @@ mod tests {
                     .env("TOOLPORT_AUDIT_STRESS_PATH", &path)
                     .env("TOOLPORT_AUDIT_STRESS_READY", ready)
                     .env("TOOLPORT_AUDIT_STRESS_GO", &go)
+                    // The writer must wait out a sibling's rotation however long
+                    // its fsync takes, never fall back to the store deadline and
+                    // drop the batch. A tiny deadline makes any fallback show here
+                    // instead of only on a slow disk.
+                    .env("TOOLPORT_LOCK_TIMEOUT_MS", "1")
                     .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
+                    .stderr(stderr)
                     .spawn()
                     .expect("spawn independent audit appender"),
             );
@@ -1861,10 +1876,11 @@ mod tests {
         std::fs::write(&go, "go").unwrap();
         for (child_id, child) in fixture.children.iter_mut().enumerate() {
             let status = wait_for_child(child, "audit stress child");
-            assert!(
-                status.success(),
-                "audit stress child {child_id} failed: {status}"
-            );
+            if !status.success() {
+                let stderr = std::fs::read_to_string(root.join(format!("child-{child_id}.stderr")))
+                    .unwrap_or_else(|error| format!("<stderr unavailable: {error}>"));
+                panic!("audit stress child {child_id} failed: {status}\nchild stderr:\n{stderr}");
+            }
         }
 
         let content = std::fs::read_to_string(&path).unwrap();

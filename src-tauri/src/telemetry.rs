@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 
 const BATCH_MAX: usize = 64;
 const FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+/// How soon a log whose lock another process holds is tried again.
+const RETRY_INTERVAL: Duration = Duration::from_millis(20);
 const QUEUE_CAPACITY: usize = 8192;
 
 /// A failed append distinguishes records already landed from unconfirmed writes.
@@ -64,7 +66,9 @@ struct Record {
 
 enum Msg {
     Record(Record),
-    Flush(SyncSender<()>),
+    /// A FIFO barrier, answered once every record queued before it has landed or
+    /// been counted, and forgotten once its caller's deadline passes.
+    Flush(SyncSender<()>, Option<Instant>),
 }
 
 #[derive(Default)]
@@ -112,6 +116,13 @@ impl Health {
 }
 
 impl Counters {
+    fn count_drops(&self, count: u64) {
+        let _ =
+            self.dropped_since
+                .compare_exchange(0, now_ms(), Ordering::Relaxed, Ordering::Relaxed);
+        self.queue_dropped.fetch_add(count, Ordering::Relaxed);
+    }
+
     fn health(&self) -> Health {
         Health {
             queue_dropped: self.queue_dropped.load(Ordering::Relaxed),
@@ -150,7 +161,11 @@ impl Writer {
         let (tx, rx) = mpsc::sync_channel(capacity);
         let tx = std::thread::Builder::new()
             .name("toolport-telemetry".into())
-            .spawn(move || writer_loop(rx, &worker_counters, append))
+            .spawn(move || {
+                // A busy log keeps its batch for a later pass; see the helper.
+                crate::registry::try_locks_once_on_this_thread();
+                writer_loop(rx, &worker_counters, capacity, append)
+            })
             .ok()
             .map(|_| tx);
         Self {
@@ -192,13 +207,7 @@ impl Writer {
     }
 
     fn count_drop(&self) {
-        let _ = self.counters.dropped_since.compare_exchange(
-            0,
-            now_ms(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
-        self.counters.queue_dropped.fetch_add(1, Ordering::Relaxed);
+        self.counters.count_drops(1);
     }
 
     fn flush(&self, budget: Duration) -> bool {
@@ -211,7 +220,8 @@ impl Writer {
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         #[cfg(any(test, feature = "test-support"))]
         let started = Instant::now();
-        let queued = tx.try_send(Msg::Flush(done_tx)).is_ok();
+        let deadline = Instant::now().checked_add(budget);
+        let queued = tx.try_send(Msg::Flush(done_tx, deadline)).is_ok();
         if queued && done_rx.recv_timeout(budget).is_ok() {
             return true;
         }
@@ -367,45 +377,70 @@ pub fn activity_notices(value: &serde_json::Value) -> Vec<String> {
     notes
 }
 
+/// Lines for one log, in arrival order.
+struct Batch {
+    /// Arrival number of the oldest line, so a flush knows whether it waits on it.
+    first_seq: u64,
+    path: std::path::PathBuf,
+    rotation: Rotation,
+    lines: Vec<String>,
+}
+
+fn is_audit(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "audit.jsonl")
+}
+
 fn writer_loop(
     rx: Receiver<Msg>,
     counters: &Counters,
+    capacity: usize,
     mut append: impl FnMut(&Path, &[String], Rotation) -> Result<(), AppendError>,
 ) {
+    let received = |record: &Record| {
+        if !is_audit(&record.path) {
+            counters.non_audit_queued.fetch_sub(1, Ordering::Relaxed);
+        }
+    };
     let mut pending = Vec::new();
+    // Arrival number of the next record received; `pending[i]` is `pending_seq + i`.
+    let (mut next_seq, mut pending_seq) = (0u64, 0u64);
+    // Batches for logs whose lock another process held, retried every pass.
+    let mut kept: Vec<Batch> = Vec::new();
+    // Flushes waiting on kept lines that arrived before them, with the arrival
+    // number they wait up to and their caller's deadline.
+    let mut waiters: Vec<(u64, SyncSender<()>, Option<Instant>)> = Vec::new();
     let mut gaps = GapState::default();
     loop {
-        let mut done = None;
-        match rx.recv() {
+        let first = if kept.is_empty() && !gaps.busy {
+            rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+        } else {
+            rx.recv_timeout(RETRY_INTERVAL)
+        };
+        let mut flushing = false;
+        match first {
             Ok(Msg::Record(record)) => {
-                if record
-                    .path
-                    .file_name()
-                    .is_none_or(|name| name != "audit.jsonl")
-                {
-                    counters.non_audit_queued.fetch_sub(1, Ordering::Relaxed);
-                }
+                received(&record);
                 pending.push(record);
+                next_seq += 1;
             }
-            Ok(Msg::Flush(waiter)) => done = Some(waiter),
-            Err(_) => break,
+            Ok(Msg::Flush(waiter, deadline)) => {
+                waiters.push((next_seq, waiter, deadline));
+                flushing = true;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
         }
-        if done.is_none() {
+        if !flushing && !pending.is_empty() {
             let deadline = Instant::now() + FLUSH_INTERVAL;
             while pending.len() < BATCH_MAX {
                 match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                     Ok(Msg::Record(record)) => {
-                        if record
-                            .path
-                            .file_name()
-                            .is_none_or(|name| name != "audit.jsonl")
-                        {
-                            counters.non_audit_queued.fetch_sub(1, Ordering::Relaxed);
-                        }
+                        received(&record);
                         pending.push(record);
+                        next_seq += 1;
                     }
-                    Ok(Msg::Flush(waiter)) => {
-                        done = Some(waiter);
+                    Ok(Msg::Flush(waiter, deadline)) => {
+                        waiters.push((next_seq, waiter, deadline));
                         break;
                     }
                     Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
@@ -415,42 +450,113 @@ fn writer_loop(
         if let Some(record) = pending.first() {
             gaps.dir = record.path.parent().map(Path::to_path_buf);
         }
-        deliver(&mut pending, counters, &mut append);
+        deliver(
+            &mut pending,
+            pending_seq,
+            &mut kept,
+            counters,
+            capacity,
+            &mut append,
+        );
+        pending_seq = next_seq;
         gaps.deliver(counters, &mut append);
-        if let Some(done) = done {
-            let _ = done.send(());
-        }
+        // Kept lines are in arrival order within a batch, so a batch's first line
+        // says whether a barrier still waits on it. A busy gap marker holds every
+        // barrier, so an exit before it lands reports an incomplete flush.
+        let oldest_kept = kept.iter().map(|batch| batch.first_seq).min();
+        let now = Instant::now();
+        waiters.retain(|(upto, waiter, deadline)| {
+            let settled = !gaps.busy && oldest_kept.is_none_or(|oldest| oldest >= *upto);
+            if settled {
+                let _ = waiter.send(());
+                return false;
+            }
+            deadline.is_none_or(|deadline| deadline > now)
+        });
     }
 }
 
+/// Append each log's lines under its lock. A log whose lock another process
+/// holds keeps its batch in `kept`, ahead of any later lines for it, so a slow
+/// holder delays only that log. Kept lines stay within the queue's bounds and
+/// audit reserve; anything past them is counted as dropped.
 fn deliver(
     pending: &mut Vec<Record>,
+    pending_seq: u64,
+    kept: &mut Vec<Batch>,
     counters: &Counters,
+    capacity: usize,
     append: &mut impl FnMut(&Path, &[String], Rotation) -> Result<(), AppendError>,
 ) {
-    let mut groups: Vec<(std::path::PathBuf, Rotation, Vec<String>)> = Vec::new();
-    for record in pending.drain(..) {
-        match groups.iter_mut().find(|group| group.0 == record.path) {
-            Some(group) => group.2.push(record.line),
-            None => groups.push((record.path, record.rotation, vec![record.line])),
+    let mut batches = std::mem::take(kept);
+    for (seq, record) in (pending_seq..).zip(pending.drain(..)) {
+        // Prepare savings rows once, so a retry on a busy lock reuses them.
+        let line = match record.rotation {
+            Rotation::Savings { .. } => crate::savings::prepare_line(&record.line),
+            _ => record.line,
+        };
+        match batches.iter_mut().find(|batch| batch.path == record.path) {
+            Some(batch) => batch.lines.push(line),
+            None => batches.push(Batch {
+                first_seq: seq,
+                path: record.path,
+                rotation: record.rotation,
+                lines: vec![line],
+            }),
         }
     }
-    for (path, rotation, lines) in groups {
-        if let Err(error) = append(&path, &lines, rotation) {
-            counters.write_failures.fetch_add(1, Ordering::Relaxed);
-            counters.write_failed_records.fetch_add(
-                error.unconfirmed.unwrap_or(lines.len()) as u64,
-                Ordering::Relaxed,
-            );
-            // Fixed text: paths and OS/downstream errors can contain credentials.
-            // Do not enqueue diagnostics about a failed diagnostic write recursively.
-            if rotation != Rotation::Gateway {
-                // Keep diagnostics beside the failed record's captured path, even
-                // if a test override or data directory migration has since changed.
-                crate::gatewaylog::queue_at(&path.with_file_name("gateway.log"), "telemetry batch persistence failed; Activity, savings, Teams reporting and diagnostics may be incomplete");
-            } else {
-                eprintln!("toolport: gateway diagnostic write failed");
+    let non_audit_limit = capacity.saturating_sub((capacity / 4).max(1));
+    let (mut kept_lines, mut kept_non_audit) = (0, 0);
+    for Batch {
+        first_seq,
+        path,
+        rotation,
+        mut lines,
+    } in batches
+    {
+        crate::registry::take_lock_busy();
+        let error = match append(&path, &lines, rotation) {
+            Ok(()) => continue,
+            Err(error) => error,
+        };
+        // Contention writes nothing, so the whole batch can wait for a later pass.
+        if error.unconfirmed.is_none() && crate::registry::take_lock_busy() {
+            let audit = is_audit(&path);
+            let mut room = capacity.saturating_sub(kept_lines);
+            if !audit {
+                room = room.min(non_audit_limit.saturating_sub(kept_non_audit));
             }
+            if lines.len() > room {
+                counters.count_drops((lines.len() - room) as u64);
+                lines.truncate(room);
+            }
+            kept_lines += lines.len();
+            if !audit {
+                kept_non_audit += lines.len();
+            }
+            if !lines.is_empty() {
+                kept.push(Batch {
+                    first_seq,
+                    path,
+                    rotation,
+                    lines,
+                });
+            }
+            continue;
+        }
+        counters.write_failures.fetch_add(1, Ordering::Relaxed);
+        counters.write_failed_records.fetch_add(
+            error.unconfirmed.unwrap_or(lines.len()) as u64,
+            Ordering::Relaxed,
+        );
+        // Fixed text: paths and OS/downstream errors can contain credentials.
+        // Do not enqueue diagnostics about a failed diagnostic write recursively.
+        if rotation != Rotation::Gateway {
+            // Keep diagnostics beside the failed record's captured path, even
+            // if a test override or data directory migration has since changed.
+            crate::gatewaylog::queue_at(&path.with_file_name("gateway.log"), "telemetry batch persistence failed; Activity, savings, Teams reporting and diagnostics may be incomplete");
+        } else {
+            eprintln!("toolport: gateway diagnostic write failed");
         }
     }
 }
@@ -464,6 +570,8 @@ fn now_ms() -> u64 {
 
 #[derive(Default)]
 struct GapState {
+    /// A marker found its log busy and is retried on the kept-batch schedule.
+    busy: bool,
     dir: Option<std::path::PathBuf>,
     audit_reported: u64,
     log_reported: u64,
@@ -475,6 +583,7 @@ impl GapState {
         counters: &Counters,
         append: &mut impl FnMut(&Path, &[String], Rotation) -> Result<(), AppendError>,
     ) {
+        self.busy = false;
         let dropped = counters.queue_dropped.load(Ordering::Relaxed);
         let Some(dir) = &self.dir else { return };
         #[cfg(any(test, feature = "test-support"))]
@@ -509,8 +618,13 @@ impl GapState {
                     "telemetry gap: {count} records dropped since {since}"
                 ))
             };
+            crate::registry::take_lock_busy();
             match append(&dir.join(name), &[line], rotation) {
                 Ok(()) => *reported = dropped,
+                // A busy log gets the marker on a later pass.
+                Err(error) if error.unconfirmed.is_none() && crate::registry::take_lock_busy() => {
+                    self.busy = true;
+                }
                 Err(error) => {
                     counters.write_failures.fetch_add(1, Ordering::Relaxed);
                     let unconfirmed = error.unconfirmed.unwrap_or(1);
@@ -540,7 +654,7 @@ fn append_batch(path: &Path, lines: &[String], rotation: Rotation) -> Result<(),
         Rotation::Savings {
             max_bytes,
             keep_lines,
-        } => crate::savings::append_lines_at(path, lines, max_bytes, keep_lines),
+        } => crate::savings::append_prepared_lines_at(path, lines, max_bytes, keep_lines),
     }
 }
 
@@ -630,7 +744,7 @@ mod tests {
             .tx
             .as_ref()
             .unwrap()
-            .try_send(Msg::Flush(done_tx))
+            .try_send(Msg::Flush(done_tx, None))
             .unwrap_or_else(|_| panic!("flush queue full"));
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         // Counter traffic exhausts only its share. An approval still fits.
@@ -727,7 +841,14 @@ mod tests {
                 rotation,
             }];
             with_atomic_failure(Rename, || {
-                deliver(&mut records, &counters, &mut append_batch)
+                deliver(
+                    &mut records,
+                    0,
+                    &mut Vec::new(),
+                    &counters,
+                    QUEUE_CAPACITY,
+                    &mut append_batch,
+                )
             });
             assert_eq!(counters.health().write_failures, 1);
             assert_eq!(counters.health().write_failed_records, 0);
@@ -943,7 +1064,7 @@ mod tests {
             .tx
             .as_ref()
             .unwrap()
-            .try_send(Msg::Flush(barrier_tx))
+            .try_send(Msg::Flush(barrier_tx, None))
             .unwrap_or_else(|_| panic!("barrier queue full"));
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let (returned_tx, returned_rx) = mpsc::sync_channel(1);
@@ -1014,9 +1135,14 @@ mod tests {
                     record.path = dir.join("audit.jsonl");
                     record.rotation = rotation;
                 }
-                deliver(&mut pending, &counters, &mut |_, _, _| {
-                    Err(error.to_string().into())
-                });
+                deliver(
+                    &mut pending,
+                    0,
+                    &mut Vec::new(),
+                    &counters,
+                    QUEUE_CAPACITY,
+                    &mut |_, _, _| Err(error.to_string().into()),
+                );
                 let health = counters.health();
                 assert_eq!(health.write_failures, 1);
                 assert_eq!(health.write_failed_records, 2);
@@ -1116,5 +1242,323 @@ mod tests {
         );
         assert!(retire_dir_for_test(&dir, Duration::from_secs(5)));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A writer process for the held-lock tests. Killed and cleaned up on drop, so
+    /// a failed assertion never leaves it running.
+    struct WriterProcess {
+        root: PathBuf,
+        child: std::process::Child,
+    }
+
+    impl WriterProcess {
+        fn spawn(test: &str, root: &Path, lock_timeout_ms: Option<&str>) -> Self {
+            let stderr = std::fs::File::create(root.join("child.stderr")).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", test, "--nocapture"])
+                .env("TOOLPORT_TELEMETRY_HELD_CHILD", root)
+                .stdout(std::process::Stdio::null())
+                .stderr(stderr);
+            if let Some(ms) = lock_timeout_ms {
+                command.env("TOOLPORT_LOCK_TIMEOUT_MS", ms);
+            }
+            Self {
+                root: root.to_path_buf(),
+                child: command.spawn().expect("spawn telemetry writer process"),
+            }
+        }
+
+        fn stderr(&self) -> String {
+            std::fs::read_to_string(self.root.join("child.stderr")).unwrap_or_default()
+        }
+
+        /// Poll until `done`, failing with the child's stderr if it exits first or
+        /// the hang guard expires.
+        fn wait_until(&mut self, label: &str, done: impl Fn() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !done() {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    panic!(
+                        "writer exited ({status}) before {label}:\n{}",
+                        self.stderr()
+                    );
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {label}:\n{}",
+                    self.stderr()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn exit_status(&mut self) -> std::process::ExitStatus {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    return status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "writer did not exit:\n{}",
+                    self.stderr()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for WriterProcess {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn file_has(path: &Path, needle: &str) -> bool {
+        std::fs::read_to_string(path).is_ok_and(|content| content.contains(needle))
+    }
+
+    fn wait_for_file(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "timed out waiting for {path:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Another process holding one log's lock must neither drop that log's lines
+    /// nor hold up the others. The free log lands while the lock is held, and the
+    /// held log's lines, including ones queued after it went busy, land in order
+    /// once it is released. The child's store deadline is 1 ms, so falling back to
+    /// it drops the batch, and waiting on the lock never writes the free log.
+    #[test]
+    fn a_held_log_keeps_its_lines_in_order_while_other_logs_drain() {
+        if let Some(root) = std::env::var_os("TOOLPORT_TELEMETRY_HELD_CHILD") {
+            let root = PathBuf::from(root);
+            let held = root.join("gateway.log");
+            record(&held, "held-1", Rotation::Gateway);
+            record(
+                &root.join("audit.jsonl"),
+                "{\"free\":1}",
+                trimmed(1 << 20, 100),
+            );
+            wait_for_file(&root.join("free-seen"));
+            record(&held, "held-2", Rotation::Gateway);
+            record(&held, "held-3", Rotation::Gateway);
+            std::fs::write(root.join("queued"), "").unwrap();
+            wait_for_file(&root.join("released"));
+            assert!(flush_for_test(Duration::MAX));
+            assert_eq!(health(), Health::default(), "a record was not persisted");
+            return;
+        }
+
+        let root = scratch("held-log");
+        let held = root.join("gateway.log");
+        let free = root.join("audit.jsonl");
+        let guard = crate::registry::lock_at(&held).expect("hold the gateway log lock");
+        let mut writer = WriterProcess::spawn(
+            "telemetry::tests::a_held_log_keeps_its_lines_in_order_while_other_logs_drain",
+            &root,
+            Some("1"),
+        );
+        writer.wait_until("the free log while the other is held", || {
+            file_has(&free, "{\"free\":1}")
+        });
+        assert!(!held.exists(), "held log written without its lock");
+        std::fs::write(root.join("free-seen"), "").unwrap();
+        let queued = root.join("queued");
+        writer.wait_until("later lines for the held log", || queued.exists());
+        drop(guard);
+        std::fs::write(root.join("released"), "").unwrap();
+        let status = writer.exit_status();
+        assert!(status.success(), "writer failed:\n{}", writer.stderr());
+        assert_eq!(
+            std::fs::read_to_string(&held).unwrap(),
+            "held-1\nheld-2\nheld-3\n"
+        );
+    }
+
+    /// Shutdown while another process holds one log's lock still lands the other
+    /// logs, and reports the held one as an incomplete flush instead of exiting
+    /// as if everything landed.
+    #[test]
+    fn shutdown_lands_free_logs_and_reports_a_held_one() {
+        if let Some(root) = std::env::var_os("TOOLPORT_TELEMETRY_HELD_CHILD") {
+            let root = PathBuf::from(root);
+            record(&root.join("gateway.log"), "held", Rotation::Gateway);
+            record(
+                &root.join("audit.jsonl"),
+                "{\"free\":1}",
+                trimmed(1 << 20, 100),
+            );
+            shutdown();
+            return;
+        }
+
+        let root = scratch("held-shutdown");
+        let held = root.join("gateway.log");
+        let free = root.join("audit.jsonl");
+        let guard = crate::registry::lock_at(&held).expect("hold the gateway log lock");
+        let mut writer = WriterProcess::spawn(
+            "telemetry::tests::shutdown_lands_free_logs_and_reports_a_held_one",
+            &root,
+            None,
+        );
+        let status = writer.exit_status();
+        drop(guard);
+        let stderr = writer.stderr();
+        assert!(status.success(), "writer failed:\n{stderr}");
+        assert!(
+            file_has(&free, "{\"free\":1}"),
+            "free log lost at shutdown:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("telemetry shutdown budget exhausted"),
+            "held log not reported:\n{stderr}"
+        );
+    }
+
+    fn wait_for(label: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {label}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn gateway_record(path: &Path, line: &str) -> Record {
+        Record {
+            path: path.to_path_buf(),
+            line: line.into(),
+            rotation: Rotation::Gateway,
+        }
+    }
+
+    /// Queue a flush barrier without waiting on it.
+    fn barrier(writer: &Writer) -> Receiver<()> {
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        writer
+            .tx
+            .as_ref()
+            .unwrap()
+            .try_send(Msg::Flush(done_tx, None))
+            .unwrap();
+        done_rx
+    }
+
+    /// Only contention is retried. Any other lock failure is a failed write, as
+    /// it was before busy logs were kept, so health shows it and flush returns.
+    #[test]
+    fn a_lock_error_other_than_contention_counts_as_a_failed_write() {
+        let dir = scratch("lock-error");
+        let path = dir.join("audit.jsonl");
+        #[cfg(unix)]
+        let code = libc::ENOLCK;
+        #[cfg(windows)]
+        let code = 8; // ERROR_NOT_ENOUGH_MEMORY
+        crate::registry::inject_lock_error_for_test(&path, code);
+        let writer = Writer::spawn(QUEUE_CAPACITY, append_batch);
+        writer.record(Record {
+            path: path.clone(),
+            line: "{\"i\":1}".into(),
+            rotation: trimmed(1 << 20, 100),
+        });
+        assert!(
+            writer.flush(Duration::from_secs(5)),
+            "a lock error was retried as contention"
+        );
+        let health = writer.counters.health();
+        assert_eq!((health.write_failures, health.write_failed_records), (1, 1));
+        assert!(!path.exists());
+        assert!(retire_dir_for_test(&dir, Duration::from_secs(5)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A savings row kept for a busy log is tokenized once, not on every retry.
+    #[test]
+    fn a_kept_savings_row_is_tokenized_once() {
+        let dir = scratch("savings-prepared");
+        let path = dir.join("savings-v4.jsonl");
+        let probe = format!("tokenize-probe-{}", dir.display());
+        let held = crate::registry::lock_at(&path).expect("hold the savings lock");
+        let writer = Writer::spawn(QUEUE_CAPACITY, append_batch);
+        writer.record(Record {
+            path: path.clone(),
+            line: serde_json::json!({"v": 2, "kind": "list", "_fullText": probe}).to_string(),
+            rotation: Rotation::Savings {
+                max_bytes: 1 << 20,
+                keep_lines: 100,
+            },
+        });
+        // The writer retries every 20 ms while the lock is held.
+        assert!(!writer.flush(Duration::from_millis(300)));
+        drop(held);
+        assert!(writer.flush(Duration::from_secs(5)));
+        assert_eq!(crate::savings::tokenized_probe_count(&probe), 1);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("fullTokens") && !content.contains(&probe));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A flush waits on what was queued before it, not on a busy log whose lines
+    /// arrived after it.
+    #[test]
+    fn a_flush_does_not_wait_on_records_queued_after_it() {
+        let dir = scratch("barrier-order");
+        let (a, b, c) = (dir.join("a.log"), dir.join("b.log"), dir.join("c.log"));
+        let held_a = crate::registry::lock_at(&a).expect("hold a");
+        let held_b = crate::registry::lock_at(&b).expect("hold b");
+        let writer = Writer::spawn(QUEUE_CAPACITY, append_batch);
+        writer.record(gateway_record(&a, "before"));
+        let done = barrier(&writer);
+        writer.record(gateway_record(&b, "after"));
+        writer.record(gateway_record(&c, "marker"));
+        // c lands in the pass that kept "after" for b, or a later one.
+        wait_for("the free log", || file_has(&c, "marker"));
+        drop(held_a);
+        assert!(
+            done.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "flush waited on a record queued after it"
+        );
+        assert!(file_has(&a, "before"));
+        assert!(!b.exists());
+        drop(held_b);
+        assert!(writer.flush(Duration::from_secs(5)));
+        assert!(file_has(&b, "after"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A gap marker whose log is busy is retried on the kept-batch schedule and
+    /// holds flush until it lands, even when no record batch is kept.
+    #[test]
+    fn a_busy_gap_marker_is_retried_and_holds_flush() {
+        let dir = scratch("busy-gap");
+        let held = dir.join("x.log");
+        let gateway = dir.join("gateway.log");
+        let held_x = crate::registry::lock_at(&held).expect("hold x");
+        let held_gateway = crate::registry::lock_at(&gateway).expect("hold gateway.log");
+        // Room for three kept non-audit lines; the rest are counted as dropped.
+        let writer = Writer::spawn(4, append_batch);
+        for i in 0..10 {
+            writer.record(gateway_record(&held, &format!("x-{i}")));
+        }
+        wait_for("the audit gap marker", || {
+            file_has(&dir.join("audit.jsonl"), "telemetry_gap")
+        });
+        drop(held_x);
+        wait_for("the kept lines", || file_has(&held, "x-0"));
+        assert!(
+            !writer.flush(Duration::from_millis(300)),
+            "flush passed with a gap marker unwritten"
+        );
+        drop(held_gateway);
+        wait_for("the gateway gap marker without another flush", || {
+            file_has(&gateway, "telemetry gap")
+        });
+        assert!(writer.flush(Duration::from_secs(5)));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
