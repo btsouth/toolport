@@ -6,9 +6,72 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [2.3.8] - 2026-11-19
+
+Toolport 2.3.8 stops asking you to review tool changes when Safety is Off,
+supports WorkBuddy and WorkBuddy AI, and no longer drops Activity records while
+another Toolport process holds the log.
+
+If you are on Toolport 1.24.x, this is also your update to Toolport 2. Read the
+[upgrade guide](https://github.com/btsouth/toolport/blob/main/docs/migration.md)
+before updating.
+
+### Changed
+
+- With Safety set to Off, Activity no longer asks you to review or accept tool
+  changes that nothing blocks. They go into a folded list of tool change records,
+  and Activity says "Safety is Off. Toolport records tool changes but does not
+  block them." Tools that are still held, blocked or waiting for their new
+  definition keep their cards. Nothing is dismissed, so switching back to Ask
+  shows the same cards as before. (#1416, #1419)
+- The Connect flow, Servers and Activity now use the same wording, controls and
+  layout in the desktop app and the GTK app. (#1375, #1379, #1382, #1407)
+- Run on a server's Tools tab now waits for a server that has to start first and
+  shows "Starting" while it does. Cancel stops the call in the gateway instead of
+  only stopping the wait. (#1374)
+
+### Added
+
 - WorkBuddy and WorkBuddy AI are supported clients. Toolport finds each one,
   connects it through its own `mcp.json` (`~/.workbuddy` or `~/.workbuddy-ai`),
-  and imports the servers already set up there.
+  and imports the servers already set up there. Thanks @XuChen-AI for asking for
+  it in #1414. (#1418)
+
+### Fixed
+
+- Audit, savings and gateway log records are no longer dropped when another
+  Toolport process holds the log's lock for a while, for example while it
+  rotates the log on a slow disk. (#1422)
+- On Linux, saving a value while the keyring is locked asks you to unlock it
+  once, not twice. (#1402)
+- Add server in the desktop app saves the server and all its values in one step.
+  A locked keychain asks once, and if a save fails nothing is saved and the
+  dialog stays open with what you typed. (#1403)
+- Adding a remote server with a pasted Authorization value no longer fails in
+  the desktop app, and the value is kept as the server's bearer token in both
+  apps. In GTK, pasted values offer the same choices as in the desktop app.
+  (#1373)
+- In GTK, a catalog server or a Duplicate keeps its launch inputs when a pasted
+  config fills its values and leaves the command alone. (#1404)
+- The GTK credential dialogs stay open after a save or removal and show the
+  result there, and Remove token and Remove client credentials ask first. (#1372)
+- Connect all no longer stops with "Servers changed during setup. Review again."
+  right after you unlock the keychain. (#1411)
+- When a client config cannot be read or written, the error now names the file,
+  for example `~/.cursor/mcp.json: Permission denied (os error 13)`. (#1362)
+- Remove Toolport data no longer leaves the secret cleanup's marker and lock
+  files behind. (#1399)
+- A request a server sends to your client (sampling, elicitation or roots) keeps
+  its id even when the id matches a stored secret, so the client's answer gets
+  back to the server. (#1361)
+- After changing Safety from Strict to Ask in the desktop app, a server's Tools
+  panel no longer says a destructive tool is hidden. (#1419)
+- A tool's switch is named after the tool instead of reading "Enable" while the
+  tool is on. Review cards no longer look cut off at the dialog edges. A failed
+  save or a refused paste in Add server shows above the dialog buttons instead of
+  in a toast that covered them. In GTK, a client's access label uses the room it
+  has instead of ending in "..." in a wide window. (#1417)
+- GTK no longer keeps closed Add and Edit server windows in memory. (#1377)
 
 ## [2.3.7] - 2026-11-16
 
