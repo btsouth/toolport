@@ -5331,36 +5331,37 @@ pub fn tool_change_summary(events: &[Value]) -> String {
             .cloned()
             .unwrap_or_default()
     };
-    let source = if events.iter().all(|event| event["change"] == "added") {
+    let count_text = count.to_string();
+    let values = [("count", count_text.as_str())];
+    if events.iter().all(|event| event["change"] == "added") {
         if one {
-            crate::i18n::msg("{count} new tool")
+            crate::i18n::trf("{count} new tool", &values)
         } else {
-            crate::i18n::msg("{count} new tools")
+            crate::i18n::trf("{count} new tools", &values)
         }
     } else if events
         .iter()
         .all(|event| fields(event).iter().any(|field| field == "input_schema"))
     {
         if one {
-            crate::i18n::msg("{count} tool changed its inputs")
+            crate::i18n::trf("{count} tool changed its inputs", &values)
         } else {
-            crate::i18n::msg("{count} tools changed their inputs")
+            crate::i18n::trf("{count} tools changed their inputs", &values)
         }
     } else if events
         .iter()
         .all(|event| fields(event) == vec![json!("description")])
     {
         if one {
-            crate::i18n::msg("{count} tool changed its description")
+            crate::i18n::trf("{count} tool changed its description", &values)
         } else {
-            crate::i18n::msg("{count} tools changed their descriptions")
+            crate::i18n::trf("{count} tools changed their descriptions", &values)
         }
     } else if one {
-        crate::i18n::msg("{count} tool changed")
+        crate::i18n::trf("{count} tool changed", &values)
     } else {
-        crate::i18n::msg("{count} tools changed")
-    };
-    crate::i18n::trf(source, &[("count", &count.to_string())])
+        crate::i18n::trf("{count} tools changed", &values)
+    }
 }
 
 /// One tool definition as the offline ecosystem tracker records it: both fingerprints,
