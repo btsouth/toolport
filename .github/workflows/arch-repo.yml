@@ -73,8 +73,10 @@ jobs:
             echo "::error::PKGBUILD pkgver is $have but the tag is $want. Bump it and re-run updpkgsums."
             exit 1
           fi
-          if grep -q "sha256sums=('SKIP')" packaging/linux/native/PKGBUILD; then
-            echo "::error::PKGBUILD still has sha256sums=('SKIP'). Run updpkgsums against the tag."
+          # Any SKIP entry, not only a one-line array: the archive digest is the
+          # first entry of a multi-line sha256sums array.
+          if grep -q "'SKIP'" packaging/linux/native/PKGBUILD; then
+            echo "::error::PKGBUILD still has a 'SKIP' checksum. Run updpkgsums against the tag."
             exit 1
           fi
 
