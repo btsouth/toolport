@@ -158,6 +158,20 @@ pub fn apply_import(registry: &mut Registry, json: &str) -> Result<usize, String
     apply_import_selected(registry, json, None)
 }
 
+/// Why pasted or loaded text is not a setup, in a plain sentence instead of the
+/// parser's line and column.
+pub(crate) fn not_a_setup(error: &serde_json::Error) -> String {
+    use serde_json::error::Category;
+    match error.classify() {
+        Category::Eof => "That doesn't look like a Toolport setup. The text ends before the setup does.",
+        Category::Syntax => "That doesn't look like a Toolport setup. The text isn't JSON.",
+        Category::Data | Category::Io => {
+            "That doesn't look like a Toolport setup. It is JSON, but not a setup exported from Toolport."
+        }
+    }
+    .to_string()
+}
+
 /// Like [`apply_import`], importing only the servers whose names are in
 /// `selected` (case-insensitive). `None` keeps every new server.
 pub fn apply_import_selected(
@@ -169,8 +183,7 @@ pub fn apply_import_selected(
     struct Document {
         servers: Vec<ServerEntry>,
     }
-    let document: Document = serde_json::from_str(json)
-        .map_err(|error| format!("That doesn't look like a Toolport setup: {error}"))?;
+    let document: Document = serde_json::from_str(json).map_err(|error| not_a_setup(&error))?;
     let mut to_add = Vec::<ServerEntry>::new();
     for mut server in document.servers {
         if let Some(selected) = selected {
@@ -280,8 +293,7 @@ pub fn preview_import(json: &str) -> Result<Vec<SetupImportItem>, String> {
     struct Document {
         servers: Vec<ServerEntry>,
     }
-    let document: Document = serde_json::from_str(json)
-        .map_err(|error| format!("That doesn't look like a Toolport setup: {error}"))?;
+    let document: Document = serde_json::from_str(json).map_err(|error| not_a_setup(&error))?;
     let registry = registry::load()?;
     Ok(document
         .servers
@@ -718,5 +730,34 @@ mod controller_tests {
             import_item_warnings(&item),
             vec!["Replace the placeholders in its URL with your own values"]
         );
+    }
+}
+
+#[cfg(test)]
+mod not_a_setup_tests {
+    #[test]
+    fn a_bad_setup_is_explained_without_parser_positions() {
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)]
+        struct Document {
+            servers: Vec<crate::registry::ServerEntry>,
+        }
+        for (text, reason) in [
+            ("not a setup", "The text isn't JSON."),
+            ("{\"servers\": [", "The text ends before the setup does."),
+            (
+                "{\"name\": 1}",
+                "It is JSON, but not a setup exported from Toolport.",
+            ),
+        ] {
+            let error = serde_json::from_str::<Document>(text).unwrap_err();
+            let message = super::not_a_setup(&error);
+            assert_eq!(
+                message,
+                format!("That doesn't look like a Toolport setup. {reason}"),
+                "{text}"
+            );
+            assert!(!message.contains("line"), "{message}");
+        }
     }
 }

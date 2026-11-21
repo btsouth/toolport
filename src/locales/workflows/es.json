@@ -117,8 +117,6 @@
   "https://toolport.yourcompany.com": "https://toolport.yourcompany.com",
   "If the team or your local servers change before saving, Toolport stops and asks you to review again. ": "Si el equipo o sus servidores locales cambian antes de guardar, Toolport se detiene y le pide que revise nuevamente. ",
   "If your browser cannot open Toolport, copy the manual code shown after approving this device.": "Si tu navegador no puede abrir Toolport, copia el código manual que se muestra después de aprobar este dispositivo.",
-  "Import {value1} server": "Importar {value1} servidor",
-  "Import {value1} servers": "Importar {value1} servidores",
   "Import a setup": "Importar una configuración",
   "Imported shared setup": "Configuración compartida importada",
   "Imported the setup you already confirmed": "Importaste la configuración que ya confirmaste",
@@ -550,5 +548,8 @@
   "Toolport's damaged record of the servers it moved from {client} was deleted. The servers stay in Toolport, and the client config was not changed.": "Se eliminó el registro dañado de Toolport sobre los servidores que movió desde {client}. Los servidores siguen en Toolport y la configuración del cliente no cambió.",
   "Toolport kept the toolport entry you edited. Remove it by hand if you uninstall Toolport.": "Toolport mantuvo la entrada toolport que editaste. Quítala a mano si desinstalas Toolport.",
   "Keyring locked. Nothing was restored. Unlock your keyring, then choose Retry.": "Llavero bloqueado. No se restauró nada. Desbloquea tu llavero y selecciona Reintentar.",
-  "Unlock your keyring to disconnect {client}.": "Desbloquea tu llavero para desconectar {client}."
+  "Unlock your keyring to disconnect {client}.": "Desbloquea tu llavero para desconectar {client}.",
+  "Every server in this setup is already present, so there is nothing to import.": "Todos los servidores de esta configuración ya están presentes, así que no hay nada que importar.",
+  "All files": "Todos los archivos",
+  "Couldn't read the pasted setup. Check that you copied all of it, then try again.": "No se pudo leer la configuración pegada. Compruebe que la copió completa e inténtelo de nuevo."
 }

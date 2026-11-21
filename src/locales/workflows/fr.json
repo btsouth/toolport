@@ -117,8 +117,6 @@
   "https://toolport.yourcompany.com": "https://toolport.yourcompany.com",
   "If the team or your local servers change before saving, Toolport stops and asks you to review again. ": "Si l'équipe ou vos serveurs locaux changent avant l'enregistrement, Toolport s'arrête et vous demande un nouvel examen. ",
   "If your browser cannot open Toolport, copy the manual code shown after approving this device.": "Si votre navigateur ne peut pas ouvrir Toolport, copiez le code manuel affiché après avoir approuvé cet appareil.",
-  "Import {value1} server": "Importer {value1} serveur",
-  "Import {value1} servers": "Importer {value1} serveurs",
   "Import a setup": "Importer une configuration",
   "Imported shared setup": "Configuration partagée importée",
   "Imported the setup you already confirmed": "Importé la configuration que vous avez déjà confirmée",
@@ -550,5 +548,8 @@
   "Toolport's damaged record of the servers it moved from {client} was deleted. The servers stay in Toolport, and the client config was not changed.": "L’enregistrement endommagé des serveurs que Toolport a déplacés depuis {client} a été supprimé. Les serveurs restent dans Toolport et la configuration du client n’a pas été modifiée.",
   "Toolport kept the toolport entry you edited. Remove it by hand if you uninstall Toolport.": "Toolport a conservé l’entrée toolport que vous avez modifiée. Supprimez-la à la main si vous désinstallez Toolport.",
   "Keyring locked. Nothing was restored. Unlock your keyring, then choose Retry.": "Trousseau verrouillé. Rien n'a été restauré. Déverrouillez votre trousseau, puis choisissez Réessayer.",
-  "Unlock your keyring to disconnect {client}.": "Déverrouillez votre trousseau pour déconnecter {client}."
+  "Unlock your keyring to disconnect {client}.": "Déverrouillez votre trousseau pour déconnecter {client}.",
+  "Every server in this setup is already present, so there is nothing to import.": "Tous les serveurs de cette configuration sont déjà présents : il n'y a rien à importer.",
+  "All files": "Tous les fichiers",
+  "Couldn't read the pasted setup. Check that you copied all of it, then try again.": "Impossible de lire la configuration collée. Vérifiez que vous l'avez copiée en entier, puis réessayez."
 }

@@ -1462,6 +1462,7 @@ button.toolport-catalog-action {{
 .toolport-status-title {{ font-size: 14px; font-weight: 600; }}
 .toolport-status-detail {{ font-size: 13px; }}
 .toolport-inline-error {{ font-size: 13px; color: @toolport_error; }}
+.toolport-inline-reason {{ font-size: 13px; color: @toolport_text_secondary; }}
 .toolport-skeleton-group {{ background: @toolport_card; border: 1px solid @toolport_border; border-radius: 12px; }}
 .toolport-skeleton {{ min-height: 24px; margin: 16px; border-radius: 8px; background: alpha(@toolport_fg, 0.06); }}
 toast {{ background: @toolport_raised; color: @toolport_fg; border: 1px solid @toolport_border; border-radius: 12px; }}

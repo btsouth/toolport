@@ -1,7 +1,7 @@
 import { translate, translate as t, useI18n, msg, type SourceMessage } from "@/lib/i18n";
 import { SETTINGS_PAGES, type SettingsSubpage } from "@/lib/settingsPages";
 import { isPersonalSync } from "@/lib/personalSync";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   Shield,
@@ -53,8 +53,11 @@ import {
 } from "@/lib/updater";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { ShareDialog } from "@/components/ShareDialog";
 import { navItemTitle } from "@/lib/shortcuts";
+
+const ShareDialog = lazy(() =>
+  import("@/components/ShareDialog").then((m) => ({ default: m.ShareDialog })),
+);
 
 const FOCUS_RING =
   "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
@@ -312,15 +315,24 @@ function VersionFooter({
               {t("Keyboard shortcuts")}
               <span className="ml-auto">?</span>
             </button>
-            <ShareDialog
-              onImported={onImport}
-              trigger={
+            <Suspense
+              fallback={
                 <button className={HELP_ITEM}>
                   <Share2 className="size-4" />
                   {t("Share or import a setup")}
                 </button>
               }
-            />
+            >
+              <ShareDialog
+                onImported={onImport}
+                trigger={
+                  <button className={HELP_ITEM}>
+                    <Share2 className="size-4" />
+                    {t("Share or import a setup")}
+                  </button>
+                }
+              />
+            </Suspense>
             <button className={HELP_ITEM} onClick={onReplay}>
               <Compass className="size-4" />
               {t("Run setup again")}

@@ -107,6 +107,8 @@ it("shows downstream tool counts and only Done on success", async () => {
     screen.queryByRole("button", { name: "Open Credentials" }),
   ).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Done" })).toBeVisible();
+  // Enter closes it, as in GTK: Done has focus, not the first disclosure.
+  await waitFor(() => expect(screen.getByRole("button", { name: "Done" })).toHaveFocus());
 });
 
 it("puts Done in the right-aligned footer and dates the backup without seconds", async () => {
