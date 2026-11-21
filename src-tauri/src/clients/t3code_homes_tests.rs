@@ -237,6 +237,7 @@ fn each_row_writes_its_providers_file_in_its_shape_and_names_the_data_folder() {
         );
     }
 
+    let expected_bin = format!("toolport-gateway{}", std::env::consts::EXE_SUFFIX);
     let oc_doc = json(&oc.join("opencode.json"));
     assert_eq!(oc_doc["model"], "x/y");
     assert_eq!(oc_doc["mcp"]["notes"]["command"][0], "notes");
@@ -245,7 +246,7 @@ fn each_row_writes_its_providers_file_in_its_shape_and_names_the_data_folder() {
     assert!(entry["command"][0]
         .as_str()
         .unwrap()
-        .ends_with("toolport-gateway"));
+        .ends_with(&expected_bin));
     assert!(entry["environment"]["TOOLPORT_CLIENT_ID"]
         .as_str()
         .unwrap()
@@ -265,18 +266,12 @@ fn each_row_writes_its_providers_file_in_its_shape_and_names_the_data_folder() {
     );
     let grok_doc: toml::Table = toml::from_str(&grok_text).unwrap();
     let entry = grok_doc["mcp_servers"]["toolport"].as_table().unwrap();
-    assert!(entry["command"]
-        .as_str()
-        .unwrap()
-        .ends_with("toolport-gateway"));
+    assert!(entry["command"].as_str().unwrap().ends_with(&expected_bin));
     assert_eq!(entry["env"].get("TOOLPORT_DATA_DIR").is_some(), pinned);
 
     let pi_doc = json(&pi.join("mcp.json"));
     let entry = &pi_doc["mcpServers"]["toolport"];
-    assert!(entry["command"]
-        .as_str()
-        .unwrap()
-        .ends_with("toolport-gateway"));
+    assert!(entry["command"].as_str().unwrap().ends_with(&expected_bin));
     assert!(entry["env"]["TOOLPORT_CLIENT_ID"]
         .as_str()
         .unwrap()
