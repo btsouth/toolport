@@ -492,6 +492,64 @@ impl CodexValue {
     }
 }
 
+/// Keys a client itself saves into a server's entry, which it edits in place: Pi's
+/// `enabled` switch and how its tools are exposed and kept running. A rewrite of
+/// Toolport's entry keeps them, they never make the entry count as changed by hand,
+/// and Disconnect takes them out with the entry.
+fn client_entry_settings(client_id: &str) -> &'static [&'static str] {
+    match client_id.split('@').next().unwrap_or(client_id) {
+        "pi" => &[
+            "enabled",
+            "exposure",
+            "toolExposure",
+            "lifecycle",
+            "idleTimeout",
+        ],
+        _ => &[],
+    }
+}
+
+/// `entry` with the [`client_entry_settings`] the client saved into Toolport's current
+/// entry in `path`. Any other client, or a file without such an entry, gets `entry` as
+/// it is.
+fn with_client_settings(
+    client_id: &str,
+    format: Format,
+    path: &Path,
+    entry: &ServerEntry,
+) -> ServerEntry {
+    let mut entry = entry.clone();
+    let keys = client_entry_settings(client_id);
+    if keys.is_empty() || !matches!(format, Format::JsonMcpServers) {
+        return entry;
+    }
+    let Some(root) = read_config_file(path)
+        .ok()
+        .and_then(|text| mutation::value(format, Some(&text)).ok())
+    else {
+        return entry;
+    };
+    let Some(prior) = root["mcpServers"].as_object().and_then(|servers| {
+        servers
+            .get(GATEWAY_ENTRY_NAME)
+            .filter(|value| gateway_edit_matches(GATEWAY_ENTRY_NAME, value["command"].as_str()))
+            .or_else(|| {
+                servers
+                    .iter()
+                    .find(|(name, value)| gateway_edit_matches(name, value["command"].as_str()))
+                    .map(|(_, value)| value)
+            })
+    }) else {
+        return entry;
+    };
+    for key in keys {
+        if let Some(value) = prior.get(*key) {
+            entry.unknown_fields.insert(key.to_string(), value.clone());
+        }
+    }
+    entry
+}
+
 /// Codex, including a Codex home added as a location (`codex@<key>`).
 fn is_codex_client(client_id: &str) -> bool {
     client_id == "codex" || client_id.starts_with("codex@")
@@ -9562,6 +9620,12 @@ fn edit_json_gateway_body(
                 .unwrap()
                 .insert("tools".into(), serde_json::json!(["*"]));
         }
+        // Settings the client keeps in Toolport's entry (Pi's), never over its shape.
+        if let Some(fields) = value.as_object_mut() {
+            for (key, setting) in &entry.unknown_fields {
+                fields.entry(key.clone()).or_insert_with(|| setting.clone());
+            }
+        }
         servers.insert(GATEWAY_ENTRY_NAME.to_string(), value);
     }
 
@@ -9742,7 +9806,8 @@ fn install_or_remove_inner(
     if let Some(record) = managed.as_mut().filter(|_| is_codex_client(client_id)) {
         record.codex_settings = codex_setting_keys(false);
     }
-    edit_format(def.format, &path, entry, lenient)?;
+    let entry = entry.map(|entry| with_client_settings(client_id, def.format, &path, entry));
+    edit_format(def.format, &path, entry.as_ref(), lenient)?;
     Ok(WriteOutcome {
         existed_before: true,
         path: path.display().to_string(),
@@ -10088,7 +10153,13 @@ pub(crate) fn migrate_reviewed(
             let backup = backup_file(client_id, &path)?;
             moved::record_selected(client_id, def.format, &path, names)?;
             moved::remove_selected(def.format, &path, names)?;
-            let entry = gateway_entry(profile, client_id)?;
+            // Settings the client saved in the entry it replaces stay, as on Connect.
+            let entry = with_client_settings(
+                client_id,
+                def.format,
+                &path,
+                &gateway_entry(profile, client_id)?,
+            );
             edit_format(
                 def.format,
                 &path,

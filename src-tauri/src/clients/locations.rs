@@ -685,6 +685,7 @@ pub(super) fn validate(row: &ClientLocation) -> Result<(), String> {
     // a write recreate a home whose folder was deleted.
     let ok = if is_t3_home(row) {
         super::t3code::path_is_safe(&row.config_path)
+            && super::t3code::opencode_jsonc_is_plain(&row.config_path)
     } else {
         row.manual
             || automatic_path_is_missing(row)

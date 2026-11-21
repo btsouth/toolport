@@ -917,9 +917,9 @@ fn a_saved_t3_home_whose_folder_is_gone_reads_as_not_installed() {
 /// R2-5: an instance whose home Toolport will not use is listed on the card with why,
 /// never dropped: a home outside home or with `..` (classified by its text only), a folder
 /// that does not exist yet, and a folder or config file that is a link. An OpenCode, Grok
-/// or Pi home no row covers, existing or not, is listed to add by hand; one that is an
-/// existing row's config (here the client's default, spelled as T3 Code or as Toolport
-/// does) is not. Only the display name and provider are shown, never the path text from
+/// or Pi home that exists is a row like a Claude Code one; one that is an existing row's
+/// config (here the client's default, spelled as T3 Code or as Toolport does) is not
+/// listed. Only the display name and provider are shown, never the path text from
 /// the settings.
 #[test]
 fn every_home_toolport_will_not_use_is_listed_with_why() {
@@ -1004,16 +1004,9 @@ fn every_home_toolport_will_not_use_is_listed_with_why() {
             "Grok",
             "Missing",
             true,
-            "unlistedHome".to_string(),
+            "missingHome".to_string(),
         ),
         ("net", "Codex", "Codex", true, "outsideHome".to_string()),
-        (
-            "oc_plain",
-            "OpenCode",
-            "Plain OC",
-            true,
-            "unlistedOpenCodeHome".to_string(),
-        ),
         (
             "off_missing",
             "Claude",
@@ -1048,14 +1041,17 @@ fn every_home_toolport_will_not_use_is_listed_with_why() {
     }
     expected.sort();
     assert_eq!(summary, expected);
-    // The usable home is a row, as before, and the others still are not.
+    // The usable homes are rows, and the others still are not.
     let real = std::fs::canonicalize(&home).unwrap();
     assert_eq!(
         automatic(&[])
             .into_iter()
             .map(|row| row.config_path)
             .collect::<Vec<_>>(),
-        vec![real.join("ok/.claude.json")]
+        vec![
+            real.join("ok/.claude.json"),
+            real.join(".oc-xdg/opencode/opencode.json")
+        ]
     );
     // No path text from the settings reaches the card.
     let shown = format!("{others:?}{}", serde_json::to_string(&others).unwrap());
@@ -1180,43 +1176,6 @@ fn a_home_matches_by_the_platforms_case_rule() {
 
 /// Only Claude Code and Codex homes become rows. An OpenCode, Grok or Pi home T3 Code
 /// names, even a plain existing folder inside home, gets none.
-#[test]
-fn only_claude_code_and_codex_homes_become_rows() {
-    let _lock = crate::registry::data_dir_test_lock();
-    let root = std::env::temp_dir().join(format!(
-        "toolport-t3-kinds-{}-{}",
-        std::process::id(),
-        epoch_millis()
-    ));
-    let home = root.join("home");
-    std::fs::create_dir_all(home.join(".t3/userdata")).unwrap();
-    for folder in ["oc/opencode", "grok", "pi", "cc"] {
-        std::fs::create_dir_all(home.join(".t3/x").join(folder)).unwrap();
-    }
-    std::fs::write(
-        home.join(".t3/userdata/settings.json"),
-        r#"{"providerInstances": {
-            "oc": {"driver": "opencode", "environment": [{"name": "XDG_CONFIG_HOME", "value": "~/.t3/x/oc"}]},
-            "grok": {"driver": "grok", "environment": [{"name": "GROK_HOME", "value": "~/.t3/x/grok"}]},
-            "pi": {"driver": "pi", "environment": [{"name": "PI_CODING_AGENT_DIR", "value": "~/.t3/x/pi"}]},
-            "cc": {"driver": "claudeAgent", "config": {"homePath": "~/.t3/x/cc"}}}}"#,
-    )
-    .unwrap();
-    let _data = crate::registry::DataDirOverride::set(root.join("data"));
-    let _home = TestHome::set(&home);
-    // The three are read as instances, so the test is not passing by accident.
-    let found = instances();
-    for id in ["oc", "grok", "pi"] {
-        assert!(by_id(&found, id).config_path.is_some(), "{id}");
-    }
-    let types: Vec<String> = automatic(&[])
-        .into_iter()
-        .map(|row| row.client_type)
-        .collect();
-    assert_eq!(types, vec!["claude-code".to_string()]);
-    let _ = std::fs::remove_dir_all(&root);
-}
-
 /// The home text is checked as written, before `Path` drops `.` segments (S2).
 #[test]
 fn home_text_is_checked_segment_by_segment() {
@@ -1968,11 +1927,12 @@ fn an_opencode_home_with_only_jsonc_labels_its_row() {
             .collect::<Vec<_>>(),
         ["OC"]
     );
-    // A home whose only file is `opencode.jsonc`, added as a location under that name, is
-    // the location's row and not a home to add.
-    assert!(other_instances()
-        .iter()
-        .any(|other| other.instance_id == "oc2"));
+    // A home whose only file is `opencode.jsonc` is a row of its own, until it is added
+    // as a location under that name: then it is the location's row, not a second one.
+    let oc2 = std::fs::canonicalize(home.join(".oc2/opencode"))
+        .unwrap()
+        .join("opencode.json");
+    assert!(automatic(&[]).iter().any(|row| row.config_path == oc2));
     locations::remember(&locations::ClientLocation {
         id: "opencode@oc2".into(),
         manual: true,
@@ -1988,6 +1948,12 @@ fn an_opencode_home_with_only_jsonc_labels_its_row() {
         "{:?}",
         other_instances()
     );
+    let saved = locations::saved().unwrap();
+    assert!(
+        automatic(&saved).iter().all(|row| row.config_path != oc2),
+        "{:?}",
+        automatic(&saved)
+    );
     #[cfg(unix)]
     {
         let elsewhere = root.join("elsewhere.jsonc");
@@ -2001,9 +1967,9 @@ fn an_opencode_home_with_only_jsonc_labels_its_row() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The card compares a Grok, OpenCode or Pi home with the path that client's own row
-/// uses, which honors Toolport's `GROK_HOME`, `XDG_CONFIG_HOME` and
-/// `PI_CODING_AGENT_DIR`. A T3 Code instance naming that same folder has a row.
+/// A Grok, OpenCode or Pi home is compared with the path that client's own row uses,
+/// which honors Toolport's `GROK_HOME`, `XDG_CONFIG_HOME` and `PI_CODING_AGENT_DIR`. A
+/// T3 Code instance naming that same folder uses that row and gets no second one.
 #[test]
 fn a_home_that_is_the_clients_own_row_is_not_listed() {
     let _lock = crate::registry::data_dir_test_lock();
@@ -2031,11 +1997,13 @@ fn a_home_that_is_the_clients_own_row_is_not_listed() {
     .unwrap();
     let _data = crate::registry::DataDirOverride::set(root.join("data"));
     let _home = TestHome::set(&home);
-    // Without Toolport's variables each home is one to add by hand.
-    assert_eq!(other_instances().len(), 3, "{:?}", other_instances());
+    // Without Toolport's variables each home is a row of its own.
+    assert_eq!(other_instances(), Vec::new());
+    assert_eq!(automatic(&[]).len(), 3, "{:?}", automatic(&[]));
     let _grok = EnvRestore::set("GROK_HOME", &home.join(".grok-mine"));
     let _xdg = EnvRestore::set("XDG_CONFIG_HOME", &home.join(".xdg-mine"));
     let _pi = EnvRestore::set("PI_CODING_AGENT_DIR", &home.join(".pi-mine"));
+    assert!(automatic(&[]).is_empty(), "{:?}", automatic(&[]));
     assert_eq!(other_instances(), Vec::new());
     let _ = std::fs::remove_dir_all(&root);
 }

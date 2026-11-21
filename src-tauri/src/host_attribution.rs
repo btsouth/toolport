@@ -21,6 +21,8 @@
 //!   process (or npm's Node launcher, then T3 Code). That says "via T3 Code" but not which thread: one app-server serves many
 //!   threads, T3 Code puts the thread id only in Codex's shell environment, and the
 //!   `threadId` Codex sends in tool call `_meta` is Codex's own id, not T3 Code's.
+//! * OpenCode is the same: T3 Code starts one `opencode serve` per instance, which serves
+//!   every thread of it and starts MCP servers as its own children.
 //! * Nothing else is attributed: a thread id without T3 Code among the ancestors is not.
 //!
 //! T3 Code's process is its Electron executable run as Node (`process.execPath`):
@@ -96,6 +98,10 @@ pub fn is_t3_code_process_on(name: &str, os: Os) -> bool {
     }
 }
 
+/// Providers T3 Code starts itself that do not pass its thread to MCP servers: one
+/// process serves many threads (Codex's `app-server`, OpenCode's `serve`).
+const PROVIDER_STEMS: [&str; 2] = ["codex", "opencode"];
+
 fn stem(name: &str) -> String {
     let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let lower = name.to_ascii_lowercase();
@@ -127,19 +133,23 @@ pub fn detect_with(
             thread,
         });
     }
-    // T3 Code starts Codex directly, or through npm's Node launcher, which starts the
-    // native binary.
-    let codex_under_t3 = match names.as_slice() {
-        [parent, grandparent, rest @ ..] if stem(parent) == "codex" => {
+    // T3 Code starts Codex and OpenCode directly, or through npm's Node launcher, which
+    // starts the native binary.
+    let provider_under_t3 = match names.as_slice() {
+        [parent, grandparent, rest @ ..] if PROVIDER_STEMS.contains(&stem(parent).as_str()) => {
+            let provider = stem(parent);
             is_t3_code_process_on(grandparent, os)
-                || (matches!(stem(grandparent).as_str(), "codex" | "codex.js" | "node")
+                || ((stem(grandparent) == provider
+                    || stem(grandparent) == format!("{provider}.js")
+                    || stem(grandparent) == format!("{provider}.cjs")
+                    || stem(grandparent) == "node")
                     && rest
                         .first()
                         .is_some_and(|name| is_t3_code_process_on(name, os)))
         }
         _ => false,
     };
-    codex_under_t3.then(|| Host {
+    provider_under_t3.then(|| Host {
         host: T3_CODE.into(),
         thread: None,
     })
@@ -408,6 +418,41 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn opencode_is_attributed_by_its_parents_without_a_thread() {
+        for chain in [
+            vec!["opencode", "t3code"],
+            vec!["opencode", "node", "t3code"],
+            vec!["opencode", "opencode", "t3code"],
+        ] {
+            let host = detect_with(
+                env(&[]),
+                || true,
+                || chain.iter().map(|name| name.to_string()).collect(),
+            )
+            .unwrap();
+            assert_eq!(host.host, T3_CODE);
+            assert_eq!(host.thread, None);
+        }
+        // OpenCode started from a shell, or T3 Code further up, is not attributed.
+        for chain in [
+            vec!["opencode", "bash", "t3code"],
+            vec!["opencode", "bash"],
+            vec!["bash", "opencode", "t3code"],
+        ] {
+            assert_eq!(
+                detect_with(
+                    env(&[]),
+                    || true,
+                    || { chain.iter().map(|name| name.to_string()).collect() }
+                ),
+                None,
+                "{chain:?}"
+            );
+        }
     }
 
     #[test]

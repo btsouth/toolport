@@ -317,34 +317,6 @@ export function t3CodeGapLines(others: T3CodeOther[]): string[] {
         { names: names("missingHome") },
       ),
     );
-  const unlistedHome = of("unlistedHome");
-  if (unlistedHome.length > 0)
-    lines.push(
-      translate(
-        unlistedHome.length === 1
-          ? msg(
-              "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once {names}'s home folder exists, add it by hand as a client location to connect it.",
-            )
-          : msg(
-              "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once the home folders {names} use exist, add each by hand as a client location to connect it.",
-            ),
-        { names: names("unlistedHome") },
-      ),
-    );
-  const unlistedOpenCodeHome = of("unlistedOpenCodeHome");
-  if (unlistedOpenCodeHome.length > 0)
-    lines.push(
-      translate(
-        unlistedOpenCodeHome.length === 1
-          ? msg(
-              "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once {names}'s config folder exists, add the opencode folder inside it by hand as a client location to connect it.",
-            )
-          : msg(
-              "Toolport makes rows only for T3 Code's Claude Code and Codex homes. Once the config folders {names} use exist, add the opencode folder inside each by hand as a client location to connect it.",
-            ),
-        { names: names("unlistedOpenCodeHome") },
-      ),
-    );
   const unreadable = others.find((other) => other.gap === "unreadable");
   if (unreadable)
     lines.push(
