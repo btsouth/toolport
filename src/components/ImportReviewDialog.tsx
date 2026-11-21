@@ -198,12 +198,13 @@ function ImportReviewContent({
                   !env.present &&
                   !credentialInputs[item.name]?.[env.key]?.trim(),
               )
-              .map((env) =>
-                t("Enter {value0} or deselect {value1}", {
+              .map((env) => ({
+                key: `${key}:${env.key}`,
+                reason: t("Enter {value0} or deselect {value1}", {
                   value0: env.key,
                   value1: item.name,
                 }),
-              )
+              }))
           : [],
       )
     : [];
@@ -255,7 +256,11 @@ function ImportReviewContent({
         <div
           data-slot="review-list"
           className={`-my-1 flex flex-col gap-2 overflow-y-auto p-1 ${
-            keyedItems.length > 0 ? "min-h-24" : "min-h-0"
+            keyedItems.length > 1
+              ? "min-h-24"
+              : keyedItems.length === 1
+                ? "shrink-0"
+                : "min-h-0"
           }`}
         >
           {keyedItems.map(({ item, key }) => {
@@ -392,10 +397,10 @@ function ImportReviewContent({
             );
           })}
         </div>
-        {missingRequired.map((reason) => (
+        {missingRequired.map(({ key, reason }) => (
           <p
-            key={reason}
-            className="shrink-0 text-sm text-warning [overflow-wrap:anywhere]"
+            key={key}
+            className="shrink-0 text-sm text-warning [overflow-wrap:anywhere] last:pb-1"
           >
             {reason}
           </p>

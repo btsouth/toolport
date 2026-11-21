@@ -604,6 +604,15 @@ describe("ImportReviewDialog spec details", () => {
     expect(dialog.querySelector('[data-slot="dialog-footer"]')).toBeVisible();
   });
 
+  it("does not reserve extra list height for a single server", () => {
+    const single = items()[0];
+    renderDialog({ items: [single] });
+    const list = screen.getByRole("button", { name: new RegExp(single.name) })
+      .parentElement!.parentElement!;
+    expect(list).toHaveClass("overflow-y-auto", "shrink-0");
+    expect(list).not.toHaveClass("min-h-24");
+  });
+
   it("keeps the review list at a usable minimum height when credential warnings grow", () => {
     const base = items()[0];
     const many = Array.from({ length: 12 }, (_, i) => ({

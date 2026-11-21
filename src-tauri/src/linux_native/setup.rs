@@ -1144,6 +1144,9 @@ pub(super) fn review_with_notice(
         .propagate_natural_height(true)
         .visible(!unreadable)
         .build();
+    if selected.len() > 1 {
+        entries.set_min_content_height(96);
+    }
     entries.set_widget_name("toolport-setup-review-entries");
     body.append(&entries);
     body.append(&missing_reason);
@@ -3315,6 +3318,48 @@ mod tests {
         assert!(unsqueezed("toolport-setup-success-icon"));
         assert!(unsqueezed("toolport-setup-next-step"));
         win.close();
+        // Many unsatisfied required credentials must not collapse the multi-item review list.
+        let cred_item = |i: usize| SetupItem {
+            credentials: vec![crate::registry_controller::CredentialReview {
+                key: format!("TOKEN_{i}"),
+                secret: true,
+                present: false,
+                required: true,
+            }],
+            ..item(i)
+        };
+        review(
+            &parent,
+            "Warnings",
+            (0..12).map(cred_item).collect(),
+            "Config: /c",
+            "Connect",
+            true,
+            |_, _, _| Ok(Completion::default()),
+            || {},
+            None,
+        );
+        let warn_win = window_titled("Warnings").unwrap();
+        let warn_all = descendants(warn_win.upcast_ref());
+        let warn_entries: gtk::ScrolledWindow = warn_all
+            .iter()
+            .find(|w| w.widget_name() == "toolport-setup-review-entries")
+            .unwrap()
+            .clone()
+            .downcast()
+            .unwrap();
+        let warn_footer = warn_all
+            .iter()
+            .find(|w| w.has_css_class("toolport-dialog-footer"))
+            .unwrap();
+        wait_for(&|| {
+            warn_win.height() > 0
+                && warn_footer.height() > 0
+                && warn_win.height() <= parent.height() - 32
+        });
+        assert!(warn_entries.height() >= 90);
+        assert!(fits(warn_footer, warn_win.upcast_ref(), 1.0));
+        warn_win.close();
         parent.close();
     }
 }
