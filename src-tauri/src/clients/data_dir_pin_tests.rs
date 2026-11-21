@@ -300,3 +300,34 @@ fn a_data_folder_set_by_hand_is_kept() {
     assert_eq!(row.read(), after);
     assert_eq!(shown.entry_state, GatewayEntryState::Managed);
 }
+
+#[test]
+fn a_deleted_data_folder_pin_stays_deleted_across_repoint() {
+    if !cfg!(all(unix, not(target_os = "macos"))) {
+        return;
+    }
+    let row = Connected::new("pin-deleted");
+    let before = row.read();
+    assert!(before.contains("TOOLPORT_DATA_DIR"), "{before}");
+    let edited = before
+        .lines()
+        .filter(|line| !line.contains("TOOLPORT_DATA_DIR"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!edited.contains("TOOLPORT_DATA_DIR"));
+    std::fs::write(&row.file, &edited).unwrap();
+    let moved = row.data.dir.join("bin/toolport-gateway");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::write(&moved, "fixture").unwrap();
+    let shown = detect_clients_for_display_in(
+        vec![find_def(&row.id).unwrap()],
+        crate::registry::load().unwrap(),
+        Some(moved.clone()),
+    )
+    .unwrap()
+    .remove(0);
+    let after = row.read();
+    assert_eq!(after, edited, "a deleted pin leaves the entry untouched");
+    assert!(!after.contains("TOOLPORT_DATA_DIR"), "{after}");
+    assert_eq!(shown.error, None);
+}

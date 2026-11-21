@@ -11,8 +11,9 @@ Entries before the rename below shipped under the project's former name, Conduit
 - On Linux, a T3 Code OpenCode instance, or any client run with its own
   `XDG_CONFIG_HOME`, no longer starts Toolport with an empty server list. Rows
   that are not a client's main config now name Toolport's data folder in their
-  entry when you connect them. Rows you connected before are left as they are;
-  disconnect and connect one again if its client shows no servers. A data
+  entry when you connect them. Rows you connected before get it the next time
+  Toolport rewrites their entry (for example after an update moves the gateway);
+  disconnect and connect one again to add it now. A data
   folder you set in such an entry yourself stays as you set it.
 
 ## [2.3.8] - 2026-11-19

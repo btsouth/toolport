@@ -9213,6 +9213,12 @@ fn keep_foreign_data_dir_pin(
     record: Option<&ManagedEntry>,
 ) -> bool {
     let Some(prior) = entry_env_value(format, text, entry_name, DATA_DIR_ENV) else {
+        if record
+            .and_then(|record| record.env.get(DATA_DIR_ENV))
+            .is_some_and(|written| !written.is_empty())
+        {
+            entry.env.retain(|var| var.key != DATA_DIR_ENV);
+        }
         return false;
     };
     if record.and_then(|record| record.env.get(DATA_DIR_ENV)) == Some(&prior) {
@@ -10789,6 +10795,7 @@ fn repoint_stale_gateways_in(
                             .iter()
                             .find(|s| s.name == entry_name)
                             .ok_or("Gateway disappeared during identity repair")?;
+                        let had_record = managed.contains_key(&client.id);
                         let mut managed = managed
                             .get(&client.id)
                             .cloned()
@@ -10801,6 +10808,8 @@ fn repoint_stale_gateways_in(
                         // Only the identity was added to the file, not a data folder.
                         if !server.env_keys.iter().any(|key| key == DATA_DIR_ENV) {
                             managed.env.remove(DATA_DIR_ENV);
+                        } else if !had_record {
+                            managed.env.insert(DATA_DIR_ENV.into(), String::new());
                         }
                         managed
                             .env

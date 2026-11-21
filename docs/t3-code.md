@@ -51,9 +51,10 @@ elsewhere is never read.
 On Linux, a T3 Code home's entry names Toolport's data folder
 (`TOOLPORT_DATA_DIR`), because some providers, such as OpenCode, pass their own
 `XDG_CONFIG_HOME` to MCP servers and the gateway would look for its data there.
-Toolport replaces that value only when it wrote it itself, for example after its
-data folder was renamed. A folder you set by hand, or one another Toolport on its
-own data folder wrote, stays as it is. Some limits:
+Toolport adds it when you connect the row, or on a later rewrite of an older
+entry. Toolport replaces that value only when it wrote it itself, for example
+after its data folder was renamed. A folder you set by hand, or one another
+Toolport on its own data folder wrote, stays as it is. Some limits:
 
 - On macOS the entry gets no data folder. A client run there with its own `HOME`
   starts the gateway without your servers. Windows is not affected.
