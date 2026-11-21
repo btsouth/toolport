@@ -373,7 +373,6 @@
   "Import selected servers": "Import selected servers",
   "Import setup…": "Import setup…",
   "Import this Toolport setup?": "Import this Toolport setup?",
-  "Import {value0}": "Import {value0}",
   "Import, export and setup": "Import, export and setup",
   "Imported {value0} server. It stays off until you turn it on in Servers.": "Imported {value0} server. It stays off until you turn it on in Servers.",
   "Imported {value0} servers. Check their status under Servers.": "Imported {value0} servers. Check their status under Servers.",
@@ -1208,5 +1207,6 @@
   "Show all {value0} entries": "Show all {value0} entries",
   "Import as {value0}": "Import as {value0}",
   "Open the review to check whether this is already in Toolport.": "Open the review to check whether this is already in Toolport.",
-  "{value0} is already in Toolport.": "{value0} is already in Toolport."
+  "{value0} is already in Toolport.": "{value0} is already in Toolport.",
+  "Paste a setup to review it.": "Paste a setup to review it."
 }

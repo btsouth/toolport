@@ -373,7 +373,6 @@
   "Import selected servers": "导入选定的服务器",
   "Import setup…": "导入设置...",
   "Import this Toolport setup?": "导入此 Toolport 设置吗？",
-  "Import {value0}": "导入{value0}",
   "Import, export and setup": "导入、导出和设置",
   "Imported {value0} server. It stays off until you turn it on in Servers.": "已导入 {value0} 个服务器。在“服务器”中开启前，它会保持关闭。",
   "Imported {value0} servers. Check their status under Servers.": "已导入 {value0} 个服务器。可在“服务器”中查看其状态。",
@@ -1208,5 +1207,6 @@
   "Show all {value0} entries": "显示全部 {value0} 条记录",
   "Import as {value0}": "导入为 {value0}",
   "Open the review to check whether this is already in Toolport.": "打开审核，检查它是否已在 Toolport 中。",
-  "{value0} is already in Toolport.": "{value0} 已在 Toolport 中。"
+  "{value0} is already in Toolport.": "{value0} 已在 Toolport 中。",
+  "Paste a setup to review it.": "粘贴设置后即可查看。"
 }

@@ -3132,11 +3132,18 @@ fn deliver_shared_import(handle: &tauri::AppHandle, id: String) {
     let _ = handle.emit("import-shared", id);
 }
 
-/// Import a shared setup. Adds servers not already present (by name); secret
-/// values are never included, so each new server is left for the user to vault.
+/// Import a shared setup. Adds servers not already present (by name), or only
+/// the reviewed names in `selected`; secret values are never included, so each
+/// new server is left for the user to vault.
 #[tauri::command]
-fn import_config(state: State<RegistryState>, json: String) -> Result<Registry, String> {
-    let (reg, _) = write_registry(state.inner(), |reg| apply_import(reg, &json))?;
+fn import_config(
+    state: State<RegistryState>,
+    json: String,
+    selected: Option<Vec<String>>,
+) -> Result<Registry, String> {
+    let (reg, _) = write_registry(state.inner(), |reg| {
+        apply_import(reg, &json, selected.as_deref())
+    })?;
     Ok(reg)
 }
 
@@ -3221,8 +3228,8 @@ fn preview_import(state: State<RegistryState>, json: String) -> Result<Vec<Impor
     struct Doc {
         servers: Vec<ServerEntry>,
     }
-    let doc: Doc = serde_json::from_str(&json)
-        .map_err(|e| format!("That doesn't look like a Toolport setup: {e}"))?;
+    let doc: Doc =
+        serde_json::from_str(&json).map_err(|e| crate::sharing_controller::not_a_setup(&e))?;
     let reg = state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3265,9 +3272,10 @@ fn build_export(
 }
 
 /// Merge a shared setup into the registry: add servers not already present (by
-/// name, case-insensitive), stripping any secret values. Pure (no Tauri state).
-fn apply_import(reg: &mut Registry, json: &str) -> Result<(), String> {
-    crate::sharing_controller::apply_import(reg, json)?;
+/// name, case-insensitive), or only the `selected` names, stripping any secret
+/// values. Pure (no Tauri state).
+fn apply_import(reg: &mut Registry, json: &str, selected: Option<&[String]>) -> Result<(), String> {
+    crate::sharing_controller::apply_import_selected(reg, json, selected)?;
     Ok(())
 }
 
@@ -6683,7 +6691,7 @@ mod tests {
         });
         let json = serde_json::to_string(&build_export(&reg, None, None, None)).unwrap();
         let mut recipient = Registry::default();
-        apply_import(&mut recipient, &json).unwrap();
+        apply_import(&mut recipient, &json, None).unwrap();
         let imported = recipient
             .servers
             .iter()
@@ -6697,6 +6705,22 @@ mod tests {
     }
 
     #[test]
+    fn import_keeps_only_the_reviewed_names() {
+        let mut reg = Registry::default();
+        let doc = r#"{"kind":"conduit-setup","version":1,"servers":[
+            {"name":"Linear","transport":"stdio","command":"npx"},
+            {"name":"Stripe","transport":"http","url":"https://x"}
+        ]}"#;
+        apply_import(&mut reg, doc, Some(&["stripe".to_string()])).unwrap();
+        let names = reg
+            .servers
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Stripe"]);
+    }
+
+    #[test]
     fn import_dedups_by_name_and_nulls_secrets() {
         let mut reg = Registry::default();
         reg.add_server(github_with_secret());
@@ -6705,7 +6729,7 @@ mod tests {
             {"name":"Stripe","transport":"http","url":"https://x",
              "env":[{"key":"K","value":"shh","secret":true}]}
         ]}"#;
-        apply_import(&mut reg, doc).unwrap();
+        apply_import(&mut reg, doc, None).unwrap();
 
         // "github" is deduped case-insensitively; only Stripe is added.
         assert_eq!(
@@ -6723,7 +6747,7 @@ mod tests {
     #[test]
     fn import_rejects_garbage() {
         let mut reg = Registry::default();
-        assert!(apply_import(&mut reg, "{not json").is_err());
+        assert!(apply_import(&mut reg, "{not json", None).is_err());
     }
 
     #[test]

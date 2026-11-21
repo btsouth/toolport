@@ -12,6 +12,8 @@ const mocks = vi.hoisted(() => ({
   shareStack: vi.fn(),
   success: vi.fn(),
   toastError: vi.fn(),
+  open: vi.fn(),
+  save: vi.fn(),
 }));
 
 vi.mock("sonner", () => ({ toast: { success: mocks.success } }));
@@ -28,8 +30,13 @@ vi.mock("@/lib/api", () => ({
   takePendingShared: vi.fn().mockResolvedValue(null),
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({
-  open: vi.fn(),
-  save: vi.fn(),
+  open: mocks.open,
+  save: mocks.save,
+}));
+vi.mock("@tauri-apps/api/path", () => ({
+  downloadDir: vi.fn().mockResolvedValue("/home/u/Downloads"),
+  homeDir: vi.fn().mockResolvedValue("/home/u"),
+  join: vi.fn((...parts: string[]) => Promise.resolve(parts.join("/"))),
 }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi
@@ -250,10 +257,164 @@ describe("ShareDialog share links", () => {
       ]),
     );
 
-    const duplicateButtons = screen.getAllByRole("button", { name: "Duplicate" });
-    await userEvent.click(duplicateButtons[0]);
+    // Same-name servers show their ids so the two can be told apart, as in GTK.
+    const first = screen.getByRole("button", { name: "Duplicate (duplicate-a)" });
+    expect(screen.getByRole("button", { name: "Duplicate (duplicate-b)" })).toBeVisible();
+    expect(first).toHaveAttribute("aria-pressed", "true");
+    await userEvent.click(first);
+    expect(first).toHaveAttribute("aria-pressed", "false");
     await waitFor(() =>
       expect(mocks.exportConfig).toHaveBeenLastCalledWith("", "", ["duplicate-b"]),
+    );
+  });
+
+  it("says why the share actions are off with nothing selected", async () => {
+    mocks.getRegistry.mockResolvedValue({
+      servers: [{ id: "linear", name: "Linear", transport: "stdio" }],
+    });
+    render(<ShareDialog trigger={<button>Share</button>} onImported={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Share" }));
+    const create = await screen.findByRole("button", { name: /create share link/i });
+    await waitFor(() => expect(create).toBeEnabled());
+    expect(create).not.toHaveAttribute("title");
+    // One right-aligned row, as GTK's footer: the exports, then the primary.
+    const row = create.parentElement!;
+    expect(row).toHaveClass("justify-end");
+    expect(
+      Array.from(row.querySelectorAll("button")).map((b) => b.textContent?.trim()),
+    ).toEqual(["Copy", "Save to file", "Create share link"]);
+    const reason = "Select at least one server to share.";
+    expect(screen.queryByText(reason, { selector: "p" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "None" }));
+    // The reason is a line by the buttons, not only a tooltip.
+    expect(screen.getByText(reason, { selector: "p" })).toBeVisible();
+    for (const name of [/create share link/i, /^copy$/i, /save to file/i]) {
+      const button = screen.getByRole("button", { name });
+      expect(button).toBeDisabled();
+      expect(button).toHaveAttribute("title", "Select at least one server to share.");
+    }
+    // A disabled button takes no hover, so its row shows the tooltip.
+    expect(create.parentElement).toHaveAttribute(
+      "title",
+      "Select at least one server to share.",
+    );
+  });
+
+  it("leads a failed paste with what to do before the parser detail", async () => {
+    mocks.previewImport.mockRejectedValueOnce(
+      "That doesn't look like a Toolport setup. The text isn't JSON.",
+    );
+    render(<ShareDialog trigger={<button>Share</button>} onImported={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Share" }));
+    fireEvent.change(screen.getByLabelText("Paste a shared setup"), {
+      target: { value: "{x" },
+    });
+    const review = screen.getByRole("button", { name: /review and import/i });
+    // Load from file, then the one primary, at the right as in GTK.
+    expect(review.parentElement).toHaveClass("justify-end");
+    expect(review.parentElement!.lastElementChild).toBe(review);
+    await userEvent.click(review);
+    // An error on the field shows under it, not as a toast.
+    const error = await screen.findByRole("alert");
+    expect(error).toHaveTextContent(
+      "Couldn't read the pasted setup. Check that you copied all of it, then try again.",
+    );
+    expect(error).toHaveTextContent(
+      "That doesn't look like a Toolport setup. The text isn't JSON.",
+    );
+    const field = screen.getByLabelText("Paste a shared setup");
+    expect(field).toHaveAttribute("aria-describedby", error.id);
+    expect(field.nextElementSibling).toBe(error);
+    expect(mocks.toastError).not.toHaveBeenCalled();
+    fireEvent.change(field, { target: { value: "{}" } });
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("starts both choosers in Downloads and offers every file after setup files", async () => {
+    mocks.open.mockResolvedValue(null);
+    mocks.save.mockResolvedValue(null);
+    mocks.getRegistry.mockResolvedValue({
+      servers: [{ id: "linear", name: "Linear", transport: "stdio" }],
+    });
+    render(<ShareDialog trigger={<button>Share</button>} onImported={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Share" }));
+    const save = await screen.findByRole("button", { name: /save to file/i });
+    await waitFor(() => expect(save).toBeEnabled());
+    await userEvent.click(save);
+    await userEvent.click(screen.getByRole("button", { name: /load from file/i }));
+    const filters = [
+      { name: "Toolport setup", extensions: ["json"] },
+      { name: "All files", extensions: ["*"] },
+    ];
+    await waitFor(() =>
+      expect(mocks.open).toHaveBeenCalledWith(
+        expect.objectContaining({ filters, defaultPath: "/home/u/Downloads" }),
+      ),
+    );
+    expect(mocks.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        filters,
+        defaultPath: "/home/u/Downloads/toolport-setup.json",
+      }),
+    );
+  });
+
+  it("imports only the servers left checked and follows every toggle", async () => {
+    const server = (name: string, isNew = true) => ({
+      name,
+      transport: "stdio" as const,
+      command: "npx",
+      args: [],
+      url: null,
+      isNew,
+    });
+    mocks.previewImport.mockResolvedValue([
+      server("Linear"),
+      server("GitHub"),
+      server("Stripe", false),
+    ]);
+    render(<ShareDialog trigger={<button>Share</button>} onImported={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Share" }));
+    fireEvent.change(screen.getByLabelText("Paste a shared setup"), {
+      target: { value: '{"servers":[]}' },
+    });
+    await userEvent.click(screen.getByRole("button", { name: /review and import/i }));
+    expect(await screen.findByRole("button", { name: "Import 2 servers" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /Stripe/ })).toBeDisabled();
+    const linear = screen.getByRole("button", { name: /Linear/ });
+    expect(linear).toHaveAttribute("aria-pressed", "true");
+    await userEvent.click(linear);
+    expect(linear).toHaveAttribute("aria-pressed", "false");
+    await userEvent.click(screen.getByRole("button", { name: /GitHub/ }));
+    expect(screen.getByRole("button", { name: "Select a server" })).toBeDisabled();
+    await userEvent.click(screen.getByRole("button", { name: /GitHub/ }));
+    await userEvent.click(screen.getByRole("button", { name: "Import 1 server" }));
+    await waitFor(() =>
+      expect(mocks.importConfig).toHaveBeenCalledWith('{"servers":[]}', ["GitHub"]),
+    );
+  });
+
+  it("explains a setup whose servers are all present", async () => {
+    mocks.previewImport.mockResolvedValue([
+      {
+        name: "Stripe",
+        transport: "stdio" as const,
+        command: "npx",
+        args: [],
+        url: null,
+        isNew: false,
+      },
+    ]);
+    render(<ShareDialog trigger={<button>Share</button>} onImported={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Share" }));
+    fireEvent.change(screen.getByLabelText("Paste a shared setup"), {
+      target: { value: '{"servers":[]}' },
+    });
+    await userEvent.click(screen.getByRole("button", { name: /review and import/i }));
+    const button = await screen.findByRole("button", { name: "Nothing new to import" });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAccessibleDescription(
+      "Every server in this setup is already present, so there is nothing to import.",
     );
   });
 

@@ -386,7 +386,16 @@ jobs:
             tests::connect_shows_reacts_restart_reminder \
             details::tests::b5_credential_save_reprobes_unchanged_detail_without_refresh \
             setup::tests::review_list_caps_at_parent_height_and_keeps_footer_visible \
-            setup::tests::import_review_shows_saved_names_and_marks_unsupported_for_review
+            setup::tests::import_review_shows_saved_names_and_marks_unsupported_for_review \
+            setup::tests::review_rows_show_markup_characters_as_text \
+            setup_import_share_tests::import_selection_count_tracks_zero_one_and_many \
+            setup_import_share_tests::setup_import_review_names_checks_follows_toggles_and_clears_progress \
+            setup_import_share_tests::client_import_review_clears_the_scan_line \
+            setup_import_share_tests::paste_import_starts_in_the_editor_and_needs_text \
+            setup_import_share_tests::share_actions_stay_pinned_and_need_a_server \
+            setup_import_share_tests::setup_file_dialogs_start_in_downloads_and_list_setups_first \
+            setup::tests::successful_review_shows_restart_and_only_done \
+            setup::tests::a_review_closed_while_connecting_only_refreshes
           do
             xvfb-run -a dbus-run-session -- cargo test \
               --manifest-path src-tauri/Cargo.toml --no-default-features \
