@@ -64,6 +64,8 @@ pub(crate) use restore::after_capture_conflict as record_config_capture_conflict
 pub(crate) use restore::after_rollback as record_config_rollback;
 #[cfg(test)]
 mod codex_settings_tests;
+#[cfg(test)]
+mod data_dir_pin_tests;
 pub(crate) mod nanobot;
 pub(crate) mod openclaw;
 mod openhands;
@@ -646,8 +648,17 @@ fn client_gateway_entry_needs_rewrite(
     current: &str,
     config_text: Option<&str>,
     handled: &[String],
+    record: Option<&ManagedEntry>,
 ) -> bool {
     gateway_entry_needs_rewrite(entry_name, stored_command, current, config_text)
+        || data_dir_pin_is_stale(
+            client_id,
+            || find_def(client_id).map(|def| def.format),
+            entry_name,
+            stored_command,
+            config_text,
+            record,
+        )
         || (command_is_gateway_binary(stored_command)
             && !codex_entry_missing_settings(client_id, entry_name, config_text, handled, false)
                 .is_empty())
@@ -9124,9 +9135,158 @@ fn files_have_same_bytes(a: &std::path::Path, b: &std::path::Path) -> bool {
     }
 }
 
+/// The variable that names the gateway's data folder outright.
+const DATA_DIR_ENV: &str = "TOOLPORT_DATA_DIR";
+
+/// The data folder a gateway entry names for `client_id`, or `None` when the entry
+/// leaves it to the gateway.
+///
+/// On Linux and the BSDs the gateway finds its data folder through `XDG_CONFIG_HOME`.
+/// A location row (any row that is not a client's main config, such as a T3 Code
+/// home or a folder added by hand) is a client run with its own home, and some of
+/// those homes set their own `XDG_CONFIG_HOME` (T3 Code's OpenCode instances, which
+/// pass it on to MCP servers). The gateway would then open an empty registry, so
+/// these entries name this Toolport's folder. Main rows run in the user's own
+/// environment and stay as they are, so no existing entry changes. macOS and Windows
+/// never read `XDG_CONFIG_HOME` for it, and on Windows an explicit folder would skip
+/// the redirect check a gateway inside a packaged app needs, so nothing is pinned there.
+pub(crate) fn pinned_data_dir(client_id: &str) -> Option<String> {
+    if !cfg!(all(unix, not(target_os = "macos"))) || !client_id.contains('@') {
+        return None;
+    }
+    // A relative folder would be read against the client's working directory.
+    crate::registry::conduit_dir()
+        .filter(|dir| dir.is_absolute())
+        .and_then(|dir| dir.to_str().map(str::to_string))
+}
+
+/// The environment Toolport's gateway entry for `client_id` carries, for tests that
+/// start the gateway the way a client would.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn gateway_entry_env(client_id: &str) -> Vec<(String, String)> {
+    gateway_entry_env_vars(None, client_id)
+        .into_iter()
+        .filter_map(|var| Some((var.key, var.value?)))
+        .collect()
+}
+
+/// Whether a location row's entry names a data folder other than this Toolport's,
+/// as after the `Conduit` folder was renamed. Only a pin this Toolport wrote (its
+/// ownership record holds the same value) counts: a pin from another Toolport on its
+/// own data folder, or one the user set by hand, is theirs and stays. An entry
+/// without a pin is left alone.
+fn data_dir_pin_is_stale(
+    client_id: &str,
+    format: impl FnOnce() -> Option<Format>,
+    entry_name: &str,
+    stored_command: &str,
+    config_text: Option<&str>,
+    record: Option<&ManagedEntry>,
+) -> bool {
+    let Some(written) = record
+        .and_then(|record| record.env.get(DATA_DIR_ENV))
+        .filter(|written| !written.is_empty())
+    else {
+        return false;
+    };
+    // Only location rows carry a pin; read the entry before resolving the data folder.
+    if !client_id.contains('@') || !command_is_gateway_binary(stored_command) {
+        return false;
+    }
+    // Entries without the key anywhere in the file need no parse or location lookup.
+    let Some(pinned) = config_text
+        .filter(|text| text.contains(DATA_DIR_ENV))
+        .and_then(|text| {
+            format().and_then(|format| entry_env_value(format, text, entry_name, DATA_DIR_ENV))
+        })
+    else {
+        return false;
+    };
+    pinned == *written && pinned_data_dir(client_id).is_some_and(|current| pinned != current)
+}
+
+/// Keep a pin in `entry` that the file had and this Toolport did not write, when a
+/// scan or start-up pass rewrites the entry for another reason. Returns whether it did.
+fn keep_foreign_data_dir_pin(
+    entry: &mut ServerEntry,
+    format: Format,
+    text: &str,
+    entry_name: &str,
+    record: Option<&ManagedEntry>,
+) -> bool {
+    let Some(prior) = entry_env_value(format, text, entry_name, DATA_DIR_ENV) else {
+        if record
+            .and_then(|record| record.env.get(DATA_DIR_ENV))
+            .is_some_and(|written| !written.is_empty())
+        {
+            entry.env.retain(|var| var.key != DATA_DIR_ENV);
+        }
+        return false;
+    };
+    if !prior.is_empty() && record.and_then(|record| record.env.get(DATA_DIR_ENV)) == Some(&prior) {
+        return false;
+    }
+    entry.env.retain(|var| var.key != DATA_DIR_ENV);
+    entry.env.push(crate::registry::EnvVar {
+        key: DATA_DIR_ENV.into(),
+        value: Some(prior),
+        secret: false,
+        unknown_fields: Default::default(),
+    });
+    true
+}
+
+/// The string value of `key` in the environment of the entry named `name`, read from
+/// the parsed config (not by searching the text, which may quote the name elsewhere).
+fn entry_env_value(format: Format, text: &str, name: &str, key: &str) -> Option<String> {
+    let value = mutation::value(format, Some(text)).ok()?;
+    let container = moved::server_container(format, &value);
+    let entry = if matches!(format, Format::YamlMcpServersList) {
+        container
+            .as_array()?
+            .iter()
+            .find(|entry| entry["name"] == name)?
+    } else {
+        container.get(name)?
+    };
+    let env_key = match format {
+        Format::JsonOpenCodeMcp => "environment",
+        Format::YamlExtensions => "envs",
+        _ => "env",
+    };
+    entry[env_key].get(key)?.as_str().map(str::to_string)
+}
+
 fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, String> {
     let path =
         resolve_gateway_path_for_launch()?.ok_or("Could not locate the toolport-gateway binary")?;
+    let env = gateway_entry_env_vars(profile, client_id);
+    let unknown_fields = gateway_entry_client_fields(client_id);
+    Ok(ServerEntry {
+        enabled: false,
+        inherit_env: false,
+        id: GATEWAY_ENTRY_NAME.to_string(),
+        name: GATEWAY_ENTRY_NAME.to_string(),
+        transport: "stdio".to_string(),
+        command: Some(path.to_string_lossy().into_owned()),
+        args: Vec::new(),
+        env,
+        url: None,
+        source: Some("toolport".to_string()),
+        disabled_tools: Vec::new(),
+        hide_prompts: false,
+        cwd: None,
+        client_credentials: None,
+        request_timeout_ms: None,
+        initialize_timeout_ms: None,
+        launch: None,
+        unknown_fields,
+    })
+}
+
+/// The environment of Toolport's gateway entry for `client_id`.
+fn gateway_entry_env_vars(profile: Option<&str>, client_id: &str) -> Vec<crate::registry::EnvVar> {
     let env_var = |k: &str, v: &str| crate::registry::EnvVar {
         key: k.to_string(),
         value: Some(v.to_string()),
@@ -9155,27 +9315,10 @@ fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, 
     if let Some(p) = profile.map(str::trim).filter(|p| !p.is_empty()) {
         env.push(env_var(crate::brand::PROFILE, p));
     }
-    let unknown_fields = gateway_entry_client_fields(client_id);
-    Ok(ServerEntry {
-        enabled: false,
-        inherit_env: false,
-        id: GATEWAY_ENTRY_NAME.to_string(),
-        name: GATEWAY_ENTRY_NAME.to_string(),
-        transport: "stdio".to_string(),
-        command: Some(path.to_string_lossy().into_owned()),
-        args: Vec::new(),
-        env,
-        url: None,
-        source: Some("toolport".to_string()),
-        disabled_tools: Vec::new(),
-        hide_prompts: false,
-        cwd: None,
-        client_credentials: None,
-        request_timeout_ms: None,
-        initialize_timeout_ms: None,
-        launch: None,
-        unknown_fields,
-    })
+    if let Some(dir) = pinned_data_dir(client_id) {
+        env.push(env_var(DATA_DIR_ENV, &dir));
+    }
+    env
 }
 
 fn main_location_identity_changed(id: &str, prior: Option<&str>) -> bool {
@@ -9694,6 +9837,7 @@ pub fn install_gateway_for(
     keep: Option<&[String]>,
 ) -> Result<WriteOutcome, String> {
     let mut entry = gateway_entry(profile, client_id)?;
+    let mut kept_pin = false;
     if let Some(handled) = keep {
         let def = find_def(client_id).ok_or("Unknown client")?;
         let path = resolved_definition_path(&def)?;
@@ -9710,8 +9854,20 @@ pub fn install_gateway_for(
             handled,
             &mut entry,
         );
+        let record = crate::registry::load()
+            .ok()
+            .and_then(|mut reg| reg.client_managed_entries.remove(client_id));
+        kept_pin = text.as_deref().is_some_and(|text| {
+            keep_foreign_data_dir_pin(&mut entry, def.format, text, &entry_name, record.as_ref())
+        });
     }
-    install_or_remove(client_id, Some(&entry))
+    let mut write = install_or_remove(client_id, Some(&entry))?;
+    if kept_pin {
+        if let Some(record) = write.managed.as_mut() {
+            record.env.insert(DATA_DIR_ENV.into(), String::new());
+        }
+    }
+    Ok(write)
 }
 
 /// Limit the Codex defaults in a rebuilt gateway `entry` to the ones a rewrite that is
@@ -10592,6 +10748,7 @@ fn repoint_stale_gateways_in(
                 current,
                 config_text.as_deref(),
                 handled,
+                managed.get(&client.id),
             )
             && entry
                 .env_keys
@@ -10641,6 +10798,7 @@ fn repoint_stale_gateways_in(
                             current,
                             config_text.as_deref(),
                             handled,
+                            managed.get(&client.id),
                         )
                     {
                         backfill_gateway_identity(&def, &path, entry_name, &client.id)?;
@@ -10653,6 +10811,7 @@ fn repoint_stale_gateways_in(
                             .iter()
                             .find(|s| s.name == entry_name)
                             .ok_or("Gateway disappeared during identity repair")?;
+                        let had_record = managed.contains_key(&client.id);
                         let mut managed = managed
                             .get(&client.id)
                             .cloned()
@@ -10661,6 +10820,12 @@ fn repoint_stale_gateways_in(
                         managed.args = server.args.clone();
                         for key in &server.env_keys {
                             managed.env.entry(key.clone()).or_default();
+                        }
+                        // Only the identity was added to the file, not a data folder.
+                        if !server.env_keys.iter().any(|key| key == DATA_DIR_ENV) {
+                            managed.env.remove(DATA_DIR_ENV);
+                        } else if !had_record {
+                            managed.env.insert(DATA_DIR_ENV.into(), String::new());
                         }
                         managed
                             .env
@@ -10689,17 +10854,35 @@ fn repoint_stale_gateways_in(
                         let mut entry =
                             repair_gateway_entry(def.format, &path, entry_name, &client.id)?;
                         entry.command = Some(current.to_string());
+                        let text = read_config_file(&path).ok();
                         // A repair is not a Connect: it adds only the Codex settings a
                         // launch would add, so a handled key stays as the user left it
                         // and an entry without a record keeps its removals.
                         keep_only_missing_codex_settings(
                             &client.id,
                             entry_name,
-                            read_config_file(&path).ok().as_deref(),
+                            text.as_deref(),
                             handled,
                             &mut entry,
                         );
-                        install_or_remove(&client.id, Some(&entry))
+                        // Nor does it move a data folder pin this Toolport did not write.
+                        let kept_pin = text.as_deref().is_some_and(|text| {
+                            keep_foreign_data_dir_pin(
+                                &mut entry,
+                                def.format,
+                                text,
+                                entry_name,
+                                managed.get(&client.id),
+                            )
+                        });
+                        let mut write = install_or_remove(&client.id, Some(&entry))?;
+                        // Owned, but not a value this Toolport wrote, so never stale.
+                        if kept_pin {
+                            if let Some(record) = write.managed.as_mut() {
+                                record.env.insert(DATA_DIR_ENV.into(), String::new());
+                            }
+                        }
+                        Ok(write)
                     }
                 })
             });
@@ -11400,6 +11583,14 @@ mod tests {
             );
             assert_eq!(
                 after["mcpServers"]["toolport"]["env"]["TOOLPORT_CLIENT_ID"], id,
+                "{mode}"
+            );
+            // A rewrite names the data folder; adding only the identity does not.
+            assert_eq!(
+                after["mcpServers"]["toolport"]["env"]
+                    .get(DATA_DIR_ENV)
+                    .is_some(),
+                stale && cfg!(all(unix, not(target_os = "macos"))),
                 "{mode}"
             );
             assert_eq!(
@@ -14301,6 +14492,7 @@ bad = "not-a-table"
                 current,
                 Some(text),
                 &[],
+                None,
             )
         };
         // Keys Toolport handled before never trigger a repair again.
@@ -14312,6 +14504,7 @@ bad = "not-a-table"
             current,
             Some(&lacking),
             &all_handled,
+            None,
         ));
         assert!(needs("codex", current, &lacking));
         assert!(needs("codex@work", current, &lacking));
@@ -14331,6 +14524,7 @@ bad = "not-a-table"
             current,
             None,
             &[],
+            None,
         ));
     }
 
