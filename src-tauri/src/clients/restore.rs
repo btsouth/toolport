@@ -415,8 +415,8 @@ fn rebase_value(baseline: &mut Value, native: &Value, path: &[String]) {
 }
 
 /// Whether a changed `path` is one of the [`client_entry_settings`] inside Toolport's
-/// gateway entry, such as Pi's `enabled` or Antigravity's `disabled`, or a value
-/// nested in one, such as one tool in Pi's `toolExposure`.
+/// gateway entry, such as Pi's `enabled`, or a value nested in one, such as one tool
+/// in Pi's `toolExposure`.
 fn client_setting_in_gateway(client_id: &str, format: Format, path: &[String]) -> bool {
     matches!(path, [container, name, field, ..]
         if container == key(format)
