@@ -165,10 +165,8 @@ fn connect_and_disconnect_touch_only_mcp_config_json() {
         serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
     assert_eq!(doc["mcpServers"]["notes"]["disabled"], true);
     let entry = &doc["mcpServers"]["toolport"];
-    assert!(entry["command"]
-        .as_str()
-        .unwrap()
-        .ends_with("toolport-gateway"));
+    let expected_bin = format!("toolport-gateway{}", std::env::consts::EXE_SUFFIX);
+    assert!(entry["command"].as_str().unwrap().ends_with(&expected_bin));
     assert!(entry["env"]["TOOLPORT_CLIENT_ID"]
         .as_str()
         .unwrap()
