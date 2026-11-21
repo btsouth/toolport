@@ -531,9 +531,14 @@ fn with_client_settings(
     };
     let Some(prior) = root["mcpServers"].as_object().and_then(|servers| {
         servers
-            .iter()
-            .find(|(name, value)| gateway_edit_matches(name, value["command"].as_str()))
-            .map(|(_, value)| value)
+            .get(GATEWAY_ENTRY_NAME)
+            .filter(|value| gateway_edit_matches(GATEWAY_ENTRY_NAME, value["command"].as_str()))
+            .or_else(|| {
+                servers
+                    .iter()
+                    .find(|(name, value)| gateway_edit_matches(name, value["command"].as_str()))
+                    .map(|(_, value)| value)
+            })
     }) else {
         return entry;
     };

@@ -1226,11 +1226,16 @@ fn jsonc_twin(config: &Path) -> Option<PathBuf> {
 /// For an OpenCode `opencode.json` path, whether the `opencode.jsonc` beside it is absent
 /// or a plain file reached without a link, since OpenCode reads that one when only it
 /// exists. Any other path passes.
-fn opencode_jsonc_is_plain(config: &Path) -> bool {
+pub(super) fn opencode_jsonc_is_plain(config: &Path) -> bool {
     let Some(twin) = jsonc_twin(config) else {
         return true;
     };
-    home().is_some_and(|home| walk_below_home(&twin, &home) == HomeWalk::Plain)
+    home().is_some_and(|home| {
+        walk_below_home(&twin, &home) == HomeWalk::Plain
+            || std::fs::canonicalize(&home)
+                .ok()
+                .is_some_and(|root| walk_below_home(&twin, &root) == HomeWalk::Plain)
+    })
 }
 
 fn default_config_path(provider: Provider) -> Option<PathBuf> {

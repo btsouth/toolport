@@ -141,6 +141,7 @@ pub fn detect_with(
             is_t3_code_process_on(grandparent, os)
                 || ((stem(grandparent) == provider
                     || stem(grandparent) == format!("{provider}.js")
+                    || stem(grandparent) == format!("{provider}.cjs")
                     || stem(grandparent) == "node")
                     && rest
                         .first()
