@@ -76,8 +76,7 @@ export interface T3CodeOther {
   providerName: string;
   displayName: string;
   enabled: boolean;
-  /** `unsupported`: no Toolport client yet. `privateHome`: T3 Code gives it a private
-   * settings folder (Antigravity). `unreadable`: T3 Code's settings file can't be read.
+  /** `unsupported`: no Toolport client yet. `unreadable`: T3 Code's settings file can't be read.
    * `malformed`: this instance's entry or config can't be read. `hiddenHome`: its home
    * folder variable is sensitive or not plain text. `relativeHome`: its home folder is a
    * relative path. `outsideHome`: its home folder isn't inside the user's home (judged by
@@ -86,7 +85,6 @@ export interface T3CodeOther {
    * empty when the driver can't be shown. */
   gap:
     | "unsupported"
-    | "privateHome"
     | "unreadable"
     | "malformed"
     | "hiddenHome"

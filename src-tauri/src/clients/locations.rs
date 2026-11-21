@@ -78,7 +78,7 @@ pub(super) fn t3_location_name(client_type: &str, config: &Path) -> String {
             let rest = folder.strip_prefix(&root).ok()?;
             let parts: Vec<String> = rest
                 .components()
-                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .map(|part| short_hash(&part.as_os_str().to_string_lossy()))
                 .collect();
             Some(format!("~/{}", parts.join("/")))
         })
@@ -95,6 +95,16 @@ pub(super) fn t3_location_name(client_type: &str, config: &Path) -> String {
         .take(80)
         .collect();
     format!("{kind} ({shown})")
+}
+
+/// A folder named by a SHA-256 hash, such as T3 Code's Antigravity profiles, by its first
+/// eight characters; any other name as it is.
+fn short_hash(name: &str) -> String {
+    if name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+        name[..8].to_string()
+    } else {
+        name.to_string()
+    }
 }
 
 /// A home found only because T3 Code lists it. Listed again on each refresh while T3 Code

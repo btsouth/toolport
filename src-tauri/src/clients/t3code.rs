@@ -35,6 +35,7 @@ pub(super) enum Provider {
     Kiro,
     Grok,
     Pi,
+    Antigravity,
 }
 
 impl Provider {
@@ -47,6 +48,7 @@ impl Provider {
             "kiro" => Self::Kiro,
             "grok" => Self::Grok,
             "pi" => Self::Pi,
+            "antigravity" => Self::Antigravity,
             _ => return None,
         })
     }
@@ -61,6 +63,7 @@ impl Provider {
             Self::Kiro => "kiro",
             Self::Grok => "grok",
             Self::Pi => "pi",
+            Self::Antigravity => "antigravity",
         }
     }
 
@@ -74,6 +77,7 @@ impl Provider {
             Self::Kiro => "Kiro",
             Self::Grok => "Grok",
             Self::Pi => "Pi",
+            Self::Antigravity => "Antigravity",
         }
     }
 }
@@ -106,9 +110,6 @@ pub struct T3CodeUse {
 pub enum T3CodeGap {
     /// Toolport has no client for this provider yet.
     Unsupported,
-    /// T3 Code runs this provider with a private settings folder of its own (Antigravity's
-    /// `GEMINI_HOME` under T3 Code's data folder), which Toolport does not manage.
-    PrivateHome,
     /// T3 Code's settings file could not be read, so no instance is known. The entry's
     /// display name is the file, with `~` for home.
     Unreadable,
@@ -149,7 +150,6 @@ pub struct T3CodeOther {
 /// (`PROVIDER_DISPLAY_NAMES`) and whether the driver is on before it is configured.
 fn other_driver(driver: &str) -> Option<(&'static str, T3CodeGap, bool)> {
     Some(match driver {
-        "antigravity" => ("Antigravity", T3CodeGap::PrivateHome, false),
         "fx" => ("fx", T3CodeGap::Unsupported, false),
         "muse" => ("Muse Code", T3CodeGap::Unsupported, false),
         "acpRegistry" => ("ACP Registry", T3CodeGap::Unsupported, true),
@@ -181,7 +181,11 @@ pub(super) struct Outside {
 
 /// T3 Code's data folder: `T3CODE_HOME` (with `~` expanded) or `<home>/.t3`.
 pub(super) fn data_dir() -> Option<PathBuf> {
-    let home = home()?;
+    data_dir_for(&home()?)
+}
+
+/// [`data_dir`] for a given home folder.
+fn data_dir_for(home: &Path) -> Option<PathBuf> {
     match client_path_env("T3CODE_HOME") {
         Some(raw) => {
             let raw = raw.to_string_lossy().trim().to_string();
@@ -190,7 +194,7 @@ pub(super) fn data_dir() -> Option<PathBuf> {
             }
             // T3 Code resolves a relative value against its own working directory, which
             // Toolport cannot know. No guess: such a folder is not read.
-            expand(&raw, &home).filter(|path| path.is_absolute())
+            expand(&raw, home).filter(|path| path.is_absolute())
         }
         None => Some(home.join(".t3")),
     }
@@ -1021,6 +1025,12 @@ fn instance_of(
             .map(|dir| dir.join("mcp.json")),
         // T3 Code's Cursor and Kiro use the user's own default MCP config.
         Provider::Cursor | Provider::Kiro => None,
+        // T3 Code gives each Antigravity instance a private profile named by the SHA-256
+        // of its id (`antigravityAuthSupport.ts`), and `agy acp --gemini-dir` reads its
+        // MCP servers from `config/mcp_config.json` there. That file is the only one
+        // Toolport touches: T3 Code manages the rest of the profile, such as its
+        // `settings.json` and the `config/skills` link.
+        Provider::Antigravity => antigravity_config_path(home, id),
     };
     // Checked by its text alone, before anything touches the file system: a network or
     // device path, `..`, or a folder outside the user's home is never opened, resolved or
@@ -1238,6 +1248,19 @@ pub(super) fn opencode_jsonc_is_plain(config: &Path) -> bool {
     })
 }
 
+/// The `mcp_config.json` in the private profile T3 Code gives the Antigravity instance
+/// `id`: `<T3 Code data>/userdata/providers/antigravity/<sha256 of id>/config/`.
+pub(super) fn antigravity_config_path(home: &Path, id: &str) -> Option<PathBuf> {
+    let path = data_dir_for(home)?
+        .join("userdata")
+        .join("providers")
+        .join("antigravity")
+        .join(crate::registry::sha256_hex(id))
+        .join("config")
+        .join("mcp_config.json");
+    Some(path)
+}
+
 fn default_config_path(provider: Provider) -> Option<PathBuf> {
     match provider {
         // With no homePath and no CLAUDE_CONFIG_DIR or CODEX_HOME in the instance
@@ -1250,6 +1273,8 @@ fn default_config_path(provider: Provider) -> Option<PathBuf> {
         Provider::Kiro => client_config_path("kiro"),
         Provider::Grok => client_config_path("grok"),
         Provider::Pi => client_config_path("pi"),
+        // Never the user's own Antigravity config: an instance always has its profile.
+        Provider::Antigravity => None,
     }
 }
 
@@ -1264,8 +1289,10 @@ pub(super) fn is_location_id(id: &str) -> bool {
     id.split_once('@')
         .and_then(|(kind, key)| Some((kind, key.strip_prefix("t3-")?)))
         .is_some_and(|(kind, hash)| {
-            matches!(kind, "claude-code" | "codex" | "opencode" | "grok" | "pi")
-                && hash.len() == 16
+            matches!(
+                kind,
+                "claude-code" | "codex" | "opencode" | "grok" | "pi" | "antigravity"
+            ) && hash.len() == 16
                 && hash
                     .bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -1489,6 +1516,9 @@ pub(super) fn annotate_with(clients: &mut [DetectedClient], instances: &[Instanc
     }
 }
 
+#[cfg(test)]
+#[path = "t3code_antigravity_tests.rs"]
+mod antigravity_tests;
 #[cfg(test)]
 #[path = "t3code_homes_tests.rs"]
 mod homes_tests;

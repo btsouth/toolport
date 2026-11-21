@@ -21,20 +21,25 @@ elsewhere is never read.
 - An instance's home comes from its home folder setting, else `CLAUDE_CONFIG_DIR`,
   `CODEX_HOME`, `XDG_CONFIG_HOME` (OpenCode), `GROK_HOME` or `PI_CODING_AGENT_DIR`
   from its environment variables, else the default.
-- A Claude Code, Codex, OpenCode, Grok or Pi home only T3 Code knows about, such as
-  one under `~/.t3`, gets its own row once its folder exists, so it can be connected
-  like any other. Each row writes the file that provider reads under T3 Code:
+- A Claude Code, Codex, OpenCode, Grok, Pi or Antigravity home only T3 Code knows
+  about, such as one under `~/.t3`, gets its own row once its folder exists, so it
+  can be connected like any other. Each row writes the file that provider reads
+  under T3 Code:
   - OpenCode: `opencode/opencode.json` in its `XDG_CONFIG_HOME`, or
     `opencode.jsonc` when only that exists (comments are kept).
   - Grok: `config.toml` in its `GROK_HOME`.
   - Pi: `mcp.json` in its `PI_CODING_AGENT_DIR`. Settings Pi saves in Toolport's
     entry, such as `enabled` and `exposure`, are kept when Toolport rewrites it,
-    also when you connect again through the review.
-
-  Pi's settings never make the entry count as edited by you, and Disconnect takes
-  them out with the entry. If nothing else in the file changed, the file goes back
-  exactly as it was.
-
+    also when you connect again through the review. Pi's settings never make the
+    entry count as edited by you, and Disconnect takes them out with the entry. If
+    nothing else in the file changed, the file goes back exactly as it was.
+  - Antigravity: `config/mcp_config.json` in the private profile T3 Code gives each
+    instance (`~/.t3/userdata/providers/antigravity/<id hash>/`), once T3 Code has run
+    it. Toolport touches only that file, never the profile's `settings.json` or its
+    `config/skills` link. T3 Code keeps this folder private, and a later T3 Code
+    release may change or clear it; if Antigravity loses Toolport after a T3 Code
+    update, open Clients and connect its row again. The `disabled` switch `agy` saves
+    in Toolport's entry is kept, and Disconnect takes it out with the entry.
 - On Linux, the Toolport entry in a T3 Code home names Toolport's data folder
   (`TOOLPORT_DATA_DIR`), because OpenCode passes its instance's `XDG_CONFIG_HOME`
   on to MCP servers. If an OpenCode instance sets `mcp.toolport` in its inline
@@ -93,9 +98,8 @@ as it is, with why and what to do:
 
 - A row it uses that isn't installed, has a config Toolport can't read, or has a
   Toolport entry changed by hand. Open that client below to fix it.
-- **Antigravity**: T3 Code gives it a private settings folder, which Toolport doesn't
-  manage yet. **fx**, **Muse Code**, **ACP Registry** agents and any provider T3 Code
-  adds later: Toolport has no client for them yet.
+- **fx**, **Muse Code**, **ACP Registry** agents and any provider T3 Code adds later:
+  Toolport has no client for them yet.
 - A home folder that is marked sensitive, isn't plain text, or is a relative path
   (T3 Code passes `CLAUDE_CONFIG_DIR` and `CODEX_HOME` as they are, so `~` there is
   relative too). Set a full, plain path in T3 Code's provider settings.
@@ -109,7 +113,8 @@ as it is, with why and what to do:
   plain folder or file. Point the instance at the real folder in T3 Code's provider
   settings.
 - A home folder that doesn't exist yet (for OpenCode, the `opencode` folder in its
-  `XDG_CONFIG_HOME`). Start the instance once in T3 Code, then refresh Clients.
+  `XDG_CONFIG_HOME`; for Antigravity, the `config` folder of its private profile).
+  Start the instance once in T3 Code, then refresh Clients.
 - An entry in `settings.json` Toolport can't read, or a settings file it can't read
   at all, named by its path with `~` for your home folder.
 
@@ -159,8 +164,10 @@ not change. Activity and approval prompts add **via T3 Code**:
   few environment variables, and one Codex process serves many threads, so Toolport
   goes by T3 Code having started Codex. Toolport knows T3 Code's process names on
   Linux, macOS and Windows; this was tested on Linux.
-- **OpenCode**: "OpenCode via T3 Code", without a thread, the same way as Codex: T3
-  Code runs one `opencode serve` per instance for all its threads.
+- **OpenCode** and **Antigravity**: "via T3 Code", the same way as Codex: T3 Code
+  runs one `opencode serve` per OpenCode instance for all its threads, and starts
+  Antigravity's `agy acp` itself. Antigravity also shows the thread when T3 Code
+  passes it on.
 - **Pi, Kiro, Grok, fx and ACP Registry agents**: T3 Code gives these its thread
   variable too. When the provider passes it on to its MCP servers, Activity shows "via
   T3 Code" and the thread, as for Claude Code. Toolport checks that T3 Code started

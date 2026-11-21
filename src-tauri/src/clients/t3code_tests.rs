@@ -143,6 +143,7 @@ fn reads_only_allow_listed_fields_and_maps_each_provider() {
     assert_eq!(
         ids,
         vec![
+            "antigravity",
             "claudeAgent",
             "claude_both",
             "claude_env",
@@ -219,6 +220,16 @@ fn reads_only_allow_listed_fields_and_maps_each_provider() {
         by_id(&instances, "codex_env").config_path,
         Some(home.join(".codex-env/config.toml"))
     );
+    // Antigravity's private profile is named by the SHA-256 of the instance id, as T3
+    // Code names it, and is off unless enabled.
+    let antigravity = by_id(&instances, "antigravity");
+    assert!(!antigravity.enabled);
+    assert_eq!(
+        antigravity.config_path,
+        Some(home.join(
+            ".t3/userdata/providers/antigravity/ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32/config/mcp_config.json"
+        ))
+    );
     // Kiro is off unless enabled, like T3 Code's default for its driver.
     let kiro = by_id(&instances, "kiro");
     assert!(!kiro.enabled);
@@ -259,14 +270,6 @@ fn instances_toolport_cannot_connect_are_listed_with_why() {
                 "Odd agent",
                 false,
                 T3CodeGap::Unsupported
-            ),
-            // T3 Code gives Antigravity a private GEMINI_HOME.
-            (
-                "antigravity",
-                "Antigravity",
-                "Antigravity",
-                false,
-                T3CodeGap::PrivateHome
             ),
             // A config that is not an object says nothing about the home.
             (
@@ -435,7 +438,6 @@ fn a_key_in_the_settings_never_reaches_any_output() {
     // Every way an instance can be listed without being connected is in this output.
     for gap in [
         T3CodeGap::Unsupported,
-        T3CodeGap::PrivateHome,
         T3CodeGap::Malformed,
         T3CodeGap::HiddenHome,
         T3CodeGap::RelativeHome,
