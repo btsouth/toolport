@@ -9184,7 +9184,10 @@ fn data_dir_pin_is_stale(
     config_text: Option<&str>,
     record: Option<&ManagedEntry>,
 ) -> bool {
-    let Some(written) = record.and_then(|record| record.env.get(DATA_DIR_ENV)) else {
+    let Some(written) = record
+        .and_then(|record| record.env.get(DATA_DIR_ENV))
+        .filter(|written| !written.is_empty())
+    else {
         return false;
     };
     // Only location rows carry a pin; read the entry before resolving the data folder.
@@ -9221,7 +9224,7 @@ fn keep_foreign_data_dir_pin(
         }
         return false;
     };
-    if record.and_then(|record| record.env.get(DATA_DIR_ENV)) == Some(&prior) {
+    if !prior.is_empty() && record.and_then(|record| record.env.get(DATA_DIR_ENV)) == Some(&prior) {
         return false;
     }
     entry.env.retain(|var| var.key != DATA_DIR_ENV);
