@@ -9834,6 +9834,7 @@ pub fn install_gateway_for(
     keep: Option<&[String]>,
 ) -> Result<WriteOutcome, String> {
     let mut entry = gateway_entry(profile, client_id)?;
+    let mut kept_pin = false;
     if let Some(handled) = keep {
         let def = find_def(client_id).ok_or("Unknown client")?;
         let path = resolved_definition_path(&def)?;
@@ -9850,8 +9851,20 @@ pub fn install_gateway_for(
             handled,
             &mut entry,
         );
+        let record = crate::registry::load()
+            .ok()
+            .and_then(|mut reg| reg.client_managed_entries.remove(client_id));
+        kept_pin = text.as_deref().is_some_and(|text| {
+            keep_foreign_data_dir_pin(&mut entry, def.format, text, &entry_name, record.as_ref())
+        });
     }
-    install_or_remove(client_id, Some(&entry))
+    let mut write = install_or_remove(client_id, Some(&entry))?;
+    if kept_pin {
+        if let Some(record) = write.managed.as_mut() {
+            record.env.insert(DATA_DIR_ENV.into(), String::new());
+        }
+    }
+    Ok(write)
 }
 
 /// Limit the Codex defaults in a rebuilt gateway `entry` to the ones a rewrite that is

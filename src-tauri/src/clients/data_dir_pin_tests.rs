@@ -331,3 +331,30 @@ fn a_deleted_data_folder_pin_stays_deleted_across_repoint() {
     assert!(!after.contains("TOOLPORT_DATA_DIR"), "{after}");
     assert_eq!(shown.error, None);
 }
+
+#[test]
+fn an_access_change_keeps_a_hand_set_data_folder() {
+    if !cfg!(all(unix, not(target_os = "macos"))) {
+        return;
+    }
+    let row = Connected::new("pin-access-change");
+    let mine = "/home/me/other-toolport";
+    let edited = row.read().replace(
+        &format!("\"{}\"", row.data.dir.display()),
+        &format!("\"{mine}\""),
+    );
+    assert!(edited.contains(mine));
+    std::fs::write(&row.file, &edited).unwrap();
+    let write = install_gateway_for(&row.id, Some("Work"), Some(&[])).unwrap();
+    let after = row.read();
+    assert!(after.contains("Work"), "{after}");
+    assert!(after.contains(mine), "{after}");
+    assert_eq!(
+        write
+            .managed
+            .as_ref()
+            .and_then(|record| record.env.get(DATA_DIR_ENV))
+            .map(String::as_str),
+        Some("")
+    );
+}
