@@ -56,17 +56,126 @@ impl From<&str> for Completion {
 /// React's dialog width (`sm:max-w-lg`), for the review, its result and its prompts.
 const REVIEW_WIDTH: i32 = 512;
 
+/// The room a dialog leaves around it in the window it opens over, 16px each side, as
+/// React's `max-w-[calc(100%-2rem)]` and `max-h-[calc(100dvh-2rem)]`.
+const DIALOG_MARGIN: i32 = 32;
+
 /// A dialog's width as React sizes it: `width`, but never wider than the window it
 /// opens over less 16px each side (`max-w-[calc(100%-2rem)]`), so it never runs off a
 /// narrow window. An unrealized parent has no width yet and keeps `width`.
 fn dialog_width(parent: &impl IsA<gtk::Window>, width: i32) -> i32 {
     match parent.as_ref().width() {
-        available if available > 0 => width.min(available - 32).max(240),
+        available if available > 0 => width.min(available - DIALOG_MARGIN).max(240),
         _ => width,
     }
 }
-/// The tallest the review's body grows before it scrolls.
+/// The tallest the review's body grows before it scrolls when the window it opens over
+/// has no size yet.
 const REVIEW_MAX_BODY_HEIGHT: i32 = 600;
+/// The least the review's body keeps in a window too short for it, about one server
+/// row; the dialog then runs past the window rather than show no body at all.
+const REVIEW_MIN_BODY_HEIGHT: i32 = 72;
+
+/// Keeps the review inside the window it opens over, as React's dialog is with
+/// `max-h-[calc(100dvh-2rem)]`, and follows that window as it is resized. GTK has no
+/// such cap: a dialog window takes its content's natural height, however tall.
+///
+/// The cap goes on the body's scroller: the window's height less the margin, header
+/// and footer. While the server list shows, the viewport gives the body only that
+/// height and the body's box takes the shortfall from the list, the one child that
+/// can shrink (labels and folds need their full height), so only the list scrolls. Without the list (a review that could not be read, the result page) the
+/// viewport gives the body its natural height and the whole body scrolls: at minimum
+/// heights a result page taller than the window would squeeze its rows.
+fn fit_review_to_parent(
+    parent: &gtk::Window,
+    content: &adw::Clamp,
+    scroller: &gtk::ScrolledWindow,
+    list: &gtk::ScrolledWindow,
+) {
+    let width = dialog_width(parent, REVIEW_WIDTH);
+    content.set_maximum_size(width);
+    content.set_tightening_threshold(width);
+    if let Some(root) = content.child() {
+        root.set_width_request(width);
+    }
+    if let Some(viewport) = scroller.child().and_downcast::<gtk::Viewport>() {
+        viewport.set_vscroll_policy(if list.get_visible() {
+            gtk::ScrollablePolicy::Minimum
+        } else {
+            gtk::ScrollablePolicy::Natural
+        });
+    }
+    let natural = |widget: &gtk::Widget| widget.measure(gtk::Orientation::Vertical, width).1;
+    let height = match parent.height() {
+        height if height > 0 => height,
+        _ => parent.default_height(),
+    };
+    let body_height = match content.child() {
+        Some(root) if height > 0 => {
+            let header_and_footer = natural(&root) - natural(scroller.upcast_ref());
+            height - DIALOG_MARGIN - header_and_footer
+        }
+        _ => REVIEW_MAX_BODY_HEIGHT,
+    };
+    scroller.set_max_content_height(body_height.max(REVIEW_MIN_BODY_HEIGHT));
+}
+
+/// Refits the review with [`fit_review_to_parent`] whenever the window it opens over
+/// changes size, until the review closes. The returned function refits it at once,
+/// for changes to the review itself such as its result page.
+fn track_parent_size(
+    parent: &gtk::Window,
+    dialog: &adw::Window,
+    content: &adw::Clamp,
+    scroller: &gtk::ScrolledWindow,
+    list: &gtk::ScrolledWindow,
+) -> std::rc::Rc<dyn Fn()> {
+    let (window, content, scroller, list) = (
+        parent.downgrade(),
+        content.downgrade(),
+        scroller.downgrade(),
+        list.downgrade(),
+    );
+    let fit: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+        if let (Some(parent), Some(content), Some(scroller), Some(list)) = (
+            window.upgrade(),
+            content.upgrade(),
+            scroller.upgrade(),
+            list.upgrade(),
+        ) {
+            fit_review_to_parent(&parent, &content, &scroller, &list);
+        }
+    });
+    fit();
+    let mut sizes: Vec<(gtk::glib::Object, &str)> = vec![
+        (parent.clone().upcast(), "default-width"),
+        (parent.clone().upcast(), "default-height"),
+    ];
+    // A tiled or user-resized window changes its surface, not its default size.
+    if let Some(surface) = parent.surface() {
+        sizes.push((surface.clone().upcast(), "width"));
+        sizes.push((surface.upcast(), "height"));
+    }
+    let handlers: Vec<_> = sizes
+        .into_iter()
+        .map(|(object, property)| {
+            let fit = fit.clone();
+            // The new size reaches the window's allocation on its next layout.
+            let id = object.connect_notify_local(Some(property), move |_, _| {
+                let fit = fit.clone();
+                gtk::glib::idle_add_local_once(move || fit());
+            });
+            (object, id)
+        })
+        .collect();
+    let handlers = std::cell::RefCell::new(handlers);
+    dialog.connect_destroy(move |_| {
+        for (object, id) in handlers.borrow_mut().drain(..) {
+            object.disconnect(id);
+        }
+    });
+    fit
+}
 
 /// A credential counts once it has more than spaces, as React's prompt and the review's
 /// own check (`refresh_confirm`) decide. The value itself is used as typed.
@@ -700,7 +809,6 @@ pub(super) fn review_with_notice(
     }
     // React's review: one bordered toggle per entry, stacked with a small gap.
     let rows = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    rows.set_widget_name("toolport-setup-review-entries");
     let mut selected = Vec::new();
     let mut credential_choices = Vec::new();
     let credential_inputs =
@@ -1029,7 +1137,18 @@ pub(super) fn review_with_notice(
             error_chip,
         ));
     }
-    body.append(&rows);
+    let entries = gtk::ScrolledWindow::builder()
+        .child(&rows)
+        .focusable(false)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .visible(!unreadable)
+        .build();
+    if selected.len() > 1 {
+        entries.set_min_content_height(96);
+    }
+    entries.set_widget_name("toolport-setup-review-entries");
+    body.append(&entries);
     body.append(&missing_reason);
     refresh_confirm();
     let (details, content) = details_expander(&crate::i18n::tr("Details"));
@@ -1066,13 +1185,7 @@ pub(super) fn review_with_notice(
         .vexpand(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .propagate_natural_height(true)
-        .max_content_height(REVIEW_MAX_BODY_HEIGHT)
         .build();
-    // Natural heights, then scroll: at minimum heights a result page taller than the
-    // window shrinks its status to the icon and cuts off the title.
-    if let Some(viewport) = scroller.child().and_downcast::<gtk::Viewport>() {
-        viewport.set_vscroll_policy(gtk::ScrollablePolicy::Natural);
-    }
     scroller.set_widget_name("toolport-setup-scroller");
     root.append(&scroller);
     root.append(&super::dialog_footer(&[&cancel, &skip, &confirm]));
@@ -1086,6 +1199,7 @@ pub(super) fn review_with_notice(
         .child(&root)
         .build();
     dialog.set_content(Some(&clamp));
+    let refit = track_parent_size(parent, &dialog, &clamp, &scroller, &entries);
     {
         let (closing, skipped) = (dialog.clone(), skipped.clone());
         skip.connect_clicked(move |_| {
@@ -1196,6 +1310,7 @@ pub(super) fn review_with_notice(
             notice.clone(),
         );
         let (shown, keyboard, step_line) = (shown.clone(), keyboard.clone(), step_line.clone());
+        let (entries, refit) = (entries.clone(), refit.clone());
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || action(chosen, choices, inputs)).await;
             busy.set(false);
@@ -1223,6 +1338,7 @@ pub(super) fn review_with_notice(
                     skip.set_visible(false);
                     // Next while more steps follow, Done on the last.
                     l10n::bind_text(&button, if more { "Next" } else { "Done" });
+                    entries.set_visible(false);
                     rows.set_visible(false);
                     details.set_visible(false);
                     lede.set_visible(false);
@@ -1409,6 +1525,7 @@ pub(super) fn review_with_notice(
                     // Return activates Next or Done without first tabbing through the
                     // results; the button was disabled while the step ran, which dropped
                     // focus and its ring.
+                    refit();
                     focus_with_ring(&shown, &button, keyboard.get());
                     finished();
                 }
@@ -3080,5 +3197,169 @@ mod tests {
         assert_eq!(saved.borrow().as_deref(), Some("secret-value"));
         assert!(!prompt.is_visible(), "saving closes the sheet");
         owner.destroy();
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn review_list_caps_at_parent_height_and_keeps_footer_visible() {
+        adw::init().unwrap();
+        let parent = gtk::Window::new();
+        parent.set_default_size(480, 600);
+        parent.present();
+        wait_for(&|| parent.width() >= 480 && parent.height() >= 600);
+        let item = |i: usize| SetupItem {
+            key: format!("s{i}"),
+            name: format!("srv-{i:02}"),
+            transport: "stdio".into(),
+            command: Some("/bin/true".into()),
+            args: vec![],
+            url: None,
+            env_keys: vec![],
+            is_new: true,
+            credentials: vec![],
+            unsupported: None,
+            updates: vec![],
+        };
+        review(
+            &parent,
+            "Height",
+            (0..40).map(item).collect(),
+            "Config: /c\nBackup: /b",
+            "Connect",
+            true,
+            |_, _, _| {
+                Ok(Completion {
+                    servers: (0..40)
+                        .map(|i| crate::registry_controller::SetupServerResult {
+                            name: format!("srv-{i:02}"),
+                            tool_count: 3,
+                            credential_state: "none".into(),
+                        })
+                        .collect(),
+                    connect: Some(ConnectResult {
+                        client: "Claude Code".into(),
+                        config_path: "/c".into(),
+                    }),
+                    ..Completion::default()
+                })
+            },
+            || {},
+            None,
+        );
+        let win = window_titled("Height").unwrap();
+        let all = descendants(win.upcast_ref());
+        let named = |n: &str| all.iter().find(|w| w.widget_name() == n).unwrap().clone();
+        let footer = all
+            .iter()
+            .find(|w| w.has_css_class("toolport-dialog-footer"))
+            .unwrap();
+        let confirm = button_named(&win, "toolport-setup-confirm");
+        let details: gtk::Expander = named("toolport-setup-review-details").downcast().unwrap();
+        let entries: gtk::ScrolledWindow =
+            named("toolport-setup-review-entries").downcast().unwrap();
+        let outer: gtk::ScrolledWindow = named("toolport-setup-scroller").downcast().unwrap();
+        let fits = |w: &gtk::Widget, bx: &gtk::Widget, pad: f32| {
+            let ok = |b: gtk::graphene::Rect| {
+                b.height() > 0.0 && b.y() >= -1.0 && b.y() + b.height() <= bx.height() as f32 + pad
+            };
+            w.compute_bounds(bx).is_some_and(ok)
+        };
+        let footer_ok =
+            || footer.is_visible() && confirm.is_visible() && fits(footer, win.upcast_ref(), 1.0);
+        wait_for(&|| {
+            win.height() > 0 && footer.height() > 0 && win.height() <= parent.height() - 32
+        });
+        assert!(win.width() == parent.width() - 32 && win.height() <= parent.height() - 32);
+        assert!(footer_ok() && !entries.is_focusable());
+        assert!(entries.vadjustment().upper() > entries.vadjustment().page_size());
+        assert!(outer.vadjustment().upper() <= outer.vadjustment().page_size() + 1.0);
+        let (t_lbl, l_lbl) = (named("toolport-setup-title"), named("toolport-setup-lede"));
+        for w in [&t_lbl, &l_lbl, details.upcast_ref(), footer] {
+            assert!(!w.is_ancestor(&entries) && !entries.is_ancestor(w));
+        }
+        details.set_expanded(true);
+        wait_for(&|| details.height() > 40 && win.height() <= parent.height() - 32);
+        assert!(win.height() <= parent.height() - 32 && footer_ok());
+        assert!(outer.vadjustment().upper() <= outer.vadjustment().page_size() + 1.0);
+        details.set_expanded(false);
+        wait_for(&|| details.height() < 40 && win.height() <= parent.height() - 32);
+        assert!(footer_ok());
+        let toggles = descendants(entries.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::ToggleButton>().ok());
+        let last = toggles.last().unwrap();
+        last.grab_focus();
+        wait_for(&|| {
+            entries.vadjustment().value() > 0.0
+                && fits(last.upcast_ref(), entries.upcast_ref(), 2.0)
+        });
+        assert!(fits(last.upcast_ref(), entries.upcast_ref(), 2.0));
+        let h0 = win.height();
+        parent.set_default_size(960, 840);
+        wait_for(&|| parent.height() >= 820 && win.height() > h0);
+        assert!(win.width() == REVIEW_WIDTH && win.height() <= parent.height() - 32 && footer_ok());
+        parent.set_default_size(480, 500);
+        wait_for(&|| parent.height() <= 520 && win.height() <= parent.height() - 32);
+        assert!(win.height() <= parent.height() - 32 && footer_ok());
+        // A result page taller than the window scrolls as a whole, at full heights:
+        // its check and lines are not squeezed to fit.
+        confirm.emit_clicked();
+        wait_for(&|| confirm.label().as_deref() == Some("Done"));
+        let unsqueezed = |name: &str| {
+            let widget = descendants(win.upcast_ref())
+                .into_iter()
+                .find(|w| w.widget_name() == name)
+                .unwrap();
+            widget.height() >= widget.measure(gtk::Orientation::Vertical, widget.width()).1
+        };
+        wait_for(&|| outer.vadjustment().upper() > outer.vadjustment().page_size());
+        assert!(win.height() <= parent.height() - 32 && footer_ok());
+        assert!(outer.vadjustment().upper() > outer.vadjustment().page_size());
+        assert!(unsqueezed("toolport-setup-success-icon"));
+        assert!(unsqueezed("toolport-setup-next-step"));
+        win.close();
+        // Many unsatisfied required credentials must not collapse the multi-item review list.
+        let cred_item = |i: usize| SetupItem {
+            credentials: vec![crate::registry_controller::CredentialReview {
+                key: format!("TOKEN_{i}"),
+                secret: true,
+                present: false,
+                required: true,
+            }],
+            ..item(i)
+        };
+        review(
+            &parent,
+            "Warnings",
+            (0..12).map(cred_item).collect(),
+            "Config: /c",
+            "Connect",
+            true,
+            |_, _, _| Ok(Completion::default()),
+            || {},
+            None,
+        );
+        let warn_win = window_titled("Warnings").unwrap();
+        let warn_all = descendants(warn_win.upcast_ref());
+        let warn_entries: gtk::ScrolledWindow = warn_all
+            .iter()
+            .find(|w| w.widget_name() == "toolport-setup-review-entries")
+            .unwrap()
+            .clone()
+            .downcast()
+            .unwrap();
+        let warn_footer = warn_all
+            .iter()
+            .find(|w| w.has_css_class("toolport-dialog-footer"))
+            .unwrap();
+        wait_for(&|| {
+            warn_win.height() > 0
+                && warn_footer.height() > 0
+                && warn_win.height() <= parent.height() - 32
+        });
+        assert!(warn_entries.height() >= 90);
+        assert!(fits(warn_footer, warn_win.upcast_ref(), 1.0));
+        warn_win.close();
+        parent.close();
     }
 }

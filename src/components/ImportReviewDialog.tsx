@@ -198,12 +198,13 @@ function ImportReviewContent({
                   !env.present &&
                   !credentialInputs[item.name]?.[env.key]?.trim(),
               )
-              .map((env) =>
-                t("Enter {value0} or deselect {value1}", {
+              .map((env) => ({
+                key: `${key}:${env.key}`,
+                reason: t("Enter {value0} or deselect {value1}", {
                   value0: env.key,
                   value1: item.name,
                 }),
-              )
+              }))
           : [],
       )
     : [];
@@ -227,8 +228,8 @@ function ImportReviewContent({
         </DialogTitle>
         {step && <p className="text-meta text-muted-foreground">{step}</p>}
       </DialogHeader>
-      <div className="flex flex-col gap-4 py-1">
-        <p className="text-meta text-muted-foreground">
+      <div className="flex min-h-0 flex-col gap-4 py-1">
+        <p className="shrink-0 text-meta text-muted-foreground">
           {description ??
             t(
               "Review the commands and URLs before adding them. Leave any server unchecked to keep it as it is.",
@@ -236,7 +237,7 @@ function ImportReviewContent({
         </p>
         {notice}
         {details && (
-          <details>
+          <details className="shrink-0">
             <DisclosureSummary className="text-meta">{t("Details")}</DisclosureSummary>
             <p
               className={`mt-2 whitespace-pre-wrap break-all text-muted-foreground ${pathText}`}
@@ -246,13 +247,22 @@ function ImportReviewContent({
           </details>
         )}
         {error && (
-          <p role="alert" className="text-sm text-warning">
+          <p role="alert" className="shrink-0 text-sm text-warning">
             {error}
           </p>
         )}
         {/* The inset keeps each card's selection and focus rings inside the
             scroller and the dialog body, which both clip them. */}
-        <div className="-my-1 flex max-h-72 flex-col gap-2 overflow-y-auto p-1">
+        <div
+          data-slot="review-list"
+          className={`-my-1 flex flex-col gap-2 overflow-y-auto p-1 ${
+            keyedItems.length > 1
+              ? "min-h-24"
+              : keyedItems.length === 1
+                ? "shrink-0"
+                : "min-h-0"
+          }`}
+        >
           {keyedItems.map(({ item, key }) => {
             const isSelected = selected.has(key);
             return (
@@ -387,6 +397,14 @@ function ImportReviewContent({
             );
           })}
         </div>
+        {missingRequired.map(({ key, reason }) => (
+          <p
+            key={key}
+            className="shrink-0 text-sm text-warning [overflow-wrap:anywhere] last:pb-1"
+          >
+            {reason}
+          </p>
+        ))}
       </div>
       {editing && (
         <Dialog
@@ -439,11 +457,6 @@ function ImportReviewContent({
           </DialogContent>
         </Dialog>
       )}
-      {missingRequired.map((reason) => (
-        <p key={reason} className="text-sm text-warning [overflow-wrap:anywhere]">
-          {reason}
-        </p>
-      ))}
       <DialogFooter>
         <Button
           ref={cancelRef}
