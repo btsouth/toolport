@@ -603,7 +603,9 @@ pub(crate) fn selected_servers_to_import(
     existing: &Registry,
     selected: Option<&std::collections::HashSet<String>>,
 ) -> Result<Vec<(ServerEntry, String)>, String> {
-    let candidates = import_candidates(detected, existing, Confirm::WithVault);
+    let candidates = crate::secrets::with_backup_batch(|| {
+        import_candidates(detected, existing, Confirm::WithVault)
+    });
     // A reviewed server whose saved name shifted since review (another server took
     // it) is refused, so no reviewed choice or value lands on a different server.
     if let Some(keys) = selected {
