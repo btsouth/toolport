@@ -4296,20 +4296,107 @@ fn name_from_invocation(command: &str, args: &[String]) -> String {
     command_stem(command)
 }
 
-/// Key an imported server for bulk-import dedupe. The friendly display name
-/// intentionally drops a package scope, so keying on it alone collapses
-/// `@acme/mcp-weather` and `@other/mcp-weather` (both name "weather") during
-/// import (#257). Fold the launched package spec into the key so those stay
-/// distinct, but keep the name as a tiebreaker so two entries for the SAME
-/// package under different names (e.g. `github-personal` and `github-work`,
-/// one token each) both survive instead of silently collapsing to one. Servers
-/// without a recognizable runner package key on name alone, as before.
-pub fn import_dedupe_key(name: &str, command: Option<&str>, args: &[String]) -> String {
-    let name = name.to_ascii_lowercase();
-    match command.and_then(|command| launcher_package_arg(command, args)) {
-        Some(package) => format!("package:{}|name:{}", package.to_ascii_lowercase(), name),
-        None => format!("name:{}", name),
+/// Connection identity for import. Display names and credentials do not identify
+/// an endpoint. Keep transports distinct and compare commands/argv or URLs exactly.
+pub fn connection_key(
+    transport: &str,
+    command: Option<&str>,
+    args: &[String],
+    url: Option<&str>,
+) -> String {
+    if transport == "stdio" {
+        serde_json::to_string(&(transport, command, args)).expect("serializable identity")
+    } else {
+        serde_json::to_string(&(transport, url)).expect("serializable identity")
     }
+}
+
+/// Lowercased names of the client's servers already in Toolport under the one identity
+/// rule (`registry_controller::existing_connection`). A server whose identity cannot be
+/// confirmed is neither managed nor importable.
+pub fn managed_server_names(
+    client: &DetectedClient,
+    registry: &crate::registry::Registry,
+) -> Vec<String> {
+    client
+        .servers
+        .iter()
+        .chain(&client.plugin_servers)
+        .filter(|s| {
+            matches!(
+                crate::registry_controller::existing_connection(
+                    registry,
+                    client,
+                    s,
+                    crate::registry_controller::Confirm::VaultFree
+                ),
+                crate::registry_controller::ConnectionState::Existing(_)
+            )
+        })
+        .map(|s| s.name.to_lowercase())
+        .collect()
+}
+
+/// The client's servers Import would add, deduped by connection (and by name when
+/// they carry env or header keys) and named as they
+/// would be saved (`github (2)` beside an unrelated `github`). Each is paired with its
+/// index in `servers` followed by `plugin_servers`. Only servers that are certainly new
+/// count: an unconfirmed identity is not claimed as importable. The last field is the
+/// opaque connection id the import review carries for the same server.
+pub fn importable_server_slots(
+    client: &DetectedClient,
+    registry: &crate::registry::Registry,
+) -> Vec<(usize, McpServer, String)> {
+    use crate::registry_controller::{import_connection_key, server_from_detected};
+    // Detection never reads the vault: a server only it could confirm is left out.
+    let names = crate::registry_controller::import_candidates(
+        std::slice::from_ref(client),
+        registry,
+        crate::registry_controller::Confirm::VaultFree,
+    )
+    .into_iter()
+    .filter(|c| c.unknown.is_none())
+    .map(|c| (import_connection_key(&c.entry), c.name))
+    .collect::<std::collections::HashMap<_, _>>();
+    let mut seen = std::collections::HashSet::new();
+    client
+        .servers
+        .iter()
+        .chain(&client.plugin_servers)
+        .enumerate()
+        .filter_map(|(index, server)| {
+            let key = import_connection_key(&server_from_detected(server, &client.id));
+            if !seen.insert(key.clone()) {
+                return None;
+            }
+            let mut server = server.clone();
+            server.name = names.get(&key)?.clone();
+            Some((index, server, key))
+        })
+        .collect()
+}
+
+/// [`importable_server_slots`] without the indices.
+pub fn importable_servers(
+    client: &DetectedClient,
+    registry: &crate::registry::Registry,
+) -> Vec<McpServer> {
+    importable_server_slots(client, registry)
+        .into_iter()
+        .map(|(_, server, _)| server)
+        .collect()
+}
+
+/// `name`, or `name (2)`, `name (3)` and so on, whichever no name in `names` already
+/// uses (ignoring ASCII case).
+pub fn distinct_import_name(name: &str, names: &[String]) -> String {
+    let mut candidate = name.to_owned();
+    let mut suffix = 2;
+    while names.iter().any(|n| n.eq_ignore_ascii_case(&candidate)) {
+        candidate = format!("{name} ({suffix})");
+        suffix += 1;
+    }
+    candidate
 }
 
 /// Parse a JSON snippet, trying each known wrapper key, then a bare server object.
@@ -18853,6 +18940,33 @@ OD_DATA_DIR = "/tmp/data"
         assert_eq!(
             name_from_invocation("/usr/local/bin/my-server", &[]),
             "my-server"
+        );
+    }
+
+    #[test]
+    fn npx_bat_names_its_package_like_npx_cmd() {
+        let vs = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let a = vs(&["-y", "@acme/mcp-weather"]);
+        let b = vs(&["-y", "@other/mcp-weather"]);
+        for runner in [
+            r"C:\Program Files\nodejs\npx.cmd",
+            r"C:\Program Files\nodejs\npx.bat",
+        ] {
+            assert_eq!(
+                launcher_package_arg(runner, &a).as_deref(),
+                Some("@acme/mcp-weather"),
+                "{runner}"
+            );
+            assert_ne!(
+                launcher_package_arg(runner, &a),
+                launcher_package_arg(runner, &b),
+                "{runner}"
+            );
+        }
+        // Only runners lose the extension: a plain batch program is not a package runner.
+        assert_eq!(
+            launcher_package_arg(r"C:\tools\my-server.bat", &vs(&["--port", "1"])),
+            None
         );
     }
 

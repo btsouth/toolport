@@ -868,22 +868,61 @@ fn render_reachable(root: &gtk::Box, client: &state::ClientView, names: &[String
     root.append(&frame);
 }
 
+/// One row of a client's import list.
+struct ImportRow<'a> {
+    server: &'a crate::clients::McpServer,
+    /// The review's id for a server Import would add; `None` when already imported.
+    connection: Option<&'a str>,
+    plugin: bool,
+    imported: bool,
+}
+
+/// What Import would add (named as it would be saved), then the client's servers
+/// already in Toolport, as React's ClientDetail lists them. Both come from the
+/// backend identity rule; a server it could not confirm is in neither.
+fn import_rows<'a>(
+    detected: &'a state::ClientDetailData,
+    imported_names: &[String],
+) -> Vec<ImportRow<'a>> {
+    let mut seen = std::collections::HashSet::new();
+    let imported = detected
+        .servers
+        .iter()
+        .map(|server| (server, false))
+        .chain(detected.plugin_servers.iter().map(|server| (server, true)))
+        .filter(|(server, _)| {
+            !crate::clients::detected_is_gateway(server)
+                && imported_names.contains(&server.name.to_lowercase())
+                && seen.insert(server.name.to_lowercase())
+        })
+        .map(|(server, plugin)| ImportRow {
+            server,
+            connection: None,
+            plugin,
+            imported: true,
+        });
+    detected
+        .1
+        .iter()
+        .map(|(server, plugin, connection)| ImportRow {
+            server,
+            connection: Some(connection),
+            plugin: *plugin,
+            imported: false,
+        })
+        .chain(imported)
+        .collect()
+}
+
 fn client_imports(
     body: &gtk::Box,
-    detected: &crate::clients::DetectedClient,
+    detected: &state::ClientDetailData,
     page: &ClientPage,
     writable: bool,
     imported_names: &[String],
     selected_scope: Rc<RefCell<Option<String>>>,
 ) {
-    let mut seen = std::collections::HashSet::new();
-    let servers = detected
-        .servers
-        .iter()
-        .filter(|s| !crate::clients::detected_is_gateway(s))
-        .chain(detected.plugin_servers.iter())
-        .filter(|server| seen.insert(server.name.to_lowercase()))
-        .collect::<Vec<_>>();
+    let servers = import_rows(detected, imported_names);
     if servers.is_empty() {
         return;
     }
@@ -899,11 +938,7 @@ fn client_imports(
     how.set_label_widget(Some(&message("How importing works")));
     how.set_child(Some(&explanation));
     body.append(&how);
-    if detected.gateway_installed
-        && servers
-            .iter()
-            .any(|s| !imported_names.contains(&s.name.to_lowercase()))
-    {
+    if detected.gateway_installed && servers.iter().any(|row| !row.imported) {
         let warning = formatted_message("{client} is already connected to Toolport. Import on its own leaves a copy here too, so these tools load twice, once directly and once through the gateway. Use {review} to avoid that.", &[("client", &detected.name)], &[("review", "Review and connect")]);
         warning.add_css_class("toolport-feedback");
         warning.add_css_class("warning");
@@ -916,8 +951,13 @@ fn client_imports(
     import.set_sensitive(writable);
     let keys = servers
         .iter()
-        .filter(|s| !imported_names.contains(&s.name.to_lowercase()))
-        .map(|s| ImportSelection::new(&detected.id, s))
+        .filter_map(|row| {
+            Some(ImportSelection::new(
+                &detected.id,
+                row.server,
+                row.connection?,
+            ))
+        })
         .collect::<Vec<_>>();
     import.set_sensitive(writable && !keys.is_empty());
     import.set_visible(!keys.is_empty());
@@ -932,9 +972,10 @@ fn client_imports(
     let p = page.clone();
     import.connect_clicked(move |_| review_imports(&p, keys.clone()));
     all.append(&import);
-    if servers
+    if detected
+        .servers
         .iter()
-        .any(|s| detected.servers.iter().any(|local| std::ptr::eq(*s, local)))
+        .any(|s| !crate::clients::detected_is_gateway(s))
     {
         let review = l10n::button("Review and connect");
         review.add_css_class("toolport-secondary-action");
@@ -957,7 +998,13 @@ fn client_imports(
     }
     body.append(&all);
     let group = row_group();
-    for server in servers {
+    for ImportRow {
+        server,
+        connection,
+        plugin,
+        imported,
+    } in servers
+    {
         let row = gtk::Box::new(gtk::Orientation::Vertical, 8);
         row.add_css_class("toolport-card");
         let copy = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -965,7 +1012,7 @@ fn client_imports(
         name.remove_css_class("toolport-muted");
         name.add_css_class("heading");
         copy.append(&name);
-        let shown = ImportSelection::new(&detected.id, server);
+        let shown = ImportSelection::new(&detected.id, server, "");
         let target = shown
             .command
             .map(|command| {
@@ -976,23 +1023,18 @@ fn client_imports(
             })
             .unwrap_or_else(|| shown.url.unwrap_or_default());
         copy.append(&text(&target, true));
-        if detected
-            .plugin_servers
-            .iter()
-            .any(|plugin| std::ptr::eq(plugin, server))
-        {
+        if plugin {
             let badge = message("plugin");
             badge.add_css_class("toolport-badge");
             badge.add_css_class("off");
             badge.set_halign(gtk::Align::Start);
             copy.append(&badge);
         }
-        let imported = imported_names.contains(&server.name.to_lowercase());
         let import = l10n::button(if imported { "in Toolport" } else { "Import" });
         import.add_css_class("toolport-secondary-action");
         import.set_halign(gtk::Align::End);
         import.set_sensitive(writable && !imported);
-        let key = ImportSelection::new(&detected.id, server);
+        let key = ImportSelection::new(&detected.id, server, connection.unwrap_or_default());
         let p = page.clone();
         import.connect_clicked(move |_| review_imports(&p, vec![key.clone()]));
         row.append(&page_header::HeaderWrap::new(&copy, &import));
@@ -1022,19 +1064,17 @@ fn client_imports(
 #[derive(Clone)]
 struct ImportSelection {
     client_id: String,
-    name: String,
-    transport: String,
+    connection: String,
     command: Option<String>,
     args: Vec<String>,
     url: Option<String>,
 }
 
 impl ImportSelection {
-    fn new(client_id: &str, server: &crate::clients::McpServer) -> Self {
+    fn new(client_id: &str, server: &crate::clients::McpServer, connection: &str) -> Self {
         Self {
             client_id: client_id.into(),
-            name: server.name.clone(),
-            transport: server.transport.clone(),
+            connection: connection.into(),
             command: server.command.as_ref().map(|c| {
                 if crate::registry::arg_looks_secret(c) {
                     "<command>".into()
@@ -1050,12 +1090,9 @@ impl ImportSelection {
         }
     }
     fn matches(&self, item: &crate::registry_controller::ClientImportCandidate) -> bool {
-        self.client_id == item.client_id
-            && self.name == item.name
-            && self.transport == item.transport
-            && self.command == item.command
-            && self.args == item.args
-            && self.url == item.url
+        // By connection id: the saved name can differ between the list and the review,
+        // and two servers whose secrets differ can show the same redacted definition.
+        self.client_id == item.client_id && self.connection == item.connection
     }
 }
 
@@ -1183,7 +1220,7 @@ mod tests {
             url: None,
             env_keys: vec![],
         };
-        let selection = ImportSelection::new("claude:work", &server);
+        let selection = ImportSelection::new("claude:work", &server, "connection:notes");
         let candidate = crate::registry_controller::ClientImportCandidate {
             client_id: "claude:work".into(),
             key: "notes".into(),
@@ -1194,6 +1231,8 @@ mod tests {
             url: None,
             credentials: vec![],
             unsupported: None,
+            source_name: None,
+            connection: "connection:notes".into(),
         };
         assert!(
             selected_imports(std::slice::from_ref(&selection), vec![candidate.clone()]).is_ok()
@@ -1206,17 +1245,113 @@ mod tests {
             url: Some("https://example.test/?token=private-value".into()),
             ..server
         };
-        let shown = ImportSelection::new("claude:work", &secret);
+        let shown = ImportSelection::new("claude:work", &secret, "");
         assert!(!shown.args.join(" ").contains("private-value"));
         assert!(!shown.url.unwrap().contains("private-value"));
+        // A changed definition is another connection.
         let mut changed = candidate.clone();
         changed.args.push("--changed".into());
+        changed.connection = "connection:changed".into();
         assert!(selected_imports(
             std::slice::from_ref(&selection),
             vec![candidate, changed.clone()]
         )
         .is_ok());
         assert!(selected_imports(&[selection], vec![changed]).is_err());
+    }
+    #[test]
+    fn rows_whose_secrets_redact_alike_review_their_own_server() {
+        let twin = |name: &str, token: &str| crate::clients::McpServer {
+            name: name.into(),
+            transport: "http".into(),
+            command: None,
+            args: vec![],
+            url: Some(format!("https://example.test/mcp?token={token}")),
+            env_keys: vec![],
+        };
+        let item =
+            |name: &str, connection: &str| crate::registry_controller::ClientImportCandidate {
+                client_id: "claude-code".into(),
+                key: format!("key-{name}"),
+                name: name.into(),
+                transport: "http".into(),
+                command: None,
+                args: vec![],
+                url: Some("https://example.test/mcp".into()),
+                credentials: vec![],
+                unsupported: None,
+                source_name: None,
+                connection: connection.into(),
+            };
+        let items = vec![
+            item("personal", "connection:a"),
+            item("work", "connection:b"),
+        ];
+        let work = ImportSelection::new("claude-code", &twin("work", "B"), "connection:b");
+        let personal = ImportSelection::new("claude-code", &twin("personal", "A"), "connection:a");
+        let picked = selected_imports(std::slice::from_ref(&work), items.clone()).unwrap();
+        assert_eq!(picked[0].name, "work");
+        let picked = selected_imports(&[personal, work], items).unwrap();
+        let keys = picked.iter().map(|i| i.key.as_str()).collect::<Vec<_>>();
+        assert_eq!(keys, ["key-personal", "key-work"]);
+    }
+
+    #[test]
+    fn import_list_uses_backend_candidates_then_servers_already_in_toolport() {
+        let server = |name: &str, command: &str| crate::clients::McpServer {
+            name: name.into(),
+            transport: "stdio".into(),
+            command: Some(command.into()),
+            args: vec![],
+            url: None,
+            env_keys: vec![],
+        };
+        let remote = crate::clients::McpServer {
+            transport: "http".into(),
+            command: None,
+            url: Some("https://api.githubcopilot.com/mcp/".into()),
+            ..server("github", "")
+        };
+        let detected = state::ClientDetailData(
+            state::tests::detected_fixture(
+                vec![
+                    remote.clone(),
+                    server("notes", "notes-mcp"),
+                    server("unconfirmed", "vaulted"),
+                ],
+                vec![server("notes", "notes-mcp"), server("linear", "linear-mcp")],
+            ),
+            vec![
+                (
+                    crate::clients::McpServer {
+                        name: "github (2)".into(),
+                        ..remote
+                    },
+                    false,
+                    "connection:remote".into(),
+                ),
+                (
+                    server("linear", "linear-mcp"),
+                    true,
+                    "connection:linear".into(),
+                ),
+            ],
+        );
+        let rows = import_rows(&detected, &["notes".into()]);
+        let shown = rows
+            .iter()
+            .map(|row| (row.server.name.as_str(), row.plugin, row.imported))
+            .collect::<Vec<_>>();
+        // The remote github is offered despite the name, the plugin keeps its badge,
+        // notes is listed once as in Toolport, and an unconfirmed server is neither.
+        assert_eq!(
+            shown,
+            [
+                ("github (2)", false, false),
+                ("linear", true, false),
+                ("notes", false, true)
+            ]
+        );
     }
     fn widgets(root: &gtk::Widget) -> Vec<gtk::Widget> {
         let mut all = vec![root.clone()];
@@ -2359,40 +2494,50 @@ mod tests {
             selected.location_removable = false;
             selected.scope_id = Some("scope-work".into());
             selected.scope_name = Some("Work projects with a deliberately long access name".into());
-            selected.detected = Some(state::ClientDetailData(crate::clients::DetectedClient {
-                id: id.into(),
-                name: name.into(),
-                config_path: format!("/home/sbx/{id}/config.json"),
-                app_present: selected.app_present,
-                config_exists: selected.config_exists,
-                uses_connectors: false,
-                location_removable: false,
-                location_kept_by_t3_code: false,
-                discovery: crate::clients::discovery_capabilities(id),
-                servers: vec![crate::clients::McpServer {
-                    name: "Local notes".into(),
-                    transport: "stdio".into(),
-                    command: Some("notes-mcp".into()),
-                    args: vec![],
-                    env_keys: vec![],
-                    url: None,
-                }],
-                plugin_servers: vec![],
-                gateway_installed: selected.gateway_state
-                    != state::ClientGatewayState::Disconnected,
-                entry_state: if view == "client-customized" {
-                    crate::clients::GatewayEntryState::Customized
-                } else if selected.gateway_state == state::ClientGatewayState::Connected {
-                    crate::clients::GatewayEntryState::Managed
-                } else {
-                    crate::clients::GatewayEntryState::Absent
+            selected.detected = Some(state::ClientDetailData::new(
+                crate::clients::DetectedClient {
+                    id: id.into(),
+                    name: name.into(),
+                    config_path: format!("/home/sbx/{id}/config.json"),
+                    app_present: selected.app_present,
+                    config_exists: selected.config_exists,
+                    uses_connectors: false,
+                    location_removable: false,
+                    location_kept_by_t3_code: false,
+                    discovery: crate::clients::discovery_capabilities(id),
+                    servers: vec![crate::clients::McpServer {
+                        name: "Local notes".into(),
+                        transport: "stdio".into(),
+                        command: Some("notes-mcp".into()),
+                        args: vec![],
+                        env_keys: vec![],
+                        url: None,
+                    }],
+                    plugin_servers: vec![],
+                    gateway_installed: selected.gateway_state
+                        != state::ClientGatewayState::Disconnected,
+                    entry_state: if view == "client-customized" {
+                        crate::clients::GatewayEntryState::Customized
+                    } else if selected.gateway_state == state::ClientGatewayState::Connected {
+                        crate::clients::GatewayEntryState::Managed
+                    } else {
+                        crate::clients::GatewayEntryState::Absent
+                    },
+                    error: selected
+                        .config_error
+                        .then(|| "Synthetic unreadable config".into()),
+                    claude_profile: None,
+                    t3_code: Vec::new(),
                 },
-                error: selected
-                    .config_error
-                    .then(|| "Synthetic unreadable config".into()),
-                claude_profile: None,
-                t3_code: Vec::new(),
-            }));
+            ));
+            if let Some(detected) = selected.detected.as_mut() {
+                detected.1 = detected
+                    .0
+                    .servers
+                    .iter()
+                    .map(|s| (s.clone(), false, String::new()))
+                    .collect();
+            }
             clients.render(snapshot(vec![selected.clone()]));
             stack.set_visible_child_name("clients");
             for widget in widgets(sidebar.upcast_ref()) {

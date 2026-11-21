@@ -591,6 +591,9 @@ impl Import {
         if existing.command != self.entry.command || existing.transport != self.entry.transport {
             return Ok(false);
         }
+        // A read that failed (a locked keyring) is reported as such, not as the
+        // missing value `resolve_args_with` would name.
+        let read_failed = std::cell::Cell::new(false);
         let args = |server: &ServerEntry, imported: bool| {
             crate::launch_inputs::resolve_args_with(server, |id, key| {
                 if imported {
@@ -598,17 +601,33 @@ impl Import {
                         return Ok(value.clone());
                     }
                 }
-                secrets::get_vault_secret_result(id, key)
+                secrets::get_vault_secret_result(id, key).inspect_err(|_| read_failed.set(true))
             })
             .map(|args| args.args)
+            .map_err(|error| {
+                if read_failed.get() {
+                    VAULT_FAILURE.to_string()
+                } else {
+                    error
+                }
+            })
         };
         if args(existing, false)? != args(&self.entry, true)? {
             return Ok(false);
         }
         let existing_url = if has_imported_url(existing) {
-            secrets::get_vault_secret_result(&existing.id, secrets::IMPORTED_URL_KEY)
+            // The registry holds only the redacted display URL; comparing that would
+            // claim (or deny) identity on a URL that is not the real endpoint.
+            let url = secrets::get_vault_secret_result(&existing.id, secrets::IMPORTED_URL_KEY)
                 .map_err(|_| VAULT_FAILURE)?
-                .or(existing.url.clone())
+                .filter(|url| url::Url::parse(url).is_ok())
+                .ok_or_else(|| {
+                    format!(
+                        "The saved address of {} is missing from the keychain. Enter its URL again under Servers.",
+                        existing.name
+                    )
+                })?;
+            Some(url)
         } else {
             existing.url.clone()
         };

@@ -338,6 +338,8 @@ mod platform {
     }
 
     pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
+        #[cfg(test)]
+        crate::secrets::tests::record_vault_read(server_id, key);
         read_secret(server_id, key).map_err(super::ReadFailure::into_message)
     }
 
@@ -1077,6 +1079,8 @@ mod platform {
     }
 
     pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
+        #[cfg(test)]
+        crate::secrets::tests::record_vault_read(server_id, key);
         read_secret(server_id, key).map_err(super::ReadFailure::into_message)
     }
 
@@ -1999,6 +2003,8 @@ mod file {
     }
 
     pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
+        #[cfg(test)]
+        crate::secrets::tests::record_vault_read(server_id, key);
         Ok(load()?.get(&account(server_id, key)).cloned())
     }
 
@@ -3231,6 +3237,25 @@ pub(crate) mod tests {
 
     thread_local! {
         static READS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    thread_local! {
+        static VAULT_READS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn record_vault_read(server_id: &str, key: &str) {
+        VAULT_READS.with(|reads| reads.borrow_mut().push(format!("{server_id}/{key}")));
+    }
+
+    /// The `server/key` reads of every secret store backend (keychain or file vault)
+    /// on this thread while `test` runs, whichever entry point made them.
+    pub(crate) fn vault_reads_during<T>(test: impl FnOnce() -> T) -> (T, Vec<String>) {
+        VAULT_READS.with(|reads| reads.borrow_mut().clear());
+        let value = test();
+        (
+            value,
+            VAULT_READS.with(|reads| std::mem::take(&mut *reads.borrow_mut())),
+        )
     }
 
     pub(crate) fn record_read(server_id: &str, key: &str) {

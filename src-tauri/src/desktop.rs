@@ -169,7 +169,7 @@ async fn test_server(entry: ServerEntry) -> Result<ProbeResult, String> {
 async fn detect_clients(
     state: State<'_, RegistryState>,
     inspect_configs: Option<bool>,
-) -> Result<Vec<clients::DetectedClient>, String> {
+) -> Result<Vec<serde_json::Value>, String> {
     // Reads several config files and scans plugin dirs - off the UI thread.
     let mut list = tauri::async_runtime::spawn_blocking(move || {
         clients::detect_clients_with_inspection(inspect_configs.unwrap_or(true))
@@ -190,7 +190,36 @@ async fn detect_clients(
         .client_managed_entries
         .clone();
     clients::apply_entry_states(&mut list, &managed);
-    Ok(list)
+    let registry = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    // Import candidates and managed names come from the one identity rule both
+    // shells share, so the client list never matches servers by name.
+    tauri::async_runtime::spawn_blocking(move || {
+        list.iter()
+            .map(|client| detected_client_value(client, &registry))
+            .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn detected_client_value(
+    client: &clients::DetectedClient,
+    registry: &Registry,
+) -> Result<serde_json::Value, String> {
+    let mut value = serde_json::to_value(client).map_err(|e| e.to_string())?;
+    let (candidates, keys): (Vec<_>, Vec<_>) = clients::importable_server_slots(client, registry)
+        .into_iter()
+        .map(|(_, server, key)| (server, key))
+        .unzip();
+    // Opaque ids, parallel to `importableServers`, that import review items carry too.
+    value["importableKeys"] = serde_json::json!(keys);
+    value["importableServers"] = serde_json::to_value(&candidates).map_err(|e| e.to_string())?;
+    value["managedServerNames"] =
+        serde_json::json!(clients::managed_server_names(client, registry));
+    Ok(value)
 }
 
 /// A token that changes when T3 Code's provider instances may have changed, so an open
@@ -265,7 +294,7 @@ fn selected_servers_to_import(
     detected: &[clients::DetectedClient],
     existing: &Registry,
     selected: Option<&std::collections::HashSet<String>>,
-) -> Result<Vec<ServerEntry>, String> {
+) -> Result<Vec<(ServerEntry, String)>, String> {
     crate::registry_controller::selected_servers_to_import(detected, existing, selected)
 }
 
@@ -3138,6 +3167,12 @@ struct ImportItem {
     reference_review: Vec<String>,
     credentials: Vec<crate::registry_controller::CredentialReview>,
     unsupported: Option<String>,
+    /// The client's own name when `name`, the name the import saves, differs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_name: Option<String>,
+    /// Opaque id matching `importableKeys` from `detect_clients`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connection: Option<String>,
 }
 
 /// Show exactly what the bulk client import would add without changing the
@@ -3166,6 +3201,8 @@ async fn preview_import_servers(
             is_new: true,
             credentials: server.credentials,
             unsupported: server.unsupported,
+            source_name: server.source_name,
+            connection: Some(server.connection),
         })
         .collect())
 }
@@ -3201,6 +3238,8 @@ fn preview_import(state: State<RegistryState>, json: String) -> Result<Vec<Impor
                 is_new,
                 credentials: Vec::new(),
                 unsupported: None,
+                source_name: None,
+                connection: None,
             }
         })
         .collect())
@@ -5811,7 +5850,7 @@ mod tests {
         clients::McpServer {
             name: name.into(),
             transport: "stdio".into(),
-            command: Some("x".into()),
+            command: Some(name.to_lowercase()),
             args: vec![],
             env_keys: vec![],
             url: None,
@@ -5903,11 +5942,18 @@ mod tests {
     #[test]
     fn selected_servers_to_import_respects_the_reviewed_keys() {
         let detected = vec![detected_client("cursor", vec!["linear", "github"], vec![])];
-        let selected = std::collections::HashSet::from(["name:github".to_string()]);
+        let selected =
+            std::collections::HashSet::from([crate::registry_controller::import_review_key(
+                &crate::registry_controller::server_from_detected(
+                    &detected_mcp_server("github"),
+                    "cursor",
+                ),
+                "github",
+            )]);
         let picked =
             selected_servers_to_import(&detected, &Registry::default(), Some(&selected)).unwrap();
         assert_eq!(picked.len(), 1);
-        assert_eq!(picked[0].name, "github");
+        assert_eq!(picked[0].0.name, "github");
     }
 
     #[test]
@@ -5942,14 +5988,16 @@ mod tests {
     #[test]
     fn servers_to_import_keeps_same_package_under_distinct_names() {
         // A multi-account setup runs the SAME package twice under different
-        // names (e.g. a personal and a work token). Keying on the package alone
-        // would collapse them and silently drop one; the name tiebreaker keeps
-        // both while still distinguishing different packages (see the test above).
+        // names, each with its own token in env (a personal and a work token).
+        // Keying on the package alone would collapse them and silently drop one;
+        // the name tiebreaker keeps both while still distinguishing different
+        // packages (see the test above).
+        let account = |name: &str| clients::McpServer {
+            env_keys: vec!["GITHUB_TOKEN".into()],
+            ..detected_mcp_server_with_args(name, "npx", &["-y", "@mcp/server-github"])
+        };
         let mut client = detected_client("claude", vec![], vec![]);
-        client.servers = vec![
-            detected_mcp_server_with_args("github-personal", "npx", &["-y", "@mcp/server-github"]),
-            detected_mcp_server_with_args("github-work", "npx", &["-y", "@mcp/server-github"]),
-        ];
+        client.servers = vec![account("github-personal"), account("github-work")];
         let picked = servers_to_import(&[client], &Registry::default());
         assert_eq!(picked.len(), 2);
         let names: std::collections::HashSet<_> =
@@ -5961,6 +6009,25 @@ mod tests {
     }
 
     #[test]
+    fn servers_to_import_offers_one_server_listed_twice_without_credentials() {
+        // With nothing in env or headers the two entries cannot differ, so one
+        // connection imports once whatever the names, in one pass or two.
+        let mut client = detected_client("claude", vec![], vec![]);
+        client.servers = vec![
+            detected_mcp_server_with_args("gh", "npx", &["-y", "@mcp/server-github"]),
+            detected_mcp_server_with_args("github", "npx", &["-y", "@mcp/server-github"]),
+        ];
+        let picked = servers_to_import(&[client], &Registry::default());
+        assert_eq!(
+            picked
+                .iter()
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>(),
+            ["gh"]
+        );
+    }
+
+    #[test]
     fn servers_to_import_skips_existing_and_own_gateway_entry() {
         let detected = vec![detected_client(
             "cursor",
@@ -5968,7 +6035,9 @@ mod tests {
             vec!["new-one"],
         )];
         let mut reg = Registry::default();
-        reg.add_server(plain_server("x", "already-here"));
+        let mut existing = plain_server("x", "already-here");
+        existing.command = Some("already-here".into());
+        reg.add_server(existing);
         let picked = servers_to_import(&detected, &reg);
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].name, "new-one");

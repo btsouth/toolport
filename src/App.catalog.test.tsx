@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "./App";
 import type { Registry } from "@/lib/types";
@@ -7,6 +7,8 @@ import type { Registry } from "@/lib/types";
 const getRegistry = vi.fn();
 const detectClients = vi.fn();
 const takeRegistryRecoveryNotice = vi.fn();
+const importServers = vi.fn();
+const previewImportServers = vi.fn();
 
 vi.mock("@/lib/api", () => ({
   teamPairState: vi.fn(() => Promise.resolve(null)),
@@ -14,10 +16,10 @@ vi.mock("@/lib/api", () => ({
   addServer: vi.fn(),
   detectClients: (...a: unknown[]) => detectClients(...a),
   getRegistry: (...a: unknown[]) => getRegistry(...a),
-  importServers: vi.fn(),
+  importServers: (...a: unknown[]) => importServers(...a),
   mainWindowVisible: vi.fn(() => Promise.resolve(true)),
   parseServerSnippet: vi.fn(),
-  previewImportServers: vi.fn(),
+  previewImportServers: (...a: unknown[]) => previewImportServers(...a),
   probeServers: vi.fn(() => Promise.resolve([])),
   removeServer: vi.fn(),
   setAllEnabled: vi.fn(),
@@ -91,5 +93,63 @@ describe("Servers header catalog entry point", () => {
     expect(
       await screen.findByRole("heading", { level: 1, name: "Servers" }),
     ).toBeInTheDocument();
+  });
+});
+
+describe("Servers empty state import count", () => {
+  it("counts distinct connections across clients, not names", async () => {
+    getRegistry.mockResolvedValue({ ...registryWithServer(), servers: [] });
+    // No servers and no connected client would open the first-run wizard. It loads
+    // lazily, so it could open over the import review and hide it.
+    localStorage.setItem("toolport.onboarded", "1");
+    const github = (url: string) => ({
+      name: "github",
+      transport: "http",
+      command: null,
+      args: [],
+      envKeys: [],
+      url,
+    });
+    const client = (id: string, url: string, key: string) => ({
+      id,
+      name: id,
+      usesConnectors: false,
+      configPath: `${id}.json`,
+      configExists: true,
+      appPresent: true,
+      servers: [github(url)],
+      pluginServers: [],
+      gatewayInstalled: false,
+      entryState: "absent",
+      error: null,
+      importableServers: [github(url)],
+      importableKeys: [key],
+      managedServerNames: [],
+    });
+    detectClients.mockResolvedValue([
+      client("cursor", "https://api.githubcopilot.com/mcp/", "connection:a"),
+      client("claude-code", "https://example.test/github", "connection:b"),
+      client("codex", "https://api.githubcopilot.com/mcp/", "connection:a"),
+    ]);
+    render(<App />);
+    const importButton = await screen.findByRole("button", {
+      name: /Import 2 from clients/,
+    });
+    expect(importButton).toBeVisible();
+
+    // After importing, the clients are scanned again: counts come from detection.
+    previewImportServers.mockResolvedValue([
+      {
+        ...github("https://api.githubcopilot.com/mcp/"),
+        key: "connection:a",
+        isNew: true,
+      },
+    ]);
+    importServers.mockResolvedValue(registryWithServer());
+    const scans = detectClients.mock.calls.length;
+    await userEvent.click(importButton);
+    await userEvent.click(await screen.findByRole("button", { name: "Import 1 server" }));
+    await waitFor(() => expect(importServers).toHaveBeenCalledWith(["connection:a"]));
+    await waitFor(() => expect(detectClients.mock.calls.length).toBeGreaterThan(scans));
   });
 });
