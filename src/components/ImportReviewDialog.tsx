@@ -254,7 +254,9 @@ function ImportReviewContent({
             scroller and the dialog body, which both clip them. */}
         <div
           data-slot="review-list"
-          className="-my-1 flex min-h-0 flex-col gap-2 overflow-y-auto p-1"
+          className={`-my-1 flex flex-col gap-2 overflow-y-auto p-1 ${
+            keyedItems.length > 0 ? "min-h-24" : "min-h-0"
+          }`}
         >
           {keyedItems.map(({ item, key }) => {
             const isSelected = selected.has(key);
@@ -390,6 +392,14 @@ function ImportReviewContent({
             );
           })}
         </div>
+        {missingRequired.map((reason) => (
+          <p
+            key={reason}
+            className="shrink-0 text-sm text-warning [overflow-wrap:anywhere]"
+          >
+            {reason}
+          </p>
+        ))}
       </div>
       {editing && (
         <Dialog
@@ -442,14 +452,6 @@ function ImportReviewContent({
           </DialogContent>
         </Dialog>
       )}
-      {missingRequired.map((reason) => (
-        <p
-          key={reason}
-          className="shrink-0 text-sm text-warning [overflow-wrap:anywhere]"
-        >
-          {reason}
-        </p>
-      ))}
       <DialogFooter>
         <Button
           ref={cancelRef}

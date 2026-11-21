@@ -593,7 +593,7 @@ describe("ImportReviewDialog spec details", () => {
     const list = screen.getByRole("button", { name: /srv-1\b/ }).parentElement!
       .parentElement!;
     expect(list).toContainElement(screen.getByRole("button", { name: /srv-40\b/ }));
-    expect(list).toHaveClass("overflow-y-auto", "min-h-0");
+    expect(list).toHaveClass("overflow-y-auto", "min-h-24");
     expect(list.className).not.toMatch(/\bmax-h-/);
     expect(list).not.toHaveAttribute("tabindex");
     expect(list.parentElement).toHaveClass("flex", "flex-col", "min-h-0");
@@ -602,5 +602,25 @@ describe("ImportReviewDialog spec details", () => {
     expect(details).toHaveClass("shrink-0");
     await userEvent.click(screen.getByText("Details"));
     expect(dialog.querySelector('[data-slot="dialog-footer"]')).toBeVisible();
+  });
+
+  it("keeps the review list at a usable minimum height when credential warnings grow", () => {
+    const base = items()[0];
+    const many = Array.from({ length: 12 }, (_, i) => ({
+      ...base,
+      key: `s${i}`,
+      name: `srv-${i + 1}`,
+      credentials: [{ key: `TOKEN_${i}`, secret: true, present: false, required: true }],
+    }));
+    renderDialog({ items: many, requireCredentials: true });
+    const list = screen.getByRole("button", { name: /srv-1\b/ }).parentElement!
+      .parentElement!;
+    expect(list).toHaveClass("overflow-y-auto", "min-h-24");
+    const warnings = screen.getAllByText(/^Enter TOKEN_\d+ or deselect srv-\d+$/);
+    expect(warnings.length).toBe(12);
+    for (const warning of warnings) {
+      expect(warning).toHaveClass("shrink-0");
+      expect(list.parentElement).toContainElement(warning);
+    }
   });
 });
