@@ -951,7 +951,7 @@ fn client_imports(
     how.set_label_widget(Some(&message("How importing works")));
     how.set_child(Some(&explanation));
     body.append(&how);
-    if detected.gateway_installed && servers.iter().any(|row| !row.imported) {
+    if detected.gateway_installed && servers.iter().any(|row| !row.imported && !row.unconfirmed) {
         let warning = formatted_message("{client} is already connected to Toolport. Import on its own leaves a copy here too, so these tools load twice, once directly and once through the gateway. Use {review} to avoid that.", &[("client", &detected.name)], &[("review", "Review and connect")]);
         warning.add_css_class("toolport-feedback");
         warning.add_css_class("warning");
