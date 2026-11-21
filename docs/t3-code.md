@@ -21,9 +21,10 @@ elsewhere is never read.
 - An instance's home comes from its home folder setting, else `CLAUDE_CONFIG_DIR`,
   `CODEX_HOME`, `XDG_CONFIG_HOME` (OpenCode), `GROK_HOME` or `PI_CODING_AGENT_DIR`
   from its environment variables, else the default.
-- A Claude Code, Codex, OpenCode, Grok, Pi or Antigravity home only T3 Code knows about, such as
-  one under `~/.t3`, gets its own row once its folder exists, so it can be connected
-  like any other. Each row writes the file that provider reads under T3 Code:
+- A Claude Code, Codex, OpenCode, Grok, Pi or Antigravity home only T3 Code knows
+  about, such as one under `~/.t3`, gets its own row once its folder exists, so it
+  can be connected like any other. Each row writes the file that provider reads
+  under T3 Code:
   - OpenCode: `opencode/opencode.json` in its `XDG_CONFIG_HOME`, or
     `opencode.jsonc` when only that exists (comments are kept).
   - Grok: `config.toml` in its `GROK_HOME`.
@@ -112,7 +113,8 @@ as it is, with why and what to do:
   plain folder or file. Point the instance at the real folder in T3 Code's provider
   settings.
 - A home folder that doesn't exist yet (for OpenCode, the `opencode` folder in its
-  `XDG_CONFIG_HOME`; for Antigravity, the `config` folder of its private profile). Start the instance once in T3 Code, then refresh Clients.
+  `XDG_CONFIG_HOME`; for Antigravity, the `config` folder of its private profile).
+  Start the instance once in T3 Code, then refresh Clients.
 - An entry in `settings.json` Toolport can't read, or a settings file it can't read
   at all, named by its path with `~` for your home folder.
 

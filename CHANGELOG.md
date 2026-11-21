@@ -16,6 +16,8 @@ Entries before the rename below shipped under the project's former name, Conduit
   the entry, for Pi's usual config too.
 - T3 Code's Antigravity instances get a row too, for the `mcp_config.json` in the
   private profile T3 Code gives each one. Toolport changes nothing else there.
+  The `disabled` switch Antigravity saves in Toolport's entry is kept across
+  rewrites and removed on Disconnect, for Antigravity's usual config too.
 
 ### Fixed
 
