@@ -3362,6 +3362,7 @@ mod tests {
         let item = |i: usize| SetupItem {
             key: format!("s{i}"),
             name: format!("srv-{i:02}"),
+            source_name: None,
             transport: "stdio".into(),
             command: Some("/bin/true".into()),
             args: vec![],
