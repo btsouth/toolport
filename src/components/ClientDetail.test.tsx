@@ -262,11 +262,7 @@ it("lists backend import candidates by connection, not by registry name", async 
   expect(within(card("notes") as HTMLElement).getByText(/in Toolport/)).toBeVisible();
   expect(screen.queryByText("github", { selector: "span.font-medium" })).toBeNull();
   await userEvent.click(screen.getByRole("button", { name: "Import all (2)" }));
-  expect(
-    within(await screen.findByRole("dialog")).getByText("github (2)", {
-      selector: "span.font-medium",
-    }),
-  ).toBeVisible();
+  expect(await screen.findByText("Import as github (2)")).toBeVisible();
   await userEvent.click(screen.getByRole("button", { name: "Import 2 servers" }));
   await waitFor(() => expect(importServers).toHaveBeenCalledWith(["remote", "linear"]));
   expect(onChanged).toHaveBeenCalled();
@@ -310,6 +306,63 @@ it("reviews the row's own server when two servers redact alike", async () => {
   await waitFor(() =>
     expect(importServers).toHaveBeenLastCalledWith(["key-personal", "key-work"]),
   );
+});
+
+it("lists servers only review can check and confirms them there", async () => {
+  const docs = {
+    name: "docs",
+    transport: "http" as const,
+    command: null,
+    args: [],
+    envKeys: [],
+    url: "https://docs.example.test/mcp",
+  };
+  const context7 = {
+    ...docs,
+    name: "context7",
+    url: "https://context7.example.test/mcp",
+  };
+  vi.mocked(previewImportServers).mockResolvedValue([]);
+  render(
+    <ClientDetail
+      client={client({
+        servers: [docs, context7],
+        importableServers: [],
+        importableKeys: [],
+        managedServerNames: ["context7"],
+        unconfirmedServers: [docs],
+        unconfirmedKeys: ["c:docs"],
+      })}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  const card = screen
+    .getByText("docs", { selector: "span.font-medium" })
+    .closest("[data-slot=card]") as HTMLElement;
+  expect(
+    within(card).getByText(
+      "Open the review to check whether this is already in Toolport.",
+    ),
+  ).toBeVisible();
+  expect(within(card).queryByText(/in Toolport$/)).toBeNull();
+  expect(screen.queryByText(/Everything here is already in Toolport/)).toBeNull();
+  expect(screen.queryByRole("button", { name: /Import all/ })).toBeNull();
+  await userEvent.click(within(card).getByRole("button", { name: "Review" }));
+  expect(await screen.findByText("docs is already in Toolport.")).toBeVisible();
+  // When review still lists it, the review opens on it.
+  vi.mocked(previewImportServers).mockResolvedValue([
+    {
+      ...docs,
+      key: "k:docs",
+      connection: "c:docs",
+      isNew: false,
+      unsupported: "Could not compare docs.",
+    },
+  ]);
+  await userEvent.click(within(card).getByRole("button", { name: "Review" }));
+  expect(await screen.findByRole("dialog")).toBeVisible();
 });
 
 it("shows a refused import inside the review that is still open", async () => {

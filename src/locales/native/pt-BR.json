@@ -1205,5 +1205,8 @@
   "Showing {value0} matching entries from the latest {value1}.": "Mostrando {value0} entradas correspondentes das {value1} mais recentes.",
   "Showing {value0} of the latest {value1} entries.": "Mostrando {value0} das {value1} entradas mais recentes.",
   "Showing 1 matching entry from the latest {value1}.": "Mostrando 1 entrada correspondente das {value1} mais recentes.",
-  "Show all {value0} entries": "Mostrar todas as {value0} entradas"
+  "Show all {value0} entries": "Mostrar todas as {value0} entradas",
+  "Import as {value0}": "Importar como {value0}",
+  "Open the review to check whether this is already in Toolport.": "Abra a revisão para verificar se isto já está no Toolport.",
+  "{value0} is already in Toolport.": "{value0} já está no Toolport."
 }

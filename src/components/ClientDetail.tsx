@@ -346,11 +346,13 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     if (!byName.has(s.name.toLowerCase())) byName.set(s.name.toLowerCase(), s);
   }
   const toImport = importableServers(client, registry);
-  // What Import would add, then what is already in Toolport. A server the backend
-  // could not confirm is in neither list.
+  // Only review can check these: listed, never imported blind or called in Toolport.
+  const unconfirmed = client.unconfirmedServers ?? [];
+  // What Import would add, what review must check, then what is already in Toolport.
   const allServers = client.importableServers
     ? [
         ...toImport,
+        ...unconfirmed,
         ...[...byName.values()].filter((s) => importedNames.has(s.name.toLowerCase())),
       ]
     : [...byName.values()];
@@ -362,7 +364,9 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       const items = servers.map((server) => {
         // By the backend's connection id: the saved name can differ between the list
         // and the review, and two servers whose secrets differ can look alike here.
-        const connection = client.importableKeys?.[toImport.indexOf(server)];
+        const connection = unconfirmed.includes(server)
+          ? client.unconfirmedKeys?.[unconfirmed.indexOf(server)]
+          : client.importableKeys?.[toImport.indexOf(server)];
         return preview.find((item) =>
           connection
             ? item.connection === connection
@@ -372,6 +376,19 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               JSON.stringify(item.args) === JSON.stringify(server.args),
         );
       });
+      // Review lists only what Import would change; an unconfirmed server it leaves
+      // out is already in Toolport.
+      const inToolport = servers.filter(
+        (server, index) => !items[index] && unconfirmed.includes(server),
+      );
+      if (inToolport.length && inToolport.length === servers.length) {
+        showFeedback(
+          translate("{value0} is already in Toolport.", {
+            value0: inToolport.map((server) => server.name).join(", "),
+          }),
+        );
+        return;
+      }
       if (items.some((item) => !item?.key))
         throw new Error(
           translate("Server changed. Refresh the client and review again."),
@@ -1002,9 +1019,10 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                 isPlugin={isPluginServer(server)}
                 imported={
                   client.importableServers
-                    ? index >= toImport.length
+                    ? index >= toImport.length + unconfirmed.length
                     : importedNames.has(server.name.toLowerCase())
                 }
+                unconfirmed={unconfirmed.includes(server)}
                 busy={busy || !!client.error}
                 // Same review dialog as "Import all": a per-row import must show the
                 // same shell/private-host warnings before anything is added.
@@ -1013,7 +1031,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             ))}
           </div>
 
-          {toImport.length === 0 && (
+          {toImport.length === 0 && unconfirmed.length === 0 && (
             <p className="mt-3 inline-flex items-center gap-1.5 text-meta text-success">
               <Trans
                 message={msg(
@@ -1133,12 +1151,14 @@ function ServerMiniCard({
   server,
   isPlugin,
   imported,
+  unconfirmed,
   busy,
   onImport,
 }: {
   server: McpServer;
   isPlugin: boolean;
   imported: boolean;
+  unconfirmed: boolean;
   busy: boolean;
   onImport: () => void;
 }) {
@@ -1161,6 +1181,11 @@ function ServerMiniCard({
             ? [server.command, ...server.args].join(" ")
             : (server.url ?? "")}
         </code>
+        {unconfirmed && (
+          <p className="text-meta text-muted-foreground">
+            {t("Open the review to check whether this is already in Toolport.")}
+          </p>
+        )}
         <div className="flex justify-end">
           {imported ? (
             <span className="inline-flex items-center gap-1 text-meta text-success">
@@ -1177,10 +1202,14 @@ function ServerMiniCard({
               onClick={onImport}
               disabled={busy}
             >
-              <Trans
-                message={msg("{value1}Import")}
-                values={{ value1: <Download className="size-3" /> }}
-              />
+              {unconfirmed ? (
+                t("Review")
+              ) : (
+                <Trans
+                  message={msg("{value1}Import")}
+                  values={{ value1: <Download className="size-3" /> }}
+                />
+              )}
             </Button>
           )}
         </div>

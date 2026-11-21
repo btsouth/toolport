@@ -59,6 +59,28 @@ function renderDialog(overrides: Partial<Parameters<typeof ImportReviewDialog>[0
 }
 
 describe("ImportReviewDialog", () => {
+  it("names the saved name and marks unsupported servers for review", () => {
+    renderDialog({
+      items: [
+        { ...items()[1], name: "github (2)", sourceName: "github" },
+        {
+          ...items()[0],
+          name: "stripe (2)",
+          sourceName: "stripe",
+          unsupported: "Custom headers stay native",
+        },
+      ],
+    });
+    expect(screen.getByText("github")).toBeVisible();
+    expect(screen.getByText("Import as github (2)")).toBeVisible();
+    expect(screen.queryByText("github (2)")).toBeNull();
+    expect(screen.getAllByText("New")).toHaveLength(1);
+    expect(screen.getByText("Needs review")).toBeVisible();
+    expect(screen.getByText("Unsupported: Custom headers stay native")).toBeVisible();
+    // Not imported, so no destination name.
+    expect(screen.queryByText("Import as stripe (2)")).toBeNull();
+  });
+
   it("discloses changed settings on existing servers", () => {
     renderDialog({
       items: [

@@ -219,6 +219,13 @@ fn detected_client_value(
     value["importableServers"] = serde_json::to_value(&candidates).map_err(|e| e.to_string())?;
     value["managedServerNames"] =
         serde_json::json!(clients::managed_server_names(client, registry));
+    // Servers only the keychain could match: listed for review, never imported blind.
+    let (unconfirmed, keys): (Vec<_>, Vec<_>) = clients::unconfirmed_server_slots(client, registry)
+        .into_iter()
+        .map(|(_, server, key)| (server, key))
+        .unzip();
+    value["unconfirmedKeys"] = serde_json::json!(keys);
+    value["unconfirmedServers"] = serde_json::to_value(&unconfirmed).map_err(|e| e.to_string())?;
     Ok(value)
 }
 

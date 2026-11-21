@@ -67,6 +67,10 @@ export interface DetectedClient {
   importableKeys?: string[];
   /** Lowercased names of this client's servers already in Toolport. */
   managedServerNames?: string[];
+  /** Servers only the keychain could match to Toolport's; review checks them. */
+  unconfirmedServers?: McpServer[];
+  /** Connection keys of `unconfirmedServers`, as review items carry them. */
+  unconfirmedKeys?: string[];
 }
 
 /** A T3 Code instance that uses a client row (src-tauri/src/clients/t3code.rs). */

@@ -389,8 +389,7 @@ function ImportReviewContent({
                 )}
                 {item.unsupported && (
                   <p className="px-3 pb-2 text-meta text-warning">
-                    {t("Unsupported:")}
-                    {item.unsupported}
+                    {t("Unsupported: {value0}", { value0: item.unsupported })}
                   </p>
                 )}
               </div>
@@ -530,17 +529,27 @@ export function ImportRow({
             }`}
           />
         )}
-        <span className="truncate text-sm font-medium">{item.name}</span>
+        <span className="truncate text-sm font-medium">
+          {item.sourceName ?? item.name}
+        </span>
         {
           <span className="ml-auto shrink-0 text-meta text-muted-foreground">
-            {item.updates?.length
-              ? t("Updates existing server")
-              : item.isNew
-                ? t("New")
-                : t("In Toolport")}
+            {item.unsupported
+              ? t("Needs review")
+              : item.updates?.length
+                ? t("Updates existing server")
+                : item.isNew
+                  ? t("New")
+                  : t("In Toolport")}
           </span>
         }
       </div>
+      {/* An unsupported server is not imported, as in the GTK review. */}
+      {item.sourceName && item.sourceName !== item.name && !item.unsupported && (
+        <p className="mt-1 break-words text-meta text-muted-foreground [overflow-wrap:anywhere]">
+          {t("Import as {value0}", { value0: item.name })}
+        </p>
+      )}
       {item.referenceReview?.map((line) => (
         <p key={line} className="mt-1 text-meta break-all">
           {line}
