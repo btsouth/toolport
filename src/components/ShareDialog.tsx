@@ -12,8 +12,6 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
-import { open as openFile, save } from "@tauri-apps/plugin-dialog";
-import { downloadDir, homeDir, join } from "@tauri-apps/api/path";
 import {
   exportConfig,
   exportConfigToPath,
@@ -246,10 +244,10 @@ export function ShareDialog({ trigger, onImported }: Props) {
     setSaving(true);
     try {
       const file = `${slug(name) || "toolport-setup"}.json`;
-      const folder = await setupFolder();
+      const { save } = await import("@tauri-apps/plugin-dialog");
       const path = await save({
         title: t("Save Toolport setup"),
-        defaultPath: folder ? await join(folder, file) : file,
+        defaultPath: await setupSavePath(file),
         filters: setupFilters(t),
       });
       if (!path) return;
@@ -300,6 +298,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
     const request = ++previewRequest.current;
     setBusyAction("preview-file");
     try {
+      const { open: openFile } = await import("@tauri-apps/plugin-dialog");
       const path = await openFile({
         title: t("Open a Toolport setup"),
         defaultPath: await setupFolder(),
@@ -783,11 +782,19 @@ function setupFilters(t: (message: string) => string) {
 
 /** Setup choosers start where exports land: Downloads, else Home, as in GTK. */
 async function setupFolder(): Promise<string | undefined> {
+  const { downloadDir, homeDir } = await import("@tauri-apps/api/path");
   try {
     return await downloadDir();
   } catch {
     return homeDir().catch(() => undefined);
   }
+}
+
+async function setupSavePath(file: string): Promise<string> {
+  const folder = await setupFolder();
+  if (!folder) return file;
+  const { join } = await import("@tauri-apps/api/path");
+  return join(folder, file);
 }
 
 /** Chip labels: the name, plus the id when another server has the same name. */
