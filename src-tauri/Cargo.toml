@@ -23,6 +23,12 @@ name = "toolport-gateway"
 path = "src/bin/toolport-gateway.rs"
 required-features = ["search-static"]
 
+# The standalone CLI. Needs no features, so it links none of the desktop or search
+# dependencies: `cargo build --no-default-features --bin toolport`.
+[[bin]]
+name = "toolport"
+path = "src/bin/toolport.rs"
+
 [[bin]]
 name = "mock-mcp-server"
 path = "src/test_support/mock-mcp-server.rs"
@@ -195,6 +201,15 @@ futures-channel = { version = "0.3", optional = true }
 # real debugger session.
 [profile.dev]
 debug = "line-tables-only"
+
+# The profile npm packages of the CLI are built with: about 15 MB instead of 23 MB,
+# at full speed for parsing large transcript histories.
+# `cargo build --profile release-cli --no-default-features --bin toolport`
+[profile.release-cli]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = true
 
 # Same for the profile `cargo test` builds under.
 [profile.test]
