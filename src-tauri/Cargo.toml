@@ -64,8 +64,8 @@ test-support = ["tauri?/test", "cli"]
 cli = []
 # Additive Linux-native shell. This is deliberately not a default feature: the
 # current Tauri app remains the shipping desktop while the GTK shell reaches
-# behavioral parity.
-gtk-desktop = ["dep:gtk", "dep:adw", "dep:image", "dep:ksni", "dep:futures-channel"]
+# behavioral parity. It runs the CLI's commands too (`/usr/bin/toolport scan`).
+gtk-desktop = ["cli", "dep:gtk", "dep:adw", "dep:image", "dep:ksni", "dep:futures-channel"]
 
 [lib]
 # The `_lib` suffix may seem redundant but it is necessary

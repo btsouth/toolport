@@ -39,7 +39,12 @@ impl Fixture {
     }
 
     pub fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_toolport"));
+        self.command_for(env!("CARGO_BIN_EXE_toolport"))
+    }
+
+    /// A command for another binary that runs the CLI (the Linux desktop shell).
+    pub fn command_for(&self, exe: impl AsRef<std::ffi::OsStr>) -> Command {
+        let mut command = Command::new(exe);
         command
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default());

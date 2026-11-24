@@ -64,9 +64,11 @@ pub fn is_ours(command: &str) -> bool {
     command.contains("hook check") && command.to_ascii_lowercase().contains("toolport")
 }
 
-/// Whether `path` runs this CLI: the binary itself, or the `@toolport/cli` npm launcher.
-/// The desktop packages install their own `toolport` command that opens the app, and a
-/// session start hook must never launch that.
+/// Whether `path` runs this CLI: the binary itself (the standalone one, or the Linux
+/// desktop shell that `/usr/bin/toolport` points at, which runs `hook check` without
+/// opening a window), or the `@toolport/cli` npm launcher. Any other `toolport`, such as
+/// an older desktop package's, may open the app, and a session start hook must never
+/// launch that.
 fn runs_this_cli(path: &Path) -> bool {
     let real = std::fs::canonicalize(path).ok();
     if real.is_some()

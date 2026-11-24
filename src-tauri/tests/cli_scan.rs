@@ -9,6 +9,10 @@ fn help_version_and_usage_errors() {
     let out = f.run(&["--version"]);
     assert!(out.status.success());
     assert!(stdout(&out).starts_with("toolport "));
+    // The npm launcher runs a `toolport` on PATH only when it carries this marker.
+    let version = f.json(&["--version", "--json"]);
+    assert_eq!(version["binary"], "toolport-cli-binary-v1");
+    assert_eq!(version["version"], env!("CARGO_PKG_VERSION"));
 
     let out = f.run(&["--help"]);
     assert!(out.status.success());

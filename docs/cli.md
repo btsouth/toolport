@@ -21,9 +21,13 @@ cargo install --git https://github.com/btsouth/toolport conduit --bin toolport -
 
 Set `TOOLPORT_CLI_BIN` to point the npm launcher at a binary of your own.
 
-The Toolport desktop packages for Linux also install a `toolport` command, which opens
-the app. If both are installed, whichever comes first on your PATH wins; `npx
-@toolport/cli` always runs the CLI.
+The Toolport desktop packages for Linux (`.deb`, `.rpm` and the Arch package) have the
+CLI built in: `/usr/bin/toolport scan`, `toolport usage` and every other command below
+run it without opening a window. Run with no command, `toolport` opens the app instead,
+so the desktop launcher (`toolport-gtk`) and start at login (`toolport --hidden`) work
+as before. `toolport --help` lists both. If you also install `@toolport/cli`, either one
+can come first on your PATH; for a check of every agent with no command, run `toolport
+scan` or `npx @toolport/cli`.
 
 ## Commands
 

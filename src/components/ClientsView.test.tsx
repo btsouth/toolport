@@ -583,6 +583,38 @@ describe("ClientsView", () => {
     ).toBeInTheDocument();
   });
 
+  it("describes a code-mode client the way the GTK Clients page does", () => {
+    render(
+      <ClientsView
+        clients={[
+          client({
+            id: "codex",
+            name: "Codex",
+            gatewayInstalled: true,
+            entryState: "managed",
+            servers: [server("toolport", "toolport-gateway"), server("github", "npx")],
+          }),
+        ]}
+        registry={{
+          version: 1,
+          servers: [],
+          profiles: [],
+          activeProfileId: null,
+          clientDiscovery: { codex: "code-mode" },
+        }}
+        onSelectClient={vi.fn()}
+      />,
+    );
+
+    const line = screen.getByText("1 other server · Search and run scripts");
+    expect(line).toHaveAttribute(
+      "title",
+      expect.stringContaining(
+        "Search and run scripts. Client per-tool permission rules need Full mode.",
+      ),
+    );
+  });
+
   it("does not describe a customized gateway entry as connected", () => {
     render(
       <ClientsView

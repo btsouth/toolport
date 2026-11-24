@@ -626,17 +626,37 @@ pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
     page.details.push(&client.id, &root);
 }
 
+/// The discovery picker's choices in order, matching the React Select.
+const DISCOVERY_PICKER_MODES: [Option<&str>; 5] = [
+    None,
+    Some("lazy"),
+    Some("grouped"),
+    Some("full"),
+    Some("code-mode"),
+];
+
+/// The picker row for a stored override: its canonical mode (so `codemode` shows as
+/// Code mode, as the gateway reads it), else Auto.
+fn discovery_picker_index(stored: Option<&str>) -> u32 {
+    let chosen = stored.and_then(crate::clients::chosen_discovery_mode);
+    DISCOVERY_PICKER_MODES
+        .iter()
+        .position(|m| *m == chosen)
+        .unwrap_or(0) as u32
+}
+
 fn discovery_picker(
     client: &state::ClientView,
     page: &ClientPage,
     write: fn(&str, Option<&str>) -> Result<crate::registry::Registry, String>,
 ) -> gtk::DropDown {
-    let modes = [None, Some("lazy"), Some("grouped"), Some("full")];
+    let modes = DISCOVERY_PICKER_MODES;
     let mode = gtk::DropDown::from_strings(&[
         &crate::i18n::tr("Auto"),
         &crate::i18n::tr("Lazy · search"),
         &crate::i18n::tr("Grouped · per-server"),
         &crate::i18n::tr("Full · every tool"),
+        &crate::i18n::tr("Code mode · scripts"),
     ]);
     super::quiet_tooltips::guard_dropdown(&mode);
     bound_dropdown(&mode);
@@ -647,14 +667,10 @@ fn discovery_picker(
             "Lazy · search",
             "Grouped · per-server",
             "Full · every tool",
+            "Code mode · scripts",
         ],
     );
-    mode.set_selected(
-        modes
-            .iter()
-            .position(|m| *m == client.discovery_mode.as_deref())
-            .unwrap_or(0) as u32,
-    );
+    mode.set_selected(discovery_picker_index(client.discovery_mode.as_deref()));
     mode.set_sensitive(!client.config_error);
     mode.set_valign(gtk::Align::Start);
     mode.update_property(&[gtk::accessible::Property::Label(&crate::i18n::tr(
@@ -1221,6 +1237,7 @@ mod tests {
             "Lazy · search",
             "Grouped · per-server",
             "Full · every tool",
+            "Code mode · scripts",
         ];
         let control = gtk::DropDown::from_strings(&choices);
         bound_dropdown(&control);
@@ -1249,7 +1266,11 @@ mod tests {
             .filter_map(|w| w.downcast::<gtk::Label>().ok())
             .filter(|l| l.is_mapped() && choices[1..].contains(&l.text().as_str()))
             .collect::<Vec<_>>();
-        assert_eq!(labels.len(), 3, "the open list shows the longer choices");
+        assert_eq!(
+            labels.len(),
+            choices.len() - 1,
+            "the open list shows the longer choices"
+        );
         for label in labels {
             let (one_line, _) = label.create_pango_layout(Some(&label.text())).pixel_size();
             assert!(
@@ -2171,6 +2192,99 @@ mod tests {
             "missing destination still uses live-list fallback"
         );
         window.close();
+    }
+
+    #[test]
+    fn discovery_picker_rows_follow_the_react_select() {
+        assert_eq!(
+            DISCOVERY_PICKER_MODES,
+            [
+                None,
+                Some("lazy"),
+                Some("grouped"),
+                Some("full"),
+                Some("code-mode")
+            ]
+        );
+        assert_eq!(discovery_picker_index(None), 0);
+        assert_eq!(discovery_picker_index(Some("lazy")), 1);
+        assert_eq!(discovery_picker_index(Some("grouped")), 2);
+        assert_eq!(discovery_picker_index(Some("full")), 3);
+        for stored in ["code-mode", "codemode", "code_mode", "Code-Mode"] {
+            assert_eq!(discovery_picker_index(Some(stored)), 4, "{stored}");
+        }
+        assert_eq!(discovery_picker_index(Some("inherit")), 0);
+        assert_eq!(discovery_picker_index(Some("typo")), 0);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn code_mode_choice_saves_code_mode_and_shows_its_summary() {
+        let _data = crate::registry::DataDirTestEnv::new("code-mode-discovery");
+        let app = app();
+        let (_, servers, _) = build_content(&app, crate::approval_broker::start_native());
+        let page = ClientPage::new(&app, servers);
+        let codex = fixture_client("codex@work");
+        page.render(snapshot(vec![codex.clone()]));
+        client(&codex, &page);
+        let active = page.details.stack.child_by_name("detail").unwrap();
+        let picker = widgets(&active)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::DropDown>().ok())
+            .last()
+            .unwrap();
+        let label = picker
+            .model()
+            .and_downcast::<gtk::StringList>()
+            .unwrap()
+            .string(4)
+            .unwrap();
+        assert_eq!(label, "Code mode · scripts");
+        picker.set_selected(4);
+        let saved_mode = || {
+            let path = crate::registry::registry_path()?;
+            let contents = std::fs::read_to_string(path).ok()?;
+            crate::registry::parse_registry_contents(&contents)
+                .ok()?
+                .client_discovery
+                .get("codex@work")
+                .cloned()
+        };
+        let context = gtk::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            while context.pending() {
+                context.iteration(false);
+            }
+            if saved_mode().as_deref() == Some("code-mode") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(saved_mode().as_deref(), Some("code-mode"));
+
+        let mut chosen = codex.clone();
+        chosen.discovery_mode = Some("code-mode".into());
+        client(&chosen, &page);
+        let active = page.details.stack.child_by_name("detail").unwrap();
+        let texts = widgets(&active)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .map(|l| l.text().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t
+                    == "Search and run scripts. Client per-tool permission rules need Full mode."),
+            "{texts:?}"
+        );
+        let picker = widgets(&active)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::DropDown>().ok())
+            .last()
+            .unwrap();
+        assert_eq!(picker.selected(), 4);
     }
 
     #[test]

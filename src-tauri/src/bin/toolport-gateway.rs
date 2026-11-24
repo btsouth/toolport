@@ -8133,7 +8133,11 @@ fn listed_discovery_mode(
         drop_blocked_from_cache(cached.shared(), router, reg)
     };
     let full = tool_surface(host, reg, router, &catalog, allowed, DiscoveryMode::Full);
-    let floor = full_tool_floor(host.code_mode_enabled(), full_discovery_fallback(client)).len();
+    let floor = full_tool_floor(
+        code_mode_for(host, DiscoveryMode::Full),
+        full_discovery_fallback(client),
+    )
+    .len();
     if auto_full_small_catalog(
         reg,
         router,
@@ -8686,8 +8690,13 @@ fn handle_request_with_cancel(
                 full.splice(2..2, [search_tool_def(), call_tool_def()]);
                 hints.apply_all(&mut full[2..4], router);
             }
-            let full_floor =
-                full_tool_floor(host.code_mode_enabled(), full_discovery_fallback(client)).len();
+            // The Full baseline's floor, as a Full request would get it: the script tool
+            // only with the host switch, never from this request's code-mode discovery.
+            let full_floor = full_tool_floor(
+                code_mode_for(host, DiscoveryMode::Full),
+                full_discovery_fallback(client),
+            )
+            .len();
             let mode = if mode == DiscoveryMode::Full && over_client_tool_limit(client, tools.len())
             {
                 // The client would drop every tool, so answer with search instead.
@@ -15361,14 +15370,18 @@ impl HostState {
         preserve_collapsed_servers(new_tools, previous, &mut streaks)
     }
 
-    /// Gate for server-side "code mode" (the `toolport_run_script` meta-tool).
+    /// The host's Code Mode switch (the `toolport_run_script` meta-tool in every mode).
     ///
     /// Policy: off by default via the registry's `code_mode` field (Advanced Settings
-    /// switch, synced into this host's flag). Kill switch: turn Settings off. Code mode runs
-    /// agent-supplied JS and is not a security boundary; each host call still passes the same
-    /// scope / human-approval gates as `toolport_call_tool`. `TOOLPORT_CODE_MODE=1` (or legacy
-    /// `CONDUIT_CODE_MODE`) still force-enables for power users and tests. When off, `run_script`
-    /// is neither advertised nor dispatched.
+    /// switch, synced into this host's flag). Code mode runs agent-supplied JS and is not a
+    /// security boundary; each host call still passes the same scope / human-approval gates
+    /// as `toolport_call_tool`. `TOOLPORT_CODE_MODE=1` (or legacy `CONDUIT_CODE_MODE`) still
+    /// force-enables for power users and tests.
+    ///
+    /// This is only the switch. A request in the code-mode discovery mode has the script
+    /// tool even with the switch off, so whether a request may advertise or dispatch
+    /// `run_script` is [`code_mode_for`], never this alone. With the switch off and no
+    /// code-mode discovery, `run_script` is neither advertised nor dispatched.
     fn code_mode_enabled(&self) -> bool {
         let env_forced = conduit_lib::brand::env_flag("TOOLPORT_CODE_MODE", "CONDUIT_CODE_MODE");
         env_forced || self.code_mode.load(Ordering::Relaxed)

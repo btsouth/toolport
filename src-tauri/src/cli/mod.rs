@@ -28,9 +28,46 @@ pub const EXIT_FINDINGS: i32 = 2;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Identifies this binary. The npm launcher only runs a `toolport` found on PATH when it
-/// contains this, so it never starts the desktop app's own `toolport` command.
-pub const BINARY_MARKER: &str = "toolport-cli-binary-v1";
+/// The binary the CLI runs in: the standalone `toolport`, or the Linux desktop shell,
+/// whose `/usr/bin/toolport` runs these commands too.
+pub struct Host {
+    /// `binary` in `toolport --version --json`. The standalone binary passes the marker
+    /// the npm launcher looks for; it lives only in `src/bin/toolport.rs`, so the desktop
+    /// shell, which opens its window when run without arguments, never contains it.
+    pub binary: &'static str,
+    /// A line printed after the version, such as the desktop build.
+    pub version_detail: Option<String>,
+    /// A section printed after the main help, such as how to open the desktop app.
+    pub help_footer: Option<fn(&Style) -> String>,
+}
+
+/// Whether `args` (without the program name) are a CLI command line rather than a
+/// desktop launch. Commands, their typos and the CLI's own options are; no arguments,
+/// `--hidden`, `toolport://` and other links, and options the CLI doesn't know (GTK and
+/// GApplication ones) are not.
+pub fn is_cli_invocation(args: &[std::ffi::OsString]) -> bool {
+    let Some(first) = args.first() else {
+        return false;
+    };
+    let first = first.to_string_lossy();
+    if first.contains("://") {
+        return false;
+    }
+    if first == "-" || first == "--" || !first.starts_with('-') {
+        return true;
+    }
+    if first == "--fix" {
+        return true;
+    }
+    let known = |flag: &Flag| -> bool {
+        match first.strip_prefix("--") {
+            Some(long) => long.split_once('=').map_or(long, |(n, _)| n) == flag.long,
+            None => first.len() == 2 && flag.short == first.chars().nth(1),
+        }
+    };
+    let scan = find_command("scan").expect("scan exists");
+    GLOBAL_FLAGS.iter().chain(scan.flags).any(known)
+}
 
 /// What every command gets: output mode, style and the project folder.
 pub struct Ctx {
@@ -614,7 +651,7 @@ fn wrap(text: &str, width: usize) -> String {
 // ---------------------------------------------------------------------------------------------
 
 /// Run the CLI and return the process exit code.
-pub fn run(argv: Vec<String>) -> i32 {
+pub fn run(host: &Host, argv: Vec<String>) -> i32 {
     let no_color_early = argv.iter().any(|a| a == "--no-color");
     let style = Style::detect(no_color_early);
     let args = match parse(&argv) {
@@ -623,9 +660,17 @@ pub fn run(argv: Vec<String>) -> i32 {
     };
     if args.has("version") {
         if args.has("json") {
-            out(&serde_json::json!({"name": "toolport", "version": VERSION, "binary": BINARY_MARKER}).to_string());
+            let mut value =
+                serde_json::json!({"name": "toolport", "version": VERSION, "binary": host.binary});
+            if let Some(detail) = &host.version_detail {
+                value["detail"] = detail.as_str().into();
+            }
+            out(&value.to_string());
         } else {
             out(&format!("toolport {VERSION}"));
+            if let Some(detail) = &host.version_detail {
+                out(detail);
+            }
         }
         return EXIT_OK;
     }
@@ -635,7 +680,12 @@ pub fn run(argv: Vec<String>) -> i32 {
         out(&if explicit {
             command_help(&style, command)
         } else {
-            main_help(&style)
+            let mut help = main_help(&style);
+            if let Some(footer) = host.help_footer {
+                help.push('\n');
+                help.push_str(&footer(&style));
+            }
+            help
         });
         return EXIT_OK;
     }
@@ -800,6 +850,48 @@ mod tests {
 
     fn argv(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn cli_invocations_are_told_apart_from_desktop_launches() {
+        let os =
+            |s: &str| -> Vec<std::ffi::OsString> { s.split_whitespace().map(Into::into).collect() };
+        for command in COMMANDS {
+            assert!(is_cli_invocation(&os(command.name)), "{}", command.name);
+            assert!(is_cli_invocation(&os(&format!("{} --json", command.name))));
+        }
+        for line in [
+            "-h",
+            "--help",
+            "-V",
+            "--version",
+            "--version --json",
+            "--fix",
+            "--fix --dry-run",
+            "--check",
+            "--all",
+            "--json",
+            "--no-color",
+            "--project /tmp",
+            "--project=/tmp scan",
+            "--",
+            "-",
+            "scna",
+        ] {
+            assert!(is_cli_invocation(&os(line)), "{line}");
+        }
+        for line in [
+            "",
+            "--hidden",
+            "--hidden --version",
+            "toolport://open/servers",
+            "conduit://pair?code=1",
+            "--gapplication-service",
+            "--display=:1",
+            "-x",
+        ] {
+            assert!(!is_cli_invocation(&os(line)), "{line}");
+        }
     }
 
     #[test]

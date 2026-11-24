@@ -48,6 +48,25 @@ const APP_ID: &str = "com.tsout.Toolport";
 /// can clean up what it left in the user's home directory.
 const LEGACY_PREVIEW_APP_ID: &str = "com.tsout.Toolport.NativePreview";
 
+/// The CLI as the desktop shell runs it: `/usr/bin/toolport scan` and the other
+/// commands (see [`crate::cli::is_cli_invocation`]) run here without starting GTK.
+pub fn cli_host() -> crate::cli::Host {
+    crate::cli::Host {
+        binary: "toolport-gtk",
+        version_detail: Some(single_instance::build_stamp_text()),
+        help_footer: Some(desktop_help),
+    }
+}
+
+fn desktop_help(style: &crate::cli::format::Style) -> String {
+    format!(
+        "{}\n  {}  open Toolport\n  {}  start it in the tray\n",
+        style.bold("Desktop app:"),
+        style.cyan("toolport-gtk [toolport://URL]"),
+        style.cyan("toolport-gtk --hidden        "),
+    )
+}
+
 pub fn run() {
     let _ = crate::i18n::initialize();
     #[cfg(target_env = "gnu")]
@@ -4350,17 +4369,23 @@ fn append_client_discovery_actions(
             Some("grouped"),
             crate::i18n::msg("Browse a server, then call tools. Client per-tool permission rules need Full mode."),
         ),
+        (
+            crate::i18n::msg("Code mode"),
+            Some("code-mode"),
+            crate::i18n::msg("Search and run scripts. Client per-tool permission rules need Full mode."),
+        ),
     ] {
-        let selected = match (client.discovery_mode.as_deref(), mode) {
-            (None, None) => true,
-            (Some(stored), Some(mode)) => stored.trim().eq_ignore_ascii_case(mode),
-            _ => false,
-        };
+        let selected = client
+            .discovery_mode
+            .as_deref()
+            .and_then(crate::clients::chosen_discovery_mode)
+            == mode;
         let button = toolport_menu_choice_button(label, selected);
         let tooltip = match mode {
             Some("full") => crate::i18n::tr("Full tool list. Client per-tool permission rules need Full mode."),
             Some("grouped") => crate::i18n::tr("Browse a server, then call tools. Client per-tool permission rules need Full mode."),
             Some("lazy") => crate::i18n::tr("Search, then call tools. Client per-tool permission rules need Full mode."),
+            Some("code-mode") => crate::i18n::tr("Search and run scripts. Client per-tool permission rules need Full mode."),
             _ => auto_hint.clone(),
         };
         button.set_tooltip_text(Some(&tooltip));

@@ -25,7 +25,8 @@ export const PLATFORMS = {
 };
 
 // The native binary embeds this string. A `toolport` on PATH without it is some other
-// program (the desktop app installs one that opens its window), so it is never run.
+// program, such as the Linux desktop app's, which opens its window when run without a
+// command, so it is never run.
 export const BINARY_MARKER = "toolport-cli-binary-v1";
 
 const LAUNCHER = fileURLToPath(new URL("../bin/toolport.js", import.meta.url));
