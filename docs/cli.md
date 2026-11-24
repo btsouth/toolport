@@ -27,7 +27,9 @@ run it without opening a window. Run with no command, `toolport` opens the app i
 so the desktop launcher (`toolport-gtk`) and start at login (`toolport --hidden`) work
 as before. `toolport --help` lists both. If you also install `@toolport/cli`, either one
 can come first on your PATH; for a check of every agent with no command, run `toolport
-scan` or `npx @toolport/cli`.
+scan` or `npx @toolport/cli`. On Linux AppImage installs (`~/.local/bin/toolport`) and
+legacy 1.x Tauri `.deb` packages, `toolport` still opens the app, so use
+`npx @toolport/cli` there.
 
 ## Commands
 

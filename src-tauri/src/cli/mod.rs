@@ -50,7 +50,7 @@ pub fn is_cli_invocation(args: &[std::ffi::OsString]) -> bool {
         return false;
     };
     let first = first.to_string_lossy();
-    if first.contains("://") {
+    if first.is_empty() || matches!(first.as_ref(), "%U" | "%u") || first.contains("://") {
         return false;
     }
     if first == "-" || first == "--" || !first.starts_with('-') {
@@ -889,9 +889,12 @@ mod tests {
             "--gapplication-service",
             "--display=:1",
             "-x",
+            "%U",
+            "%u",
         ] {
             assert!(!is_cli_invocation(&os(line)), "{line}");
         }
+        assert!(!is_cli_invocation(&[std::ffi::OsString::from("")]));
     }
 
     #[test]
