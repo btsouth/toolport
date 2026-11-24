@@ -9,6 +9,7 @@ pub mod brand;
 pub mod call_failure;
 pub mod catalog;
 pub mod child_ledger;
+pub mod cli;
 pub mod client_process;
 pub mod clients;
 pub mod codemode;

@@ -6,57 +6,130 @@
 [![Discord](https://img.shields.io/badge/Discord-join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/Xsn27MxdBA)
 [![Glama quality](https://glama.ai/mcp/servers/tsouth89/toolport/badges/score.svg)](https://glama.ai/mcp/servers/tsouth89/toolport)
 
-**Your AI agents' tools, skills and rules. Set up once, on every machine.**
+**One setup for every coding agent.**
 
-Toolport is a free desktop app and local gateway for MCP, the protocol that gives
-AI apps tools like GitHub, Linear and databases. Add a server once and Claude Code,
-Codex, Cursor, VS Code and 40+ other agents can all use it.
+Claude Code, Codex, Cursor, OpenCode and 40+ other agents each keep their own MCP
+servers, skills, rules files and credentials. Toolport finds all of them, shows what
+drifted or leaked, and gives every agent the same setup.
 
-[Download](https://toolport.app/download) · [Website & demo](https://toolport.app) · [Discord](https://discord.gg/Xsn27MxdBA)
+```sh
+npx @toolport/cli
+```
+
+That one command checks every agent on your machine in a few seconds: plaintext
+secrets in configs, MCP servers that differ between agents, broken skill links, and
+how many tokens each agent loads before your first prompt. Nothing leaves your machine,
+and secret values are never printed.
+
+[CLI guide](docs/cli.md) · [Desktop app](https://toolport.app/download) · [Website](https://toolport.app) · [Discord](https://discord.gg/Xsn27MxdBA)
+
+## The CLI
+
+| Command                          | What it does                                                                                                          |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `npx @toolport/cli`              | Check every agent: secrets on disk, MCP drift, skills and rules health, turn-0 token budget                           |
+| `npx @toolport/cli usage`        | See where your tokens go across Claude Code, Codex and OpenCode: cache health, what stays in context, list-price cost |
+| `npx @toolport/cli --fix`        | Preview and apply safe fixes: broken skill links, stale entries, rules links, secrets into your OS keychain           |
+| `npx @toolport/cli init`         | Write a secret-free `toolport.toml` for this repo                                                                     |
+| `npx @toolport/cli up`           | Set up every agent in this repo from `toolport.toml`                                                                  |
+| `npx @toolport/cli export`       | Share your servers as a secret-free file or gist; `import` brings one in                                              |
+| `npx @toolport/cli hook install` | A quiet session start check: silent when healthy, one line when something drifted                                     |
+| `npx @toolport/cli report`       | A static HTML report card of all of the above                                                                         |
+
+Add `--json` to any command for scripts, and `scan --check` in CI to fail when
+something needs attention (exit code 2).
+
+### Where your tokens go
+
+`toolport usage` reads your local agent transcripts, offline, and shows what each turn
+actually carries: the startup floor (system prompt, tools, rules files), shell output,
+file reads, screenshots that stay in context, and every MCP server. It flags cache
+breaks inside a session, repeat reads of unchanged files, servers with no calls, and
+servers whose bursts of calls are a fit for Code Mode.
+
+### One file for the whole repo
+
+Commit a `toolport.toml` and anyone who clones the repo runs `npx @toolport/cli up`:
+
+```toml
+version = 1
+name = "acme-api"
+
+[rules]
+source = "AGENTS.md"            # Claude Code and Gemini get a pointer to it
+
+[[skills]]
+path = ".agents/skills/release" # linked into each agent that doesn't see it yet
+
+[[skills]]
+source = "vercel-labs/agent-skills@frontend-design"
+
+[[servers]]
+name = "github"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = ["GITHUB_TOKEN"]          # names only: values go in the OS keychain
+```
+
+`toolport up` refuses a manifest that contains a literal secret, asks for missing
+credentials without echoing them, and stores them in your OS keychain.
+
+**Works with skills.sh.** Skills installed with `npx skills add` land in
+`~/.agents/skills`; Toolport shows which agents read that folder and links the ones
+that don't.
+
+### Let your agent do it
+
+Paste this into Claude Code, Codex or any coding agent:
+
+> Run `npx @toolport/cli --json`, explain what it found, then run
+> `npx @toolport/cli fix --dry-run` and apply the fixes I agree with.
+
+## The desktop app and gateway
+
+The free [Toolport app](https://toolport.app/download) for Windows, macOS and Linux
+adds everything the CLI points you toward:
+
+- **A local gateway for MCP.** Add a server once and every agent reaches it through
+  one Toolport entry. Fix a server once and every agent gets the fix. Access sets
+  choose which servers each agent can reach.
+- **Every machine, too.** [Pro](https://toolport.app/pricing) syncs your servers to each
+  computer you sign in on. Secrets stay on each machine.
+- **Skills and rules in one place.** See which skills and rules files each agent
+  loads, turn skills on or off per agent, and link agents to the rules file the others
+  share. See [skills and rules](docs/skills-and-rules.md).
+- **Safe by default.** API keys move out of plain-text configs into your OS keychain.
+  Toolport pins every tool definition and flags changes, such as a tool you approved
+  rewriting its description, plus hidden instructions in descriptions and results. The
+  default Ask level holds destructive calls for your OK. Strict also quarantines changed
+  tools and blocks detected injection. Every call is in Activity. See
+  [security](SECURITY.md).
+- **Lighter on context where it helps.** For agents that send every tool definition on
+  every request, Toolport's search tools can cut input tokens by several times. Code
+  Mode runs a burst of calls as one script so only the result enters context. See the
+  [benchmarks](BENCHMARK.md).
 
 ![Toolport Servers screen with eight servers ready and one turned off](docs/screenshots/servers.png)
 
-## Why Toolport?
-
-- **One setup for every agent.** Toolport finds the agents on your machine, imports
-  the servers they already have and gives each one a single Toolport entry. Fix a
-  server once and every agent gets the fix. Access sets choose which servers each
-  agent can reach.
-- **Every machine, too.** [Pro](https://toolport.app/pricing) syncs your servers to
-  each computer you sign in on. Secrets stay on each machine.
-- **Skills and rules in one place.** See which skills and rules files (`CLAUDE.md`,
-  `AGENTS.md` and others) each agent actually loads, turn skills on or off per agent,
-  and link agents to the rules file the others already share.
-  See [skills and rules](docs/skills-and-rules.md).
-- **Safe by default.** API keys move out of plain-text configs into your OS keychain.
-  Toolport pins every tool definition and flags changes, such as a tool you approved
-  rewriting its description, plus hidden instructions in descriptions and results.
-  The default Ask level holds destructive calls for your OK. Strict also quarantines
-  changed tools and blocks detected injection. Every call is in Activity. See
-  [security](SECURITY.md).
-- **Lighter on context where it helps.** For agents that send every tool definition on
-  every request, Toolport's search tools can cut input tokens by several times. Claude
-  Code, Codex and Cursor already defer tools, so Toolport's Auto mode gives them the
-  full list (Claude Code up to 800 tools). See the [benchmarks](BENCHMARK.md).
-
-## Get started
+### Get started with the app
 
 1. [Download Toolport](https://toolport.app/download) for Windows, macOS, or Linux.
 2. Add a server from the catalog, import an existing setup, or paste a server config.
    Curated servers that need launch arguments show a Launch setup section in the app.
-3. Authenticate the server, then open **Clients** and connect your AI apps.
-   Restart or reload the client once so it picks up Toolport.
+3. Authenticate the server, then open **Clients** and connect your AI apps. Restart or
+   reload the client once so it picks up Toolport.
 
 Installers and release notes are also on
-[GitHub Releases](https://github.com/btsouth/toolport/releases).
-On Arch and Omarchy, the [pacman repository](docs/arch-pacman-repo.md) keeps
-Toolport on your normal update path.
+[GitHub Releases](https://github.com/btsouth/toolport/releases). On Arch and Omarchy,
+the [pacman repository](docs/arch-pacman-repo.md) keeps Toolport on your normal update
+path.
 
 Working with a team? [Toolport Teams](https://toolport.app/teams) shares server
 configuration and policies while each member keeps their own credentials.
 
 ## Documentation
 
+- [The toolport CLI](docs/cli.md)
 - [Upgrade from 1.24.x to 2.0](docs/migration.md)
 - [Supported clients and setup](docs/clients.md)
 - [Toolport with T3 Code](docs/t3-code.md): the rows it uses, the T3 Code card and Connect all on Clients, and "via T3 Code" in Activity
@@ -80,13 +153,21 @@ npm run build:gateway
 npm run tauri dev
 ```
 
+The CLI builds on its own, without the desktop or search features:
+
+```sh
+cargo build --manifest-path src-tauri/Cargo.toml --no-default-features --features cli --bin toolport
+```
+
+Release packages use `--profile release-cli`, which adds full LTO and strips symbols.
+
 See [Contributing](CONTRIBUTING.md) for testing and build instructions.
 
 ## Toolport Teams
 
-Share server configuration and policies across a team while each member keeps
-their own credentials. [Hosted and self-hosted options](https://toolport.app/teams).
+Share server configuration and policies across a team while each member keeps their
+own credentials. [Hosted and self-hosted options](https://toolport.app/teams).
 
 ## License
 
-The desktop app and gateway are [MIT licensed](LICENSE).
+The CLI, desktop app and gateway are [MIT licensed](LICENSE).

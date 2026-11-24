@@ -72,7 +72,12 @@ export default tseslint.config(
   // no-undef errors — which in turn meant nobody ran it and these files went
   // unlinted entirely.
   {
-    files: ["scripts/**/*.{mjs,js}", "benchmark/**/*.{mjs,js}", "*.mjs"],
+    files: [
+      "scripts/**/*.{mjs,js}",
+      "benchmark/**/*.{mjs,js}",
+      "packages/**/*.{mjs,js}",
+      "*.mjs",
+    ],
     languageOptions: {
       ecmaVersion: 2022,
       sourceType: "module",

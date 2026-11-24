@@ -23,6 +23,14 @@ name = "toolport-gateway"
 path = "src/bin/toolport-gateway.rs"
 required-features = ["search-static"]
 
+# The standalone CLI. Its `cli` feature pulls in nothing, so it links none of the
+# desktop or search dependencies; the feature only keeps desktop builds from building
+# and bundling it: `cargo build --no-default-features --features cli --bin toolport`.
+[[bin]]
+name = "toolport"
+path = "src/bin/toolport.rs"
+required-features = ["cli"]
+
 [[bin]]
 name = "mock-mcp-server"
 path = "src/test_support/mock-mcp-server.rs"
@@ -51,7 +59,9 @@ desktop = [
 # enable in a shipped binary. `cargo test --release --bin toolport-gateway`
 # needs it because the library is compiled without `cfg(test)` when linked
 # into the binary; docker-publish rebuilds without this feature before upload.
-test-support = ["tauri?/test"]
+test-support = ["tauri?/test", "cli"]
+# Builds the standalone `toolport` CLI binary. Adds no dependencies.
+cli = []
 # Additive Linux-native shell. This is deliberately not a default feature: the
 # current Tauri app remains the shipping desktop while the GTK shell reaches
 # behavioral parity.
@@ -195,6 +205,15 @@ futures-channel = { version = "0.3", optional = true }
 # real debugger session.
 [profile.dev]
 debug = "line-tables-only"
+
+# The profile npm packages of the CLI are built with: about 15 MB instead of 23 MB,
+# at full speed for parsing large transcript histories.
+# `cargo build --profile release-cli --no-default-features --features cli --bin toolport`
+[profile.release-cli]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = true
 
 # Same for the profile `cargo test` builds under.
 [profile.test]
