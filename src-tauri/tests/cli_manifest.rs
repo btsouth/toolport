@@ -119,6 +119,11 @@ fn up_plans_then_links_rules_skills_and_vaults_credentials() {
         && s["command"] == "npx skills add vercel-labs/agent-skills --skill frontend-design"));
     let github = steps.iter().find(|s| s["name"] == "github").unwrap();
     assert_eq!(github["needs"], serde_json::json!(["GITHUB_TOKEN"]));
+    // What a repo's server runs is shown before anything is applied.
+    assert!(
+        github["runs"].as_str().unwrap().starts_with("npx"),
+        "{github:#}"
+    );
     let docs = steps.iter().find(|s| s["name"] == "docs").unwrap();
     assert!(docs["warnings"].as_array().unwrap().is_empty());
     assert!(github["warnings"][0]
@@ -175,6 +180,66 @@ fn up_plans_then_links_rules_skills_and_vaults_credentials() {
         "{again:#}"
     );
     assert!(steps.iter().any(|s| s["kind"] == "serverSame"));
+}
+
+#[test]
+fn up_again_finishes_a_server_left_off_for_a_missing_credential() {
+    let f = Fixture::new("up-finish");
+    project(&f);
+    let out = f.json(&["up", "--yes", "--json"]);
+    assert!(
+        out["applied"]
+            .to_string()
+            .contains("off until GITHUB_TOKEN is set"),
+        "{out:#}"
+    );
+
+    let plan = f.json(&["up", "--dry-run", "--json"]);
+    let finish = plan["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["kind"] == "serverFinish")
+        .unwrap_or_else(|| panic!("{plan:#}"))
+        .clone();
+    assert_eq!(finish["name"], "github");
+    assert_eq!(finish["needs"], serde_json::json!(["GITHUB_TOKEN"]));
+    assert_eq!(finish["enable"], true);
+
+    // Still no value: says so instead of claiming everything is set up.
+    let out = f.json(&["up", "--yes", "--json"]);
+    assert!(
+        out["notes"]
+            .to_string()
+            .contains("github still needs GITHUB_TOKEN"),
+        "{out:#}"
+    );
+
+    let out = f.run_env(&["up", "--yes", "--json"], &[("GITHUB_TOKEN", SECRET)]);
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        report["applied"]
+            .to_string()
+            .contains("finished github (enabled)"),
+        "{report:#}"
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(SECRET));
+    let registry: serde_json::Value =
+        serde_json::from_str(&f.read(&f.data.join("registry.json"))).unwrap();
+    let github = registry["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "github")
+        .unwrap();
+    assert_eq!(github["enabled"], true);
+
+    let again = f.json(&["up", "--dry-run", "--json"]);
+    assert!(again["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["kind"] == "serverSame" && s["name"] == "github"));
 }
 
 #[test]

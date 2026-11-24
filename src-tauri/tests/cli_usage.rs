@@ -304,3 +304,34 @@ fn usage_filters_by_client_and_handles_an_empty_machine() {
     assert_eq!(out.status.code(), Some(0));
     assert!(stdout(&out).contains("No agent sessions found"));
 }
+
+#[test]
+fn a_window_counts_the_turns_inside_it_not_whole_files() {
+    let f = Fixture::new("usage-window");
+    f.clean_machine();
+    let now = now_ms();
+    let old = now - 40 * 86_400_000;
+    // One session that started 40 days ago and was resumed an hour ago: the file was
+    // touched today, but only today's turn is inside a 7 day window.
+    let lines = [
+        assistant(old, "a1", usage(10, 0, 50_000, 0, 1_000), json!([])),
+        assistant(
+            old + 60_000,
+            "a2",
+            usage(10, 50_000, 500, 0, 1_000),
+            json!([]),
+        ),
+        assistant(now - 3_600_000, "a3", usage(10, 0, 51_000, 0, 7), json!([])),
+    ];
+    f.write(".claude/projects/-work-demo/long.jsonl", &lines.join("\n"));
+
+    let week = f.json(&["usage", "--json", "--days", "7"]);
+    assert_eq!(week["totals"]["sessions"], 1, "{week:#}");
+    assert_eq!(week["totals"]["turns"], 1, "{week:#}");
+    assert_eq!(week["totals"]["output"], 7, "{week:#}");
+
+    // The cached summary answers a wider window with every turn.
+    let all = f.json(&["usage", "--json", "--days", "60"]);
+    assert_eq!(all["totals"]["turns"], 3, "{all:#}");
+    assert_eq!(all["stats"]["cached"], 1, "{all:#}");
+}

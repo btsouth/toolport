@@ -24,7 +24,7 @@ use super::format::{self, Align, Severity, Style};
 use super::{Args, CliError, Ctx, EXIT_OK};
 
 /// Bump when [`FileSummary`] or the parsers change meaning, so old cache entries are ignored.
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 /// A session with this many calls to one MCP server is a burst: a Code Mode candidate.
 pub const BURST_CALLS: u64 = 9;
 /// An image that stays in context this many turns is lingering.
@@ -291,6 +291,107 @@ pub struct FileSummary {
     /// A Claude Code subagent transcript: its own context, but not a user session.
     #[serde(default)]
     pub subagent: bool,
+}
+
+impl FileSummary {
+    /// Add another summary of the same transcript (another day of it).
+    fn merge(&mut self, o: FileSummary) {
+        fn add_map(into: &mut BTreeMap<String, u64>, from: BTreeMap<String, u64>) {
+            for (k, v) in from {
+                *into.entry(k).or_default() += v;
+            }
+        }
+        if o.first_ms != 0 && (self.first_ms == 0 || o.first_ms < self.first_ms) {
+            self.first_ms = o.first_ms;
+        }
+        self.last_ms = self.last_ms.max(o.last_ms);
+        self.turns += o.turns;
+        for (model, t) in o.models {
+            self.models.entry(model).or_default().add(&t);
+        }
+        self.context_sum += o.context_sum;
+        self.context_max = self.context_max.max(o.context_max);
+        self.floor_sum += o.floor_sum;
+        self.floor = self.floor.max(o.floor);
+        add_map(&mut self.resident, o.resident);
+        add_map(&mut self.produced, o.produced);
+        add_map(&mut self.tool_calls, o.tool_calls);
+        add_map(&mut self.mcp_calls, o.mcp_calls);
+        self.images += o.images;
+        self.image_tokens += o.image_tokens;
+        self.images_lingering += o.images_lingering;
+        self.image_linger_turns += o.image_linger_turns;
+        self.dup_reads += o.dup_reads;
+        self.dup_read_tokens += o.dup_read_tokens;
+        self.misses_idle += o.misses_idle;
+        self.misses_idle_tokens += o.misses_idle_tokens;
+        self.misses_break += o.misses_break;
+        self.misses_break_tokens += o.misses_break_tokens;
+        self.compactions += o.compactions;
+        self.malformed_lines += o.malformed_lines;
+        self.subagent |= o.subagent;
+    }
+}
+
+const DAY_MS: u64 = 86_400_000;
+
+/// One transcript's summary per UTC day its records fall on, so a `--days` window counts
+/// the turns inside it, not every turn of a file that was touched inside it.
+pub type DaySummaries = Vec<(u32, FileSummary)>;
+
+/// Builds [`DaySummaries`] while a transcript is read. Records without a timestamp count
+/// toward the day of the record before them.
+struct Days {
+    map: BTreeMap<u32, FileSummary>,
+    day: u32,
+    subagent: bool,
+}
+
+impl Days {
+    fn new(subagent: bool) -> Self {
+        Days {
+            map: BTreeMap::new(),
+            day: 0,
+            subagent,
+        }
+    }
+
+    fn at(&mut self, ts: u64) -> &mut FileSummary {
+        if ts > 0 {
+            self.day = (ts / DAY_MS) as u32;
+        }
+        let subagent = self.subagent;
+        self.map.entry(self.day).or_insert_with(|| FileSummary {
+            subagent,
+            ..Default::default()
+        })
+    }
+
+    fn finish(mut self) -> DaySummaries {
+        // Anything before the first timestamp belongs to the first day that has one.
+        if let Some(early) = self.map.remove(&0) {
+            match self.map.values_mut().next() {
+                Some(first) => first.merge(early),
+                None => {
+                    self.map.insert(0, early);
+                }
+            }
+        }
+        self.map.into_iter().collect()
+    }
+}
+
+/// The part of a transcript inside the window starting at `since_ms`, by whole UTC days.
+/// A transcript without timestamps (day 0) is kept whole; its file time already matched.
+pub fn in_window(days: &DaySummaries, since_ms: u64) -> FileSummary {
+    let first = (since_ms / DAY_MS) as u32;
+    let mut out = FileSummary::default();
+    for (day, s) in days {
+        if *day == 0 || *day >= first {
+            out.merge(s.clone());
+        }
+    }
+    out
 }
 
 /// Running state for one context stream while its transcript is read.
@@ -720,11 +821,8 @@ fn read_lines(path: &Path, mut f: impl FnMut(&[u8])) {
     }
 }
 
-pub fn parse_claude(path: &Path) -> FileSummary {
-    let mut s = FileSummary {
-        subagent: path.components().any(|c| c.as_os_str() == "subagents"),
-        ..Default::default()
-    };
+pub fn parse_claude(path: &Path) -> DaySummaries {
+    let mut days = Days::new(path.components().any(|c| c.as_os_str() == "subagents"));
     let mut st = ClaudeState::default();
     read_lines(path, |line| {
         if !(contains(line, b"\"assistant\"")
@@ -734,17 +832,19 @@ pub fn parse_claude(path: &Path) -> FileSummary {
             return;
         }
         let Ok(parsed) = serde_json::from_slice::<ClaudeLine>(line) else {
-            s.malformed_lines += 1;
+            days.at(0).malformed_lines += 1;
             return;
         };
-        claude_line(&mut s, &mut st, parsed);
+        let ts = parsed.timestamp.as_deref().map(parse_iso_ms).unwrap_or(0);
+        claude_line(days.at(ts), &mut st, parsed);
     });
+    let s = days.at(0);
     for (server, calls) in &st.mcp_session {
         *s.mcp_calls.entry(server.clone()).or_default() += calls;
     }
-    st.main.finish(&mut s);
-    st.side.finish(&mut s);
-    s
+    st.main.finish(s);
+    st.side.finish(s);
+    days.finish()
 }
 
 fn claude_line(s: &mut FileSummary, st: &mut ClaudeState, line: ClaudeLine) {
@@ -1059,8 +1159,8 @@ fn codex_category(
     }
 }
 
-pub fn parse_codex(path: &Path) -> FileSummary {
-    let mut s = FileSummary::default();
+pub fn parse_codex(path: &Path) -> DaySummaries {
+    let mut days = Days::new(false);
     let mut stream = Stream::default();
     let mut model = String::from("unknown");
     let mut last_total = None::<u64>;
@@ -1075,12 +1175,13 @@ pub fn parse_codex(path: &Path) -> FileSummary {
             return;
         }
         let Ok(parsed) = serde_json::from_slice::<CodexLine>(line) else {
-            s.malformed_lines += 1;
+            days.at(0).malformed_lines += 1;
             return;
         };
         let ts = parsed.timestamp.as_deref().map(parse_iso_ms).unwrap_or(0);
+        let s = days.at(ts);
         if parsed.kind.as_deref() == Some("compacted") {
-            stream.compact(&mut s);
+            stream.compact(s);
             stream.prev_ctx = 0;
             return;
         }
@@ -1106,7 +1207,7 @@ pub fn parse_codex(path: &Path) -> FileSummary {
                     return;
                 }
                 last_total = Some(total.total_tokens);
-                stamp(&mut s, ts);
+                stamp(s, ts);
                 let cached = last.cached_input_tokens.min(last.input_tokens);
                 let write = last.cache_write_input_tokens;
                 let fresh = last.input_tokens.saturating_sub(cached + write);
@@ -1120,17 +1221,10 @@ pub fn parse_codex(path: &Path) -> FileSummary {
                 });
                 // OpenAI caches without an explicit write; a big uncached input after a turn
                 // that was cached is what a cache miss looks like there.
-                stream.turn(
-                    &mut s,
-                    ts,
-                    last.input_tokens,
-                    cached,
-                    write.max(fresh),
-                    false,
-                );
+                stream.turn(s, ts, last.input_tokens, cached, write.max(fresh), false);
             }
             (Some("response_item"), Some(kind)) => {
-                stamp(&mut s, ts);
+                stamp(s, ts);
                 match kind {
                     "function_call" | "custom_tool_call" | "local_shell_call" => {
                         let name = p.name.as_deref().unwrap_or(if kind == "local_shell_call" {
@@ -1172,7 +1266,7 @@ pub fn parse_codex(path: &Path) -> FileSummary {
                                         let url = part.image_url.unwrap_or_default();
                                         let data =
                                             url.split_once("base64,").map(|(_, d)| d).unwrap_or("");
-                                        stream.image(&mut s, image_tokens(data));
+                                        stream.image(s, image_tokens(data));
                                     }
                                     _ => {
                                         text += part
@@ -1182,9 +1276,9 @@ pub fn parse_codex(path: &Path) -> FileSummary {
                                     }
                                 }
                             }
-                            stream.result(&mut s, &category, text);
+                            stream.result(s, &category, text);
                         } else {
-                            stream.result(&mut s, &category, text_tokens(raw.len()));
+                            stream.result(s, &category, text_tokens(raw.len()));
                         }
                     }
                     _ => {}
@@ -1194,10 +1288,10 @@ pub fn parse_codex(path: &Path) -> FileSummary {
         }
     });
     for (server, n) in mcp_session {
-        *s.mcp_calls.entry(server).or_default() += n;
+        *days.at(0).mcp_calls.entry(server).or_default() += n;
     }
-    stream.finish(&mut s);
-    s
+    stream.finish(days.at(0));
+    days.finish()
 }
 
 // --- OpenCode ------------------------------------------------------------------------------
@@ -1238,8 +1332,9 @@ struct OpencodeCache {
 
 /// One OpenCode session folder of `storage/message/<session>/*.json`. Best effort: a message
 /// in a shape this doesn't know is skipped.
-pub fn parse_opencode(dir: &Path) -> FileSummary {
-    let mut s = FileSummary::default();
+pub fn parse_opencode(dir: &Path) -> DaySummaries {
+    let mut days = Days::new(false);
+    let mut malformed = 0;
     let mut messages: Vec<OpencodeMessage> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -1250,7 +1345,7 @@ pub fn parse_opencode(dir: &Path) -> FileSummary {
             match serde_json::from_slice::<OpencodeMessage>(&text) {
                 Ok(m) => Some(m),
                 Err(_) => {
-                    s.malformed_lines += 1;
+                    malformed += 1;
                     None
                 }
             }
@@ -1260,7 +1355,8 @@ pub fn parse_opencode(dir: &Path) -> FileSummary {
     let mut stream = Stream::default();
     for m in messages {
         let ts = m.time.as_ref().and_then(|t| t.created).unwrap_or(0);
-        stamp(&mut s, ts);
+        let s = days.at(ts);
+        stamp(s, ts);
         if m.role.as_deref() != Some("assistant") {
             continue;
         }
@@ -1275,7 +1371,7 @@ pub fn parse_opencode(dir: &Path) -> FileSummary {
             cache_write_1h: 0,
         });
         stream.turn(
-            &mut s,
+            s,
             ts,
             t.input + t.cache.read + t.cache.write,
             t.cache.read,
@@ -1283,8 +1379,9 @@ pub fn parse_opencode(dir: &Path) -> FileSummary {
             false,
         );
     }
-    stream.finish(&mut s);
-    s
+    stream.finish(days.at(0));
+    days.at(0).malformed_lines += malformed;
+    days.finish()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1301,7 +1398,7 @@ struct CacheFile {
 struct CacheEntry {
     size: u64,
     mtime: u64,
-    summary: FileSummary,
+    days: DaySummaries,
 }
 
 /// The summary cache lives with other rebuildable caches (`TOOLPORT_CACHE_DIR`, else the OS
@@ -1613,12 +1710,12 @@ pub fn analyze(sources: &Sources, opts: &Options, configured: &Configured) -> Us
     };
     cache.version = CACHE_VERSION;
     let mut todo = Vec::new();
-    let mut done: Vec<(Unit, FileSummary)> = Vec::new();
+    let mut done: Vec<(Unit, DaySummaries)> = Vec::new();
     for unit in all {
         let key = unit.path.to_string_lossy().into_owned();
         match cache.files.get(&key) {
             Some(e) if e.size == unit.size && e.mtime == unit.mtime_ms => {
-                done.push((unit, e.summary.clone()));
+                done.push((unit, e.days.clone()));
             }
             _ => todo.push(unit),
         }
@@ -1636,7 +1733,7 @@ pub fn analyze(sources: &Sources, opts: &Options, configured: &Configured) -> Us
             CacheEntry {
                 size: unit.size,
                 mtime: unit.mtime_ms,
-                summary: summary.clone(),
+                days: summary.clone(),
             },
         );
     }
@@ -1654,7 +1751,11 @@ pub fn analyze(sources: &Sources, opts: &Options, configured: &Configured) -> Us
         .as_deref()
         .filter(|p| p.is_file())
         .map(|p| read_audit(p, since_ms));
-    let mut report = reduce(done, since_ms, audit.as_ref(), configured);
+    let in_range = done
+        .into_iter()
+        .map(|(unit, days)| (unit, in_window(&days, since_ms)))
+        .collect();
+    let mut report = reduce(in_range, since_ms, audit.as_ref(), configured);
     report.days = opts.days;
     report.since_ms = since_ms;
     stats.files = stats.cached + stats.parsed;
@@ -1672,7 +1773,7 @@ pub fn analyze(sources: &Sources, opts: &Options, configured: &Configured) -> Us
     report
 }
 
-fn parse_all(todo: Vec<Unit>, progress: bool) -> Vec<(Unit, FileSummary)> {
+fn parse_all(todo: Vec<Unit>, progress: bool) -> Vec<(Unit, DaySummaries)> {
     if todo.is_empty() {
         return Vec::new();
     }

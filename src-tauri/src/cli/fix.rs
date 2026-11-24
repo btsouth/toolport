@@ -7,7 +7,7 @@
 //! config is rewired to the gateway by the same reviewed migrate the Clients page runs, so
 //! the plaintext copy leaves the file (a backup is kept in Toolport's private backups).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
@@ -62,6 +62,9 @@ pub struct SecretPlan {
     /// Servers already in Toolport: vaulted earlier, only the agent still has a copy.
     pub already_in_toolport: Vec<String>,
     pub unsupported: Vec<String>,
+    /// Whether scan found each of `servers` in Toolport already.
+    #[serde(skip)]
+    held: Vec<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -129,11 +132,22 @@ fn plan_skills(snapshot: &Snapshot, only: Only) -> Vec<PlannedFix> {
 /// Reviewed import keys for `servers` in one client, read fresh from its config and
 /// Toolport's registry: servers Toolport already has, and ones it can't import, apart.
 /// A review may read the keychain to confirm identity, but never asks to unlock it.
-fn review(client_id: &str, servers: &[String]) -> (Vec<String>, Vec<String>, Vec<String>) {
-    let candidates =
-        crate::registry_controller::preview_client_imports_for(client_id).unwrap_or_default();
+/// Import keys for `servers` (name, whether Toolport already holds it), plus the ones
+/// Toolport already holds and the ones it can't import here. A server the review can't
+/// see is only "already in Toolport" when Toolport holds it; a plugin's server or a
+/// failed preview is reported as not importable instead.
+fn review(client_id: &str, servers: &[(String, bool)]) -> (Vec<String>, Vec<String>, Vec<String>) {
     let (mut keys, mut already, mut unsupported) = (Vec::new(), Vec::new(), Vec::new());
-    for server in servers {
+    let candidates = match crate::registry_controller::preview_client_imports_for(client_id) {
+        Ok(c) => c,
+        Err(e) => {
+            for (server, _) in servers {
+                unsupported.push(format!("{server}: couldn't review its config ({e})"));
+            }
+            return (keys, already, unsupported);
+        }
+    };
+    for (server, held) in servers {
         let found = candidates.iter().find(|c| {
             c.source_name.as_deref().unwrap_or(&c.name) == server.as_str() || c.name == *server
         });
@@ -143,7 +157,10 @@ fn review(client_id: &str, servers: &[String]) -> (Vec<String>, Vec<String>, Vec
                 "{server}: {}",
                 c.unsupported.clone().unwrap_or_default()
             )),
-            None => already.push(server.clone()),
+            None if *held => already.push(server.clone()),
+            None => unsupported.push(format!(
+                "{server}: Toolport can't import this one from here; add it in the app"
+            )),
         }
     }
     (keys, already, unsupported)
@@ -158,6 +175,10 @@ fn plan_secrets(findings: &[SecretFinding]) -> Vec<SecretPlan> {
     for (client_id, items) in by_client {
         let mut servers: Vec<String> = items.iter().map(|f| f.server.clone()).collect();
         servers.dedup();
+        let held: Vec<bool> = servers
+            .iter()
+            .map(|n| items.iter().any(|f| &f.server == n && f.in_toolport))
+            .collect();
         let mut plan = SecretPlan {
             client_name: items[0].client_name.clone(),
             config_path: items[0].config_path.clone(),
@@ -167,8 +188,10 @@ fn plan_secrets(findings: &[SecretFinding]) -> Vec<SecretPlan> {
             already_in_toolport: Vec::new(),
             unsupported: Vec::new(),
             client_id: client_id.clone(),
+            held: held.clone(),
         };
-        let (keys, already, unsupported) = review(&client_id, &servers);
+        let pairs: Vec<(String, bool)> = servers.iter().cloned().zip(held).collect();
+        let (keys, already, unsupported) = review(&client_id, &pairs);
         plan.keys = keys;
         plan.already_in_toolport = already;
         plan.unsupported = unsupported;
@@ -400,6 +423,7 @@ fn apply(report: &mut FixReport, project: Option<&str>, connect: bool) {
             Err(e) => report.failed.push(format!("{}: {e}", p.title)),
         }
     }
+    let mut imported: BTreeSet<String> = BTreeSet::new();
     for s in report.secrets.clone() {
         if connect && report.gateway_available {
             let names: Vec<String> = s
@@ -437,7 +461,13 @@ fn apply(report: &mut FixReport, project: Option<&str>, connect: bool) {
             continue;
         }
         // An earlier client's import may have added the same server: review again now.
-        let (keys, already, _) = review(&s.client_id, &s.servers);
+        let pairs: Vec<(String, bool)> = s
+            .servers
+            .iter()
+            .zip(&s.held)
+            .map(|(n, held)| (n.clone(), *held || imported.contains(&n.to_lowercase())))
+            .collect();
+        let (keys, already, _) = review(&s.client_id, &pairs);
         if keys.is_empty() {
             if !already.is_empty() {
                 report.notes.push(format!(
@@ -450,6 +480,12 @@ fn apply(report: &mut FixReport, project: Option<&str>, connect: bool) {
         }
         match crate::registry_controller::import_client_servers(keys) {
             Ok((_, added)) => {
+                imported.extend(
+                    pairs
+                        .iter()
+                        .filter(|(n, _)| !already.contains(n))
+                        .map(|(n, _)| n.to_lowercase()),
+                );
                 report.applied.push(format!(
                     "{}: {} into Toolport, credentials in your OS keychain",
                     s.client_name,

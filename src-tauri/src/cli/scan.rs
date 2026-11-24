@@ -130,8 +130,9 @@ pub struct Snapshot {
     pub clients: Vec<DetectedClient>,
     pub inventory: Option<crate::skills::Inventory>,
     pub inventory_error: Option<String>,
-    /// Servers in Toolport's registry, as (lowercase name, what it runs or connects to).
-    pub toolport: Vec<(String, String)>,
+    /// Servers in Toolport's registry, as (lowercase name, what it runs or connects to,
+    /// its arguments with credentials masked).
+    pub toolport: Vec<(String, String, Vec<String>)>,
 }
 
 impl Snapshot {
@@ -150,6 +151,7 @@ impl Snapshot {
                         (
                             s.name.to_lowercase(),
                             target(s.command.as_deref(), s.url.as_deref()),
+                            crate::import_credentials::shown_args(&s.args),
                         )
                     })
                     .collect()
@@ -164,11 +166,23 @@ impl Snapshot {
     }
 
     /// Whether Toolport already has this agent server: the same name, running the same
-    /// command or reaching the same host.
+    /// program with the same arguments, or reaching the same host.
     pub fn in_toolport(&self, server: &McpServer) -> bool {
         let name = server.name.to_lowercase();
         let want = target(server.command.as_deref(), server.url.as_deref());
-        self.toolport.iter().any(|(n, t)| *n == name && *t == want)
+        let args = crate::import_credentials::shown_args(&server.args);
+        // An argument that holds a credential on either side matches any value, since an
+        // import moves it out.
+        let open = |a: &str| a == "<launch-input>" || without_references(a).1;
+        self.toolport.iter().any(|(n, t, theirs)| {
+            *n == name
+                && *t == want
+                && theirs.len() == args.len()
+                && theirs
+                    .iter()
+                    .zip(&args)
+                    .all(|(a, b)| a == b || open(a) || open(b))
+        })
     }
 
     /// Clients that are installed or configured, without the duplicate rows a background
@@ -300,7 +314,7 @@ pub fn reportable(key: &str, value: Option<&str>) -> bool {
     if PREFIXES.iter().any(|p| v.starts_with(p)) {
         return true;
     }
-    if url::Url::parse(v).is_ok_and(|u| !u.username().is_empty() || u.password().is_some()) {
+    if url::Url::parse(v).is_ok_and(|u| url_has_userinfo(&u)) {
         return true;
     }
     // A JWT, or a long high-entropy blob that isn't a path, a list or a URL. Base64 can
@@ -313,17 +327,61 @@ pub fn reportable(key: &str, value: Option<&str>) -> bool {
     jwt || blob
 }
 
-/// A value that only names where the credential comes from (`${GITHUB_TOKEN}`,
-/// `${env:X}`, `${input:x}`, `{env:X}`, `$X`) is not a plaintext secret.
+/// What a reference is replaced with before a value is checked for credentials.
+pub const REFERENCE: &str = "toolportref";
+
+/// `value` with each reference (`${X}`, `${env:X}`, `{env:X}`, `{file:x}`, `$X`) replaced
+/// by [`REFERENCE`], and whether there was one.
+pub fn without_references(value: &str) -> (String, bool) {
+    let mut out = String::with_capacity(value.len());
+    let mut found = false;
+    let mut rest = value;
+    while !rest.is_empty() {
+        let braced = if rest.starts_with("${") {
+            Some(2)
+        } else if rest.starts_with("{env:") || rest.starts_with("{file:") {
+            Some(1)
+        } else {
+            None
+        };
+        if let Some(skip) = braced {
+            if let Some(end) = rest[skip..].find('}') {
+                out.push_str(REFERENCE);
+                found = true;
+                rest = &rest[skip + end + 1..];
+                continue;
+            }
+        }
+        if let Some(after) = rest.strip_prefix('$') {
+            let len = after
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(after.len());
+            if len > 0 && !after.starts_with(|c: char| c.is_ascii_digit()) {
+                out.push_str(REFERENCE);
+                found = true;
+                rest = &after[len..];
+                continue;
+            }
+        }
+        let c = rest.chars().next().unwrap();
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    (out, found)
+}
+
+/// A value whose credential comes from somewhere else (`${GITHUB_TOKEN}`, `${env:X}`,
+/// `{env:X}`, `$X`, `Bearer ${T}`) is not a plaintext secret. The text around the
+/// references still counts: `postgres://admin:hunter2@${HOST}` holds a password.
 pub fn is_reference(value: &str) -> bool {
-    let v = value.trim();
-    if v.contains("${") || v.starts_with("{env:") || v.starts_with("{file:") {
-        return true;
-    }
-    if let Some(rest) = v.strip_prefix('$') {
-        return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    }
-    false
+    let (rest, found) = without_references(value.trim());
+    found && !reportable("", Some(&rest))
+}
+
+/// A user name or password in a URL that isn't a reference.
+pub fn url_has_userinfo(url: &url::Url) -> bool {
+    let named = |s: &str| !s.is_empty() && s != REFERENCE;
+    named(url.username()) || url.password().is_some_and(named)
 }
 
 fn definition_value(definition: Option<&serde_json::Value>, key: &str) -> Option<String> {
@@ -1047,9 +1105,22 @@ mod tests {
         ] {
             assert!(is_reference(v), "{v}");
         }
-        for v in ["ghp_abc", "sk-live-123", "$", "plain"] {
+        for v in ["ghp_abc", "sk-live-123", "$", "plain", "$1abc"] {
             assert!(!is_reference(v), "{v}");
         }
+        // Text around a reference still counts.
+        for v in [
+            "postgres://admin:hunter2@${DB_HOST}/app",
+            "${PREFIX}ghp_1234567890abcdefghijklmnop",
+        ] {
+            assert!(!is_reference(v), "{v}");
+        }
+        assert!(is_reference("postgres://${DB_USER}:${DB_PASS}@db/app"));
+        assert!(is_reference("https://api.example.com/${PATH_PART}?x=1"));
+        assert_eq!(
+            without_references("a${B}c{env:D}$E_1/x$"),
+            ("atoolportrefctoolportreftoolportref/x$".into(), true)
+        );
     }
 
     #[test]
@@ -1162,15 +1233,32 @@ mod tests {
 
         // Once Toolport holds github, the advice is to connect the agents instead.
         let snapshot = Snapshot {
-            toolport: vec![("github".into(), target(Some("/usr/bin/npx"), None))],
+            toolport: vec![(
+                "github".into(),
+                target(Some("/usr/bin/npx"), None),
+                vec!["a".into()],
+            )],
             ..snapshot
         };
         let d = drift(&snapshot);
         assert!(d[1].in_toolport && d[1].detail.starts_with("in Toolport"));
         assert!(!d[0].in_toolport);
-        let other_host = Snapshot {
-            toolport: vec![("github".into(), target(None, Some("https://a.example/mcp")))],
+        let other_args = Snapshot {
+            toolport: vec![(
+                "github".into(),
+                target(Some("npx"), None),
+                vec!["some-other-server".into()],
+            )],
             ..snapshot
+        };
+        assert!(!drift(&other_args)[1].in_toolport);
+        let other_host = Snapshot {
+            toolport: vec![(
+                "github".into(),
+                target(None, Some("https://a.example/mcp")),
+                Vec::new(),
+            )],
+            ..other_args
         };
         assert!(!drift(&other_host)[1].in_toolport);
     }

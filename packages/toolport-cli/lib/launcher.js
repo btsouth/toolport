@@ -128,7 +128,7 @@ export function resolveBinary({
   if (!pkg) {
     throw new LaunchError(
       `toolport has no prebuilt binary for ${key}. Prebuilt: ${supported}.\n` +
-        "Build it from source with: cargo install --git https://github.com/btsouth/toolport conduit --bin toolport --no-default-features\n" +
+        "Build it from source with: cargo install --git https://github.com/btsouth/toolport conduit --bin toolport --no-default-features --features cli\n" +
         "then put it on PATH or set TOOLPORT_CLI_BIN to its path.",
     );
   }

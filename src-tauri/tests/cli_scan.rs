@@ -139,9 +139,29 @@ fn hook_install_and_uninstall_touch_only_toolports_entry() {
     )
     .unwrap();
 
+    // Not on a terminal and no --yes: refuse and write nothing. A dry run writes nothing.
+    let untouched = f.read(&settings);
     let out = f.run(&["hook", "install"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("--yes"), "{}", stderr(&out));
+    let out = f.run(&["hook", "install", "--dry-run"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("would install in"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(f.read(&settings), untouched);
+    assert!(!codex_hooks.exists());
+
+    let out = f.run(&["hook", "install", "--yes"]);
     assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
     let text = f.read(&settings);
+    // The hook names this binary by absolute path, never a bare `toolport` that an
+    // agent's PATH could resolve to the desktop app.
+    assert!(!text.contains("\"toolport hook check\""), "{text}");
+    #[cfg(unix)]
+    assert!(text.contains(env!("CARGO_BIN_EXE_toolport")), "{text}");
     assert!(text.contains("// keep me") && text.contains("echo mine"));
     assert!(text.contains("hook check"));
     let codex = f.read(&codex_hooks);
@@ -155,12 +175,12 @@ fn hook_install_and_uninstall_touch_only_toolports_entry() {
     // Installing twice changes nothing.
     let before = f.read(&settings);
     assert!(f
-        .run(&["hook", "install", "--agent", "claude-code"])
+        .run(&["hook", "install", "--agent", "claude-code", "--yes"])
         .status
         .success());
     assert_eq!(f.read(&settings), before);
 
-    let out = f.run(&["hook", "uninstall"]);
+    let out = f.run(&["hook", "uninstall", "--yes"]);
     assert!(out.status.success(), "{}", stderr(&out));
     let text = f.read(&settings);
     assert!(!text.contains("hook check"));

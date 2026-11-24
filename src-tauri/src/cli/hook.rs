@@ -86,11 +86,14 @@ fn runs_this_cli(path: &Path) -> bool {
     head.contains("@toolport/cli") || head.contains("@toolport\\cli")
 }
 
-/// The command a hook runs: `toolport` when that name runs this CLI, else this binary's
-/// own path. A copy npx unpacked into its cache can vanish, so that case goes through npx.
+/// The command a hook runs, always by absolute path: an agent can start with a different
+/// PATH than this shell, where a bare `toolport` could be the desktop app. Prefers the
+/// `toolport` on PATH when it runs this CLI (an npm global install keeps that path across
+/// upgrades), else this binary. A copy npx unpacked into its cache can vanish, so that
+/// case goes through npx.
 pub fn hook_command() -> (String, Option<String>) {
-    if which("toolport").is_some_and(|p| runs_this_cli(&p)) {
-        return ("toolport hook check".into(), None);
+    if let Some(p) = which("toolport").filter(|p| runs_this_cli(p)) {
+        return (format!("\"{}\" hook check", p.display()), None);
     }
     if let Ok(exe) = std::env::current_exe() {
         let text = exe.to_string_lossy();
@@ -254,8 +257,18 @@ fn backup(path: &Path) -> Result<Option<PathBuf>, String> {
 }
 
 /// Codex only runs hooks with `[features] hooks = true`. Set it, keeping the file's layout.
+/// A settings file's text: empty when it doesn't exist yet, an error when it exists but
+/// can't be read, so an unreadable file is never replaced.
+fn read_settings(path: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("couldn't be read ({e}); left unchanged")),
+    }
+}
+
 fn enable_codex_hooks(config: &Path) -> Result<bool, String> {
-    let text = std::fs::read_to_string(config).unwrap_or_default();
+    let text = read_settings(config).map_err(|e| format!("{} {e}", config.display()))?;
     let mut doc: toml_edit::DocumentMut = text
         .parse()
         .map_err(|e| format!("{} isn't valid TOML: {e}", config.display()))?;
@@ -380,55 +393,153 @@ pub fn command(ctx: &Ctx, args: &Args) -> Result<i32, CliError> {
                     None => "neither Claude Code nor Codex is set up on this machine".into(),
                 }));
             }
+            let install = action == "install";
             let (cmd, cmd_note) = hook_command();
-            let mut results = Vec::new();
             let mut notes: Vec<String> = cmd_note.into_iter().collect();
-            for (a, path) in targets {
-                let text = std::fs::read_to_string(&path).unwrap_or_default();
-                let shown = format::home_relative(&path);
-                let outcome = if action == "install" {
-                    if installed_in(&text) {
-                        Ok(format!("{}: already installed in {shown}", a.label()))
-                    } else {
-                        add_hook(&text, a, &cmd).and_then(|new| {
-                            backup(&path)?;
-                            crate::registry::atomic_write(&path, &new)?;
-                            if a == Agent::Codex {
-                                if let Some(config) = path.parent().map(|p| p.join("config.toml")) {
-                                    if enable_codex_hooks(&config)? {
-                                        notes.push(format!(
-                                            "Turned on [features] hooks in {}.",
-                                            format::home_relative(&config)
-                                        ));
-                                    }
-                                }
-                                notes.push(
-                                    "Codex asks you to trust the new hook the next time it starts."
-                                        .into(),
-                                );
+
+            // Plan every file first, so nothing is written before the whole change is shown.
+            struct Planned {
+                agent: Agent,
+                path: PathBuf,
+                shown: String,
+                change: Result<Option<String>, String>,
+            }
+            let planned: Vec<Planned> = targets
+                .into_iter()
+                .map(|(a, path)| {
+                    let shown = format::home_relative(&path);
+                    let change = read_settings(&path).and_then(|text| {
+                        if install {
+                            if installed_in(&text) {
+                                Ok(None)
+                            } else {
+                                add_hook(&text, a, &cmd).map(Some)
                             }
-                            Ok(format!("{}: installed in {shown}", a.label()))
-                        })
-                    }
-                } else {
-                    remove_hook(&text).and_then(|(new, n)| {
-                        if n == 0 {
-                            return Ok(format!("{}: not installed in {shown}", a.label()));
+                        } else {
+                            remove_hook(&text).map(|(new, n)| (n > 0).then_some(new))
                         }
+                    });
+                    Planned {
+                        agent: a,
+                        path,
+                        shown,
+                        change,
+                    }
+                })
+                .collect();
+            let pending = planned
+                .iter()
+                .filter(|p| matches!(p.change, Ok(Some(_))))
+                .count();
+            let dry_run = args.has("dry-run");
+            if pending > 0 && !dry_run && !args.has("yes") {
+                let s = &ctx.style;
+                if !ctx.interactive || ctx.json {
+                    return Err(CliError::new(format!(
+                        "this {} {}",
+                        if install {
+                            "adds a session start hook to"
+                        } else {
+                            "removes the hook from"
+                        },
+                        format::plural(pending, "settings file", "settings files")
+                    ))
+                    .hint("run with --yes to apply, or --dry-run to preview"));
+                }
+                let mut text = String::new();
+                for p in planned.iter().filter(|p| matches!(p.change, Ok(Some(_)))) {
+                    text.push_str(&format!(
+                        "  {} {} {}{}\n",
+                        s.cyan(if install { "+" } else { "-" }),
+                        p.agent.label(),
+                        s.dim(&p.shown),
+                        if install && p.agent == Agent::Codex {
+                            s.dim(", and [features] hooks = true in config.toml")
+                        } else {
+                            String::new()
+                        }
+                    ));
+                }
+                if install {
+                    text.push_str(&format!(
+                        "  {}\n",
+                        s.dim(&format!("runs '{cmd}' at session start"))
+                    ));
+                }
+                eprint!("{text}");
+                let question = if install {
+                    "Install the hook?"
+                } else {
+                    "Remove the hook?"
+                };
+                if !ctx.confirm(question) {
+                    super::out("Nothing changed.\n");
+                    return Ok(EXIT_OK);
+                }
+            }
+
+            let mut results = Vec::new();
+            for p in planned {
+                let Planned {
+                    agent: a,
+                    path,
+                    shown,
+                    change,
+                } = p;
+                let outcome = match change {
+                    Err(e) => Err(e),
+                    Ok(None) if install => {
+                        Ok(format!("{}: already installed in {shown}", a.label()))
+                    }
+                    Ok(None) => Ok(format!("{}: not installed in {shown}", a.label())),
+                    Ok(Some(_)) if dry_run => Ok(format!(
+                        "{}: would {} {shown}{}",
+                        a.label(),
+                        if install { "install in" } else { "remove from" },
+                        if install && a == Agent::Codex {
+                            ", and turn on [features] hooks in config.toml"
+                        } else {
+                            ""
+                        }
+                    )),
+                    Ok(Some(new)) => (|| {
                         backup(&path)?;
                         crate::registry::atomic_write(&path, &new)?;
-                        Ok(format!("{}: removed from {shown}", a.label()))
-                    })
+                        if install && a == Agent::Codex {
+                            if let Some(config) = path.parent().map(|p| p.join("config.toml")) {
+                                if enable_codex_hooks(&config)? {
+                                    notes.push(format!(
+                                        "Turned on [features] hooks in {}.",
+                                        format::home_relative(&config)
+                                    ));
+                                }
+                            }
+                            notes.push(
+                                "Codex asks you to trust the new hook the next time it starts."
+                                    .into(),
+                            );
+                        }
+                        Ok(format!(
+                            "{}: {} {shown}",
+                            a.label(),
+                            if install {
+                                "installed in"
+                            } else {
+                                "removed from"
+                            }
+                        ))
+                    })(),
                 };
                 results.push((
                     a,
-                    outcome.map_err(|e| format!("{}: {shown} {e}", a.label())),
+                    outcome.map_err(|e: String| format!("{}: {shown} {e}", a.label())),
                 ));
             }
             let failed = results.iter().any(|(_, r)| r.is_err());
             if ctx.json {
                 ctx.emit_json(&serde_json::json!({
                     "action": action,
+                    "dryRun": dry_run,
                     "command": cmd,
                     "results": results.iter().map(|(a, r)| serde_json::json!({
                         "agent": a,
@@ -442,17 +553,36 @@ pub fn command(ctx: &Ctx, args: &Args) -> Result<i32, CliError> {
                 let mut text = String::new();
                 for (_, r) in &results {
                     match r {
-                        Ok(m) => text.push_str(&format!("{} {m}\n", s.mark(Severity::Ok))),
+                        Ok(m) => text.push_str(&format!(
+                            "{} {m}\n",
+                            if dry_run {
+                                s.mark(Severity::Info)
+                            } else {
+                                s.mark(Severity::Ok)
+                            }
+                        )),
                         Err(m) => text.push_str(&format!("{} {m}\n", s.mark(Severity::Error))),
                     }
                 }
                 for n in &notes {
                     text.push_str(&format!("  {}\n", s.dim(n)));
                 }
-                if action == "install" && !failed {
+                if install && !failed {
                     text.push_str(&format!(
                         "  {}\n",
-                        s.dim(&format!("Runs '{cmd}' at session start: silent when healthy, one line when not."))
+                        s.dim(&format!(
+                            "{} '{cmd}' at session start: silent when healthy, one line when not.",
+                            if dry_run { "Would run" } else { "Runs" }
+                        ))
+                    ));
+                }
+                if dry_run && pending > 0 {
+                    text.push_str(&format!(
+                        "  {}\n",
+                        s.hint(&format!(
+                            "run {} to apply",
+                            s.cmd(&format!("toolport hook {action} --yes"))
+                        ))
                     ));
                 }
                 super::out(&text);

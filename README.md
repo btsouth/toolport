@@ -156,7 +156,7 @@ npm run tauri dev
 The CLI builds on its own, without the desktop or search features:
 
 ```sh
-cargo build --manifest-path src-tauri/Cargo.toml --no-default-features --bin toolport
+cargo build --manifest-path src-tauri/Cargo.toml --no-default-features --features cli --bin toolport
 ```
 
 Release packages use `--profile release-cli`, which adds full LTO and strips symbols.

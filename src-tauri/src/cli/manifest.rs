@@ -136,8 +136,9 @@ fn inside(path: &str) -> bool {
 
 /// Why a URL carries a credential, if it does.
 fn url_secret(url: &str) -> Option<&'static str> {
-    let parsed = url::Url::parse(url).ok()?;
-    if !parsed.username().is_empty() || parsed.password().is_some() {
+    let (url, _) = super::scan::without_references(url);
+    let parsed = url::Url::parse(&url).ok()?;
+    if super::scan::url_has_userinfo(&parsed) {
         return Some("a user name or password");
     }
     for (key, value) in parsed.query_pairs() {
@@ -153,10 +154,27 @@ fn url_secret(url: &str) -> Option<&'static str> {
     None
 }
 
-/// Whether a plain setting looks like a secret.
+/// Whether a plain setting looks like a secret. One that refers to another value is
+/// still a secret when the text around the reference is credential-shaped.
 fn value_secret(key: &str, value: &str) -> bool {
-    !super::scan::is_reference(value)
-        && (creds::secret_word_is_last(key) || creds::secret_env("VALUE", Some(value)))
+    if super::scan::without_references(value).1 {
+        return !super::scan::is_reference(value);
+    }
+    creds::secret_word_is_last(key) || creds::secret_env("VALUE", Some(value))
+}
+
+/// Whether an argument holds a credential. `masked` is its entry in
+/// `registry::secret_arg_mask`, which judges an argument by the flag before it.
+fn arg_secret(arg: &str, masked: bool) -> bool {
+    if super::scan::without_references(arg).1 {
+        // Judge the value of `--flag=value` on its own, so a URL in it is parsed as one.
+        let value = match arg.split_once('=') {
+            Some((flag, value)) if flag.starts_with('-') => value,
+            _ => arg,
+        };
+        return !super::scan::is_reference(value) || url_secret(value).is_some();
+    }
+    masked || url_secret(arg).is_some()
 }
 
 pub fn validate(m: &Manifest) -> Result<(), Vec<String>> {
@@ -238,22 +256,23 @@ pub fn validate(m: &Manifest) -> Result<(), Vec<String>> {
             ));
         }
         let mask = crate::registry::secret_arg_mask(&s.args);
-        for (i, (arg, secret)) in s.args.iter().zip(mask).enumerate() {
-            if super::scan::is_reference(arg) {
+        for (i, (arg, masked)) in s.args.iter().zip(mask).enumerate() {
+            if !arg_secret(arg, masked) {
                 continue;
             }
-            if secret {
+            if let Some(why) = url_secret(arg) {
+                errors.push(format!("{at}: argument {} is a URL with {why}", i + 1));
+            } else {
                 errors.push(format!(
                     "{at}: argument {} contains a credential. Move it to env and refer to it as ${{NAME}}",
                     i + 1
                 ));
-            } else if let Some(why) = url_secret(arg) {
-                errors.push(format!("{at}: argument {} is a URL with {why}", i + 1));
             }
         }
         if let Some(url) = &s.url {
-            match url::Url::parse(url) {
-                Err(_) => errors.push(format!("{at}: url '{url}' isn't a valid URL")),
+            // Never echo the URL: an unparseable one can still hold a password.
+            match url::Url::parse(&super::scan::without_references(url).0) {
+                Err(_) => errors.push(format!("{at}: the url isn't a valid URL")),
                 Ok(_) => {
                     if let Some(why) = url_secret(url) {
                         errors.push(format!("{at}: the url has {why}. Move it to env"));
@@ -494,12 +513,7 @@ fn server_from_json(name: &str, def: &serde_json::Value) -> Result<ServerSpec, S
         return Err("its command holds a credential; move it to an env var first".into());
     }
     let mask = crate::registry::secret_arg_mask(&spec.args);
-    if spec
-        .args
-        .iter()
-        .zip(mask)
-        .any(|(a, m)| !super::scan::is_reference(a) && (m || url_secret(a).is_some()))
-    {
+    if spec.args.iter().zip(mask).any(|(a, m)| arg_secret(a, m)) {
         return Err("an argument holds a credential; move it to an env var first".into());
     }
     if let Some(url) = &spec.url {
@@ -721,6 +735,8 @@ pub enum Step {
     },
     ServerAdd {
         name: String,
+        /// What it runs or connects to, credentials masked. Shown before anything runs.
+        runs: String,
         needs: Vec<String>,
         from_env: Vec<String>,
         refs: Vec<String>,
@@ -728,6 +744,16 @@ pub enum Step {
     },
     ServerSame {
         name: String,
+    },
+    /// In Toolport already, with credentials still missing from an earlier `up`.
+    ServerFinish {
+        name: String,
+        id: String,
+        needs: Vec<String>,
+        from_env: Vec<String>,
+        /// Switch it on once every credential is set: only for a server `up` added and
+        /// left off for that reason, never one the user turned off.
+        enable: bool,
     },
     ServerConflict {
         name: String,
@@ -983,9 +1009,26 @@ pub fn plan_up(
                 && existing.url == entry.url
                 && keys(existing).is_superset(&keys(&entry))
             {
-                steps.push(Step::ServerSame {
-                    name: s.name.clone(),
-                });
+                let missing: Vec<String> = s
+                    .env
+                    .iter()
+                    .filter(|k| !s.secret_refs.contains_key(*k))
+                    .filter(|k| !has_credential(existing, k))
+                    .cloned()
+                    .collect();
+                if missing.is_empty() {
+                    steps.push(Step::ServerSame {
+                        name: s.name.clone(),
+                    });
+                } else {
+                    steps.push(Step::ServerFinish {
+                        name: s.name.clone(),
+                        id: existing.id.clone(),
+                        from_env: in_environment(&missing),
+                        needs: missing,
+                        enable: !existing.enabled && existing.source.as_deref() == Some("project"),
+                    });
+                }
             } else {
                 steps.push(Step::ServerConflict {
                     name: s.name.clone(),
@@ -1014,23 +1057,29 @@ pub fn plan_up(
             .filter(|k| !s.secret_refs.contains_key(*k))
             .cloned()
             .collect();
-        let from_env = needs
-            .iter()
-            .filter(|k| std::env::var(k).is_ok_and(|v| !v.is_empty()))
-            .cloned()
-            .collect();
+        let from_env = in_environment(&needs);
+        let runs = match &entry.url {
+            Some(url) => crate::import_credentials::shown_url(url),
+            None => std::iter::once(entry.command.clone().unwrap_or_default())
+                .chain(crate::import_credentials::shown_args(&entry.args))
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
         steps.push(Step::ServerAdd {
             name: s.name.clone(),
+            runs,
             needs,
             from_env,
             refs,
             warnings,
         });
     }
-    if steps
-        .iter()
-        .any(|s| matches!(s, Step::ServerAdd { .. } | Step::ServerSame { .. }))
-    {
+    if steps.iter().any(|s| {
+        matches!(
+            s,
+            Step::ServerAdd { .. } | Step::ServerSame { .. } | Step::ServerFinish { .. }
+        )
+    }) {
         for c in &clients {
             if !c.gateway_installed && !c.uses_connectors {
                 steps.push(Step::Connect {
@@ -1121,6 +1170,7 @@ fn render_steps(r: &UpReport, style: &Style) -> String {
             }
             Step::ServerAdd {
                 name,
+                runs,
                 needs,
                 from_env,
                 refs,
@@ -1128,6 +1178,15 @@ fn render_steps(r: &UpReport, style: &Style) -> String {
             } => {
                 head(&mut out, "Servers");
                 out.push_str(&format!("  {add} add {}\n", style.bold(name)));
+                out.push_str(&format!(
+                    "      {} {}\n",
+                    style.dim(if runs.contains("://") && !runs.contains(' ') {
+                        "connects to"
+                    } else {
+                        "runs"
+                    }),
+                    runs
+                ));
                 for w in warnings {
                     out.push_str(&format!("      {} {}\n", style.yellow("!"), w));
                 }
@@ -1159,6 +1218,37 @@ fn render_steps(r: &UpReport, style: &Style) -> String {
                         ))
                     ));
                 }
+            }
+            Step::ServerFinish {
+                name,
+                needs,
+                from_env,
+                enable,
+                ..
+            } => {
+                head(&mut out, "Servers");
+                let ask: Vec<&str> = needs
+                    .iter()
+                    .filter(|n| !from_env.contains(n))
+                    .map(String::as_str)
+                    .collect();
+                let mut parts = Vec::new();
+                if !from_env.is_empty() {
+                    parts.push(format!("from your environment: {}", from_env.join(", ")));
+                }
+                if !ask.is_empty() {
+                    parts.push(format!("asks for: {}", ask.join(", ")));
+                }
+                out.push_str(&format!(
+                    "  {add} finish {} {}\n      {}\n",
+                    style.bold(name),
+                    style.dim(if *enable {
+                        "(in Toolport, off until its credentials are set)"
+                    } else {
+                        "(in Toolport, missing credentials)"
+                    }),
+                    style.dim(&parts.join(" · "))
+                ));
             }
             Step::ServerSame { name } => {
                 head(&mut out, "Servers");
@@ -1203,6 +1293,7 @@ fn has_changes(steps: &[Step], gateway: bool) -> bool {
         | Step::RulesLink { .. }
         | Step::SkillLink { .. }
         | Step::ServerAdd { .. } => true,
+        Step::ServerFinish { .. } => true,
         Step::Connect { .. } => gateway,
         _ => false,
     })
@@ -1302,6 +1393,26 @@ fn apply_up(ctx: &Ctx, manifest: &Manifest, project: &Path, report: &mut UpRepor
                     Err(e) => report.failed.push(format!("{name}: {e}")),
                 }
             }
+            Step::ServerFinish {
+                name,
+                id,
+                needs,
+                from_env,
+                enable,
+            } => {
+                let Some(spec) = manifest.servers.iter().find(|s| s.name == name) else {
+                    continue;
+                };
+                match finish_server(ctx, spec, &id, &needs, &from_env, enable) {
+                    Ok(Some(msg)) => report.applied.push(msg),
+                    Ok(None) => report.notes.push(format!(
+                        "{name} still needs {}: run toolport up again in a terminal, or set {} in the environment",
+                        needs.join(", "),
+                        if needs.len() == 1 { "it" } else { "them" }
+                    )),
+                    Err(e) => report.failed.push(format!("{name}: {e}")),
+                }
+            }
             Step::Connect { agent_id, agent } => {
                 if !report.gateway_available {
                     continue;
@@ -1328,28 +1439,55 @@ fn apply_up(ctx: &Ctx, manifest: &Manifest, project: &Path, report: &mut UpRepor
     }
 }
 
-/// Add one server: registry first (disabled), then each credential into the keychain, then
-/// enable it. Any keychain failure removes the server again, so nothing is half set up.
-fn add_server(
+/// Names in `keys` that are set in this process's environment.
+fn in_environment(keys: &[String]) -> Vec<String> {
+    keys.iter()
+        .filter(|k| std::env::var(k).is_ok_and(|v| !v.is_empty()))
+        .cloned()
+        .collect()
+}
+
+/// Whether Toolport has a value for this server setting: a plain value, a reference, or a
+/// keychain entry. Reads the keychain without ever asking to unlock it.
+fn has_credential(entry: &crate::registry::ServerEntry, key: &str) -> bool {
+    let Some(var) = entry.env.iter().find(|v| v.key == key) else {
+        return false;
+    };
+    if var.value.as_deref().is_some_and(|v| !v.is_empty())
+        || crate::secret_refs::reference_for(var).is_some()
+    {
+        return true;
+    }
+    crate::secrets::without_prompts(|| {
+        crate::secrets::get_secret_without_prompt(&entry.id, key)
+            .is_ok_and(|v| v.is_some_and(|v| !v.is_empty()))
+    })
+}
+
+/// Values for `needs`: from the environment when listed in `from_env`, else from a hidden
+/// prompt on a terminal. Returns the values and the names still missing.
+fn collect_values(
     ctx: &Ctx,
-    spec: &ServerSpec,
+    server: &str,
     needs: &[String],
     from_env: &[String],
-) -> Result<String, String> {
-    let mut values: Vec<(String, String)> = Vec::new();
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut values = Vec::new();
     let mut missing = Vec::new();
     for key in needs {
         if from_env.contains(key) {
             if let Ok(v) = std::env::var(key) {
-                values.push((key.clone(), v));
-                continue;
+                if !v.is_empty() {
+                    values.push((key.clone(), v));
+                    continue;
+                }
             }
         }
         if ctx.interactive && !ctx.json {
             let prompt = format!(
                 "  {} for {} {}: ",
                 ctx.style.bold(key),
-                spec.name,
+                server,
                 ctx.style.dim("(hidden, Enter to skip)")
             );
             if let Some(v) = super::read_secret(&prompt) {
@@ -1359,29 +1497,96 @@ fn add_server(
         }
         missing.push(key.clone());
     }
-    let entry = to_entry(spec, false);
-    let (_, id) = crate::registry::update(|r| Ok(r.add_server(entry)))?;
-    for (key, value) in &values {
-        if let Err(e) = crate::secrets::set_secret(&id, key, value) {
-            let _ = crate::registry::update(|r| r.remove_server(&id));
+    (values, missing)
+}
+
+/// Save each value in the keychain. On a failure, the ones this call already saved are
+/// deleted again, so a failed run leaves no stray credentials behind.
+fn store_values(id: &str, values: &[(String, String)]) -> Result<(), String> {
+    for (i, (key, value)) in values.iter().enumerate() {
+        if let Err(e) = crate::secrets::set_secret(id, key, value) {
+            for (saved, _) in &values[..i] {
+                let _ = crate::secrets::delete_secret(id, saved);
+            }
             return Err(format!("couldn't save {key} in the keychain: {e}"));
         }
     }
+    Ok(())
+}
+
+fn enable(id: &str) -> Result<(), String> {
+    crate::registry::update(|r| {
+        let profile = r.default_access_id();
+        crate::registry_controller::apply_server_enabled(r, &profile, id, true, true)?;
+        let _ = r.set_access_server(&profile, id, true);
+        Ok(())
+    })
+    .map(|_| ())
+}
+
+fn still_off(name: &str, missing: &[String]) -> String {
+    format!(
+        "added {name} (off until {} {} set: run toolport up again)",
+        missing.join(", "),
+        if missing.len() == 1 { "is" } else { "are" }
+    )
+}
+
+/// Add one server: registry first (disabled), then each credential into the keychain, then
+/// enable it. Any keychain failure removes the server and its saved credentials again, so
+/// nothing is half set up.
+fn add_server(
+    ctx: &Ctx,
+    spec: &ServerSpec,
+    needs: &[String],
+    from_env: &[String],
+) -> Result<String, String> {
+    let (values, missing) = collect_values(ctx, &spec.name, needs, from_env);
+    let entry = to_entry(spec, false);
+    let (_, id) = crate::registry::update(|r| Ok(r.add_server(entry)))?;
+    if let Err(e) = store_values(&id, &values) {
+        let _ = crate::registry::update(|r| r.remove_server(&id));
+        return Err(e);
+    }
     if missing.is_empty() {
-        crate::registry::update(|r| {
-            let profile = r.default_access_id();
-            crate::registry_controller::apply_server_enabled(r, &profile, &id, true, true)?;
-            let _ = r.set_access_server(&profile, &id, true);
-            Ok(())
-        })?;
+        enable(&id)?;
         Ok(format!("added {} (enabled)", spec.name))
     } else {
-        Ok(format!(
-            "added {} (off until {} {} set: run toolport up again)",
+        Ok(still_off(&spec.name, &missing))
+    }
+}
+
+/// Supply the credentials an earlier `up` left missing. `None` when no value was given.
+fn finish_server(
+    ctx: &Ctx,
+    spec: &ServerSpec,
+    id: &str,
+    needs: &[String],
+    from_env: &[String],
+    turn_on: bool,
+) -> Result<Option<String>, String> {
+    let (values, missing) = collect_values(ctx, &spec.name, needs, from_env);
+    if values.is_empty() {
+        return Ok(None);
+    }
+    store_values(id, &values)?;
+    if !missing.is_empty() {
+        return Ok(Some(format!(
+            "saved {} for {} ({} still missing)",
+            values
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
             spec.name,
-            missing.join(", "),
-            if missing.len() == 1 { "is" } else { "are" }
-        ))
+            missing.join(", ")
+        )));
+    }
+    if turn_on {
+        enable(id)?;
+        Ok(Some(format!("finished {} (enabled)", spec.name)))
+    } else {
+        Ok(Some(format!("finished {}", spec.name)))
     }
 }
 
@@ -1548,6 +1753,11 @@ url = "https://mcp.linear.app/mcp"
             ("arg url", "[[servers]]\nname=\"a\"\ncommand=\"x\"\nargs=[\"postgres://user:hunter2@db/x\"]\n"),
             ("url query", "[[servers]]\nname=\"a\"\nurl=\"https://x.example/mcp?api_key=abc\"\n"),
             ("url userinfo", "[[servers]]\nname=\"a\"\nurl=\"https://u:p@x.example/mcp\"\n"),
+            // A reference elsewhere in the same string doesn't hide a literal secret.
+            ("arg url and reference", "[[servers]]\nname=\"a\"\ncommand=\"x\"\nargs=[\"--db\", \"postgres://admin:hunter2@${DB_HOST}/app\"]\nenv=[\"DB_HOST\"]\n"),
+            ("value and reference", "[[servers]]\nname=\"a\"\ncommand=\"x\"\nenv=[\"DB_HOST\"]\n[servers.values]\nDATABASE_URL=\"postgres://admin:hunter2@${DB_HOST}/app\"\n"),
+            ("flag url and reference", "[[servers]]\nname=\"a\"\ncommand=\"x\"\nargs=[\"--url=https://mcp.x.com/sse?api_key=sk-live-abc123&team=${TEAM}\"]\nenv=[\"TEAM\"]\n"),
+            ("url and reference", "[[servers]]\nname=\"a\"\nurl=\"https://u:hunter2@${HOST}/mcp\"\nenv=[\"HOST\"]\n"),
         ];
         for (label, body) in cases {
             let text = format!("version = 1\n{body}");
@@ -1561,6 +1771,11 @@ url = "https://mcp.linear.app/mcp"
         }
         // A reference in an argument is fine.
         load("version = 1\n[[servers]]\nname=\"a\"\ncommand=\"x\"\nargs=[\"--token=${TOKEN}\"]\nenv=[\"TOKEN\"]\n").unwrap();
+        load("version = 1\n[[servers]]\nname=\"a\"\ncommand=\"x\"\nargs=[\"postgres://${DB_USER}:${DB_PASS}@db/app\"]\nenv=[\"DB_USER\", \"DB_PASS\"]\n").unwrap();
+        // A URL that fails to parse is never echoed back.
+        let errors =
+            load("version = 1\n[[servers]]\nname=\"a\"\nurl=\"not a url hunter2\"\n").unwrap_err();
+        assert!(errors.iter().all(|e| !e.contains("hunter2")), "{errors:?}");
     }
 
     #[test]
@@ -1611,6 +1826,7 @@ url = "https://mcp.linear.app/mcp"
             r#"{"mcpServers":{
                 "github":{"command":"npx","args":["-y","server-github"],"env":{"GITHUB_TOKEN":"ghp_1234567890abcdefghijklmnopqrstuvwxyz","LOG_LEVEL":"debug"}},
                 "pg":{"command":"npx","args":["server-postgres","postgresql://u:hunter2@db/x"]},
+                "pg2":{"command":"npx","args":["server-postgres","postgres://admin:hunter2@${DB_HOST}/app"],"env":{"DATABASE_URL":"postgres://admin:hunter2@${DB_HOST}/app"}},
                 "remote":{"type":"http","url":"https://mcp.example.com/mcp"}
             }}"#,
         )
@@ -1632,6 +1848,7 @@ url = "https://mcp.linear.app/mcp"
         );
         assert!(m.servers.iter().all(|s| s.name != "pg"));
         assert!(text.contains("Not included: pg"));
+        assert!(m.servers.iter().all(|s| s.name != "pg2"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

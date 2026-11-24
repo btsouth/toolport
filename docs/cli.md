@@ -16,7 +16,7 @@ The npm package carries a prebuilt binary for macOS (Apple silicon and Intel), L
 nothing at run time. On another platform, build it from source:
 
 ```sh
-cargo install --git https://github.com/btsouth/toolport conduit --bin toolport --no-default-features
+cargo install --git https://github.com/btsouth/toolport conduit --bin toolport --no-default-features --features cli
 ```
 
 Set `TOOLPORT_CLI_BIN` to point the npm launcher at a binary of your own.
@@ -63,11 +63,11 @@ A token and cache profiler over your local agent transcripts. It reads Claude Co
 homes T3 Code uses), OpenCode's JSON message storage, and Toolport's own activity log.
 It makes no network requests.
 
-| Option          | Meaning                                |
-| --------------- | -------------------------------------- |
-| `--days N`      | Look back N days (default 30)          |
-| `--client NAME` | `claude`, `codex`, `opencode` or `all` |
-| `--no-cache`    | Read every transcript again            |
+| Option          | Meaning                                       |
+| --------------- | --------------------------------------------- |
+| `--days N`      | Count turns from the last N days (default 30) |
+| `--client NAME` | `claude`, `codex`, `opencode` or `all`        |
+| `--no-cache`    | Read every transcript again                   |
 
 What it reports:
 
@@ -210,6 +210,10 @@ toolport hook install     # Claude Code (every profile) and Codex, when present
 toolport hook check       # what the hook runs
 toolport hook uninstall
 ```
+
+Install and uninstall show the settings files they change and ask first; pass `--yes`
+in scripts, or `--dry-run` to preview. The hook names the CLI by its absolute path, so
+an agent that starts with a different `PATH` never runs the desktop app's `toolport`.
 
 The hook runs `toolport hook check` when a session starts. It prints nothing when the
 machine is healthy, and one line when something is wrong, for example:

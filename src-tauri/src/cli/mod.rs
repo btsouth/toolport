@@ -269,10 +269,14 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "hook",
         summary: "Install a quiet drift check that runs when an agent session starts",
-        usage: "toolport hook install|uninstall|check [--agent claude-code|codex]",
-        flags: &[valued("agent", "ID", "claude-code or codex (default: both when present)")],
+        usage: "toolport hook install|uninstall|check [--agent claude-code|codex] [--yes] [--dry-run]",
+        flags: &[
+            valued("agent", "ID", "claude-code or codex (default: both when present)"),
+            switch("dry-run", "Show which settings files would change"),
+            Flag { long: "yes", short: Some('y'), value: None, help: "Change settings files without asking" },
+        ],
         positionals: (1, 1),
-        examples: &["toolport hook install", "toolport hook check", "toolport hook uninstall --agent codex"],
+        examples: &["toolport hook install", "toolport hook check", "toolport hook uninstall --agent codex --yes"],
         about: "The check prints nothing when everything is healthy and one line when something drifted. Uninstall removes only Toolport's own entry and keeps a backup.",
     },
     Command {
