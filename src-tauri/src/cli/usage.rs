@@ -2121,7 +2121,7 @@ fn recommendations(r: &UsageReport) -> Vec<Recommendation> {
                 format::plural(m.bursts as usize, "burst", "bursts"),
                 BURST_CALLS
             ),
-            detail: "A Code Mode candidate: through Toolport's gateway, one script runs those calls and only the result enters context.".into(),
+            detail: "A Code Mode candidate: set TOOLPORT_DISCOVERY=code-mode (or clientDiscovery = \"code-mode\") so one script runs those calls and only the result enters context.".into(),
         });
     }
     if !r.unused_servers.is_empty() {

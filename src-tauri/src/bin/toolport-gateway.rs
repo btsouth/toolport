@@ -6218,7 +6218,7 @@ fn execute_call(
                 Some(&call_args_hash),
                 pii,
                 Some(&secrets),
-                Some(bytes),
+                bytes,
             );
             if let Some(profiler) = call_profiler {
                 profiler.finish();
@@ -6282,7 +6282,7 @@ fn execute_call(
                 Some(&call_args_hash),
                 pii,
                 Some(&secrets),
-                Some(bytes),
+                bytes,
             );
             out
         }
@@ -7059,18 +7059,34 @@ fn defend_and_shape_for(
     }
     // Toolport-authored trailer, appended last so it survives both passes intact.
     let trailer = trailer.trim();
+    let pre_trailer_bytes = if !trailer.is_empty() {
+        serde_json::to_string(&result).map_or(0, |text| text.len()) as u64
+    } else {
+        0
+    };
     if !trailer.is_empty() {
         if let Some(arr) = result.get_mut("content").and_then(|c| c.as_array_mut()) {
             arr.push(json!({ "type": "text", "text": trailer }));
         }
     }
     let response_bytes = serde_json::to_string(&result).map_or(0, |text| text.len()) as u64;
-    let bytes = audit::ResponseBytes {
-        response: response_bytes,
-        // Only a result Toolport rewrote has a different size before and after.
-        raw: shaped
-            .filter(|outcome| outcome.compacted || outcome.shaped)
-            .map(|outcome| outcome.raw_bytes as u64),
+    let trailer_delta = if !trailer.is_empty() {
+        response_bytes.saturating_sub(pre_trailer_bytes)
+    } else {
+        0
+    };
+    // Code-mode intermediate calls (`shape == false`) stay inside the JS sandbox and
+    // never enter model context directly; only record context-facing bytes when shaped.
+    let bytes = if shape {
+        Some(audit::ResponseBytes {
+            response: response_bytes,
+            // Only a result Toolport rewrote has a different size before and after.
+            raw: shaped
+                .filter(|outcome| outcome.compacted || outcome.shaped)
+                .map(|outcome| (outcome.raw_bytes as u64).saturating_add(trailer_delta)),
+        })
+    } else {
+        None
     };
     Defended {
         result,
@@ -7093,8 +7109,9 @@ struct Defended {
     /// Secrets replaced before shaping, by name; `None` when not shaped.
     secrets: Option<std::collections::BTreeMap<String, usize>>,
     /// The result's serialized size as handed on, and before compaction or shaping
-    /// when Toolport rewrote it.
-    bytes: audit::ResponseBytes,
+    /// when Toolport rewrote it. `None` for code-mode intermediate calls that never
+    /// enter model context directly.
+    bytes: Option<audit::ResponseBytes>,
 }
 
 /// Exposed tool names for code-mode `servers.*` stubs: full catalog minus gateway
@@ -31378,12 +31395,12 @@ mod tests {
         let shaped = defended.result;
         assert!(serde_json::to_string(&shaped).unwrap().len() <= shaping::PREVIEW_BUDGET_BYTES);
         assert!(
-            defended.bytes.raw.unwrap() > 130_000,
+            defended.bytes.unwrap().raw.unwrap() > 130_000,
             "{:?}",
             defended.bytes
         );
         assert_eq!(
-            defended.bytes.response as usize,
+            defended.bytes.unwrap().response as usize,
             serde_json::to_string(&shaped).unwrap().len()
         );
         let text = shaped["content"][0]["text"].as_str().unwrap();
@@ -31466,11 +31483,22 @@ mod tests {
             "",
             true,
         );
-        assert_eq!(small.bytes.raw, None);
+        assert_eq!(small.bytes.unwrap().raw, None);
         assert_eq!(
-            small.bytes.response as usize,
+            small.bytes.unwrap().response as usize,
             serde_json::to_string(&small.result).unwrap().len()
         );
+        // Code-mode intermediate calls (`shape == false`) never enter model context directly.
+        let intermediate = defend_and_shape(
+            &reg,
+            "tracker",
+            "tracker__get",
+            None,
+            json!({"content":[{"type":"text","text":"ok"}],"isError":false}),
+            "",
+            false,
+        );
+        assert_eq!(intermediate.bytes, None);
     }
 
     /// A registry rebuild or policy publication that leaves a connection's Lazy or
