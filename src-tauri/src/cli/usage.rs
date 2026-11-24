@@ -213,9 +213,10 @@ fn units(sources: &Sources, filter: &BTreeSet<Client>, since_ms: u64) -> Vec<Uni
                 if !meta.is_dir() {
                     continue;
                 }
-                // Editing a message in place leaves the folder's own time alone; the newest
-                // message, the total size and the count catch edits, additions and removals.
-                let (mut files, mut size, mut newest) = (0, 0, mtime_ms(&meta));
+                // Editing a message in place leaves the folder's own time alone (and NTFS
+                // flushes folder timestamps lazily); the newest message, total size and
+                // count catch edits, additions and removals deterministically.
+                let (mut files, mut size, mut newest) = (0, 0, 0);
                 for file in std::fs::read_dir(entry.path())
                     .into_iter()
                     .flatten()
@@ -228,7 +229,7 @@ fn units(sources: &Sources, filter: &BTreeSet<Client>, since_ms: u64) -> Vec<Uni
                         newest = newest.max(mtime_ms(&m));
                     }
                 }
-                if newest < since_ms {
+                if files == 0 || newest < since_ms {
                     continue;
                 }
                 out.push(Unit {
@@ -2902,11 +2903,11 @@ mod tests {
         let again = analyze(&sources, &opts, &Configured::new());
         assert_eq!((again.stats.parsed, again.stats.cached), (0, 1));
 
-        // Rewritten in place: no new file, so the folder's own time and count stay put.
-        write(5_000, 1_800_000);
+        // Rewritten in place with the same byte length: only the message timestamp changes.
+        write(7, 1_800_000);
         let edited = analyze(&sources, &opts, &Configured::new());
         assert_eq!((edited.stats.parsed, edited.stats.cached), (1, 0));
-        assert_eq!(edited.totals.output, 5_000);
+        assert_eq!(edited.totals.output, 7);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

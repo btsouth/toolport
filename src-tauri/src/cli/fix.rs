@@ -8,11 +8,12 @@
 //! the plaintext copy leaves the file (a backup is kept in Toolport's private backups).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use serde::Serialize;
 
 use super::format::{self, Severity, Style};
-use super::scan::{SecretFinding, Snapshot};
+use super::scan::Snapshot;
 use super::{Args, CliError, Ctx, EXIT_OK};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +51,7 @@ pub struct PlannedFix {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SecretPlan {
+pub struct VaultPlan {
     pub client_id: String,
     pub client_name: String,
     pub config_path: String,
@@ -72,7 +73,8 @@ pub struct SecretPlan {
 pub struct FixReport {
     pub dry_run: bool,
     pub planned: Vec<PlannedFix>,
-    pub secrets: Vec<SecretPlan>,
+    #[serde(rename = "secrets")]
+    pub vault_plans: Vec<VaultPlan>,
     pub gateway_available: bool,
     pub applied: Vec<String>,
     pub failed: Vec<String>,
@@ -166,23 +168,42 @@ fn review(client_id: &str, servers: &[(String, bool)]) -> (Vec<String>, Vec<Stri
     (keys, already, unsupported)
 }
 
-fn plan_secrets(findings: &[SecretFinding]) -> Vec<SecretPlan> {
-    let mut by_client: BTreeMap<String, Vec<&SecretFinding>> = BTreeMap::new();
-    for f in findings {
-        by_client.entry(f.client_id.clone()).or_default().push(f);
+fn plan_vault_plans(snapshot: &Snapshot) -> Vec<VaultPlan> {
+    let findings = super::scan::secret_findings(snapshot);
+    let mut by_client: BTreeMap<String, &crate::clients::DetectedClient> = BTreeMap::new();
+    for client in snapshot.present() {
+        if findings.iter().any(|f| f.client_id == client.id) {
+            by_client.entry(client.id.clone()).or_insert(client);
+        }
     }
     let mut plans = Vec::new();
-    for (client_id, items) in by_client {
-        let mut servers: Vec<String> = items.iter().map(|f| f.server.clone()).collect();
-        servers.dedup();
-        let held: Vec<bool> = servers
-            .iter()
-            .map(|n| items.iter().any(|f| &f.server == n && f.in_toolport))
-            .collect();
-        let mut plan = SecretPlan {
-            client_name: items[0].client_name.clone(),
-            config_path: items[0].config_path.clone(),
-            settings: items.len(),
+    for (client_id, client) in by_client {
+        let mut settings = 0usize;
+        let mut servers = Vec::new();
+        let mut held = Vec::new();
+        for server in client.servers.iter().chain(&client.plugin_servers) {
+            let count = findings
+                .iter()
+                .filter(|f| f.client_id == client_id && f.server == server.name)
+                .count();
+            if count == 0 || servers.contains(&server.name) {
+                continue;
+            }
+            settings += count;
+            servers.push(server.name.clone());
+            held.push(
+                findings
+                    .iter()
+                    .any(|f| f.client_id == client_id && f.server == server.name && f.in_toolport),
+            );
+        }
+        if servers.is_empty() {
+            continue;
+        }
+        let mut plan = VaultPlan {
+            client_name: super::scan::display_name(client),
+            config_path: format::home_relative(Path::new(&client.config_path)),
+            settings,
             servers: servers.clone(),
             keys: Vec::new(),
             already_in_toolport: Vec::new(),
@@ -202,15 +223,15 @@ fn plan_secrets(findings: &[SecretFinding]) -> Vec<SecretPlan> {
 
 pub fn plan(snapshot: &Snapshot, only: Only, dry_run: bool) -> FixReport {
     let planned = plan_skills(snapshot, only);
-    let secrets = if matches!(only, Only::All | Only::Secrets) {
-        plan_secrets(&super::scan::secret_findings(snapshot))
+    let vault_plans = if matches!(only, Only::All | Only::Secrets) {
+        plan_vault_plans(snapshot)
     } else {
         Vec::new()
     };
     FixReport {
         dry_run,
         planned,
-        secrets,
+        vault_plans,
         gateway_available: crate::clients::resolve_gateway_path_readonly().is_some(),
         ..Default::default()
     }
@@ -227,7 +248,7 @@ fn render_plan(r: &FixReport, style: &Style, connect: bool) -> String {
             "· plan"
         })
     ));
-    if r.planned.is_empty() && r.secrets.is_empty() {
+    if r.planned.is_empty() && r.vault_plans.is_empty() {
         out.push_str(&format!(
             "\n  {} Nothing to fix.\n",
             style.mark(Severity::Ok)
@@ -252,9 +273,9 @@ fn render_plan(r: &FixReport, style: &Style, connect: bool) -> String {
             }
         }
     }
-    if !r.secrets.is_empty() {
+    if !r.vault_plans.is_empty() {
         out.push_str(&style.heading("Plaintext secrets"));
-        for s in &r.secrets {
+        for s in &r.vault_plans {
             out.push_str(&format!(
                 "  {} {}  {}\n",
                 style.cyan(if style.unicode { "◆" } else { "*" }),
@@ -336,7 +357,7 @@ pub fn command(ctx: &Ctx, args: &Args) -> Result<i32, CliError> {
         return Err(CliError::new(format!("couldn't read skills: {e}")));
     }
     let mut report = plan(&snapshot, only, dry_run);
-    let nothing = report.planned.is_empty() && report.secrets.is_empty();
+    let nothing = report.planned.is_empty() && report.vault_plans.is_empty();
     if dry_run || nothing {
         if ctx.json {
             ctx.emit_json(&report)?;
@@ -418,7 +439,7 @@ fn apply(report: &mut FixReport, project: Option<&str>, connect: bool) {
         },
         |id, fingerprint| crate::skills::fix_issue(id, fingerprint, project).map(|_| ()),
     );
-    apply_secrets(report, connect);
+    apply_vault_plans(report, connect);
 }
 
 /// Skills and rules repairs, each with the fingerprint the user saw in the preview. An
@@ -464,9 +485,9 @@ fn apply_skills(
     }
 }
 
-fn apply_secrets(report: &mut FixReport, connect: bool) {
+fn apply_vault_plans(report: &mut FixReport, connect: bool) {
     let mut imported: BTreeSet<String> = BTreeSet::new();
-    for s in report.secrets.clone() {
+    for s in report.vault_plans.clone() {
         if connect && report.gateway_available {
             let names: Vec<String> = s
                 .servers

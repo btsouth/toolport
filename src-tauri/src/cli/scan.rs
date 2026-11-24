@@ -1194,7 +1194,7 @@ mod tests {
             &[],
         );
         let found = server_secrets(&c, &args, Some(&serde_json::json!({})));
-        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found.len(), 1);
         assert_eq!(found[0].kind, "arg");
         assert_eq!(found[0].setting, "argument 2");
     }

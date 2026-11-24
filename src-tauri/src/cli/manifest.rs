@@ -369,7 +369,7 @@ fn runs_project_files(s: &ServerSpec, project: &Path) -> bool {
         .trim();
         if t.is_empty()
             || t.contains("://")
-            || t.starts_with(['@', '~', '$'])
+            || t.starts_with(['@', '~', '$', '/', '\\'])
             || Path::new(t).is_absolute()
         {
             return false;

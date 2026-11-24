@@ -68,7 +68,13 @@ fn scan_finds_secrets_drift_and_skill_problems_without_printing_values() {
         .unwrap()
         .iter()
         .any(|i| i["id"] == "broken-links" && i["fixable"] == true));
-    assert_eq!(report["skills"]["sharedFolder"], "~/.agents/skills");
+    assert_eq!(
+        report["skills"]["sharedFolder"]
+            .as_str()
+            .unwrap()
+            .replace('\\', "/"),
+        "~/.agents/skills"
+    );
     let claude = report["startup"]
         .as_array()
         .unwrap()

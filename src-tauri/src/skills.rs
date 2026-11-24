@@ -130,7 +130,7 @@ impl Env {
     }
 
     pub fn current() -> Option<Self> {
-        let home = dirs::home_dir()?;
+        let home = crate::clients::home()?;
         let mut env = Env::from_home(&home);
         let abs = |key: &str| {
             std::env::var_os(key)
@@ -190,8 +190,14 @@ impl Env {
         }
         // Reasonix uses os.UserConfigDir on Windows, and trims and expands `~` in both.
         #[cfg(windows)]
-        if let Some(dir) = dirs::config_dir() {
-            env.reasonix = dir.join("reasonix");
+        {
+            #[cfg(all(not(test), feature = "test-support"))]
+            let config_dir = crate::fixture_paths::dir("config").or_else(dirs::config_dir);
+            #[cfg(not(all(not(test), feature = "test-support")))]
+            let config_dir = dirs::config_dir();
+            if let Some(dir) = config_dir {
+                env.reasonix = dir.join("reasonix");
+            }
         }
         let trimmed = |key: &str| {
             let raw = std::env::var(key).ok()?;
