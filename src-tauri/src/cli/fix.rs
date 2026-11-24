@@ -430,18 +430,34 @@ fn apply_skills(
     current: impl Fn(&str) -> Result<Option<String>, String>,
     fix: impl Fn(&str, &str) -> Result<(), String>,
 ) {
+    // Snapshot which items already matched before any repair ran so we can tell an
+    // external edit apart from a change caused by an earlier repair in this same run.
+    let matched_at_start: std::collections::BTreeSet<String> = report
+        .planned
+        .iter()
+        .filter(|p| matches!(current(&p.id), Ok(Some(ref fp)) if fp == &p.fingerprint))
+        .map(|p| p.id.clone())
+        .collect();
+    let mut applied_any = false;
     for p in report.planned.clone() {
         match current(&p.id) {
             Ok(None) => report
                 .notes
                 .push(format!("{}: already gone, nothing to do.", p.title)),
-            Ok(Some(now)) if now != p.fingerprint => report.failed.push(format!(
-                "{}: changed since the preview, so it was left alone. Run 'toolport fix --dry-run' to review it again.",
-                p.title
-            )),
+            Ok(Some(now)) if now != p.fingerprint => {
+                let reason = if applied_any && matched_at_start.contains(&p.id) {
+                    "changed after an earlier repair in this run, so it was left alone. Run 'toolport fix --dry-run' to review the remaining items."
+                } else {
+                    "changed since the preview, so it was left alone. Run 'toolport fix --dry-run' to review it again."
+                };
+                report.failed.push(format!("{}: {reason}", p.title));
+            }
             // An unreadable inventory falls through: `fix_issue` reports why.
             _ => match fix(&p.id, &p.fingerprint) {
-                Ok(()) => report.applied.push(format!("{}: {}", p.action, p.title)),
+                Ok(()) => {
+                    applied_any = true;
+                    report.applied.push(format!("{}: {}", p.action, p.title));
+                }
                 Err(e) => report.failed.push(format!("{}: {e}", p.title)),
             },
         }

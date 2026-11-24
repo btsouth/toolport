@@ -108,12 +108,18 @@ pub fn hook_command() -> (String, Option<String>) {
     )
 }
 
-/// A copy npx unpacked into its cache, which npm may clear at any time. npx also puts that
-/// cache's `.bin` on PATH while it runs, so both the path and its target are checked.
+/// A copy unpacked into an ephemeral package-runner cache (npx, pnpm dlx, bunx, yarn dlx),
+/// which may be cleared at any time. Those runners also put their cache's `.bin` on PATH
+/// while running, so both the path and its symlink target are checked.
 fn is_ephemeral(path: &Path) -> bool {
     let cached = |p: &Path| {
-        let text = p.to_string_lossy();
-        text.contains("_npx") || text.contains("npm-cache")
+        let text = p.to_string_lossy().replace('\\', "/");
+        text.contains("_npx")
+            || text.contains("npm-cache")
+            || text.contains("/dlx/")
+            || text.contains("pnpm-store")
+            || text.contains("/bunx-")
+            || text.contains("/.bun/install/cache/")
     };
     cached(path) || std::fs::canonicalize(path).is_ok_and(|real| cached(&real))
 }

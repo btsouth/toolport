@@ -388,6 +388,30 @@ fn runs_project_files(s: &ServerSpec, project: &Path) -> bool {
         && (s.command.as_deref().is_some_and(relative) || s.args.iter().any(|a| relative(a)))
 }
 
+fn normalize_project_root(project: &Path) -> String {
+    let resolved = std::fs::canonicalize(project)
+        .or_else(|_| std::path::absolute(project))
+        .unwrap_or_else(|_| project.to_path_buf());
+    resolved.to_string_lossy().into_owned()
+}
+
+fn owning_project(entry: &crate::registry::ServerEntry) -> Option<&str> {
+    entry
+        .unknown_fields
+        .get("projectRoot")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+}
+
+fn same_project_owner(
+    existing: &crate::registry::ServerEntry,
+    wanted: &crate::registry::ServerEntry,
+) -> bool {
+    existing.source.as_deref() == Some("project")
+        && owning_project(existing).is_some()
+        && owning_project(existing) == owning_project(wanted)
+}
+
 /// The registry entry a manifest server becomes. Env vars are secret with no value; their
 /// values only ever reach the keychain. A stdio server that runs files from the project
 /// gets the project folder as its working directory, so its relative paths resolve there
@@ -425,9 +449,13 @@ pub fn to_entry(
     if let Some(u) = &s.url {
         entry["url"] = serde_json::json!(u);
     }
-    if let Some(project) = project.filter(|p| runs_project_files(s, p)) {
-        let dir = std::path::absolute(project).unwrap_or_else(|_| project.to_path_buf());
-        entry["cwd"] = serde_json::json!(dir.to_string_lossy());
+    if let Some(project) = project {
+        let owner = normalize_project_root(project);
+        entry["projectRoot"] = serde_json::json!(owner);
+        if runs_project_files(s, project) {
+            let dir = std::path::absolute(project).unwrap_or_else(|_| project.to_path_buf());
+            entry["cwd"] = serde_json::json!(dir.to_string_lossy());
+        }
     }
     serde_json::from_value(entry).expect("manifest server maps onto a registry entry")
 }
@@ -1117,10 +1145,12 @@ pub fn plan_up(
 }
 
 /// What `up` does with a manifest server Toolport already has under the same name. A
-/// different command, arguments or url is a conflict: what a repo runs never changes
-/// silently. Changed settings (plain values, password manager references, new env names,
-/// the working folder) update a server an earlier `up` added and are shown before they
-/// apply; on a server added some other way they are a conflict too.
+/// A different command, arguments, url or working folder is always a conflict: what a repo
+/// runs never changes silently, and another repo can never redirect an existing server to
+/// its own files or inherit its keychain secrets. Changed settings (plain values, password
+/// manager references, new env names) update only a server added by the same project and
+/// are shown before they apply; on a server added by another project or outside `up` they
+/// are a conflict too.
 fn plan_existing(
     s: &ServerSpec,
     existing: &crate::registry::ServerEntry,
@@ -1130,20 +1160,21 @@ fn plan_existing(
         || existing.command != wanted.command
         || existing.args != wanted.args
         || existing.url != wanted.url
+        || existing.cwd != wanted.cwd
     {
         return Step::ServerConflict {
             name: s.name.clone(),
             detail: "Toolport already has a server with this name and a different definition; rename one or remove it first".into(),
         };
     }
-    let from_project = existing.source.as_deref() == Some("project");
+    let owned_here = same_project_owner(existing, wanted);
     let updated = with_manifest_settings(existing, wanted);
     let changes = setting_changes(existing, &updated);
-    if !changes.is_empty() && !from_project {
+    if !changes.is_empty() && !owned_here {
         return Step::ServerConflict {
             name: s.name.clone(),
             detail: format!(
-                "Toolport already has a server with this name and different settings ({}); change them in Toolport or remove it first",
+                "Toolport already has a server with this name from another setup with different settings ({}); change them in Toolport or remove it first",
                 changes.join(", ")
             ),
         };
@@ -1156,9 +1187,9 @@ fn plan_existing(
             .cloned()
             .collect()
     };
-    // Switch it on once every credential is set: only for a server `up` added and left
-    // off for that reason, never one the user turned off.
-    let waiting = !existing.enabled && from_project && !missing_in(existing).is_empty();
+    // Switch it on once every credential is set: only for a server this project's `up`
+    // added and left off for that reason, never one the user turned off or another repo added.
+    let waiting = !existing.enabled && owned_here && !missing_in(existing).is_empty();
     let missing = missing_in(&updated);
     if !changes.is_empty() {
         return Step::ServerUpdate {
@@ -1180,14 +1211,14 @@ fn plan_existing(
             id: existing.id.clone(),
             from_env: in_environment(&missing),
             needs: missing,
-            enable: !existing.enabled && from_project,
+            enable: !existing.enabled && owned_here,
         }
     }
 }
 
 /// `existing` with the settings the manifest declares: its plain values, password manager
-/// references, env names and working folder. Everything else, including settings added in
-/// Toolport and keychain values, is kept.
+/// references and env names. Everything else, including settings added in Toolport,
+/// working directory and keychain values, is kept.
 fn with_manifest_settings(
     existing: &crate::registry::ServerEntry,
     wanted: &crate::registry::ServerEntry,
@@ -1205,9 +1236,6 @@ fn with_manifest_settings(
             }
             None => out.env.push(var.clone()),
         }
-    }
-    if wanted.cwd.is_some() {
-        out.cwd = wanted.cwd.clone();
     }
     out
 }
@@ -1233,9 +1261,6 @@ fn setting_changes(
             }
             Some(_) => {}
         }
-    }
-    if before.cwd != after.cwd {
-        changes.push("working folder".into());
     }
     changes
 }
@@ -1774,6 +1799,18 @@ fn update_server(
             .iter()
             .find(|s| s.id == id)
             .ok_or_else(|| format!("{} is no longer in Toolport", spec.name))?;
+        if existing.transport != wanted.transport
+            || existing.command != wanted.command
+            || existing.args != wanted.args
+            || existing.url != wanted.url
+            || existing.cwd != wanted.cwd
+            || !same_project_owner(existing, &wanted)
+        {
+            return Err(format!(
+                "{} changed in Toolport since the preview; review and run toolport up again",
+                spec.name
+            ));
+        }
         let updated = with_manifest_settings(existing, &wanted);
         crate::secret_refs::validate_server(&updated).map_err(|e| e.message)?;
         r.update_server(updated)
@@ -2148,8 +2185,8 @@ url = "https://mcp.linear.app/mcp"
         let _ = std::fs::remove_dir_all(&project);
     }
 
-    fn existing(toml: &str, source: &str) -> crate::registry::ServerEntry {
-        let mut e = to_entry(&spec(toml), true, None);
+    fn existing(toml: &str, source: &str, project: Option<&Path>) -> crate::registry::ServerEntry {
+        let mut e = to_entry(&spec(toml), true, project);
         e.id = "s".into();
         e.source = Some(source.into());
         e
@@ -2158,15 +2195,20 @@ url = "https://mcp.linear.app/mcp"
     #[test]
     fn changed_values_and_references_update_a_project_server() {
         const BASE: &str = "command = \"npx\"\nargs = [\"-y\", \"pkg\"]\nenv = [\"TOKEN\"]\n[servers.secret_refs]\nTOKEN = \"op://Eng/Item/token\"\n[servers.values]\nLOG_LEVEL = \"debug\"";
-        let old = existing(BASE, "project");
-        let plan = |toml: &str, e: &crate::registry::ServerEntry| {
+        let repo_a = Path::new("/tmp/toolport-test-repo-a");
+        let repo_b = Path::new("/tmp/toolport-test-repo-b");
+        let old = existing(BASE, "project", Some(repo_a));
+        let plan_in = |toml: &str, e: &crate::registry::ServerEntry, dir: &Path| {
             let s = spec(toml);
-            plan_existing(&s, e, &to_entry(&s, false, None))
+            plan_existing(&s, e, &to_entry(&s, false, Some(dir)))
         };
-        assert!(matches!(plan(BASE, &old), Step::ServerSame { .. }));
+        assert!(matches!(
+            plan_in(BASE, &old, repo_a),
+            Step::ServerSame { .. }
+        ));
 
         let value = BASE.replace("\"debug\"", "\"info\"");
-        match plan(&value, &old) {
+        match plan_in(&value, &old, repo_a) {
             Step::ServerUpdate { changes, needs, .. } => {
                 assert_eq!(changes, vec!["LOG_LEVEL".to_string()]);
                 assert!(needs.is_empty());
@@ -2174,7 +2216,7 @@ url = "https://mcp.linear.app/mcp"
             other => panic!("{other:?}"),
         }
         let reference = BASE.replace("op://Eng/Item/token", "op://Eng/Other/token");
-        match plan(&reference, &old) {
+        match plan_in(&reference, &old, repo_a) {
             Step::ServerUpdate { changes, .. } => {
                 assert_eq!(changes, vec!["TOKEN from a new reference".to_string()])
             }
@@ -2182,7 +2224,7 @@ url = "https://mcp.linear.app/mcp"
         }
         // The update keeps what the manifest doesn't declare and applies what it does.
         let s = spec(&value);
-        let updated = with_manifest_settings(&old, &to_entry(&s, false, None));
+        let updated = with_manifest_settings(&old, &to_entry(&s, false, Some(repo_a)));
         assert_eq!(updated.id, "s");
         let level = updated.env.iter().find(|v| v.key == "LOG_LEVEL").unwrap();
         assert_eq!(level.value.as_deref(), Some("info"));
@@ -2193,10 +2235,31 @@ url = "https://mcp.linear.app/mcp"
             ),
             Some("op://Eng/Item/token")
         );
-        assert!(matches!(plan(&value, &updated), Step::ServerSame { .. }));
+        assert!(matches!(
+            plan_in(&value, &updated, repo_a),
+            Step::ServerSame { .. }
+        ));
+
+        // Another repo cannot update or hijack settings of repo A's server.
+        assert!(matches!(
+            plan_in(&value, &old, repo_b),
+            Step::ServerConflict { .. }
+        ));
+        assert!(matches!(
+            plan_in(&reference, &old, repo_b),
+            Step::ServerConflict { .. }
+        ));
+        // Another repo with a local script under the same name gets a conflict, never a
+        // cwd swap that could run repo B's script with repo A's keychain secrets.
+        const LOCAL: &str = "command = \"node\"\nargs = [\"./server.js\"]\nenv = [\"TOKEN\"]";
+        let local_a = existing(LOCAL, "project", Some(repo_a));
+        assert!(matches!(
+            plan_in(LOCAL, &local_a, repo_b),
+            Step::ServerConflict { .. }
+        ));
 
         // Never changed on a server the user added some other way.
-        match plan(&value, &existing(BASE, "manual")) {
+        match plan_in(&value, &existing(BASE, "manual", None), repo_a) {
             Step::ServerConflict { detail, .. } => {
                 assert!(
                     detail.contains("LOG_LEVEL") && !detail.contains("info"),
@@ -2207,7 +2270,7 @@ url = "https://mcp.linear.app/mcp"
         }
         // A different command is always a conflict.
         assert!(matches!(
-            plan(&BASE.replace("\"pkg\"", "\"other\""), &old),
+            plan_in(&BASE.replace("\"pkg\"", "\"other\""), &old, repo_a),
             Step::ServerConflict { .. }
         ));
     }
