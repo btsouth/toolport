@@ -16,6 +16,17 @@ const scriptPath = fileURLToPath(new URL("./check-release-version.mjs", import.m
 function writeFixture(root, { version, pkgbuildVersion }) {
   const files = {
     "package.json": JSON.stringify({ name: "toolport", version }),
+    "packages/toolport-cli/package.json": JSON.stringify({
+      name: "@toolport/cli",
+      version,
+      optionalDependencies: {
+        "@toolport/cli-darwin-arm64": version,
+        "@toolport/cli-darwin-x64": version,
+        "@toolport/cli-linux-arm64": version,
+        "@toolport/cli-linux-x64": version,
+        "@toolport/cli-win32-x64": version,
+      },
+    }),
     "package-lock.json": JSON.stringify({ version, packages: { "": { version } } }),
     "src-tauri/Cargo.toml": `[package]\nname = "conduit"\nversion = "${version}"\n`,
     "src-tauri/Cargo.lock": `[[package]]\nname = "conduit"\nversion = "${version}"\n`,

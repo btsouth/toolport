@@ -1,0 +1,191 @@
+name: npm CLI
+
+# Cross-builds the lean standalone `toolport` CLI binary for all 5 platforms,
+# stages `@toolport/cli` + its 5 optional platform packages via
+# `scripts/stage-npm-cli.mjs`, and optionally publishes via npm OIDC Trusted
+# Publishing (`npm stage publish` or `npm publish --provenance`).
+#
+# For the very first release (before npm Trusted Publishing can be linked on
+# npmjs.com), run with `publish_mode: artifact-only` (or push a `v*` tag),
+# download the `npm-cli-packages` artifact, publish the 6 packages once with
+# interactive 2FA, and then link this workflow as a Trusted Publisher on each
+# package in the `toolport` npm org.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp (defaults to package.json version)"
+        required: false
+        type: string
+      publish_mode:
+        description: "Publish mode after staging"
+        required: true
+        default: "artifact-only"
+        type: choice
+        options:
+          - artifact-only
+          - npm-stage
+          - npm-direct
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-cli-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build CLI (${{ matrix.platform }})
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bin: toolport
+          - platform: darwin-x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            bin: toolport
+          - platform: linux-x64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bin: toolport
+          - platform: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bin: toolport
+          - platform: win32-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: toolport.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux build dependencies
+        if: startsWith(matrix.platform, 'linux-')
+        uses: ./.github/actions/apt-install
+        with:
+          packages: pkg-config libdbus-1-dev libssl-dev
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri -> target
+          key: cli-${{ matrix.platform }}
+
+      - name: Build release-cli binary
+        shell: bash
+        run: |
+          cargo build \
+            --manifest-path src-tauri/Cargo.toml \
+            --profile release-cli \
+            --locked \
+            --no-default-features \
+            --features cli \
+            --target "${{ matrix.target }}" \
+            --bin toolport
+
+      - name: Verify native binary marker
+        if: matrix.platform != 'darwin-x64'
+        shell: bash
+        run: |
+          out=$("src-tauri/target/${{ matrix.target }}/release-cli/${{ matrix.bin }}" --version --json)
+          echo "$out"
+          echo "$out" | grep -q '"toolport-cli-binary-v1"'
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cli-bin-${{ matrix.platform }}
+          path: src-tauri/target/${{ matrix.target }}/release-cli/${{ matrix.bin }}
+          if-no-files-found: error
+
+  stage-and-publish:
+    name: Stage and publish @toolport/cli
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: cli-bin-*
+          path: dist/cli-bins
+
+      - name: Check launcher tests and package consistency
+        run: |
+          node --test packages/toolport-cli/test/launcher.test.mjs scripts/stage-npm-cli.test.mjs
+          node scripts/stage-npm-cli.mjs --check
+
+      - name: Stage all 6 npm packages
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          elif [[ "${GITHUB_REF_NAME}" == v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION=$(node -p 'JSON.parse(require("fs").readFileSync("packages/toolport-cli/package.json","utf8")).version')
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          node scripts/stage-npm-cli.mjs \
+            --out dist/npm \
+            --version "$VERSION" \
+            --all \
+            --bin darwin-arm64=dist/cli-bins/cli-bin-darwin-arm64/toolport \
+            --bin darwin-x64=dist/cli-bins/cli-bin-darwin-x64/toolport \
+            --bin linux-arm64=dist/cli-bins/cli-bin-linux-arm64/toolport \
+            --bin linux-x64=dist/cli-bins/cli-bin-linux-x64/toolport \
+            --bin win32-x64=dist/cli-bins/cli-bin-win32-x64/toolport.exe
+
+      - name: Upload staged npm packages artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: npm-cli-packages
+          path: dist/npm
+          if-no-files-found: error
+
+      - name: Publish via npm OIDC Trusted Publishing
+        if: inputs.publish_mode == 'npm-stage' || inputs.publish_mode == 'npm-direct'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --version
+          # Platform packages first so optionalDependencies resolve before @toolport/cli lands.
+          for dir in \
+            dist/npm/cli-darwin-arm64 \
+            dist/npm/cli-darwin-x64 \
+            dist/npm/cli-linux-arm64 \
+            dist/npm/cli-linux-x64 \
+            dist/npm/cli-win32-x64 \
+            dist/npm/cli; do
+            if [ "${{ inputs.publish_mode }}" = "npm-stage" ]; then
+              (cd "$dir" && npm stage publish --access public)
+            else
+              (cd "$dir" && npm publish --provenance --access public)
+            fi
+          done

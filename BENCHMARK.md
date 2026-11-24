@@ -12,6 +12,42 @@ search and call tools. Whether that saves tokens depends on the client:
 
 Reproduce it yourself: [`benchmark/`](benchmark/).
 
+## Result shaping and Code Mode, 2026-11-24
+
+Tool definitions are only half of MCP context cost. Large responses and multi-call
+fan-outs stay in context for every later turn of a session. Toolport now replaces
+over-budget results with a preview of at most 2 KB (structure, short head, and a
+queryable cursor for `path`, `where`, `fields`, `grep`, and `sort`) and adds a
+`code-mode` discovery mode (`status`, `search`, `fetch_result`, and `run_script`,
+with no individual tools advertised beside it).
+
+Two deterministic mock-tracker tasks, 3 runs per cell, 36 of 36 solved. Claude Code
+2.1.331 (Sonnet) and Codex 0.172.0 (`gpt-6.2-sol`, low reasoning). Numbers are mean
+total input tokens (including cache reads and writes):
+
+- **Task 1 (oversized result):** `list_issues` returns 145 KB of JSON (120 issues,
+  3 `p0` issues assigned to `alice` buried at indices 17, 63, and 108).
+- **Task 2 (8-way fan-out join):** `list_projects` (25 projects, 8 active in team
+  `payments`) followed by 8 calls to `get_project_metrics` (~96 KB total) to find
+  the highest p99 latency and top error code.
+
+| Task                  | Client      | Direct MCP | Previous shaping / Full | Current Toolport | Change vs Direct |
+| --------------------- | ----------- | ---------: | ----------------------: | ---------------: | ---------------: |
+| Task 1: 145 KB result | Claude Code |     51,312 |                 208,157 |       **34,404** |         **-33%** |
+| Task 1: 145 KB result | Codex       |    107,115 |                 144,662 |       **97,245** |          **-9%** |
+| Task 2: 8-way fan-out | Claude Code |     79,405 |                  53,609 |       **32,348** |         **-59%** |
+| Task 2: 8-way fan-out | Codex       |    101,817 |                 108,070 |       **95,228** |          **-6%** |
+
+Honest caveats:
+
+- Previous 48 KB chunked shaping hurt Claude Code (+306%) because 48 KB chunks
+  stayed inline in context instead of triggering Claude Code's native disk spill.
+  The 2 KB preview plus structured queries reversed that into a -33% win.
+- In `code-mode` discovery, Codex's 17-call fallback disappeared (every run made
+  the exact 9 downstream calls). Codex's margin over Direct is narrower than Claude
+  Code's because each extra step re-sends about 27K tokens of Codex prompt context,
+  so 1 of 3 Codex runs per task overlapped Direct when it took an extra query step.
+
 ## REA (Reverse Engineer Anything), 2026-10-18
 
 [REA](https://github.com/morluto/rea) 6.7.0 with Ghidra 12.1.4: 207 tools, about 366K
