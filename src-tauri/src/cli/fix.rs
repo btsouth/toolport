@@ -406,23 +406,49 @@ pub fn command(ctx: &Ctx, args: &Args) -> Result<i32, CliError> {
 }
 
 fn apply(report: &mut FixReport, project: Option<&str>, connect: bool) {
-    for p in report.planned.clone() {
-        // Each fix re-plans from disk and refuses if the problem changed since it was shown.
-        // An earlier fix can change a later issue's fingerprint, so look it up fresh.
-        let fingerprint = crate::skills::inventory(project)
-            .ok()
-            .and_then(|inv| {
+    apply_skills(
+        report,
+        |id| {
+            crate::skills::inventory(project).map(|inv| {
                 inv.issues
                     .into_iter()
-                    .find(|i| i.id == p.id)
+                    .find(|i| i.id == id)
                     .map(|i| i.fingerprint)
             })
-            .unwrap_or(p.fingerprint.clone());
-        match crate::skills::fix_issue(&p.id, &fingerprint, project) {
-            Ok(_) => report.applied.push(format!("{}: {}", p.action, p.title)),
-            Err(e) => report.failed.push(format!("{}: {e}", p.title)),
+        },
+        |id, fingerprint| crate::skills::fix_issue(id, fingerprint, project).map(|_| ()),
+    );
+    apply_secrets(report, connect);
+}
+
+/// Skills and rules repairs, each with the fingerprint the user saw in the preview. An
+/// issue that changed since (on disk, or through an earlier repair in this run) is left
+/// alone: `fix_issue` would refuse it anyway, and a fresh fingerprint would approve a
+/// repair nobody reviewed. `current` reads an issue's fingerprint now (`None`: it's gone).
+fn apply_skills(
+    report: &mut FixReport,
+    current: impl Fn(&str) -> Result<Option<String>, String>,
+    fix: impl Fn(&str, &str) -> Result<(), String>,
+) {
+    for p in report.planned.clone() {
+        match current(&p.id) {
+            Ok(None) => report
+                .notes
+                .push(format!("{}: already gone, nothing to do.", p.title)),
+            Ok(Some(now)) if now != p.fingerprint => report.failed.push(format!(
+                "{}: changed since the preview, so it was left alone. Run 'toolport fix --dry-run' to review it again.",
+                p.title
+            )),
+            // An unreadable inventory falls through: `fix_issue` reports why.
+            _ => match fix(&p.id, &p.fingerprint) {
+                Ok(()) => report.applied.push(format!("{}: {}", p.action, p.title)),
+                Err(e) => report.failed.push(format!("{}: {e}", p.title)),
+            },
         }
     }
+}
+
+fn apply_secrets(report: &mut FixReport, connect: bool) {
     let mut imported: BTreeSet<String> = BTreeSet::new();
     for s in report.secrets.clone() {
         if connect && report.gateway_available {
@@ -498,5 +524,119 @@ fn apply(report: &mut FixReport, project: Option<&str>, connect: bool) {
             }
             Err(e) => report.failed.push(format!("{}: {e}", s.client_name)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    fn planned(id: &str, fingerprint: &str) -> PlannedFix {
+        PlannedFix {
+            kind: "skills",
+            id: id.into(),
+            title: format!("{id} title"),
+            action: format!("Fix {id}"),
+            detail: String::new(),
+            paths: Vec::new(),
+            fingerprint: fingerprint.into(),
+        }
+    }
+
+    #[test]
+    fn a_repair_that_changed_since_the_preview_is_refused_not_re_approved() {
+        // The machine as previewed: three issues, each with the fingerprint the user saw.
+        let state = RefCell::new(BTreeMap::from([
+            ("broken-links".to_string(), "broken-links:aaaa".to_string()),
+            (
+                "rules-missing".to_string(),
+                "rules-missing:bbbb".to_string(),
+            ),
+            ("gone".to_string(), "gone:cccc".to_string()),
+        ]));
+        let mut report = FixReport {
+            planned: vec![
+                planned("broken-links", "broken-links:aaaa"),
+                planned("rules-missing", "rules-missing:bbbb"),
+                planned("gone", "gone:cccc"),
+            ],
+            ..Default::default()
+        };
+        // Between the preview and the confirmation, one more link broke and another
+        // problem went away on its own.
+        state
+            .borrow_mut()
+            .insert("broken-links".into(), "broken-links:dddd".into());
+        state.borrow_mut().remove("gone");
+
+        let calls = RefCell::new(Vec::new());
+        apply_skills(
+            &mut report,
+            |id| Ok(state.borrow().get(id).cloned()),
+            |id, fingerprint| {
+                calls
+                    .borrow_mut()
+                    .push((id.to_string(), fingerprint.to_string()));
+                // Same check as `skills::fix_issue`: only the fingerprint as it is now.
+                if state.borrow().get(id).map(String::as_str) != Some(fingerprint) {
+                    return Err("That problem changed since you looked.".into());
+                }
+                state.borrow_mut().remove(id);
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            *calls.borrow(),
+            vec![(
+                "rules-missing".to_string(),
+                "rules-missing:bbbb".to_string()
+            )],
+            "only the unchanged repair runs, with the fingerprint from the preview"
+        );
+        assert_eq!(
+            report.applied,
+            vec!["Fix rules-missing: rules-missing title"]
+        );
+        assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
+        assert!(report.failed[0].starts_with("broken-links title: changed since the preview"));
+        assert!(report.failed[0].contains("toolport fix --dry-run"));
+        assert!(report
+            .notes
+            .iter()
+            .any(|n| n.contains("gone title: already gone")));
+        // The changed issue was left exactly as it is now.
+        assert_eq!(
+            state.borrow().get("broken-links").map(String::as_str),
+            Some("broken-links:dddd")
+        );
+    }
+
+    #[test]
+    fn an_unreadable_inventory_still_goes_through_the_checked_fix() {
+        let mut report = FixReport {
+            planned: vec![planned("broken-links", "broken-links:aaaa")],
+            ..Default::default()
+        };
+        let calls = RefCell::new(Vec::new());
+        apply_skills(
+            &mut report,
+            |_| Err("no home".into()),
+            |id, fingerprint| {
+                calls
+                    .borrow_mut()
+                    .push((id.to_string(), fingerprint.to_string()));
+                Err("Couldn't find your home folder".into())
+            },
+        );
+        assert_eq!(
+            *calls.borrow(),
+            vec![("broken-links".to_string(), "broken-links:aaaa".to_string())]
+        );
+        assert_eq!(
+            report.failed,
+            vec!["broken-links title: Couldn't find your home folder"]
+        );
     }
 }

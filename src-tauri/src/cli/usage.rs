@@ -24,7 +24,7 @@ use super::format::{self, Align, Severity, Style};
 use super::{Args, CliError, Ctx, EXIT_OK};
 
 /// Bump when [`FileSummary`] or the parsers change meaning, so old cache entries are ignored.
-const CACHE_VERSION: u32 = 4;
+const CACHE_VERSION: u32 = 5;
 /// A session with this many calls to one MCP server is a burst: a Code Mode candidate.
 pub const BURST_CALLS: u64 = 9;
 /// An image that stays in context this many turns is lingering.
@@ -134,6 +134,8 @@ fn push_unique(list: &mut Vec<PathBuf>, dir: PathBuf) {
 }
 
 /// One unit of parsing and caching: a transcript file, or an OpenCode session folder.
+/// For a folder, `size`, `mtime_ms` and `files` cover the message files inside it, so a
+/// message rewritten in place invalidates the cached summary.
 #[derive(Debug, Clone)]
 struct Unit {
     client: Client,
@@ -141,6 +143,7 @@ struct Unit {
     path: PathBuf,
     size: u64,
     mtime_ms: u64,
+    files: u64,
 }
 
 fn mtime_ms(meta: &std::fs::Metadata) -> u64 {
@@ -187,6 +190,7 @@ fn units(sources: &Sources, filter: &BTreeSet<Client>, since_ms: u64) -> Vec<Uni
                 path,
                 size,
                 mtime_ms,
+                files: 1,
             });
         }
     };
@@ -206,18 +210,34 @@ fn units(sources: &Sources, filter: &BTreeSet<Client>, since_ms: u64) -> Vec<Uni
             let messages = root.join("storage").join("message");
             for entry in std::fs::read_dir(&messages).into_iter().flatten().flatten() {
                 let Ok(meta) = entry.metadata() else { continue };
-                if !meta.is_dir() || mtime_ms(&meta) < since_ms {
+                if !meta.is_dir() {
                     continue;
                 }
-                let count = std::fs::read_dir(entry.path())
-                    .map(|d| d.count() as u64)
-                    .unwrap_or(0);
+                // Editing a message in place leaves the folder's own time alone; the newest
+                // message, the total size and the count catch edits, additions and removals.
+                let (mut files, mut size, mut newest) = (0, 0, mtime_ms(&meta));
+                for file in std::fs::read_dir(entry.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    let Ok(m) = file.metadata() else { continue };
+                    if m.is_file() {
+                        files += 1;
+                        size += m.len();
+                        newest = newest.max(mtime_ms(&m));
+                    }
+                }
+                if newest < since_ms {
+                    continue;
+                }
                 out.push(Unit {
                     client: Client::Opencode,
                     root: root.clone(),
                     path: entry.path(),
-                    size: count,
-                    mtime_ms: mtime_ms(&meta),
+                    size,
+                    mtime_ms: newest,
+                    files,
                 });
             }
         }
@@ -402,6 +422,8 @@ struct Stream {
     prev_ts: u64,
     last_write_1h: bool,
     floor: u64,
+    /// Set by a compaction: the next turn's context is the new floor.
+    refloor: bool,
     live: BTreeMap<String, u64>,
     images: Vec<(u64, u64)>,
 }
@@ -435,7 +457,12 @@ impl Stream {
         if self.turns == 0 {
             self.floor = ctx;
             s.floor = s.floor.max(ctx);
+        } else if self.refloor {
+            // After a compaction the summary replaces the history; growth from here on is
+            // what later tools and messages add, not part of the old floor.
+            self.floor = ctx;
         }
+        self.refloor = false;
         let floor = self.floor.min(ctx);
         s.floor_sum += floor;
         let live: u64 = self.live.values().sum();
@@ -477,6 +504,7 @@ impl Stream {
         s.compactions += 1;
         self.finish_images(s);
         self.live.clear();
+        self.refloor = true;
     }
 
     fn finish_images(&mut self, s: &mut FileSummary) {
@@ -793,7 +821,6 @@ struct ClaudeState {
     seen: HashMap<String, (bool, u64)>,
     pending: HashMap<String, PendingTool>,
     reads: HashMap<String, u64>,
-    mcp_session: BTreeMap<String, u64>,
 }
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -839,9 +866,6 @@ pub fn parse_claude(path: &Path) -> DaySummaries {
         claude_line(days.at(ts), &mut st, parsed);
     });
     let s = days.at(0);
-    for (server, calls) in &st.mcp_session {
-        *s.mcp_calls.entry(server.clone()).or_default() += calls;
-    }
     st.main.finish(s);
     st.side.finish(s);
     days.finish()
@@ -932,8 +956,10 @@ fn claude_line(s: &mut FileSummary, st: &mut ClaudeState, line: ClaudeLine) {
                 }
                 let category = claude_category(name, block.input);
                 *s.tool_calls.entry(category.clone()).or_default() += 1;
+                // On the day of the message that made the call, so a `--days` window only
+                // counts the calls inside it.
                 if let Some(server) = category.strip_prefix("mcp:") {
-                    *st.mcp_session.entry(server.to_string()).or_default() += 1;
+                    *s.mcp_calls.entry(server.to_string()).or_default() += 1;
                 }
                 let file = block
                     .input
@@ -1165,7 +1191,6 @@ pub fn parse_codex(path: &Path) -> DaySummaries {
     let mut model = String::from("unknown");
     let mut last_total = None::<u64>;
     let mut calls: HashMap<String, String> = HashMap::new();
-    let mut mcp_session: BTreeMap<String, u64> = BTreeMap::new();
     read_lines(path, |line| {
         if !(contains(line, b"token_count")
             || contains(line, b"turn_context")
@@ -1240,7 +1265,7 @@ pub fn parse_codex(path: &Path) -> DaySummaries {
                             codex_category(name, p.namespace.as_deref(), input.as_deref());
                         *s.tool_calls.entry(category.clone()).or_default() += 1;
                         for server in servers {
-                            *mcp_session.entry(server).or_default() += 1;
+                            *s.mcp_calls.entry(server).or_default() += 1;
                         }
                         if let Some(id) = p.call_id {
                             calls.insert(id.into_owned(), category);
@@ -1287,9 +1312,6 @@ pub fn parse_codex(path: &Path) -> DaySummaries {
             _ => {}
         }
     });
-    for (server, n) in mcp_session {
-        *days.at(0).mcp_calls.entry(server).or_default() += n;
-    }
     stream.finish(days.at(0));
     days.finish()
 }
@@ -1398,6 +1420,8 @@ struct CacheFile {
 struct CacheEntry {
     size: u64,
     mtime: u64,
+    #[serde(default)]
+    files: u64,
     days: DaySummaries,
 }
 
@@ -1714,7 +1738,7 @@ pub fn analyze(sources: &Sources, opts: &Options, configured: &Configured) -> Us
     for unit in all {
         let key = unit.path.to_string_lossy().into_owned();
         match cache.files.get(&key) {
-            Some(e) if e.size == unit.size && e.mtime == unit.mtime_ms => {
+            Some(e) if e.size == unit.size && e.mtime == unit.mtime_ms && e.files == unit.files => {
                 done.push((unit, e.days.clone()));
             }
             _ => todo.push(unit),
@@ -1733,6 +1757,7 @@ pub fn analyze(sources: &Sources, opts: &Options, configured: &Configured) -> Us
             CacheEntry {
                 size: unit.size,
                 mtime: unit.mtime_ms,
+                files: unit.files,
                 days: summary.clone(),
             },
         );
@@ -2460,8 +2485,12 @@ pub fn parse_clients(value: Option<&str>) -> Result<BTreeSet<Client>, CliError> 
     }
 }
 
-/// Servers configured in Toolport and in the agents whose calls this report can see.
-pub fn configured_servers(snapshot: &super::scan::Snapshot) -> Configured {
+/// Servers configured in Toolport and in the agents `--client` selected, whose calls this
+/// report can see.
+pub fn configured_servers(
+    snapshot: &super::scan::Snapshot,
+    clients: &BTreeSet<Client>,
+) -> Configured {
     let mut out: Configured = BTreeMap::new();
     if let Ok(registry) = crate::registry::load() {
         for s in registry.servers.iter().filter(|s| s.enabled) {
@@ -2474,9 +2503,25 @@ pub fn configured_servers(snapshot: &super::scan::Snapshot) -> Configured {
                 .insert("Toolport".into());
         }
     }
-    for client in snapshot.present() {
-        let kind = client.id.split('@').next().unwrap_or(&client.id);
-        if !matches!(kind, "claude-code" | "codex" | "opencode") {
+    add_client_servers(&mut out, snapshot.present(), clients);
+    out
+}
+
+/// The servers each selected agent configures. Another agent's servers are not unused just
+/// because this report doesn't read that agent's transcripts.
+fn add_client_servers<'a>(
+    out: &mut Configured,
+    detected: impl Iterator<Item = &'a crate::clients::DetectedClient>,
+    clients: &BTreeSet<Client>,
+) {
+    for client in detected {
+        let kind = match client.id.split('@').next().unwrap_or(&client.id) {
+            "claude-code" => Client::Claude,
+            "codex" => Client::Codex,
+            "opencode" => Client::Opencode,
+            _ => continue,
+        };
+        if !clients.contains(&kind) {
             continue;
         }
         for s in &client.servers {
@@ -2489,14 +2534,13 @@ pub fn configured_servers(snapshot: &super::scan::Snapshot) -> Configured {
                 .insert(super::scan::display_name(client));
         }
     }
-    out
 }
 
 pub fn build(ctx: &Ctx, days: u32, clients: BTreeSet<Client>, use_cache: bool) -> UsageReport {
     let project = ctx.project_str();
     let snapshot = super::scan::Snapshot::read(project.as_deref());
     let sources = Sources::discover(&snapshot.clients);
-    let configured = configured_servers(&snapshot);
+    let configured = configured_servers(&snapshot, &clients);
     let opts = Options {
         days,
         clients,
@@ -2603,5 +2647,266 @@ mod tests {
         assert_eq!(s.compactions, 1);
         assert_eq!(s.floor, 30_000);
         assert!(s.floor_sum <= s.context_sum);
+    }
+
+    /// A fresh directory for one test's fixture files, outside any real data directory.
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("toolport-usage-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_lines(path: &Path, lines: &[serde_json::Value]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        std::fs::write(path, text.join("\n") + "\n").unwrap();
+    }
+
+    fn options(clients: BTreeSet<Client>, cache_path: Option<PathBuf>) -> Options {
+        Options {
+            days: 30,
+            clients,
+            now_ms: crate::cli::now_ms(),
+            use_cache: cache_path.is_some(),
+            cache_path,
+            progress: false,
+        }
+    }
+
+    #[test]
+    fn compaction_resets_the_floor() {
+        let mut s = FileSummary::default();
+        let mut st = Stream::default();
+        st.turn(&mut s, 1_000, 30_000, 0, 30_000, false);
+        st.result(&mut s, "bash", 2_000);
+        st.turn(&mut s, 2_000, 32_000, 30_000, 2_000, false);
+        // Compaction: the summary turn is the new floor.
+        st.turn(&mut s, 3_000, 8_000, 0, 8_000, false);
+        st.result(&mut s, "bash", 17_000);
+        st.turn(&mut s, 4_000, 25_000, 8_000, 17_000, false);
+        // An explicit boundary (Claude Code's compact_boundary) does the same.
+        st.compact(&mut s);
+        st.prev_ctx = 0;
+        st.turn(&mut s, 5_000, 6_000, 0, 6_000, false);
+        st.result(&mut s, "read", 4_000);
+        st.turn(&mut s, 6_000, 10_000, 6_000, 4_000, false);
+        st.finish(&mut s);
+        assert_eq!(s.compactions, 2);
+        // The startup floor stays the first turn's.
+        assert_eq!(s.floor, 30_000);
+        assert_eq!(s.floor_sum, 30_000 * 2 + 8_000 * 2 + 6_000 * 2);
+        // 2k before compaction, then all 17k of growth after it, not hidden by the old floor.
+        assert_eq!(s.resident["bash"], 2_000 + 17_000);
+        assert_eq!(s.resident["read"], 4_000);
+    }
+
+    #[test]
+    fn claude_mcp_calls_count_on_the_day_they_happened() {
+        let dir = scratch("claude-mcp-days");
+        let path = dir.join("s.jsonl");
+        let call = |ts: Option<&str>, id: &str, tool: &str| {
+            let mut line = serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "id": id,
+                    "model": "claude-opus-5-5",
+                    "usage": {"input_tokens": 10, "cache_creation_input_tokens": 30_000, "output_tokens": 5},
+                    "content": [{"type": "tool_use", "id": format!("t-{id}"), "name": tool, "input": {}}]
+                }
+            });
+            if let Some(ts) = ts {
+                line["timestamp"] = ts.into();
+            }
+            line
+        };
+        write_lines(
+            &path,
+            &[
+                call(Some("2026-11-14T10:00:00Z"), "m1", "mcp__github__search"),
+                call(Some("2026-11-24T10:00:00Z"), "m2", "mcp__github__search"),
+                call(Some("2026-11-24T10:01:00Z"), "m3", "mcp__linear__list"),
+                // No timestamp: the day of the record before it.
+                call(None, "m4", "mcp__github__search"),
+            ],
+        );
+        let days = parse_claude(&path);
+        assert_eq!(days.len(), 2);
+        let recent = in_window(&days, parse_iso_ms("2026-11-24T00:00:00Z"));
+        assert_eq!(
+            recent.mcp_calls,
+            BTreeMap::from([("github".into(), 2), ("linear".into(), 1)])
+        );
+        let all = in_window(&days, parse_iso_ms("2026-11-01T00:00:00Z"));
+        assert_eq!(all.mcp_calls["github"], 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn codex_mcp_calls_count_on_the_day_they_happened() {
+        let dir = scratch("codex-mcp-days");
+        let path = dir.join("rollout.jsonl");
+        let call = |ts: Option<&str>, id: &str, name: &str, namespace: Option<&str>| {
+            let mut line = serde_json::json!({
+                "type": "response_item",
+                "payload": {"type": "function_call", "name": name, "arguments": "{}", "call_id": id}
+            });
+            if let Some(ts) = ts {
+                line["timestamp"] = ts.into();
+            }
+            if let Some(ns) = namespace {
+                line["payload"]["namespace"] = ns.into();
+            }
+            line
+        };
+        write_lines(
+            &path,
+            &[
+                call(
+                    Some("2026-11-14T10:00:00Z"),
+                    "c1",
+                    "search",
+                    Some("mcp__github"),
+                ),
+                call(
+                    Some("2026-11-24T10:00:00Z"),
+                    "c2",
+                    "search",
+                    Some("mcp__github"),
+                ),
+                call(None, "c3", "mcp__linear__list", None),
+            ],
+        );
+        let days = parse_codex(&path);
+        assert_eq!(days.len(), 2);
+        let recent = in_window(&days, parse_iso_ms("2026-11-24T00:00:00Z"));
+        assert_eq!(
+            recent.mcp_calls,
+            BTreeMap::from([("github".into(), 1), ("linear".into(), 1)])
+        );
+        let all = in_window(&days, parse_iso_ms("2026-11-01T00:00:00Z"));
+        assert_eq!(all.mcp_calls["github"], 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn detected(id: &str, name: &str, servers: &[&str]) -> crate::clients::DetectedClient {
+        crate::clients::DetectedClient {
+            id: id.into(),
+            name: name.into(),
+            uses_connectors: false,
+            discovery: crate::clients::discovery_capabilities(id),
+            config_path: format!("/fixture/{id}.json"),
+            config_exists: true,
+            app_present: true,
+            servers: servers
+                .iter()
+                .map(|s| crate::clients::McpServer {
+                    name: (*s).into(),
+                    transport: "stdio".into(),
+                    command: Some(format!("/fixture/{s}")),
+                    args: Vec::new(),
+                    env_keys: Vec::new(),
+                    url: None,
+                })
+                .collect(),
+            plugin_servers: Vec::new(),
+            gateway_installed: false,
+            entry_state: crate::clients::GatewayEntryState::Absent,
+            error: None,
+            claude_profile: None,
+            t3_code: Vec::new(),
+            location_removable: false,
+            location_kept_by_t3_code: false,
+        }
+    }
+
+    #[test]
+    fn client_filter_keeps_other_clients_servers_out_of_unused() {
+        let dir = scratch("client-filter-unused");
+        // One Claude Code session without MCP calls.
+        write_lines(
+            &dir.join("claude/projects/-work/s.jsonl"),
+            &[serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "id": "m1",
+                    "model": "claude-opus-5-5",
+                    "usage": {"input_tokens": 10, "cache_creation_input_tokens": 30_000, "output_tokens": 5},
+                    "content": []
+                }
+            })],
+        );
+        let clients = [
+            detected("claude-code", "Claude Code", &["alpha"]),
+            detected("codex", "Codex", &["beta"]),
+        ];
+        let only_claude: BTreeSet<Client> = [Client::Claude].into();
+        let mut configured = Configured::new();
+        add_client_servers(&mut configured, clients.iter(), &only_claude);
+        assert_eq!(configured.keys().collect::<Vec<_>>(), ["alpha"]);
+
+        let sources = Sources {
+            claude: vec![dir.join("claude")],
+            ..Default::default()
+        };
+        let report = analyze(&sources, &options(only_claude, None), &configured);
+        assert_eq!(report.totals.sessions, 1);
+        let unused: Vec<&str> = report
+            .unused_servers
+            .iter()
+            .map(|u| u.name.as_str())
+            .collect();
+        assert_eq!(unused, ["alpha"]);
+
+        let mut every = Configured::new();
+        let all: BTreeSet<Client> = [Client::Claude, Client::Codex, Client::Opencode].into();
+        add_client_servers(&mut every, clients.iter(), &all);
+        assert_eq!(every.keys().collect::<Vec<_>>(), ["alpha", "beta"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opencode_cache_rereads_a_message_edited_in_place() {
+        let dir = scratch("opencode-in-place");
+        let root = dir.join("opencode");
+        let session = root.join("storage/message/ses_1");
+        std::fs::create_dir_all(&session).unwrap();
+        let file = session.join("msg_1.json");
+        let now = crate::cli::now_ms();
+        let write = |output: u64, age_ms: u64| {
+            let message = serde_json::json!({
+                "role": "assistant",
+                "modelID": "m",
+                "time": {"created": now - 3_600_000},
+                "tokens": {"input": 100, "output": output, "cache": {"read": 0, "write": 0}}
+            });
+            std::fs::write(&file, message.to_string()).unwrap();
+            let at = std::time::UNIX_EPOCH + std::time::Duration::from_millis(now - age_ms);
+            std::fs::File::options()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
+        };
+        write(5, 3_600_000);
+        let sources = Sources {
+            opencode: vec![root],
+            ..Default::default()
+        };
+        let opts = options([Client::Opencode].into(), Some(dir.join("cache.json")));
+        let first = analyze(&sources, &opts, &Configured::new());
+        assert_eq!((first.stats.parsed, first.stats.cached), (1, 0));
+        assert_eq!(first.totals.output, 5);
+        let again = analyze(&sources, &opts, &Configured::new());
+        assert_eq!((again.stats.parsed, again.stats.cached), (0, 1));
+
+        // Rewritten in place: no new file, so the folder's own time and count stay put.
+        write(5_000, 1_800_000);
+        let edited = analyze(&sources, &opts, &Configured::new());
+        assert_eq!((edited.stats.parsed, edited.stats.cached), (1, 0));
+        assert_eq!(edited.totals.output, 5_000);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

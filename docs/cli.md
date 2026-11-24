@@ -148,7 +148,11 @@ in `--agents claude-code,codex`:
 - **Servers**: added to Toolport with the warnings an import shows (runs a local
   command, connects to a private address). Each name in `env` comes from
   `secret_refs`, then your environment, then a hidden prompt, and is stored in the OS
-  keychain. A server stays off until its credentials are set.
+  keychain. A server stays off until its credentials are set. A stdio server that runs
+  files from the project (`node ./server.js`, `dist/index.js`) starts in the project
+  folder. Running `up` again after the file changes updates the values, references, env
+  names and working folder of servers an earlier `up` added, and shows the update first.
+  A changed command, argument or URL is a conflict, never a silent change.
 - **Agents**: when the manifest has servers, agents that aren't connected to the
   Toolport gateway are connected, if a gateway is installed.
 

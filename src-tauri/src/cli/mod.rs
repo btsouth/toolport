@@ -32,7 +32,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// whose `/usr/bin/toolport` runs these commands too.
 pub struct Host {
     /// `binary` in `toolport --version --json`. The standalone binary passes the marker
-    /// the npm launcher looks for; it lives only in `src/bin/toolport.rs`, so the desktop
+    /// the npm launcher looks for; it lives only in `src/cli/main.rs`, so the desktop
     /// shell, which opens its window when run without arguments, never contains it.
     pub binary: &'static str,
     /// A line printed after the version, such as the desktop build.

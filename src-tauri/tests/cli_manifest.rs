@@ -316,3 +316,80 @@ fn export_strips_credentials_and_import_adds_servers_switched_off() {
             == Some(1)
     );
 }
+
+fn registry_server(f: &Fixture, name: &str) -> serde_json::Value {
+    let registry: serde_json::Value =
+        serde_json::from_str(&f.read(&f.data.join("registry.json"))).unwrap();
+    registry["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == name)
+        .unwrap_or_else(|| panic!("{registry:#}"))
+        .clone()
+}
+
+#[test]
+fn up_starts_project_scripts_in_the_project_and_applies_reviewed_setting_changes() {
+    let f = Fixture::new("up-update");
+    f.clean_machine();
+    f.write_project("server.js", "");
+    let manifest = |level: &str| {
+        format!(
+            "version = 1\n[[servers]]\nname = \"local\"\ncommand = \"node\"\nargs = [\"server.js\"]\n[servers.values]\nLOG_LEVEL = \"{level}\"\n\n[[servers]]\nname = \"github\"\ncommand = \"npx\"\nargs = [\"-y\", \"@modelcontextprotocol/server-github\"]\n"
+        )
+    };
+    f.write_project("toolport.toml", &manifest("debug"));
+    let out = f.json(&["up", "--yes", "--json"]);
+    assert!(out["failed"].as_array().unwrap().is_empty(), "{out:#}");
+    let project = f.project.clone();
+    let local = registry_server(&f, "local");
+    let cwd =
+        std::path::PathBuf::from(local["cwd"].as_str().unwrap_or_else(|| panic!("{local:#}")));
+    assert_eq!(
+        std::fs::canonicalize(cwd).unwrap(),
+        std::fs::canonicalize(&project).unwrap()
+    );
+    // A package run from the npm cache doesn't depend on the project.
+    assert!(registry_server(&f, "github").get("cwd").is_none());
+
+    // A changed value is shown before it applies, by name only, and nothing changes yet.
+    f.write_project("toolport.toml", &manifest("info"));
+    let plan = f.json(&["up", "--dry-run", "--json"]);
+    let update = plan["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["kind"] == "serverUpdate")
+        .unwrap_or_else(|| panic!("{plan:#}"))
+        .clone();
+    assert_eq!(update["name"], "local");
+    assert_eq!(update["changes"], serde_json::json!(["LOG_LEVEL"]));
+    let level = |f: &Fixture| {
+        registry_server(f, "local")["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["key"] == "LOG_LEVEL")
+            .unwrap()["value"]
+            .clone()
+    };
+    assert_eq!(level(&f), "debug");
+
+    let out = f.json(&["up", "--yes", "--json"]);
+    assert!(
+        out["applied"].to_string().contains("updated local"),
+        "{out:#}"
+    );
+    assert_eq!(level(&f), "info");
+    assert_eq!(registry_server(&f, "local")["enabled"], true);
+    let again = f.json(&["up", "--dry-run", "--json"]);
+    assert!(
+        again["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["kind"] == "serverSame" && s["name"] == "local"),
+        "{again:#}"
+    );
+}

@@ -94,13 +94,12 @@ fn runs_this_cli(path: &Path) -> bool {
 /// upgrades), else this binary. A copy npx unpacked into its cache can vanish, so that
 /// case goes through npx.
 pub fn hook_command() -> (String, Option<String>) {
-    if let Some(p) = which("toolport").filter(|p| runs_this_cli(p)) {
+    if let Some(p) = std::env::var_os("PATH").and_then(|path| cli_on_path(&path)) {
         return (format!("\"{}\" hook check", p.display()), None);
     }
     if let Ok(exe) = std::env::current_exe() {
-        let text = exe.to_string_lossy();
-        if !text.contains("_npx") && !text.contains("npm-cache") {
-            return (format!("\"{}\" hook check", text), None);
+        if !is_ephemeral(&exe) {
+            return (format!("\"{}\" hook check", exe.display()), None);
         }
     }
     (
@@ -109,16 +108,27 @@ pub fn hook_command() -> (String, Option<String>) {
     )
 }
 
-fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    let names: Vec<String> = if cfg!(windows) {
-        vec![format!("{name}.exe"), format!("{name}.cmd")]
-    } else {
-        vec![name.to_string()]
+/// A copy npx unpacked into its cache, which npm may clear at any time. npx also puts that
+/// cache's `.bin` on PATH while it runs, so both the path and its target are checked.
+fn is_ephemeral(path: &Path) -> bool {
+    let cached = |p: &Path| {
+        let text = p.to_string_lossy();
+        text.contains("_npx") || text.contains("npm-cache")
     };
-    std::env::split_paths(&path)
+    cached(path) || std::fs::canonicalize(path).is_ok_and(|real| cached(&real))
+}
+
+/// The first `toolport` on `path` that runs this CLI and won't vanish with npx's cache.
+fn cli_on_path(path: &std::ffi::OsStr) -> Option<PathBuf> {
+    let names: Vec<String> = if cfg!(windows) {
+        vec!["toolport.exe".into(), "toolport.cmd".into()]
+    } else {
+        vec!["toolport".into()]
+    };
+    std::env::split_paths(path)
         .flat_map(|dir| names.iter().map(move |n| dir.join(n)))
-        .find(|p| p.is_file())
+        .filter(|p| p.is_file())
+        .find(|p| !is_ephemeral(p) && runs_this_cli(p))
 }
 
 fn parse(text: &str) -> Result<CstRootNode, String> {
@@ -258,7 +268,6 @@ fn backup(path: &Path) -> Result<Option<PathBuf>, String> {
     Ok(Some(dest))
 }
 
-/// Codex only runs hooks with `[features] hooks = true`. Set it, keeping the file's layout.
 /// A settings file's text: empty when it doesn't exist yet, an error when it exists but
 /// can't be read, so an unreadable file is never replaced.
 fn read_settings(path: &Path) -> Result<String, String> {
@@ -269,17 +278,23 @@ fn read_settings(path: &Path) -> Result<String, String> {
     }
 }
 
-fn enable_codex_hooks(config: &Path) -> Result<bool, String> {
+fn read_codex_config(config: &Path) -> Result<toml_edit::DocumentMut, String> {
     let text = read_settings(config).map_err(|e| format!("{} {e}", config.display()))?;
-    let mut doc: toml_edit::DocumentMut = text
-        .parse()
-        .map_err(|e| format!("{} isn't valid TOML: {e}", config.display()))?;
-    if doc
-        .get("features")
+    text.parse()
+        .map_err(|e| format!("{} isn't valid TOML: {e}", config.display()))
+}
+
+fn codex_hooks_on(doc: &toml_edit::DocumentMut) -> bool {
+    doc.get("features")
         .and_then(|f| f.get("hooks"))
         .and_then(|h| h.as_bool())
         == Some(true)
-    {
+}
+
+/// Codex only runs hooks with `[features] hooks = true`. Set it, keeping the file's layout.
+fn enable_codex_hooks(config: &Path) -> Result<bool, String> {
+    let mut doc = read_codex_config(config)?;
+    if codex_hooks_on(&doc) {
         return Ok(false);
     }
     backup(config)?;
@@ -289,6 +304,127 @@ fn enable_codex_hooks(config: &Path) -> Result<bool, String> {
     doc["features"]["hooks"] = toml_edit::value(true);
     crate::registry::atomic_write(config, &doc.to_string())?;
     Ok(true)
+}
+
+/// One settings file's planned change, worked out before anything is written.
+struct Planned {
+    agent: Agent,
+    path: PathBuf,
+    shown: String,
+    /// The settings file's new text, `None` when it needs no change.
+    change: Result<Option<String>, String>,
+    /// Codex's config.toml, when installing and it doesn't turn hooks on yet. Checked even
+    /// when hooks.json already has the entry, so a retry finishes an earlier partial install.
+    codex_config: Option<PathBuf>,
+}
+
+impl Planned {
+    fn pending(&self) -> bool {
+        matches!(self.change, Ok(Some(_))) || (self.change.is_ok() && self.codex_config.is_some())
+    }
+}
+
+fn plan_target(agent: Agent, path: PathBuf, install: bool, cmd: &str) -> Planned {
+    let shown = format::home_relative(&path);
+    let change = read_settings(&path).and_then(|text| {
+        if install {
+            if installed_in(&text) {
+                Ok(None)
+            } else {
+                add_hook(&text, agent, cmd).map(Some)
+            }
+        } else {
+            remove_hook(&text).map(|(new, n)| (n > 0).then_some(new))
+        }
+    });
+    let codex_config = (install && agent == Agent::Codex)
+        .then(|| path.parent().map(|p| p.join("config.toml")))
+        .flatten()
+        // An unreadable or invalid config is planned too, so applying reports why.
+        .filter(|config| !read_codex_config(config).is_ok_and(|doc| codex_hooks_on(&doc)));
+    Planned {
+        agent,
+        path,
+        shown,
+        change,
+        codex_config,
+    }
+}
+
+/// Apply (or, on a dry run, describe) one planned change. Returns what happened.
+fn apply_target(
+    p: Planned,
+    install: bool,
+    dry_run: bool,
+    notes: &mut Vec<String>,
+) -> Result<String, String> {
+    let Planned {
+        agent: a,
+        path,
+        shown,
+        change,
+        codex_config,
+    } = p;
+    let config_shown = codex_config.as_deref().map(format::home_relative);
+    let outcome = match change {
+        Err(e) => Err(e),
+        Ok(None) if !install => Ok(format!("{}: not installed in {shown}", a.label())),
+        // The entry is there, but an earlier install may have stopped before Codex's
+        // config.toml turned hooks on: finish that now.
+        Ok(None) => {
+            let enabled = match &codex_config {
+                Some(_) if dry_run => Ok(true),
+                Some(config) => enable_codex_hooks(config),
+                None => Ok(false),
+            };
+            enabled.map(|enabled| match &config_shown {
+                Some(c) if enabled => format!(
+                    "{}: already installed in {shown}; {} [features] hooks in {c}",
+                    a.label(),
+                    if dry_run {
+                        "would turn on"
+                    } else {
+                        "turned on"
+                    }
+                ),
+                _ => format!("{}: already installed in {shown}", a.label()),
+            })
+        }
+        Ok(Some(_)) if dry_run => Ok(format!(
+            "{}: would {} {shown}{}",
+            a.label(),
+            if install { "install in" } else { "remove from" },
+            match &config_shown {
+                Some(c) => format!(", and turn on [features] hooks in {c}"),
+                None => String::new(),
+            }
+        )),
+        Ok(Some(new)) => (|| {
+            backup(&path)?;
+            crate::registry::atomic_write(&path, &new)?;
+            if let Some(config) = &codex_config {
+                if enable_codex_hooks(config)? {
+                    notes.push(format!(
+                        "Turned on [features] hooks in {}.",
+                        format::home_relative(config)
+                    ));
+                }
+            }
+            if install && a == Agent::Codex {
+                notes.push("Codex asks you to trust the new hook the next time it starts.".into());
+            }
+            Ok(format!(
+                "{}: {} {shown}",
+                a.label(),
+                if install {
+                    "installed in"
+                } else {
+                    "removed from"
+                }
+            ))
+        })(),
+    };
+    outcome.map_err(|e: String| format!("{}: {shown} {e}", a.label()))
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -400,39 +536,11 @@ pub fn command(ctx: &Ctx, args: &Args) -> Result<i32, CliError> {
             let mut notes: Vec<String> = cmd_note.into_iter().collect();
 
             // Plan every file first, so nothing is written before the whole change is shown.
-            struct Planned {
-                agent: Agent,
-                path: PathBuf,
-                shown: String,
-                change: Result<Option<String>, String>,
-            }
             let planned: Vec<Planned> = targets
                 .into_iter()
-                .map(|(a, path)| {
-                    let shown = format::home_relative(&path);
-                    let change = read_settings(&path).and_then(|text| {
-                        if install {
-                            if installed_in(&text) {
-                                Ok(None)
-                            } else {
-                                add_hook(&text, a, &cmd).map(Some)
-                            }
-                        } else {
-                            remove_hook(&text).map(|(new, n)| (n > 0).then_some(new))
-                        }
-                    });
-                    Planned {
-                        agent: a,
-                        path,
-                        shown,
-                        change,
-                    }
-                })
+                .map(|(a, path)| plan_target(a, path, install, &cmd))
                 .collect();
-            let pending = planned
-                .iter()
-                .filter(|p| matches!(p.change, Ok(Some(_))))
-                .count();
+            let pending = planned.iter().filter(|p| p.pending()).count();
             let dry_run = args.has("dry-run");
             if pending > 0 && !dry_run && !args.has("yes") {
                 let s = &ctx.style;
@@ -449,16 +557,19 @@ pub fn command(ctx: &Ctx, args: &Args) -> Result<i32, CliError> {
                     .hint("run with --yes to apply, or --dry-run to preview"));
                 }
                 let mut text = String::new();
-                for p in planned.iter().filter(|p| matches!(p.change, Ok(Some(_)))) {
+                for p in planned.iter().filter(|p| p.pending()) {
+                    let hooks_on = s.dim(", and [features] hooks = true in config.toml");
                     text.push_str(&format!(
                         "  {} {} {}{}\n",
                         s.cyan(if install { "+" } else { "-" }),
                         p.agent.label(),
                         s.dim(&p.shown),
-                        if install && p.agent == Agent::Codex {
-                            s.dim(", and [features] hooks = true in config.toml")
-                        } else {
-                            String::new()
+                        match (&p.change, &p.codex_config) {
+                            (Ok(None), Some(_)) => s.dim(
+                                " already has the hook; turn on [features] hooks = true in config.toml"
+                            ),
+                            (_, Some(_)) => hooks_on,
+                            _ => String::new(),
                         }
                     ));
                 }
@@ -482,60 +593,8 @@ pub fn command(ctx: &Ctx, args: &Args) -> Result<i32, CliError> {
 
             let mut results = Vec::new();
             for p in planned {
-                let Planned {
-                    agent: a,
-                    path,
-                    shown,
-                    change,
-                } = p;
-                let outcome = match change {
-                    Err(e) => Err(e),
-                    Ok(None) if install => {
-                        Ok(format!("{}: already installed in {shown}", a.label()))
-                    }
-                    Ok(None) => Ok(format!("{}: not installed in {shown}", a.label())),
-                    Ok(Some(_)) if dry_run => Ok(format!(
-                        "{}: would {} {shown}{}",
-                        a.label(),
-                        if install { "install in" } else { "remove from" },
-                        if install && a == Agent::Codex {
-                            ", and turn on [features] hooks in config.toml"
-                        } else {
-                            ""
-                        }
-                    )),
-                    Ok(Some(new)) => (|| {
-                        backup(&path)?;
-                        crate::registry::atomic_write(&path, &new)?;
-                        if install && a == Agent::Codex {
-                            if let Some(config) = path.parent().map(|p| p.join("config.toml")) {
-                                if enable_codex_hooks(&config)? {
-                                    notes.push(format!(
-                                        "Turned on [features] hooks in {}.",
-                                        format::home_relative(&config)
-                                    ));
-                                }
-                            }
-                            notes.push(
-                                "Codex asks you to trust the new hook the next time it starts."
-                                    .into(),
-                            );
-                        }
-                        Ok(format!(
-                            "{}: {} {shown}",
-                            a.label(),
-                            if install {
-                                "installed in"
-                            } else {
-                                "removed from"
-                            }
-                        ))
-                    })(),
-                };
-                results.push((
-                    a,
-                    outcome.map_err(|e: String| format!("{}: {shown} {e}", a.label())),
-                ));
+                let a = p.agent;
+                results.push((a, apply_target(p, install, dry_run, &mut notes)));
             }
             let failed = results.iter().any(|(_, r)| r.is_err());
             if ctx.json {
@@ -645,6 +704,113 @@ mod tests {
         let (same, n) = remove_hook(user_empty).unwrap();
         assert_eq!(n, 0);
         assert_eq!(same, user_empty);
+    }
+
+    fn scratch(label: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-hook-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_launcher_in_the_npx_cache_on_path_is_never_saved() {
+        let root = scratch("npx-path");
+        let launcher = |dir: PathBuf| {
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join(if cfg!(windows) {
+                "toolport.cmd"
+            } else {
+                "toolport"
+            });
+            std::fs::write(&file, "#!/usr/bin/env node\n// @toolport/cli launcher\n").unwrap();
+            file
+        };
+        let cached = launcher(root.join(".npm/_npx/4f1c/node_modules/.bin"));
+        let cache_dir = launcher(root.join("npm-cache/bin"));
+        let global = launcher(root.join("global/bin"));
+        assert!(is_ephemeral(&cached) && is_ephemeral(&cache_dir));
+        assert!(!is_ephemeral(&global));
+        let path = |dirs: &[&PathBuf]| {
+            std::env::join_paths(dirs.iter().map(|f| f.parent().unwrap())).unwrap()
+        };
+        // npx puts its cache first on PATH while it runs; the global install behind it wins.
+        assert_eq!(
+            cli_on_path(&path(&[&cached, &cache_dir, &global])),
+            Some(global.clone())
+        );
+        assert_eq!(cli_on_path(&path(&[&cached, &cache_dir])), None);
+        // A PATH entry that only links into the cache is the cache too.
+        #[cfg(unix)]
+        {
+            let linked = root.join("linked/bin");
+            std::fs::create_dir_all(&linked).unwrap();
+            std::os::unix::fs::symlink(&cached, linked.join("toolport")).unwrap();
+            assert!(is_ephemeral(&linked.join("toolport")));
+            assert_eq!(cli_on_path(linked.as_os_str()), None);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_retry_turns_hooks_on_when_the_entry_is_already_there() {
+        let _data = crate::registry::DataDirTestEnv::new("hook-codex-retry");
+        let codex = scratch("codex-home");
+        let hooks = codex.join("hooks.json");
+        let config = codex.join("config.toml");
+        let cmd = "\"/opt/toolport\" hook check";
+        // An earlier install wrote hooks.json, then stopped before config.toml.
+        let entry = add_hook("{}", Agent::Codex, cmd).unwrap();
+        std::fs::write(&hooks, &entry).unwrap();
+        std::fs::write(
+            &config,
+            "# mine\nmodel = \"o3\"\n\n[features]\nhooks = false\n",
+        )
+        .unwrap();
+
+        let plan = plan_target(Agent::Codex, hooks.clone(), true, cmd);
+        assert!(matches!(plan.change, Ok(None)));
+        assert!(plan.pending(), "hooks are still off, so there is work left");
+        let mut notes = Vec::new();
+        let dry = apply_target(plan, true, true, &mut notes).unwrap();
+        assert!(dry.contains("would turn on [features] hooks"), "{dry}");
+        assert!(std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("hooks = false"));
+
+        let plan = plan_target(Agent::Codex, hooks.clone(), true, cmd);
+        let done = apply_target(plan, true, false, &mut notes).unwrap();
+        assert!(
+            done.contains("already installed") && done.contains("turned on [features] hooks"),
+            "{done}"
+        );
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            text.contains("# mine") && text.contains("model = \"o3\""),
+            "{text}"
+        );
+        let doc: toml_edit::DocumentMut = text.parse().unwrap();
+        assert!(codex_hooks_on(&doc), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(&hooks).unwrap(),
+            entry,
+            "hooks.json untouched"
+        );
+
+        // Now everything is in place: nothing left to do, and it says so.
+        let plan = plan_target(Agent::Codex, hooks.clone(), true, cmd);
+        assert!(!plan.pending());
+        let again = apply_target(plan, true, false, &mut notes).unwrap();
+        assert!(
+            again.contains("already installed") && !again.contains("turned on"),
+            "{again}"
+        );
+        let _ = std::fs::remove_dir_all(&codex);
     }
 
     #[test]

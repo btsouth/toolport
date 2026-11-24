@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, describe, it } from "node:test";
@@ -144,7 +151,7 @@ describe("launcher process", { skip: !unix }, () => {
         encoding: "utf8",
       });
       assert.equal(result.status, code, result.stderr);
-      const args = spawnSync("cat", [record], { encoding: "utf8" }).stdout;
+      const args = readFileSync(record, { encoding: "utf8" });
       assert.equal(args, "scan\n--json\na b\n");
     }
   });

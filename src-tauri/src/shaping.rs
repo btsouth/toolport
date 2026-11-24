@@ -1382,7 +1382,14 @@ pub fn query_result_for_model_visible(
         0 => QUERY_BUDGET_BYTES,
         budget => budget.min(QUERY_BUDGET_BYTES),
     };
-    let mut result = match run_query(&body, structured, query, max) {
+    // The reply text travels JSON-escaped inside the result envelope, which also
+    // carries the provenance label, so the text gets what the envelope leaves.
+    let mut envelope = text_result(String::new(), false);
+    if let Some(server) = &server {
+        crate::integrity::label_untrusted_result(server, &mut envelope);
+    }
+    let text_max = max.saturating_sub(value_size(&envelope));
+    let mut result = match run_query(&body, structured, query, text_max) {
         Ok(text) => text_result(text, false),
         Err(message) => text_result(message, true),
     };
@@ -1453,7 +1460,13 @@ fn compile_filter_regexes(
     out
 }
 
-/// The reply text for one query, or the error text to return instead.
+/// Bytes `text` adds to a result once serialized as a JSON string, quotes excluded.
+fn encoded_len(text: &str) -> usize {
+    json_string_len(text) - 2
+}
+
+/// The reply text for one query, or the error text to return instead. `max_bytes`
+/// bounds the text as it encodes inside the reply (see [`encoded_len`]).
 fn run_query(
     body: &str,
     structured: Option<Value>,
@@ -1569,12 +1582,12 @@ fn run_query(
         };
         reply.insert("value".into(), value);
         let text = Value::Object(reply).to_string();
-        if text.len() > max_bytes {
+        if encoded_len(&text) > max_bytes {
             return Err(format!(
                 "[Toolport: the value at \"{}\" is ~{} KB, over the {} KB reply limit. Structure: \
                  {}. Narrow it with fields, grep, or a deeper path.]",
                 preview(&path),
-                text.len() / 1024,
+                encoded_len(&text) / 1024,
                 max_bytes / 1024,
                 describe_shape(target, 0, 2)
             ));
@@ -1618,8 +1631,9 @@ fn run_query(
     let picked = matched.iter().skip(query.skip).take(limit);
     let mut out_items = Vec::new();
     let mut indices = Vec::new();
-    // The reply without items, with room for the widest continuation note.
-    let mut used = Value::Object(reply.clone()).to_string().len() + 160;
+    // The reply without items, with room for the widest continuation note. Each item
+    // is charged as it encodes, since the reply is itself a JSON string.
+    let mut used = encoded_len(&Value::Object(reply.clone()).to_string()) + 160;
     let mut cut = false;
     for (index, item) in picked {
         let value = if fields.is_empty() {
@@ -1627,7 +1641,7 @@ fn run_query(
         } else {
             pick_fields(item, &fields)
         };
-        let cost = value_size(&value) + index.to_string().len() + 2;
+        let cost = encoded_len(&value.to_string()) + index.to_string().len() + 2;
         if used + cost > max_bytes {
             cut = true;
             break;
@@ -1636,32 +1650,44 @@ fn run_query(
         out_items.push(value);
         indices.push(*index);
     }
-    let returned = out_items.len();
-    let remaining = matched.len().saturating_sub(query.skip + returned);
-    reply.insert("indices".into(), json!(indices));
-    reply.insert("items".into(), Value::Array(out_items));
-    if remaining > 0 {
-        let next = query.skip + returned;
-        reply.insert(
-            "more".into(),
-            json!(if cut && returned == 0 {
-                format!(
-                    "{remaining} matches; the next one alone is over the {} KB reply limit. \
-                     Pick keys with fields.",
-                    max_bytes / 1024
-                )
-            } else if cut {
-                format!(
-                    "{remaining} more matches past the {} KB reply limit. Use skip={next}, or \
-                     pick fewer keys with fields.",
-                    max_bytes / 1024
-                )
-            } else {
-                format!("{remaining} more matches. Use skip={next}.")
-            }),
-        );
+    let assemble = |out_items: &[Value], indices: &[usize], cut: bool| {
+        let mut reply = reply.clone();
+        let returned = out_items.len();
+        let remaining = matched.len().saturating_sub(query.skip + returned);
+        reply.insert("indices".into(), json!(indices));
+        reply.insert("items".into(), Value::Array(out_items.to_vec()));
+        if remaining > 0 {
+            let next = query.skip + returned;
+            reply.insert(
+                "more".into(),
+                json!(if cut && returned == 0 {
+                    format!(
+                        "{remaining} matches; the next one alone is over the {} KB reply limit. \
+                         Pick keys with fields.",
+                        max_bytes / 1024
+                    )
+                } else if cut {
+                    format!(
+                        "{remaining} more matches past the {} KB reply limit. Use skip={next}, or \
+                         pick fewer keys with fields.",
+                        max_bytes / 1024
+                    )
+                } else {
+                    format!("{remaining} more matches. Use skip={next}.")
+                }),
+            );
+        }
+        Value::Object(reply).to_string()
+    };
+    // The estimate above is exact per item; the final text is measured too, and items
+    // come off the end until it fits.
+    let mut text = assemble(&out_items, &indices, cut);
+    while encoded_len(&text) > max_bytes && !out_items.is_empty() {
+        out_items.pop();
+        indices.pop();
+        text = assemble(&out_items, &indices, true);
     }
-    Ok(Value::Object(reply).to_string())
+    Ok(text)
 }
 
 /// The text an item's `grep` match is tested against: a string as itself, anything
@@ -1767,7 +1793,7 @@ fn operator_holds(
         }
         "gt" | "gte" | "lt" | "lte" => actual.is_some_and(|actual| {
             let ordering = match (number_of(actual), number_of(operand)) {
-                (Some(a), Some(b)) => a.partial_cmp(&b),
+                (Some(a), Some(b)) => Some(a.cmp(&b)),
                 _ => match (actual.as_str(), operand.as_str()) {
                     (Some(a), Some(b)) => Some(a.cmp(b)),
                     _ => None,
@@ -1784,10 +1810,78 @@ fn operator_holds(
     }
 }
 
-fn number_of(value: &Value) -> Option<f64> {
+/// A query number: an exact integer when the value is one, else a finite float.
+/// Comparing through `f64` alone would make `9007199254740992` equal
+/// `9007199254740993`, so integers stay integers and a mixed comparison is exact.
+#[derive(Clone, Copy, Debug)]
+enum QueryNumber {
+    Int(i128),
+    Float(f64),
+}
+
+impl QueryNumber {
+    /// The exact mathematical order. `-0.0` equals `0.0` and `0`, so equality stays
+    /// transitive across the two representations.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (*self, *other) {
+            (QueryNumber::Int(a), QueryNumber::Int(b)) => a.cmp(&b),
+            (QueryNumber::Float(a), QueryNumber::Float(b)) => {
+                a.partial_cmp(&b).unwrap_or(Ordering::Equal)
+            }
+            (QueryNumber::Int(a), QueryNumber::Float(b)) => cmp_int_f64(a, b),
+            (QueryNumber::Float(a), QueryNumber::Int(b)) => cmp_int_f64(b, a).reverse(),
+        }
+    }
+}
+
+/// `i` against `f` by their exact values. `f` is finite; a NaN never reaches here
+/// because [`number_of`] keeps only finite floats.
+fn cmp_int_f64(i: i128, f: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    // 2^127: every finite f64 in [-2^127, 2^127) truncates to an exact i128.
+    const LIMIT: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+    if f.is_nan() {
+        return Ordering::Equal;
+    }
+    if f >= LIMIT {
+        return Ordering::Less;
+    }
+    if f < -LIMIT {
+        return Ordering::Greater;
+    }
+    let whole = f.trunc();
+    match i.cmp(&(whole as i128)) {
+        Ordering::Equal => {
+            let fraction = f - whole;
+            if fraction > 0.0 {
+                Ordering::Less
+            } else if fraction < 0.0 {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        }
+        order => order,
+    }
+}
+
+fn number_of(value: &Value) -> Option<QueryNumber> {
     match value {
-        Value::Number(n) => n.as_f64().filter(|n| n.is_finite()),
-        Value::String(s) => s.trim().parse::<f64>().ok().filter(|n| n.is_finite()),
+        Value::Number(n) => n
+            .as_i64()
+            .map(|n| QueryNumber::Int(n.into()))
+            .or_else(|| n.as_u64().map(|n| QueryNumber::Int(n.into())))
+            .or_else(|| n.as_f64().filter(|n| n.is_finite()).map(QueryNumber::Float)),
+        Value::String(s) => {
+            let s = s.trim();
+            s.parse::<i128>().map(QueryNumber::Int).ok().or_else(|| {
+                s.parse::<f64>()
+                    .ok()
+                    .filter(|n| n.is_finite())
+                    .map(QueryNumber::Float)
+            })
+        }
         _ => None,
     }
 }
@@ -1805,7 +1899,7 @@ fn scalar_equal(actual: &Value, expected: &Value) -> bool {
         (Value::String(a), Value::String(b)) => a.eq_ignore_ascii_case(b) || a == b,
         (Value::Number(_), _) | (_, Value::Number(_)) => {
             match (number_of(actual), number_of(expected)) {
-                (Some(a), Some(b)) => a == b,
+                (Some(a), Some(b)) => a.cmp(&b).is_eq(),
                 _ => false,
             }
         }
@@ -1844,17 +1938,61 @@ fn compare_for_sort(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering 
                 0 => Ordering::Equal,
                 1 => a.as_bool().cmp(&b.as_bool()),
                 2 => number_of(a)
-                    .expect("rank 2 is finite number")
-                    .total_cmp(&number_of(b).expect("rank 2 is finite number")),
+                    .expect("rank 2 is a number")
+                    .cmp(&number_of(b).expect("rank 2 is a number")),
                 _ => scalar_text(a).cmp(&scalar_text(b)),
             }
         }
     }
 }
 
-/// Matching lines of a text result: `{"matched":n,"lines":[[line,"text"],...]}`.
+/// Characters of one matching line a grep reply shows.
+const GREP_LINE_CHARS: usize = 400;
+/// Characters a trimmed line keeps before its match, for context.
+const GREP_LEAD_CHARS: usize = 100;
+
+/// The shown part of one matching line. A line of at most [`GREP_LINE_CHARS`]
+/// characters comes back whole. A longer one is cut to that many characters around
+/// its first match, with `…` where text was trimmed, so the match is always in view;
+/// when the start was trimmed, the match's character offset in the line comes back
+/// too, so the reader can place the window.
+fn grep_line_window(line: &str, grep: &regex::Regex) -> (String, Option<usize>) {
+    let total = line.chars().count();
+    if total <= GREP_LINE_CHARS {
+        return (line.to_string(), None);
+    }
+    let found = grep.find(line).map(|m| (m.start(), m.end()));
+    let (match_char, match_end_char) = match found {
+        Some((start, end)) => {
+            let start_char = line[..start].chars().count();
+            (start_char, start_char + line[start..end].chars().count())
+        }
+        None => (0, 0),
+    };
+    let start = if match_end_char <= GREP_LINE_CHARS {
+        0
+    } else {
+        match_char
+            .saturating_sub(GREP_LEAD_CHARS)
+            .min(total - GREP_LINE_CHARS)
+    };
+    let end = start + GREP_LINE_CHARS;
+    let mut text = String::new();
+    if start > 0 {
+        text.push('…');
+    }
+    text.extend(line.chars().skip(start).take(GREP_LINE_CHARS));
+    if end < total {
+        text.push('…');
+    }
+    (text, (start > 0).then_some(match_char))
+}
+
+/// Matching lines of a text result: `{"matched":n,"lines":[[line,"text"],...]}`. A
+/// long line trimmed before its match is `[line,"…text…",offset]`, where `offset` is
+/// the match's character offset in the whole line. `max` bounds the reply as it
+/// encodes (see [`encoded_len`]).
 fn grep_lines(body: &str, grep: &regex::Regex, skip: usize, limit: usize, max: usize) -> String {
-    const LINE_CHARS: usize = 400;
     let matching: Vec<(usize, &str)> = body
         .lines()
         .enumerate()
@@ -1864,12 +2002,11 @@ fn grep_lines(body: &str, grep: &regex::Regex, skip: usize, limit: usize, max: u
     let mut used = 200;
     let mut cut = false;
     for (number, line) in matching.iter().skip(skip).take(limit) {
-        let mut text: String = line.chars().take(LINE_CHARS).collect();
-        if line.chars().count() > LINE_CHARS {
-            text.push('…');
-        }
-        let entry = json!([number + 1, text]);
-        let cost = value_size(&entry) + 1;
+        let entry = match grep_line_window(line, grep) {
+            (text, None) => json!([number + 1, text]),
+            (text, Some(offset)) => json!([number + 1, text, offset]),
+        };
+        let cost = encoded_len(&entry.to_string()) + 1;
         if used + cost > max {
             cut = true;
             break;
@@ -1877,17 +2014,25 @@ fn grep_lines(body: &str, grep: &regex::Regex, skip: usize, limit: usize, max: u
         used += cost;
         lines.push(entry);
     }
-    let remaining = matching.len().saturating_sub(skip + lines.len());
-    let mut reply = json!({ "matched": matching.len(), "lines": lines });
-    if remaining > 0 {
-        let next = skip + reply["lines"].as_array().map_or(0, Vec::len);
-        reply["more"] = json!(if cut {
-            format!("{remaining} more matching lines past the reply limit. Use skip={next}.")
-        } else {
-            format!("{remaining} more matching lines. Use skip={next}.")
-        });
+    let assemble = |lines: &[Value], cut: bool| {
+        let remaining = matching.len().saturating_sub(skip + lines.len());
+        let mut reply = json!({ "matched": matching.len(), "lines": lines });
+        if remaining > 0 {
+            let next = skip + lines.len();
+            reply["more"] = json!(if cut {
+                format!("{remaining} more matching lines past the reply limit. Use skip={next}.")
+            } else {
+                format!("{remaining} more matching lines. Use skip={next}.")
+            });
+        }
+        reply.to_string()
+    };
+    let mut text = assemble(&lines, cut);
+    while encoded_len(&text) > max && !lines.is_empty() {
+        lines.pop();
+        text = assemble(&lines, true);
     }
-    reply.to_string()
+    text
 }
 
 /// Matching scalar leaves of a JSON value: `{"matched":n,"leaves":[["a.b.0",value],...]}`.
@@ -1938,12 +2083,12 @@ fn grep_leaves(
     let mut leaves = Vec::new();
     walk(value, path.to_string(), grep, &mut leaves);
     reply.insert("matched".into(), json!(leaves.len()));
-    let mut used = Value::Object(reply.clone()).to_string().len() + 160;
+    let mut used = encoded_len(&Value::Object(reply.clone()).to_string()) + 160;
     let mut out = Vec::new();
     let mut cut = false;
     for (leaf_path, leaf) in leaves.iter().skip(skip).take(limit) {
         let entry = json!([leaf_path, leaf]);
-        let cost = value_size(&entry) + 1;
+        let cost = encoded_len(&entry.to_string()) + 1;
         if used + cost > max {
             cut = true;
             break;
@@ -1951,21 +2096,30 @@ fn grep_leaves(
         used += cost;
         out.push(entry);
     }
-    let returned = out.len();
-    reply.insert("leaves".into(), Value::Array(out));
-    let remaining = leaves.len().saturating_sub(skip + returned);
-    if remaining > 0 {
-        let next = skip + returned;
-        reply.insert(
-            "more".into(),
-            json!(if cut {
-                format!("{remaining} more matches past the reply limit. Use skip={next}.")
-            } else {
-                format!("{remaining} more matches. Use skip={next}.")
-            }),
-        );
+    let assemble = |out: &[Value], cut: bool| {
+        let mut reply = reply.clone();
+        let returned = out.len();
+        reply.insert("leaves".into(), Value::Array(out.to_vec()));
+        let remaining = leaves.len().saturating_sub(skip + returned);
+        if remaining > 0 {
+            let next = skip + returned;
+            reply.insert(
+                "more".into(),
+                json!(if cut {
+                    format!("{remaining} more matches past the reply limit. Use skip={next}.")
+                } else {
+                    format!("{remaining} more matches. Use skip={next}.")
+                }),
+            );
+        }
+        Value::Object(reply).to_string()
+    };
+    let mut text = assemble(&out, cut);
+    while encoded_len(&text) > max && !out.is_empty() {
+        out.pop();
+        text = assemble(&out, true);
     }
-    Value::Object(reply).to_string()
+    text
 }
 
 fn not_retained_notice(body_bytes: usize, refusal: Refusal) -> String {
@@ -4896,5 +5050,238 @@ mod tests {
                 .unwrap_or_else(|e| panic!("sort={sort} failed: {e}"));
             assert!(text.contains("\"items\":["), "{text}");
         }
+    }
+
+    fn run_json(body: &str, args: Value) -> Value {
+        let q = ResultQuery::from_arguments(&args).unwrap().unwrap();
+        let text = run_query(body, None, &q, QUERY_BUDGET_BYTES).expect("query succeeds");
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn query_compares_64_bit_ids_exactly() {
+        let body = r#"{"items":[{"id":9007199254740992},{"id":9007199254740993},{"id":"9007199254740993"},{"id":18446744073709551615}]}"#;
+        let eq = run_json(
+            body,
+            json!({"path":"items","where":{"id":9007199254740993u64}}),
+        );
+        assert_eq!(eq["indices"], json!([1, 2]), "{eq}");
+        let eq_text = run_json(
+            body,
+            json!({"path":"items","where":{"id":"9007199254740992"}}),
+        );
+        assert_eq!(eq_text["indices"], json!([0]), "{eq_text}");
+        let gt = run_json(
+            body,
+            json!({"path":"items","where":{"id":{"gt":9007199254740992u64}}}),
+        );
+        assert_eq!(gt["indices"], json!([1, 2, 3]), "{gt}");
+        let lt = run_json(
+            body,
+            json!({"path":"items","where":{"id":{"lt":9007199254740993u64}}}),
+        );
+        assert_eq!(lt["indices"], json!([0]), "{lt}");
+        let lte = run_json(
+            body,
+            json!({"path":"items","where":{"id":{"lte":"9007199254740993"}}}),
+        );
+        assert_eq!(lte["indices"], json!([0, 1, 2]), "{lte}");
+        let sorted = run_json(body, json!({"path":"items","sort":"-id"}));
+        assert_eq!(sorted["indices"], json!([3, 1, 2, 0]), "{sorted}");
+        // Floats against integers compare by exact value.
+        let mixed = r#"{"items":[{"v":9007199254740992.0},{"v":9007199254740993},{"v":2.5},{"v":2},{"v":3}]}"#;
+        let eq_float = run_json(
+            mixed,
+            json!({"path":"items","where":{"v":9007199254740992u64}}),
+        );
+        assert_eq!(eq_float["indices"], json!([0]), "{eq_float}");
+        let between = run_json(mixed, json!({"path":"items","where":{"v":{"gt":2,"lt":3}}}));
+        assert_eq!(between["indices"], json!([2]), "{between}");
+    }
+
+    #[test]
+    fn exact_int_float_comparison_handles_edges() {
+        use std::cmp::Ordering::*;
+        assert_eq!(cmp_int_f64(0, -0.0), Equal);
+        assert_eq!(cmp_int_f64(0, 0.0), Equal);
+        assert_eq!(cmp_int_f64(2, 2.5), Less);
+        assert_eq!(cmp_int_f64(-2, -2.5), Greater);
+        assert_eq!(cmp_int_f64(-3, -2.5), Less);
+        assert_eq!(cmp_int_f64(9007199254740993, 9007199254740992.0), Greater);
+        assert_eq!(cmp_int_f64(i128::MAX, 1e39), Less);
+        assert_eq!(cmp_int_f64(i128::MAX, 2f64.powi(127)), Less);
+        assert_eq!(cmp_int_f64(i128::MIN, -(2f64.powi(127))), Equal);
+        assert_eq!(cmp_int_f64(i128::MIN, -1e39), Greater);
+        assert_eq!(cmp_int_f64(i128::MIN, f64::MIN), Greater);
+    }
+
+    #[test]
+    fn sort_over_big_ints_floats_strings_and_nan_is_a_strict_total_order() {
+        let values = [
+            json!(9007199254740993u64),
+            json!(9007199254740992u64),
+            json!(9007199254740992.0),
+            json!("9007199254740993"),
+            json!(u64::MAX),
+            json!(i64::MIN),
+            json!(-0.0),
+            json!(0),
+            json!(0.5),
+            json!(1e300),
+            json!(-1e300),
+            json!("170141183460469231731687303715884105727"),
+            json!("1e400"),
+            json!("NaN"),
+            json!("abc"),
+            json!(null),
+            json!(true),
+            json!([1]),
+        ];
+        let sample: Vec<Option<&Value>> = values
+            .iter()
+            .map(Some)
+            .chain(std::iter::once(None))
+            .collect();
+        for a in &sample {
+            assert_eq!(compare_for_sort(*a, *a), std::cmp::Ordering::Equal);
+            for b in &sample {
+                let ab = compare_for_sort(*a, *b);
+                assert_eq!(ab, compare_for_sort(*b, *a).reverse(), "{a:?} {b:?}");
+                for c in &sample {
+                    let bc = compare_for_sort(*b, *c);
+                    if ab == bc {
+                        assert_eq!(compare_for_sort(*a, *c), ab, "{a:?} {b:?} {c:?}");
+                    }
+                }
+            }
+        }
+        let mut items: Vec<Value> = Vec::new();
+        for _ in 0..4 {
+            items.extend(
+                values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| json!({"id": i, "v": v})),
+            );
+        }
+        let body = json!({ "items": items }).to_string();
+        let first = run_json(&body, json!({"path":"items","sort":"v","limit":100}));
+        let again = run_json(&body, json!({"path":"items","sort":"v","limit":100}));
+        assert_eq!(first["indices"], again["indices"]);
+        // Equal values keep their input order (the sort is stable), so the first
+        // appearance of each id gives the order of the distinct values.
+        let mut order: Vec<u64> = Vec::new();
+        for item in first["items"].as_array().unwrap() {
+            let id = item["id"].as_u64().unwrap();
+            if !order.contains(&id) {
+                order.push(id);
+            }
+        }
+        // null, bool, then numbers by exact value, then text.
+        assert_eq!(
+            order,
+            vec![15, 16, 10, 5, 6, 7, 8, 1, 2, 0, 3, 4, 11, 9, 12, 13, 17, 14]
+        );
+    }
+
+    #[test]
+    fn quote_heavy_query_replies_stay_within_the_byte_bound() {
+        let items: Vec<Value> = (0..200)
+            .map(|i| {
+                json!({
+                    "id": i,
+                    "q": "\"".repeat(60),
+                    "b": "\\".repeat(30),
+                    "c": "\u{1}\u{2}\n\t".repeat(10),
+                })
+            })
+            .collect();
+        let structured = json!({ "items": items });
+        let body = structured.to_string();
+        let mut result = json!({
+            "content": [{ "type": "text", "text": body.clone() }],
+            "structuredContent": structured,
+            "isError": false
+        });
+        crate::integrity::label_untrusted_result("github", &mut result);
+        assert!(shape_tool_result(&mut result, 8192, None).shaped);
+        let cursor = cursor_of(&result);
+        for (args, budget) in [
+            (json!({"path": "items", "limit": 200}), 0),
+            (json!({"path": "items", "limit": 200}), 3000),
+            (json!({"grep": "\"", "path": "items.3"}), 0),
+            (
+                json!({"path": "items", "fields": ["q"], "limit": 200}),
+                1500,
+            ),
+        ] {
+            let q = ResultQuery::from_arguments(&args).unwrap().unwrap();
+            let reply = query_result_for_model_visible(&cursor, None, &q, budget, &|_| true);
+            assert_eq!(reply["isError"], false, "{reply}");
+            assert_eq!(
+                reply["_meta"]["app.toolport/provenance"]["server"],
+                "github"
+            );
+            let bound = if budget == 0 {
+                QUERY_BUDGET_BYTES
+            } else {
+                budget
+            };
+            let size = serde_json::to_string(&reply).unwrap().len();
+            assert!(size <= bound, "{args}: {size} > {bound}");
+            let parsed: Value = serde_json::from_str(text_of(&reply)).unwrap();
+            assert!(
+                parsed["items"].as_array().is_some_and(|i| !i.is_empty())
+                    || parsed["leaves"].as_array().is_some_and(|l| !l.is_empty()),
+                "{parsed}"
+            );
+        }
+        // Plain text lines full of quotes are bounded the same way.
+        let lines: String = (0..300)
+            .map(|i| format!("{i} {}\n", "\"\\".repeat(150)))
+            .collect();
+        let grep = compile_grep("\"");
+        let text = grep_lines(&lines, &grep, 0, 300, 4000);
+        assert!(encoded_len(&text) <= 4000, "{}", encoded_len(&text));
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        assert!(!parsed["lines"].as_array().unwrap().is_empty());
+        assert!(parsed["more"].as_str().unwrap().contains("reply limit"));
+    }
+
+    #[test]
+    fn grep_shows_matches_past_the_line_window() {
+        let grep = compile_grep("needle");
+        let line = format!("{}needle{}", "a".repeat(1000), "b".repeat(994));
+        assert_eq!(line.chars().count(), 2000);
+        let reply: Value = serde_json::from_str(&grep_lines(&line, &grep, 0, 5, 8000)).unwrap();
+        let entry = &reply["lines"][0];
+        assert_eq!(entry[0], 1);
+        assert_eq!(entry[2], 1000, "{entry}");
+        let text = entry[1].as_str().unwrap();
+        assert!(text.starts_with('…') && text.ends_with('…'), "{text}");
+        assert!(text.contains("needle"), "{text}");
+        assert_eq!(text.chars().count(), GREP_LINE_CHARS + 2);
+
+        // A match near the end ends the window at the line's end.
+        let tail = format!("{}needle", "a".repeat(1994));
+        let reply: Value = serde_json::from_str(&grep_lines(&tail, &grep, 0, 5, 8000)).unwrap();
+        let text = reply["lines"][0][1].as_str().unwrap();
+        assert!(text.starts_with('…') && text.ends_with("needle"), "{text}");
+        assert_eq!(reply["lines"][0][2], 1994);
+
+        // An early match keeps the head and no offset.
+        let head = format!("needle{}", "a".repeat(1994));
+        let reply: Value = serde_json::from_str(&grep_lines(&head, &grep, 0, 5, 8000)).unwrap();
+        assert_eq!(reply["lines"][0].as_array().unwrap().len(), 2);
+        assert!(reply["lines"][0][1].as_str().unwrap().starts_with("needle"));
+
+        // Multi-byte characters: the window and offset count characters, not bytes.
+        let wide = format!("{}NEEDLE{}", "é漢🙂".repeat(400), "ü".repeat(500));
+        let reply: Value = serde_json::from_str(&grep_lines(&wide, &grep, 0, 5, 8000)).unwrap();
+        let entry = &reply["lines"][0];
+        assert_eq!(entry[2], 1200, "{entry}");
+        let text = entry[1].as_str().unwrap();
+        assert!(text.contains("NEEDLE"), "{text}");
+        assert_eq!(text.chars().count(), GREP_LINE_CHARS + 2);
     }
 }

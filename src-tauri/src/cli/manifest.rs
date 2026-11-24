@@ -316,7 +316,7 @@ pub fn validate(m: &Manifest) -> Result<(), Vec<String>> {
             }
         }
         if errors.is_empty() {
-            if let Err(e) = crate::secret_refs::validate_server(&to_entry(s, false)) {
+            if let Err(e) = crate::secret_refs::validate_server(&to_entry(s, false, None)) {
                 errors.push(format!("{at}: {}", e.message));
             }
         }
@@ -353,9 +353,50 @@ pub fn skills_add_command(source: &str) -> String {
     }
 }
 
+/// Whether a stdio server runs something from the project, so it has to start in the
+/// project folder: its command or an argument (or the value of `--flag=value`) is a
+/// relative path such as `./server.js` or `dist/index.js`, or names something that exists
+/// in the project. Package names (`@scope/pkg`), URLs, `owner/repo` style values and
+/// absolute or `~`/`${VAR}` paths don't count, so the same `npx` server in two projects
+/// stays one definition.
+fn runs_project_files(s: &ServerSpec, project: &Path) -> bool {
+    let relative = |token: &str| {
+        let t = match token.split_once('=') {
+            Some((flag, value)) if flag.starts_with('-') => value,
+            _ if token.starts_with('-') => return false,
+            _ => token,
+        }
+        .trim();
+        if t.is_empty()
+            || t.contains("://")
+            || t.starts_with(['@', '~', '$'])
+            || Path::new(t).is_absolute()
+        {
+            return false;
+        }
+        if t == "." || t == ".." || t.starts_with("./") || t.starts_with("../") {
+            return true;
+        }
+        if cfg!(windows) && (t.starts_with(".\\") || t.starts_with("..\\")) {
+            return true;
+        }
+        let path = Path::new(t);
+        project.join(path).exists()
+            || (t.contains(['/', '\\']) && !t.contains(':') && path.extension().is_some())
+    };
+    s.transport() == "stdio"
+        && (s.command.as_deref().is_some_and(relative) || s.args.iter().any(|a| relative(a)))
+}
+
 /// The registry entry a manifest server becomes. Env vars are secret with no value; their
-/// values only ever reach the keychain.
-pub fn to_entry(s: &ServerSpec, enabled: bool) -> crate::registry::ServerEntry {
+/// values only ever reach the keychain. A stdio server that runs files from the project
+/// gets the project folder as its working directory, so its relative paths resolve there
+/// and not wherever the gateway was started.
+pub fn to_entry(
+    s: &ServerSpec,
+    enabled: bool,
+    project: Option<&Path>,
+) -> crate::registry::ServerEntry {
     let mut env: Vec<serde_json::Value> = s
         .env
         .iter()
@@ -383,6 +424,10 @@ pub fn to_entry(s: &ServerSpec, enabled: bool) -> crate::registry::ServerEntry {
     }
     if let Some(u) = &s.url {
         entry["url"] = serde_json::json!(u);
+    }
+    if let Some(project) = project.filter(|p| runs_project_files(s, p)) {
+        let dir = std::path::absolute(project).unwrap_or_else(|_| project.to_path_buf());
+        entry["cwd"] = serde_json::json!(dir.to_string_lossy());
     }
     serde_json::from_value(entry).expect("manifest server maps onto a registry entry")
 }
@@ -755,6 +800,16 @@ pub enum Step {
         /// left off for that reason, never one the user turned off.
         enable: bool,
     },
+    /// In Toolport from an earlier `up`, with settings the manifest has since changed.
+    ServerUpdate {
+        name: String,
+        id: String,
+        /// What changes, by name only.
+        changes: Vec<String>,
+        needs: Vec<String>,
+        from_env: Vec<String>,
+        enable: bool,
+    },
     ServerConflict {
         name: String,
         detail: String,
@@ -994,47 +1049,13 @@ pub fn plan_up(
     // Servers.
     let registry = crate::registry::load().unwrap_or_default();
     for s in &manifest.servers {
-        let entry = to_entry(s, false);
+        let entry = to_entry(s, false, Some(project));
         if let Some(existing) = registry
             .servers
             .iter()
             .find(|e| e.name.eq_ignore_ascii_case(&s.name))
         {
-            let keys = |e: &crate::registry::ServerEntry| {
-                e.env.iter().map(|v| v.key.clone()).collect::<BTreeSet<_>>()
-            };
-            if existing.transport == entry.transport
-                && existing.command == entry.command
-                && existing.args == entry.args
-                && existing.url == entry.url
-                && keys(existing).is_superset(&keys(&entry))
-            {
-                let missing: Vec<String> = s
-                    .env
-                    .iter()
-                    .filter(|k| !s.secret_refs.contains_key(*k))
-                    .filter(|k| !has_credential(existing, k))
-                    .cloned()
-                    .collect();
-                if missing.is_empty() {
-                    steps.push(Step::ServerSame {
-                        name: s.name.clone(),
-                    });
-                } else {
-                    steps.push(Step::ServerFinish {
-                        name: s.name.clone(),
-                        id: existing.id.clone(),
-                        from_env: in_environment(&missing),
-                        needs: missing,
-                        enable: !existing.enabled && existing.source.as_deref() == Some("project"),
-                    });
-                }
-            } else {
-                steps.push(Step::ServerConflict {
-                    name: s.name.clone(),
-                    detail: "Toolport already has a server with this name and a different definition; rename one or remove it first".into(),
-                });
-            }
+            steps.push(plan_existing(s, existing, &entry));
             continue;
         }
         let item = crate::sharing_controller::SetupImportItem {
@@ -1077,7 +1098,10 @@ pub fn plan_up(
     if steps.iter().any(|s| {
         matches!(
             s,
-            Step::ServerAdd { .. } | Step::ServerSame { .. } | Step::ServerFinish { .. }
+            Step::ServerAdd { .. }
+                | Step::ServerSame { .. }
+                | Step::ServerFinish { .. }
+                | Step::ServerUpdate { .. }
         )
     }) {
         for c in &clients {
@@ -1090,6 +1114,130 @@ pub fn plan_up(
         }
     }
     steps
+}
+
+/// What `up` does with a manifest server Toolport already has under the same name. A
+/// different command, arguments or url is a conflict: what a repo runs never changes
+/// silently. Changed settings (plain values, password manager references, new env names,
+/// the working folder) update a server an earlier `up` added and are shown before they
+/// apply; on a server added some other way they are a conflict too.
+fn plan_existing(
+    s: &ServerSpec,
+    existing: &crate::registry::ServerEntry,
+    wanted: &crate::registry::ServerEntry,
+) -> Step {
+    if existing.transport != wanted.transport
+        || existing.command != wanted.command
+        || existing.args != wanted.args
+        || existing.url != wanted.url
+    {
+        return Step::ServerConflict {
+            name: s.name.clone(),
+            detail: "Toolport already has a server with this name and a different definition; rename one or remove it first".into(),
+        };
+    }
+    let from_project = existing.source.as_deref() == Some("project");
+    let updated = with_manifest_settings(existing, wanted);
+    let changes = setting_changes(existing, &updated);
+    if !changes.is_empty() && !from_project {
+        return Step::ServerConflict {
+            name: s.name.clone(),
+            detail: format!(
+                "Toolport already has a server with this name and different settings ({}); change them in Toolport or remove it first",
+                changes.join(", ")
+            ),
+        };
+    }
+    let missing_in = |entry: &crate::registry::ServerEntry| -> Vec<String> {
+        s.env
+            .iter()
+            .filter(|k| !s.secret_refs.contains_key(*k))
+            .filter(|k| !has_credential(entry, k))
+            .cloned()
+            .collect()
+    };
+    // Switch it on once every credential is set: only for a server `up` added and left
+    // off for that reason, never one the user turned off.
+    let waiting = !existing.enabled && from_project && !missing_in(existing).is_empty();
+    let missing = missing_in(&updated);
+    if !changes.is_empty() {
+        return Step::ServerUpdate {
+            name: s.name.clone(),
+            id: existing.id.clone(),
+            changes,
+            from_env: in_environment(&missing),
+            needs: missing,
+            enable: waiting,
+        };
+    }
+    if missing.is_empty() {
+        Step::ServerSame {
+            name: s.name.clone(),
+        }
+    } else {
+        Step::ServerFinish {
+            name: s.name.clone(),
+            id: existing.id.clone(),
+            from_env: in_environment(&missing),
+            needs: missing,
+            enable: !existing.enabled && from_project,
+        }
+    }
+}
+
+/// `existing` with the settings the manifest declares: its plain values, password manager
+/// references, env names and working folder. Everything else, including settings added in
+/// Toolport and keychain values, is kept.
+fn with_manifest_settings(
+    existing: &crate::registry::ServerEntry,
+    wanted: &crate::registry::ServerEntry,
+) -> crate::registry::ServerEntry {
+    let mut out = existing.clone();
+    for var in &wanted.env {
+        match out.env.iter_mut().find(|v| v.key == var.key) {
+            Some(v) => {
+                v.secret = var.secret;
+                v.value = var.value.clone();
+                v.unknown_fields.remove("source");
+                if let Some(source) = var.unknown_fields.get("source") {
+                    v.unknown_fields.insert("source".into(), source.clone());
+                }
+            }
+            None => out.env.push(var.clone()),
+        }
+    }
+    if wanted.cwd.is_some() {
+        out.cwd = wanted.cwd.clone();
+    }
+    out
+}
+
+/// Names of the settings that differ, for the plan. Never shows a value.
+fn setting_changes(
+    before: &crate::registry::ServerEntry,
+    after: &crate::registry::ServerEntry,
+) -> Vec<String> {
+    let mut changes = Vec::new();
+    for var in &after.env {
+        let reference = crate::secret_refs::reference_for(var);
+        match before.env.iter().find(|v| v.key == var.key) {
+            None => changes.push(format!("adds {}", var.key)),
+            Some(old) if crate::secret_refs::reference_for(old) != reference => {
+                changes.push(match reference {
+                    Some(_) => format!("{} from a new reference", var.key),
+                    None => format!("{} no longer from a reference", var.key),
+                })
+            }
+            Some(old) if old.secret != var.secret || old.value != var.value => {
+                changes.push(var.key.clone())
+            }
+            Some(_) => {}
+        }
+    }
+    if before.cwd != after.cwd {
+        changes.push("working folder".into());
+    }
+    changes
 }
 
 fn render_steps(r: &UpReport, style: &Style) -> String {
@@ -1250,6 +1398,41 @@ fn render_steps(r: &UpReport, style: &Style) -> String {
                     style.dim(&parts.join(" · "))
                 ));
             }
+            Step::ServerUpdate {
+                name,
+                changes,
+                needs,
+                from_env,
+                ..
+            } => {
+                head(&mut out, "Servers");
+                out.push_str(&format!(
+                    "  {} update {}\n      {}\n",
+                    style.cyan("~"),
+                    style.bold(name),
+                    style.dim(&format!("changes: {}", changes.join(", ")))
+                ));
+                let ask: Vec<&str> = needs
+                    .iter()
+                    .filter(|n| !from_env.contains(n))
+                    .map(String::as_str)
+                    .collect();
+                if !from_env.is_empty() {
+                    out.push_str(&format!(
+                        "      {}\n",
+                        style.dim(&format!(
+                            "from your environment into the keychain: {}",
+                            from_env.join(", ")
+                        ))
+                    ));
+                }
+                if !ask.is_empty() {
+                    out.push_str(&format!(
+                        "      {}\n",
+                        style.dim(&format!("asks for: {}", ask.join(", ")))
+                    ));
+                }
+            }
             Step::ServerSame { name } => {
                 head(&mut out, "Servers");
                 out.push_str(&format!(
@@ -1293,7 +1476,7 @@ fn has_changes(steps: &[Step], gateway: bool) -> bool {
         | Step::RulesLink { .. }
         | Step::SkillLink { .. }
         | Step::ServerAdd { .. } => true,
-        Step::ServerFinish { .. } => true,
+        Step::ServerFinish { .. } | Step::ServerUpdate { .. } => true,
         Step::Connect { .. } => gateway,
         _ => false,
     })
@@ -1388,7 +1571,7 @@ fn apply_up(ctx: &Ctx, manifest: &Manifest, project: &Path, report: &mut UpRepor
                 let Some(spec) = manifest.servers.iter().find(|s| s.name == name) else {
                     continue;
                 };
-                match add_server(ctx, spec, &needs, &from_env) {
+                match add_server(ctx, spec, project, &needs, &from_env) {
                     Ok(msg) => report.applied.push(msg),
                     Err(e) => report.failed.push(format!("{name}: {e}")),
                 }
@@ -1410,6 +1593,22 @@ fn apply_up(ctx: &Ctx, manifest: &Manifest, project: &Path, report: &mut UpRepor
                         needs.join(", "),
                         if needs.len() == 1 { "it" } else { "them" }
                     )),
+                    Err(e) => report.failed.push(format!("{name}: {e}")),
+                }
+            }
+            Step::ServerUpdate {
+                name,
+                id,
+                needs,
+                from_env,
+                enable,
+                ..
+            } => {
+                let Some(spec) = manifest.servers.iter().find(|s| s.name == name) else {
+                    continue;
+                };
+                match update_server(ctx, spec, project, &id, &needs, &from_env, enable) {
+                    Ok(msg) => report.applied.push(msg),
                     Err(e) => report.failed.push(format!("{name}: {e}")),
                 }
             }
@@ -1538,11 +1737,12 @@ fn still_off(name: &str, missing: &[String]) -> String {
 fn add_server(
     ctx: &Ctx,
     spec: &ServerSpec,
+    project: &Path,
     needs: &[String],
     from_env: &[String],
 ) -> Result<String, String> {
     let (values, missing) = collect_values(ctx, &spec.name, needs, from_env);
-    let entry = to_entry(spec, false);
+    let entry = to_entry(spec, false, Some(project));
     let (_, id) = crate::registry::update(|r| Ok(r.add_server(entry)))?;
     if let Err(e) = store_values(&id, &values) {
         let _ = crate::registry::update(|r| r.remove_server(&id));
@@ -1554,6 +1754,44 @@ fn add_server(
     } else {
         Ok(still_off(&spec.name, &missing))
     }
+}
+
+/// Apply the manifest's changed settings to a server an earlier `up` added, then ask for
+/// any credential that is now missing. Keychain values and settings added in Toolport stay.
+fn update_server(
+    ctx: &Ctx,
+    spec: &ServerSpec,
+    project: &Path,
+    id: &str,
+    needs: &[String],
+    from_env: &[String],
+    turn_on: bool,
+) -> Result<String, String> {
+    let wanted = to_entry(spec, false, Some(project));
+    crate::registry::update(|r| {
+        let existing = r
+            .servers
+            .iter()
+            .find(|s| s.id == id)
+            .ok_or_else(|| format!("{} is no longer in Toolport", spec.name))?;
+        let updated = with_manifest_settings(existing, &wanted);
+        crate::secret_refs::validate_server(&updated).map_err(|e| e.message)?;
+        r.update_server(updated)
+    })?;
+    let (values, missing) = collect_values(ctx, &spec.name, needs, from_env);
+    store_values(id, &values)?;
+    if !missing.is_empty() {
+        return Ok(format!(
+            "updated {} ({} still missing: run toolport up again)",
+            spec.name,
+            missing.join(", ")
+        ));
+    }
+    if turn_on {
+        enable(id)?;
+        return Ok(format!("updated {} (enabled)", spec.name));
+    }
+    Ok(format!("updated {}", spec.name))
 }
 
 /// Supply the credentials an earlier `up` left missing. `None` when no value was given.
@@ -1731,7 +1969,7 @@ url = "https://mcp.linear.app/mcp"
         let m = load(GOOD).unwrap();
         assert_eq!(m.servers.len(), 2);
         assert_eq!(m.servers[1].transport(), "http");
-        let entry = to_entry(&m.servers[0], false);
+        let entry = to_entry(&m.servers[0], false, None);
         assert!(entry
             .env
             .iter()
@@ -1861,5 +2099,116 @@ url = "https://mcp.linear.app/mcp"
             ),
             PathBuf::from("../../.agents/skills/x")
         );
+    }
+
+    fn spec(toml: &str) -> ServerSpec {
+        load(&format!("version = 1\n[[servers]]\nname = \"s\"\n{toml}"))
+            .unwrap()
+            .servers
+            .remove(0)
+    }
+
+    #[test]
+    fn servers_that_run_project_files_start_in_the_project() {
+        let project =
+            std::env::temp_dir().join(format!("toolport-manifest-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(project.join("tools")).unwrap();
+        std::fs::write(project.join("server.py"), "").unwrap();
+        let cwd = |toml: &str| to_entry(&spec(toml), false, Some(&project)).cwd;
+        let here = Some(project.to_string_lossy().into_owned());
+        for toml in [
+            "command = \"node\"\nargs = [\"./server.js\"]",
+            "command = \"node\"\nargs = [\"dist/index.js\"]",
+            "command = \"uv\"\nargs = [\"run\", \"server.py\"]",
+            "command = \"uv\"\nargs = [\"run\", \"--directory=tools\", \"srv\"]",
+            "command = \"./bin/server\"",
+        ] {
+            assert_eq!(cwd(toml), here, "{toml}");
+        }
+        for toml in [
+            "command = \"npx\"\nargs = [\"-y\", \"@modelcontextprotocol/server-github\"]",
+            "command = \"uvx\"\nargs = [\"--from\", \"git+https://github.com/o/r\", \"srv\"]",
+            "command = \"docker\"\nargs = [\"run\", \"ghcr.io/o/r:latest\"]",
+            "command = \"gh-mcp\"\nargs = [\"--repo\", \"owner/repo\"]",
+            "command = \"node\"\nargs = [\"/opt/server.js\"]",
+            "url = \"https://mcp.example.com/mcp\"",
+        ] {
+            assert_eq!(cwd(toml), None, "{toml}");
+        }
+        // Validation has no project: no working folder.
+        assert_eq!(
+            to_entry(
+                &spec("command = \"node\"\nargs = [\"./s.js\"]"),
+                false,
+                None
+            )
+            .cwd,
+            None
+        );
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    fn existing(toml: &str, source: &str) -> crate::registry::ServerEntry {
+        let mut e = to_entry(&spec(toml), true, None);
+        e.id = "s".into();
+        e.source = Some(source.into());
+        e
+    }
+
+    #[test]
+    fn changed_values_and_references_update_a_project_server() {
+        const BASE: &str = "command = \"npx\"\nargs = [\"-y\", \"pkg\"]\nenv = [\"TOKEN\"]\n[servers.secret_refs]\nTOKEN = \"op://Eng/Item/token\"\n[servers.values]\nLOG_LEVEL = \"debug\"";
+        let old = existing(BASE, "project");
+        let plan = |toml: &str, e: &crate::registry::ServerEntry| {
+            let s = spec(toml);
+            plan_existing(&s, e, &to_entry(&s, false, None))
+        };
+        assert!(matches!(plan(BASE, &old), Step::ServerSame { .. }));
+
+        let value = BASE.replace("\"debug\"", "\"info\"");
+        match plan(&value, &old) {
+            Step::ServerUpdate { changes, needs, .. } => {
+                assert_eq!(changes, vec!["LOG_LEVEL".to_string()]);
+                assert!(needs.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+        let reference = BASE.replace("op://Eng/Item/token", "op://Eng/Other/token");
+        match plan(&reference, &old) {
+            Step::ServerUpdate { changes, .. } => {
+                assert_eq!(changes, vec!["TOKEN from a new reference".to_string()])
+            }
+            other => panic!("{other:?}"),
+        }
+        // The update keeps what the manifest doesn't declare and applies what it does.
+        let s = spec(&value);
+        let updated = with_manifest_settings(&old, &to_entry(&s, false, None));
+        assert_eq!(updated.id, "s");
+        let level = updated.env.iter().find(|v| v.key == "LOG_LEVEL").unwrap();
+        assert_eq!(level.value.as_deref(), Some("info"));
+        assert!(!level.secret);
+        assert_eq!(
+            crate::secret_refs::reference_for(
+                updated.env.iter().find(|v| v.key == "TOKEN").unwrap()
+            ),
+            Some("op://Eng/Item/token")
+        );
+        assert!(matches!(plan(&value, &updated), Step::ServerSame { .. }));
+
+        // Never changed on a server the user added some other way.
+        match plan(&value, &existing(BASE, "manual")) {
+            Step::ServerConflict { detail, .. } => {
+                assert!(
+                    detail.contains("LOG_LEVEL") && !detail.contains("info"),
+                    "{detail}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        // A different command is always a conflict.
+        assert!(matches!(
+            plan(&BASE.replace("\"pkg\"", "\"other\""), &old),
+            Step::ServerConflict { .. }
+        ));
     }
 }

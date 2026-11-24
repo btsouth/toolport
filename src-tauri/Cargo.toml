@@ -28,7 +28,7 @@ required-features = ["search-static"]
 # and bundling it: `cargo build --no-default-features --features cli --bin toolport`.
 [[bin]]
 name = "toolport"
-path = "src/bin/toolport.rs"
+path = "src/cli/main.rs"
 required-features = ["cli"]
 
 [[bin]]
