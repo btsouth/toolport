@@ -265,7 +265,9 @@ fn token_budget_regression() {
             "{label} {measured} tokens exceeds {limit}; raise the limit deliberately and record before/after token counts"
         );
     };
-    check("lazy floor", tokens, 550);
+    // 550 until fetch_result took queries (path, where, fields, grep, sort, limit,
+    // skip): the floor measured 680 tokens after, 2,999 bytes.
+    check("lazy floor", tokens, 750);
     let floor_tokens = tokens;
     let help = help_tool_def("synthetic00", 618).to_string();
     let help_tokens = bpe.encode_ordinary(&help).len();

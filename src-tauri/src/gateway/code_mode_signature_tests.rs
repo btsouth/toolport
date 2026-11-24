@@ -100,7 +100,8 @@ fn split_search(text: &str) -> (&str, Value) {
 /// exact bytes `main` produced before signatures existed. The digests were captured
 /// from origin/main (49614543f) with this same test body.
 /// The tools/list digests were updated once for this branch's `anthropic/alwaysLoad`
-/// on Toolport's meta-tools; the search digest is unchanged.
+/// on Toolport's meta-tools, and again for `toolport_fetch_result`'s query arguments;
+/// the search digest is unchanged.
 #[test]
 fn code_mode_off_search_and_tools_list_are_byte_for_byte_unchanged() {
     let _data = DataDirTestEnv::new("code-mode-off-search-unchanged");
@@ -121,8 +122,8 @@ fn code_mode_off_search_and_tools_list_are_byte_for_byte_unchanged() {
         [sha256_hex(&searches), sha256_hex(&lazy), sha256_hex(&full)],
         [
             "8f4f9904eebf070a0810daea357b04056513f3ddf4e89fb442aff22b3b9761fa".to_string(),
-            "c1014053103ee9f76fa161ff9a60654e984f4717c0bb94518c2cfab5dc488052".to_string(),
-            "f68ebfb55064ce074f03ada89d30f0cbaf712f77df1fabc96b2a0c1f884e4db3".to_string(),
+            "26ca0b620d018ed0b6f22623f3d7b9a4ec81226494a40e022436c91c876848ac".to_string(),
+            "16ca896e46028721ea757e1f7df6aa471c33a8bbbfcb8e0023aa49abbdb926af".to_string(),
         ],
         "Code Mode off output changed"
     );

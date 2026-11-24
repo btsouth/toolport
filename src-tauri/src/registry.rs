@@ -1333,7 +1333,7 @@ pub struct Registry {
     /// states: absent = built-in text, a string = sent instead, empty = omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_instructions: Option<String>,
-    /// Discovery-mode override: `"lazy"` | `"grouped"` | `"full"`. When set, it takes
+    /// Discovery-mode override: `"lazy"` | `"grouped"` | `"full"` | `"code-mode"`. When set, it takes
     /// precedence over `lazy_discovery`; `None` (the default, and every pre-existing
     /// registry) falls back to that bool. An explicit `CONDUIT_DISCOVERY` env var still
     /// overrides this. Lets a user pick grouped mode once - for weak/local models that
@@ -1411,7 +1411,7 @@ pub struct Registry {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub folder_profiles: Vec<FolderProfile>,
     /// Per-client discovery-mode override, keyed by stable client id (e.g. "cursor" ->
-    /// "grouped"). Value is `"full" | "lazy" | "grouped"`; an absent entry means the client
+    /// "grouped"). Value is `"full" | "lazy" | "grouped" | "code-mode"`; an absent entry means the client
     /// uses Auto from the client capability table. The gateway
     /// resolves it live via `CONDUIT_CLIENT_ID`, so changing it re-applies without
     /// reinstalling the client (same mechanism as `client_scopes`).
@@ -2818,7 +2818,7 @@ impl Registry {
     /// resolution falls back to `lazy_discovery`. Keeps `lazy_discovery` in sync for
     /// the "lazy"/"full" cases so an older gateway reading only that bool still agrees.
     pub fn set_discovery_mode(&mut self, mode: &str) {
-        match mode.trim().to_ascii_lowercase().as_str() {
+        match crate::clients::chosen_discovery_mode(mode).unwrap_or_default() {
             "lazy" => {
                 self.discovery_mode = Some("lazy".into());
                 self.lazy_discovery = true;
@@ -2828,6 +2828,12 @@ impl Registry {
                 self.lazy_discovery = false;
             }
             "grouped" => self.discovery_mode = Some("grouped".into()),
+            // An older gateway reads only the bool: the nearest mode it knows is Lazy,
+            // which advertises the same floor less the script tool.
+            "code-mode" => {
+                self.discovery_mode = Some("code-mode".into());
+                self.lazy_discovery = true;
+            }
             _ => self.discovery_mode = None,
         }
     }
@@ -3015,16 +3021,16 @@ impl Registry {
         }
     }
 
-    /// Set (or clear) a client's discovery-mode override. `Some("full"|"lazy"|"grouped")`
-    /// pins that mode for the client; `None`, an empty/whitespace value, `"inherit"`, or any
-    /// unrecognized value clears the entry so the client inherits the global mode.
+    /// Set (or clear) a client's discovery-mode override.
+    /// `Some("full"|"lazy"|"grouped"|"code-mode")` pins that mode for the client;
+    /// `None`, an empty/whitespace value, `"inherit"`, or any unrecognized value clears
+    /// the entry so the client inherits the global mode.
     pub fn set_client_discovery(&mut self, client_id: &str, mode: Option<&str>) {
-        let valid = mode
-            .map(|m| m.trim().to_ascii_lowercase())
-            .filter(|m| matches!(m.as_str(), "full" | "lazy" | "grouped"));
+        let valid = mode.and_then(crate::clients::chosen_discovery_mode);
         match valid {
             Some(m) => {
-                self.client_discovery.insert(client_id.to_string(), m);
+                self.client_discovery
+                    .insert(client_id.to_string(), m.to_string());
             }
             None => {
                 self.client_discovery.remove(client_id);
@@ -6625,6 +6631,26 @@ pub(crate) mod tests {
     fn cannot_remove_last_profile() {
         let mut r = Registry::default();
         assert!(r.remove_profile("default").is_err());
+    }
+
+    #[test]
+    fn code_mode_discovery_is_stored_under_one_name() {
+        let mut r = Registry::default();
+        r.set_discovery_mode("full");
+        for spelling in ["code-mode", "CodeMode", "code_mode", " code "] {
+            r.set_discovery_mode(spelling);
+            assert_eq!(r.discovery_mode.as_deref(), Some("code-mode"));
+            // An older gateway reading only the bool shows the nearest floor.
+            assert!(r.lazy_discovery);
+            r.set_client_discovery("codex", Some(spelling));
+            assert_eq!(r.client_discovery_mode("codex"), Some("code-mode"));
+        }
+        // It round-trips through the file like the other modes.
+        let back: Registry = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.discovery_mode.as_deref(), Some("code-mode"));
+        assert_eq!(back.client_discovery_mode("codex"), Some("code-mode"));
+        r.set_client_discovery("codex", Some("nonsense"));
+        assert_eq!(r.client_discovery_mode("codex"), None);
     }
 
     #[test]
