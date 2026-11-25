@@ -6,6 +6,33 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [2.4.1] - 2026-11-25
+
+Toolport 2.4.1 adds a shell output command breakdown to `toolport usage` and
+`toolport report`, discovers nested Claude Code workflow subagent transcripts,
+and fixes a UTF-8 slicing crash in image sizing.
+
+### Added
+
+- `toolport usage` and `toolport report` now include a `Shell output` section
+  showing where bash residency came from by command category (`File reads &
+search`, `Git & GitHub`, `Scripts & data tools`, `Tests & verification`,
+  `Builds, lint & typecheck`, `Network & packages`, and `Other commands`),
+  with tokens added, call counts, path-free allowlisted top commands, and a
+  tailored recommendation for the largest shell contributor. (#1433)
+- `skills/toolport/SKILL.md` for installing the Toolport skill via
+  `npx skills add btsouth/toolport`, plus automatic OIDC npm publishing on
+  release tags. (#1432)
+
+### Fixed
+
+- `toolport usage` now walks deeper under Claude Code `projects/` so nested
+  workflow subagents (`subagents/workflows/<wf>/agent-*.jsonl`) are included
+  while skipping workflow `journal.jsonl` files, attributes continued output
+  from Codex `wait`/`write_stdin` and Claude `BashOutput` back to the
+  originating command, and avoids panicking on malformed non-ASCII image data.
+  (#1433)
+
 ## [2.4.0] - 2026-11-24
 
 Toolport 2.4.0 adds the standalone `toolport` CLI (`@toolport/cli`), compact
