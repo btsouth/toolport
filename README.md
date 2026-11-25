@@ -2,9 +2,10 @@
 
 [![CI](https://github.com/btsouth/toolport/actions/workflows/ci.yml/badge.svg)](https://github.com/btsouth/toolport/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/btsouth/toolport?label=release)](https://github.com/btsouth/toolport/releases)
+[![npm](https://img.shields.io/npm/v/@toolport/cli?label=%40toolport%2Fcli)](https://www.npmjs.com/package/@toolport/cli)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/Xsn27MxdBA)
-[![Glama quality](https://glama.ai/mcp/servers/tsouth89/toolport/badges/score.svg)](https://glama.ai/mcp/servers/tsouth89/toolport)
+[![Glama quality](https://glama.ai/mcp/servers/btsouth/toolport/badges/score.svg)](https://glama.ai/mcp/servers/btsouth/toolport)
 
 **One setup for every coding agent.**
 
@@ -14,6 +15,31 @@ drifted or leaked, and gives every agent the same setup.
 
 ```sh
 npx @toolport/cli
+```
+
+```text
+toolport scan · project ~/work/demo
+
+Agents  3 found, 0 connected to Toolport
+  ·  Claude Code  2 servers  direct  ~/.claude.json
+  ·  Codex        0 servers  no MCP  ~/.codex/config.toml
+  ·  Cursor       2 servers  direct  ~/.cursor/mcp.json
+
+Plaintext secrets on disk  2
+  ✗  github  GITHUB_TOKEN  Claude Code  ~/.claude.json
+  ✗  github  GITHUB_TOKEN  Cursor       ~/.cursor/mcp.json
+  → toolport fix --only secrets moves them into your OS keychain
+
+MCP drift  1 shared, 1 conflicting
+  ! filesystem  2 different definitions (command, arguments or URL differ)
+      Claude Code, Cursor
+  · github  configured separately in 2 agents; add it to Toolport once and every agent shares it
+      Claude Code, Cursor
+
+Skills & rules  2 skills, 1 rules files
+  ✓ Works with skills.sh: ~/.agents/skills is read by Codex, Cursor
+  ✗ 1 link to a missing folder  [fixable]
+      ~/.claude/skills/old-skill points at nothing. Clients skip it without saying so.
 ```
 
 That one command checks every agent on your machine in a few seconds: plaintext
@@ -80,7 +106,13 @@ that don't.
 
 ### Let your agent do it
 
-Paste this into Claude Code, Codex or any coding agent:
+Install the Toolport skill into your coding agents:
+
+```sh
+npx skills add btsouth/toolport
+```
+
+Or paste this directly into Claude Code, Codex or any coding agent:
 
 > Run `npx @toolport/cli --json`, explain what it found, then run
 > `npx @toolport/cli fix --dry-run` and apply the fixes I agree with.

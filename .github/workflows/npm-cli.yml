@@ -2,14 +2,11 @@ name: npm CLI
 
 # Cross-builds the lean standalone `toolport` CLI binary for all 5 platforms,
 # stages `@toolport/cli` + its 5 optional platform packages via
-# `scripts/stage-npm-cli.mjs`, and optionally publishes via npm OIDC Trusted
-# Publishing (`npm stage publish` or `npm publish --provenance`).
+# `scripts/stage-npm-cli.mjs`, and publishes automatically via npm OIDC Trusted
+# Publishing on every `v*` tag push (prereleases use `--tag next`).
 #
-# For the very first release (before npm Trusted Publishing can be linked on
-# npmjs.com), run with `publish_mode: artifact-only` (or push a `v*` tag),
-# download the `npm-cli-packages` artifact, publish the 6 packages once with
-# interactive 2FA, and then link this workflow as a Trusted Publisher on each
-# package in the `toolport` npm org.
+# Manual `workflow_dispatch` runs can choose `artifact-only`, `npm-stage`, or
+# `npm-direct`.
 on:
   push:
     tags:
@@ -139,6 +136,10 @@ jobs:
           node --test packages/toolport-cli/test/launcher.test.mjs scripts/stage-npm-cli.test.mjs
           node scripts/stage-npm-cli.mjs --check
 
+      - name: Check release tag matches embedded versions
+        if: github.event_name == 'push'
+        run: node scripts/check-release-version.mjs "$GITHUB_REF_NAME"
+
       - name: Stage all 6 npm packages
         id: stage
         shell: bash
@@ -170,11 +171,23 @@ jobs:
           if-no-files-found: error
 
       - name: Publish via npm OIDC Trusted Publishing
-        if: inputs.publish_mode == 'npm-stage' || inputs.publish_mode == 'npm-direct'
+        if: github.event_name == 'push' || inputs.publish_mode == 'npm-stage' || inputs.publish_mode == 'npm-direct'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUBLISH_MODE: ${{ inputs.publish_mode }}
+          STAGE_VERSION: ${{ steps.stage.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
           npm --version
+          MODE="$PUBLISH_MODE"
+          if [ "$EVENT_NAME" = "push" ]; then
+            MODE="npm-direct"
+          fi
+          TAG_ARGS=()
+          if [[ "$STAGE_VERSION" == *-* ]]; then
+            TAG_ARGS=(--tag next)
+          fi
           # Platform packages first so optionalDependencies resolve before @toolport/cli lands.
           for dir in \
             dist/npm/cli-darwin-arm64 \
@@ -183,9 +196,9 @@ jobs:
             dist/npm/cli-linux-x64 \
             dist/npm/cli-win32-x64 \
             dist/npm/cli; do
-            if [ "${{ inputs.publish_mode }}" = "npm-stage" ]; then
-              (cd "$dir" && npm stage publish --access public)
+            if [ "$MODE" = "npm-stage" ]; then
+              (cd "$dir" && npm stage publish --access public "${TAG_ARGS[@]}")
             else
-              (cd "$dir" && npm publish --provenance --access public)
+              (cd "$dir" && npm publish --provenance --access public "${TAG_ARGS[@]}")
             fi
           done
