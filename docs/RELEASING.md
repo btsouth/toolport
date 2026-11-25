@@ -54,6 +54,12 @@ checks the image's `io.modelcontextprotocol.server.name` label and publishes `se
 over GitHub OIDC. Nothing waits on it; to retry, dispatch `docker-publish.yml` with
 `registry_tag=vX.Y.Z`.
 
+The **standalone npm CLI** (`@toolport/cli` plus its five platform packages) builds and
+publishes automatically on every `v*` tag push via `.github/workflows/npm-cli.yml` using
+npm OIDC Trusted Publishing with provenance (prerelease tags publish under the `next`
+dist-tag). To dry-run or re-stage manually, dispatch `npm-cli.yml` with
+`publish_mode=artifact-only` or `npm-stage`.
+
 ## 2.0 staged rollout
 
 Publish 2.0.0 for manual installation first. Hold the 1.x in-app update offer
