@@ -867,6 +867,16 @@ fn split_shell_segments(cmd: &str) -> Vec<&str> {
             b'\\' if i + 1 < bytes.len() => {
                 i += 2;
             }
+            b'#' if i == start
+                || matches!(
+                    bytes[i - 1],
+                    b' ' | b'\t' | b'\r' | b'\n' | b';' | b'&' | b'|' | b'(' | b'{'
+                ) =>
+            {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
             b'<' if i + 1 < bytes.len() && bytes[i + 1] == b'<' => {
                 if let Some((strip_tabs, delim, next)) = parse_heredoc_marker(cmd, i) {
                     heredocs.push((strip_tabs, delim));
@@ -2178,7 +2188,12 @@ fn extract_all_js_cmd_literals(script: &str) -> Vec<String> {
             let mut closed = false;
             for c in chars {
                 if escaped {
-                    buf.push(c);
+                    match c {
+                        'n' => buf.push('\n'),
+                        'r' => buf.push('\r'),
+                        't' => buf.push('\t'),
+                        other => buf.push(other),
+                    }
                     escaped = false;
                 } else if c == '\\' {
                     escaped = true;
@@ -2772,26 +2787,28 @@ pub fn parse_codex(path: &Path) -> DaySummaries {
                         });
                         let (raw_category, servers) =
                             codex_category(name, p.namespace.as_deref(), input.as_deref());
-                        let (category, shell_cmd) = if name == "wait" {
-                            extract_codex_id_field(input.as_deref(), "cell_id")
-                                .and_then(|cid| cell_ids.get(&cid).cloned())
-                                .unwrap_or_else(|| (shell_category_key("other"), None))
-                        } else if name == "write_stdin" {
-                            extract_codex_id_field(input.as_deref(), "session_id")
-                                .and_then(|sid| session_ids.get(&sid).cloned())
-                                .unwrap_or_else(|| (shell_category_key("other"), None))
-                        } else if raw_category == "bash" {
-                            let sc = extract_codex_shell_command(
-                                name,
-                                input.as_deref(),
-                                p.action.as_ref(),
-                            )
-                            .map(classify_extracted_shell)
-                            .unwrap_or(ShellClass {
-                                bucket: "other",
-                                command: None,
-                            });
-                            (shell_category_key(sc.bucket), sc.command)
+                        let (category, shell_cmd) = if raw_category == "bash" {
+                            if name == "wait" {
+                                extract_codex_id_field(input.as_deref(), "cell_id")
+                                    .and_then(|cid| cell_ids.get(&cid).cloned())
+                                    .unwrap_or_else(|| (shell_category_key("other"), None))
+                            } else if name == "write_stdin" {
+                                extract_codex_id_field(input.as_deref(), "session_id")
+                                    .and_then(|sid| session_ids.get(&sid).cloned())
+                                    .unwrap_or_else(|| (shell_category_key("other"), None))
+                            } else {
+                                let sc = extract_codex_shell_command(
+                                    name,
+                                    input.as_deref(),
+                                    p.action.as_ref(),
+                                )
+                                .map(classify_extracted_shell)
+                                .unwrap_or(ShellClass {
+                                    bucket: "other",
+                                    command: None,
+                                });
+                                (shell_category_key(sc.bucket), sc.command)
+                            }
                         } else {
                             (raw_category, None)
                         };
@@ -4725,6 +4742,13 @@ mod tests {
         // Multibyte UTF-8 and unterminated quotes never panic.
         check("rg \"日本語の検索", "read", Some("rg"));
         check("cat 'unterminated 🦀", "read", Some("cat"));
+        // Comments with separators or heredoc markers do not affect following commands.
+        check(
+            "# Previous attempt; cargo test\ngit diff",
+            "git",
+            Some("git diff"),
+        );
+        check("# fake <<EOF\ngit status", "git", Some("git status"));
     }
 
     #[test]
@@ -4737,6 +4761,18 @@ mod tests {
             Some(ShellClass {
                 bucket: "read",
                 command: Some("rg")
+            })
+        );
+        // Multiline escaped JS cmd literal decodes `\n` before splitting segments.
+        assert_eq!(
+            classify(
+                "exec",
+                Some(r#"text(await tools.exec_command({cmd:"cd /repo\ncargo test"}))"#),
+                None
+            ),
+            Some(ShellClass {
+                bucket: "test",
+                command: Some("cargo test")
             })
         );
         let action = CodexAction {
@@ -4865,6 +4901,27 @@ mod tests {
                         "output": "y".repeat(2000)
                     }
                 }),
+                // An MCP tool named `wait` must stay in its MCP server category, not bash:other.
+                serde_json::json!({
+                    "timestamp": "2026-11-24T10:00:11Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "namespace": "mcp__jobs",
+                        "name": "wait",
+                        "call_id": "c5",
+                        "arguments": r#"{"job_id":"j1"}"#
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-11-24T10:00:12Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "c5",
+                        "output": "w".repeat(1200)
+                    }
+                }),
             ],
         );
         let csum = in_window(&parse_codex(&codex_path), 0);
@@ -4876,6 +4933,11 @@ mod tests {
         assert!(
             csum.produced.get("bash:git").copied().unwrap_or(0) >= 500,
             "write_stdin output attributed to bash:git: {:?}",
+            csum.produced
+        );
+        assert!(
+            csum.produced.get("mcp:jobs").copied().unwrap_or(0) >= 300,
+            "MCP wait stays under mcp:jobs: {:?}",
             csum.produced
         );
         assert_eq!(csum.produced.get("bash:other").copied().unwrap_or(0), 0);
