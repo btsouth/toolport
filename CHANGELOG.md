@@ -25,9 +25,10 @@ before updating.
   token and cache behavior offline across Claude Code, Codex, OpenCode, and
   `audit.jsonl`, and bootstrap repos from a secret-free `toolport.toml`. (#1428)
 - Code mode discovery (`code-mode`, "Code mode · scripts" in both desktop apps)
-  exposes `toolport_describe` and `toolport_run` so agents can batch multi-call
-  workflows in a single script instead of pulling every intermediate payload
-  into context. (#1428)
+  exposes `toolport_run_script` alongside `toolport_search_tools` and
+  `toolport_fetch_result`, with `toolport.describe(name)` inside scripts so
+  agents can batch multi-call workflows in a single script instead of pulling
+  every intermediate payload into context. (#1428)
 - Compact result shaping and structured queries on `toolport_fetch_result`
   (`path`, `where`, `fields`, `grep`, `sort`, `limit`, `skip`), lossless JSON
   whitespace minification, and suppressed no-op `tools/list_changed`
