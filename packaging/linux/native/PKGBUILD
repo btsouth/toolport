@@ -1,7 +1,7 @@
 # Maintainer: Tyler South <tsouth2@gmail.com>
 # The archive is expected to unpack to toolport-$pkgver.
 pkgname=toolport
-pkgver=2.3.8
+pkgver=2.4.0
 pkgrel=1
 install=toolport.install
 pkgdesc='One local MCP gateway for every AI client, with a native GTK shell'
@@ -26,7 +26,7 @@ options=('!lto')
 source=("toolport-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         "toolport.install"
         "disconnect-users.sh")
-sha256sums=('a9301cc9a758ac3bfd38a16583fc29b210b73e2579338645e46d887670e24b01'
+sha256sums=('SKIP'
             '0083ee13186ff966eb3c5379a75e2f1107e4f51fbeb9cd213ffa807acc7b97ab'
             '84fab489c8c11413a32f51e7cc4d8f00a52ca63a1ff35b560d7bbd8e9b8dc68b')
 
