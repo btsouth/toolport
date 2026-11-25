@@ -136,6 +136,10 @@ jobs:
           node --test packages/toolport-cli/test/launcher.test.mjs scripts/stage-npm-cli.test.mjs
           node scripts/stage-npm-cli.mjs --check
 
+      - name: Check release tag matches embedded versions
+        if: github.event_name == 'push'
+        run: node scripts/check-release-version.mjs "$GITHUB_REF_NAME"
+
       - name: Stage all 6 npm packages
         id: stage
         shell: bash
