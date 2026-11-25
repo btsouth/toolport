@@ -214,6 +214,30 @@ fn usage_profiles_claude_and_codex_sessions() {
         .sum();
     assert!((total - 1.0).abs() < 0.02, "shares add up: {total}");
 
+    let shell = r["shell"].as_array().unwrap();
+    let test_row = shell.iter().find(|s| s["category"] == "test").unwrap();
+    assert_eq!(test_row["calls"], 1);
+    assert!(test_row["topCommands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c == "cargo test"));
+    let read_row = shell.iter().find(|s| s["category"] == "read").unwrap();
+    assert_eq!(read_row["calls"], 1);
+    assert!(read_row["topCommands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c == "ls"));
+    let shell_share_sum: f64 = shell
+        .iter()
+        .map(|s| s["shellShare"].as_f64().unwrap())
+        .sum();
+    assert!(
+        (shell_share_sum - 1.0).abs() < 0.02,
+        "shell shares add up: {shell_share_sum}"
+    );
+
     assert_eq!(r["waste"]["duplicateReads"], 1);
     assert_eq!(r["waste"]["images"], 1);
     assert_eq!(r["cache"]["breaks"], 1, "{:#}", r["cache"]);
@@ -261,6 +285,7 @@ fn usage_caches_summaries_and_rereads_changed_files() {
     assert_eq!(second["stats"]["cached"], 2);
     assert_eq!(first["totals"], second["totals"]);
     assert_eq!(first["resident"], second["resident"]);
+    assert_eq!(first["shell"], second["shell"]);
 
     // Appending to one transcript re-reads only that one.
     let path = f.home.join(".codex/sessions/2026/11/24/rollout-c1.jsonl");
@@ -290,6 +315,7 @@ fn usage_filters_by_client_and_handles_an_empty_machine() {
     let human = stdout(&f.run(&["usage"]));
     for heading in [
         "What stays in context",
+        "Shell output",
         "Cache health",
         "MCP servers",
         "Recommendations",

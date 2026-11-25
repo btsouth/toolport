@@ -24,7 +24,7 @@ use super::format::{self, Align, Severity, Style};
 use super::{Args, CliError, Ctx, EXIT_OK};
 
 /// Bump when [`FileSummary`] or the parsers change meaning, so old cache entries are ignored.
-const CACHE_VERSION: u32 = 5;
+const CACHE_VERSION: u32 = 6;
 /// A session with this many calls to one MCP server is a burst: a Code Mode candidate.
 pub const BURST_CALLS: u64 = 9;
 /// An image that stays in context this many turns is lingering.
@@ -196,7 +196,7 @@ fn units(sources: &Sources, filter: &BTreeSet<Client>, since_ms: u64) -> Vec<Uni
     };
     if filter.contains(&Client::Claude) {
         for root in &sources.claude {
-            add(Client::Claude, root, root.join("projects"), 4);
+            add(Client::Claude, root, root.join("projects"), 8);
         }
     }
     if filter.contains(&Client::Codex) {
@@ -297,6 +297,9 @@ pub struct FileSummary {
     pub produced: BTreeMap<String, u64>,
     pub tool_calls: BTreeMap<String, u64>,
     pub mcp_calls: BTreeMap<String, u64>,
+    /// Allowlisted shell command counts and produced tokens, keyed by `"<bucket>\u{1f}<cmd>"`.
+    #[serde(default)]
+    pub shell_commands: BTreeMap<String, (u64, u64)>,
     pub images: u64,
     pub image_tokens: u64,
     pub images_lingering: u64,
@@ -338,6 +341,11 @@ impl FileSummary {
         add_map(&mut self.produced, o.produced);
         add_map(&mut self.tool_calls, o.tool_calls);
         add_map(&mut self.mcp_calls, o.mcp_calls);
+        for (k, (calls, tok)) in o.shell_commands {
+            let e = self.shell_commands.entry(k).or_default();
+            e.0 += calls;
+            e.1 += tok;
+        }
         self.images += o.images;
         self.image_tokens += o.image_tokens;
         self.images_lingering += o.images_lingering;
@@ -724,6 +732,1174 @@ fn claude_category(name: &str, input: Option<&RawValue>) -> String {
     .to_string()
 }
 
+/// Classification of one shell command: a fixed bucket plus an allowlisted, path-free label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShellClass {
+    bucket: &'static str,
+    command: Option<&'static str>,
+}
+
+fn shell_label(bucket: &str) -> &'static str {
+    match bucket {
+        "read" => "File reads & search",
+        "git" => "Git & GitHub",
+        "test" => "Tests & verification",
+        "build" => "Builds, lint & typecheck",
+        "script" => "Scripts & data tools",
+        "net" => "Network & packages",
+        _ => "Other commands",
+    }
+}
+
+fn shell_category_key(bucket: &str) -> String {
+    format!("bash:{bucket}")
+}
+
+fn record_shell_command(
+    s: &mut FileSummary,
+    category: &str,
+    cmd: Option<&'static str>,
+    tokens: u64,
+) {
+    let Some(bucket) = category.strip_prefix("bash:") else {
+        return;
+    };
+    let Some(cmd) = cmd else {
+        return;
+    };
+    let entry = s
+        .shell_commands
+        .entry(format!("{bucket}\u{1f}{cmd}"))
+        .or_default();
+    entry.0 += 1;
+    entry.1 += tokens;
+}
+
+/// Split a shell command into top-level `&&` / `||` / `;` / newline segments without breaking
+/// quoted strings or parenthesized subshells.
+fn split_shell_segments(cmd: &str) -> Vec<&str> {
+    let bytes = cmd.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut quote = 0u8;
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if quote != 0 {
+            if b == b'\\' && quote == b'"' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == quote {
+                quote = 0;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => {
+                quote = b;
+                i += 1;
+            }
+            b'\\' if i + 1 < bytes.len() => {
+                i += 2;
+            }
+            b'(' | b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' | b'}' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b';' | b'\n' if depth == 0 => {
+                out.push(&cmd[start..i]);
+                i += 1;
+                start = i;
+            }
+            b'&' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
+                out.push(&cmd[start..i]);
+                i += 2;
+                start = i;
+            }
+            b'|' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'|' => {
+                out.push(&cmd[start..i]);
+                i += 2;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    if start < cmd.len() {
+        out.push(&cmd[start..]);
+    }
+    out
+}
+
+/// Tokenize the first pipeline stage of one segment (stops at top-level `|`, `<`, `>`, `#`).
+fn tokenize_first_stage(seg: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut chars = seg.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut in_token = false;
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            if c == '\\' && q == '"' {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+            } else if c == q {
+                quote = None;
+            } else {
+                cur.push(c);
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                in_token = true;
+            }
+            '\\' => {
+                in_token = true;
+                match chars.peek().copied() {
+                    Some(next)
+                        if next.is_whitespace()
+                            || matches!(next, '"' | '\'' | '|' | '<' | '>' | '\\' | ';') =>
+                    {
+                        cur.push(chars.next().unwrap());
+                    }
+                    _ => cur.push('\\'),
+                }
+            }
+            c if c.is_whitespace() => {
+                if in_token {
+                    tokens.push(std::mem::take(&mut cur));
+                    in_token = false;
+                    if tokens.len() >= 16 {
+                        break;
+                    }
+                }
+            }
+            '|' | '<' | '>' => {
+                // Keep numeric fd prefix out of tokens (e.g. `2>&1`).
+                if in_token && !cur.chars().all(|ch| ch.is_ascii_digit()) {
+                    tokens.push(std::mem::take(&mut cur));
+                }
+                break;
+            }
+            '#' if !in_token => break,
+            _ => {
+                in_token = true;
+                cur.push(c);
+            }
+        }
+    }
+    if in_token && tokens.len() < 16 {
+        tokens.push(cur);
+    }
+    tokens
+}
+
+fn is_env_assignment(tok: &str) -> bool {
+    let Some((name, _)) = tok.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()))
+}
+
+fn base_command_name(tok: &str) -> String {
+    let tail = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
+    let lower = tail.to_ascii_lowercase();
+    lower
+        .strip_suffix(".exe")
+        .or_else(|| lower.strip_suffix(".cmd"))
+        .or_else(|| lower.strip_suffix(".bat"))
+        .unwrap_or(&lower)
+        .to_string()
+}
+
+fn is_setup_builtin(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "cd" | "pushd"
+            | "popd"
+            | "export"
+            | "set"
+            | "unset"
+            | "source"
+            | "."
+            | "umask"
+            | "shopt"
+            | "ulimit"
+            | "true"
+            | ":"
+            | "mkdir"
+            | "rm"
+            | "touch"
+            | "trap"
+            | "local"
+            | "declare"
+            | "typeset"
+    )
+}
+
+fn classify_segment(seg: &str, depth: u8) -> Option<ShellClass> {
+    if depth > 4 {
+        return None;
+    }
+    let trimmed = seg.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let tokens = tokenize_first_stage(trimmed);
+    classify_tokens(&tokens, depth)
+}
+
+fn classify_tokens(tokens: &[String], depth: u8) -> Option<ShellClass> {
+    if depth > 4 {
+        return None;
+    }
+    let mut i = 0usize;
+    while i < tokens.len() && is_env_assignment(&tokens[i]) {
+        i += 1;
+    }
+    if i >= tokens.len() {
+        return None;
+    }
+
+    // Unwrap common command wrappers (`env`, `nohup`, `timeout`, `sudo`, `ssh`, `bash -lc`, etc.).
+    let mut loops = 0u8;
+    while i < tokens.len() && loops < 6 {
+        loops += 1;
+        while i < tokens.len() && is_env_assignment(&tokens[i]) {
+            i += 1;
+        }
+        if i >= tokens.len() {
+            return None;
+        }
+        let cmd = base_command_name(&tokens[i]);
+        match cmd.as_str() {
+            "env" => {
+                i += 1;
+                while i < tokens.len() {
+                    let t = tokens[i].as_str();
+                    if matches!(t, "-u" | "-C" | "-S" | "--unset" | "--chdir") {
+                        i += 2;
+                    } else if t.starts_with('-') || is_env_assignment(t) {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "nohup" | "time" | "command" | "exec" | "builtin" => {
+                i += 1;
+                while i < tokens.len() && tokens[i].starts_with('-') {
+                    i += 1;
+                }
+            }
+            "sudo" | "doas" => {
+                i += 1;
+                while i < tokens.len() {
+                    let t = tokens[i].as_str();
+                    if matches!(t, "-u" | "-g" | "-C" | "-p" | "-h") {
+                        i += 2;
+                    } else if t.starts_with('-') || is_env_assignment(t) {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "nice" => {
+                i += 1;
+                if i < tokens.len() && tokens[i] == "-n" {
+                    i += 2;
+                } else if i < tokens.len() && tokens[i].starts_with('-') {
+                    i += 1;
+                }
+            }
+            "timeout" => {
+                i += 1;
+                while i < tokens.len() {
+                    let t = tokens[i].as_str();
+                    if matches!(t, "-k" | "-s") {
+                        i += 2;
+                    } else if t.starts_with('-') {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                // Skip duration argument.
+                if i < tokens.len() {
+                    i += 1;
+                }
+            }
+            "stdbuf" | "xvfb-run" => {
+                i += 1;
+                while i < tokens.len() {
+                    let t = tokens[i].as_str();
+                    if matches!(t, "-s" | "-f" | "-n" | "-e" | "-i" | "-o") {
+                        i += 2;
+                    } else if t.starts_with('-') {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "heavy-run" | "burst-run" => {
+                if let Some(pos) = tokens[i + 1..].iter().position(|t| t == "--") {
+                    i += 1 + pos + 1;
+                } else {
+                    break;
+                }
+            }
+            "bash" | "sh" | "zsh" | "dash" | "fish" => {
+                if let Some(pos) = tokens[i + 1..]
+                    .iter()
+                    .position(|t| matches!(t.as_str(), "-c" | "-lc" | "-cl" | "-ec" | "-ce"))
+                {
+                    if let Some(script) = tokens.get(i + 1 + pos + 1) {
+                        return Some(classify_shell_command_depth(script, depth + 1));
+                    }
+                }
+                break;
+            }
+            "cmd" => {
+                if let Some(pos) = tokens[i + 1..]
+                    .iter()
+                    .position(|t| t.eq_ignore_ascii_case("/c"))
+                {
+                    let rest = tokens[i + 1 + pos + 1..].join(" ");
+                    if !rest.is_empty() {
+                        return Some(classify_shell_command_depth(&rest, depth + 1));
+                    }
+                }
+                break;
+            }
+            "ssh" => {
+                let mut j = i + 1;
+                while j < tokens.len() {
+                    let t = tokens[j].as_str();
+                    if matches!(
+                        t,
+                        "-b" | "-c"
+                            | "-D"
+                            | "-E"
+                            | "-e"
+                            | "-F"
+                            | "-I"
+                            | "-i"
+                            | "-J"
+                            | "-L"
+                            | "-l"
+                            | "-m"
+                            | "-O"
+                            | "-o"
+                            | "-p"
+                            | "-Q"
+                            | "-R"
+                            | "-S"
+                            | "-W"
+                            | "-w"
+                    ) {
+                        j += 2;
+                    } else if t.starts_with('-') {
+                        j += 1;
+                    } else {
+                        // Host token.
+                        j += 1;
+                        break;
+                    }
+                }
+                if j < tokens.len() {
+                    if j + 1 == tokens.len() {
+                        return Some(classify_shell_command_depth(&tokens[j], depth + 1));
+                    }
+                    let rest = tokens[j..].join(" ");
+                    return Some(classify_shell_command_depth(&rest, depth + 1));
+                }
+                return Some(ShellClass {
+                    bucket: "net",
+                    command: Some("ssh"),
+                });
+            }
+            _ => break,
+        }
+    }
+
+    if i >= tokens.len() {
+        return None;
+    }
+
+    let raw = tokens[i].as_str();
+    let cmd = base_command_name(raw);
+    if is_setup_builtin(&cmd) {
+        return None;
+    }
+
+    let args = &tokens[i + 1..];
+    let first_sub = |skip_with_arg: &[&str]| -> Option<String> {
+        let mut j = 0usize;
+        while j < args.len() {
+            let t = args[j].as_str();
+            if skip_with_arg.contains(&t) {
+                j += 2;
+            } else if t.starts_with('-') {
+                j += 1;
+            } else {
+                return Some(t.to_ascii_lowercase());
+            }
+        }
+        None
+    };
+
+    let classified = match cmd.as_str() {
+        // File reads, dumps, and search.
+        "cat" => ShellClass {
+            bucket: "read",
+            command: Some("cat"),
+        },
+        "sed" => ShellClass {
+            bucket: "read",
+            command: Some("sed"),
+        },
+        "rg" => ShellClass {
+            bucket: "read",
+            command: Some("rg"),
+        },
+        "grep" | "egrep" | "fgrep" => ShellClass {
+            bucket: "read",
+            command: Some("grep"),
+        },
+        "ag" | "ack" => ShellClass {
+            bucket: "read",
+            command: Some("grep"),
+        },
+        "find" => ShellClass {
+            bucket: "read",
+            command: Some("find"),
+        },
+        "fd" => ShellClass {
+            bucket: "read",
+            command: Some("fd"),
+        },
+        "ls" | "dir" | "get-childitem" => ShellClass {
+            bucket: "read",
+            command: Some("ls"),
+        },
+        "tree" => ShellClass {
+            bucket: "read",
+            command: Some("tree"),
+        },
+        "head" => ShellClass {
+            bucket: "read",
+            command: Some("head"),
+        },
+        "tail" => ShellClass {
+            bucket: "read",
+            command: Some("tail"),
+        },
+        "awk" | "gawk" => ShellClass {
+            bucket: "read",
+            command: Some("awk"),
+        },
+        "wc" => ShellClass {
+            bucket: "read",
+            command: Some("wc"),
+        },
+        "nl" => ShellClass {
+            bucket: "read",
+            command: Some("nl"),
+        },
+        "bat" => ShellClass {
+            bucket: "read",
+            command: Some("bat"),
+        },
+        "less" | "more" => ShellClass {
+            bucket: "read",
+            command: Some("less"),
+        },
+        "diff" => ShellClass {
+            bucket: "read",
+            command: Some("diff"),
+        },
+        "stat" => ShellClass {
+            bucket: "read",
+            command: Some("stat"),
+        },
+        "file" => ShellClass {
+            bucket: "read",
+            command: Some("file"),
+        },
+        "du" | "df" => ShellClass {
+            bucket: "read",
+            command: Some("du"),
+        },
+        "get-content" | "type" => ShellClass {
+            bucket: "read",
+            command: Some("cat"),
+        },
+        "select-string" => ShellClass {
+            bucket: "read",
+            command: Some("grep"),
+        },
+
+        // Git & GitHub / VCS.
+        "git" => {
+            let sub = first_sub(&["-C", "-c", "--git-dir", "--work-tree"]);
+            let label = match sub.as_deref() {
+                Some("diff") => "git diff",
+                Some("log") => "git log",
+                Some("show") => "git show",
+                Some("status") => "git status",
+                Some("blame") => "git blame",
+                Some("branch") => "git branch",
+                Some("fetch") => "git fetch",
+                Some("pull") => "git pull",
+                Some("push") => "git push",
+                Some("commit") => "git commit",
+                Some("checkout") => "git checkout",
+                Some("switch") => "git switch",
+                Some("rebase") => "git rebase",
+                Some("merge") => "git merge",
+                Some("stash") => "git stash",
+                Some("worktree") => "git worktree",
+                Some("rev-parse") => "git rev-parse",
+                Some("ls-files") => "git ls-files",
+                _ => "git",
+            };
+            ShellClass {
+                bucket: "git",
+                command: Some(label),
+            }
+        }
+        "gh" => {
+            let sub = first_sub(&["-R", "--repo"]);
+            let label = match sub.as_deref() {
+                Some("pr") => "gh pr",
+                Some("issue") => "gh issue",
+                Some("run") => "gh run",
+                Some("workflow") => "gh workflow",
+                Some("api") => "gh api",
+                Some("repo") => "gh repo",
+                Some("release") => "gh release",
+                Some("search") => "gh search",
+                _ => "gh",
+            };
+            ShellClass {
+                bucket: "git",
+                command: Some(label),
+            }
+        }
+        "glab" => ShellClass {
+            bucket: "git",
+            command: Some("glab"),
+        },
+        "jj" => ShellClass {
+            bucket: "git",
+            command: Some("jj"),
+        },
+        "hg" => ShellClass {
+            bucket: "git",
+            command: Some("hg"),
+        },
+
+        // Direct test runners.
+        "pytest" => ShellClass {
+            bucket: "test",
+            command: Some("pytest"),
+        },
+        "vitest" => ShellClass {
+            bucket: "test",
+            command: Some("vitest"),
+        },
+        "jest" => ShellClass {
+            bucket: "test",
+            command: Some("jest"),
+        },
+        "mocha" => ShellClass {
+            bucket: "test",
+            command: Some("mocha"),
+        },
+        "playwright" => ShellClass {
+            bucket: "test",
+            command: Some("playwright"),
+        },
+        "rspec" => ShellClass {
+            bucket: "test",
+            command: Some("rspec"),
+        },
+        "phpunit" => ShellClass {
+            bucket: "test",
+            command: Some("phpunit"),
+        },
+        "ctest" => ShellClass {
+            bucket: "test",
+            command: Some("ctest"),
+        },
+
+        // Cargo / Go / Node / JS package managers.
+        "cargo" => {
+            match first_sub(&["--manifest-path", "--target-dir", "-p", "--package"]).as_deref() {
+                Some("test") => ShellClass {
+                    bucket: "test",
+                    command: Some("cargo test"),
+                },
+                Some("nextest") => ShellClass {
+                    bucket: "test",
+                    command: Some("cargo nextest"),
+                },
+                Some("build") => ShellClass {
+                    bucket: "build",
+                    command: Some("cargo build"),
+                },
+                Some("check") => ShellClass {
+                    bucket: "build",
+                    command: Some("cargo check"),
+                },
+                Some("clippy") => ShellClass {
+                    bucket: "build",
+                    command: Some("cargo clippy"),
+                },
+                Some("fmt") => ShellClass {
+                    bucket: "build",
+                    command: Some("cargo fmt"),
+                },
+                Some("bench") => ShellClass {
+                    bucket: "build",
+                    command: Some("cargo bench"),
+                },
+                Some("doc") => ShellClass {
+                    bucket: "build",
+                    command: Some("cargo doc"),
+                },
+                Some("install" | "add" | "fetch" | "update") => ShellClass {
+                    bucket: "net",
+                    command: Some("cargo install"),
+                },
+                _ => ShellClass {
+                    bucket: "build",
+                    command: Some("cargo"),
+                },
+            }
+        }
+        "go" => match first_sub(&[]).as_deref() {
+            Some("test") => ShellClass {
+                bucket: "test",
+                command: Some("go test"),
+            },
+            Some("build") => ShellClass {
+                bucket: "build",
+                command: Some("go build"),
+            },
+            Some("vet") => ShellClass {
+                bucket: "build",
+                command: Some("go vet"),
+            },
+            Some("get" | "mod") => ShellClass {
+                bucket: "net",
+                command: Some("go mod"),
+            },
+            _ => ShellClass {
+                bucket: "script",
+                command: Some("go"),
+            },
+        },
+        "npm" | "pnpm" | "yarn" | "bun" => classify_js_runner(&cmd, args),
+        "npx" | "bunx" => classify_npx(args),
+
+        // Direct build, lint, format, and typecheck tools.
+        "tsc" => ShellClass {
+            bucket: "build",
+            command: Some("tsc"),
+        },
+        "eslint" => ShellClass {
+            bucket: "build",
+            command: Some("eslint"),
+        },
+        "prettier" => ShellClass {
+            bucket: "build",
+            command: Some("prettier"),
+        },
+        "biome" => ShellClass {
+            bucket: "build",
+            command: Some("biome"),
+        },
+        "ruff" => ShellClass {
+            bucket: "build",
+            command: Some("ruff"),
+        },
+        "mypy" => ShellClass {
+            bucket: "build",
+            command: Some("mypy"),
+        },
+        "pyright" => ShellClass {
+            bucket: "build",
+            command: Some("pyright"),
+        },
+        "flake8" => ShellClass {
+            bucket: "build",
+            command: Some("flake8"),
+        },
+        "black" => ShellClass {
+            bucket: "build",
+            command: Some("black"),
+        },
+        "rustc" => ShellClass {
+            bucket: "build",
+            command: Some("rustc"),
+        },
+        "rustfmt" => ShellClass {
+            bucket: "build",
+            command: Some("rustfmt"),
+        },
+        "gcc" | "g++" | "clang" | "clang++" => ShellClass {
+            bucket: "build",
+            command: Some("cc"),
+        },
+        "make" | "gmake" => ShellClass {
+            bucket: "build",
+            command: Some("make"),
+        },
+        "cmake" => ShellClass {
+            bucket: "build",
+            command: Some("cmake"),
+        },
+        "ninja" => ShellClass {
+            bucket: "build",
+            command: Some("ninja"),
+        },
+        "vite" => ShellClass {
+            bucket: "build",
+            command: Some("vite"),
+        },
+        "webpack" => ShellClass {
+            bucket: "build",
+            command: Some("webpack"),
+        },
+        "esbuild" | "rollup" | "tsup" => ShellClass {
+            bucket: "build",
+            command: Some("bundler"),
+        },
+        "makepkg" => ShellClass {
+            bucket: "build",
+            command: Some("makepkg"),
+        },
+        "xcodebuild" | "swift" => ShellClass {
+            bucket: "build",
+            command: Some("swift"),
+        },
+        "dotnet" => match first_sub(&[]).as_deref() {
+            Some("test") => ShellClass {
+                bucket: "test",
+                command: Some("dotnet test"),
+            },
+            Some("build") => ShellClass {
+                bucket: "build",
+                command: Some("dotnet build"),
+            },
+            _ => ShellClass {
+                bucket: "build",
+                command: Some("dotnet"),
+            },
+        },
+        "mvn" | "gradle" | "gradlew" => match first_sub(&[]).as_deref() {
+            Some("test") => ShellClass {
+                bucket: "test",
+                command: Some("gradle test"),
+            },
+            _ => ShellClass {
+                bucket: "build",
+                command: Some("gradle"),
+            },
+        },
+        "docker" | "podman" => match first_sub(&[]).as_deref() {
+            Some("build" | "buildx") => ShellClass {
+                bucket: "build",
+                command: Some("docker build"),
+            },
+            Some("compose") => ShellClass {
+                bucket: "build",
+                command: Some("docker compose"),
+            },
+            _ => ShellClass {
+                bucket: "net",
+                command: Some("docker"),
+            },
+        },
+
+        // Scripts and structured data tools.
+        "python" | "python3" => ShellClass {
+            bucket: "script",
+            command: Some("python3"),
+        },
+        "node" => ShellClass {
+            bucket: "script",
+            command: Some("node"),
+        },
+        "deno" => ShellClass {
+            bucket: "script",
+            command: Some("deno"),
+        },
+        "ruby" => ShellClass {
+            bucket: "script",
+            command: Some("ruby"),
+        },
+        "perl" => ShellClass {
+            bucket: "script",
+            command: Some("perl"),
+        },
+        "php" => ShellClass {
+            bucket: "script",
+            command: Some("php"),
+        },
+        "jq" => ShellClass {
+            bucket: "script",
+            command: Some("jq"),
+        },
+        "yq" => ShellClass {
+            bucket: "script",
+            command: Some("yq"),
+        },
+        "sqlite3" => ShellClass {
+            bucket: "script",
+            command: Some("sqlite3"),
+        },
+        "psql" => ShellClass {
+            bucket: "script",
+            command: Some("psql"),
+        },
+        "mysql" => ShellClass {
+            bucket: "script",
+            command: Some("mysql"),
+        },
+        "bash" | "sh" | "zsh" | "dash" | "fish" => ShellClass {
+            bucket: "script",
+            command: Some("bash"),
+        },
+        "pwsh" | "powershell" => ShellClass {
+            bucket: "script",
+            command: Some("pwsh"),
+        },
+
+        // Network, remote, and package managers.
+        "curl" => ShellClass {
+            bucket: "net",
+            command: Some("curl"),
+        },
+        "wget" => ShellClass {
+            bucket: "net",
+            command: Some("wget"),
+        },
+        "http" | "xh" => ShellClass {
+            bucket: "net",
+            command: Some("http"),
+        },
+        "pip" | "pip3" => ShellClass {
+            bucket: "net",
+            command: Some("pip"),
+        },
+        "uv" => ShellClass {
+            bucket: "net",
+            command: Some("uv"),
+        },
+        "brew" => ShellClass {
+            bucket: "net",
+            command: Some("brew"),
+        },
+        "pacman" => ShellClass {
+            bucket: "net",
+            command: Some("pacman"),
+        },
+        "yay" | "paru" => ShellClass {
+            bucket: "net",
+            command: Some("aur"),
+        },
+        "apt" | "apt-get" | "dnf" => ShellClass {
+            bucket: "net",
+            command: Some("apt"),
+        },
+        "winget" | "choco" | "scoop" => ShellClass {
+            bucket: "net",
+            command: Some("winget"),
+        },
+        "kubectl" => ShellClass {
+            bucket: "net",
+            command: Some("kubectl"),
+        },
+        "scp" | "rsync" => ShellClass {
+            bucket: "net",
+            command: Some("rsync"),
+        },
+
+        // System inspection.
+        "systemctl" => ShellClass {
+            bucket: "other",
+            command: Some("systemctl"),
+        },
+        "journalctl" => ShellClass {
+            bucket: "other",
+            command: Some("journalctl"),
+        },
+        "ps" | "pgrep" => ShellClass {
+            bucket: "other",
+            command: Some("ps"),
+        },
+
+        _ => ShellClass {
+            bucket: "other",
+            command: None,
+        },
+    };
+    Some(classified)
+}
+
+fn classify_js_runner(runner: &str, args: &[String]) -> ShellClass {
+    let mut non_flags = args
+        .iter()
+        .filter(|a| !a.starts_with('-'))
+        .map(|a| a.to_ascii_lowercase());
+    let first = non_flags.next();
+    let second = non_flags.next();
+    let is_test_script = |s: &str| {
+        s == "test"
+            || s.starts_with("test:")
+            || s.starts_with("verify")
+            || s.starts_with("smoke")
+            || s.contains("e2e")
+            || s.contains("vitest")
+            || s.contains("jest")
+            || s.contains("playwright")
+    };
+    let is_build_script = |s: &str| {
+        s == "build"
+            || s.starts_with("build:")
+            || s.starts_with("lint")
+            || s.starts_with("typecheck")
+            || s.starts_with("check")
+            || s.starts_with("format")
+            || s == "fmt"
+            || s.starts_with("bench")
+    };
+    match first.as_deref() {
+        Some("test" | "t") => ShellClass {
+            bucket: "test",
+            command: Some(match runner {
+                "pnpm" => "pnpm test",
+                "yarn" => "yarn test",
+                "bun" => "bun test",
+                _ => "npm test",
+            }),
+        },
+        Some("install" | "ci" | "i" | "add" | "update" | "remove" | "uninstall") => ShellClass {
+            bucket: "net",
+            command: Some(match runner {
+                "pnpm" => "pnpm install",
+                "yarn" => "yarn install",
+                "bun" => "bun install",
+                _ => "npm install",
+            }),
+        },
+        Some("run") => match second.as_deref() {
+            Some(s) if is_test_script(s) => ShellClass {
+                bucket: "test",
+                command: Some("npm run test"),
+            },
+            Some(s) if is_build_script(s) => ShellClass {
+                bucket: "build",
+                command: Some("npm run build"),
+            },
+            _ => ShellClass {
+                bucket: "script",
+                command: Some("npm run"),
+            },
+        },
+        Some(s) if is_test_script(s) => ShellClass {
+            bucket: "test",
+            command: Some("npm test"),
+        },
+        Some(s) if is_build_script(s) => ShellClass {
+            bucket: "build",
+            command: Some("npm run build"),
+        },
+        Some("dlx" | "exec") => classify_npx(&args[1..]),
+        _ => ShellClass {
+            bucket: "script",
+            command: Some("npm"),
+        },
+    }
+}
+
+fn classify_npx(args: &[String]) -> ShellClass {
+    let tool = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .map(|a| a.to_ascii_lowercase());
+    match tool.as_deref() {
+        Some(t) if t.contains("vitest") => ShellClass {
+            bucket: "test",
+            command: Some("vitest"),
+        },
+        Some(t) if t.contains("jest") => ShellClass {
+            bucket: "test",
+            command: Some("jest"),
+        },
+        Some(t) if t.contains("playwright") => ShellClass {
+            bucket: "test",
+            command: Some("playwright"),
+        },
+        Some(t) if t.contains("tsc") => ShellClass {
+            bucket: "build",
+            command: Some("tsc"),
+        },
+        Some(t) if t.contains("eslint") => ShellClass {
+            bucket: "build",
+            command: Some("eslint"),
+        },
+        Some(t) if t.contains("prettier") => ShellClass {
+            bucket: "build",
+            command: Some("prettier"),
+        },
+        Some(t) if t.contains("biome") => ShellClass {
+            bucket: "build",
+            command: Some("biome"),
+        },
+        Some(t) if t.contains("vite") => ShellClass {
+            bucket: "build",
+            command: Some("vite"),
+        },
+        _ => ShellClass {
+            bucket: "script",
+            command: Some("npx"),
+        },
+    }
+}
+
+fn classify_shell_command(cmd: &str) -> ShellClass {
+    classify_shell_command_depth(cmd, 0)
+}
+
+fn classify_shell_command_depth(cmd: &str, depth: u8) -> ShellClass {
+    let mut fallback: Option<ShellClass> = None;
+    for seg in split_shell_segments(cmd) {
+        let Some(sc) = classify_segment(seg, depth) else {
+            continue;
+        };
+        // Prefer tests/builds/git/read/script/net over generic "other" (e.g. `echo ... && cargo test`).
+        if sc.bucket != "other" {
+            return sc;
+        }
+        if fallback.is_none() {
+            fallback = Some(sc);
+        }
+    }
+    fallback.unwrap_or(ShellClass {
+        bucket: "other",
+        command: None,
+    })
+}
+
+fn extract_claude_shell_command(input: Option<&RawValue>) -> Option<String> {
+    #[derive(Deserialize)]
+    struct BashInput<'a> {
+        #[serde(borrow)]
+        command: Option<std::borrow::Cow<'a, str>>,
+    }
+    input
+        .and_then(|i| serde_json::from_str::<BashInput>(i.get()).ok())
+        .and_then(|b| b.command.map(|c| c.into_owned()))
+}
+
+fn extract_codex_shell_command(
+    name: &str,
+    input: Option<&str>,
+    action: Option<&CodexAction>,
+) -> Option<String> {
+    if name == "local_shell" {
+        if let Some(cmd) = action.and_then(|a| a.command.as_deref()) {
+            return join_argv_command(cmd);
+        }
+    }
+    let raw = input?;
+    if name == "exec" {
+        return extract_js_cmd_literal(raw);
+    }
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StrOrVec {
+        Str(String),
+        Vec(Vec<String>),
+    }
+    #[derive(Deserialize)]
+    struct CodexShellArgs {
+        cmd: Option<StrOrVec>,
+        command: Option<StrOrVec>,
+    }
+    if let Ok(args) = serde_json::from_str::<CodexShellArgs>(raw) {
+        match args.cmd.or(args.command) {
+            Some(StrOrVec::Str(s)) => return Some(s),
+            Some(StrOrVec::Vec(v)) => return join_argv_command(&v),
+            None => {}
+        }
+    }
+    None
+}
+
+fn join_argv_command(argv: &[String]) -> Option<String> {
+    if argv.is_empty() {
+        return None;
+    }
+    if argv.len() >= 3
+        && matches!(
+            base_command_name(&argv[0]).as_str(),
+            "bash" | "sh" | "zsh" | "dash" | "fish"
+        )
+        && matches!(argv[1].as_str(), "-c" | "-lc" | "-cl")
+    {
+        return Some(argv[2].clone());
+    }
+    Some(argv.join(" "))
+}
+
+fn extract_js_cmd_literal(script: &str) -> Option<String> {
+    for needle in ["cmd:", "command:"] {
+        let Some(pos) = script.find(needle) else {
+            continue;
+        };
+        let rest = script[pos + needle.len()..].trim_start();
+        let mut chars = rest.chars();
+        let quote = chars.next()?;
+        if !matches!(quote, '"' | '\'' | '`') {
+            continue;
+        }
+        let mut out = String::new();
+        let mut escaped = false;
+        for c in chars {
+            if escaped {
+                out.push(c);
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == quote {
+                return Some(out);
+            } else {
+                out.push(c);
+            }
+        }
+    }
+    None
+}
+
 // --- Claude Code -------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -810,6 +1986,7 @@ struct FileInput<'a> {
 
 struct PendingTool {
     category: String,
+    shell_cmd: Option<&'static str>,
     read_key: Option<String>,
     duplicate: bool,
 }
@@ -955,7 +2132,18 @@ fn claude_line(s: &mut FileSummary, st: &mut ClaudeState, line: ClaudeLine) {
                 if st.pending.contains_key(id) {
                     continue;
                 }
-                let category = claude_category(name, block.input);
+                let raw_category = claude_category(name, block.input);
+                let (category, shell_cmd) = if raw_category == "bash" {
+                    let sc = extract_claude_shell_command(block.input)
+                        .map(|cmd| classify_shell_command(&cmd))
+                        .unwrap_or(ShellClass {
+                            bucket: "other",
+                            command: None,
+                        });
+                    (shell_category_key(sc.bucket), sc.command)
+                } else {
+                    (raw_category, None)
+                };
                 *s.tool_calls.entry(category.clone()).or_default() += 1;
                 // On the day of the message that made the call, so a `--days` window only
                 // counts the calls inside it.
@@ -995,6 +2183,7 @@ fn claude_line(s: &mut FileSummary, st: &mut ClaudeState, line: ClaudeLine) {
                     id.to_string(),
                     PendingTool {
                         category,
+                        shell_cmd,
                         read_key,
                         duplicate,
                     },
@@ -1056,6 +2245,7 @@ fn claude_line(s: &mut FileSummary, st: &mut ClaudeState, line: ClaudeLine) {
                                 s.dup_reads += 1;
                                 s.dup_read_tokens += text;
                             }
+                            record_shell_command(s, &p.category, p.shell_cmd, text);
                             let _ = &p.read_key;
                         }
                         stream.result(s, &category, text);
@@ -1103,6 +2293,12 @@ struct CodexPayload<'a> {
     #[serde(borrow)]
     model: Option<std::borrow::Cow<'a, str>>,
     info: Option<CodexInfo>,
+    action: Option<CodexAction>,
+}
+
+#[derive(Deserialize)]
+struct CodexAction {
+    command: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -1191,7 +2387,7 @@ pub fn parse_codex(path: &Path) -> DaySummaries {
     let mut stream = Stream::default();
     let mut model = String::from("unknown");
     let mut last_total = None::<u64>;
-    let mut calls: HashMap<String, String> = HashMap::new();
+    let mut calls: HashMap<String, (String, Option<&'static str>)> = HashMap::new();
     read_lines(path, |line| {
         if !(contains(line, b"token_count")
             || contains(line, b"turn_context")
@@ -1262,27 +2458,42 @@ pub fn parse_codex(path: &Path) -> DaySummaries {
                             serde_json::from_str::<String>(r.get())
                                 .unwrap_or_else(|_| r.get().to_string())
                         });
-                        let (category, servers) =
+                        let (raw_category, servers) =
                             codex_category(name, p.namespace.as_deref(), input.as_deref());
+                        let (category, shell_cmd) = if raw_category == "bash" {
+                            let sc = extract_codex_shell_command(
+                                name,
+                                input.as_deref(),
+                                p.action.as_ref(),
+                            )
+                            .map(|cmd| classify_shell_command(&cmd))
+                            .unwrap_or(ShellClass {
+                                bucket: "other",
+                                command: None,
+                            });
+                            (shell_category_key(sc.bucket), sc.command)
+                        } else {
+                            (raw_category, None)
+                        };
                         *s.tool_calls.entry(category.clone()).or_default() += 1;
                         for server in servers {
                             *s.mcp_calls.entry(server).or_default() += 1;
                         }
                         if let Some(id) = p.call_id {
-                            calls.insert(id.into_owned(), category);
+                            calls.insert(id.into_owned(), (category, shell_cmd));
                         }
                     }
                     "function_call_output"
                     | "custom_tool_call_output"
                     | "local_shell_call_output" => {
-                        let category = p
+                        let (category, shell_cmd) = p
                             .call_id
                             .as_deref()
                             .and_then(|id| calls.remove(id))
-                            .unwrap_or_else(|| "other".into());
+                            .unwrap_or_else(|| ("other".into(), None));
                         let Some(output) = p.output else { return };
                         let raw = output.get();
-                        if raw.starts_with('[') {
+                        let text = if raw.starts_with('[') {
                             let mut text = 0;
                             for part in serde_json::from_str::<Vec<CodexOutputPart>>(raw)
                                 .unwrap_or_default()
@@ -1302,10 +2513,12 @@ pub fn parse_codex(path: &Path) -> DaySummaries {
                                     }
                                 }
                             }
-                            stream.result(s, &category, text);
+                            text
                         } else {
-                            stream.result(s, &category, text_tokens(raw.len()));
-                        }
+                            text_tokens(raw.len())
+                        };
+                        record_shell_command(s, &category, shell_cmd, text);
+                        stream.result(s, &category, text);
                     }
                     _ => {}
                 }
@@ -1585,6 +2798,7 @@ pub struct UsageReport {
     pub models: Vec<ModelRow>,
     pub clients: Vec<ClientRow>,
     pub resident: Vec<Share>,
+    pub shell: Vec<ShellRow>,
     pub startup: Vec<super::scan::BudgetRow>,
     pub cache: CacheHealth,
     pub waste: Waste,
@@ -1651,6 +2865,24 @@ pub struct Share {
     pub share: f64,
     /// Tokens these results added, each counted once.
     pub produced: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellRow {
+    pub category: String,
+    pub label: String,
+    pub calls: u64,
+    /// Token-turns resident in context.
+    pub tokens: u64,
+    /// Share of all turn context.
+    pub share: f64,
+    /// Share of shell resident context.
+    pub shell_share: f64,
+    /// Tokens these commands added, each counted once.
+    pub produced: u64,
+    /// Top normalized command prefixes in this category (never paths or arguments).
+    pub top_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -1871,6 +3103,10 @@ fn reduce(
     let mut by_root: BTreeMap<(Client, PathBuf), usize> = BTreeMap::new();
     let mut resident: BTreeMap<String, u64> = BTreeMap::new();
     let mut produced: BTreeMap<String, u64> = BTreeMap::new();
+    let mut shell_resident: BTreeMap<String, u64> = BTreeMap::new();
+    let mut shell_produced: BTreeMap<String, u64> = BTreeMap::new();
+    let mut shell_calls: BTreeMap<String, u64> = BTreeMap::new();
+    let mut shell_cmds: BTreeMap<String, BTreeMap<String, (u64, u64)>> = BTreeMap::new();
     let mut floor = 0u64;
     let mut context = 0u64;
     let mut linger_turns = 0u64;
@@ -1897,10 +3133,36 @@ fn reduce(
             c.4 += t.context();
         }
         for (k, v) in &s.resident {
-            *resident.entry(k.clone()).or_default() += v;
+            if let Some(bucket) = k.strip_prefix("bash:") {
+                *resident.entry("bash".into()).or_default() += v;
+                *shell_resident.entry(bucket.to_string()).or_default() += v;
+            } else {
+                *resident.entry(k.clone()).or_default() += v;
+            }
         }
         for (k, v) in &s.produced {
-            *produced.entry(k.clone()).or_default() += v;
+            if let Some(bucket) = k.strip_prefix("bash:") {
+                *produced.entry("bash".into()).or_default() += v;
+                *shell_produced.entry(bucket.to_string()).or_default() += v;
+            } else {
+                *produced.entry(k.clone()).or_default() += v;
+            }
+        }
+        for (k, v) in &s.tool_calls {
+            if let Some(bucket) = k.strip_prefix("bash:") {
+                *shell_calls.entry(bucket.to_string()).or_default() += v;
+            }
+        }
+        for (k, (calls, tok)) in &s.shell_commands {
+            if let Some((bucket, cmd)) = k.split_once('\u{1f}') {
+                let entry = shell_cmds
+                    .entry(bucket.to_string())
+                    .or_default()
+                    .entry(cmd.to_string())
+                    .or_default();
+                entry.0 += calls;
+                entry.1 += tok;
+            }
         }
         floor += s.floor_sum;
         context += s.context_sum;
@@ -2005,6 +3267,54 @@ fn reduce(
     shares.retain(|s| s.tokens > 0);
     shares.sort_by_key(|a| std::cmp::Reverse(a.tokens));
     r.resident = shares;
+    // Shell output breakdown.
+    let bash_resident = resident.get("bash").copied().unwrap_or(0);
+    let bash_produced = produced.get("bash").copied().unwrap_or(0);
+    let mut shell_buckets: BTreeSet<String> = BTreeSet::new();
+    shell_buckets.extend(shell_resident.keys().cloned());
+    shell_buckets.extend(shell_produced.keys().cloned());
+    shell_buckets.extend(shell_calls.keys().cloned());
+    let mut shell_rows: Vec<ShellRow> = shell_buckets
+        .into_iter()
+        .map(|bucket| {
+            let tokens = shell_resident.get(&bucket).copied().unwrap_or(0);
+            let prod = shell_produced.get(&bucket).copied().unwrap_or(0);
+            let calls = shell_calls.get(&bucket).copied().unwrap_or(0);
+            let mut cmds: Vec<(String, u64, u64)> = shell_cmds
+                .remove(&bucket)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(cmd, (c, t))| (cmd, t, c))
+                .collect();
+            cmds.sort_by(|a, b| (b.1, b.2, &a.0).cmp(&(a.1, a.2, &b.0)));
+            let top_commands = cmds.into_iter().take(4).map(|(c, _, _)| c).collect();
+            let shell_share = if bash_resident > 0 {
+                ratio(tokens, bash_resident)
+            } else {
+                ratio(prod, bash_produced)
+            };
+            ShellRow {
+                label: shell_label(&bucket).into(),
+                category: bucket,
+                calls,
+                tokens,
+                share: ratio(tokens, context),
+                shell_share,
+                produced: prod,
+                top_commands,
+            }
+        })
+        .filter(|row| row.tokens > 0 || row.produced > 0 || row.calls > 0)
+        .collect();
+    shell_rows.sort_by(|a, b| {
+        (b.tokens, b.produced, b.calls, &a.category).cmp(&(
+            a.tokens,
+            a.produced,
+            a.calls,
+            &b.category,
+        ))
+    });
+    r.shell = shell_rows;
     // MCP servers: transcript calls plus Toolport's audit log.
     let mut mcp: BTreeMap<String, McpRow> = BTreeMap::new();
     for (server, (calls, sessions, bursts)) in &transcript_mcp {
@@ -2080,11 +3390,34 @@ fn recommendations(r: &UsageReport) -> Vec<Recommendation> {
     };
     let bash = share("bash");
     if bash >= 0.15 {
+        let top = r.shell.first().filter(|s| s.shell_share >= 0.35);
+        let (title, detail) = match top {
+            Some(s) => {
+                let title = format!(
+                    "Shell output holds {} of resident context ({} from {})",
+                    format::percent(bash),
+                    format::percent(s.shell_share),
+                    s.label.to_lowercase()
+                );
+                let detail = match s.category.as_str() {
+                    "read" => "Prefer built-in Read and Grep over shell cat/sed/grep, or pipe long output through head; rtk (github.com/rtk-ai/rtk) also compacts common command output.",
+                    "git" => "Pass --stat or --name-only to git diff/log and --jq to gh commands so full patches and JSON blobs stay out of context; rtk (github.com/rtk-ai/rtk) also compacts git output.",
+                    "test" | "build" => "Filter test and build output to failures only (tail, --quiet, or rtk at github.com/rtk-ai/rtk) so passing logs stay out of context.",
+                    "script" => "Keep script stdout bounded with head, summary counts, or jq filters so large dumps stay out of context; rtk (github.com/rtk-ai/rtk) also compacts common command output.",
+                    _ => "Trim it where it starts: rtk (github.com/rtk-ai/rtk) compacts common command output, and asking agents to pipe long output through head or a grep keeps logs out of context.",
+                };
+                (title, detail.into())
+            }
+            None => (
+                format!("Shell output holds {} of resident context", format::percent(bash)),
+                "Trim it where it starts: rtk (github.com/rtk-ai/rtk) compacts common command output, and asking agents to pipe long output through head or a grep keeps logs out of context.".into(),
+            ),
+        };
         out.push(Recommendation {
             id: "bash-output",
             severity: Severity::Warn,
-            title: format!("Shell output holds {} of resident context", format::percent(bash)),
-            detail: "Trim it where it starts: rtk (github.com/rtk-ai/rtk) compacts common command output, and asking agents to pipe long output through head or a grep keeps logs out of context.".into(),
+            title,
+            detail,
         });
     }
     if r.waste.lingering_images > 0 {
@@ -2324,6 +3657,72 @@ pub fn render(r: &UsageReport, style: &Style) -> String {
         &[Align::Left, Align::Left, Align::Right, Align::Right],
         2,
     ));
+
+    // Shell output breakdown.
+    let shell_rows: Vec<&ShellRow> = r
+        .shell
+        .iter()
+        .filter(|s| s.tokens > 0 || s.produced > 0)
+        .collect();
+    if !shell_rows.is_empty() {
+        let bash_share = r
+            .resident
+            .iter()
+            .find(|s| s.source == "bash")
+            .map(|s| s.share)
+            .unwrap_or(0.0);
+        out.push_str(&style.heading(&format!(
+            "Shell output  {}",
+            style.dim(&format!(
+                "where the {} bash residency came from",
+                format::percent(bash_share)
+            ))
+        )));
+        let smax = shell_rows
+            .iter()
+            .map(|s| s.shell_share)
+            .fold(0.0, f64::max)
+            .max(0.0001);
+        let rows: Vec<Vec<String>> = shell_rows
+            .iter()
+            .map(|s| {
+                let colorize = |text: &str| match s.category.as_str() {
+                    "read" => style.cyan(text),
+                    "git" => style.yellow(text),
+                    "test" | "build" => style.magenta(text),
+                    "script" => style.green(text),
+                    _ => style.dim(text),
+                };
+                let cmds = s
+                    .top_commands
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                vec![
+                    format::truncate(&s.label, 26),
+                    colorize(&style.bar(s.shell_share / smax, 20)),
+                    format::percent(s.shell_share),
+                    style.dim(&format!("{} added", format::compact(s.produced))),
+                    style.dim(&format!("{} calls", format::thousands(s.calls))),
+                    style.dim(&cmds),
+                ]
+            })
+            .collect();
+        out.push_str(&format::table(
+            &rows,
+            &[
+                Align::Left,
+                Align::Left,
+                Align::Right,
+                Align::Right,
+                Align::Right,
+                Align::Left,
+            ],
+            2,
+        ));
+    }
 
     // Startup tax.
     if !r.startup.is_empty() {
@@ -2908,6 +4307,117 @@ mod tests {
         let edited = analyze(&sources, &opts, &Configured::new());
         assert_eq!((edited.stats.parsed, edited.stats.cached), (1, 0));
         assert_eq!(edited.totals.output, 7);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shell_classifier_unwraps_wrappers_and_never_leaks_paths() {
+        let check = |cmd: &str, bucket: &str, label: Option<&str>| {
+            let sc = classify_shell_command(cmd);
+            assert_eq!((sc.bucket, sc.command), (bucket, label), "command: {cmd}");
+        };
+        check(
+            "cd /home/bts/Projects/secret && cargo test --lib",
+            "test",
+            Some("cargo test"),
+        );
+        check(
+            "S=/tmp/private\nrg -n foo src/ | head -n 50",
+            "read",
+            Some("rg"),
+        );
+        check(
+            "RUST_LOG=debug timeout 30s npm run verify:headless",
+            "test",
+            Some("npm run test"),
+        );
+        check(
+            "ssh devbox-bts \"cd /workspace/repos/app && heavy-run -- cargo clippy\"",
+            "build",
+            Some("cargo clippy"),
+        );
+        check(
+            "git -C /home/bts/secret-repo diff --stat",
+            "git",
+            Some("git diff"),
+        );
+        check(
+            "/home/bts/.local/bin/gh pr view 123 --json state",
+            "git",
+            Some("gh pr"),
+        );
+        check("bash -lc 'sed -n 1,80p /etc/hosts'", "read", Some("sed"));
+        check("python3 - <<'PY'\nprint(1)\nPY", "script", Some("python3"));
+        check("echo '=== test ===' && vitest run", "test", Some("vitest"));
+        check(
+            "curl -s https://example.com/secret-token",
+            "net",
+            Some("curl"),
+        );
+        // Custom/unknown binary never exposes its path or name.
+        check(
+            "./scripts/private-deploy-tool.sh --token=abc",
+            "other",
+            None,
+        );
+        check("C:\\tools\\git.exe status", "git", Some("git status"));
+    }
+
+    #[test]
+    fn codex_shell_extractors_handle_exec_command_local_shell_and_code_mode() {
+        assert_eq!(
+            extract_codex_shell_command("exec_command", Some(r#"{"cmd":"rg foo src/"}"#), None)
+                .as_deref(),
+            Some("rg foo src/")
+        );
+        let action = CodexAction {
+            command: Some(vec!["bash".into(), "-lc".into(), "git diff".into()]),
+        };
+        assert_eq!(
+            extract_codex_shell_command("local_shell", None, Some(&action)).as_deref(),
+            Some("git diff")
+        );
+        assert_eq!(
+            extract_codex_shell_command(
+                "exec",
+                Some(r#"text(await tools.exec_command({cmd:"cargo test --lib"}))"#),
+                None
+            )
+            .as_deref(),
+            Some("cargo test --lib")
+        );
+    }
+
+    #[test]
+    fn nested_claude_workflow_subagents_are_discovered() {
+        let dir = scratch("nested-workflow-subagents");
+        let path =
+            dir.join("claude/projects/-work/sess-1/subagents/workflows/wf_abc/agent-1.jsonl");
+        write_lines(
+            &path,
+            &[serde_json::json!({
+                "type": "assistant",
+                "isSidechain": true,
+                "message": {
+                    "id": "m1",
+                    "model": "claude-opus-5-5",
+                    "usage": {"input_tokens": 12, "cache_read_input_tokens": 5_000, "output_tokens": 34},
+                    "content": []
+                }
+            })],
+        );
+        let sources = Sources {
+            claude: vec![dir.join("claude")],
+            ..Default::default()
+        };
+        let report = analyze(
+            &sources,
+            &options([Client::Claude].into(), None),
+            &Configured::new(),
+        );
+        assert_eq!(report.totals.subagents, 1);
+        assert_eq!(report.totals.turns, 1);
+        assert_eq!(report.totals.cache_read, 5_000);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
