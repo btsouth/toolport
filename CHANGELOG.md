@@ -6,18 +6,52 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-11-24
+
+Toolport 2.4.0 adds the standalone `toolport` CLI (`@toolport/cli`), compact
+result previews with structured queries in the gateway, and Code mode discovery
+across the gateway and both desktop apps.
+
+If you are on Toolport 1.24.x, this is also your update to Toolport 2. Read the
+[upgrade guide](https://github.com/btsouth/toolport/blob/main/docs/migration.md)
+before updating.
+
 ### Added
 
+- Standalone `toolport` CLI (`@toolport/cli` on npm, and directly from
+  `/usr/bin/toolport` on Linux GTK packages) with `scan`, `usage`, `fix`,
+  `init`, `up`, `export`, `import`, `hook`, and static HTML `report`. Check
+  agents for plaintext secrets, config drift, and skill issues, profile local
+  token and cache behavior offline across Claude Code, Codex, OpenCode, and
+  `audit.jsonl`, and bootstrap repos from a secret-free `toolport.toml`. (#1428)
+- Code mode discovery (`code-mode`, "Code mode · scripts" in both desktop apps)
+  exposes `toolport_describe` and `toolport_run` so agents can batch multi-call
+  workflows in a single script instead of pulling every intermediate payload
+  into context. (#1428)
+- Compact result shaping and structured queries on `toolport_fetch_result`
+  (`path`, `where`, `fields`, `grep`, `sort`, `limit`, `skip`), lossless JSON
+  whitespace minification, and suppressed no-op `tools/list_changed`
+  notifications for unchanged Lazy and Code mode catalogs to keep prompt caches
+  warm. (#1428)
 - T3 Code's OpenCode, Grok and Pi instances with their own home now get a row on
   the Clients page once the home exists, and connect like any other client. The
   T3 Code card no longer asks you to add them by hand, Connect all includes them,
   and Activity shows "OpenCode via T3 Code". Settings Pi saves in Toolport's
   entry are kept when Toolport rewrites it, and Disconnect takes them out with
-  the entry, for Pi's usual config too.
+  the entry, for Pi's usual config too. (#1426)
 - T3 Code's Antigravity instances get a row too, for the `mcp_config.json` in the
   private profile T3 Code gives each one. Toolport changes nothing else there.
   The `disabled` switch Antigravity saves in Toolport's entry is kept across
-  rewrites and removed on Disconnect, for Antigravity's usual config too.
+  rewrites and removed on Disconnect, for Antigravity's usual config too. (#1412)
+
+### Changed
+
+- Client imports now match existing Toolport servers by connection rather than
+  only by name, show where imported servers land, list servers to review, and
+  keep setup import, export, and share consistent in both desktop apps. (#1383,
+  #1384, #1387)
+- The connect review list now grows with the window and scrolls only the list.
+  (#1413)
 
 ### Fixed
 
@@ -27,7 +61,8 @@ Entries before the rename below shipped under the project's former name, Conduit
   entry when you connect them. Rows you connected before get it the next time
   Toolport rewrites their entry (for example after an update moves the gateway);
   disconnect and connect one again to add it now. A data
-  folder you set in such an entry yourself stays as you set it.
+  folder you set in such an entry yourself stays as you set it. (#1409)
+- Updated `url` and `cookie` dependencies for RustSec advisories. (#1427)
 
 ## [2.3.8] - 2026-11-19
 
