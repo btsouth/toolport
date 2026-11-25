@@ -127,6 +127,59 @@ pub fn render(scan: &ScanReport, usage: &UsageReport, generated: &str) -> String
         h.push_str("</table></section>");
     }
 
+    // Shell output breakdown.
+    let shell_rows: Vec<_> = usage
+        .shell
+        .iter()
+        .filter(|s| s.tokens > 0 || s.produced > 0 || s.calls > 0)
+        .collect();
+    if !shell_rows.is_empty() {
+        let bash_row = usage.resident.iter().find(|s| s.source == "bash");
+        let subtitle = match bash_row {
+            Some(b) if b.tokens > 0 => {
+                format!(
+                    "where the {} bash residency came from",
+                    format::percent(b.share)
+                )
+            }
+            _ => "by tokens added".into(),
+        };
+        h.push_str(&format!(
+            "<section><h2>Shell output<small>{}</small></h2><table><tr><th>Category</th><th>Share</th><th class=n>%</th><th class=n>Added</th><th class=n>Calls</th><th class=hide>Top commands</th></tr>",
+            escape(&subtitle)
+        ));
+        let smax = shell_rows
+            .iter()
+            .map(|s| s.shell_share)
+            .fold(0.0, f64::max)
+            .max(0.0001);
+        for s in shell_rows {
+            let class = match s.category.as_str() {
+                "git" => "bar mcp",
+                "test" | "build" => "bar floor",
+                "other" => "bar conv",
+                _ => "bar",
+            };
+            let cmds = s
+                .top_commands
+                .iter()
+                .take(4)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            h.push_str(&format!(
+                "<tr><td>{}</td><td style=\"width:38%\"><div class=track><div class=\"{class}\" style=\"width:{:.1}%\"></div></div></td><td class=n>{}</td><td class=n>{}</td><td class=n>{}</td><td class=hide><code>{}</code></td></tr>",
+                escape(&s.label),
+                (s.shell_share / smax * 100.0).clamp(0.0, 100.0),
+                escape(&format::percent(s.shell_share)),
+                escape(&format::compact(s.produced)),
+                escape(&format::thousands(s.calls)),
+                escape(&cmds)
+            ));
+        }
+        h.push_str("</table></section>");
+    }
+
     // Recommendations.
     if !usage.recommendations.is_empty() {
         h.push_str("<section><h2>Recommendations</h2><ul class=recs>");
@@ -339,7 +392,21 @@ mod tests {
             next_steps: Vec::new(),
         };
         scan.counts.errors = 1;
-        let html = render(&scan, &UsageReport::default(), "2026-11-24");
+        let mut usage = UsageReport::default();
+        usage.shell.push(super::super::usage::ShellRow {
+            category: "read".into(),
+            label: "File reads & search".into(),
+            calls: 12,
+            tokens: 4_000,
+            share: 0.2,
+            shell_share: 1.0,
+            produced: 1_200,
+            top_commands: vec!["sed".into(), "rg".into()],
+        });
+        let html = render(&scan, &usage, "2026-11-24");
+        assert!(html.contains("Shell output"));
+        assert!(html.contains("File reads &amp; search"));
+        assert!(html.contains("<code>sed, rg</code>"));
         assert!(!html.contains("<script>"));
         assert!(html.contains("&lt;script&gt;"));
         assert!(!html.contains("http://") && !html.contains("https://"));

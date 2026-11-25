@@ -214,6 +214,30 @@ fn usage_profiles_claude_and_codex_sessions() {
         .sum();
     assert!((total - 1.0).abs() < 0.02, "shares add up: {total}");
 
+    let shell = r["shell"].as_array().unwrap();
+    let test_row = shell.iter().find(|s| s["category"] == "test").unwrap();
+    assert_eq!(test_row["calls"], 1);
+    assert!(test_row["topCommands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c == "cargo test"));
+    let read_row = shell.iter().find(|s| s["category"] == "read").unwrap();
+    assert_eq!(read_row["calls"], 1);
+    assert!(read_row["topCommands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c == "ls"));
+    let shell_share_sum: f64 = shell
+        .iter()
+        .map(|s| s["shellShare"].as_f64().unwrap())
+        .sum();
+    assert!(
+        (shell_share_sum - 1.0).abs() < 0.02,
+        "shell shares add up: {shell_share_sum}"
+    );
+
     assert_eq!(r["waste"]["duplicateReads"], 1);
     assert_eq!(r["waste"]["images"], 1);
     assert_eq!(r["cache"]["breaks"], 1, "{:#}", r["cache"]);
@@ -261,6 +285,7 @@ fn usage_caches_summaries_and_rereads_changed_files() {
     assert_eq!(second["stats"]["cached"], 2);
     assert_eq!(first["totals"], second["totals"]);
     assert_eq!(first["resident"], second["resident"]);
+    assert_eq!(first["shell"], second["shell"]);
 
     // Appending to one transcript re-reads only that one.
     let path = f.home.join(".codex/sessions/2026/11/24/rollout-c1.jsonl");
@@ -290,6 +315,7 @@ fn usage_filters_by_client_and_handles_an_empty_machine() {
     let human = stdout(&f.run(&["usage"]));
     for heading in [
         "What stays in context",
+        "Shell output",
         "Cache health",
         "MCP servers",
         "Recommendations",
@@ -334,4 +360,81 @@ fn a_window_counts_the_turns_inside_it_not_whole_files() {
     let all = f.json(&["usage", "--json", "--days", "60"]);
     assert_eq!(all["totals"]["turns"], 3, "{all:#}");
     assert_eq!(all["stats"]["cached"], 1, "{all:#}");
+}
+
+#[test]
+fn shell_breakdown_never_leaks_hosts_paths_or_tokens_in_json_text_or_html() {
+    let f = Fixture::new("usage-shell-privacy");
+    f.clean_machine();
+    let t0 = now_ms() - 3_600_000;
+    let lines = [
+        assistant(
+            t0,
+            "m1",
+            usage(10, 0, 20_000, 0, 50),
+            json!([{
+                "type": "tool_use",
+                "id": "t1",
+                "name": "Bash",
+                "input": {"command": "ssh secret-host.internal \"cat /home/alice/private-key.txt?token=SUPERSECRET123\""}
+            }]),
+        ),
+        tool_result(t0 + 1000, "t1", json!("x".repeat(8_000))),
+        assistant(
+            t0 + 2000,
+            "m2",
+            usage(10, 20_000, 2_000, 0, 50),
+            json!([{"type": "text", "text": "ok"}]),
+        ),
+    ];
+    f.write(
+        ".claude/projects/-work-demo/s1.jsonl",
+        &(lines.join("\n") + "\n"),
+    );
+
+    let json_out = f.run(&["usage", "--json", "--days", "7"]);
+    assert_eq!(json_out.status.code(), Some(0));
+    let json_raw = stdout(&json_out);
+    let human_out = f.run(&["usage", "--days", "7"]);
+    assert_eq!(human_out.status.code(), Some(0));
+    let human = stdout(&human_out);
+    let html_path = f.home.join("report.html");
+    let report_out = f.run(&[
+        "report",
+        "--days",
+        "7",
+        "--out",
+        html_path.to_str().unwrap(),
+    ]);
+    assert_eq!(report_out.status.code(), Some(0));
+    let html = std::fs::read_to_string(&html_path).unwrap();
+
+    assert!(
+        human.contains("Shell output") && human.contains("cat"),
+        "{human}"
+    );
+    assert!(
+        html.contains("Shell output") && html.contains("<code>cat</code>"),
+        "{html}"
+    );
+    for (kind, text) in [("json", &json_raw), ("human", &human), ("html", &html)] {
+        for forbidden in ["secret-host", "alice", "private-key", "SUPERSECRET123"] {
+            assert!(
+                !text.contains(forbidden),
+                "{forbidden} leaked into {kind} output:\n{text}"
+            );
+        }
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&json_raw).unwrap();
+    let read_row = parsed["shell"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["category"] == "read")
+        .unwrap();
+    assert!(read_row["topCommands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c == "cat"));
 }
