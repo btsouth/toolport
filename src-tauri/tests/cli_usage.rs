@@ -392,8 +392,12 @@ fn shell_breakdown_never_leaks_hosts_paths_or_tokens_in_json_text_or_html() {
         &(lines.join("\n") + "\n"),
     );
 
-    let json_raw = stdout(&f.run(&["usage", "--json", "--days", "7"]));
-    let human = stdout(&f.run(&["usage", "--days", "7"]));
+    let json_out = f.run(&["usage", "--json", "--days", "7"]);
+    assert_eq!(json_out.status.code(), Some(0));
+    let json_raw = stdout(&json_out);
+    let human_out = f.run(&["usage", "--days", "7"]);
+    assert_eq!(human_out.status.code(), Some(0));
+    let human = stdout(&human_out);
     let html_path = f.home.join("report.html");
     let report_out = f.run(&[
         "report",
@@ -405,6 +409,14 @@ fn shell_breakdown_never_leaks_hosts_paths_or_tokens_in_json_text_or_html() {
     assert_eq!(report_out.status.code(), Some(0));
     let html = std::fs::read_to_string(&html_path).unwrap();
 
+    assert!(
+        human.contains("Shell output") && human.contains("cat"),
+        "{human}"
+    );
+    assert!(
+        html.contains("Shell output") && html.contains("<code>cat</code>"),
+        "{html}"
+    );
     for (kind, text) in [("json", &json_raw), ("human", &human), ("html", &html)] {
         for forbidden in ["secret-host", "alice", "private-key", "SUPERSECRET123"] {
             assert!(

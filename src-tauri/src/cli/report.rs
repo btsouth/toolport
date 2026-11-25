@@ -131,7 +131,7 @@ pub fn render(scan: &ScanReport, usage: &UsageReport, generated: &str) -> String
     let shell_rows: Vec<_> = usage
         .shell
         .iter()
-        .filter(|s| s.tokens > 0 || s.produced > 0)
+        .filter(|s| s.tokens > 0 || s.produced > 0 || s.calls > 0)
         .collect();
     if !shell_rows.is_empty() {
         let bash_row = usage.resident.iter().find(|s| s.source == "bash");

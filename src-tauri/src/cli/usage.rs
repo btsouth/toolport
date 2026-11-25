@@ -154,7 +154,13 @@ fn mtime_ms(meta: &std::fs::Metadata) -> u64 {
         .unwrap_or(0)
 }
 
-fn walk_jsonl(dir: &Path, since_ms: u64, depth: usize, out: &mut Vec<(PathBuf, u64, u64)>) {
+fn walk_jsonl(
+    dir: &Path,
+    since_ms: u64,
+    depth: usize,
+    skip_workflow_journals: bool,
+    out: &mut Vec<(PathBuf, u64, u64)>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -165,13 +171,11 @@ fn walk_jsonl(dir: &Path, since_ms: u64, depth: usize, out: &mut Vec<(PathBuf, u
         let path = entry.path();
         if kind.is_dir() {
             if depth > 0 {
-                walk_jsonl(&path, since_ms, depth - 1, out);
+                walk_jsonl(&path, since_ms, depth - 1, skip_workflow_journals, out);
             }
         } else if kind.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
-            // Skip workflow journal files under `subagents/workflows/<wf>/journal.jsonl`.
-            if path.file_name().is_some_and(|n| n == "journal.jsonl")
-                && path.components().any(|c| c.as_os_str() == "workflows")
-            {
+            // Skip Claude workflow journal files under `subagents/workflows/<wf>/journal.jsonl`.
+            if skip_workflow_journals && is_claude_workflow_journal(&path) {
                 continue;
             }
             if let Ok(meta) = entry.metadata() {
@@ -184,11 +188,28 @@ fn walk_jsonl(dir: &Path, since_ms: u64, depth: usize, out: &mut Vec<(PathBuf, u
     }
 }
 
+fn is_claude_workflow_journal(path: &Path) -> bool {
+    if !path.file_name().is_some_and(|n| n == "journal.jsonl") {
+        return false;
+    }
+    let Some(wf_dir) = path.parent() else {
+        return false;
+    };
+    let Some(workflows_dir) = wf_dir.parent() else {
+        return false;
+    };
+    let Some(subagents_dir) = workflows_dir.parent() else {
+        return false;
+    };
+    workflows_dir.file_name().is_some_and(|n| n == "workflows")
+        && subagents_dir.file_name().is_some_and(|n| n == "subagents")
+}
+
 fn units(sources: &Sources, filter: &BTreeSet<Client>, since_ms: u64) -> Vec<Unit> {
     let mut out = Vec::new();
     let mut add = |client: Client, root: &Path, dir: PathBuf, depth: usize| {
         let mut files = Vec::new();
-        walk_jsonl(&dir, since_ms, depth, &mut files);
+        walk_jsonl(&dir, since_ms, depth, client == Client::Claude, &mut files);
         for (path, size, mtime_ms) in files {
             out.push(Unit {
                 client,
@@ -607,9 +628,9 @@ fn text_tokens(raw_len: usize) -> u64 {
 /// as a typical screenshot.
 pub fn image_tokens(base64_data: &str) -> u64 {
     use base64::Engine as _;
-    let head: String = base64_data
-        .chars()
-        .filter(|c| !c.is_whitespace())
+    let head: Vec<u8> = base64_data
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace())
         .take(48 * 1024)
         .collect();
     let head = &head[..head.len() / 4 * 4];
@@ -806,30 +827,35 @@ fn parse_heredoc_marker(cmd: &str, pos: usize) -> Option<(bool, String, usize)> 
         return None;
     }
     let mut delim = String::new();
-    let mut quote = 0u8;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if quote != 0 {
-            if b == quote {
-                quote = 0;
+    let mut quote: Option<char> = None;
+    let mut iter = cmd[i..].char_indices();
+    let mut consumed = 0usize;
+    while let Some((off, c)) = iter.next() {
+        if let Some(q) = quote {
+            consumed = off + c.len_utf8();
+            if c == q {
+                quote = None;
             } else {
-                delim.push(b as char);
+                delim.push(c);
             }
-            i += 1;
-        } else if matches!(b, b'\'' | b'"') {
-            quote = b;
-            i += 1;
-        } else if b == b'\\' && i + 1 < bytes.len() {
-            i += 1;
-            delim.push(bytes[i] as char);
-            i += 1;
-        } else if b.is_ascii_whitespace() || matches!(b, b';' | b'&' | b'|' | b')' | b'>' | b'<') {
+        } else if matches!(c, '\'' | '"') {
+            quote = Some(c);
+            consumed = off + c.len_utf8();
+        } else if c == '\\' {
+            if let Some((next_off, next_c)) = iter.next() {
+                delim.push(next_c);
+                consumed = next_off + next_c.len_utf8();
+            } else {
+                consumed = off + c.len_utf8();
+            }
+        } else if c.is_ascii_whitespace() || matches!(c, ';' | '&' | '|' | ')' | '>' | '<') {
             break;
         } else {
-            delim.push(b as char);
-            i += 1;
+            delim.push(c);
+            consumed = off + c.len_utf8();
         }
     }
+    i += consumed;
     if delim.is_empty() {
         return None;
     }
@@ -2171,7 +2197,14 @@ fn extract_codex_shell_command(
 
 fn extract_all_js_cmd_literals(script: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for needle in ["cmd:", "command:"] {
+    for needle in [
+        "cmd:",
+        "\"cmd\":",
+        "'cmd':",
+        "command:",
+        "\"command\":",
+        "'command':",
+    ] {
         let mut rest = script;
         while let Some(pos) = rest.find(needle) {
             rest = &rest[pos + needle.len()..];
@@ -2568,7 +2601,9 @@ fn claude_line(s: &mut FileSummary, st: &mut ClaudeState, line: ClaudeLine) {
                                 s.dup_read_tokens += text;
                             }
                             if let Some(id) = bg_id {
-                                st.bash_ids.insert(id, (p.category.clone(), p.shell_cmd));
+                                if p.category.starts_with("bash:") {
+                                    st.bash_ids.insert(id, (p.category.clone(), p.shell_cmd));
+                                }
                             }
                             record_shell_command(s, &p.category, p.shell_cmd, text);
                             let _ = &p.read_key;
@@ -2711,8 +2746,15 @@ pub fn parse_codex(path: &Path) -> DaySummaries {
     let mut days = Days::new(false);
     let mut stream = Stream::default();
     let mut model = String::from("unknown");
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CodexCallOrigin {
+        Exec,
+        Shell,
+        Other,
+    }
     let mut last_total = None::<u64>;
-    let mut calls: HashMap<String, (String, Option<&'static str>)> = HashMap::new();
+    let mut calls: HashMap<String, (String, Option<&'static str>, CodexCallOrigin)> =
+        HashMap::new();
     let mut cell_ids: HashMap<String, (String, Option<&'static str>)> = HashMap::new();
     let mut session_ids: HashMap<String, (String, Option<&'static str>)> = HashMap::new();
     read_lines(path, |line| {
@@ -2816,29 +2858,40 @@ pub fn parse_codex(path: &Path) -> DaySummaries {
                         for server in servers {
                             *s.mcp_calls.entry(server).or_default() += 1;
                         }
+                        let origin = match name {
+                            "exec" => CodexCallOrigin::Exec,
+                            "exec_command" | "shell" | "shell_command" | "local_shell" => {
+                                CodexCallOrigin::Shell
+                            }
+                            _ => CodexCallOrigin::Other,
+                        };
                         if let Some(id) = p.call_id {
-                            calls.insert(id.into_owned(), (category, shell_cmd));
+                            calls.insert(id.into_owned(), (category, shell_cmd, origin));
                         }
                     }
                     "function_call_output"
                     | "custom_tool_call_output"
                     | "local_shell_call_output" => {
-                        let (category, shell_cmd) = p
+                        let (category, shell_cmd, origin) = p
                             .call_id
                             .as_deref()
                             .and_then(|id| calls.remove(id))
-                            .unwrap_or_else(|| ("other".into(), None));
+                            .unwrap_or_else(|| ("other".into(), None, CodexCallOrigin::Other));
                         let Some(output) = p.output else { return };
                         let raw = output.get();
-                        if let Some(cid) =
-                            extract_codex_running_id(raw, "Script running with cell ID ")
-                        {
-                            cell_ids.insert(cid, (category.clone(), shell_cmd));
+                        if origin == CodexCallOrigin::Exec {
+                            if let Some(cid) =
+                                extract_codex_running_id(raw, "Script running with cell ID ")
+                            {
+                                cell_ids.insert(cid, (category.clone(), shell_cmd));
+                            }
                         }
-                        if let Some(sid) =
-                            extract_codex_running_id(raw, "Process running with session ID ")
-                        {
-                            session_ids.insert(sid, (category.clone(), shell_cmd));
+                        if origin == CodexCallOrigin::Shell {
+                            if let Some(sid) =
+                                extract_codex_running_id(raw, "Process running with session ID ")
+                            {
+                                session_ids.insert(sid, (category.clone(), shell_cmd));
+                            }
                         }
                         let text = if raw.starts_with('[') {
                             let mut text = 0;
@@ -4009,7 +4062,7 @@ pub fn render(r: &UsageReport, style: &Style) -> String {
     let shell_rows: Vec<&ShellRow> = r
         .shell
         .iter()
-        .filter(|s| s.tokens > 0 || s.produced > 0)
+        .filter(|s| s.tokens > 0 || s.produced > 0 || s.calls > 0)
         .collect();
     if !shell_rows.is_empty() {
         let bash_row = r.resident.iter().find(|s| s.source == "bash");
@@ -4342,6 +4395,7 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode(gif);
         assert_eq!(image_tokens(&b64), 10);
         assert_eq!(image_tokens("not-base64!"), 1200);
+        assert_eq!(image_tokens("a🦀"), 1200);
     }
 
     #[test]
