@@ -143,6 +143,26 @@ pub fn record_timed_with_pii(
     ));
 }
 
+/// How large a call's result was, in serialized JSON bytes. Recorded as
+/// `responseBytes` and, when Toolport compacted or shaped the result,
+/// `rawResponseBytes`; older rows have neither and readers treat them as unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResponseBytes {
+    /// What the client (or a code-mode script) received.
+    pub response: u64,
+    /// What the server sent, when that differs because Toolport rewrote it.
+    pub raw: Option<u64>,
+}
+
+impl ResponseBytes {
+    fn write(self, entry: &mut Value) {
+        entry["responseBytes"] = json!(self.response);
+        if let Some(raw) = self.raw.filter(|&raw| raw != self.response) {
+            entry["rawResponseBytes"] = json!(raw);
+        }
+    }
+}
+
 /// Record the actual routed identity independently from the normalized tool prefix.
 /// Existing Activity consumers keep `server`; Teams uses the authoritative `serverId`.
 #[allow(clippy::too_many_arguments)]
@@ -160,6 +180,75 @@ pub fn record_routed_call(
     pii: Option<PiiPass>,
     secrets_replaced: Option<&std::collections::BTreeMap<String, usize>>,
 ) {
+    record_routed_call_with_bytes(
+        reg,
+        server_id,
+        tool,
+        ok,
+        duration_ms,
+        error,
+        client,
+        client_name,
+        client_label,
+        args_hash,
+        pii,
+        secrets_replaced,
+        None,
+    );
+}
+
+/// [`record_routed_call`], also recording the result's size ([`ResponseBytes`]).
+#[allow(clippy::too_many_arguments)]
+pub fn record_routed_call_with_bytes(
+    reg: &crate::registry::Registry,
+    server_id: &str,
+    tool: &str,
+    ok: bool,
+    duration_ms: Option<u64>,
+    error: Option<&str>,
+    client: Option<&str>,
+    client_name: Option<&str>,
+    client_label: Option<&str>,
+    args_hash: Option<&str>,
+    pii: Option<PiiPass>,
+    secrets_replaced: Option<&std::collections::BTreeMap<String, usize>>,
+    bytes: Option<ResponseBytes>,
+) {
+    write_line(&routed_call_entry(
+        reg,
+        server_id,
+        tool,
+        ok,
+        duration_ms,
+        error,
+        client,
+        client_name,
+        client_label,
+        args_hash,
+        pii,
+        secrets_replaced,
+        bytes,
+    ));
+}
+
+/// The row [`record_routed_call_with_bytes`] writes. Persists Teams activity as a side
+/// effect, like the call it describes.
+#[allow(clippy::too_many_arguments)]
+fn routed_call_entry(
+    reg: &crate::registry::Registry,
+    server_id: &str,
+    tool: &str,
+    ok: bool,
+    duration_ms: Option<u64>,
+    error: Option<&str>,
+    client: Option<&str>,
+    client_name: Option<&str>,
+    client_label: Option<&str>,
+    args_hash: Option<&str>,
+    pii: Option<PiiPass>,
+    secrets_replaced: Option<&std::collections::BTreeMap<String, usize>>,
+    bytes: Option<ResponseBytes>,
+) -> Value {
     let mut entry = timed_entry(
         &crate::router::sanitize_segment(server_id),
         tool,
@@ -198,7 +287,10 @@ pub fn record_routed_call(
             }
         }
     }
-    write_line(&entry);
+    if let Some(bytes) = bytes {
+        bytes.write(&mut entry);
+    }
+    entry
 }
 
 /// Resolve older display-prefix records only when all local principals agree on one ID.
@@ -956,6 +1048,10 @@ fn aggregate_rows<T: std::borrow::Borrow<Value>>(entries: impl IntoIterator<Item
     let mut total = 0u64;
     let mut errors = 0u64;
     let mut dropped = 0u64;
+    // Result sizes, over the rows that recorded one (older rows did not).
+    let mut sized = 0u64;
+    let mut response_bytes = 0u64;
+    let mut raw_response_bytes = 0u64;
 
     for row in entries {
         let e = row.borrow();
@@ -974,6 +1070,15 @@ fn aggregate_rows<T: std::borrow::Borrow<Value>>(entries: impl IntoIterator<Item
         total += 1;
         if !ok {
             errors += 1;
+        }
+        if let Some(bytes) = e.get("responseBytes").and_then(Value::as_u64) {
+            sized += 1;
+            response_bytes = response_bytes.saturating_add(bytes);
+            raw_response_bytes = raw_response_bytes.saturating_add(
+                e.get("rawResponseBytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(bytes),
+            );
         }
         let a = by_server.entry(server.to_string()).or_default();
         a.calls += 1;
@@ -1041,13 +1146,19 @@ fn aggregate_rows<T: std::borrow::Borrow<Value>>(entries: impl IntoIterator<Item
             .cmp(&x.get("calls").and_then(|v| v.as_u64()))
     });
 
-    json!({
+    let mut stats = json!({
         "total": total,
         "retainedDropped": dropped,
         "errors": errors,
         "errorRate": if total > 0 { errors as f64 / total as f64 } else { 0.0 },
         "servers": servers,
-    })
+    });
+    if sized > 0 {
+        stats["sizedCalls"] = json!(sized);
+        stats["responseBytes"] = json!(response_bytes);
+        stats["rawResponseBytes"] = json!(raw_response_bytes);
+    }
+    stats
 }
 
 /// The columns exported to CSV, in order. Keys match the audit entry JSON.
@@ -1073,6 +1184,8 @@ const CSV_COLUMNS: &[&str] = &[
     "piiIncomplete",
     "clientName",
     "clientLabel",
+    "responseBytes",
+    "rawResponseBytes",
 ];
 
 /// Render audit `entries` as CSV (RFC-4180-ish: CRLF rows, quoted cells, doubled
@@ -1480,7 +1593,7 @@ mod tests {
         })];
         let csv = to_csv(&entries);
         assert!(csv.starts_with(
-            "ts,server,tool,client,ok,held,kind,reason,decision,argsHash,durationMs,heldMs,action,error,piiReplaced,piiIncomplete,clientName,clientLabel\r\n"
+            "ts,server,tool,client,ok,held,kind,reason,decision,argsHash,durationMs,heldMs,action,error,piiReplaced,piiIncomplete,clientName,clientLabel,responseBytes,rawResponseBytes\r\n"
         ));
         assert!(csv.contains("\"gh\""));
         assert!(csv.contains("\"search\""));
@@ -1992,6 +2105,67 @@ mod tests {
         );
 
         assert!(empty.get("clientName").is_none());
+    }
+
+    #[test]
+    fn routed_call_rows_record_result_bytes_only_when_known() {
+        let reg = crate::registry::Registry::default();
+        let row = |bytes| {
+            routed_call_entry(
+                &reg,
+                "gh",
+                "list",
+                true,
+                Some(3),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                bytes,
+            )
+        };
+        // Older call sites record no size: the row has neither field.
+        let unknown = row(None);
+        assert!(unknown.get("responseBytes").is_none());
+        assert!(unknown.get("rawResponseBytes").is_none());
+        // Passed through unchanged: one size, no raw size.
+        let whole = row(Some(ResponseBytes {
+            response: 900,
+            raw: None,
+        }));
+        assert_eq!(whole["responseBytes"], 900);
+        assert!(whole.get("rawResponseBytes").is_none());
+        // Shaped: both, so Activity can show what shaping saved.
+        let shaped = row(Some(ResponseBytes {
+            response: 1_800,
+            raw: Some(145_000),
+        }));
+        assert_eq!(shaped["responseBytes"], 1_800);
+        assert_eq!(shaped["rawResponseBytes"], 145_000);
+        // A raw size equal to the response says nothing and is left out.
+        let same = row(Some(ResponseBytes {
+            response: 50,
+            raw: Some(50),
+        }));
+        assert!(same.get("rawResponseBytes").is_none());
+    }
+
+    #[test]
+    fn stats_total_result_bytes_over_rows_that_recorded_them() {
+        let none = aggregate(&[json!({"ts":1,"server":"gh","tool":"a","ok":true})]);
+        assert!(none.get("responseBytes").is_none(), "{none}");
+        let stats = aggregate(&[
+            json!({"ts":1,"server":"gh","tool":"a","ok":true}),
+            json!({"ts":2,"server":"gh","tool":"a","ok":true,"responseBytes":100}),
+            json!({"ts":3,"server":"gh","tool":"b","ok":true,"responseBytes":2000,"rawResponseBytes":140000}),
+        ]);
+        assert_eq!(stats["total"], 3);
+        assert_eq!(stats["sizedCalls"], 2);
+        assert_eq!(stats["responseBytes"], 2_100);
+        assert_eq!(stats["rawResponseBytes"], 140_100);
     }
 
     #[test]

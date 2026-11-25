@@ -29,6 +29,7 @@ import { TeamsView } from "@/components/TeamsView";
 import { createRoot } from "react-dom/client";
 import { ClientLogo } from "@/components/ClientLogo";
 import { ServerLogo } from "@/components/ServerLogo";
+import { chosenDiscoveryMode } from "@/lib/clientDiscovery";
 import type {
   AuditEntry,
   ClientSession,
@@ -1063,12 +1064,15 @@ mockIPC(
         return null;
       case "export_config":
         return JSON.stringify({ servers });
-      case "set_client_discovery":
+      case "set_client_discovery": {
+        // Normalized like Registry::set_client_discovery: aliases store as their
+        // canonical name and anything else clears the override.
         registry.clientDiscovery ??= {};
-        if (args.mode)
-          registry.clientDiscovery[String(args.clientId)] = String(args.mode);
+        const mode = chosenDiscoveryMode(args.mode as string | null);
+        if (mode) registry.clientDiscovery[String(args.clientId)] = mode;
         else delete registry.clientDiscovery[String(args.clientId)];
         return { ...registry, clientDiscovery: { ...registry.clientDiscovery } };
+      }
       case "get_ui_language": {
         const saved = sessionStorage.getItem("toolport-fixture-language");
         return isLanguageChoice(saved) ? saved : "system";

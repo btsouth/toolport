@@ -132,6 +132,13 @@ function discoverySummary(client: DetectedClient, registry: Registry | null) {
           "Browse a server, then call tools. Client per-tool permission rules need Full mode.",
         ),
       };
+    case "code-mode":
+      return {
+        text: translate("Search and run scripts"),
+        full: translate(
+          "Search and run scripts. Client per-tool permission rules need Full mode.",
+        ),
+      };
     default:
       return {
         text: translate("Search, then call tools"),

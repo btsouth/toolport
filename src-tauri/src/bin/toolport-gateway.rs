@@ -817,7 +817,7 @@ fn gateway_capabilities(
             json!({
                 "version": "2.0.0",
                 "discoveryMode": mode.as_str(),
-                "codeMode": host.code_mode_enabled(),
+                "codeMode": code_mode_for(host, mode),
                 "humanApproval": reg.human_approval_effective()
             }),
         );
@@ -1519,6 +1519,14 @@ fn call_tool_def() -> Value {
 const DISCOVER_INSTRUCTIONS_PREAMBLE: &str = "Toolport aggregates configured MCP servers. When advertised, search/help helpers reach the live inventory; call them before declaring a tool absent. Local keyword filters do not search that inventory.";
 
 fn discovery_instructions(mode: DiscoveryMode, client: Option<&str>) -> String {
+    if mode == DiscoveryMode::CodeMode {
+        return format!(
+            "{DISCOVER_INSTRUCTIONS_PREAMBLE} Run tools inside toolport_run_script as \
+             servers.<server>.<tool>(args), batching every step (loops, fan-outs with \
+             toolport.callAll) into one script that returns only the answer. Search with \
+             toolport_search_tools only for a tool name or schema you do not know."
+        );
+    }
     let dispatch = if mode != DiscoveryMode::Full || full_discovery_fallback(client) {
         "Dispatch with toolport_call_tool."
     } else {
@@ -1598,15 +1606,22 @@ fn run_script_tool_def() -> Value {
 fn fetch_result_tool_def() -> Value {
     json!({
         "name": "toolport_fetch_result",
-        "description": "Continue a large tool result Toolport truncated at its `[Toolport shaped \
-            this result]` marker. Call this with the marker's `cursor` and `offset` to page \
-            through the rest.",
+        "description": "Read a result Toolport kept out of context, by the cursor in its note. \
+            Query just what you need (path, where, fields, grep) for a small exact answer; \
+            offset pages raw text.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "cursor": { "type": "string", "description": "The cursor from the marker." },
-                "offset": { "type": "integer", "minimum": 0, "description": "Character offset to read from." },
-                "projection": { "type": "string", "description": "Optional dot-separated path into `structuredContent`." }
+                "cursor": { "type": "string" },
+                "path": { "type": "string", "description": "Dot path, e.g. \"issues\"; default: the largest array." },
+                "where": { "type": "object", "description": "Item filter, e.g. {\"assignee\":\"alice\",\"labels\":\"p0\"}. Ignores case; an array matches a value it contains; a list means any of; ops gt gte lt lte ne contains exists regex." },
+                "fields": { "type": "array", "items": { "type": "string" }, "description": "Keys to return per item." },
+                "grep": { "type": "string", "description": "Regex or text, ignoring case." },
+                "sort": { "type": "string", "description": "Key; -key descends." },
+                "limit": { "type": "integer", "minimum": 1 },
+                "skip": { "type": "integer", "minimum": 0 },
+                "offset": { "type": "integer", "minimum": 0 },
+                "projection": { "type": "string", "description": "Dot path into structuredContent." }
             },
             "required": ["cursor"],
             "additionalProperties": false
@@ -1736,6 +1751,40 @@ fn floor_tool_defs(host: &HostState) -> Vec<Value> {
     floor_tool_defs_with_code_mode(host.code_mode_enabled())
 }
 
+/// The code-mode discovery floor: status, search, fetch-result and run-script, with
+/// search and run-script described for running tools inside a script.
+fn code_mode_floor_tool_defs() -> Vec<Value> {
+    let mut search = search_tool_def();
+    search["description"] = json!(
+        "Search live tools before declaring one absent; local filters miss this inventory. \
+         Up to ten rows: [name, description, required parameters, optional schema, script \
+         signature]; #1 has its full schema. Search an exact name for its complete \
+         definition. Run hits inside toolport_run_script as servers.<server>.<tool>(args)."
+    );
+    let mut run_script = run_script_tool_def();
+    run_script["description"] = json!(
+        "Run downstream tools: they are not listed separately, so every call goes through \
+         this one JavaScript script. Call a tool the task names directly, as \
+         servers.<server>.<tool>(args) or toolport.call(\"<server>__<tool>\", args); to \
+         find others, list a server's tools and signatures with one toolport_search_tools \
+         call (`server` set, empty `query`) or toolport.listTools() in the script. Do the \
+         whole task in ONE script: loop, fan out independent calls with await \
+         toolport.callAll([{name, args}, ...]), filter and join in JS, and `return` only the \
+         answer. Intermediate results stay in the script at full size; only the returned \
+         value reaches context. A call returns the MCP result {content, structuredContent, \
+         isError}; read JSON text with JSON.parse(r.content[0].text), and when you do not \
+         know a result's fields, find them in the script (Object.keys, a search of nested \
+         values) instead of guessing. On failure, structuredContent.toolportScript.progress \
+         lists the calls that ran; resume from there. Gates match a direct call."
+    );
+    vec![
+        status_tool_def(),
+        search,
+        fetch_result_tool_def(),
+        run_script,
+    ]
+}
+
 fn floor_tool_defs_with_code_mode(code_mode: bool) -> Vec<Value> {
     let mut tools = vec![
         status_tool_def(),
@@ -1756,8 +1805,11 @@ fn floor_tool_defs_with_code_mode(code_mode: bool) -> Vec<Value> {
 /// The default floor goal is at most 550 o200k_base tokens, including 10% headroom.
 /// Raised from 2,400 for Claude Code's `anthropic/alwaysLoad` on search, call and
 /// fetch-result: 2,376 -> 2,490 bytes with Code Mode off.
+/// Raised from 2,520 for `toolport_fetch_result` queries (path, where, fields, grep,
+/// sort, limit, skip): 2,490 -> 2,999 bytes and 680 o200k tokens. One query replaces
+/// paging a large result, which costs thousands of tokens per page.
 #[cfg(test)]
-const META_TOOL_FLOOR_BYTE_BUDGET: usize = 2_520;
+const META_TOOL_FLOOR_BYTE_BUDGET: usize = 3_060;
 
 /// The floor, named in the error a client gets when it calls a meta-tool that 2.0
 /// removed. Kept as one string so every refusal reads the same.
@@ -1805,14 +1857,20 @@ fn removed_meta_tool_error(name: &str) -> String {
 // there is no new execution surface. Enabled per-client via the env var; grouped
 // implies not-lazy (the lazy resolver only returns true for `=lazy`).
 
-/// The three tool-discovery modes. Resolved from env + the registry (including a
+/// The tool-discovery modes. Resolved from env + the registry (including a
 /// per-client override) and cached on the host as `HostState::discovery`, which the
 /// registry watcher refreshes on every change so a mode edit applies live.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum DiscoveryMode {
     Lazy,
     Grouped,
     Full,
+    /// Code-mode-first: status, search, fetch-result and `toolport_run_script`, and
+    /// no downstream tool listed beside them. The model finds tools with search and
+    /// runs them, one call or a whole loop, inside a script. Choosing it turns
+    /// `toolport_run_script` on for that connection, whatever the Code Mode switch
+    /// says: the mode is unusable without it, and picking it is the opt-in.
+    CodeMode,
 }
 
 impl DiscoveryMode {
@@ -1821,12 +1879,14 @@ impl DiscoveryMode {
             DiscoveryMode::Lazy => 0,
             DiscoveryMode::Grouped => 1,
             DiscoveryMode::Full => 2,
+            DiscoveryMode::CodeMode => 3,
         }
     }
     fn from_u8(v: u8) -> Self {
         match v {
             1 => DiscoveryMode::Grouped,
             2 => DiscoveryMode::Full,
+            3 => DiscoveryMode::CodeMode,
             _ => DiscoveryMode::Lazy,
         }
     }
@@ -1836,7 +1896,25 @@ impl DiscoveryMode {
             DiscoveryMode::Lazy => "lazy",
             DiscoveryMode::Grouped => "grouped",
             DiscoveryMode::Full => "full",
+            DiscoveryMode::CodeMode => "code-mode",
         }
+    }
+}
+
+/// Whether `toolport_run_script` is on for a request in `mode`: the host's Code Mode
+/// switch, or the code-mode discovery mode, which needs it.
+fn code_mode_for(host: &HostState, mode: DiscoveryMode) -> bool {
+    mode == DiscoveryMode::CodeMode || host.code_mode_enabled()
+}
+
+/// Parse a discovery-mode name, accepting the code-mode spellings people write.
+fn mode_from_name(name: &str) -> Option<DiscoveryMode> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "grouped" => Some(DiscoveryMode::Grouped),
+        "full" => Some(DiscoveryMode::Full),
+        "lazy" => Some(DiscoveryMode::Lazy),
+        "code-mode" | "codemode" | "code_mode" | "code" => Some(DiscoveryMode::CodeMode),
+        _ => None,
     }
 }
 
@@ -1857,12 +1935,7 @@ fn seed_code_mode_after_registry_load(loaded: Result<&Registry, ()>) -> bool {
 /// Parse a registry / per-client override mode string; `None` for empty, `inherit`, or an
 /// unrecognized value (so it falls through to the next precedence level).
 fn parse_mode(s: &str) -> Option<DiscoveryMode> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "grouped" => Some(DiscoveryMode::Grouped),
-        "full" => Some(DiscoveryMode::Full),
-        "lazy" => Some(DiscoveryMode::Lazy),
-        _ => None,
-    }
+    mode_from_name(s)
 }
 
 /// The bearer identity uses the same Auto and explicit modes as stdio adapters.
@@ -1920,11 +1993,9 @@ fn resolve_mode_from(
     lazy_discovery: bool,
 ) -> (DiscoveryMode, Option<String>) {
     if let Some(v) = env {
-        return match v.trim().to_ascii_lowercase().as_str() {
-            "lazy" => (DiscoveryMode::Lazy,None),
-            "grouped" => (DiscoveryMode::Grouped, None),
-            "full" => (DiscoveryMode::Full, None),
-            _ => (
+        return match mode_from_name(v) {
+            Some(mode) => (mode, None),
+            None => (
                     DiscoveryMode::Full,
                     Some(format!(
                         "toolport: unrecognized TOOLPORT_DISCOVERY/CONDUIT_DISCOVERY value '{v}', falling back to full discovery",
@@ -6118,6 +6189,7 @@ fn execute_call(
                 result: mut out,
                 pii,
                 secrets: shaped,
+                bytes,
             } = defend_and_shape_for(reg, srv, tool, client, result, "", shape, Some(&request));
             let secrets = with_shaped(
                 shaped,
@@ -6133,7 +6205,7 @@ fn execute_call(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let err = if ok { None } else { Some(content_text(&out)) };
-            audit::record_routed_call(
+            audit::record_routed_call_with_bytes(
                 reg,
                 server_id,
                 tool,
@@ -6146,6 +6218,7 @@ fn execute_call(
                 Some(&call_args_hash),
                 pii,
                 Some(&secrets),
+                bytes,
             );
             if let Some(profiler) = call_profiler {
                 profiler.finish();
@@ -6180,6 +6253,7 @@ fn execute_call(
                 result: mut out,
                 pii,
                 secrets: shaped,
+                bytes,
             } = defend_and_shape_for(
                 reg,
                 srv,
@@ -6195,7 +6269,7 @@ fn execute_call(
                 secrets_replaced_in(&mut out, &client_arguments, opts.direct),
             );
             let defended_err = audited_error_text(&e, &out);
-            audit::record_routed_call(
+            audit::record_routed_call_with_bytes(
                 reg,
                 server_id,
                 tool,
@@ -6208,6 +6282,7 @@ fn execute_call(
                 Some(&call_args_hash),
                 pii,
                 Some(&secrets),
+                bytes,
             );
             out
         }
@@ -6951,7 +7026,8 @@ fn defend_and_shape_for(
         integrity::label_untrusted_result(srv, &mut result);
     }
     let mut secrets = None;
-    // Cap an oversized result, cache the full body, hand back a head + fetch cursor.
+    let mut shaped = None;
+    // Cap an oversized result, cache the full body, hand back a preview + fetch cursor.
     // A per-server resultBudget overrides the global default (Some(0) = never shape).
     // Code-mode intermediate calls pass `shape = false`: full bodies stay in the
     // sandbox; only the script's final aggregate is shaped for the model.
@@ -6976,22 +7052,47 @@ fn defend_and_shape_for(
             &mut result,
             request,
         ));
-        shaping::shape_result(&mut result, budget, client);
+        shaped = Some(shaping::shape_tool_result(&mut result, budget, client));
     }
     if !blocked && shape {
         integrity::label_untrusted_result(srv, &mut result);
     }
     // Toolport-authored trailer, appended last so it survives both passes intact.
     let trailer = trailer.trim();
+    let pre_trailer_bytes = if !trailer.is_empty() {
+        serde_json::to_string(&result).map_or(0, |text| text.len()) as u64
+    } else {
+        0
+    };
     if !trailer.is_empty() {
         if let Some(arr) = result.get_mut("content").and_then(|c| c.as_array_mut()) {
             arr.push(json!({ "type": "text", "text": trailer }));
         }
     }
+    let response_bytes = serde_json::to_string(&result).map_or(0, |text| text.len()) as u64;
+    let trailer_delta = if !trailer.is_empty() {
+        response_bytes.saturating_sub(pre_trailer_bytes)
+    } else {
+        0
+    };
+    // Code-mode intermediate calls (`shape == false`) stay inside the JS sandbox and
+    // never enter model context directly; only record context-facing bytes when shaped.
+    let bytes = if shape {
+        Some(audit::ResponseBytes {
+            response: response_bytes,
+            // Only a result Toolport rewrote has a different size before and after.
+            raw: shaped
+                .filter(|outcome| outcome.compacted || outcome.shaped)
+                .map(|outcome| (outcome.raw_bytes as u64).saturating_add(trailer_delta)),
+        })
+    } else {
+        None
+    };
     Defended {
         result,
         pii,
         secrets,
+        bytes,
     }
 }
 
@@ -7007,6 +7108,10 @@ struct Defended {
     pii: Option<audit::PiiPass>,
     /// Secrets replaced before shaping, by name; `None` when not shaped.
     secrets: Option<std::collections::BTreeMap<String, usize>>,
+    /// The result's serialized size as handed on, and before compaction or shaping
+    /// when Toolport rewrote it. `None` for code-mode intermediate calls that never
+    /// enter model context directly.
+    bytes: Option<audit::ResponseBytes>,
 }
 
 /// Exposed tool names for code-mode `servers.*` stubs: full catalog minus gateway
@@ -7810,7 +7915,9 @@ fn handle_request(
     let search_index = CatalogSearchIndex::build(cached);
     // Callers of this wrapper hand in the mode as a bool; translate it back to a mode so
     // a host-wide grouped mode still applies to them.
-    let mode = if lazy {
+    let mode = if lazy && host.discovery_mode() == DiscoveryMode::CodeMode {
+        DiscoveryMode::CodeMode
+    } else if lazy {
         DiscoveryMode::Lazy
     } else if host.grouped_discovery() {
         DiscoveryMode::Grouped
@@ -7847,6 +7954,8 @@ struct GatewayResponse {
     /// Digest of the scoped catalog this tools/list was built from, when it was
     /// a Full list, and the connection record it is saved to once delivered.
     listed_catalog: Option<[u8; 32]>,
+    /// What a Lazy or code-mode list of Toolport's own tools was built from.
+    listed_floor: Option<ListedFloor>,
     listed_tools: Option<ListedTools>,
 }
 
@@ -7858,6 +7967,7 @@ impl From<Value> for GatewayResponse {
             observation: None,
             tools_list: false,
             listed_catalog: None,
+            listed_floor: None,
             listed_tools: None,
         }
     }
@@ -7895,11 +8005,17 @@ impl GatewayResponse {
     /// The record a delivered tools/list updates, and its digest. Every tools/list
     /// updates it: one that is not a Full list clears it, so the next publication
     /// still notifies.
-    fn listed(&self) -> Option<(ListedTools, Option<[u8; 32]>)> {
+    fn listed(&self) -> Option<(ListedTools, ListedView)> {
         if !self.tools_list {
             return None;
         }
-        Some((self.listed_tools.clone()?, self.listed_catalog))
+        Some((
+            self.listed_tools.clone()?,
+            ListedView {
+                catalog: self.listed_catalog,
+                floor: self.listed_floor,
+            },
+        ))
     }
 }
 
@@ -8017,7 +8133,11 @@ fn listed_discovery_mode(
         drop_blocked_from_cache(cached.shared(), router, reg)
     };
     let full = tool_surface(host, reg, router, &catalog, allowed, DiscoveryMode::Full);
-    let floor = full_tool_floor(host.code_mode_enabled(), full_discovery_fallback(client)).len();
+    let floor = full_tool_floor(
+        code_mode_for(host, DiscoveryMode::Full),
+        full_discovery_fallback(client),
+    )
+    .len();
     if auto_full_small_catalog(
         reg,
         router,
@@ -8178,7 +8298,7 @@ fn cached_tool_surfaces(
         connection_profile: active_connection_profile(),
         allowed: allowed_key,
         mode: mode.as_u8(),
-        code_mode: host.code_mode_enabled(),
+        code_mode: code_mode_for(host, mode),
         full_fallback: full_discovery_fallback(
             active_request_context().connection_identity.as_deref(),
         ),
@@ -8327,13 +8447,17 @@ fn build_tool_surfaces(
         summary: Arc::new(savings::SurfaceSummary::from_tools(full_tools())),
         key: key.clone(),
     });
-    let mut floor = grouped_tool_defs_from_tools(
-        key.code_mode,
-        scoped
-            .iter()
-            .copied()
-            .filter(|_| mode == DiscoveryMode::Grouped),
-    );
+    let mut floor = if mode == DiscoveryMode::CodeMode {
+        code_mode_floor_tool_defs()
+    } else {
+        grouped_tool_defs_from_tools(
+            key.code_mode,
+            scoped
+                .iter()
+                .copied()
+                .filter(|_| mode == DiscoveryMode::Grouped),
+        )
+    };
     hints.apply_all(&mut floor, router);
     let apps = scoped
         .iter()
@@ -8378,7 +8502,7 @@ fn tool_surface(
     mode: DiscoveryMode,
 ) -> Vec<Value> {
     tool_surface_with_code_mode(
-        host.code_mode_enabled(),
+        code_mode_for(host, mode),
         reg,
         router,
         catalog,
@@ -8395,7 +8519,7 @@ fn tool_surface_with_code_mode(
     allowed: Option<&std::collections::HashSet<String>>,
     mode: DiscoveryMode,
 ) -> Vec<Value> {
-    let mut scoped = if mode == DiscoveryMode::Lazy {
+    let mut scoped = if matches!(mode, DiscoveryMode::Lazy | DiscoveryMode::CodeMode) {
         Vec::new()
     } else {
         let owners = unique_prefix_owners(reg);
@@ -8413,15 +8537,19 @@ fn tool_surface_with_code_mode(
             tools.extend(scoped);
             tools
         }
-        DiscoveryMode::Lazy | DiscoveryMode::Grouped => {
-            let mut tools = grouped_tool_defs_with_code_mode(
-                code_mode,
-                if mode == DiscoveryMode::Grouped {
-                    &scoped
-                } else {
-                    &[]
-                },
-            );
+        DiscoveryMode::Lazy | DiscoveryMode::Grouped | DiscoveryMode::CodeMode => {
+            let mut tools = if mode == DiscoveryMode::CodeMode {
+                code_mode_floor_tool_defs()
+            } else {
+                grouped_tool_defs_with_code_mode(
+                    code_mode,
+                    if mode == DiscoveryMode::Grouped {
+                        &scoped
+                    } else {
+                        &[]
+                    },
+                )
+            };
             let mut app_tools = mcp_app_tools_for_client(catalog, allowed, router, reg);
             neutralize_listed_tools(&mut app_tools);
             tools.extend(app_tools);
@@ -8562,8 +8690,13 @@ fn handle_request_with_cancel(
                 full.splice(2..2, [search_tool_def(), call_tool_def()]);
                 hints.apply_all(&mut full[2..4], router);
             }
-            let full_floor =
-                full_tool_floor(host.code_mode_enabled(), full_discovery_fallback(client)).len();
+            // The Full baseline's floor, as a Full request would get it: the script tool
+            // only with the host switch, never from this request's code-mode discovery.
+            let full_floor = full_tool_floor(
+                code_mode_for(host, DiscoveryMode::Full),
+                full_discovery_fallback(client),
+            )
+            .len();
             let mode = if mode == DiscoveryMode::Full && over_client_tool_limit(client, tools.len())
             {
                 // The client would drop every tool, so answer with search instead.
@@ -8676,12 +8809,19 @@ fn handle_request_with_cancel(
                 }
                 let visible =
                     |name: &str| discovery_tool_visible(name, cached, router, reg, allowed);
-                return Some(success(
-                    id,
-                    shaping::fetch_result_for_model_visible(
+                let reply = match shaping::ResultQuery::from_arguments(&arguments) {
+                    Err(message) => json!({
+                        "content": [{ "type": "text", "text": message }],
+                        "isError": true
+                    }),
+                    Ok(Some(query)) => shaping::query_result_for_model_visible(
+                        cursor, client, &query, budget, &visible,
+                    ),
+                    Ok(None) => shaping::fetch_result_for_model_visible(
                         cursor, offset, len, client, projection, budget, &visible,
                     ),
-                ));
+                };
+                return Some(success(id, reply));
             }
 
             if name == "toolport_status" {
@@ -8933,7 +9073,7 @@ fn handle_request_with_cancel(
                 } else {
                     format!("{lead} {} pinned prerequisite tool(s) included with full schema; unranked prerequisites listed first.", pinned.len())
                 };
-                if host.code_mode_enabled() {
+                if code_mode_for(host, mode) {
                     add_search_signatures(&mut entries, &source);
                 }
                 // Count the exact serialized payload sent to the client.
@@ -9042,7 +9182,7 @@ fn handle_request_with_cancel(
             // round-trip; intermediate results never enter model context. Opt-in, and needs
             // the shareable router (router_arc) to build the script's call binding.
             if name == "toolport_run_script" {
-                if !host.code_mode_enabled() {
+                if !code_mode_for(host, mode) {
                     return Some(success(
                         id,
                         json!({
@@ -10405,6 +10545,10 @@ struct ListedRecord {
     /// surface, or an Auto list held on the Lazy floor while a server starts, can
     /// change on re-list without its catalog changing.
     digest: Option<[u8; 32]>,
+    /// For a delivered Lazy or code-mode list of Toolport's own tools only, what
+    /// it was built from ([`ListedFloor`]). Such a list does not change with the
+    /// catalog, so a publication that leaves its inputs alone needs no re-list.
+    floor: Option<ListedFloor>,
     /// HTTP replies being written now. Replies on separate connections have no
     /// delivery order, so overlapping ones clear the record instead of guessing.
     writing: usize,
@@ -10450,11 +10594,163 @@ fn listed_catalog_digest(
     hasher.finalize().into()
 }
 
-fn record_listed_tools(record: &ListedTools, digest: Option<[u8; 32]>) {
+/// A delivered Lazy or code-mode list that held only Toolport's own tools: its
+/// mode, a digest of the surface its inputs produce ([`floor_surface_digest`]), and,
+/// for an Auto client, the catalog size at which Auto would answer Full instead.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct ListedFloor {
+    mode: DiscoveryMode,
+    digest: [u8; 32],
+    auto_full_max: Option<usize>,
+    /// [`discovery_inputs_digest`] when it was listed: a mode edit must re-list.
+    discovery: [u8; 32],
+}
+
+/// Every setting that picks a connection's discovery mode, so a floor recorded
+/// under one choice is never taken as current under another.
+fn discovery_inputs_digest(reg: &Registry, host_mode: DiscoveryMode) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut clients: Vec<(&String, &String)> = reg.client_discovery.iter().collect();
+    clients.sort();
+    let inputs = json!([
+        reg.discovery_mode,
+        reg.lazy_discovery,
+        reg.legacy_lazy_discovery,
+        clients,
+        host_mode.as_str(),
+        conduit_lib::brand::env_var("TOOLPORT_DISCOVERY", "CONDUIT_DISCOVERY"),
+    ]);
+    Sha256::digest(inputs.to_string().as_bytes()).into()
+}
+
+/// What one delivered tools/list is recorded as ([`ListedRecord`]).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct ListedView {
+    catalog: Option<[u8; 32]>,
+    floor: Option<ListedFloor>,
+}
+
+impl From<Option<[u8; 32]>> for ListedView {
+    fn from(catalog: Option<[u8; 32]>) -> Self {
+        Self {
+            catalog,
+            floor: None,
+        }
+    }
+}
+
+/// The digest of the Lazy or code-mode surface these inputs build, or `None` when
+/// that surface lists anything beyond Toolport's own tools (an MCP app tool, say),
+/// which the catalog and the connection's router view decide.
+fn floor_surface_digest(
+    code_mode: bool,
+    reg: &Registry,
+    router: &Router,
+    catalog: &dyn ToolCatalog,
+    allowed: Option<&HashSet<String>>,
+    mode: DiscoveryMode,
+) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    if !matches!(mode, DiscoveryMode::Lazy | DiscoveryMode::CodeMode) {
+        return None;
+    }
+    let tools = tool_surface_with_code_mode(code_mode, reg, router, catalog, allowed, mode);
+    let own = tools.iter().all(|tool| {
+        tool.get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.starts_with("toolport_"))
+    });
+    own.then(|| Sha256::digest(serde_json::to_vec(&tools).unwrap_or_default()).into())
+}
+
+/// The floor record for a tools/list answered in `answered` mode, when it was asked
+/// for in `requested` mode, or `None` when the list is not one [`ListedFloor`] covers.
+#[allow(clippy::too_many_arguments)]
+fn listed_floor_for(
+    host: &HostState,
+    reg: &Registry,
+    router: &Router,
+    catalog: &dyn ToolCatalog,
+    allowed: Option<&HashSet<String>>,
+    client: Option<&str>,
+    requested: DiscoveryMode,
+    answered: DiscoveryMode,
+) -> Option<ListedFloor> {
+    // A Full request answered on the Lazy floor (a client tool cap) turns Full again
+    // when the catalog shrinks, so it is never treated as fixed.
+    if requested != answered {
+        return None;
+    }
+    let digest = floor_surface_digest(
+        code_mode_for(host, answered),
+        reg,
+        router,
+        catalog,
+        allowed,
+        answered,
+    )?;
+    let auto_full_max = (answered == DiscoveryMode::Lazy
+        && conduit_lib::brand::env_var("TOOLPORT_DISCOVERY", "CONDUIT_DISCOVERY").is_none())
+    .then(|| client.and_then(|id| clients::auto_full_max_tools(reg, id)))
+    .flatten();
+    Some(ListedFloor {
+        mode: answered,
+        digest,
+        auto_full_max,
+        discovery: discovery_inputs_digest(reg, host.discovery_mode()),
+    })
+}
+
+/// Whether a connection last sent the floor `floor` would be sent the same list
+/// now. Conservative: any doubt (an MCP app tool, an Auto client whose catalog may
+/// now be small enough for Full) answers `false`, so the client is told to re-list.
+fn listed_floor_current(
+    floor: &ListedFloor,
+    host: &HostState,
+    reg: &Registry,
+    router: &Router,
+    catalog: &dyn ToolCatalog,
+    allowed: Option<&HashSet<String>>,
+) -> bool {
+    if discovery_inputs_digest(reg, host.discovery_mode()) != floor.discovery {
+        return false;
+    }
+    let code_mode = code_mode_for(host, floor.mode);
+    if floor_surface_digest(code_mode, reg, router, catalog, allowed, floor.mode)
+        != Some(floor.digest)
+    {
+        return false;
+    }
+    let Some(max) = floor.auto_full_max else {
+        return true;
+    };
+    // Auto answers Full for a scoped catalog of 1..=max model-visible tools. The
+    // fewest that could count are the ones every view shows; if even those pass
+    // `max`, Auto stays on the Lazy floor.
+    let owners = unique_prefix_owners(reg);
+    let visible = scope_tools(catalog, allowed, |name| {
+        owner_of_exposed_tool(Some(router), &owners, name)
+    })
+    .into_iter()
+    .filter(mcp_app_tool_is_model_visible)
+    .count();
+    visible > max
+}
+
+fn listed_record_floor(record: &ListedTools) -> Option<ListedFloor> {
     record
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .digest = digest;
+        .floor
+}
+
+fn record_listed_tools(record: &ListedTools, view: impl Into<ListedView>) {
+    let view = view.into();
+    let mut record = record
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    record.digest = view.catalog;
+    record.floor = view.floor;
 }
 
 /// Marks an HTTP tools/list reply as being written. Pair with `finish_listed_write`.
@@ -10468,15 +10764,18 @@ fn begin_listed_write(record: &ListedTools) {
     }
 }
 
-fn finish_listed_write(record: &ListedTools, delivered: bool, digest: Option<[u8; 32]>) {
+fn finish_listed_write(record: &ListedTools, delivered: bool, view: impl Into<ListedView>) {
+    let view = view.into();
     let mut record = record
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     record.writing = record.writing.saturating_sub(1);
     if record.overlapped {
         record.digest = None;
+        record.floor = None;
     } else if delivered {
-        record.digest = digest;
+        record.digest = view.catalog;
+        record.floor = view.floor;
     }
     if record.writing == 0 {
         record.overlapped = false;
@@ -10497,6 +10796,119 @@ fn notify_tools_changed(stdio: &SessionState, mcp_sessions: Option<&McpSessions>
     notify_list_changed(stdio, mcp_sessions, "notifications/tools/list_changed");
 }
 
+/// The scope a session's tools/list was built for, as the allow-set the surface
+/// builders take.
+fn session_allowed(session: &SessionState) -> Option<HashSet<String>> {
+    session
+        .owner
+        .as_ref()
+        .and_then(|owner| owner.scope.clone())
+        .map(|scope| scope.into_iter().collect())
+}
+
+/// Checks connections against [`listed_floor_current`], once per distinct floor and
+/// scope: many sessions of one client share both.
+struct FloorCheck<'a> {
+    host: Option<&'a HostState>,
+    reg: &'a Registry,
+    router: &'a Router,
+    catalog: &'a dyn ToolCatalog,
+    seen: HashMap<(ListedFloor, Option<Vec<String>>), bool>,
+}
+
+impl<'a> FloorCheck<'a> {
+    /// `host` `None` checks nothing: every connection counts as changed.
+    fn new(
+        host: Option<&'a HostState>,
+        reg: &'a Registry,
+        router: &'a Router,
+        catalog: &'a dyn ToolCatalog,
+    ) -> Self {
+        Self {
+            host,
+            reg,
+            router,
+            catalog,
+            seen: HashMap::new(),
+        }
+    }
+
+    /// Whether the connection behind `record`, scoped to `allowed`, was last sent a
+    /// list it would be sent again now.
+    fn current(&mut self, record: &ListedTools, allowed: Option<&HashSet<String>>) -> bool {
+        let Some(host) = self.host else {
+            return false;
+        };
+        let Some(floor) = listed_record_floor(record) else {
+            return false;
+        };
+        let mut scope = allowed.map(|set| set.iter().cloned().collect::<Vec<_>>());
+        if let Some(scope) = &mut scope {
+            scope.sort();
+        }
+        let (reg, router, catalog) = (self.reg, self.router, self.catalog);
+        *self
+            .seen
+            .entry((floor, scope))
+            .or_insert_with(|| listed_floor_current(&floor, host, reg, router, catalog, allowed))
+    }
+}
+
+/// Announce a tools change to every connection except those last sent a Lazy or
+/// code-mode list of Toolport's own tools that these inputs would build again
+/// ([`ListedFloor`]). A registry edit or a policy publication that leaves a
+/// connection's list alone then costs it no re-list, and its prompt cache no
+/// invalidation; anything that may change the list still notifies.
+fn notify_tools_changed_unless_floor_current(
+    stdio: &SessionState,
+    mcp_sessions: Option<&McpSessions>,
+    host: &HostState,
+    reg: &Registry,
+    router: &Router,
+    catalog: &dyn ToolCatalog,
+) {
+    let method = "notifications/tools/list_changed";
+    let mut floors = FloorCheck::new(Some(host), reg, router, catalog);
+    let mut suppressed = 0usize;
+    if floors.current(&stdio.listed_tools, None) {
+        suppressed += 1;
+    } else {
+        notify_list_changed(stdio, None, method);
+    }
+    let Some(sessions) = mcp_sessions else {
+        return;
+    };
+    let sessions: Vec<Arc<SessionState>> = sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .cloned()
+        .collect();
+    let msg = json!({ "jsonrpc": "2.0", "method": method });
+    let (mut queued, mut dropped) = (0usize, 0usize);
+    for session in sessions {
+        if !session.takes_notifications() {
+            continue;
+        }
+        if floors.current(&session.listed_tools, session_allowed(&session).as_ref()) {
+            suppressed += 1;
+            continue;
+        }
+        let Some(json) = session.notification_json(&msg) else {
+            continue;
+        };
+        if session.push_message(json, request_id_key(&msg)) {
+            queued += 1;
+        } else {
+            dropped += 1;
+            eprintln!("toolport: MCP session could not take a notification; dropped");
+        }
+    }
+    glog(&format!(
+        "catalog_notification reason=publication prior=floor accepted={queued} dropped={dropped} suppressed={suppressed}"
+    ));
+}
+
 /// A shared downstream's catalog is visible to every session authorized for
 /// that server. Notify exactly the sessions whose visible catalog changed;
 /// sending this to the whole host leaks activity from other profiles.
@@ -10511,14 +10923,18 @@ fn notify_tools_changed_for_catalog_diff(
     current_router: &Router,
     reg: &Registry,
     previous_adapter_tools: Option<&HashMap<String, Vec<[u8; 32]>>>,
+    host: Option<&HostState>,
 ) {
     // A cold first tools/list can wait for the publication this announces and
     // already carry its catalog. Only a client sent something else needs a re-list.
+    // A Lazy or code-mode floor does not move with the catalog at all.
     let owners = unique_prefix_owners(reg);
+    let mut floors = FloorCheck::new(host, reg, current_router, current);
     if !listed_tools_current(
         &stdio.listed_tools,
         &listed_catalog_digest(current_router, current, None, &owners),
-    ) {
+    ) && !floors.current(&stdio.listed_tools, None)
+    {
         notify_list_changed(stdio, None, "notifications/tools/list_changed");
     }
     let Some(sessions) = mcp_sessions else {
@@ -10603,7 +11019,9 @@ fn notify_tools_changed_for_catalog_diff(
             });
         // A cold first list can already carry this publication. The record only
         // suppresses: a client sent exactly this catalog does not need a re-list.
-        let changed = published_change && !listed_tools_current(&session.listed_tools, &now);
+        let changed = published_change
+            && !listed_tools_current(&session.listed_tools, &now)
+            && !floors.current(&session.listed_tools, session_allowed(&session).as_ref());
         if !changed {
             suppressed += 1;
             continue;
@@ -12385,6 +12803,38 @@ impl HostState {
         catalogs
     }
 
+    /// [`notify_tools_changed_unless_floor_current`] against this host's live
+    /// registry, `router` and catalog.
+    fn notify_tools_changed_unless_floor_current(
+        &self,
+        stdio: &SessionState,
+        mcp_sessions: Option<&McpSessions>,
+        cached_tools: &SharedCatalog,
+        router: &Arc<Mutex<Arc<Router>>>,
+    ) {
+        let catalog = cached_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let router = router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let reg = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        notify_tools_changed_unless_floor_current(
+            stdio,
+            mcp_sessions,
+            self,
+            &reg,
+            &router,
+            &catalog.tools,
+        );
+    }
+
     /// Persist a rebuilt catalog and fan out `notifications/tools/list_changed`.
     // Persist and notify from the same rebuild snapshot and session scope.
     #[allow(clippy::too_many_arguments)]
@@ -12478,9 +12928,15 @@ impl HostState {
                 &current_router,
                 &reg,
                 previous_adapter_tools,
+                Some(self),
             );
         } else {
-            notify_tools_changed(stdio, mcp_sessions);
+            self.notify_tools_changed_unless_floor_current(
+                stdio,
+                mcp_sessions,
+                cached_tools,
+                router,
+            );
         }
         gateway_memory::request(tools.len());
     }
@@ -13170,7 +13626,14 @@ fn watch_tick(
         if policy_changed {
             host.invalidate_root_views();
             host.invalidate_tool_scope_views();
-            notify_tools_changed(stdio, mcp_sessions);
+            // Policy decides which catalog tools a client sees, which a Lazy or
+            // code-mode floor never lists: those connections keep their list.
+            host.notify_tools_changed_unless_floor_current(
+                stdio,
+                mcp_sessions,
+                cached_tools,
+                router,
+            );
             if !prompts_toggled.is_empty() {
                 notify_prompts_changed_for_servers(stdio, mcp_sessions, &prompts_toggled);
             }
@@ -14907,14 +15370,18 @@ impl HostState {
         preserve_collapsed_servers(new_tools, previous, &mut streaks)
     }
 
-    /// Gate for server-side "code mode" (the `toolport_run_script` meta-tool).
+    /// The host's Code Mode switch (the `toolport_run_script` meta-tool in every mode).
     ///
     /// Policy: off by default via the registry's `code_mode` field (Advanced Settings
-    /// switch, synced into this host's flag). Kill switch: turn Settings off. Code mode runs
-    /// agent-supplied JS and is not a security boundary; each host call still passes the same
-    /// scope / human-approval gates as `toolport_call_tool`. `TOOLPORT_CODE_MODE=1` (or legacy
-    /// `CONDUIT_CODE_MODE`) still force-enables for power users and tests. When off, `run_script`
-    /// is neither advertised nor dispatched.
+    /// switch, synced into this host's flag). Code mode runs agent-supplied JS and is not a
+    /// security boundary; each host call still passes the same scope / human-approval gates
+    /// as `toolport_call_tool`. `TOOLPORT_CODE_MODE=1` (or legacy `CONDUIT_CODE_MODE`) still
+    /// force-enables for power users and tests.
+    ///
+    /// This is only the switch. A request in the code-mode discovery mode has the script
+    /// tool even with the switch off, so whether a request may advertise or dispatch
+    /// `run_script` is [`code_mode_for`], never this alone. With the switch off and no
+    /// code-mode discovery, `run_script` is neither advertised nor dispatched.
     fn code_mode_enabled(&self) -> bool {
         let env_forced = conduit_lib::brand::env_flag("TOOLPORT_CODE_MODE", "CONDUIT_CODE_MODE");
         env_forced || self.code_mode.load(Ordering::Relaxed)
@@ -16990,7 +17457,14 @@ fn finish_startup_build(
     if let Some(tools) = persisted_tools {
         save_tool_cache(&tools, profile);
     }
-    notify_tools_changed(stdio, Some(&host.mcp_sessions));
+    // A connection that listed a Lazy or code-mode floor while the build ran keeps
+    // it; an Auto one that may now be small enough for Full is still told.
+    host.notify_tools_changed_unless_floor_current(
+        stdio,
+        Some(&host.mcp_sessions),
+        &host.cached_tools,
+        &host.router,
+    );
     glog(&format!(
         "background build: initial catalog announced; servers={}",
         serde_json::to_string(&announced_servers).unwrap()
@@ -18232,6 +18706,7 @@ fn process_request_wire_inner(
                 .map(str::to_string),
         );
         let _capabilities = UpstreamCapabilitiesGuard::enter(req);
+        let requested = discovery;
         let (mut full, mut exposed) = cached_tool_surfaces(
             state,
             &reg,
@@ -18339,12 +18814,26 @@ fn process_request_wire_inner(
                 &unique_prefix_owners(&reg),
             )
         });
+        // A Lazy or code-mode list of Toolport's own tools is fixed by its inputs,
+        // not the catalog: record them so a publication that leaves them alone
+        // sends no list_changed.
+        let listed_floor = listed_floor_for(
+            state,
+            &reg,
+            &router,
+            &cache_snapshot.tools,
+            allowed,
+            client,
+            requested,
+            discovery,
+        );
         return Some(GatewayResponse {
             envelope,
             surface: Some(exposed),
             observation: None,
             tools_list: true,
             listed_catalog: listed,
+            listed_floor,
             listed_tools: None,
         });
     }
@@ -18594,6 +19083,8 @@ fn http_tool_defs(
     };
     if matches!(discovery, DiscoveryMode::Lazy) {
         floor_tool_defs(state)
+    } else if matches!(discovery, DiscoveryMode::CodeMode) {
+        code_mode_floor_tool_defs()
     } else if matches!(discovery, DiscoveryMode::Grouped) {
         // Grouped: the meta-tools plus a per-server help_<server> browse tool. Scope
         // the catalog to this client FIRST so the help tools (which read as meta-tools
@@ -18863,7 +19354,7 @@ struct HttpOut {
     /// Long-lived MCP SSE listen stream (chunked response).
     mcp_listen: Option<McpListen>,
     catalog_delivery: Option<(Arc<observation::Session>, observation::CatalogDelivery)>,
-    listed: Option<(ListedTools, Option<[u8; 32]>)>,
+    listed: Option<(ListedTools, ListedView)>,
     observation: Option<Arc<observation::Session>>,
 }
 
@@ -25940,6 +26431,7 @@ mod tests {
             &router,
             &reg,
             None,
+            None,
         );
         assert!(methods(&session).contains(&tools_changed));
         assert!(
@@ -26077,6 +26569,7 @@ mod tests {
             &live,
             &reg,
             None,
+            None,
         );
         assert!(methods(&listed).contains(&tools_changed));
     }
@@ -26134,6 +26627,7 @@ mod tests {
                 &live,
                 &live,
                 &reg,
+                None,
                 None,
             );
             session.outbound.lock().unwrap().iter().any(|message| {
@@ -26231,6 +26725,7 @@ mod tests {
                 &router,
                 &router,
                 &reg,
+                None,
                 None,
             )
         };
@@ -30778,6 +31273,337 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("code mode is disabled"));
+    }
+
+    /// Code-mode-first discovery lists only the floor (no downstream tool), runs
+    /// scripts even with the Code Mode switch off, and tells the model to batch.
+    #[test]
+    fn code_mode_discovery_lists_the_floor_and_runs_scripts() {
+        let _data_env = DataDirTestEnv::new("code_mode_discovery_floor");
+        let host = dispatch_host(false);
+        let reg = Registry::default();
+        let router = Arc::new(routed_router("s", "tool"));
+        let catalog = router.shared_tools();
+        let search_index = CatalogSearchIndex::build(&catalog);
+        let call = |req: Value| {
+            handle_request_with_cancel(
+                &host,
+                &req,
+                &reg,
+                &router,
+                &catalog,
+                DiscoveryMode::CodeMode,
+                None,
+                &SearchGuard::default(),
+                None,
+                None,
+                None,
+                None,
+                Some(&search_index),
+                Some(&router),
+                None,
+            )
+            .unwrap()
+        };
+        let listed = call(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}));
+        let names: Vec<&str> = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "toolport_status",
+                "toolport_search_tools",
+                "toolport_fetch_result",
+                "toolport_run_script"
+            ]
+        );
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        let run = tools
+            .iter()
+            .find(|t| t["name"] == "toolport_run_script")
+            .unwrap();
+        let description = run["description"].as_str().unwrap();
+        assert!(description.contains("ONE script") && description.contains("toolport.callAll"));
+        assert_eq!(run["_meta"][CLAUDE_ALWAYS_LOAD_META], true);
+        let init = call(json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}));
+        assert!(init["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("toolport_run_script"));
+        // Search hits carry the script signature to call them with.
+        let found = call(
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"tool"}}}),
+        );
+        assert!(
+            found["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("servers.s.tool"),
+            "{found}"
+        );
+        let ran = call(
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"toolport_run_script","arguments":{"script":"return 42;"}}}),
+        );
+        assert_eq!(ran["result"]["isError"], false, "{ran}");
+        assert_eq!(ran["result"]["structuredContent"]["result"], 42);
+        // The host switch still governs every other mode.
+        assert!(!code_mode_for(&host, DiscoveryMode::Lazy));
+    }
+
+    #[test]
+    fn code_mode_discovery_is_selectable_everywhere_a_mode_is() {
+        for spelling in ["code-mode", "codemode", "CODE_MODE", "code"] {
+            assert_eq!(parse_mode(spelling), Some(DiscoveryMode::CodeMode));
+            assert_eq!(
+                resolve_mode_from(Some(spelling), None, None, false),
+                (DiscoveryMode::CodeMode, None)
+            );
+        }
+        assert_eq!(
+            resolve_mode_from(None, Some("code-mode"), Some("full"), false).0,
+            DiscoveryMode::CodeMode
+        );
+        assert_eq!(
+            DiscoveryMode::from_u8(DiscoveryMode::CodeMode.as_u8()),
+            DiscoveryMode::CodeMode
+        );
+        let mut reg = Registry::default();
+        reg.set_client_discovery("codex", Some("codemode"));
+        assert_eq!(reg.client_discovery_mode("codex"), Some("code-mode"));
+        assert_eq!(
+            conduit_lib::clients::client_discovery_mode(&reg, "codex"),
+            "code-mode"
+        );
+        assert_eq!(
+            http_client_discovery_override(&reg, "codex"),
+            Some(DiscoveryMode::CodeMode)
+        );
+        // A chosen mode turns Auto's small-catalog Full off, like any other choice.
+        reg.set_client_discovery("claude-code", Some("code-mode"));
+        assert_eq!(
+            conduit_lib::clients::auto_full_max_tools(&reg, "claude-code"),
+            None
+        );
+        reg.set_discovery_mode("code-mode");
+        assert_eq!(reg.discovery_mode.as_deref(), Some("code-mode"));
+        assert!(reg.lazy_discovery, "an older gateway falls back to Lazy");
+    }
+
+    /// The model-facing fetch tool answers a structured query against a result
+    /// shaped on the tool-call path, in one small reply.
+    #[test]
+    fn fetch_result_answers_a_query_against_a_shaped_call_result() {
+        let _data_env = DataDirTestEnv::new("fetch_result_query");
+        let issues: Vec<Value> = (0..150)
+            .map(|i| json!({"id": format!("ISS-{i}"), "assignee": if i % 50 == 7 { "alice" } else { "bob" }, "labels": ["p0"], "notes": "x".repeat(900)}))
+            .collect();
+        let raw = json!({"content":[{"type":"text","text":json!({"issues":issues}).to_string()}],"isError":false});
+        let reg = Registry::default();
+        let defended =
+            defend_and_shape(&reg, "tracker", "tracker__list_issues", None, raw, "", true);
+        let shaped = defended.result;
+        assert!(serde_json::to_string(&shaped).unwrap().len() <= shaping::PREVIEW_BUDGET_BYTES);
+        assert!(
+            defended.bytes.unwrap().raw.unwrap() > 130_000,
+            "{:?}",
+            defended.bytes
+        );
+        assert_eq!(
+            defended.bytes.unwrap().response as usize,
+            serde_json::to_string(&shaped).unwrap().len()
+        );
+        let text = shaped["content"][0]["text"].as_str().unwrap();
+        let cursor = text
+            .split("\"cursor\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap();
+        let host = dispatch_host(false);
+        let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_fetch_result","arguments":{"cursor":cursor,"where":{"assignee":"alice"},"fields":["id"]}}});
+        let resp = handle_request(
+            &host,
+            &req,
+            &reg,
+            &Router::new(),
+            &[],
+            false,
+            None,
+            &SearchGuard::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let reply: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            reply["items"],
+            json!([
+                {"id":"ISS-7","assignee":"alice"},
+                {"id":"ISS-57","assignee":"alice"},
+                {"id":"ISS-107","assignee":"alice"}
+            ])
+        );
+        assert_eq!(
+            resp["result"]["_meta"]["app.toolport/provenance"]["server"],
+            "tracker"
+        );
+        // A malformed query is refused with a clear message, not paged.
+        let bad = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"toolport_fetch_result","arguments":{"cursor":cursor,"where":"alice"}}});
+        let resp = handle_request(
+            &host,
+            &bad,
+            &reg,
+            &Router::new(),
+            &[],
+            false,
+            None,
+            &SearchGuard::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        // Plain paging is unchanged.
+        let page = json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"toolport_fetch_result","arguments":{"cursor":cursor,"offset":0}}});
+        let resp = handle_request(
+            &host,
+            &page,
+            &reg,
+            &Router::new(),
+            &[],
+            false,
+            None,
+            &SearchGuard::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("{\"issues\":["));
+        // A result Toolport did not rewrite records one size.
+        let small = defend_and_shape(
+            &reg,
+            "tracker",
+            "tracker__get",
+            None,
+            json!({"content":[{"type":"text","text":"ok"}],"isError":false}),
+            "",
+            true,
+        );
+        assert_eq!(small.bytes.unwrap().raw, None);
+        assert_eq!(
+            small.bytes.unwrap().response as usize,
+            serde_json::to_string(&small.result).unwrap().len()
+        );
+        // Code-mode intermediate calls (`shape == false`) never enter model context directly.
+        let intermediate = defend_and_shape(
+            &reg,
+            "tracker",
+            "tracker__get",
+            None,
+            json!({"content":[{"type":"text","text":"ok"}],"isError":false}),
+            "",
+            false,
+        );
+        assert_eq!(intermediate.bytes, None);
+    }
+
+    /// A registry rebuild or policy publication that leaves a connection's Lazy or
+    /// code-mode list alone must not tell it to re-list: each needless
+    /// `list_changed` costs a round trip and can invalidate the client's prompt cache.
+    /// Anything that changes the list still notifies.
+    #[test]
+    fn unchanged_floor_lists_get_no_list_changed() {
+        let _env = DataDirTestEnv::new("floor-list-changed");
+        let state = http_state(true);
+        swap_router(&state, routed_router("cache", "read"));
+        let mint = || mint_mcp_session(&state, None).unwrap_or_else(|_| panic!("mint session"));
+        let (lazy, code, full, unlisted) = (mint(), mint(), mint(), mint());
+        for (sid, mode) in [
+            (&lazy, DiscoveryMode::Lazy),
+            (&code, DiscoveryMode::CodeMode),
+            (&full, DiscoveryMode::Grouped),
+        ] {
+            let _session = McpSessionGuard::enter(Some(sid.clone()));
+            let reply = process_request_wire(
+                &state,
+                &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+                &SearchGuard::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                mode,
+            )
+            .unwrap();
+            reply.delivered();
+            reply.record_listed();
+        }
+        let session = |sid: &str| Arc::clone(&state.mcp_sessions.lock().unwrap()[sid]);
+        let told = |sid: &str| -> bool {
+            session(sid).outbound.lock().unwrap().iter().any(|message| {
+                let message: Value = serde_json::from_str(&message.json).unwrap();
+                message["method"] == "notifications/tools/list_changed"
+            })
+        };
+        let clear = || {
+            for sid in [&lazy, &code, &full, &unlisted] {
+                session(sid).outbound.lock().unwrap().clear();
+            }
+        };
+        let rebuild = || {
+            let tools = state.router.lock().unwrap().shared_tools();
+            state.host.persist_and_emit_with_sessions(
+                &tools,
+                &state.cached_tools,
+                &state.router,
+                None,
+                &state.stdio_upstream,
+                Some(&state.mcp_sessions),
+                None,
+                false,
+                None,
+            );
+        };
+
+        rebuild();
+        assert!(!told(&lazy), "a Lazy floor does not move with the catalog");
+        assert!(!told(&code), "nor does a code-mode floor");
+        assert!(told(&full), "a Grouped list counts the catalog's tools");
+        assert!(told(&unlisted), "a client that never listed is told");
+
+        // Repeated no-op publications stay silent.
+        clear();
+        rebuild();
+        rebuild();
+        assert!(!told(&lazy) && !told(&code));
+
+        // Code Mode on adds run_script to the Lazy floor: that client must re-list.
+        // The code-mode floor already had it.
+        clear();
+        state.host.set_code_mode(true);
+        rebuild();
+        assert!(told(&lazy));
+        assert!(!told(&code));
+        state.host.set_code_mode(false);
+
+        // A discovery edit is never taken as a no-op.
+        clear();
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .set_client_discovery("cursor", Some("full"));
+        rebuild();
+        assert!(told(&lazy) && told(&code));
     }
 
     /// P1.3: the code-mode flag belongs to the host, so one host's switch cannot decide
@@ -36190,6 +37016,7 @@ mod tests {
             &current_router,
             &reg,
             Some(&frozen),
+            None,
         );
         for session in [existing, joining, first_in_profile] {
             let queue = session.outbound.lock().unwrap();
@@ -48869,6 +49696,16 @@ mod tests {
         }
         for (tool, case, output) in outputs {
             let chars = claude_text_chars(&output);
+            if tool == "toolport_call_tool" {
+                // An oversized downstream result now comes back as a small preview
+                // with a queryable cursor, far under any hint.
+                assert!(
+                    chars <= shaping::PREVIEW_BUDGET_BYTES,
+                    "{tool} {case} must be a preview: {chars}"
+                );
+                assert!(claude_text_chars(&output) > 0 && output.to_string().contains("cursor"));
+                continue;
+            }
             assert!(
                 chars > 50_000,
                 "{tool} {case} must be a large output: {chars}"
@@ -49502,6 +50339,7 @@ mod tests {
                 observation: None,
                 tools_list: true,
                 listed_catalog: None,
+                listed_floor: None,
                 listed_tools: None,
             };
             let expected = serde_json::to_string(&response).unwrap();
@@ -50639,40 +51477,57 @@ mod tests {
             .parse()
             .unwrap();
 
-        // Fetch the remainder through the public tool API.
-        let fetch_req = json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {
-                "name": "toolport_fetch_result",
-                "arguments": {
-                    "cursor": cursor,
-                    "offset": offset,
-                    "len":  usize::MAX,
+        // Fetch the remainder through the public tool API. The preview shows only a
+        // short head, so the rest can take more than one budget-sized page.
+        let mut next = offset;
+        let mut rest = String::new();
+        loop {
+            let fetch_req = json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "toolport_fetch_result",
+                    "arguments": {
+                        "cursor": cursor,
+                        "offset": next,
+                        "len":  usize::MAX,
+                    }
                 }
+            });
+            let fetch_resp = handle_request(
+                &host,
+                &fetch_req,
+                &reg,
+                &router,
+                &[],
+                true,
+                None,
+                &SearchGuard::default(),
+                None,
+                None,
+            )
+            .unwrap();
+            let fetched = fetch_resp["result"]["content"][0]["text"].as_str().unwrap();
+            let (slice, footer) = fetched.rsplit_once("\n\n[Toolport: ").unwrap();
+            rest.push_str(slice);
+            if footer.starts_with("end of result") {
+                break;
             }
-        });
-
-        let fetch_resp = handle_request(
-            &host,
-            &fetch_req,
-            &reg,
-            &router,
-            &[],
-            true,
-            None,
-            &SearchGuard::default(),
-            None,
-            None,
-        )
-        .unwrap();
-
-        let fetched = fetch_resp["result"]["content"][0]["text"].as_str().unwrap();
-
-        assert!(fetched.starts_with(&body[offset..]));
-
-        assert!(fetched.contains("[Toolport: end of result"));
+            next = footer
+                .split("offset=")
+                .nth(1)
+                .and_then(|tail| tail.split(' ').next())
+                .unwrap()
+                .parse()
+                .unwrap();
+        }
+        // The kept body is the text plus the server's structuredContent after it.
+        assert!(
+            rest.starts_with(&body[offset..]),
+            "{}",
+            &rest[rest.len() - 120..]
+        );
     }
 
     #[test]

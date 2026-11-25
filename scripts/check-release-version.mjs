@@ -75,6 +75,16 @@ export function expectedChecks(parsed) {
       read: (root) => jsonVersion(root, "package.json"),
     },
     {
+      file: "packages/toolport-cli/package.json",
+      expected: parsed.version,
+      read: (root) => {
+        const pkg = JSON.parse(
+          readFileSync(path.join(root, "packages/toolport-cli/package.json"), "utf8"),
+        );
+        return [pkg.version, ...Object.values(pkg.optionalDependencies ?? {})];
+      },
+    },
+    {
       file: "package-lock.json",
       expected: parsed.version,
       read: (root) => {

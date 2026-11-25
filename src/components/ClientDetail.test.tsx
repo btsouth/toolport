@@ -1425,6 +1425,43 @@ it("shows a client's list reminder on its details after another client's feedbac
   expect(screen.queryByText("refused")).not.toBeInTheDocument();
 });
 
+it("offers code mode discovery and explains it once chosen", async () => {
+  const chosen = { ...emptyRegistry(), clientDiscovery: { codex: "code-mode" } };
+  vi.mocked(setClientDiscovery).mockResolvedValue(chosen);
+  const onRegistryChange = vi.fn();
+  const view = render(
+    <ClientDetail
+      client={client({ id: "codex", name: "Codex" })}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={onRegistryChange}
+    />,
+  );
+  await userEvent.click(screen.getByRole("combobox", { name: "Discovery mode" }));
+  await userEvent.click(
+    await screen.findByRole("option", { name: "Code mode · scripts" }),
+  );
+  expect(setClientDiscovery).toHaveBeenCalledWith("codex", "code-mode");
+  await waitFor(() => expect(onRegistryChange).toHaveBeenCalledWith(chosen));
+
+  view.rerender(
+    <ClientDetail
+      client={client({ id: "codex", name: "Codex" })}
+      registry={chosen}
+      onChanged={vi.fn()}
+      onRegistryChange={onRegistryChange}
+    />,
+  );
+  expect(
+    screen.getByText(
+      "Search and run scripts. Client per-tool permission rules need Full mode.",
+    ),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("combobox", { name: "Discovery mode" })).toHaveTextContent(
+    "Code mode · scripts",
+  );
+});
+
 it("drops discovery feedback that arrives after the details page closed", async () => {
   const reminder = {
     clientId: "cursor",

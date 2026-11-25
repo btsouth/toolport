@@ -350,6 +350,11 @@ jobs:
           cargo test --manifest-path src-tauri/Cargo.toml --no-default-features
           --features gtk-desktop --lib linux_native::
 
+      - name: Test Linux desktop CLI dispatch and marker isolation
+        run: >-
+          cargo test --manifest-path src-tauri/Cargo.toml --no-default-features
+          --features gtk-desktop,test-support --test cli_desktop_dispatch
+
       - name: Test GTK dialogs and menus in isolated processes
         env:
           GSK_RENDERER: cairo
@@ -385,6 +390,7 @@ jobs:
             credential_dialog_tests::remove_client_credentials_shows_when_the_secret_is_unknown \
             tests::connect_shows_reacts_restart_reminder \
             details::tests::b5_credential_save_reprobes_unchanged_detail_without_refresh \
+            details::tests::code_mode_choice_saves_code_mode_and_shows_its_summary \
             setup::tests::review_list_caps_at_parent_height_and_keeps_footer_visible \
             setup::tests::import_review_shows_saved_names_and_marks_unsupported_for_review \
             setup::tests::review_rows_show_markup_characters_as_text \

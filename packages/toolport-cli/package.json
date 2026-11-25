@@ -1,0 +1,45 @@
+{
+  "name": "@toolport/cli",
+  "version": "2.3.8",
+  "description": "One setup for every coding agent: check agents, find plaintext secrets, profile token use and bootstrap repos from toolport.toml.",
+  "license": "MIT",
+  "author": "South Forge AI",
+  "homepage": "https://github.com/btsouth/toolport/blob/main/docs/cli.md",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/btsouth/toolport.git",
+    "directory": "packages/toolport-cli"
+  },
+  "keywords": [
+    "mcp",
+    "claude-code",
+    "codex",
+    "cursor",
+    "opencode",
+    "agents",
+    "skills",
+    "tokens"
+  ],
+  "type": "module",
+  "bin": {
+    "toolport": "bin/toolport.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "optionalDependencies": {
+    "@toolport/cli-darwin-arm64": "2.3.8",
+    "@toolport/cli-darwin-x64": "2.3.8",
+    "@toolport/cli-linux-arm64": "2.3.8",
+    "@toolport/cli-linux-x64": "2.3.8",
+    "@toolport/cli-win32-x64": "2.3.8"
+  }
+}

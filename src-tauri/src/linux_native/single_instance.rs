@@ -154,13 +154,19 @@ fn read_build_stamp(bytes: &[u8]) -> Option<u64> {
         })
         .max()
 }
+/// The build stamp as `--version` prints it.
+pub(super) fn build_stamp_text() -> String {
+    String::from_utf8_lossy(std::hint::black_box(&BUILD_STAMP_BYTES))
+        .trim_end_matches('\0')
+        .to_string()
+}
+
 pub(super) fn information(args: &[String]) -> Option<String> {
     if args.iter().any(|a| a == "--version" || a == "-V") {
         return Some(format!(
             "Toolport {}\n{}",
             env!("CARGO_PKG_VERSION"),
-            String::from_utf8_lossy(std::hint::black_box(&BUILD_STAMP_BYTES))
-                .trim_end_matches('\0')
+            build_stamp_text()
         ));
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {

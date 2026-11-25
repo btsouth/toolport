@@ -19,11 +19,9 @@ pub struct DiscoveryCapabilities {
 
 impl DiscoveryCapabilities {
     pub fn resolve_mode(self, mode: Option<&str>) -> &'static str {
-        match mode.map(str::trim) {
-            Some(mode) if mode.eq_ignore_ascii_case("full") => "full",
-            Some(mode) if mode.eq_ignore_ascii_case("lazy") => "lazy",
-            Some(mode) if mode.eq_ignore_ascii_case("grouped") => "grouped",
-            _ => self.auto_mode(),
+        match mode.and_then(chosen_mode) {
+            Some(mode) => mode,
+            None => self.auto_mode(),
         }
     }
 
@@ -33,17 +31,25 @@ impl DiscoveryCapabilities {
 
     /// Auto's small-catalog Full limit, or `None` when a chosen mode decides instead.
     pub fn auto_full_max_tools_for(self, chosen: Option<&str>) -> Option<usize> {
-        let chosen = chosen.is_some_and(|mode| {
-            matches!(
-                mode.trim().to_ascii_lowercase().as_str(),
-                "full" | "lazy" | "grouped"
-            )
-        });
+        let chosen = chosen.and_then(chosen_mode).is_some();
         if chosen {
             None
         } else {
             self.auto_full_max_tools
         }
+    }
+}
+
+/// The canonical name of a discovery mode someone chose, or `None` for Auto (an
+/// empty, `inherit` or unknown value). `code-mode` also accepts `codemode`,
+/// `code_mode` and `code`.
+pub fn chosen_mode(mode: &str) -> Option<&'static str> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "full" => Some("full"),
+        "lazy" => Some("lazy"),
+        "grouped" => Some("grouped"),
+        "code-mode" | "codemode" | "code_mode" | "code" => Some("code-mode"),
+        _ => None,
     }
 }
 

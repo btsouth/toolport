@@ -208,6 +208,7 @@ mod linux {
                 observation: None,
                 tools_list: true,
                 listed_catalog: None,
+                listed_floor: None,
                 listed_tools: None,
             }
         }

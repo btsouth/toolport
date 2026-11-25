@@ -440,7 +440,7 @@ export function setCodeMode(enabled: boolean): Promise<Registry> {
   return invoke<Registry>("set_code_mode", { enabled });
 }
 
-/** Override one client's discovery mode ("full" | "lazy" | "grouped"), or clear it
+/** Override one client's discovery mode ("full" | "lazy" | "grouped" | "code-mode"), or clear it
  * (`null`) so the client inherits the global mode. Applies live via the gateway's
  * per-client resolution, no reconnect needed. */
 export function setClientDiscovery(

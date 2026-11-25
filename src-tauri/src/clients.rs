@@ -35,7 +35,7 @@ mod reasonix;
 pub(crate) mod reasonix_paths;
 mod synced;
 mod t3code;
-pub use discovery::DiscoveryCapabilities;
+pub use discovery::{chosen_mode as chosen_discovery_mode, DiscoveryCapabilities};
 pub(crate) use locations::folder_key as claude_profile_key;
 #[cfg(feature = "test-support")]
 pub use locations::measure_scan as measure_client_location_scan;

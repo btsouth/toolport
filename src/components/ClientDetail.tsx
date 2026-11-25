@@ -76,6 +76,9 @@ const DISCOVERY_HINT: Record<string, SourceMessage> = {
     "Browse a server, then call tools. Client per-tool permission rules need Full mode.",
   ),
   full: msg("Full tool list. Client per-tool permission rules need Full mode."),
+  "code-mode": msg(
+    "Search and run scripts. Client per-tool permission rules need Full mode.",
+  ),
 };
 
 export function ClientDetail({ client, registry, onChanged, onRegistryChange }: Props) {
@@ -828,6 +831,9 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               <SelectItem value="lazy">{translate("Lazy · search")}</SelectItem>
               <SelectItem value="grouped">{translate("Grouped · per-server")}</SelectItem>
               <SelectItem value="full">{translate("Full · every tool")}</SelectItem>
+              <SelectItem value="code-mode">
+                {translate("Code mode · scripts")}
+              </SelectItem>
             </SelectContent>
           </Select>
         </div>

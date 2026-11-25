@@ -56,9 +56,11 @@ impl ProfileProduct {
 /// The short discovery summary for a connected client, and the full sentence for its tooltip.
 pub(super) fn discovery_summary(client: &state::ClientView) -> (String, String) {
     let capabilities = crate::clients::discovery_capabilities(&client.id);
+    // An unrecognized override is Auto, so it inherits like the gateway and React do.
     let chosen = client
         .discovery_mode
         .as_deref()
+        .and_then(crate::clients::chosen_discovery_mode)
         .or(client.inherited_discovery.as_deref());
     if let Some(max) = capabilities.auto_full_max_tools_for(chosen) {
         // Auto lists a small catalog in full for this client, then switches to search.
@@ -83,6 +85,12 @@ pub(super) fn discovery_summary(client: &state::ClientView) -> (String, String) 
             crate::i18n::tr("Browse a server, then call tools"),
             crate::i18n::tr(
                 "Browse a server, then call tools. Client per-tool permission rules need Full mode.",
+            ),
+        ),
+        "code-mode" => (
+            crate::i18n::tr("Search and run scripts"),
+            crate::i18n::tr(
+                "Search and run scripts. Client per-tool permission rules need Full mode.",
             ),
         ),
         _ => (
@@ -1533,6 +1541,27 @@ mod caption_tests {
             "{text} / {tooltip}"
         );
         assert!(tooltip.contains("Full mode"), "{tooltip}");
+        // Code mode reads as React's Clients page does, from any spelling the gateway takes.
+        for stored in ["code-mode", "codemode", "code_mode"] {
+            client.discovery_mode = Some(stored.into());
+            assert_eq!(
+                discovery_summary(&client),
+                (
+                    "Search and run scripts".to_string(),
+                    "Search and run scripts. Client per-tool permission rules need Full mode."
+                        .to_string()
+                ),
+                "{stored}"
+            );
+            let (text, tooltip) = client_detail(&client, RowStyle::Line);
+            assert!(text.ends_with("Search and run scripts"), "{text}");
+            assert!(tooltip.contains("Full mode"), "{tooltip}");
+        }
+        client.discovery_mode = None;
+        client.inherited_discovery = Some("code-mode".into());
+        assert_eq!(discovery_summary(&client).0, "Search and run scripts");
+        client.inherited_discovery = None;
+        client.discovery_mode = Some("lazy".into());
         // A line with nothing more to say has no tooltip.
         client.gateway_state = state::ClientGatewayState::Disconnected;
         assert_eq!(client_detail(&client, RowStyle::Line).1, "");

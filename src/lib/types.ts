@@ -748,7 +748,7 @@ export interface Registry {
   injectionBlockExempt?: Record<string, boolean>;
   /** Global switch: expose 4 meta-tools instead of the full catalog. */
   lazyDiscovery?: boolean;
-  /** Global discovery mode ("full" | "lazy" | "grouped"). Takes precedence over
+  /** Global discovery mode ("full" | "lazy" | "grouped" | "code-mode"). Takes precedence over
    * `lazyDiscovery`; absent = fall back to the `lazyDiscovery` bool. */
   discoveryMode?: string | null;
   /** Set when a 1.x upgrade kept 1.x's Lazy default for every client. */
@@ -760,7 +760,8 @@ export interface Registry {
    * calls in one server-side script. Off by default; opt in under Advanced. */
   codeMode?: boolean;
   /** Per-client discovery-mode override, keyed by client id (e.g. "cursor" ->
-   * "grouped"). Absent = Auto from the client capability table. */
+   * "grouped"; one of "full" | "lazy" | "grouped" | "code-mode"). Absent = Auto from
+   * the client capability table. */
   clientDiscovery?: Record<string, string>;
   /** Connection to a Toolport Teams server, if joined. Token lives in the keychain. */
   team?: TeamConnection | null;
