@@ -128,28 +128,32 @@ pub fn render(scan: &ScanReport, usage: &UsageReport, generated: &str) -> String
     }
 
     // Shell output breakdown.
-    if !usage.shell.is_empty() {
-        let bash_share = usage
-            .resident
-            .iter()
-            .find(|s| s.source == "bash")
-            .map(|s| s.share)
-            .unwrap_or(0.0);
+    let shell_rows: Vec<_> = usage
+        .shell
+        .iter()
+        .filter(|s| s.tokens > 0 || s.produced > 0)
+        .collect();
+    if !shell_rows.is_empty() {
+        let bash_row = usage.resident.iter().find(|s| s.source == "bash");
+        let subtitle = match bash_row {
+            Some(b) if b.tokens > 0 => {
+                format!(
+                    "where the {} bash residency came from",
+                    format::percent(b.share)
+                )
+            }
+            _ => "by tokens added".into(),
+        };
         h.push_str(&format!(
-            "<section><h2>Shell output<small>where the {} bash residency came from</small></h2><table><tr><th>Category</th><th>Share</th><th class=n>%</th><th class=n>Added</th><th class=n>Calls</th><th class=hide>Top commands</th></tr>",
-            escape(&format::percent(bash_share))
+            "<section><h2>Shell output<small>{}</small></h2><table><tr><th>Category</th><th>Share</th><th class=n>%</th><th class=n>Added</th><th class=n>Calls</th><th class=hide>Top commands</th></tr>",
+            escape(&subtitle)
         ));
-        let smax = usage
-            .shell
+        let smax = shell_rows
             .iter()
             .map(|s| s.shell_share)
             .fold(0.0, f64::max)
             .max(0.0001);
-        for s in usage
-            .shell
-            .iter()
-            .filter(|s| s.tokens > 0 || s.produced > 0)
-        {
+        for s in shell_rows {
             let class = match s.category.as_str() {
                 "git" => "bar mcp",
                 "test" | "build" => "bar floor",

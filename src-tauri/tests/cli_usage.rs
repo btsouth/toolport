@@ -361,3 +361,68 @@ fn a_window_counts_the_turns_inside_it_not_whole_files() {
     assert_eq!(all["totals"]["turns"], 3, "{all:#}");
     assert_eq!(all["stats"]["cached"], 1, "{all:#}");
 }
+
+#[test]
+fn shell_breakdown_never_leaks_hosts_paths_or_tokens_in_json_text_or_html() {
+    let f = Fixture::new("usage-shell-privacy");
+    f.clean_machine();
+    let t0 = now_ms() - 3_600_000;
+    let lines = [
+        assistant(
+            t0,
+            "m1",
+            usage(10, 0, 20_000, 0, 50),
+            json!([{
+                "type": "tool_use",
+                "id": "t1",
+                "name": "Bash",
+                "input": {"command": "ssh secret-host.internal \"cat /home/alice/private-key.txt?token=SUPERSECRET123\""}
+            }]),
+        ),
+        tool_result(t0 + 1000, "t1", json!("x".repeat(8_000))),
+        assistant(
+            t0 + 2000,
+            "m2",
+            usage(10, 20_000, 2_000, 0, 50),
+            json!([{"type": "text", "text": "ok"}]),
+        ),
+    ];
+    f.write(
+        ".claude/projects/-work-demo/s1.jsonl",
+        &(lines.join("\n") + "\n"),
+    );
+
+    let json_raw = stdout(&f.run(&["usage", "--json", "--days", "7"]));
+    let human = stdout(&f.run(&["usage", "--days", "7"]));
+    let html_path = f.home.join("report.html");
+    let report_out = f.run(&[
+        "report",
+        "--days",
+        "7",
+        "--out",
+        html_path.to_str().unwrap(),
+    ]);
+    assert_eq!(report_out.status.code(), Some(0));
+    let html = std::fs::read_to_string(&html_path).unwrap();
+
+    for (kind, text) in [("json", &json_raw), ("human", &human), ("html", &html)] {
+        for forbidden in ["secret-host", "alice", "private-key", "SUPERSECRET123"] {
+            assert!(
+                !text.contains(forbidden),
+                "{forbidden} leaked into {kind} output:\n{text}"
+            );
+        }
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&json_raw).unwrap();
+    let read_row = parsed["shell"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["category"] == "read")
+        .unwrap();
+    assert!(read_row["topCommands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c == "cat"));
+}

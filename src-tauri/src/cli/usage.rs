@@ -168,6 +168,12 @@ fn walk_jsonl(dir: &Path, since_ms: u64, depth: usize, out: &mut Vec<(PathBuf, u
                 walk_jsonl(&path, since_ms, depth - 1, out);
             }
         } else if kind.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
+            // Skip workflow journal files under `subagents/workflows/<wf>/journal.jsonl`.
+            if path.file_name().is_some_and(|n| n == "journal.jsonl")
+                && path.components().any(|c| c.as_os_str() == "workflows")
+            {
+                continue;
+            }
             if let Ok(meta) = entry.metadata() {
                 let m = mtime_ms(&meta);
                 if m >= since_ms {
@@ -775,8 +781,63 @@ fn record_shell_command(
     entry.1 += tokens;
 }
 
+/// Parse an unquoted heredoc marker starting at `bytes[pos..]` (where `bytes[pos..pos+2] == b"<<"`).
+/// Returns `Some((strip_tabs, delimiter, next_index))` if this is a real heredoc (not `<<<`).
+fn parse_heredoc_marker(cmd: &str, pos: usize) -> Option<(bool, String, usize)> {
+    let bytes = cmd.as_bytes();
+    if pos + 2 > bytes.len() || &bytes[pos..pos + 2] != b"<<" {
+        return None;
+    }
+    // `<<<` is a here-string, not a heredoc.
+    if bytes.get(pos + 2) == Some(&b'<') {
+        return None;
+    }
+    let mut i = pos + 2;
+    let strip_tabs = if bytes.get(i) == Some(&b'-') {
+        i += 1;
+        true
+    } else {
+        false
+    };
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    let mut delim = String::new();
+    let mut quote = 0u8;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if quote != 0 {
+            if b == quote {
+                quote = 0;
+            } else {
+                delim.push(b as char);
+            }
+            i += 1;
+        } else if matches!(b, b'\'' | b'"') {
+            quote = b;
+            i += 1;
+        } else if b == b'\\' && i + 1 < bytes.len() {
+            i += 1;
+            delim.push(bytes[i] as char);
+            i += 1;
+        } else if b.is_ascii_whitespace() || matches!(b, b';' | b'&' | b'|' | b')' | b'>' | b'<') {
+            break;
+        } else {
+            delim.push(b as char);
+            i += 1;
+        }
+    }
+    if delim.is_empty() {
+        return None;
+    }
+    Some((strip_tabs, delim, i))
+}
+
 /// Split a shell command into top-level `&&` / `||` / `;` / newline segments without breaking
-/// quoted strings or parenthesized subshells.
+/// quoted strings, parenthesized subshells, or heredoc bodies.
 fn split_shell_segments(cmd: &str) -> Vec<&str> {
     let bytes = cmd.as_bytes();
     let mut out = Vec::new();
@@ -784,6 +845,7 @@ fn split_shell_segments(cmd: &str) -> Vec<&str> {
     let mut i = 0usize;
     let mut quote = 0u8;
     let mut depth = 0usize;
+    let mut heredocs: Vec<(bool, String)> = Vec::new();
     while i < bytes.len() {
         let b = bytes[i];
         if quote != 0 {
@@ -805,6 +867,14 @@ fn split_shell_segments(cmd: &str) -> Vec<&str> {
             b'\\' if i + 1 < bytes.len() => {
                 i += 2;
             }
+            b'<' if i + 1 < bytes.len() && bytes[i + 1] == b'<' => {
+                if let Some((strip_tabs, delim, next)) = parse_heredoc_marker(cmd, i) {
+                    heredocs.push((strip_tabs, delim));
+                    i = next;
+                } else {
+                    i += 2;
+                }
+            }
             b'(' | b'{' => {
                 depth += 1;
                 i += 1;
@@ -813,7 +883,38 @@ fn split_shell_segments(cmd: &str) -> Vec<&str> {
                 depth = depth.saturating_sub(1);
                 i += 1;
             }
-            b';' | b'\n' if depth == 0 => {
+            b'\n' if depth == 0 => {
+                out.push(&cmd[start..i]);
+                i += 1;
+                // Skip any pending heredoc bodies before resuming segment scanning.
+                for (strip_tabs, delim) in heredocs.drain(..) {
+                    while i < bytes.len() {
+                        let line_end = bytes[i..]
+                            .iter()
+                            .position(|&ch| ch == b'\n')
+                            .map(|p| i + p)
+                            .unwrap_or(bytes.len());
+                        let line = &cmd[i..line_end]
+                            .strip_suffix('\r')
+                            .unwrap_or(&cmd[i..line_end]);
+                        let candidate = if strip_tabs {
+                            line.trim_start_matches('\t')
+                        } else {
+                            line
+                        };
+                        i = if line_end < bytes.len() {
+                            line_end + 1
+                        } else {
+                            bytes.len()
+                        };
+                        if candidate == delim {
+                            break;
+                        }
+                    }
+                }
+                start = i;
+            }
+            b';' if depth == 0 => {
                 out.push(&cmd[start..i]);
                 i += 1;
                 start = i;
@@ -954,7 +1055,16 @@ fn classify_segment(seg: &str, depth: u8) -> Option<ShellClass> {
     if depth > 4 {
         return None;
     }
-    let trimmed = seg.trim();
+    let mut trimmed = seg.trim();
+    // Unwrap enclosing subshell parens like `(cd x && cargo test)`.
+    while trimmed.starts_with('(') && trimmed.ends_with(')') && trimmed.len() >= 2 {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        if !inner.is_empty() && inner.contains("&&") || inner.contains(';') || inner.contains('\n')
+        {
+            return Some(classify_shell_command_depth(inner, depth + 1));
+        }
+        trimmed = inner.trim();
+    }
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return None;
     }
@@ -962,29 +1072,41 @@ fn classify_segment(seg: &str, depth: u8) -> Option<ShellClass> {
     classify_tokens(&tokens, depth)
 }
 
+fn is_shell_keyword(tok: &str) -> bool {
+    matches!(
+        tok,
+        "do" | "then" | "else" | "elif" | "if" | "while" | "until" | "!" | "{" | "(" | "coproc"
+    )
+}
+
 fn classify_tokens(tokens: &[String], depth: u8) -> Option<ShellClass> {
     if depth > 4 {
         return None;
     }
     let mut i = 0usize;
-    while i < tokens.len() && is_env_assignment(&tokens[i]) {
-        i += 1;
-    }
-    if i >= tokens.len() {
-        return None;
-    }
-
-    // Unwrap common command wrappers (`env`, `nohup`, `timeout`, `sudo`, `ssh`, `bash -lc`, etc.).
+    // Unwrap common command wrappers (`env`, `nohup`, `timeout`, `sudo`, `ssh`, `bash -lc`, `mise x --`, etc.).
     let mut loops = 0u8;
-    while i < tokens.len() && loops < 6 {
+    while i < tokens.len() && loops < 8 {
         loops += 1;
-        while i < tokens.len() && is_env_assignment(&tokens[i]) {
-            i += 1;
+        while i < tokens.len()
+            && (is_env_assignment(&tokens[i])
+                || is_shell_keyword(tokens[i].trim_start_matches(['(', '{'])))
+        {
+            if is_shell_keyword(&tokens[i]) || is_env_assignment(&tokens[i]) {
+                i += 1;
+            } else {
+                break;
+            }
         }
         if i >= tokens.len() {
             return None;
         }
-        let cmd = base_command_name(&tokens[i]);
+        let raw_head = tokens[i].trim_start_matches(['(', '{']);
+        if raw_head.is_empty() {
+            i += 1;
+            continue;
+        }
+        let cmd = base_command_name(raw_head);
         match cmd.as_str() {
             "env" => {
                 i += 1;
@@ -1063,6 +1185,18 @@ fn classify_tokens(tokens: &[String], depth: u8) -> Option<ShellClass> {
                     break;
                 }
             }
+            "mise" => {
+                if tokens
+                    .get(i + 1)
+                    .is_some_and(|sub| matches!(sub.as_str(), "x" | "exec"))
+                {
+                    if let Some(pos) = tokens[i + 2..].iter().position(|t| t == "--") {
+                        i += 2 + pos + 1;
+                        continue;
+                    }
+                }
+                break;
+            }
             "bash" | "sh" | "zsh" | "dash" | "fish" => {
                 if let Some(pos) = tokens[i + 1..]
                     .iter()
@@ -1070,6 +1204,22 @@ fn classify_tokens(tokens: &[String], depth: u8) -> Option<ShellClass> {
                 {
                     if let Some(script) = tokens.get(i + 1 + pos + 1) {
                         return Some(classify_shell_command_depth(script, depth + 1));
+                    }
+                }
+                break;
+            }
+            "pwsh" | "powershell" => {
+                if let Some(pos) = tokens[i + 1..].iter().position(|t| {
+                    t.eq_ignore_ascii_case("-command")
+                        || t.eq_ignore_ascii_case("-c")
+                        || t.eq_ignore_ascii_case("/c")
+                }) {
+                    let rest = &tokens[i + 1 + pos + 1..];
+                    if rest.len() == 1 {
+                        return Some(classify_shell_command_depth(&rest[0], depth + 1));
+                    } else if !rest.is_empty() {
+                        let joined = rest.join(" ");
+                        return Some(classify_shell_command_depth(&joined, depth + 1));
                     }
                 }
                 break;
@@ -1141,20 +1291,28 @@ fn classify_tokens(tokens: &[String], depth: u8) -> Option<ShellClass> {
         return None;
     }
 
-    let raw = tokens[i].as_str();
+    let raw = tokens[i].trim_start_matches(['(', '{']);
     let cmd = base_command_name(raw);
     if is_setup_builtin(&cmd) {
         return None;
     }
 
     let args = &tokens[i + 1..];
+    // `sed -i` edits a file in place with no stdout; skip it so a chained command wins.
+    if cmd == "sed"
+        && args.iter().any(|a| {
+            a == "-i" || a.starts_with("-i") || a == "--in-place" || a.starts_with("--in-place=")
+        })
+    {
+        return None;
+    }
     let first_sub = |skip_with_arg: &[&str]| -> Option<String> {
         let mut j = 0usize;
         while j < args.len() {
             let t = args[j].as_str();
             if skip_with_arg.contains(&t) {
                 j += 2;
-            } else if t.starts_with('-') {
+            } else if t.starts_with('-') || (cmd == "cargo" && t.starts_with('+')) {
                 j += 1;
             } else {
                 return Some(t.to_ascii_lowercase());
@@ -1331,7 +1489,7 @@ fn classify_tokens(tokens: &[String], depth: u8) -> Option<ShellClass> {
             bucket: "test",
             command: Some("mocha"),
         },
-        "playwright" => ShellClass {
+        "playwright" | "playwright-cli" => ShellClass {
             bucket: "test",
             command: Some("playwright"),
         },
@@ -1350,7 +1508,21 @@ fn classify_tokens(tokens: &[String], depth: u8) -> Option<ShellClass> {
 
         // Cargo / Go / Node / JS package managers.
         "cargo" => {
-            match first_sub(&["--manifest-path", "--target-dir", "-p", "--package"]).as_deref() {
+            match first_sub(&[
+                "--manifest-path",
+                "--target-dir",
+                "-p",
+                "--package",
+                "--features",
+                "-F",
+                "--profile",
+                "--target",
+                "-j",
+                "--jobs",
+                "-C",
+            ])
+            .as_deref()
+            {
                 Some("test") => ShellClass {
                     bucket: "test",
                     command: Some("cargo test"),
@@ -1665,12 +1837,33 @@ fn classify_tokens(tokens: &[String], depth: u8) -> Option<ShellClass> {
 }
 
 fn classify_js_runner(runner: &str, args: &[String]) -> ShellClass {
-    let mut non_flags = args
-        .iter()
-        .filter(|a| !a.starts_with('-'))
-        .map(|a| a.to_ascii_lowercase());
-    let first = non_flags.next();
-    let second = non_flags.next();
+    let skip_with_arg = [
+        "--prefix",
+        "-C",
+        "--dir",
+        "--filter",
+        "-F",
+        "--cwd",
+        "--workspace",
+        "-w",
+        "--config",
+        "--userconfig",
+    ];
+    let mut non_flags: Vec<(usize, String)> = Vec::new();
+    let mut j = 0usize;
+    while j < args.len() {
+        let t = args[j].as_str();
+        if skip_with_arg.contains(&t) {
+            j += 2;
+        } else if t.starts_with('-') {
+            j += 1;
+        } else {
+            non_flags.push((j, t.to_ascii_lowercase()));
+            j += 1;
+        }
+    }
+    let first = non_flags.first().map(|(idx, s)| (*idx, s.as_str()));
+    let second = non_flags.get(1).map(|(_, s)| s.as_str());
     let is_test_script = |s: &str| {
         s == "test"
             || s.starts_with("test:")
@@ -1691,8 +1884,8 @@ fn classify_js_runner(runner: &str, args: &[String]) -> ShellClass {
             || s == "fmt"
             || s.starts_with("bench")
     };
-    match first.as_deref() {
-        Some("test" | "t") => ShellClass {
+    match first {
+        Some((_, "test" | "t")) => ShellClass {
             bucket: "test",
             command: Some(match runner {
                 "pnpm" => "pnpm test",
@@ -1701,16 +1894,18 @@ fn classify_js_runner(runner: &str, args: &[String]) -> ShellClass {
                 _ => "npm test",
             }),
         },
-        Some("install" | "ci" | "i" | "add" | "update" | "remove" | "uninstall") => ShellClass {
-            bucket: "net",
-            command: Some(match runner {
-                "pnpm" => "pnpm install",
-                "yarn" => "yarn install",
-                "bun" => "bun install",
-                _ => "npm install",
-            }),
-        },
-        Some("run") => match second.as_deref() {
+        Some((_, "install" | "ci" | "i" | "add" | "update" | "remove" | "uninstall")) => {
+            ShellClass {
+                bucket: "net",
+                command: Some(match runner {
+                    "pnpm" => "pnpm install",
+                    "yarn" => "yarn install",
+                    "bun" => "bun install",
+                    _ => "npm install",
+                }),
+            }
+        }
+        Some((_, "run")) => match second {
             Some(s) if is_test_script(s) => ShellClass {
                 bucket: "test",
                 command: Some("npm run test"),
@@ -1724,15 +1919,15 @@ fn classify_js_runner(runner: &str, args: &[String]) -> ShellClass {
                 command: Some("npm run"),
             },
         },
-        Some(s) if is_test_script(s) => ShellClass {
+        Some((_, s)) if is_test_script(s) => ShellClass {
             bucket: "test",
             command: Some("npm test"),
         },
-        Some(s) if is_build_script(s) => ShellClass {
+        Some((_, s)) if is_build_script(s) => ShellClass {
             bucket: "build",
             command: Some("npm run build"),
         },
-        Some("dlx" | "exec") => classify_npx(&args[1..]),
+        Some((idx, "dlx" | "exec")) => classify_npx(&args[idx + 1..]),
         _ => ShellClass {
             bucket: "script",
             command: Some("npm"),
@@ -1741,10 +1936,20 @@ fn classify_js_runner(runner: &str, args: &[String]) -> ShellClass {
 }
 
 fn classify_npx(args: &[String]) -> ShellClass {
-    let tool = args
-        .iter()
-        .find(|a| !a.starts_with('-'))
-        .map(|a| a.to_ascii_lowercase());
+    let skip_with_arg = ["-p", "--package", "-c", "--call"];
+    let mut j = 0usize;
+    let mut tool = None;
+    while j < args.len() {
+        let t = args[j].as_str();
+        if skip_with_arg.contains(&t) {
+            j += 2;
+        } else if t.starts_with('-') {
+            j += 1;
+        } else {
+            tool = Some(t.to_ascii_lowercase());
+            break;
+        }
+    }
     match tool.as_deref() {
         Some(t) if t.contains("vitest") => ShellClass {
             bucket: "test",
@@ -1785,6 +1990,18 @@ fn classify_npx(args: &[String]) -> ShellClass {
     }
 }
 
+fn shell_bucket_priority(bucket: &str) -> u8 {
+    match bucket {
+        "test" => 6,
+        "build" => 5,
+        "git" => 4,
+        "read" => 3,
+        "script" => 2,
+        "net" => 1,
+        _ => 0,
+    }
+}
+
 fn classify_shell_command(cmd: &str) -> ShellClass {
     classify_shell_command_depth(cmd, 0)
 }
@@ -1809,6 +2026,41 @@ fn classify_shell_command_depth(cmd: &str, depth: u8) -> ShellClass {
     })
 }
 
+enum ShellCommand {
+    Text(String),
+    Argv(Vec<String>),
+    Multiple(Vec<String>),
+}
+
+fn classify_extracted_shell(cmd: ShellCommand) -> ShellClass {
+    match cmd {
+        ShellCommand::Text(s) => classify_shell_command(&s),
+        ShellCommand::Argv(argv) => classify_tokens(&argv, 0).unwrap_or(ShellClass {
+            bucket: "other",
+            command: None,
+        }),
+        ShellCommand::Multiple(cmds) => {
+            let mut best: Option<ShellClass> = None;
+            for c in cmds {
+                let sc = classify_shell_command(&c);
+                let better = match best {
+                    None => true,
+                    Some(prev) => {
+                        shell_bucket_priority(sc.bucket) > shell_bucket_priority(prev.bucket)
+                    }
+                };
+                if better {
+                    best = Some(sc);
+                }
+            }
+            best.unwrap_or(ShellClass {
+                bucket: "other",
+                command: None,
+            })
+        }
+    }
+}
+
 fn extract_claude_shell_command(input: Option<&RawValue>) -> Option<String> {
     #[derive(Deserialize)]
     struct BashInput<'a> {
@@ -1820,19 +2072,71 @@ fn extract_claude_shell_command(input: Option<&RawValue>) -> Option<String> {
         .and_then(|b| b.command.map(|c| c.into_owned()))
 }
 
+fn extract_claude_bash_id(input: Option<&RawValue>) -> Option<String> {
+    #[derive(Deserialize)]
+    struct BashOutputInput<'a> {
+        #[serde(borrow)]
+        bash_id: Option<std::borrow::Cow<'a, str>>,
+    }
+    input
+        .and_then(|i| serde_json::from_str::<BashOutputInput>(i.get()).ok())
+        .and_then(|b| b.bash_id.map(|s| s.into_owned()))
+}
+
+fn extract_claude_background_id(raw: &str) -> Option<String> {
+    for needle in [
+        "Command running in background with ID: ",
+        "command running in background with id: ",
+        "Background bash ",
+    ] {
+        if let Some(pos) = raw.find(needle) {
+            let tail = &raw[pos + needle.len()..];
+            let id: String = tail
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+                .collect();
+            if !id.is_empty() {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+fn extract_codex_id_field(input: Option<&str>, key: &str) -> Option<String> {
+    let raw = input?;
+    let val: serde_json::Value = serde_json::from_str(raw).ok()?;
+    match val.get(key)? {
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn extract_codex_running_id(raw: &str, needle: &str) -> Option<String> {
+    let pos = raw.find(needle)?;
+    let tail = &raw[pos + needle.len()..];
+    let id: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    (!id.is_empty()).then_some(id)
+}
+
 fn extract_codex_shell_command(
     name: &str,
     input: Option<&str>,
     action: Option<&CodexAction>,
-) -> Option<String> {
+) -> Option<ShellCommand> {
     if name == "local_shell" {
-        if let Some(cmd) = action.and_then(|a| a.command.as_deref()) {
-            return join_argv_command(cmd);
+        if let Some(cmd) = action
+            .and_then(|a| a.command.as_ref())
+            .filter(|v| !v.is_empty())
+        {
+            return Some(ShellCommand::Argv(cmd.clone()));
         }
     }
     let raw = input?;
     if name == "exec" {
-        return extract_js_cmd_literal(raw);
+        let cmds = extract_all_js_cmd_literals(raw);
+        return (!cmds.is_empty()).then_some(ShellCommand::Multiple(cmds));
     }
     #[derive(Deserialize)]
     #[serde(untagged)]
@@ -1847,57 +2151,50 @@ fn extract_codex_shell_command(
     }
     if let Ok(args) = serde_json::from_str::<CodexShellArgs>(raw) {
         match args.cmd.or(args.command) {
-            Some(StrOrVec::Str(s)) => return Some(s),
-            Some(StrOrVec::Vec(v)) => return join_argv_command(&v),
-            None => {}
+            Some(StrOrVec::Str(s)) => return Some(ShellCommand::Text(s)),
+            Some(StrOrVec::Vec(v)) if !v.is_empty() => return Some(ShellCommand::Argv(v)),
+            _ => {}
         }
     }
     None
 }
 
-fn join_argv_command(argv: &[String]) -> Option<String> {
-    if argv.is_empty() {
-        return None;
-    }
-    if argv.len() >= 3
-        && matches!(
-            base_command_name(&argv[0]).as_str(),
-            "bash" | "sh" | "zsh" | "dash" | "fish"
-        )
-        && matches!(argv[1].as_str(), "-c" | "-lc" | "-cl")
-    {
-        return Some(argv[2].clone());
-    }
-    Some(argv.join(" "))
-}
-
-fn extract_js_cmd_literal(script: &str) -> Option<String> {
+fn extract_all_js_cmd_literals(script: &str) -> Vec<String> {
+    let mut out = Vec::new();
     for needle in ["cmd:", "command:"] {
-        let Some(pos) = script.find(needle) else {
-            continue;
-        };
-        let rest = script[pos + needle.len()..].trim_start();
-        let mut chars = rest.chars();
-        let quote = chars.next()?;
-        if !matches!(quote, '"' | '\'' | '`') {
-            continue;
-        }
-        let mut out = String::new();
-        let mut escaped = false;
-        for c in chars {
-            if escaped {
-                out.push(c);
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == quote {
-                return Some(out);
-            } else {
-                out.push(c);
+        let mut rest = script;
+        while let Some(pos) = rest.find(needle) {
+            rest = &rest[pos + needle.len()..];
+            let trimmed = rest.trim_start();
+            let mut chars = trimmed.chars();
+            let Some(quote) = chars.next() else {
+                break;
+            };
+            if !matches!(quote, '"' | '\'' | '`') {
+                continue;
+            }
+            let mut buf = String::new();
+            let mut escaped = false;
+            let mut closed = false;
+            for c in chars {
+                if escaped {
+                    buf.push(c);
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == quote {
+                    closed = true;
+                    break;
+                } else {
+                    buf.push(c);
+                }
+            }
+            if closed && !buf.is_empty() {
+                out.push(buf);
             }
         }
     }
-    None
+    out
 }
 
 // --- Claude Code -------------------------------------------------------------------------
@@ -1999,6 +2296,7 @@ struct ClaudeState {
     seen: HashMap<String, (bool, u64)>,
     pending: HashMap<String, PendingTool>,
     reads: HashMap<String, u64>,
+    bash_ids: HashMap<String, (String, Option<&'static str>)>,
 }
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -2133,7 +2431,11 @@ fn claude_line(s: &mut FileSummary, st: &mut ClaudeState, line: ClaudeLine) {
                     continue;
                 }
                 let raw_category = claude_category(name, block.input);
-                let (category, shell_cmd) = if raw_category == "bash" {
+                let (category, shell_cmd) = if name == "BashOutput" {
+                    extract_claude_bash_id(block.input)
+                        .and_then(|bid| st.bash_ids.get(&bid).cloned())
+                        .unwrap_or_else(|| (shell_category_key("other"), None))
+                } else if raw_category == "bash" {
                     let sc = extract_claude_shell_command(block.input)
                         .map(|cmd| classify_shell_command(&cmd))
                         .unwrap_or(ShellClass {
@@ -2214,6 +2516,7 @@ fn claude_line(s: &mut FileSummary, st: &mut ClaudeState, line: ClaudeLine) {
                             .map(|p| p.category.clone())
                             .unwrap_or_else(|| "other".into());
                         let mut text = 0u64;
+                        let mut bg_id = None;
                         if let Some(c) = block.content {
                             let raw = c.get();
                             if raw.starts_with('[') {
@@ -2229,14 +2532,18 @@ fn claude_line(s: &mut FileSummary, st: &mut ClaudeState, line: ClaudeLine) {
                                             stream.image(s, image_tokens(&data));
                                         }
                                         _ => {
-                                            text += inner
-                                                .text
-                                                .map(|t| text_tokens(t.get().len()))
-                                                .unwrap_or(0);
+                                            if let Some(t) = inner.text {
+                                                let s_raw = t.get();
+                                                if bg_id.is_none() {
+                                                    bg_id = extract_claude_background_id(s_raw);
+                                                }
+                                                text += text_tokens(s_raw.len());
+                                            }
                                         }
                                     }
                                 }
                             } else {
+                                bg_id = extract_claude_background_id(raw);
                                 text += text_tokens(raw.len());
                             }
                         }
@@ -2244,6 +2551,9 @@ fn claude_line(s: &mut FileSummary, st: &mut ClaudeState, line: ClaudeLine) {
                             if p.duplicate {
                                 s.dup_reads += 1;
                                 s.dup_read_tokens += text;
+                            }
+                            if let Some(id) = bg_id {
+                                st.bash_ids.insert(id, (p.category.clone(), p.shell_cmd));
                             }
                             record_shell_command(s, &p.category, p.shell_cmd, text);
                             let _ = &p.read_key;
@@ -2388,6 +2698,8 @@ pub fn parse_codex(path: &Path) -> DaySummaries {
     let mut model = String::from("unknown");
     let mut last_total = None::<u64>;
     let mut calls: HashMap<String, (String, Option<&'static str>)> = HashMap::new();
+    let mut cell_ids: HashMap<String, (String, Option<&'static str>)> = HashMap::new();
+    let mut session_ids: HashMap<String, (String, Option<&'static str>)> = HashMap::new();
     read_lines(path, |line| {
         if !(contains(line, b"token_count")
             || contains(line, b"turn_context")
@@ -2460,13 +2772,21 @@ pub fn parse_codex(path: &Path) -> DaySummaries {
                         });
                         let (raw_category, servers) =
                             codex_category(name, p.namespace.as_deref(), input.as_deref());
-                        let (category, shell_cmd) = if raw_category == "bash" {
+                        let (category, shell_cmd) = if name == "wait" {
+                            extract_codex_id_field(input.as_deref(), "cell_id")
+                                .and_then(|cid| cell_ids.get(&cid).cloned())
+                                .unwrap_or_else(|| (shell_category_key("other"), None))
+                        } else if name == "write_stdin" {
+                            extract_codex_id_field(input.as_deref(), "session_id")
+                                .and_then(|sid| session_ids.get(&sid).cloned())
+                                .unwrap_or_else(|| (shell_category_key("other"), None))
+                        } else if raw_category == "bash" {
                             let sc = extract_codex_shell_command(
                                 name,
                                 input.as_deref(),
                                 p.action.as_ref(),
                             )
-                            .map(|cmd| classify_shell_command(&cmd))
+                            .map(classify_extracted_shell)
                             .unwrap_or(ShellClass {
                                 bucket: "other",
                                 command: None,
@@ -2493,6 +2813,16 @@ pub fn parse_codex(path: &Path) -> DaySummaries {
                             .unwrap_or_else(|| ("other".into(), None));
                         let Some(output) = p.output else { return };
                         let raw = output.get();
+                        if let Some(cid) =
+                            extract_codex_running_id(raw, "Script running with cell ID ")
+                        {
+                            cell_ids.insert(cid, (category.clone(), shell_cmd));
+                        }
+                        if let Some(sid) =
+                            extract_codex_running_id(raw, "Process running with session ID ")
+                        {
+                            session_ids.insert(sid, (category.clone(), shell_cmd));
+                        }
                         let text = if raw.starts_with('[') {
                             let mut text = 0;
                             for part in serde_json::from_str::<Vec<CodexOutputPart>>(raw)
@@ -3665,19 +3995,17 @@ pub fn render(r: &UsageReport, style: &Style) -> String {
         .filter(|s| s.tokens > 0 || s.produced > 0)
         .collect();
     if !shell_rows.is_empty() {
-        let bash_share = r
-            .resident
-            .iter()
-            .find(|s| s.source == "bash")
-            .map(|s| s.share)
-            .unwrap_or(0.0);
-        out.push_str(&style.heading(&format!(
-            "Shell output  {}",
-            style.dim(&format!(
-                "where the {} bash residency came from",
-                format::percent(bash_share)
-            ))
-        )));
+        let bash_row = r.resident.iter().find(|s| s.source == "bash");
+        let subtitle = match bash_row {
+            Some(b) if b.tokens > 0 => {
+                format!(
+                    "where the {} bash residency came from",
+                    format::percent(b.share)
+                )
+            }
+            _ => "by tokens added".into(),
+        };
+        out.push_str(&style.heading(&format!("Shell output  {}", style.dim(&subtitle))));
         let smax = shell_rows
             .iter()
             .map(|s| s.shell_share)
@@ -4361,31 +4689,248 @@ mod tests {
             None,
         );
         check("C:\\tools\\git.exe status", "git", Some("git status"));
+        // Heredoc bodies are not commands.
+        check("tee out.txt <<EOF\ncargo test\nEOF", "other", None);
+        check("tee out.txt <<-'END'\n\tgit diff\n\tEND", "other", None);
+        // Shell keywords, subshells, mise wrapper, and sed -i.
+        check("for f in a b; do cat \"$f\"; done", "read", Some("cat"));
+        check("if true; then cargo test; fi", "test", Some("cargo test"));
+        check("(cd /repo && cargo test)", "test", Some("cargo test"));
+        check(
+            "mise x pnpm@10.18.1 -- pnpm exec vitest run",
+            "test",
+            Some("vitest"),
+        );
+        check(
+            "sed -i 's/a/b/' src/lib.rs && cargo clippy",
+            "build",
+            Some("cargo clippy"),
+        );
+        check(
+            "playwright-cli -s=inbox snapshot",
+            "test",
+            Some("playwright"),
+        );
+        // Flags that take values and cargo +toolchain.
+        check("npm --prefix web run test", "test", Some("npm run test"));
+        check("pnpm -C app --filter web test", "test", Some("pnpm test"));
+        check("pnpm --silent exec vitest", "test", Some("vitest"));
+        check("cargo +nightly test", "test", Some("cargo test"));
+        // Windows PowerShell -Command unwrapping.
+        check(
+            "powershell.exe -NoProfile -Command \"git diff\"",
+            "git",
+            Some("git diff"),
+        );
+        // Multibyte UTF-8 and unterminated quotes never panic.
+        check("rg \"日本語の検索", "read", Some("rg"));
+        check("cat 'unterminated 🦀", "read", Some("cat"));
     }
 
     #[test]
     fn codex_shell_extractors_handle_exec_command_local_shell_and_code_mode() {
+        let classify = |name, input, action: Option<&CodexAction>| {
+            extract_codex_shell_command(name, input, action).map(classify_extracted_shell)
+        };
         assert_eq!(
-            extract_codex_shell_command("exec_command", Some(r#"{"cmd":"rg foo src/"}"#), None)
-                .as_deref(),
-            Some("rg foo src/")
+            classify("exec_command", Some(r#"{"cmd":"rg foo src/"}"#), None),
+            Some(ShellClass {
+                bucket: "read",
+                command: Some("rg")
+            })
         );
         let action = CodexAction {
             command: Some(vec!["bash".into(), "-lc".into(), "git diff".into()]),
         };
         assert_eq!(
-            extract_codex_shell_command("local_shell", None, Some(&action)).as_deref(),
-            Some("git diff")
+            classify("local_shell", None, Some(&action)),
+            Some(ShellClass {
+                bucket: "git",
+                command: Some("git diff")
+            })
         );
+        // Argv with `;` inside an argument must not split into a second command.
+        let commit_action = CodexAction {
+            command: Some(vec![
+                "git".into(),
+                "commit".into(),
+                "-m".into(),
+                "fix; cargo test".into(),
+            ]),
+        };
         assert_eq!(
-            extract_codex_shell_command(
-                "exec",
-                Some(r#"text(await tools.exec_command({cmd:"cargo test --lib"}))"#),
-                None
-            )
-            .as_deref(),
-            Some("cargo test --lib")
+            classify("local_shell", None, Some(&commit_action)),
+            Some(ShellClass {
+                bucket: "git",
+                command: Some("git commit")
+            })
         );
+        // Multi-cmd code-mode script picks the highest-priority shell command.
+        assert_eq!(
+            classify(
+                "exec",
+                Some(
+                    r#"text(await Promise.all([tools.exec_command({cmd:"ls"}), tools.exec_command({cmd:"cargo test --lib"})]))"#
+                ),
+                None
+            ),
+            Some(ShellClass {
+                bucket: "test",
+                command: Some("cargo test")
+            })
+        );
+    }
+
+    #[test]
+    fn codex_wait_write_stdin_and_claude_bash_output_inherit_origin_category() {
+        let dir = scratch("shell-continuation-ids");
+        // Codex: exec -> cell ID -> wait, and exec_command -> session ID -> write_stdin.
+        let codex_path = dir.join("codex.jsonl");
+        write_lines(
+            &codex_path,
+            &[
+                serde_json::json!({
+                    "timestamp": "2026-11-24T10:00:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call",
+                        "name": "exec",
+                        "call_id": "c1",
+                        "input": r#"text(await tools.exec_command({cmd:"cargo test --lib"}))"#
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-11-24T10:00:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": "c1",
+                        "output": "Script running with cell ID 42\n"
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-11-24T10:00:05Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "wait",
+                        "call_id": "c2",
+                        "arguments": r#"{"cell_id":"42"}"#
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-11-24T10:00:06Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "c2",
+                        "output": "x".repeat(4000)
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-11-24T10:00:07Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "c3",
+                        "arguments": r#"{"cmd":"git diff"}"#
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-11-24T10:00:08Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "c3",
+                        "output": "Process running with session ID 7\n"
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-11-24T10:00:09Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "write_stdin",
+                        "call_id": "c4",
+                        "arguments": r#"{"session_id":7,"chars":""}"#
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-11-24T10:00:10Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "c4",
+                        "output": "y".repeat(2000)
+                    }
+                }),
+            ],
+        );
+        let csum = in_window(&parse_codex(&codex_path), 0);
+        assert!(
+            csum.produced.get("bash:test").copied().unwrap_or(0) >= 1000,
+            "wait output attributed to bash:test: {:?}",
+            csum.produced
+        );
+        assert!(
+            csum.produced.get("bash:git").copied().unwrap_or(0) >= 500,
+            "write_stdin output attributed to bash:git: {:?}",
+            csum.produced
+        );
+        assert_eq!(csum.produced.get("bash:other").copied().unwrap_or(0), 0);
+
+        // Claude: Bash -> background ID -> BashOutput inherits bash:test.
+        let claude_path = dir.join("claude.jsonl");
+        write_lines(
+            &claude_path,
+            &[
+                serde_json::json!({
+                    "type": "assistant",
+                    "timestamp": "2026-11-24T10:00:00Z",
+                    "message": {
+                        "id": "m1",
+                        "model": "claude-opus-5-5",
+                        "usage": {"input_tokens": 10, "cache_creation_input_tokens": 10_000, "output_tokens": 5},
+                        "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "cargo test"}}]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "user",
+                    "timestamp": "2026-11-24T10:00:01Z",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "Command running in background with ID: bg_99"}]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "assistant",
+                    "timestamp": "2026-11-24T10:00:02Z",
+                    "message": {
+                        "id": "m2",
+                        "model": "claude-opus-5-5",
+                        "usage": {"input_tokens": 10, "cache_read_input_tokens": 10_000, "output_tokens": 5},
+                        "content": [{"type": "tool_use", "id": "t2", "name": "BashOutput", "input": {"bash_id": "bg_99"}}]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "user",
+                    "timestamp": "2026-11-24T10:00:03Z",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "tool_result", "tool_use_id": "t2", "content": "z".repeat(4000)}]
+                    }
+                }),
+            ],
+        );
+        let clsum = in_window(&parse_claude(&claude_path), 0);
+        assert!(
+            clsum.produced.get("bash:test").copied().unwrap_or(0) >= 1000,
+            "BashOutput attributed to bash:test: {:?}",
+            clsum.produced
+        );
+        assert_eq!(clsum.produced.get("bash:other").copied().unwrap_or(0), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4393,6 +4938,8 @@ mod tests {
         let dir = scratch("nested-workflow-subagents");
         let path =
             dir.join("claude/projects/-work/sess-1/subagents/workflows/wf_abc/agent-1.jsonl");
+        let journal =
+            dir.join("claude/projects/-work/sess-1/subagents/workflows/wf_abc/journal.jsonl");
         write_lines(
             &path,
             &[serde_json::json!({
@@ -4406,6 +4953,7 @@ mod tests {
                 }
             })],
         );
+        write_lines(&journal, &[serde_json::json!({"event": "started"})]);
         let sources = Sources {
             claude: vec![dir.join("claude")],
             ..Default::default()
@@ -4415,6 +4963,7 @@ mod tests {
             &options([Client::Claude].into(), None),
             &Configured::new(),
         );
+        assert_eq!(report.stats.parsed, 1, "journal.jsonl is skipped");
         assert_eq!(report.totals.subagents, 1);
         assert_eq!(report.totals.turns, 1);
         assert_eq!(report.totals.cache_read, 5_000);
