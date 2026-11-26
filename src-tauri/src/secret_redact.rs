@@ -4037,12 +4037,287 @@ fn mask_in_place(matcher: &Matcher, dir: &Path, path: &Path) -> std::io::Result<
     mask_locked(matcher, dir, path)
 }
 
+/// Logical bytes [`mask_locked`] searches at once. The undecided tail of each
+/// window (what [`Stream`] would hold) is searched again with the next, so a
+/// file of any size is masked in bounded memory. Decoding a window's encoded
+/// spellings costs some tens of bytes per byte, so windows stay small.
+const MASK_WINDOW_BYTES: usize = 256 * 1024;
+
+/// Longest line [`mask_locked`] reads whole (and parses as JSON). A longer
+/// line is searched as text, in parts that continue one another.
+const MASK_LINE_BYTES: usize = 1024 * 1024;
+
+/// Ranges [`mask_locked`] collects before masking them (one journaled pass),
+/// so a file full of secrets does not grow its memory either.
+const MASK_BATCH_RANGES: usize = 64 * 1024;
+
+/// The sizes [`mask_locked`] works in; tests use tiny ones to cross every
+/// boundary.
+#[derive(Clone, Copy)]
+struct MaskLimits {
+    window: usize,
+    line: usize,
+    batch: usize,
+}
+
+const MASK_LIMITS: MaskLimits = MaskLimits {
+    window: MASK_WINDOW_BYTES,
+    line: MASK_LINE_BYTES,
+    batch: MASK_BATCH_RANGES,
+};
+
+/// Ranges to mask, by marker, flushed to the file in journaled batches.
+struct MaskRanges<'a> {
+    dir: &'a Path,
+    path: &'a Path,
+    groups: Vec<(String, Vec<(u64, u64)>)>,
+    count: usize,
+    batch: usize,
+    masked: bool,
+}
+
+impl MaskRanges<'_> {
+    fn add(&mut self, marker: String, range: (u64, u64)) -> std::io::Result<()> {
+        match self.groups.iter_mut().find(|(m, _)| *m == marker) {
+            Some((_, ranges)) => ranges.push(range),
+            None => self.groups.push((marker, vec![range])),
+        }
+        self.count += 1;
+        if self.count >= self.batch {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// One journaled pass per distinct marker, each range masked with it.
+    fn flush(&mut self) -> std::io::Result<()> {
+        for (marker, ranges) in std::mem::take(&mut self.groups) {
+            let mask = |len: usize| -> Vec<u8> {
+                if marker.len() <= len {
+                    marker.as_bytes().to_vec()
+                } else {
+                    Vec::new()
+                }
+            };
+            self.masked |= crate::scrub_io::mask_ranges(self.dir, self.path, &ranges, &mask)?;
+        }
+        self.count = 0;
+        Ok(())
+    }
+}
+
+/// One logical text of a file being masked (the string values and text lines,
+/// or the keys and numbers), searched a window at a time.
+#[derive(Default)]
+struct MaskText {
+    logical: Vec<u8>,
+    /// `(logical offset, file offset)` of each run of bytes that is contiguous
+    /// in the file, ascending; a run ends where the next begins.
+    segs: Vec<(usize, u64)>,
+    /// Logical offsets where a piece starts, ascending, without repeats.
+    starts: Vec<usize>,
+}
+
+impl MaskText {
+    /// Append `bytes`, found at `offset` in the file; `piece` when they start
+    /// a piece (a string value or a line) rather than continue one.
+    fn push(&mut self, offset: u64, bytes: &[u8], piece: bool) {
+        let at = self.logical.len();
+        if piece && self.starts.last() != Some(&at) {
+            self.starts.push(at);
+        }
+        if bytes.is_empty() {
+            return;
+        }
+        // The parts of one long line are one run, so a mask over them is one.
+        let continues = self
+            .segs
+            .last()
+            .is_some_and(|&(s, o)| o + (at - s) as u64 == offset);
+        if !continues {
+            self.segs.push((at, offset));
+        }
+        self.logical.extend_from_slice(bytes);
+        #[cfg(test)]
+        tests::MASK_PEAK.with(|p| p.set(p.get().max(self.logical.len())));
+    }
+
+    /// Search what is held and queue the masks for every span that is decided;
+    /// keep the undecided tail (all of it is decided at the `end`). A tail held
+    /// past [`MAX_HELD_BYTES`] is masked whole, as [`Stream`] withholds it.
+    fn search(&mut self, m: &Matcher, end: bool, out: &mut MaskRanges<'_>) -> std::io::Result<()> {
+        if self.logical.is_empty() {
+            self.starts.clear();
+            return Ok(());
+        }
+        // The held text always starts a piece, as a stream's does.
+        let mut starts = Vec::with_capacity(self.starts.len() + 1);
+        if self.starts.first() != Some(&0) {
+            starts.push(0);
+        }
+        starts.extend_from_slice(&self.starts);
+        let spans = m.byte_spans(&self.logical, &starts);
+        let len = self.logical.len();
+        let mut cut = if end {
+            len
+        } else {
+            mask_hold(m, &self.logical, &starts)
+        };
+        // A span crossing the cut would be masked in part.
+        while let Some((s, _, _)) = spans.iter().find(|(s, e, _)| *s < cut && cut < *e) {
+            cut = *s;
+        }
+        for (s, e, names) in spans.iter().filter(|(s, _, _)| *s < cut) {
+            self.queue(*s, (*e).min(cut), m.marker(names), out)?;
+        }
+        if len - cut > MAX_HELD_BYTES {
+            self.queue(cut, len, m.marker(&[]), out)?;
+            cut = len;
+        }
+        self.drain(cut);
+        Ok(())
+    }
+
+    /// Queue `marker` over logical `s..e`, in each run of the file it covers.
+    fn queue(
+        &self,
+        s: usize,
+        e: usize,
+        marker: String,
+        out: &mut MaskRanges<'_>,
+    ) -> std::io::Result<()> {
+        let first = self
+            .segs
+            .partition_point(|&(p, _)| p <= s)
+            .saturating_sub(1);
+        for k in first..self.segs.len() {
+            let (ls, offset) = self.segs[k];
+            let le = self.segs.get(k + 1).map_or(self.logical.len(), |&(p, _)| p);
+            if ls >= e {
+                break;
+            }
+            let (from, to) = (s.max(ls), e.min(le));
+            if from < to {
+                out.add(
+                    marker.clone(),
+                    (offset + (from - ls) as u64, (to - from) as u64),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop logical `..cut`, keeping the rest at the start.
+    fn drain(&mut self, cut: usize) {
+        let k = self.segs.partition_point(|&(p, _)| p <= cut);
+        let mut segs: Vec<(usize, u64)> = Vec::with_capacity(self.segs.len() - k + 1);
+        if cut < self.logical.len() && k > 0 {
+            let (ls, offset) = self.segs[k - 1];
+            segs.push((0, offset + (cut - ls) as u64));
+        }
+        segs.extend(self.segs[k..].iter().map(|&(p, o)| (p - cut, o)));
+        debug_assert!(segs.first().is_none_or(|&(p, _)| p == 0));
+        self.segs = segs;
+        self.starts = self
+            .starts
+            .iter()
+            .filter(|&&p| p > cut)
+            .map(|&p| p - cut)
+            .collect();
+        self.logical.drain(..cut);
+    }
+}
+
+/// Where a window of logical bytes may be cut: [`Matcher::hold_from`] over its
+/// tail, which is all a live prefix can reach (the tail scanned is twice
+/// [`MAX_HELD_BYTES`], and a tail held past that is withheld anyway). Bytes
+/// that are not text cannot be in a live prefix, so only the text after the
+/// last of them is checked.
+fn mask_hold(m: &Matcher, bytes: &[u8], starts: &[usize]) -> usize {
+    let mut from = bytes.len().saturating_sub(2 * MAX_HELD_BYTES);
+    let (text, limit) = loop {
+        match std::str::from_utf8(&bytes[from..]) {
+            Ok(text) => break (text, bytes.len()),
+            Err(e) => match e.error_len() {
+                Some(bad) => from += e.valid_up_to() + bad,
+                // Cut off inside a char: hold from it.
+                None => {
+                    let to = from + e.valid_up_to();
+                    let text = std::str::from_utf8(&bytes[from..to]).expect("valid up to");
+                    break (text, to);
+                }
+            },
+        }
+    };
+    let mut rel = Vec::with_capacity(8);
+    rel.push(0);
+    rel.extend(
+        starts
+            .iter()
+            .filter(|&&p| p > from && p < limit)
+            .map(|&p| p - from),
+    );
+    (from + m.hold_with(text, &rel, true)).min(limit)
+}
+
+/// Read the rest of a line of `reader` into `line` (with its `\n`), until it
+/// holds `cap` bytes. Returns whether the line ended (at `\n` or at the end of
+/// the file).
+fn read_line_capped(
+    reader: &mut impl std::io::BufRead,
+    line: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<bool> {
+    loop {
+        let room = cap.saturating_sub(line.len());
+        if room == 0 {
+            return Ok(false);
+        }
+        let buf = match reader.fill_buf() {
+            Ok(buf) => buf,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if buf.is_empty() {
+            return Ok(true);
+        }
+        let take = &buf[..buf.len().min(room)];
+        match take.iter().position(|&b| b == b'\n') {
+            Some(i) => {
+                line.extend_from_slice(&take[..=i]);
+                reader.consume(i + 1);
+                return Ok(true);
+            }
+            None => {
+                let n = take.len();
+                line.extend_from_slice(take);
+                reader.consume(n);
+            }
+        }
+    }
+}
+
 /// [`mask_in_place`] for a caller that already holds the file's lock. The
 /// file's text is searched as the pieces of one text, as the rewrite does: the
 /// string values of each JSON line, and each other line without its ending, so
 /// a value split over strings or wrapped over lines is masked where each piece
 /// is. A file with other hard links is never changed ([`multi_link`]).
+///
+/// The file is streamed, never read whole: each [`MASK_WINDOW_BYTES`] window
+/// of the text is searched and its decided spans masked, and the undecided
+/// tail (what [`Stream`] would hold) is searched again with the next window,
+/// so a secret split over windows is found as in one search. A log of any size
+/// costs bounded memory.
 fn mask_locked(matcher: &Matcher, dir: &Path, path: &Path) -> std::io::Result<bool> {
+    mask_locked_with(matcher, dir, path, MASK_LIMITS)
+}
+
+fn mask_locked_with(
+    matcher: &Matcher,
+    dir: &Path,
+    path: &Path,
+    limits: MaskLimits,
+) -> std::io::Result<bool> {
     let file = match crate::scrub_io::open_inside(dir, path)? {
         Ok(file) => file,
         Err(skip) => return skipped(path, skip),
@@ -4050,83 +4325,80 @@ fn mask_locked(matcher: &Matcher, dir: &Path, path: &Path) -> std::io::Result<bo
     if crate::scrub_io::link_count(&file)? > 1 {
         return multi_link(path);
     }
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut &file, &mut bytes)?;
-    drop(file);
-    // (offset in the file, length) of each piece, in order: string values and
-    // text lines are one text; keys and numbers another.
-    let mut pieces: Vec<(usize, usize)> = Vec::new();
-    let mut others: Vec<(usize, usize)> = Vec::new();
-    let mut at = 0;
-    for line in bytes.split_inclusive(|&b| b == b'\n') {
-        let body_len = line
-            .iter()
-            .rposition(|&b| b != b'\n' && b != b'\r')
-            .map_or(0, |i| i + 1);
-        let body = &line[..body_len];
-        let tokens = std::str::from_utf8(body)
-            .ok()
-            .filter(|t| t.trim_start().starts_with(['{', '[']))
-            .and_then(json_tokens);
-        match tokens {
-            Some(t) => {
-                for (s, e, _) in t.values {
-                    pieces.push((at + s, e - s));
+    let mut out = MaskRanges {
+        dir,
+        path,
+        groups: Vec::new(),
+        count: 0,
+        batch: limits.batch.max(1),
+        masked: false,
+    };
+    // String values and text lines are one text; keys and numbers another.
+    let mut text = MaskText::default();
+    let mut others = MaskText::default();
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    let mut line = Vec::new();
+    let mut offset = 0u64;
+    // Inside a line longer than `limits.line`, read in parts.
+    let mut long = false;
+    loop {
+        let ended = read_line_capped(&mut reader, &mut line, limits.line.max(4))?;
+        if line.is_empty() {
+            break;
+        }
+        if ended && !long {
+            let body_len = line
+                .iter()
+                .rposition(|&b| b != b'\n' && b != b'\r')
+                .map_or(0, |i| i + 1);
+            let body = &line[..body_len];
+            let tokens = std::str::from_utf8(body)
+                .ok()
+                .filter(|t| t.trim_start().starts_with(['{', '[']))
+                .and_then(json_tokens);
+            match tokens {
+                Some(t) => {
+                    for (s, e, _) in t.values {
+                        text.push(offset + s as u64, &body[s..e], true);
+                    }
+                    for (s, e) in t.keys.into_iter().chain(t.numbers) {
+                        others.push(offset + s as u64, &body[s..e], true);
+                    }
                 }
-                for (s, e) in t.keys.into_iter().chain(t.numbers) {
-                    others.push((at + s, e - s));
-                }
+                None => text.push(offset, body, true),
             }
-            None => pieces.push((at, body_len)),
-        }
-        at += line.len();
-    }
-    // One journaled pass per distinct marker, each range masked with it; a
-    // span over several pieces is masked in each of them.
-    let mut groups: Vec<(String, Vec<(u64, u64)>)> = Vec::new();
-    for pieces in [pieces, others] {
-        let mut logical = Vec::with_capacity(bytes.len());
-        let mut starts = Vec::with_capacity(pieces.len());
-        for &(s, len) in &pieces {
-            starts.push(logical.len());
-            logical.extend_from_slice(&bytes[s..s + len]);
-        }
-        let spans = matcher.byte_spans(&logical, &starts);
-        for (start, end, names) in &spans {
-            let marker = matcher.marker(names);
-            let first = starts.partition_point(|&p| p <= *start) - 1;
-            for k in first..starts.len() {
-                let (ls, len) = (starts[k], pieces[k].1);
-                if ls >= *end {
-                    break;
-                }
-                let (s, e) = ((*start).max(ls), (*end).min(ls + len));
-                if s >= e {
-                    continue;
-                }
-                let range = ((pieces[k].0 + s - ls) as u64, (e - s) as u64);
-                match groups.iter_mut().find(|(m, _)| *m == marker) {
-                    Some((_, ranges)) => ranges.push(range),
-                    None => groups.push((marker.clone(), vec![range])),
-                }
-            }
-        }
-    }
-    if groups.is_empty() {
-        return Ok(false);
-    }
-    let mut masked = false;
-    for (marker, ranges) in groups {
-        let mask = |len: usize| -> Vec<u8> {
-            if marker.len() <= len {
-                marker.as_bytes().to_vec()
+            offset += line.len() as u64;
+            line.clear();
+        } else {
+            // A part of a long line, searched as text continuing the part
+            // before it. A char cut off at its end waits for the next part.
+            let keep = if ended {
+                line.iter()
+                    .rposition(|&b| b != b'\n' && b != b'\r')
+                    .map_or(0, |i| i + 1)
             } else {
-                Vec::new()
+                match std::str::from_utf8(&line) {
+                    Err(e) if e.error_len().is_none() && e.valid_up_to() > 0 => e.valid_up_to(),
+                    _ => line.len(),
+                }
+            };
+            let used = if ended { line.len() } else { keep };
+            text.push(offset, &line[..keep], !long);
+            offset += used as u64;
+            line.drain(..used);
+            long = !ended;
+        }
+        for t in [&mut text, &mut others] {
+            if t.logical.len() >= limits.window {
+                t.search(matcher, false, &mut out)?;
             }
-        };
-        masked |= crate::scrub_io::mask_ranges(dir, path, &ranges, &mask)?;
+        }
     }
-    Ok(masked)
+    drop(reader);
+    text.search(matcher, true, &mut out)?;
+    others.search(matcher, true, &mut out)?;
+    out.flush()?;
+    Ok(out.masked)
 }
 
 /// Per scope, the files the last scrub could not clean, with the reason
@@ -7171,5 +7443,205 @@ mod tests {
         out.push_str(&s.push_with(&m, "123xyZ\n"));
         out.push_str(&s.finish_with(&m));
         assert_eq!(out, format!("x [secret:KEY]{}", "\n".repeat(1_001)));
+    }
+
+    /// Every byte percent-encoded, as a tool might print a secret in a URL.
+    fn percent_all(text: &str) -> String {
+        text.bytes().map(|b| format!("%{b:02X}")).collect()
+    }
+
+    /// Every char as a JSON `\u` escape, in a text line.
+    fn json_escape_all(text: &str) -> String {
+        text.chars()
+            .map(|c| format!("\\u{:04x}", c as u32))
+            .collect()
+    }
+
+    fn mask_fixture(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tp-mask-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `content` masked in place as `daemon.log` with `limits`.
+    fn masked_with(m: &Matcher, dir: &Path, content: &[u8], limits: MaskLimits) -> Vec<u8> {
+        let log = dir.join("daemon.log");
+        std::fs::write(&log, content).unwrap();
+        mask_locked_with(m, dir, &log, limits).unwrap();
+        let out = std::fs::read(&log).unwrap();
+        assert_eq!(out.len(), content.len(), "masking never moves bytes");
+        let journals: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".mask-journal-")
+            })
+            .collect();
+        assert!(journals.is_empty(), "every batch removes its journal");
+        out
+    }
+
+    const ONE_WINDOW: MaskLimits = MaskLimits {
+        window: usize::MAX,
+        line: usize::MAX,
+        batch: usize::MAX,
+    };
+
+    /// The streamed mask finds exactly what one search over the whole file
+    /// finds, wherever the windows fall: a secret wrapped over lines, split
+    /// over JSON string values, in a key, percent-encoded or JSON-escaped, and
+    /// several per window.
+    #[test]
+    fn a_streamed_mask_matches_one_search_over_the_whole_file() {
+        let secret = "sk-live-9Qx7Lm2Pw4Rt8Zk";
+        let other = "ghp_T6vB3nM8qW1eR5yU0iO";
+        let m = m(&[("KEY", secret), ("GH", other)]);
+        let (a, b) = secret.split_at(9);
+        let mut content = String::new();
+        content.push_str("[info] starting up\n");
+        content.push_str(&format!("[warn] token {secret} rejected\n"));
+        content.push_str(&format!("[warn] wrapped {a}\n{b} end\n"));
+        content.push_str(&format!("{{\"msg\":\"{a}\",\"more\":\"{b}\",\"n\":1}}\n"));
+        content.push_str(&format!("{{\"{secret}\":true}}\n"));
+        content.push_str(&format!("GET /x?k={} 401\n", percent_all(secret)));
+        content.push_str(&format!("echo \"{}\"\n", json_escape_all(other)));
+        for i in 0..40 {
+            content.push_str(&format!("[debug] line {i} nothing to see here\n"));
+            if i % 7 == 0 {
+                content.push_str(&format!("[debug] {other} and {secret} again\n"));
+            }
+        }
+        content.push_str(&format!("last {a}"));
+        content.push_str(b);
+        let dir = mask_fixture("stream-eq");
+        let whole = masked_with(&m, &dir, content.as_bytes(), ONE_WINDOW);
+        let whole_text = String::from_utf8(whole.clone()).unwrap();
+        assert!(
+            !whole_text.contains(secret) && !whole_text.contains(other),
+            "{whole_text}"
+        );
+        assert!(!whole_text.contains(&percent_all(secret)), "{whole_text}");
+        assert!(
+            !whole_text.contains(&json_escape_all(other)),
+            "{whole_text}"
+        );
+        assert!(
+            !whole_text.contains(&format!("{a}\",\"more\":\"{b}")),
+            "{whole_text}"
+        );
+        assert!(whole_text.starts_with("[info] starting up\n"));
+        for window in [1, 2, 3, 5, 8, 13, 31, 64, 200, 1_000] {
+            for batch in [1, 3, usize::MAX] {
+                let limits = MaskLimits {
+                    window,
+                    line: usize::MAX,
+                    batch,
+                };
+                let streamed = masked_with(&m, &dir, content.as_bytes(), limits);
+                assert_eq!(
+                    String::from_utf8_lossy(&streamed),
+                    whole_text,
+                    "window {window} batch {batch}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A line longer than the line limit is read in parts that continue one
+    /// another, so a secret across a part boundary (or a multibyte char cut
+    /// by one) is still masked, and nothing else changes.
+    #[test]
+    fn a_line_longer_than_the_line_limit_is_masked_across_its_parts() {
+        let secret = "pässwörd-Ünïcode-7Hk2Lq9";
+        let m = m(&[("PW", secret)]);
+        let filler = "é-".repeat(300);
+        let content = format!(
+            "{filler}{secret}{filler}{}{filler}\n{{\"v\":\"{secret}\"}}\ntail {secret}",
+            percent_all(secret)
+        );
+        let dir = mask_fixture("long-line");
+        for line in [4, 5, 7, 16, 33, 100, 1_000] {
+            for window in [1, 9, 4_096] {
+                let limits = MaskLimits {
+                    window,
+                    line,
+                    batch: 2,
+                };
+                let out = masked_with(&m, &dir, content.as_bytes(), limits);
+                let text = String::from_utf8(out).unwrap_or_else(|e| {
+                    panic!("masking split a char: line {line} window {window}: {e}")
+                });
+                assert!(
+                    !text.contains(secret),
+                    "line {line} window {window}: {text}"
+                );
+                assert!(
+                    !text.contains(&percent_all(secret)),
+                    "line {line} window {window}"
+                );
+                assert_eq!(
+                    text.matches(&filler).count(),
+                    3,
+                    "line {line} window {window}: {text}"
+                );
+                assert!(text.contains("[secret:PW]"), "line {line} window {window}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    thread_local! {
+        pub(super) static MASK_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Memory stays bounded by the window, the longest line and the held
+    /// tail, however long the file is; issue #1437 was a multi-GB
+    /// `daemon.log.1` read whole (and copied, and decoded) until the commit
+    /// limit killed both processes.
+    #[test]
+    fn a_large_log_is_masked_in_bounded_memory() {
+        let secret = "glpat-Zx8Cv7Bn6Mm5Ll4Kk3";
+        let m = m(&[("GL", secret)]);
+        let mut content = String::new();
+        for i in 0..20_000 {
+            content.push_str(&format!(
+                "[2026-11-25 10:00:00] resource collision gitlab://x/{i} owned by a\n"
+            ));
+            if i % 997 == 0 {
+                let (a, b) = secret.split_at(i % secret.len());
+                content.push_str(&format!("{{\"a\":\"{a}\",\"b\":\"{b}\"}}\n"));
+            }
+        }
+        let dir = mask_fixture("bounded");
+        MASK_PEAK.with(|p| p.set(0));
+        let limits = MaskLimits {
+            window: 4_096,
+            line: 1_024,
+            batch: 4,
+        };
+        let out = masked_with(&m, &dir, content.as_bytes(), limits);
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains(secret));
+        let windows: Vec<&str> = (0..=secret.len() - 6).map(|i| &secret[i..i + 6]).collect();
+        let mut split = 0;
+        for line in text.lines().filter(|l| l.starts_with('{')) {
+            let v: Value = serde_json::from_str(line).unwrap();
+            let joined = format!("{}{}", v["a"].as_str().unwrap(), v["b"].as_str().unwrap());
+            assert!(!windows.iter().any(|w| joined.contains(w)), "{line}");
+            split += 1;
+        }
+        assert_eq!(split, 21);
+        let peak = MASK_PEAK.with(std::cell::Cell::get);
+        assert!(peak > 0, "the peak is recorded");
+        assert!(
+            peak < 4_096 + 1_024 + 2 * secret.len(),
+            "held {peak} bytes of a {}-byte file",
+            content.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

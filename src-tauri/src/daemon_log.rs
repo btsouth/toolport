@@ -70,12 +70,35 @@ pub fn stderr_file(dir: &Path) -> Option<std::fs::File> {
 
 /// Append one line stamped with the time and this process id. Redacted under
 /// the log's lock, so a secret learned while a scrub masks the file is caught.
+///
+/// The relay writes stderr into the same file without this lock and may stop
+/// mid-line (a held tail, a chunk without its end), so the line starts on a
+/// line of its own and is written whole, in one append.
 pub fn append(dir: &Path, line: &str) {
     if let Some((_lock, mut file)) = open_for_append(dir) {
         let line = crate::secret_redact::redact_log_text(line);
-        let _ =
-            file.write_all(format!("{} pid={} {line}\n", now_ms(), std::process::id()).as_bytes());
+        let lead = if ends_mid_line(&log_path(dir)) {
+            "\n"
+        } else {
+            ""
+        };
+        let _ = file.write_all(
+            format!("{lead}{} pid={} {line}\n", now_ms(), std::process::id()).as_bytes(),
+        );
     }
+}
+
+/// Whether the log at `path` is not empty and its last byte is not a line end.
+/// The append handle cannot read, so the file is opened again to look.
+fn ends_mid_line(path: &Path) -> bool {
+    use std::io::{Read as _, Seek as _};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut last = [0u8; 1];
+    file.seek(std::io::SeekFrom::End(-1)).is_ok()
+        && file.read(&mut last).is_ok_and(|n| n == 1)
+        && last[0] != b'\n'
 }
 
 /// The relay threads that carry this process's stderr into `daemon.log`.
@@ -185,21 +208,63 @@ pub fn install_stderr_redactor() {
 /// so a secret wrapped over any number of lines or written in any number of
 /// chunks is matched whole, and only the matcher's live prefix is ever held.
 ///
+/// When the destination is the data directory's `daemon.log` (the daemon's
+/// stderr), the relay keeps it under [`MAX_LOG_BYTES`] while it runs, not only
+/// at the next start: a noisy daemon once grew it to gigabytes in one run, and
+/// the scrub and the next start both choked on the result (issue #1437).
+///
 /// [`Stream::lines`]: crate::secret_redact::Stream::lines
 struct RelayOut {
-    out: std::fs::File,
+    /// `None` only after a rotation could not reopen the log; reopened on the
+    /// next write.
+    out: Option<std::fs::File>,
     stream: crate::secret_redact::Stream,
     /// The bytes of a character not complete yet.
     partial_char: Vec<u8>,
+    rotate: Rotation,
 }
+
+/// What [`RelayOut`] tracks to rotate `daemon.log` as it grows.
+struct Rotation {
+    /// The data directory whose `daemon.log` the relay writes, once known.
+    /// Looked up when the output first reaches the cap ([`daemon_log_dir`]),
+    /// so a relay started before the daemon names its directory still finds
+    /// it, and one writing anywhere else (a terminal, a pipe) never rotates.
+    dir: Option<PathBuf>,
+    /// Bytes in the file as last seen, plus what the relay wrote since.
+    written: u64,
+    /// The size at which to try again after a rotation that could not run (a
+    /// lock held elsewhere, a failed rename), so a busy lock is not retried on
+    /// every write.
+    retry_at: u64,
+}
+
+/// How much more the relay writes before it tries a rotation again that
+/// could not run.
+const ROTATE_RETRY_BYTES: u64 = 64 * 1024;
 
 impl RelayOut {
     fn new(out: std::fs::File) -> Self {
+        // A pipe or a terminal has no length; it is never rotated anyway.
+        let written = out.metadata().map(|m| m.len()).unwrap_or(0);
         Self {
-            out,
+            out: Some(out),
             stream: crate::secret_redact::Stream::lines(),
             partial_char: Vec::new(),
+            rotate: Rotation {
+                dir: None,
+                written,
+                retry_at: 0,
+            },
         }
+    }
+
+    /// A relay into `dir`'s `daemon.log` (already opened as `out`).
+    #[cfg(test)]
+    fn rotating(out: std::fs::File, dir: PathBuf) -> Self {
+        let mut relay = Self::new(out);
+        relay.rotate.dir = Some(dir);
+        relay
     }
 
     fn data(&mut self, bytes: &[u8]) {
@@ -212,14 +277,14 @@ impl RelayOut {
                 let text = String::from_utf8_lossy(&self.partial_char).into_owned();
                 self.partial_char.clear();
                 let ready = self.stream.push(&text);
-                let _ = self.out.write_all(ready.as_bytes());
+                self.write(ready.as_bytes());
                 return;
             }
         };
         let text = std::str::from_utf8(&self.partial_char[..valid]).expect("checked above");
         let ready = self.stream.push(text);
         self.partial_char.drain(..valid);
-        let _ = self.out.write_all(ready.as_bytes());
+        self.write(ready.as_bytes());
     }
 
     /// The end of what was written so far (a sync or the end of the pipe).
@@ -228,12 +293,149 @@ impl RelayOut {
             let text = String::from_utf8_lossy(&self.partial_char).into_owned();
             self.partial_char.clear();
             let ready = self.stream.push(&text);
-            let _ = self.out.write_all(ready.as_bytes());
+            self.write(ready.as_bytes());
         }
         let rest = self.stream.finish();
-        let _ = self.out.write_all(rest.as_bytes());
-        let _ = self.out.flush();
+        self.write(rest.as_bytes());
+        self.flush();
     }
+
+    fn flush(&mut self) {
+        if let Some(out) = &mut self.out {
+            let _ = out.flush();
+        }
+    }
+
+    /// Write `bytes` (dropped on failure: stderr never fails), then rotate
+    /// the log if this took it to the cap.
+    fn write(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.out.is_none() {
+            self.reopen();
+        }
+        let Some(out) = &mut self.out else {
+            return;
+        };
+        if out.write_all(bytes).is_err() {
+            return;
+        }
+        let rotation = &mut self.rotate;
+        rotation.written += bytes.len() as u64;
+        if rotation.written < MAX_LOG_BYTES || rotation.written < rotation.retry_at {
+            return;
+        }
+        if rotation.dir.is_none() {
+            rotation.dir = daemon_log_dir(out);
+        }
+        if rotation.dir.is_none() {
+            rotation.retry_at = rotation.written.saturating_add(ROTATE_RETRY_BYTES);
+            return;
+        }
+        self.rotate_now();
+    }
+
+    /// Move a full `daemon.log` aside and carry on in a new one, under both
+    /// log locks as [`rotate_if_full`] takes them, but never waiting for one:
+    /// a scrub masking either file would otherwise stall every stderr writer
+    /// in the daemon. A lock held elsewhere or a failed rename is retried
+    /// after [`ROTATE_RETRY_BYTES`] more.
+    ///
+    /// The relay's handle is closed before the rename and the log reopened
+    /// after it, so the rename never runs against an open handle of ours
+    /// (Windows allows it only for handles opened to share deletion, and a
+    /// handle kept open would go on writing into `daemon.log.1`).
+    fn rotate_now(&mut self) {
+        let rotation = &mut self.rotate;
+        let Some(dir) = rotation.dir.clone() else {
+            return;
+        };
+        let path = log_path(&dir);
+        let previous = dir.join(format!("{LOG_FILE}.1"));
+        let retry = |rotation: &mut Rotation| {
+            rotation.retry_at = rotation.written.saturating_add(ROTATE_RETRY_BYTES);
+        };
+        let Ok(_lock) = crate::registry::lock_once_at(&path) else {
+            retry(rotation);
+            return;
+        };
+        // Someone else may have rotated it already (a daemon starting, an
+        // `append`): then the relay only moves on to the current file.
+        let ours = self.out.as_ref().is_some_and(|out| is_log_of(out, &dir));
+        let full = std::fs::metadata(&path).is_ok_and(|m| m.len() >= MAX_LOG_BYTES);
+        if ours && full {
+            let Ok(_previous) = crate::registry::lock_once_at(&previous) else {
+                retry(rotation);
+                return;
+            };
+            if let Some(out) = self.out.take() {
+                let _ = out.sync_data();
+                drop(out);
+            }
+            let renamed = std::fs::rename(&path, &previous).is_ok();
+            self.reopen_locked();
+            if !renamed {
+                retry(&mut self.rotate);
+            }
+            return;
+        }
+        if !ours {
+            self.out = None;
+        }
+        self.reopen_locked();
+    }
+
+    /// Open `daemon.log` again, taking its lock.
+    fn reopen(&mut self) {
+        let Some(dir) = &self.rotate.dir else {
+            return;
+        };
+        let Ok(_lock) = crate::registry::lock_once_at(&log_path(dir)) else {
+            return;
+        };
+        self.reopen_locked();
+    }
+
+    /// Open `daemon.log` for append (the caller holds its lock) unless the
+    /// relay still has it open, and count what it holds.
+    fn reopen_locked(&mut self) {
+        let rotation = &mut self.rotate;
+        let Some(dir) = &rotation.dir else {
+            return;
+        };
+        if self.out.is_none() {
+            self.out = crate::registry::open_append_private(&log_path(dir)).ok();
+        }
+        if let Some(out) = &self.out {
+            rotation.written = out.metadata().map(|m| m.len()).unwrap_or(0);
+            if rotation.written < MAX_LOG_BYTES {
+                rotation.retry_at = 0;
+            }
+        }
+    }
+}
+
+/// The data directory this process runs the daemon for ([`begin_run`]).
+static DAEMON_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// The daemon's data directory, if `out` is its `daemon.log`: then the relay
+/// rotates it as it grows.
+fn daemon_log_dir(out: &std::fs::File) -> Option<PathBuf> {
+    let dir = DAEMON_DIR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()?;
+    is_log_of(out, &dir).then_some(dir)
+}
+
+/// Whether `out` is the file `dir`'s `daemon.log` names now.
+fn is_log_of(out: &std::fs::File, dir: &Path) -> bool {
+    let Ok(current) = std::fs::File::open(log_path(dir)) else {
+        return false;
+    };
+    let id = crate::scrub_io::file_id(out).ok();
+    id.is_some() && id == crate::scrub_io::file_id(&current).ok()
 }
 
 fn relay_writer(
@@ -246,7 +448,7 @@ fn relay_writer(
         match msg {
             RelayMsg::Data(bytes) => {
                 out.data(&bytes);
-                let _ = out.out.flush();
+                out.flush();
             }
             RelayMsg::Sync(ack) => {
                 out.drain();
@@ -758,6 +960,9 @@ fn last_panic_of(dir: &Path, pid: u32) -> Option<String> {
 /// the latest for the app and `toolport_status`, and leave our own marker.
 /// Returns the unclean end it found, if any.
 pub fn begin_run(dir: &Path) -> Option<PreviousExit> {
+    *DAEMON_DIR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dir.to_path_buf());
     let me = std::process::id();
     let mut found: Option<PreviousExit> = None;
     if let Ok(entries) = std::fs::read_dir(dir.join(RUNS_DIR)) {
@@ -1996,5 +2201,179 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(text.contains("src/router.rs:1:2: bad "), "{text}");
         assert!(!text.contains("exit-late-key-M2xP8vKs"), "{text}");
+    }
+
+    fn relay_into(dir: &Path) -> RelayOut {
+        let file = crate::registry::open_append_private(&log_path(dir)).unwrap();
+        RelayOut::rotating(file, dir.to_path_buf())
+    }
+
+    fn line_of(n: usize) -> String {
+        format!("[warn] resource collision gitlab://project/{n:08} kept on a, refused on b\n")
+    }
+
+    /// Issue #1437: the cap was only checked when the log was opened, so one
+    /// noisy daemon run grew `daemon.log` to 4.93 GB. The relay now rotates it
+    /// as it writes: neither file passes the cap by more than one write, and
+    /// the newest lines are in `daemon.log`.
+    #[test]
+    fn the_relay_rotates_daemon_log_as_it_grows() {
+        let dir = scratch("relay-rotate");
+        let mut relay = relay_into(&dir);
+        let line_len = line_of(0).len() as u64;
+        let lines = (3 * MAX_LOG_BYTES / line_len) as usize + 10;
+        for n in 0..lines {
+            relay.data(line_of(n).as_bytes());
+        }
+        relay.drain();
+        let current = std::fs::read_to_string(log_path(&dir)).unwrap();
+        let previous = std::fs::read_to_string(dir.join(format!("{LOG_FILE}.1"))).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let bound = MAX_LOG_BYTES + 4 * line_len;
+        assert!(
+            current.len() as u64 <= bound,
+            "daemon.log {}",
+            current.len()
+        );
+        assert!(
+            previous.len() as u64 <= bound,
+            "daemon.log.1 {}",
+            previous.len()
+        );
+        assert!(
+            previous.len() as u64 >= MAX_LOG_BYTES,
+            "rotated only when full"
+        );
+        assert!(
+            current.ends_with(&line_of(lines - 1)),
+            "the newest line is kept"
+        );
+        // Nothing is lost or torn between the two files.
+        let both = format!("{previous}{current}");
+        let first: usize = both[both.find("project/").unwrap() + 8..][..8]
+            .parse()
+            .unwrap();
+        for n in first..lines {
+            assert!(both.contains(&line_of(n)), "line {n} is whole");
+        }
+        assert_eq!(both.lines().count(), lines - first);
+    }
+
+    /// A scrub masking `daemon.log.1` holds its lock; the relay must not wait
+    /// for it (every stderr writer in the daemon would stall behind it), and
+    /// rotates once the lock is free.
+    #[test]
+    fn the_relay_never_waits_for_a_held_log_lock_and_rotates_later() {
+        let dir = scratch("relay-rotate-held");
+        let previous = dir.join(format!("{LOG_FILE}.1"));
+        std::fs::write(&previous, "OLD PREVIOUS\n").unwrap();
+        let held = crate::registry::lock_at(&previous).unwrap();
+        let mut relay = relay_into(&dir);
+        let line_len = line_of(0).len() as u64;
+        let started = std::time::Instant::now();
+        let mut n = 0;
+        while std::fs::metadata(log_path(&dir)).unwrap().len() < MAX_LOG_BYTES + line_len {
+            relay.data(line_of(n).as_bytes());
+            n += 1;
+        }
+        // A few more writes, each of which could have tried the held lock.
+        for _ in 0..100 {
+            relay.data(line_of(n).as_bytes());
+            n += 1;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the relay waited for the held lock"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&previous).unwrap(),
+            "OLD PREVIOUS\n"
+        );
+        drop(held);
+        let retry_lines = (ROTATE_RETRY_BYTES / line_len) as usize + 2;
+        for _ in 0..retry_lines {
+            relay.data(line_of(n).as_bytes());
+            n += 1;
+        }
+        relay.drain();
+        let previous_len = std::fs::metadata(&previous).unwrap().len();
+        let current = std::fs::read_to_string(log_path(&dir)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(previous_len >= MAX_LOG_BYTES, "rotated once the lock freed");
+        assert!((current.len() as u64) < MAX_LOG_BYTES);
+        assert!(current.ends_with(&line_of(n - 1)));
+    }
+
+    /// Another process rotated `daemon.log` under the relay (a daemon start
+    /// renames it): the relay was left writing into `daemon.log.1`, and at
+    /// the cap it moves on to the current `daemon.log` rather than renaming
+    /// that one away.
+    #[test]
+    fn the_relay_follows_a_log_rotated_by_someone_else() {
+        let dir = scratch("relay-rotate-other");
+        let mut relay = relay_into(&dir);
+        relay.data(b"before the rename\n");
+        let previous = dir.join(format!("{LOG_FILE}.1"));
+        std::fs::rename(log_path(&dir), &previous).unwrap();
+        std::fs::write(log_path(&dir), "new daemon start\n").unwrap();
+        let mut n = 0;
+        while std::fs::metadata(&previous).unwrap().len() < MAX_LOG_BYTES {
+            relay.data(line_of(n).as_bytes());
+            n += 1;
+        }
+        relay.data(b"after the cap\n");
+        relay.drain();
+        let current = std::fs::read_to_string(log_path(&dir)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(current.starts_with("new daemon start\n"), "{current:.80}");
+        assert!(current.ends_with("after the cap\n"), "{current:.80}");
+    }
+
+    /// A relay whose destination is not the daemon's `daemon.log` (a
+    /// terminal, a client's pipe, any other file) is never rotated.
+    #[test]
+    fn only_the_daemons_own_log_is_rotated() {
+        let dir = scratch("relay-not-daemon-log");
+        let other = dir.join("elsewhere.log");
+        let file = crate::registry::open_append_private(&other).unwrap();
+        assert!(!is_log_of(&file, &dir));
+        let mut relay = RelayOut::new(file);
+        let chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..(2 * MAX_LOG_BYTES as usize / chunk.len()) {
+            relay.data(&chunk);
+        }
+        relay.data(b"\n");
+        relay.drain();
+        assert!(std::fs::metadata(&other).unwrap().len() > 2 * MAX_LOG_BYTES);
+        assert!(!dir.join(format!("{LOG_FILE}.1")).exists());
+        let file = crate::registry::open_append_private(&log_path(&dir)).unwrap();
+        assert!(is_log_of(&file, &dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The relay may stop mid-line; a stamped line appended then starts on a
+    /// line of its own rather than inside the relay's.
+    #[test]
+    fn an_appended_line_never_lands_inside_a_relayed_one() {
+        let dir = scratch("append-own-line");
+        let mut relay = relay_into(&dir);
+        relay.data(b"a line the relay has not ended");
+        relay.flush();
+        append(&dir, "daemon start");
+        relay.data(b" yet\n");
+        relay.drain();
+        let text = std::fs::read_to_string(log_path(&dir)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.ends_with(" daemon start") && l.contains(" pid=")),
+            "{text}"
+        );
+        assert!(
+            text.starts_with("a line the relay has not ended\n"),
+            "{text}"
+        );
     }
 }

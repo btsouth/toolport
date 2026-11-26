@@ -65,6 +65,12 @@ pub fn link_count(file: &File) -> std::io::Result<u64> {
     Ok(sys::ident(file)?.links)
 }
 
+/// The identity of the open file `file`: (device, inode) on Unix, (volume
+/// serial, file index) on Windows. Two handles with one identity name one file.
+pub fn file_id(file: &File) -> std::io::Result<(u64, u64)> {
+    Ok(sys::ident(file)?.id)
+}
+
 /// Whether a stream's output differs from its input, compared as both are
 /// produced (the output may lag behind, holding text back).
 #[derive(Default)]

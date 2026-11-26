@@ -706,6 +706,60 @@ pub enum DispatchTarget<'a> {
     Server(&'a str),
 }
 
+/// A refused claim on a resource URI or template: `(kind, uri, owner, refused)`.
+type Collision = (&'static str, String, String, String);
+
+/// Collisions this process has already reported. The aggregation is rebuilt on
+/// every catalog refresh and re-detects every collision each time; reporting
+/// each one again wrote 27 million lines (99.7 % of a 4.93 GB `daemon.log`)
+/// in one day for three servers sharing a catalog (issue #1437). Each distinct
+/// collision is reported once per process, and the set is bounded.
+static REPORTED_COLLISIONS: std::sync::LazyLock<Mutex<HashSet<Collision>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Most distinct collisions remembered (and reported); past it one notice
+/// says further ones go unreported.
+const MAX_REPORTED_COLLISIONS: usize = 4096;
+
+#[cfg(test)]
+thread_local! {
+    /// Collision lines this thread reported, for tests.
+    static COLLISION_LINES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Report that `refused` claimed `uri` (a `kind` route) already owned by
+/// `owner`, unless this process already reported that collision.
+fn report_collision(kind: &'static str, uri: &str, owner: &str, refused: &str) {
+    let key = (
+        kind,
+        uri.to_string(),
+        owner.to_string(),
+        refused.to_string(),
+    );
+    let mut seen = REPORTED_COLLISIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if seen.contains(&key) || seen.len() > MAX_REPORTED_COLLISIONS {
+        return;
+    }
+    let line = if seen.len() < MAX_REPORTED_COLLISIONS {
+        seen.insert(key);
+        format!(
+            "toolport: {kind} collision on '{uri}': keeping owner '{owner}', refusing claim from '{refused}' (reported once)"
+        )
+    } else {
+        // One placeholder entry past the bound stands for every further one.
+        seen.insert(("", String::new(), String::new(), String::new()));
+        format!(
+            "toolport: more than {MAX_REPORTED_COLLISIONS} resource URI or template collisions; further ones are not reported"
+        )
+    };
+    drop(seen);
+    eprintln!("{line}");
+    #[cfg(test)]
+    COLLISION_LINES.with(|lines| lines.borrow_mut().push(line));
+}
+
 /// One connected downstream server behind its own lock. Calls on a transport
 /// that multiplexes requests (stdio) take the lock only to fetch a
 /// [`crate::downstream::CallHandle`], so one slow call never blocks other calls to
@@ -893,6 +947,17 @@ impl ServerSlot {
             publishing: false,
         }));
         slot
+    }
+
+    /// Whether the catalog refresh passes re-query this server: one with no
+    /// supervisor, or one whose supervisor is `Ready`.
+    fn takes_refresh(&self) -> bool {
+        self.supervisor.as_ref().is_none_or(|s| {
+            s.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .state
+                == SupervisorState::Ready
+        })
     }
 
     fn retire(&self) {
@@ -2563,9 +2628,7 @@ impl Router {
                 if let Some(uri) = tools.app_uri(idx) {
                     match self.resource_routes.get(uri) {
                         Some(owner) if owner != server_id => {
-                            eprintln!(
-                                "toolport: MCP App resource URI collision on '{uri}': keeping owner '{owner}', refusing claim from '{server_id}'"
-                            );
+                            report_collision("MCP App resource URI", uri, owner, server_id);
                         }
                         Some(_) => {}
                         None => {
@@ -2585,9 +2648,7 @@ impl Router {
             if let Some(uri) = resource.get("uri").and_then(|u| u.as_str()) {
                 match self.resource_routes.get(uri) {
                     Some(owner) if owner != server_id => {
-                        eprintln!(
-                            "toolport: resource URI collision on '{uri}': keeping owner '{owner}', refusing claim from '{server_id}'"
-                        );
+                        report_collision("resource URI", uri, owner, server_id);
                     }
                     Some(_) => {
                         // The route may already have come from this server's MCP
@@ -2616,9 +2677,7 @@ impl Router {
             if let Some(uri_template) = template.get("uriTemplate").and_then(|u| u.as_str()) {
                 match self.template_routes.get(uri_template) {
                     Some(owner) if owner != server_id => {
-                        eprintln!(
-                            "toolport: resource template collision on '{uri_template}': keeping owner '{owner}', refusing claim from '{server_id}'"
-                        );
+                        report_collision("resource template", uri_template, owner, server_id);
                     }
                     Some(_) => {}
                     None => {
@@ -3466,9 +3525,19 @@ impl Router {
     /// Positive downstream TTLs schedule a refresh at their expiry. Zero/missing
     /// hints do not create a one-second polling loop; notifications still invalidate
     /// them immediately through the existing dirty-bit path.
+    ///
+    /// Only servers the `refresh_stale_*` passes refresh count (`ServerSlot::takes_refresh`):
+    /// a server whose supervisor is not `Ready` keeps the hints of its last
+    /// connection, which never reset because nothing refreshes them, so
+    /// counting it made every watch tick refresh and rebuild the whole
+    /// catalog (issue #1437, tens of thousands of rebuilds a day). Once it is
+    /// `Ready` again an expired hint is refreshed as before.
     pub fn expired_cache_kinds(&self) -> u8 {
         let mut kinds = 0;
         for slot in &self.servers {
+            if !slot.takes_refresh() {
+                continue;
+            }
             let server = slot
                 .inner
                 .lock()
@@ -3503,12 +3572,7 @@ impl Router {
     pub fn refresh_tools(&mut self) {
         // `&mut self` is exclusive, so locking each slot here can't contend.
         for slot in &self.servers {
-            if slot.supervisor.as_ref().is_some_and(|s| {
-                s.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .state
-                    != SupervisorState::Ready
-            }) {
+            if !slot.takes_refresh() {
                 continue;
             }
             if slot
@@ -3525,12 +3589,7 @@ impl Router {
 
     pub fn refresh_stale_tools(&mut self) {
         for slot in &self.servers {
-            if slot.supervisor.as_ref().is_some_and(|s| {
-                s.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .state
-                    != SupervisorState::Ready
-            }) {
+            if !slot.takes_refresh() {
                 continue;
             }
             if slot
@@ -3552,12 +3611,7 @@ impl Router {
     /// Mirrors [`refresh_tools`].
     pub fn refresh_resources(&mut self) {
         for slot in &self.servers {
-            if slot.supervisor.as_ref().is_some_and(|s| {
-                s.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .state
-                    != SupervisorState::Ready
-            }) {
+            if !slot.takes_refresh() {
                 continue;
             }
             slot.inner
@@ -3570,12 +3624,7 @@ impl Router {
 
     pub fn refresh_stale_resources(&mut self) {
         for slot in &self.servers {
-            if slot.supervisor.as_ref().is_some_and(|s| {
-                s.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .state
-                    != SupervisorState::Ready
-            }) {
+            if !slot.takes_refresh() {
                 continue;
             }
             slot.inner
@@ -3591,12 +3640,7 @@ impl Router {
     /// Mirrors [`refresh_tools`].
     pub fn refresh_prompts(&mut self) {
         for slot in &self.servers {
-            if slot.supervisor.as_ref().is_some_and(|s| {
-                s.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .state
-                    != SupervisorState::Ready
-            }) {
+            if !slot.takes_refresh() {
                 continue;
             }
             slot.inner
@@ -3609,12 +3653,7 @@ impl Router {
 
     pub fn refresh_stale_prompts(&mut self) {
         for slot in &self.servers {
-            if slot.supervisor.as_ref().is_some_and(|s| {
-                s.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .state
-                    != SupervisorState::Ready
-            }) {
+            if !slot.takes_refresh() {
                 continue;
             }
             slot.inner
@@ -9353,6 +9392,120 @@ mod tests {
         assert_eq!(result["contents"][0]["text"], "alpha-body");
         let expanded = router.read_resource("shared://item/7").unwrap();
         assert_eq!(expanded["contents"][0]["text"], "alpha-body");
+    }
+
+    /// Issue #1437: every catalog refresh rebuilds the aggregation, and each
+    /// rebuild re-reported every resource and template collision, 27 million
+    /// lines in a day. Each distinct collision is now reported once, however
+    /// often the catalog is rebuilt; a new one is still reported.
+    #[test]
+    fn a_collision_is_reported_once_across_rebuilds() {
+        struct SharedCatalog;
+        impl Transport for SharedCatalog {
+            fn request(&mut self, method: &str, _params: Value) -> Result<Value, TransportError> {
+                match method {
+                    "initialize" => Ok(json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": { "resources": {} }
+                    })),
+                    "tools/list" => Ok(json!({ "tools": [] })),
+                    "resources/list" => Ok(json!({
+                        "resources": [{ "uri": "issue1437://project/readme", "name": "readme" }]
+                    })),
+                    "resources/templates/list" => Ok(json!({
+                        "resourceTemplates": [{
+                            "uriTemplate": "issue1437://project/{id}",
+                            "name": "item"
+                        }]
+                    })),
+                    other => Err(TransportError::Fatal(format!("unexpected method {other}"))),
+                }
+            }
+            fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+        fn shared(id: &str) -> DownstreamServer {
+            let mut ds =
+                DownstreamServer::connect(id.to_string(), Box::new(SharedCatalog)).unwrap();
+            ds.load_resources_prompts();
+            ds
+        }
+        let lines = || {
+            COLLISION_LINES.with(|lines| {
+                lines
+                    .borrow()
+                    .iter()
+                    .filter(|l| l.contains("issue1437://"))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+        };
+        let mut router = Router::new();
+        router.add(shared("gitlab-a"));
+        router.add(shared("gitlab-b"));
+        router.add(shared("gitlab-c"));
+        // Two refused claims, each on the URI and on the template.
+        assert_eq!(lines().len(), 4, "{:#?}", lines());
+        for _ in 0..50 {
+            router.refresh_resources();
+            router.refresh_stale_resources();
+            let _ = router.reindexed();
+        }
+        assert_eq!(lines().len(), 4, "{:#?}", lines());
+        assert_eq!(
+            router.resource_server("issue1437://project/readme"),
+            Some("gitlab-a")
+        );
+        router.add(shared("gitlab-d"));
+        let after = lines();
+        assert_eq!(after.len(), 6, "{after:#?}");
+        assert!(
+            after[4..].iter().all(|l| l.contains("'gitlab-d'")),
+            "{after:#?}"
+        );
+    }
+
+    /// Issue #1437: a server whose supervisor is not `Ready` kept the expired
+    /// cache hints of its last connection. `refresh_stale_*` skips it, so
+    /// nothing reset them and every watch tick reported an expired cache,
+    /// refreshing and rebuilding the whole catalog each second.
+    #[test]
+    fn a_server_that_is_not_ready_never_reports_an_expired_cache() {
+        let mut router = supervised_fixture(flaky_connect("s", 0, Arc::new(AtomicU64::new(0))));
+        *router.servers[0]
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hinted_server("s", 5, "public");
+        std::thread::sleep(Duration::from_millis(15));
+        let set = |router: &Router, state: SupervisorState| {
+            router.servers[0]
+                .supervisor
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .state = state;
+        };
+        for state in [
+            SupervisorState::Stopped,
+            SupervisorState::Starting,
+            SupervisorState::Degraded,
+            SupervisorState::Backoff,
+            SupervisorState::NeedsAuth,
+            SupervisorState::Stopping,
+        ] {
+            set(&router, state);
+            assert_eq!(router.expired_cache_kinds(), 0, "{state:?}");
+            router.refresh_stale_tools();
+            assert_eq!(router.expired_cache_kinds(), 0, "{state:?} stays quiet");
+        }
+        // Once it is Ready its expired hint is refreshed as before.
+        set(&router, SupervisorState::Ready);
+        assert_ne!(
+            router.expired_cache_kinds() & crate::downstream::change::TOOLS,
+            0
+        );
     }
 
     #[test]
