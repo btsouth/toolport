@@ -4044,7 +4044,11 @@ fn mask_in_place(matcher: &Matcher, dir: &Path, path: &Path) -> std::io::Result<
 const MASK_WINDOW_BYTES: usize = 256 * 1024;
 
 /// Longest line [`mask_locked`] reads whole (and parses as JSON). A longer
-/// line is searched as text, in parts that continue one another.
+/// line is never tokenized as JSON: it is searched as plain text, in parts
+/// that continue one another. Its secrets are still found in every spelling
+/// the text search knows (whole, wrapped, encoded, JSON-escaped), but a value
+/// split over two string values of that line is not joined as it would be in
+/// a line read whole, and its keys and numbers are searched with its text.
 const MASK_LINE_BYTES: usize = 1024 * 1024;
 
 /// Ranges [`mask_locked`] collects before masking them (one journaled pass),
@@ -4074,6 +4078,9 @@ struct MaskRanges<'a> {
     count: usize,
     batch: usize,
     masked: bool,
+    /// The identity of the file the ranges are found in: a batch is never
+    /// written into a file that replaced it.
+    id: (u64, u64),
 }
 
 impl MaskRanges<'_> {
@@ -4099,7 +4106,8 @@ impl MaskRanges<'_> {
                     Vec::new()
                 }
             };
-            self.masked |= crate::scrub_io::mask_ranges(self.dir, self.path, &ranges, &mask)?;
+            self.masked |=
+                crate::scrub_io::mask_ranges(self.dir, self.path, &ranges, &mask, Some(self.id))?;
         }
         self.count = 0;
         Ok(())
@@ -4158,10 +4166,16 @@ impl MaskText {
         starts.extend_from_slice(&self.starts);
         let spans = m.byte_spans(&self.logical, &starts);
         let len = self.logical.len();
-        let mut cut = if end {
-            len
+        // Short of the end, the cut also keeps the last FRAGMENT_CHARS chars
+        // before the hold: a fragment window or the boundary of a whole-token
+        // match that the next window continues is then decided with the text
+        // after it, as one search over the whole file decides it.
+        let (mut cut, margin) = if end {
+            (len, 0)
         } else {
-            mask_hold(m, &self.logical, &starts)
+            let hold = mask_hold(m, &self.logical, &starts);
+            let cut = back_chars(&self.logical, hold, FRAGMENT_CHARS.max(1));
+            (cut, hold - cut)
         };
         // A span crossing the cut would be masked in part.
         while let Some((s, _, _)) = spans.iter().find(|(s, e, _)| *s < cut && cut < *e) {
@@ -4170,7 +4184,7 @@ impl MaskText {
         for (s, e, names) in spans.iter().filter(|(s, _, _)| *s < cut) {
             self.queue(*s, (*e).min(cut), m.marker(names), out)?;
         }
-        if len - cut > MAX_HELD_BYTES {
+        if len - cut > MAX_HELD_BYTES + margin {
             self.queue(cut, len, m.marker(&[]), out)?;
             cut = len;
         }
@@ -4260,6 +4274,21 @@ fn mask_hold(m: &Matcher, bytes: &[u8], starts: &[usize]) -> usize {
     (from + m.hold_with(text, &rel, true)).min(limit)
 }
 
+/// The offset `n` chars before `at` in `bytes` (UTF-8 continuation bytes are
+/// not counted), or 0.
+fn back_chars(bytes: &[u8], mut at: usize, n: usize) -> usize {
+    for _ in 0..n {
+        if at == 0 {
+            break;
+        }
+        at -= 1;
+        while at > 0 && bytes[at] & 0xC0 == 0x80 {
+            at -= 1;
+        }
+    }
+    at
+}
+
 /// Read the rest of a line of `reader` into `line` (with its `\n`), until it
 /// holds `cap` bytes. Returns whether the line ended (at `\n` or at the end of
 /// the file).
@@ -4332,6 +4361,7 @@ fn mask_locked_with(
         count: 0,
         batch: limits.batch.max(1),
         masked: false,
+        id: crate::scrub_io::file_id(&file)?,
     };
     // String values and text lines are one text; keys and numbers another.
     let mut text = MaskText::default();
@@ -7589,6 +7619,52 @@ mod tests {
                     "line {line} window {window}: {text}"
                 );
                 assert!(text.contains("[secret:PW]"), "line {line} window {window}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fragment of a long secret, or a short secret whose whole-token
+    /// boundary is the next char, straddling a window cut is decided as one
+    /// search over the whole file decides it: the cut keeps the last
+    /// FRAGMENT_CHARS chars before the hold for the next window.
+    #[test]
+    fn fragments_and_short_tokens_across_a_window_cut_match_a_whole_search() {
+        let secret = "Vq8mZ2rT5wK9pL3x";
+        let short = "Q7z";
+        let m = m(&[("LONG", secret), ("SHORT", short)]);
+        let mut content = String::new();
+        for i in 0..12 {
+            content.push_str(&format!(
+                "[debug] {i} piece {} here\n",
+                &secret[i % 5..i % 5 + 9]
+            ));
+            content.push_str(&format!("[debug] {i} token {short} alone\n"));
+            content.push_str(&format!("[debug] {i} word {short}abc kept\n"));
+            content.push_str(&format!("[debug] {i} end {short}"));
+            content.push_str(if i % 2 == 0 { "\n" } else { "Zed\n" });
+        }
+        content.push_str(&format!("tail {}", &secret[3..12]));
+        let dir = mask_fixture("fragment-cut");
+        let whole =
+            String::from_utf8(masked_with(&m, &dir, content.as_bytes(), ONE_WINDOW)).unwrap();
+        assert!(whole.contains("token *** alone"), "{whole}");
+        assert!(whole.contains(&format!("{short}abc kept")), "{whole}");
+        assert!(!whole.contains(&secret[3..12]), "{whole}");
+        // Lines read in parts put the cut anywhere inside a line.
+        for line in [4, 5, 6, 7, 9, 11, 13, 17, 23, usize::MAX] {
+            for window in 1..=40 {
+                let limits = MaskLimits {
+                    window,
+                    line,
+                    batch: 2,
+                };
+                let streamed = masked_with(&m, &dir, content.as_bytes(), limits);
+                assert_eq!(
+                    String::from_utf8_lossy(&streamed),
+                    whole,
+                    "line {line} window {window}"
+                );
             }
         }
         let _ = std::fs::remove_dir_all(&dir);

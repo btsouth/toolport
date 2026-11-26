@@ -706,16 +706,24 @@ pub enum DispatchTarget<'a> {
     Server(&'a str),
 }
 
-/// A refused claim on a resource URI or template: `(kind, uri, owner, refused)`.
-type Collision = (&'static str, String, String, String);
+/// Collisions this process has already reported, by a digest of the refused
+/// claim `(kind, uri, owner, refused)`, so the set's memory does not grow with
+/// the length of URIs and names. The aggregation is rebuilt on every catalog
+/// refresh and re-detects every collision each time; reporting each one again
+/// wrote 27 million lines (99.7 % of a 4.93 GB `daemon.log`) in one day for
+/// three servers sharing a catalog (issue #1437). Each distinct collision is
+/// reported once per process, and the set is bounded. Two claims that share a
+/// digest would only lose a log line.
+static REPORTED_COLLISIONS: Mutex<ReportedCollisions> = Mutex::new(ReportedCollisions {
+    seen: None,
+    overflowed: false,
+});
 
-/// Collisions this process has already reported. The aggregation is rebuilt on
-/// every catalog refresh and re-detects every collision each time; reporting
-/// each one again wrote 27 million lines (99.7 % of a 4.93 GB `daemon.log`)
-/// in one day for three servers sharing a catalog (issue #1437). Each distinct
-/// collision is reported once per process, and the set is bounded.
-static REPORTED_COLLISIONS: std::sync::LazyLock<Mutex<HashSet<Collision>>> =
-    std::sync::LazyLock::new(Default::default);
+struct ReportedCollisions {
+    seen: Option<HashSet<u64>>,
+    /// The notice that further collisions go unreported was written.
+    overflowed: bool,
+}
 
 /// Most distinct collisions remembered (and reported); past it one notice
 /// says further ones go unreported.
@@ -730,16 +738,18 @@ thread_local! {
 /// Report that `refused` claimed `uri` (a `kind` route) already owned by
 /// `owner`, unless this process already reported that collision.
 fn report_collision(kind: &'static str, uri: &str, owner: &str, refused: &str) {
-    let key = (
-        kind,
-        uri.to_string(),
-        owner.to_string(),
-        refused.to_string(),
-    );
-    let mut seen = REPORTED_COLLISIONS
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::hash::DefaultHasher::new();
+    (kind, uri, owner, refused).hash(&mut hasher);
+    let key = hasher.finish();
+    let mut reported = REPORTED_COLLISIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if seen.contains(&key) || seen.len() > MAX_REPORTED_COLLISIONS {
+    if reported.overflowed {
+        return;
+    }
+    let seen = reported.seen.get_or_insert_with(HashSet::new);
+    if seen.contains(&key) {
         return;
     }
     let line = if seen.len() < MAX_REPORTED_COLLISIONS {
@@ -748,13 +758,12 @@ fn report_collision(kind: &'static str, uri: &str, owner: &str, refused: &str) {
             "toolport: {kind} collision on '{uri}': keeping owner '{owner}', refusing claim from '{refused}' (reported once)"
         )
     } else {
-        // One placeholder entry past the bound stands for every further one.
-        seen.insert(("", String::new(), String::new(), String::new()));
+        reported.overflowed = true;
         format!(
             "toolport: more than {MAX_REPORTED_COLLISIONS} resource URI or template collisions; further ones are not reported"
         )
     };
-    drop(seen);
+    drop(reported);
     eprintln!("{line}");
     #[cfg(test)]
     COLLISION_LINES.with(|lines| lines.borrow_mut().push(line));
