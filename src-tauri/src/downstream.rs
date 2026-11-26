@@ -2809,6 +2809,9 @@ pub trait Transport: Send {
     /// the merge. Default no-op, so legacy connections send exactly what they
     /// always did (SOU-445).
     fn set_protocol_meta(&mut self, _meta: Option<Value>) {}
+    /// Record the protocol version a legacy server negotiated in `initialize`
+    /// so HTTP transports carry it in `MCP-Protocol-Version` on follow-up
+    /// requests. Default no-op; `set_protocol_meta` replaces it on HTTP.
     fn set_legacy_protocol_version(&mut self, _version: Option<String>) {}
     /// Replace the long-lived modern notification listener. Legacy transports
     /// keep the default no-op; modern connections call this after discovery and
@@ -7011,7 +7014,8 @@ impl HttpTransport {
     /// and a server that sees them disagree rejects the request with `400` and
     /// `HeaderMismatch` (-32020). So this has to follow whatever the connection
     /// negotiated, not a constant. Legacy connections have no protocol `_meta`
-    /// and keep sending [`PROTOCOL_VERSION`] exactly as before.
+    /// and send the version negotiated at `initialize`, falling back to
+    /// [`PROTOCOL_VERSION`].
     fn wire_protocol_version(&self) -> String {
         self.protocol_meta
             .as_ref()
@@ -8768,6 +8772,8 @@ impl DownstreamServer {
                 let version = init
                     .get("protocolVersion")
                     .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty() && v.bytes().all(|b| (0x21..=0x7e).contains(&b)))
                     .unwrap_or(PROTOCOL_VERSION)
                     .to_string();
                 let caps = init.get("capabilities").cloned();
@@ -17420,6 +17426,7 @@ mod tests {
     fn legacy_initialize_version_is_recorded_for_follow_up_headers() {
         struct LegacyTransport {
             negotiated: Arc<Mutex<Option<String>>>,
+            seen_on_notify: Arc<Mutex<Option<String>>>,
         }
 
         impl Transport for LegacyTransport {
@@ -17427,6 +17434,52 @@ mod tests {
                 Ok(match method {
                     "initialize" => json!({
                         "protocolVersion": "2025-11-25",
+                        "capabilities": {}
+                    }),
+                    "tools/list" => json!({ "tools": [] }),
+                    _ => json!({}),
+                })
+            }
+
+            fn notify(&mut self, method: &str, _params: Value) -> Result<(), TransportError> {
+                if method == "notifications/initialized" {
+                    *self.seen_on_notify.lock().unwrap() = self.negotiated.lock().unwrap().clone();
+                }
+                Ok(())
+            }
+
+            fn set_legacy_protocol_version(&mut self, version: Option<String>) {
+                *self.negotiated.lock().unwrap() = version;
+            }
+        }
+
+        let negotiated = Arc::new(Mutex::new(None));
+        let seen_on_notify = Arc::new(Mutex::new(None));
+        let transport = LegacyTransport {
+            negotiated: Arc::clone(&negotiated),
+            seen_on_notify: Arc::clone(&seen_on_notify),
+        };
+        DownstreamServer::connect("legacy".into(), Box::new(transport)).unwrap();
+        assert_eq!(
+            seen_on_notify.lock().unwrap().as_deref(),
+            Some("2025-11-25"),
+            "version must be stored before notifications/initialized is sent"
+        );
+        assert_eq!(negotiated.lock().unwrap().as_deref(), Some("2025-11-25"));
+    }
+
+    #[test]
+    fn legacy_initialize_invalid_protocol_version_falls_back_to_default() {
+        struct BadVersionTransport {
+            raw_version: &'static str,
+            negotiated: Arc<Mutex<Option<String>>>,
+        }
+
+        impl Transport for BadVersionTransport {
+            fn request(&mut self, method: &str, _params: Value) -> Result<Value, TransportError> {
+                Ok(match method {
+                    "initialize" => json!({
+                        "protocolVersion": self.raw_version,
                         "capabilities": {}
                     }),
                     "tools/list" => json!({ "tools": [] }),
@@ -17443,12 +17496,19 @@ mod tests {
             }
         }
 
-        let negotiated = Arc::new(Mutex::new(None));
-        let transport = LegacyTransport {
-            negotiated: Arc::clone(&negotiated),
-        };
-        DownstreamServer::connect("legacy".into(), Box::new(transport)).unwrap();
-        assert_eq!(negotiated.lock().unwrap().as_deref(), Some("2025-11-25"));
+        for raw in ["", "   ", "2025-11-25\r\nX-Injected: 1", "bad version"] {
+            let negotiated = Arc::new(Mutex::new(None));
+            let transport = BadVersionTransport {
+                raw_version: raw,
+                negotiated: Arc::clone(&negotiated),
+            };
+            DownstreamServer::connect("legacy".into(), Box::new(transport)).unwrap();
+            assert_eq!(
+                negotiated.lock().unwrap().as_deref(),
+                Some(super::PROTOCOL_VERSION),
+                "invalid protocolVersion {raw:?} should fall back to default"
+            );
+        }
     }
 
     #[test]
