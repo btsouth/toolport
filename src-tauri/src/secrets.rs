@@ -61,9 +61,7 @@ mod line_safe {
     /// True when `value` cannot be stored raw on one key file line, or would
     /// read back as an encoded value.
     pub(super) fn needs_encoding(value: &str) -> bool {
-        value.starts_with(MARKER)
-            || value.chars().any(char::is_control)
-            || value.trim() != value
+        value.starts_with(MARKER) || value.chars().any(char::is_control) || value.trim() != value
     }
 
     pub(super) fn encode(value: &str) -> Cow<'_, str> {
@@ -3339,7 +3337,10 @@ pub(crate) mod tests {
     #[test]
     fn ordinary_values_are_stored_exactly_as_before() {
         for value in ["sk-abc123", "", "a b", "{\"token\":\"x\"}", "pässwörd"] {
-            assert!(matches!(line_safe::encode(value), std::borrow::Cow::Borrowed(_)));
+            assert!(matches!(
+                line_safe::encode(value),
+                std::borrow::Cow::Borrowed(_)
+            ));
             assert_eq!(line_safe::decode(value.to_string()).unwrap(), value);
         }
     }
@@ -3367,7 +3368,8 @@ pub(crate) mod tests {
     #[test]
     fn a_damaged_encoded_value_is_an_error_not_garbage() {
         assert!(line_safe::decode(format!("{}not base64!", line_safe::MARKER)).is_err());
-        let not_text = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0xff, 0xfe]);
+        let not_text =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0xff, 0xfe]);
         assert!(line_safe::decode(format!("{}{not_text}", line_safe::MARKER)).is_err());
     }
 
