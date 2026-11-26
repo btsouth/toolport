@@ -44,6 +44,50 @@ fn account(server_id: &str, key: &str) -> String {
     format!("{server_id}::{key}")
 }
 
+/// gnome-keyring's unencrypted keyring (the default on Omarchy) saves each
+/// secret raw on one line of a key file. A value with a line break turns the
+/// rest of it into lines the daemon cannot parse, so at the next login it
+/// rejects the whole keyring and every app on the desktop loses its saved
+/// logins. Leading and trailing whitespace does not survive that line either.
+/// On the Secret Service those values are stored base64-encoded behind
+/// [`line_safe::MARKER`]; every other value is stored exactly as before.
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+mod line_safe {
+    use base64::Engine;
+    use std::borrow::Cow;
+
+    pub(super) const MARKER: &str = "toolport-line-safe-b64:";
+
+    /// True when `value` cannot be stored raw on one key file line, or would
+    /// read back as an encoded value.
+    pub(super) fn needs_encoding(value: &str) -> bool {
+        value.starts_with(MARKER)
+            || value.chars().any(char::is_control)
+            || value.trim() != value
+    }
+
+    pub(super) fn encode(value: &str) -> Cow<'_, str> {
+        if needs_encoding(value) {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+            Cow::Owned(format!("{MARKER}{encoded}"))
+        } else {
+            Cow::Borrowed(value)
+        }
+    }
+
+    /// The value [`encode`] was given. `Err` when the marker is there but what
+    /// follows is not base64 of text.
+    pub(super) fn decode(stored: String) -> Result<String, String> {
+        let Some(encoded) = stored.strip_prefix(MARKER) else {
+            return Ok(stored);
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded.trim())
+            .map_err(|_| "stored secret has a damaged encoding".to_string())?;
+        String::from_utf8(bytes).map_err(|_| "stored secret has a damaged encoding".to_string())
+    }
+}
+
 // ── macOS ──────────────────────────────────────────────────────────────────
 //
 // On macOS we bypass the `keyring` crate and call `security_framework` /
@@ -1074,7 +1118,8 @@ mod platform {
 
     pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
         invalidate_backup_read(server_id, key);
-        with_service(|| Entry::new(SERVICE, &account(server_id, key))?.set_password(value))
+        let stored = super::line_safe::encode(value);
+        with_service(|| Entry::new(SERVICE, &account(server_id, key))?.set_password(&stored))
             .map_err(|e| e.to_string())
     }
 
@@ -1097,7 +1142,9 @@ mod platform {
         read: Result<String, keyring::Error>,
     ) -> Result<Option<String>, super::ReadFailure> {
         match read {
-            Ok(v) => Ok(Some(v)),
+            Ok(v) => super::line_safe::decode(v)
+                .map(Some)
+                .map_err(super::ReadFailure::Damaged),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e @ keyring::Error::BadEncoding(_)) => {
                 Err(super::ReadFailure::Damaged(e.to_string()))
@@ -1338,8 +1385,9 @@ mod platform {
             backup_deadline()?;
             let bytes = item.get_secret().map_err(|error| classify(&error))?;
             String::from_utf8(bytes)
-                .map(Some)
                 .map_err(|_| State::Corrupt)
+                .and_then(|text| super::line_safe::decode(text).map_err(|_| State::Corrupt))
+                .map(Some)
         });
         BACKUP_BATCH.with(|slot| {
             if let Some(batch) = slot.borrow_mut().as_mut() {
@@ -1347,6 +1395,41 @@ mod platform {
             }
         });
         result
+    }
+
+    /// Re-store, encoded, every unlocked Toolport item an older version saved
+    /// raw with text a key file line cannot carry (client backups are whole
+    /// config files). The daemon still holds those in memory and rewrites its
+    /// file on the change, so the keyring loads again at the next login.
+    /// Never unlocks or prompts; a locked item waits for a later start.
+    pub(super) fn repair_line_unsafe_items() -> Result<usize, super::BackupSecretError> {
+        with_backup_batch(|| {
+            with_backup_service(|service| {
+                let found = service
+                    .search_items(std::collections::HashMap::from([("service", SERVICE)]))
+                    .map_err(|error| classify(&error))?;
+                let mut repaired = 0;
+                for item in &found.unlocked {
+                    backup_deadline()?;
+                    let Ok(bytes) = item.get_secret() else {
+                        continue;
+                    };
+                    let Ok(text) = String::from_utf8(bytes) else {
+                        continue;
+                    };
+                    if text.starts_with(super::line_safe::MARKER)
+                        || !super::line_safe::needs_encoding(&text)
+                    {
+                        continue;
+                    }
+                    let stored = super::line_safe::encode(&text);
+                    if item.set_secret(stored.as_bytes(), "text/plain").is_ok() {
+                        repaired += 1;
+                    }
+                }
+                Ok(repaired)
+            })
+        })
     }
 
     /// Never prompt, even if an item locks between SearchItems and Delete.
@@ -2731,6 +2814,35 @@ pub(crate) fn backup_secret_status(
     platform::get_backup_secret_status(owner.as_str(), key)
 }
 
+/// Start-up repair of Secret Service items an older version stored raw with
+/// line breaks, which break gnome-keyring's unencrypted keyring at the next
+/// login (see [`line_safe`]). Returns how many were re-stored; never prompts.
+pub(crate) fn repair_line_unsafe_items() -> usize {
+    #[cfg(test)]
+    {
+        0
+    }
+    #[cfg(all(not(test), not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        if file::active() || locked_store::locked() {
+            return 0;
+        }
+        match platform::repair_line_unsafe_items() {
+            Ok(0) | Err(_) => 0,
+            Ok(repaired) => {
+                crate::gatewaylog::append(&format!(
+                    "re-stored {repaired} keyring item(s) whose line breaks would break an unencrypted keyring"
+                ));
+                repaired
+            }
+        }
+    }
+    #[cfg(all(not(test), any(target_os = "macos", target_os = "windows")))]
+    {
+        0
+    }
+}
+
 /// Vault-only backup access, with no interactive unlock during Linux recovery.
 pub(crate) fn get_backup_secret_result(
     server_id: &str,
@@ -3223,6 +3335,41 @@ pub(crate) mod tests {
 
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn ordinary_values_are_stored_exactly_as_before() {
+        for value in ["sk-abc123", "", "a b", "{\"token\":\"x\"}", "pässwörd"] {
+            assert!(matches!(line_safe::encode(value), std::borrow::Cow::Borrowed(_)));
+            assert_eq!(line_safe::decode(value.to_string()).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn values_a_key_file_line_cannot_carry_round_trip_encoded() {
+        let config = "model = \"x\"\n\n[projects.\"/home/a\"]\ntrust_level = \"trusted\"\n";
+        for value in [
+            config,
+            "line\r\nbreak",
+            " leading",
+            "trailing ",
+            "tab\tinside",
+            "nul\0inside",
+            "toolport-line-safe-b64:looks encoded",
+        ] {
+            let stored = line_safe::encode(value);
+            assert!(stored.starts_with(line_safe::MARKER), "{value:?}");
+            assert!(!stored.chars().any(char::is_control), "{value:?}");
+            assert_eq!(stored.trim(), stored);
+            assert_eq!(line_safe::decode(stored.into_owned()).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn a_damaged_encoded_value_is_an_error_not_garbage() {
+        assert!(line_safe::decode(format!("{}not base64!", line_safe::MARKER)).is_err());
+        let not_text = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0xff, 0xfe]);
+        assert!(line_safe::decode(format!("{}{not_text}", line_safe::MARKER)).is_err());
+    }
 
     /// Serializes tests that read or mutate the process-global `CONDUIT_SECRET_KEY`
     /// env var (and thus `file::active()`). Without this, a test that sets the var

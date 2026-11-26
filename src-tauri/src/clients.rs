@@ -10583,6 +10583,10 @@ pub(crate) static UPGRADE_WAITERS: std::sync::atomic::AtomicUsize =
 
 fn repoint_stale_gateways_quietly(managed: &HashMap<String, ManagedEntry>) -> RepointOutcome {
     let mut outcome = RepointOutcome::default();
+    // Before anything else, so a keyring holding raw multi-line backups is
+    // saved in a form that still loads at the next login. Items still locked
+    // are left for the next pass (a later start or a recovery Retry).
+    crate::secrets::repair_line_unsafe_items();
     match backup_storage::upgrade_legacy_at_start() {
         Some(Ok(_)) => {}
         // Refused as locked inside the start-up pass: retried on the next start
