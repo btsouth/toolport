@@ -15962,6 +15962,9 @@ fn open_server_editor_prefilled(
     let edited_inherit = edited.clone();
     let id = inherit_env.connect_active_notify(move |_| edited_inherit());
     editor_handlers.keep(&inherit_env, id);
+    let edited_prefer = edited.clone();
+    let id = prefer_modern.connect_active_notify(move |_| edited_prefer());
+    editor_handlers.keep(&prefer_modern, id);
     for (_, field, source) in &launch_entries {
         let edited_field = edited.clone();
         let id = field.connect_changed(move |_| edited_field());

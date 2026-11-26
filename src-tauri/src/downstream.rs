@@ -9081,21 +9081,30 @@ impl DownstreamServer {
         // Discovery is the first request, so it gets the whole handshake budget:
         // a launcher may still be downloading the package before it can answer.
         let discovered = discover_modern(transport);
-        transport.initialize_complete();
         let probe_err = match discovered {
-            Ok(handshake) => return Ok(handshake),
+            Ok(handshake) => {
+                transport.initialize_complete();
+                return Ok(handshake);
+            }
             // A dead, silent or unresponsive server is not a legacy server.
             // Falling back would double the wait before the same failure.
             Err(DiscoverError::Refused(err)) if err.is_health_failure() => {
-                return Err(err.call_failure())
+                transport.initialize_complete();
+                return Err(err.call_failure());
             }
             // Authentication is independent of the protocol era (#914).
             Err(DiscoverError::Refused(err)) if err.is_auth_failure() => {
-                return Err(err.call_failure())
+                transport.initialize_complete();
+                return Err(err.call_failure());
             }
-            Err(DiscoverError::Failed(failure)) => return Err(failure),
+            Err(DiscoverError::Failed(failure)) => {
+                transport.initialize_complete();
+                return Err(failure);
+            }
             // A legacy-only server refuses the method; a modern server on a
             // revision Toolport does not speak may still accept `initialize`.
+            // Leave `initialize_complete` for `legacy_initialize` so HTTP
+            // fallback keeps the handshake timeout budget.
             Err(DiscoverError::Refused(err)) => err.to_string(),
             Err(DiscoverError::Incompatible(failure)) => failure.detail,
         };
