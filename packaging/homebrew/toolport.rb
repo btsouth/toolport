@@ -2,11 +2,11 @@ cask "toolport" do
   version "2.4.2"
 
   on_arm do
-    sha256 "1c44c3264115dea0b993c7c1119a7872cbd3a490cf2a49477a7116177c707f34"
+    sha256 "6873828170b7c6fa68a91aec644d61fcf777cbdff5926311bca70f6cdc411756"
     url "https://github.com/btsouth/toolport/releases/download/v#{version}/Toolport_aarch64-apple-darwin.dmg"
   end
   on_intel do
-    sha256 "bb575d0d45a224ab00c35b5ab45553e7f648e45268f76704cd20ce86a34af097"
+    sha256 "9a29e56ef8a5a14b56f310d8500d31a98f57bfc066d259cb0761bc4d56ff7e92"
     url "https://github.com/btsouth/toolport/releases/download/v#{version}/Toolport_x86_64-apple-darwin.dmg"
   end
 
