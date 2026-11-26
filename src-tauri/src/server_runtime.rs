@@ -161,9 +161,10 @@ fn connect_server_classified(
         if let Some(timeout) = server.initialize_timeout()? {
             transport.set_connect_timeout(timeout);
         }
-        DownstreamServer::connect_classified(
+        DownstreamServer::connect_classified_with(
             server.id.clone(),
             remote::protect_transport(server, Box::new(transport)),
+            crate::downstream::ConnectOptions::for_server(server),
         )
         .map_err(|error| {
             crate::call_failure::CallFailure::new(error.kind, resolved.redact(error.detail))
@@ -533,6 +534,7 @@ mod tests {
             source: None,
             disabled_tools: Vec::new(),
             hide_prompts: false,
+            prefer_modern: false,
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,

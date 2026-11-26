@@ -15581,6 +15581,10 @@ fn open_server_editor_prefilled(
     let (hide_prompts_row, hide_prompts) =
         hide_prompts_field(server.as_ref().is_some_and(|server| server.hide_prompts));
     connection.append(&hide_prompts_row);
+    // Handshake order applies to every transport too (#1438).
+    let (prefer_modern_row, prefer_modern) =
+        prefer_modern_field(server.as_ref().is_some_and(|server| server.prefer_modern));
+    connection.append(&prefer_modern_row);
     test.set_halign(gtk::Align::End);
     form.append(&connection);
 
@@ -16034,6 +16038,7 @@ fn open_server_editor_prefilled(
     let url_for_test = url.clone();
     let cwd_for_test = cwd.clone();
     let inherit_env_for_test = inherit_env.clone();
+    let prefer_modern_for_test = prefer_modern.clone();
     let launch_for_test = launch_entries.clone();
     let launch_definition_for_test = original_launch.clone();
     let original_command_for_test = original_command.clone();
@@ -16065,6 +16070,8 @@ fn open_server_editor_prefilled(
             &inherit_env_for_test,
         );
         fields.initialize_timeout_ms = timeout_ms;
+        // Test the handshake the server will actually get once saved.
+        fields.prefer_modern = Some(prefer_modern_for_test.is_active());
         let binding_changed =
             fields.command != original_command_for_test || fields.args != original_args_for_test;
         let launch_values = launch_for_test
@@ -16220,6 +16227,7 @@ fn open_server_editor_prefilled(
         fields.initialize_timeout_ms = timeout_ms;
         fields.sync_local_only = local_only.is_active();
         fields.hide_prompts = Some(hide_prompts.is_active());
+        fields.prefer_modern = Some(prefer_modern.is_active());
         let binding_changed =
             fields.command != original_command_for_save || fields.args != original_args_for_save;
         let launch_values = launch_for_save
@@ -16784,6 +16792,7 @@ fn collect_server_fields(
         cwd: Some(cwd.text().to_string()),
         inherit_env: Some(inherit_env.is_active()),
         hide_prompts: None,
+        prefer_modern: None,
     }
 }
 
@@ -16816,6 +16825,44 @@ fn hide_prompts_field(active: bool) -> (gtk::Box, gtk::Switch) {
             .css_classes(["toolport-muted", "caption"])
             .build();
         l10n::bind_label(&widget, "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available.");
+        widget
+    });
+    switch.update_relation(&[gtk::accessible::Relation::LabelledBy(&[label.upcast_ref()])]);
+    row.append(&copy);
+    row.append(&switch);
+    (row, switch)
+}
+
+/// The "Prefer modern MCP" row of the server editor, matching the web dialog's
+/// switch (#1438).
+fn prefer_modern_field(active: bool) -> (gtk::Box, gtk::Switch) {
+    let switch = gtk::Switch::builder()
+        .active(active)
+        .valign(gtk::Align::Center)
+        .build();
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    row.set_margin_top(6);
+    let copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    copy.set_hexpand(true);
+    let label = {
+        let widget = gtk::Label::builder()
+            .label(crate::i18n::tr("Prefer modern MCP (2026-07-28)"))
+            .halign(gtk::Align::Start)
+            .css_classes(["toolport-field-label"])
+            .build();
+        l10n::bind_label(&widget, "Prefer modern MCP (2026-07-28)");
+        widget
+    };
+    copy.append(&label);
+    copy.append(&{
+        let widget = gtk::Label::builder()
+            .label(crate::i18n::tr("Probes the 2026-07-28 server/discover handshake before the legacy initialize, so a server that speaks both gets per-request metadata and tasks. Falls back to initialize if the server refuses discovery."))
+            .halign(gtk::Align::Start)
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["toolport-muted", "caption"])
+            .build();
+        l10n::bind_label(&widget, "Probes the 2026-07-28 server/discover handshake before the legacy initialize, so a server that speaks both gets per-request metadata and tasks. Falls back to initialize if the server refuses discovery.");
         widget
     });
     switch.update_relation(&[gtk::accessible::Relation::LabelledBy(&[label.upcast_ref()])]);
@@ -18129,6 +18176,7 @@ mod tests {
                 cwd: None,
                 inherit_env: None,
                 hide_prompts: None,
+                prefer_modern: None,
             };
             crate::registry_controller::add_snippet_server_choices(
                 fields,
@@ -22411,6 +22459,7 @@ mod tests {
             cwd: None,
             inherit_env: false,
             hide_prompts: false,
+            prefer_modern: false,
             secret_keys: vec![],
             plain_env: vec![state::PlainEnvView {
                 key: "REGION".into(),
@@ -24040,6 +24089,7 @@ mod tests {
             cwd: None,
             inherit_env: false,
             hide_prompts: false,
+            prefer_modern: false,
             secret_keys: Vec::new(),
             plain_env: Vec::new(),
             secret_references: Default::default(),
@@ -24881,6 +24931,32 @@ mod tests {
                 .and_downcast::<gtk::Label>()
                 .expect("the switch explains itself");
             assert!(note.text().contains("Its tools stay available."));
+            assert!(note.has_css_class("caption"));
+            assert_eq!(row.last_child().as_ref(), Some(switch.upcast_ref()));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires GTK; explicitly run in the isolated omabox session"]
+    fn prefer_modern_switch_starts_from_the_saved_choice_and_is_labelled() {
+        gtk::init().expect("this regression runs inside omabox");
+        for saved in [false, true] {
+            let (row, switch) = prefer_modern_field(saved);
+            assert_eq!(switch.is_active(), saved);
+            switch.set_active(!saved);
+            assert_eq!(switch.is_active(), !saved);
+            let copy = row.first_child().expect("the label column comes first");
+            let label = copy
+                .first_child()
+                .and_downcast::<gtk::Label>()
+                .expect("the switch has a visible label");
+            assert_eq!(label.text(), "Prefer modern MCP (2026-07-28)");
+            assert!(label.has_css_class("toolport-field-label"));
+            let note = label
+                .next_sibling()
+                .and_downcast::<gtk::Label>()
+                .expect("the switch explains itself");
+            assert!(note.text().contains("server/discover"));
             assert!(note.has_css_class("caption"));
             assert_eq!(row.last_child().as_ref(), Some(switch.upcast_ref()));
         }

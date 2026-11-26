@@ -604,6 +604,9 @@ export interface ServerEntry {
   /** Keep this server's MCP prompts out of clients' prompt lists (often shown
    * as slash commands) while its tools stay available. Unset = exposed. */
   hidePrompts?: boolean;
+  /** Probe the 2026-07-28 server/discover handshake before legacy initialize,
+   * so a dual-era server connects as modern (#1438). Unset = legacy-first. */
+  preferModern?: boolean;
   /** Headless outbound OAuth (SBS-524). Present = this server uses the
    * client-credentials flow instead of the interactive browser one. */
   clientCredentials?: ClientCredentials | null;

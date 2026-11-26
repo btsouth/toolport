@@ -188,6 +188,8 @@ pub struct ServerFields {
     pub inherit_env: Option<bool>,
     /// "Hide prompts" for any transport. `None` keeps the saved choice.
     pub hide_prompts: Option<bool>,
+    /// "Prefer modern MCP" for any transport (#1438). `None` keeps the saved choice.
+    pub prefer_modern: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -425,6 +427,7 @@ fn entry_from_fields(fields: ServerFields) -> Result<ServerEntry, String> {
         source: Some("manual".into()),
         disabled_tools: Vec::new(),
         hide_prompts: fields.hide_prompts.unwrap_or(false),
+        prefer_modern: fields.prefer_modern.unwrap_or(false),
         client_credentials: None,
         request_timeout_ms: None,
         initialize_timeout_ms: fields.initialize_timeout_ms.flatten(),
@@ -465,6 +468,7 @@ pub(crate) fn server_from_detected(server: &clients::McpServer, client_id: &str)
         source: Some(format!("imported:{client_id}")),
         disabled_tools: Vec::new(),
         hide_prompts: false,
+        prefer_modern: false,
         cwd: None,
         client_credentials: None,
         request_timeout_ms: None,
@@ -1222,6 +1226,9 @@ pub fn apply_update_server_fields(
     if let Some(hide_prompts) = fields.hide_prompts {
         server.hide_prompts = hide_prompts;
     }
+    if let Some(prefer_modern) = fields.prefer_modern {
+        server.prefer_modern = prefer_modern;
+    }
     Ok(())
 }
 
@@ -1486,6 +1493,7 @@ pub fn values_from_entry(
         cwd: entry.cwd,
         inherit_env: Some(entry.inherit_env),
         hide_prompts: Some(entry.hide_prompts),
+        prefer_modern: Some(entry.prefer_modern),
     };
     let kept_fields = KEPT_ENTRY_FIELDS
         .iter()
@@ -1765,6 +1773,7 @@ pub fn add_snippet_servers_inputs(
             cwd: None,
             inherit_env: None,
             hide_prompts: None,
+            prefer_modern: None,
         })?;
         let definition = serde_json::json!({"env": server.env.into_iter().map(|e| (e.key,e.value.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null))).collect::<serde_json::Map<_,_>>()});
         let choice = choices.get(&entry.name);
@@ -1801,6 +1810,7 @@ fn catalog_server(entry: crate::catalog::CatalogEntry) -> ServerEntry {
         source: Some(format!("catalog:{}", entry.source)),
         disabled_tools: Vec::new(),
         hide_prompts: false,
+        prefer_modern: false,
         client_credentials: None,
         request_timeout_ms: entry.request_timeout_ms,
         initialize_timeout_ms: None,
@@ -1960,6 +1970,7 @@ pub fn server_entry_for_probe(
                 source: Some("manual".into()),
                 disabled_tools: Vec::new(),
                 hide_prompts: false,
+                prefer_modern: fields.prefer_modern.unwrap_or(false),
                 client_credentials: None,
                 request_timeout_ms: None,
                 initialize_timeout_ms: fields.initialize_timeout_ms.flatten(),
@@ -7160,6 +7171,7 @@ API_KEY = "synthetic-first-origin"
             source: None,
             disabled_tools: Vec::new(),
             hide_prompts: false,
+            prefer_modern: false,
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
@@ -7180,6 +7192,7 @@ API_KEY = "synthetic-first-origin"
             cwd: (transport == "stdio").then(|| " /tmp/project ".into()),
             inherit_env: None,
             hide_prompts: None,
+            prefer_modern: None,
         }
     }
 
@@ -7285,6 +7298,7 @@ API_KEY = "synthetic-first-origin"
             cwd: None,
             inherit_env: None,
             hide_prompts: None,
+            prefer_modern: None,
         };
         let secret = |e: &crate::clients::SnippetEnvVar| {
             crate::import_credentials::secret_env(&e.key, e.value.as_deref())
@@ -8695,6 +8709,31 @@ API_KEY = "synthetic-first-origin"
     }
 
     #[test]
+    fn native_field_edit_sets_or_keeps_prefer_modern() {
+        let mut registry = Registry::default();
+        let mut existing = server("one");
+        existing.prefer_modern = true;
+        registry.servers.push(existing);
+        apply_update_server_fields(&mut registry, "one", fields("One", "http")).unwrap();
+        assert!(
+            registry.servers[0].prefer_modern,
+            "None keeps the saved choice"
+        );
+        let mut off = fields("One", "http");
+        off.prefer_modern = Some(false);
+        apply_update_server_fields(&mut registry, "one", off).unwrap();
+        assert!(!registry.servers[0].prefer_modern);
+        let mut new = fields("New", "stdio");
+        new.prefer_modern = Some(true);
+        assert!(entry_from_fields(new).unwrap().prefer_modern);
+        assert!(
+            !entry_from_fields(fields("New", "stdio"))
+                .unwrap()
+                .prefer_modern
+        );
+    }
+
+    #[test]
     fn native_field_edit_sets_or_keeps_hidden_prompts_on_any_transport() {
         let mut registry = Registry::default();
         let mut existing = server("one");
@@ -8762,6 +8801,7 @@ API_KEY = "synthetic-first-origin"
             cwd: None,
             inherit_env: None,
             hide_prompts: None,
+            prefer_modern: None,
         };
         apply_update_server_fields(&mut registry, "one", same.clone()).unwrap();
         assert_eq!(
@@ -8807,6 +8847,7 @@ API_KEY = "synthetic-first-origin"
                     cwd: None,
                     inherit_env: None,
                     hide_prompts: None,
+                    prefer_modern: None,
                 },
             )
         });

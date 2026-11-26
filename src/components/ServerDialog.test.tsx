@@ -376,6 +376,47 @@ describe("ServerDialog", () => {
     );
   });
 
+  it("saves the prefer modern MCP choice and starts from the saved one", async () => {
+    const initial: ServerEntry = {
+      id: "dual",
+      name: "Dual",
+      transport: "http",
+      command: null,
+      args: [],
+      env: [],
+      url: "https://mcp.example.com/mcp",
+      source: "manual",
+    };
+    api.updateServer.mockResolvedValue(savedRegistry("dual"));
+    const user = userEvent.setup();
+
+    const { unmount } = render(
+      <ServerDialog autoOpen editId="dual" initial={initial} onSaved={vi.fn()} />,
+    );
+    const modern = screen.getByRole("switch", { name: "Prefer modern MCP (2026-07-28)" });
+    expect(modern).not.toBeChecked();
+    await user.click(modern);
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(api.updateServer).toHaveBeenCalledTimes(1));
+    expect(api.updateServer).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "dual", preferModern: true }),
+    );
+    unmount();
+
+    render(
+      <ServerDialog
+        autoOpen
+        editId="dual"
+        initial={{ ...initial, preferModern: true }}
+        onSaved={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByRole("switch", { name: "Prefer modern MCP (2026-07-28)" }),
+    ).toBeChecked();
+  });
+
   it("saves the startup timeout in milliseconds", async () => {
     const initial: ServerEntry = {
       id: "remote",

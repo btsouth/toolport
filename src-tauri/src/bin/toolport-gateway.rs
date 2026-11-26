@@ -10311,6 +10311,7 @@ fn effective_server_spec(
         "inheritEnv": server.inherit_env, "env": env,
         "clientCredentials": server.client_credentials,
         "requestTimeoutMs": server.request_timeout_ms, "initializeTimeoutMs": server.initialize_timeout_ms,
+        "preferModern": server.prefer_modern,
         "credentialsRevision": server_credential_revision(server, secrets_generation),
     })
 }
@@ -10469,9 +10470,10 @@ fn connect_one_result(
                     Arc::clone(&server_handler),
                 ));
                 t.set_progress_sink(remote::protect_progress(server, progress));
-                DownstreamServer::connect(
+                DownstreamServer::connect_with(
                     server.id.clone(),
                     remote::protect_transport(server, Box::new(t)),
+                    downstream::ConnectOptions::for_server(server),
                 )
                 .map_err(|error| resolved.redact(error))
             }
@@ -28562,6 +28564,10 @@ mod tests {
         changed = server.clone();
         changed.request_timeout_ms = Some(1000);
         assert_ne!(effective_server_spec(&changed, None, 0), original);
+        // The handshake order picks the era, so toggling it must reconnect (#1438).
+        changed = server.clone();
+        changed.prefer_modern = true;
+        assert_ne!(effective_server_spec(&changed, None, 0), original);
         changed = server.clone();
         changed.cwd = Some("${ROOT}".to_string());
         assert_ne!(
@@ -34225,6 +34231,7 @@ mod tests {
                 source: None,
                 disabled_tools: vec![],
                 hide_prompts: false,
+                prefer_modern: false,
                 cwd: None,
                 client_credentials: None,
                 request_timeout_ms: None,
@@ -34299,6 +34306,7 @@ mod tests {
                 source: None,
                 disabled_tools: vec![],
                 hide_prompts: false,
+                prefer_modern: false,
                 cwd: None,
                 client_credentials: None,
                 request_timeout_ms: None,
@@ -34387,6 +34395,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -36084,6 +36093,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -40844,6 +40854,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,

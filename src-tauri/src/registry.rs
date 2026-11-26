@@ -835,6 +835,15 @@ pub struct ServerEntry {
     /// Default (false, omitted on save) exposes prompts as before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hide_prompts: bool,
+    /// Probe the 2026-07-28 `server/discover` handshake before legacy
+    /// `initialize` (#1438). For dual-era servers that answer both: legacy-first
+    /// pins them to the legacy era, so they never receive per-request `_meta`
+    /// or modern extensions such as tasks. Default (false, omitted on save)
+    /// keeps legacy-first, which never sends an unknown method to a legacy-only
+    /// server. A server that refuses discovery still falls back to
+    /// `initialize`; one that ignores it fails the connect on the timeout.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prefer_modern: bool,
     /// Headless outbound OAuth for an HTTP server (SBS-524). Presence of this
     /// block is what selects the client-credentials flow; absence leaves
     /// interactive OAuth and pasted-token behaviour exactly as before.
@@ -5791,6 +5800,7 @@ pub(crate) mod tests {
             source: Some("manual".to_string()),
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -6799,6 +6809,28 @@ pub(crate) mod tests {
         assert!(json.contains("\"inheritEnv\":true"), "{json}");
         let back: ServerEntry = serde_json::from_str(&json).unwrap();
         assert!(back.inherit_env);
+        assert_eq!(back, on);
+    }
+
+    /// `preferModern` (#1438) is additive: an older entry loads legacy-first and
+    /// saves without the key, and an opted-in entry keeps the `true` as a real
+    /// field, never in `unknown_fields`.
+    #[test]
+    fn prefer_modern_is_additive_and_round_trips() {
+        let server = sample_server("dual-era");
+        assert!(!server.prefer_modern);
+        let json = serde_json::to_string(&server).unwrap();
+        assert!(!json.contains("preferModern"), "{json}");
+        let loaded: ServerEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, server);
+
+        let mut on = server;
+        on.prefer_modern = true;
+        let json = serde_json::to_string(&on).unwrap();
+        assert!(json.contains("\"preferModern\":true"), "{json}");
+        let back: ServerEntry = serde_json::from_str(&json).unwrap();
+        assert!(back.prefer_modern);
+        assert!(!back.unknown_fields.contains_key("preferModern"));
         assert_eq!(back, on);
     }
 
@@ -8043,6 +8075,7 @@ pub(crate) mod tests {
             source: None,
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -9072,6 +9105,7 @@ mod registry_version_tests {
             source: Some("manual".to_string()),
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,

@@ -1330,6 +1330,7 @@ mod tests {
             source: None,
             disabled_tools: Vec::new(),
             hide_prompts: false,
+            prefer_modern: false,
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,

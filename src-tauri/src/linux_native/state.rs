@@ -759,6 +759,7 @@ pub(super) struct ServerView {
     pub(super) cwd: Option<String>,
     pub(super) inherit_env: bool,
     pub(super) hide_prompts: bool,
+    pub(super) prefer_modern: bool,
     pub(super) secret_keys: Vec<String>,
     /// Nonsecret environment values, editable in Edit server.
     pub(super) plain_env: Vec<PlainEnvView>,
@@ -881,6 +882,7 @@ impl RegistrySnapshot {
                     cwd: server.cwd.clone(),
                     inherit_env: server.inherit_env,
                     hide_prompts: server.hide_prompts,
+                    prefer_modern: server.prefer_modern,
                     secret_references: server
                         .env
                         .iter()
@@ -1398,6 +1400,7 @@ pub(super) mod tests {
             source: None,
             disabled_tools: Vec::new(),
             hide_prompts: false,
+            prefer_modern: false,
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
@@ -1497,6 +1500,7 @@ pub(super) mod tests {
                     cwd: None,
                     inherit_env: false,
                     hide_prompts: false,
+                    prefer_modern: false,
                     secret_keys: vec!["TOKEN".into()],
                     plain_env: Vec::new(),
                     secret_references: Default::default(),
@@ -1519,6 +1523,7 @@ pub(super) mod tests {
                     cwd: None,
                     inherit_env: false,
                     hide_prompts: true,
+                    prefer_modern: false,
                     secret_keys: Vec::new(),
                     plain_env: Vec::new(),
                     secret_references: Default::default(),

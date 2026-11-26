@@ -129,6 +129,7 @@ export function ServerDialog({
     cwd: initial?.cwd ?? "",
     inheritEnv: initial?.inheritEnv ?? false,
     hidePrompts: initial?.hidePrompts ?? false,
+    preferModern: initial?.preferModern ?? false,
     initializeTimeoutSeconds:
       initial?.initializeTimeoutMs == null
         ? ""
@@ -248,6 +249,7 @@ export function ServerDialog({
         cwd: initial?.cwd ?? "",
         inheritEnv: initial?.inheritEnv ?? false,
         hidePrompts: initial?.hidePrompts ?? false,
+        preferModern: initial?.preferModern ?? false,
         initializeTimeoutSeconds:
           initial?.initializeTimeoutMs == null
             ? ""
@@ -330,6 +332,7 @@ export function ServerDialog({
         cwd: "",
         inheritEnv: false,
         hidePrompts: false,
+        preferModern: false,
         initializeTimeoutSeconds: "",
       });
       setEnvRows(
@@ -416,6 +419,7 @@ export function ServerDialog({
       cwd: isStdio ? form.cwd.trim() || null : null,
       inheritEnv: isStdio && form.inheritEnv,
       hidePrompts: form.hidePrompts,
+      preferModern: form.preferModern,
       requestTimeoutMs:
         isStdio || initialUsesLocalCommand ? null : initial?.requestTimeoutMs,
       initializeTimeoutMs: form.initializeTimeoutSeconds.trim()
@@ -995,6 +999,26 @@ export function ServerDialog({
               id="srv-hide-prompts"
               checked={form.hidePrompts}
               onCheckedChange={(checked) => set("hidePrompts", checked)}
+            />
+          </div>
+
+          {/* Dual-era servers answer the legacy initialize, which would pin them
+              to the legacy era. This tries server/discover first (#1438). */}
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex flex-col gap-1">
+              <Label htmlFor="srv-prefer-modern">
+                {t("Prefer modern MCP (2026-07-28)")}
+              </Label>
+              <p className="text-meta text-muted-foreground">
+                {t(
+                  "Probes the 2026-07-28 server/discover handshake before the legacy initialize, so a server that speaks both gets per-request metadata and tasks. Falls back to initialize if the server refuses discovery.",
+                )}
+              </p>
+            </div>
+            <Switch
+              id="srv-prefer-modern"
+              checked={form.preferModern}
+              onCheckedChange={(checked) => set("preferModern", checked)}
             />
           </div>
 
