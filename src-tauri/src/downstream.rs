@@ -2809,6 +2809,10 @@ pub trait Transport: Send {
     /// the merge. Default no-op, so legacy connections send exactly what they
     /// always did (SOU-445).
     fn set_protocol_meta(&mut self, _meta: Option<Value>) {}
+    /// Record the protocol version a legacy server negotiated in `initialize`
+    /// so HTTP transports carry it in `MCP-Protocol-Version` on follow-up
+    /// requests. Default no-op; `set_protocol_meta` replaces it on HTTP.
+    fn set_legacy_protocol_version(&mut self, _version: Option<String>) {}
     /// Replace the long-lived modern notification listener. Legacy transports
     /// keep the default no-op; modern connections call this after discovery and
     /// whenever their resource URI set changes.
@@ -6327,6 +6331,8 @@ pub struct HttpTransport {
     /// Standard per-request `_meta` for a modern (2026-07-28+) connection, merged
     /// into every outgoing request. `None` on legacy connections (SOU-445).
     protocol_meta: Option<Value>,
+    /// Negotiated version for legacy HTTP connections, which have no protocol metadata.
+    legacy_protocol_version: Option<String>,
     /// Catalog refresh signal used by the modern HTTP listen worker.
     change_dirty: Option<Arc<AtomicU8>>,
     /// Replacing a listener increments this generation. The superseded worker
@@ -6912,6 +6918,7 @@ impl HttpTransport {
             resource_updated: None,
             progress: None,
             protocol_meta: None,
+            legacy_protocol_version: None,
             change_dirty: None,
             listener_generation: Arc::new(AtomicU64::new(0)),
             subscription_listener_id: None,
@@ -7007,12 +7014,14 @@ impl HttpTransport {
     /// and a server that sees them disagree rejects the request with `400` and
     /// `HeaderMismatch` (-32020). So this has to follow whatever the connection
     /// negotiated, not a constant. Legacy connections have no protocol `_meta`
-    /// and keep sending [`PROTOCOL_VERSION`] exactly as before.
+    /// and send the version negotiated at `initialize`, falling back to
+    /// [`PROTOCOL_VERSION`].
     fn wire_protocol_version(&self) -> String {
         self.protocol_meta
             .as_ref()
             .and_then(|meta| meta.get("io.modelcontextprotocol/protocolVersion"))
             .and_then(Value::as_str)
+            .or(self.legacy_protocol_version.as_deref())
             .unwrap_or(PROTOCOL_VERSION)
             .to_string()
     }
@@ -7057,6 +7066,7 @@ impl HttpTransport {
             resource_updated: self.resource_updated.clone(),
             progress: self.progress.clone(),
             protocol_meta: self.protocol_meta.clone(),
+            legacy_protocol_version: self.legacy_protocol_version.clone(),
             change_dirty: self.change_dirty.clone(),
             listener_generation: Arc::clone(&self.listener_generation),
             subscription_listener_id: self.subscription_listener_id,
@@ -8357,6 +8367,7 @@ impl Transport for HttpTransport {
 
     fn set_protocol_meta(&mut self, meta: Option<Value>) {
         self.protocol_meta = meta;
+        self.legacy_protocol_version = None;
         if let Some(meta) = self.protocol_meta.as_mut() {
             merge_declared_extensions(meta, &self.declared_extensions);
         }
@@ -8366,6 +8377,10 @@ impl Transport for HttpTransport {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
+    }
+
+    fn set_legacy_protocol_version(&mut self, version: Option<String>) {
+        self.legacy_protocol_version = version;
     }
 
     fn set_subscription_listener(
@@ -8757,9 +8772,12 @@ impl DownstreamServer {
                 let version = init
                     .get("protocolVersion")
                     .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty() && v.bytes().all(|b| (0x21..=0x7e).contains(&b)))
                     .unwrap_or(PROTOCOL_VERSION)
                     .to_string();
                 let caps = init.get("capabilities").cloned();
+                transport.set_legacy_protocol_version(Some(version.clone()));
                 transport
                     .notify("notifications/initialized", json!({}))
                     .map_err(|e| e.call_failure())?;
@@ -17393,12 +17411,104 @@ mod tests {
             "a legacy connection declares exactly what it always did"
         );
 
+        t.set_legacy_protocol_version(Some("2025-11-25".to_string()));
+        assert_eq!(t.wire_protocol_version(), "2025-11-25");
+
         t.set_protocol_meta(Some(super::protocol_meta_for(MODERN_PROTOCOL_VERSION)));
         assert_eq!(
             t.wire_protocol_version(),
             MODERN_PROTOCOL_VERSION,
             "the header must follow the negotiated version, not a constant"
         );
+    }
+
+    #[test]
+    fn legacy_initialize_version_is_recorded_for_follow_up_headers() {
+        struct LegacyTransport {
+            negotiated: Arc<Mutex<Option<String>>>,
+            seen_on_notify: Arc<Mutex<Option<String>>>,
+        }
+
+        impl Transport for LegacyTransport {
+            fn request(&mut self, method: &str, _params: Value) -> Result<Value, TransportError> {
+                Ok(match method {
+                    "initialize" => json!({
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {}
+                    }),
+                    "tools/list" => json!({ "tools": [] }),
+                    _ => json!({}),
+                })
+            }
+
+            fn notify(&mut self, method: &str, _params: Value) -> Result<(), TransportError> {
+                if method == "notifications/initialized" {
+                    *self.seen_on_notify.lock().unwrap() = self.negotiated.lock().unwrap().clone();
+                }
+                Ok(())
+            }
+
+            fn set_legacy_protocol_version(&mut self, version: Option<String>) {
+                *self.negotiated.lock().unwrap() = version;
+            }
+        }
+
+        let negotiated = Arc::new(Mutex::new(None));
+        let seen_on_notify = Arc::new(Mutex::new(None));
+        let transport = LegacyTransport {
+            negotiated: Arc::clone(&negotiated),
+            seen_on_notify: Arc::clone(&seen_on_notify),
+        };
+        DownstreamServer::connect("legacy".into(), Box::new(transport)).unwrap();
+        assert_eq!(
+            seen_on_notify.lock().unwrap().as_deref(),
+            Some("2025-11-25"),
+            "version must be stored before notifications/initialized is sent"
+        );
+        assert_eq!(negotiated.lock().unwrap().as_deref(), Some("2025-11-25"));
+    }
+
+    #[test]
+    fn legacy_initialize_invalid_protocol_version_falls_back_to_default() {
+        struct BadVersionTransport {
+            raw_version: &'static str,
+            negotiated: Arc<Mutex<Option<String>>>,
+        }
+
+        impl Transport for BadVersionTransport {
+            fn request(&mut self, method: &str, _params: Value) -> Result<Value, TransportError> {
+                Ok(match method {
+                    "initialize" => json!({
+                        "protocolVersion": self.raw_version,
+                        "capabilities": {}
+                    }),
+                    "tools/list" => json!({ "tools": [] }),
+                    _ => json!({}),
+                })
+            }
+
+            fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+                Ok(())
+            }
+
+            fn set_legacy_protocol_version(&mut self, version: Option<String>) {
+                *self.negotiated.lock().unwrap() = version;
+            }
+        }
+
+        for raw in ["", "   ", "2025-11-25\r\nX-Injected: 1", "bad version"] {
+            let negotiated = Arc::new(Mutex::new(None));
+            let transport = BadVersionTransport {
+                raw_version: raw,
+                negotiated: Arc::clone(&negotiated),
+            };
+            DownstreamServer::connect("legacy".into(), Box::new(transport)).unwrap();
+            assert_eq!(
+                negotiated.lock().unwrap().as_deref(),
+                Some(super::PROTOCOL_VERSION),
+                "invalid protocolVersion {raw:?} should fall back to default"
+            );
+        }
     }
 
     #[test]

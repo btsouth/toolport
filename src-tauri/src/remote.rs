@@ -1716,6 +1716,9 @@ impl Transport for ImportedTransport {
     fn set_protocol_meta(&mut self, meta: Option<serde_json::Value>) {
         self.0.set_protocol_meta(meta)
     }
+    fn set_legacy_protocol_version(&mut self, version: Option<String>) {
+        self.0.set_legacy_protocol_version(version)
+    }
     fn set_subscription_listener(
         &mut self,
         filter: crate::downstream::SubscriptionFilter,
@@ -3215,6 +3218,65 @@ mod tests {
             }
             assert_eq!(endpoint.count(), 1);
         });
+    }
+
+    #[test]
+    fn imported_transport_keeps_the_negotiated_legacy_protocol_version() {
+        use crate::downstream::Transport;
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", server.server_addr());
+        let mut transport = ImportedTransport(
+            Box::new(HttpTransport::new(&url)),
+            Redaction::for_server(&remote_server(&url, None)),
+            false,
+        );
+        let wire = std::thread::spawn(move || {
+            let mut versions = Vec::new();
+            for _ in 0..2 {
+                let mut request = server
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                versions.push(
+                    request
+                        .headers()
+                        .iter()
+                        .find(|h| h.field.equiv("MCP-Protocol-Version"))
+                        .map(|h| h.value.as_str().to_string()),
+                );
+                let mut text = String::new();
+                request.as_reader().read_to_string(&mut text).unwrap();
+                let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+                request
+                    .respond(tiny_http::Response::from_string(
+                        serde_json::json!({"jsonrpc":"2.0","id":body["id"],"result":{}})
+                            .to_string(),
+                    ))
+                    .unwrap();
+            }
+            versions
+        });
+
+        transport.set_legacy_protocol_version(Some("2025-03-26".into()));
+        transport
+            .request("tools/list", serde_json::json!({}))
+            .unwrap();
+        transport.set_protocol_meta(Some(serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion":
+                crate::downstream::MODERN_PROTOCOL_VERSION,
+        })));
+        transport
+            .request("tools/list", serde_json::json!({}))
+            .unwrap();
+
+        assert_eq!(
+            wire.join().unwrap(),
+            [
+                Some("2025-03-26".to_string()),
+                Some(crate::downstream::MODERN_PROTOCOL_VERSION.to_string()),
+            ],
+            "the wrapper forwards the legacy version, and modern metadata replaces it"
+        );
     }
 
     #[test]
