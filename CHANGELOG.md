@@ -6,6 +6,27 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [2.4.2] - 2026-11-26
+
+Toolport 2.4.2 adds a per-server option to prefer the modern MCP handshake on
+dual-era servers, stops daemon log scrubbing and log growth from exhausting
+memory on Windows, and preserves negotiated legacy HTTP protocol versions.
+
+### Added
+
+- Per-server `preferModern` option (available in the React and native GTK
+  server editors) that probes `server/discover` before legacy `initialize` on
+  dual-era MCP servers, unlocking MCP Tasks and `_meta` relay while falling
+  back cleanly to legacy `initialize` when unsupported. (#1442)
+
+### Fixed
+
+- Streamed in-place secret redaction, bounded tail reads of `daemon.log`, live
+  log rotation, and deduplicated refresh/collision storms so runaway logs
+  cannot exhaust gateway memory or crash `conduit.exe`. (#1441)
+- Preserved the negotiated legacy MCP protocol version header on downstream
+  streamable HTTP requests and sanitized imported HTTP headers. (#1440)
+
 ## [2.4.1] - 2026-11-25
 
 Toolport 2.4.1 adds a shell output command breakdown to `toolport usage` and
