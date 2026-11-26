@@ -1925,9 +1925,10 @@ fn connect_remote_inner(
     transport.set_resource_updated_sink(protect_resource_updates(server, resource_updated.clone()));
     transport.set_progress_sink(protect_progress(server, progress.clone()));
     transport.set_change_sink(change_dirty.clone());
-    match DownstreamServer::connect_classified(
+    match DownstreamServer::connect_classified_with(
         server_id.to_string(),
         reviewed_transport(server, transport),
+        crate::downstream::ConnectOptions::for_server(server),
     )
     .map_err(|e| {
         crate::call_failure::CallFailure::new(e.kind, safe_imported_error(server, e.detail))
@@ -1994,9 +1995,10 @@ fn connect_remote_inner(
                     transport.set_resource_updated_sink(resource_updated);
                     transport.set_progress_sink(progress);
                     transport.set_change_sink(change_dirty);
-                    DownstreamServer::connect_classified(
+                    DownstreamServer::connect_classified_with(
                         server_id.to_string(),
                         reviewed_transport(server, transport),
+                        crate::downstream::ConnectOptions::for_server(server),
                     )
                     .map(|mut ds| {
                         ds.set_call_timeout(request_timeout);
@@ -3771,6 +3773,7 @@ mod tests {
             source: source.map(String::from),
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,

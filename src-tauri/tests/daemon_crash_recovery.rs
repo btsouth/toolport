@@ -184,6 +184,7 @@ fn write_registry(scratch: &Scratch, wrapped: bool) {
         source: Some("manual".to_string()),
         disabled_tools: vec![],
         hide_prompts: false,
+        prefer_modern: false,
         cwd: None,
         client_credentials: None,
         request_timeout_ms: None,

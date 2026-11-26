@@ -1101,6 +1101,8 @@
   "Server is no longer available": "伺服器已無法使用",
   "Hide prompts": "隱藏提示詞",
   "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available.": "不在 AI 用戶端中顯示此伺服器的提示詞（它們常以斜線命令的形式出現）。其工具仍可使用。",
+  "Prefer modern MCP (2026-07-28)": "優先使用新版 MCP (2026-07-28)",
+  "Probes the 2026-07-28 server/discover handshake before the legacy initialize, so a server that speaks both gets per-request metadata and tasks. Falls back to initialize if the server refuses discovery.": "先嘗試 2026-07-28 的 server/discover 交握，再嘗試舊版 initialize，讓同時支援兩者的伺服器取得每個請求的中繼資料與任務。如果伺服器拒絕探索，則改回 initialize。",
   "reports \"{label}\"": "報告「{label}」",
   "Calls via T3 Code": "經由 T3 Code 的呼叫",
   "{count} session via T3 Code": "經由 T3 Code 的 {count} 個工作階段",

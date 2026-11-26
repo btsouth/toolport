@@ -1101,6 +1101,8 @@
   "Server is no longer available": "Le serveur n’est plus disponible",
   "Hide prompts": "Masquer les prompts",
   "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available.": "Tient les prompts de ce serveur à l’écart de vos clients IA, où ils apparaissent souvent comme des commandes slash. Ses outils restent disponibles.",
+  "Prefer modern MCP (2026-07-28)": "Préférer le MCP moderne (2026-07-28)",
+  "Probes the 2026-07-28 server/discover handshake before the legacy initialize, so a server that speaks both gets per-request metadata and tasks. Falls back to initialize if the server refuses discovery.": "Essaie la négociation server/discover de 2026-07-28 avant l'ancien initialize, pour qu'un serveur qui gère les deux reçoive les métadonnées par requête et les tâches. Revient à initialize si le serveur refuse la découverte.",
   "reports \"{label}\"": "rapporte \"{label}\"",
   "Calls via T3 Code": "Appels via T3 Code",
   "{count} session via T3 Code": "{count} session via T3 Code",

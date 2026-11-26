@@ -1547,6 +1547,8 @@ pub(crate) fn restore_local(entry: &mut ServerEntry, old: &ServerEntry) {
     // Hiding prompts is a per-machine choice that never syncs, so a received
     // update must not reset it.
     entry.hide_prompts = old.hide_prompts;
+    // Like hidePrompts, the handshake order is per machine (#1438).
+    entry.prefer_modern = old.prefer_modern;
     entry.inherit_env = old.inherit_env; // Never import ambient-env consent.
                                          // Preserve masked arguments on their originating machine; masking is a wire
                                          // boundary, not permission to erase the owner's installed setup.
@@ -3627,6 +3629,7 @@ mod tests {
                 cwd: None,
                 inherit_env: None,
                 hide_prompts: None,
+                prefer_modern: None,
             },
         )
         .unwrap();
@@ -3877,6 +3880,25 @@ mod tests {
         apply(&mut r, &config(vec![]), 2).unwrap();
         assert_eq!(r.servers.len(), 1);
     }
+    #[test]
+    fn received_update_keeps_this_machines_prefer_modern_choice() {
+        let _data = crate::registry::DataDirTestEnv::new("sync-prefer-modern");
+        let mut r = machine();
+        apply(&mut r, &config(vec![http("docs")]), 1).unwrap();
+        r.servers[0].prefer_modern = true;
+        assert!(
+            !export(&r.servers[0])
+                .as_object()
+                .unwrap()
+                .contains_key("preferModern"),
+            "preferModern is local and is not sent"
+        );
+        let mut changed = http("docs");
+        changed["url"] = json!("https://example.com/mcp/v2");
+        apply(&mut r, &config(vec![changed]), 2).unwrap();
+        assert!(r.servers[0].prefer_modern, "the update must not reset it");
+    }
+
     #[test]
     fn received_update_keeps_this_machines_hide_prompts_choice() {
         let _data = crate::registry::DataDirTestEnv::new("sync-hide-prompts");

@@ -3773,6 +3773,7 @@ fn seed_member_review(reg: &Registry, team_id: &str, config: &Value, review: &mu
         saved["enabled"] = json!(false);
         saved.as_object_mut().unwrap().remove("inheritEnv");
         saved.as_object_mut().unwrap().remove("hidePrompts");
+        saved.as_object_mut().unwrap().remove("preferModern");
         if let Some(launch) = &server.launch {
             saved["launch"] = json!(launch.without_values());
         }
@@ -4412,6 +4413,9 @@ fn restore_personal_definition(entry: &mut ServerEntry, old: &ServerEntry) {
     // `hidePrompts` is this member's local choice and is never part of the shared
     // definition, so a re-sync must not turn it back off.
     entry.hide_prompts = old.hide_prompts;
+    // So is `preferModern` (#1438): which handshake this member's Toolport tries
+    // first is local, and a re-sync must not switch it back to legacy-first.
+    entry.prefer_modern = old.prefer_modern;
     if old.unknown_fields.get("personalSyncEntry") != Some(&json!(true)) {
         restore_local_references(entry, old);
         return;
@@ -5203,6 +5207,7 @@ pub(crate) fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         disabled_tools: str_array("disabledTools"),
         // A local display preference, not part of the shared definition.
         hide_prompts: false,
+        prefer_modern: false,
         cwd: str_field("cwd").map(String::from),
         // Carried through so a shared headless server stays headless. Dropping it
         // silently downgraded the member to interactive OAuth, which is exactly
@@ -6560,6 +6565,7 @@ mod tests {
             source: Some("manual".into()),
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -7251,6 +7257,7 @@ mod tests {
             source: Some("manual".into()),
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -7288,6 +7295,26 @@ mod tests {
             team[0].id, "team_github",
             "team server deduped away from the local id"
         );
+    }
+
+    #[test]
+    fn team_resync_keeps_a_members_prefer_modern_choice() {
+        let mut r = base_registry();
+        let cfg = json!({ "servers": [{
+            "id": "docs",
+            "name": "Docs",
+            "transport": "http",
+            "url": "https://1.2.3.4/mcp",
+            "preferModern": true
+        }]});
+        apply_team_config(&mut r, "t1", &cfg);
+        let id = member_id(&r, "docs");
+        let server = r.servers.iter_mut().find(|s| s.id == id).unwrap();
+        assert!(!server.prefer_modern, "a team cannot set it for the member");
+        server.prefer_modern = true;
+        apply_team_config(&mut r, "t1", &cfg);
+        let server = r.servers.iter().find(|s| s.id == id).unwrap();
+        assert!(server.prefer_modern, "a re-sync keeps the member's choice");
     }
 
     #[test]
@@ -7414,6 +7441,7 @@ mod tests {
             source: Some("manual".into()),
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -8020,6 +8048,7 @@ mod tests {
             source: Some("manual".into()),
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -8541,6 +8570,7 @@ mod tests {
             source: Some("manual".into()),
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -8562,6 +8592,7 @@ mod tests {
             source: Some("team:abc".into()),
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -9054,6 +9085,7 @@ mod tests {
             source: Some("team:t1".into()),
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,

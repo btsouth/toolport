@@ -470,7 +470,11 @@ fn prewarm_launcher(server: &ServerEntry) {
             // Attempting the handshake keeps the child alive until the download
             // finishes (dropping the transport kills it), and warms it end-to-end
             // when the server actually comes up.
-            let _ = DownstreamServer::connect(server.id.clone(), Box::new(t));
+            let _ = DownstreamServer::connect_with(
+                server.id.clone(),
+                Box::new(t),
+                crate::downstream::ConnectOptions::for_server(&server),
+            );
         }
     });
 }
@@ -5812,6 +5816,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -5852,6 +5857,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -6394,6 +6400,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -6506,6 +6513,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -6580,6 +6588,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -6636,6 +6645,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -6682,6 +6692,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -6818,6 +6829,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -6838,6 +6850,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             hide_prompts: false,
+            prefer_modern: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,

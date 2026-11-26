@@ -1101,6 +1101,8 @@
   "Server is no longer available": "서버를 더 이상 사용할 수 없습니다",
   "Hide prompts": "프롬프트 숨기기",
   "Keeps this server's prompts out of your AI clients, where they often show up as slash commands. Its tools stay available.": "이 서버의 프롬프트를 AI 클라이언트에 표시하지 않습니다. 프롬프트는 슬래시 명령으로 표시되는 경우가 많습니다. 도구는 계속 사용할 수 있습니다.",
+  "Prefer modern MCP (2026-07-28)": "최신 MCP 우선 (2026-07-28)",
+  "Probes the 2026-07-28 server/discover handshake before the legacy initialize, so a server that speaks both gets per-request metadata and tasks. Falls back to initialize if the server refuses discovery.": "기존 initialize보다 먼저 2026-07-28 server/discover 핸드셰이크를 시도해, 둘 다 지원하는 서버가 요청별 메타데이터와 작업을 받도록 합니다. 서버가 검색을 거부하면 initialize로 돌아갑니다.",
   "reports \"{label}\"": "\"{label}\" 보고",
   "Calls via T3 Code": "T3 Code를 통한 호출",
   "{count} session via T3 Code": "T3 Code를 통한 세션 {count}개",

@@ -8722,6 +8722,145 @@ const MRTR_LEGACY_MAX_ROUNDS: usize = 8;
 const MRTR_STATE_ONLY_DELAY: Duration = Duration::from_millis(250);
 static MRTR_LEGACY_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Per-server handshake choices for [`DownstreamServer::connect_with`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConnectOptions {
+    /// Probe `server/discover` before legacy `initialize` (registry
+    /// `preferModern`, #1438). Off by default: legacy-first never charges a
+    /// legacy server for an unknown method it may ignore.
+    pub prefer_modern: bool,
+}
+
+impl ConnectOptions {
+    pub fn for_server(server: &crate::registry::ServerEntry) -> Self {
+        Self {
+            prefer_modern: server.prefer_modern,
+        }
+    }
+}
+
+/// How a `server/discover` probe failed.
+enum DiscoverError {
+    /// The probe was rejected without a recognized modern error, or got no
+    /// usable answer at all.
+    Refused(TransportError),
+    /// The server is modern but shares no protocol version with Toolport.
+    Incompatible(crate::call_failure::CallFailure),
+    /// The server is modern and the handshake failed after that was known.
+    Failed(crate::call_failure::CallFailure),
+}
+
+/// Send the legacy `initialize` handshake. The inner error is the server's
+/// refusal of `initialize` (a candidate for modern discovery); the outer error
+/// is final: a health or auth failure, or a failure after it was accepted.
+fn legacy_initialize(
+    transport: &mut dyn Transport,
+) -> Result<Result<(Era, Option<Value>), TransportError>, crate::call_failure::CallFailure> {
+    let initialize_result = transport.request(
+        "initialize",
+        json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": { "name": "toolport-gateway", "version": env!("CARGO_PKG_VERSION") }
+        }),
+    );
+    transport.initialize_complete();
+    match initialize_result {
+        Ok(init) => {
+            let version = init
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty() && v.bytes().all(|b| (0x21..=0x7e).contains(&b)))
+                .unwrap_or(PROTOCOL_VERSION)
+                .to_string();
+            let caps = init.get("capabilities").cloned();
+            transport.set_legacy_protocol_version(Some(version.clone()));
+            transport
+                .notify("notifications/initialized", json!({}))
+                .map_err(|e| e.call_failure())?;
+            Ok(Ok((Era::Legacy { version }, caps)))
+        }
+        // A dead or unresponsive server is not a modern server. Probing it
+        // again would just double the wait before reporting the same failure.
+        Err(err) if err.is_health_failure() => Err(err.call_failure()),
+        // Authentication is independent of the protocol era. Probing after an
+        // explicit rejection can only replace the actionable error with a
+        // secondary protocol failure (#914).
+        Err(err) if err.is_auth_failure() => Err(err.call_failure()),
+        Err(init_err) => Ok(Err(init_err)),
+    }
+}
+
+/// Run the 2026-07-28 `server/discover` handshake and version ladder. On
+/// success the transport carries modern per-request metadata.
+fn discover_modern(transport: &mut dyn Transport) -> Result<(Era, Option<Value>), DiscoverError> {
+    // Stamp the modern metadata BEFORE probing, not after. On HTTP the transport
+    // derives `MCP-Protocol-Version` from it, and that header MUST match the
+    // body's `_meta`; probing first would send a legacy header with a modern body
+    // and a strict server would reject the very request meant to detect it, with
+    // HeaderMismatch (-32020).
+    transport.set_protocol_meta(Some(protocol_meta_for(MODERN_PROTOCOL_VERSION)));
+    let discovered = match transport.request("server/discover", json!({})) {
+        Ok(discovered) => discovered,
+        // This is the pivot of the compatibility ladder. A RECOGNIZED modern
+        // error means the server is modern and simply does not speak the version
+        // we declared, so the honest outcome is a version mismatch, not "legacy
+        // server". Reporting the `initialize` refusal here would send someone
+        // chasing a handshake bug on a perfectly reachable modern server.
+        Err(probe_err) if probe_err.is_modern_protocol_error() => {
+            let offered = probe_err.supported_versions();
+            // Retry on a mutually supported version if there is one. Today
+            // Toolport speaks exactly one modern revision, so this is usually a
+            // clean incompatibility, but the ladder is written to negotiate
+            // rather than to assume.
+            match offered
+                .iter()
+                .find(|v| v.as_str() == MODERN_PROTOCOL_VERSION)
+            {
+                Some(version) => {
+                    // Re-stamp before retrying so header and body agree on the
+                    // newly chosen version too.
+                    transport.set_protocol_meta(Some(protocol_meta_for(version)));
+                    transport
+                        .request("server/discover", json!({}))
+                        .map_err(|e| DiscoverError::Failed(e.call_failure()))?
+                }
+                None => {
+                    return Err(DiscoverError::Incompatible(
+                        format!(
+                            "server speaks MCP {offered:?}; Toolport speaks \
+                             {MODERN_PROTOCOL_VERSION} and cannot negotiate a \
+                             common version ({probe_err})"
+                        )
+                        .into(),
+                    ))
+                }
+            }
+        }
+        Err(probe_err) => return Err(DiscoverError::Refused(probe_err)),
+    };
+    let version = choose_protocol_version(&discovered).ok_or_else(|| {
+        DiscoverError::Incompatible(
+            format!(
+                "server supports no protocol version Toolport speaks (offered {:?})",
+                discovered.get("supportedVersions")
+            )
+            .into(),
+        )
+    })?;
+    let capabilities = discovered.get("capabilities").cloned();
+    // From here every request carries its own protocol metadata; there is no
+    // handshake and no `notifications/initialized`. Catalog fetches additionally
+    // declare the MCP Apps MIME when this server offers it, so a capability-aware
+    // server includes its UI tool metadata in tools/list.
+    transport.set_protocol_meta(Some(protocol_meta_for_catalog(
+        &version,
+        capabilities.as_ref(),
+    )));
+    Ok((Era::Modern { version }, capabilities))
+}
+
 impl DownstreamServer {
     /// Handshake with the server and fetch its tool list. Resources and prompts
     /// are NOT fetched here - only whether the server advertises them is noted,
@@ -8729,13 +8868,31 @@ impl DownstreamServer {
     /// tools-only and fast and can't stall on a slow or hanging resources/prompts
     /// endpoint. The gateway calls `load_resources_prompts` to populate them.
     pub fn connect(id: String, transport: Box<dyn Transport>) -> Result<Self, String> {
-        Self::connect_classified(id, transport).map_err(|error| error.to_string())
+        Self::connect_with(id, transport, ConnectOptions::default())
+    }
+
+    /// [`Self::connect`] with per-server handshake options.
+    pub fn connect_with(
+        id: String,
+        transport: Box<dyn Transport>,
+        options: ConnectOptions,
+    ) -> Result<Self, String> {
+        Self::connect_classified_with(id, transport, options).map_err(|error| error.to_string())
     }
 
     /// Preserve transport categories for health and recovery UI.
     pub fn connect_classified(
         id: String,
+        transport: Box<dyn Transport>,
+    ) -> Result<Self, crate::call_failure::CallFailure> {
+        Self::connect_classified_with(id, transport, ConnectOptions::default())
+    }
+
+    /// [`Self::connect_classified`] with per-server handshake options.
+    pub fn connect_classified_with(
+        id: String,
         mut transport: Box<dyn Transport>,
+        options: ConnectOptions,
     ) -> Result<Self, crate::call_failure::CallFailure> {
         transport.set_server_id(&id);
         // Fail the handshake fast so one unresponsive server can't stall the whole
@@ -8749,136 +8906,25 @@ impl DownstreamServer {
         // Era detection (SOU-445). Toolport is dual-era: it must drive both
         // `initialize`-era servers and modern stateless ones.
         //
-        // We try `initialize` FIRST and fall forward, rather than probing with
-        // `server/discover` first as the spec suggests. The spec's ordering is a
-        // SHOULD, and for Toolport it is the wrong trade today: essentially every
-        // installed server is legacy, and a legacy stdio server typically answers
-        // an unknown method with silence rather than an error - so a discover-first
-        // probe would charge every existing user a read-timeout on every connect.
-        // Going legacy-first costs the existing install base exactly nothing and
-        // costs a modern server one cheap rejected request. Worth revisiting once
-        // modern servers are common.
-        let initialize_result = transport.request(
-            "initialize",
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": { "name": "toolport-gateway", "version": env!("CARGO_PKG_VERSION") }
-            }),
-        );
-        transport.initialize_complete();
-        let (era, caps) = match initialize_result {
-            Ok(init) => {
-                let version = init
-                    .get("protocolVersion")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty() && v.bytes().all(|b| (0x21..=0x7e).contains(&b)))
-                    .unwrap_or(PROTOCOL_VERSION)
-                    .to_string();
-                let caps = init.get("capabilities").cloned();
-                transport.set_legacy_protocol_version(Some(version.clone()));
-                transport
-                    .notify("notifications/initialized", json!({}))
-                    .map_err(|e| e.call_failure())?;
-                (Era::Legacy { version }, caps)
-            }
-            // A dead or unresponsive server is not a modern server. Probing it
-            // again would just double the wait before reporting the same failure.
-            Err(err) if err.is_health_failure() => return Err(err.call_failure()),
-            // Authentication is independent of the protocol era. Probing after
-            // an explicit rejection can only replace the actionable error with a
-            // secondary protocol failure (#914).
-            Err(err) if err.is_auth_failure() => return Err(err.call_failure()),
-            Err(init_err) => {
-                // The server answered, but refused `initialize`. A modern server
-                // has no such method. Confirm with `server/discover`, which every
-                // modern server MUST implement, rather than guessing from an
-                // error code the spec leaves implementation-defined.
-                // Bound the probe tightly, and restore the handshake budget after.
-                //
-                // A launcher-wrapped server (npx, uvx) carries a 120s connect
-                // budget so a cold package download can finish. Inheriting that
-                // here would turn "legacy server rejected initialize" - a missing
-                // API key, a bad config - from an instant failure into a two
-                // minute hang, and a batch probe or router rebuild waits on the
-                // slowest server. A server that implements `server/discover`
-                // answers it locally and immediately, so it needs none of that
-                // budget.
-                // The post-match first-catalog timeout below
-                // restores a normal budget for the rest of the handshake.
-                transport.set_read_timeout(PROBE_TIMEOUT);
-
-                // Stamp the modern metadata BEFORE probing, not after. On HTTP the
-                // transport derives `MCP-Protocol-Version` from it, and that header
-                // MUST match the body's `_meta`; probing first would send a legacy
-                // header with a modern body and a strict server would reject the
-                // very request meant to detect it, with HeaderMismatch (-32020).
-                transport.set_protocol_meta(Some(protocol_meta_for(MODERN_PROTOCOL_VERSION)));
-                let probe = transport.request("server/discover", json!({}));
-                let discovered = match probe {
-                    Ok(discovered) => discovered,
-                    // This is the pivot of the compatibility ladder. A RECOGNIZED
-                    // modern error means the server is modern and simply does not
-                    // speak the version we declared, so the honest outcome is a
-                    // version mismatch, not "legacy server". Reporting the
-                    // `initialize` refusal here would send someone chasing a
-                    // handshake bug on a perfectly reachable modern server.
-                    Err(probe_err) if probe_err.is_modern_protocol_error() => {
-                        let offered = probe_err.supported_versions();
-                        // Retry on a mutually supported version if there is one.
-                        // Today Toolport speaks exactly one modern revision, so
-                        // this is usually a clean incompatibility, but the ladder
-                        // is written to negotiate rather than to assume.
-                        match offered
-                            .iter()
-                            .find(|v| v.as_str() == MODERN_PROTOCOL_VERSION)
-                        {
-                            Some(version) => {
-                                // Re-stamp before retrying so header and body agree
-                                // on the newly chosen version too.
-                                transport.set_protocol_meta(Some(protocol_meta_for(version)));
-                                transport
-                                    .request("server/discover", json!({}))
-                                    .map_err(|e| e.call_failure())?
-                            }
-                            None => {
-                                return Err(format!(
-                                    "server speaks MCP {offered:?}; Toolport speaks \
-                                     {MODERN_PROTOCOL_VERSION} and cannot negotiate a \
-                                     common version ({probe_err})"
-                                )
-                                .into())
-                            }
-                        }
-                    }
-                    // Preserve the probe's actionable category while retaining
-                    // the initialize refusal as handshake context.
-                    Err(probe_err) => {
-                        return Err(crate::call_failure::CallFailure::new(
-                            probe_err.call_failure().kind,
-                            format!("{init_err} (server/discover probe also failed: {probe_err})"),
-                        ))
-                    }
-                };
-                let version = choose_protocol_version(&discovered).ok_or_else(|| {
-                    format!(
-                        "server supports no protocol version Toolport speaks (offered {:?})",
-                        discovered.get("supportedVersions")
-                    )
-                })?;
-                let capabilities = discovered.get("capabilities").cloned();
-                // From here every request carries its own protocol metadata;
-                // there is no handshake and no `notifications/initialized`.
-                // Catalog fetches additionally declare the MCP Apps MIME when
-                // this server offers it, so a capability-aware server includes
-                // its UI tool metadata in tools/list.
-                transport.set_protocol_meta(Some(protocol_meta_for_catalog(
-                    &version,
-                    capabilities.as_ref(),
-                )));
-                (Era::Modern { version }, capabilities)
-            }
+        // By default we try `initialize` FIRST and fall forward, rather than
+        // probing with `server/discover` first as the spec suggests. The spec's
+        // ordering is a SHOULD, and for Toolport it is the wrong trade today:
+        // essentially every installed server is legacy, and a legacy stdio server
+        // typically answers an unknown method with silence rather than an error -
+        // so a discover-first probe would charge every existing user a
+        // read-timeout on every connect. Going legacy-first costs the existing
+        // install base exactly nothing and costs a modern server one cheap
+        // rejected request.
+        //
+        // The cost of legacy-first is that a dual-era server, one that still
+        // answers `initialize` for older clients, is pinned to the legacy era and
+        // never sees per-request `_meta` or 2026-07-28 extensions such as tasks.
+        // `preferModern` lets the user opt such a server in to discover-first
+        // (#1438).
+        let (era, caps) = if options.prefer_modern {
+            Self::handshake_modern_first(&mut *transport, handshake_timeout)?
+        } else {
+            Self::handshake_legacy_first(&mut *transport)?
         };
         let caps = caps.as_ref();
         let caps_resources = caps.and_then(|c| c.get("resources")).is_some();
@@ -8987,6 +9033,92 @@ impl DownstreamServer {
             call_timeout: STDIO_READ_TIMEOUT,
             server_handler: None,
         })
+    }
+
+    /// Default era detection: `initialize`, then `server/discover` only when the
+    /// server answered but refused `initialize`.
+    fn handshake_legacy_first(
+        transport: &mut dyn Transport,
+    ) -> Result<(Era, Option<Value>), crate::call_failure::CallFailure> {
+        let init_err = match legacy_initialize(transport)? {
+            Ok(handshake) => return Ok(handshake),
+            Err(init_err) => init_err,
+        };
+        // The server answered, but refused `initialize`. A modern server has no
+        // such method. Confirm with `server/discover`, which every modern server
+        // MUST implement, rather than guessing from an error code the spec leaves
+        // implementation-defined. Bound the probe tightly; the first-catalog
+        // timeout after the handshake restores a normal budget.
+        //
+        // A launcher-wrapped server (npx, uvx) carries a 120s connect budget so a
+        // cold package download can finish. Inheriting that here would turn
+        // "legacy server rejected initialize" - a missing API key, a bad config -
+        // from an instant failure into a two minute hang, and a batch probe or
+        // router rebuild waits on the slowest server. A server that implements
+        // `server/discover` answers it locally and immediately, so it needs none
+        // of that budget.
+        transport.set_read_timeout(PROBE_TIMEOUT);
+        match discover_modern(transport) {
+            Ok(handshake) => Ok(handshake),
+            Err(DiscoverError::Incompatible(failure) | DiscoverError::Failed(failure)) => {
+                Err(failure)
+            }
+            // Preserve the probe's actionable category while retaining the
+            // initialize refusal as handshake context.
+            Err(DiscoverError::Refused(probe_err)) => Err(crate::call_failure::CallFailure::new(
+                probe_err.call_failure().kind,
+                format!("{init_err} (server/discover probe also failed: {probe_err})"),
+            )),
+        }
+    }
+
+    /// `preferModern` era detection (#1438): `server/discover` first, and the
+    /// legacy `initialize` handshake only when the server refused discovery.
+    fn handshake_modern_first(
+        transport: &mut dyn Transport,
+        handshake_timeout: Duration,
+    ) -> Result<(Era, Option<Value>), crate::call_failure::CallFailure> {
+        // Discovery is the first request, so it gets the whole handshake budget:
+        // a launcher may still be downloading the package before it can answer.
+        let discovered = discover_modern(transport);
+        let probe_err = match discovered {
+            Ok(handshake) => {
+                transport.initialize_complete();
+                return Ok(handshake);
+            }
+            // A dead, silent or unresponsive server is not a legacy server.
+            // Falling back would double the wait before the same failure.
+            Err(DiscoverError::Refused(err)) if err.is_health_failure() => {
+                transport.initialize_complete();
+                return Err(err.call_failure());
+            }
+            // Authentication is independent of the protocol era (#914).
+            Err(DiscoverError::Refused(err)) if err.is_auth_failure() => {
+                transport.initialize_complete();
+                return Err(err.call_failure());
+            }
+            Err(DiscoverError::Failed(failure)) => {
+                transport.initialize_complete();
+                return Err(failure);
+            }
+            // A legacy-only server refuses the method; a modern server on a
+            // revision Toolport does not speak may still accept `initialize`.
+            // Leave `initialize_complete` for `legacy_initialize` so HTTP
+            // fallback keeps the handshake timeout budget.
+            Err(DiscoverError::Refused(err)) => err.to_string(),
+            Err(DiscoverError::Incompatible(failure)) => failure.detail,
+        };
+        // Drop the modern metadata so the legacy handshake carries no modern
+        // `_meta` and, on HTTP, no modern `MCP-Protocol-Version` header.
+        transport.set_protocol_meta(None);
+        transport.set_read_timeout(handshake_timeout);
+        match legacy_initialize(transport)? {
+            Ok(handshake) => Ok(handshake),
+            Err(init_err) => Err(crate::call_failure::CallFailure::new(
+                init_err.call_failure().kind,
+                format!("{init_err} (server/discover probe failed first: {probe_err})"),
+            )),
+        }
     }
 
     /// A catalog without a live connection. The supervisor replaces it after
@@ -19664,5 +19796,246 @@ mod login_environment_tests {
             login_environment_or_process(&BTreeMap::new(), Duration::from_secs(1)),
             BTreeMap::new()
         );
+    }
+}
+
+/// `preferModern` era detection (#1438).
+#[cfg(test)]
+mod prefer_modern_tests {
+    use super::{
+        ConnectOptions, DownstreamServer, Era, Transport, TransportError, MODERN_PROTOCOL_VERSION,
+        PROTOCOL_VERSION,
+    };
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    const VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+
+    /// What `server/discover` does on the mock.
+    #[derive(Clone)]
+    enum Discover {
+        /// Answers with the modern revision.
+        Modern,
+        /// A legacy-only server: JSON-RPC method not found.
+        MethodNotFound,
+        /// A modern server on a revision Toolport does not speak.
+        OtherRevision,
+        /// The credential is rejected.
+        Unauthorized,
+        /// No answer before the read timeout.
+        Silent,
+    }
+
+    /// One request as sent: the method and the protocol version stamped on the
+    /// transport at that moment (None on a legacy request).
+    type Sent = (String, Option<String>);
+
+    struct Mock {
+        discover: Discover,
+        answers_initialize: bool,
+        meta: Option<Value>,
+        sent: Arc<Mutex<Vec<Sent>>>,
+    }
+
+    impl Transport for Mock {
+        fn request(&mut self, method: &str, _params: Value) -> Result<Value, TransportError> {
+            let version = self
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get(VERSION_KEY))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            self.sent
+                .lock()
+                .unwrap()
+                .push((method.to_string(), version));
+            match method {
+                "initialize" if self.answers_initialize => Ok(json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": { "tools": {} }
+                })),
+                "initialize" => Err(TransportError::Rpc(json!({
+                    "code": -32601,
+                    "message": "method not found"
+                }))),
+                "server/discover" => match self.discover {
+                    Discover::Modern => Ok(json!({
+                        "supportedVersions": [MODERN_PROTOCOL_VERSION],
+                        "capabilities": {
+                            "tools": {},
+                            "extensions": { "io.modelcontextprotocol/tasks": {} }
+                        }
+                    })),
+                    Discover::MethodNotFound => Err(TransportError::Rpc(json!({
+                        "code": -32601,
+                        "message": "method not found"
+                    }))),
+                    Discover::OtherRevision => Err(TransportError::Rpc(json!({
+                        "code": super::UNSUPPORTED_PROTOCOL_VERSION,
+                        "message": "unsupported protocol version",
+                        "data": { "supported": ["2099-01-01"] }
+                    }))),
+                    Discover::Unauthorized => Err(TransportError::Classified(
+                        crate::call_failure::CallFailureKind::Auth {
+                            target: crate::call_failure::AuthTarget::Endpoint,
+                        },
+                        "HTTP 401 unauthorized".into(),
+                    )),
+                    Discover::Silent => Err(TransportError::Classified(
+                        crate::call_failure::CallFailureKind::Timeout { after_send: true },
+                        "no response".into(),
+                    )),
+                },
+                "tools/list" => Ok(json!({ "tools": [{ "name": "work" }] })),
+                other => Err(TransportError::Fatal(format!("unexpected method {other}"))),
+            }
+        }
+
+        fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn set_protocol_meta(&mut self, meta: Option<Value>) {
+            self.meta = meta;
+        }
+    }
+
+    fn connect(
+        discover: Discover,
+        answers_initialize: bool,
+        prefer_modern: bool,
+    ) -> (
+        Result<DownstreamServer, crate::call_failure::CallFailure>,
+        Vec<Sent>,
+    ) {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let result = DownstreamServer::connect_classified_with(
+            "mock".into(),
+            Box::new(Mock {
+                discover,
+                answers_initialize,
+                meta: None,
+                sent: Arc::clone(&sent),
+            }),
+            ConnectOptions { prefer_modern },
+        );
+        let sent = sent.lock().unwrap().clone();
+        (result, sent)
+    }
+
+    fn methods(sent: &[Sent]) -> Vec<&str> {
+        sent.iter().map(|(method, _)| method.as_str()).collect()
+    }
+
+    #[test]
+    fn options_follow_the_registry_flag() {
+        let mut server: crate::registry::ServerEntry = serde_json::from_value(
+            json!({"id":"a","name":"A","transport":"stdio","command":"mock"}),
+        )
+        .unwrap();
+        assert_eq!(
+            ConnectOptions::for_server(&server),
+            ConnectOptions::default()
+        );
+        server.prefer_modern = true;
+        assert!(ConnectOptions::for_server(&server).prefer_modern);
+    }
+
+    #[test]
+    fn a_dual_era_server_stays_legacy_by_default() {
+        let (server, sent) = connect(Discover::Modern, true, false);
+        let server = server.unwrap();
+        assert_eq!(
+            server.era(),
+            &Era::Legacy {
+                version: PROTOCOL_VERSION.into()
+            }
+        );
+        assert_eq!(methods(&sent), ["initialize", "tools/list"]);
+        assert!(sent.iter().all(|(_, version)| version.is_none()));
+        assert!(server.extensions().is_empty());
+    }
+
+    #[test]
+    fn prefer_modern_connects_a_dual_era_server_as_modern() {
+        let (server, sent) = connect(Discover::Modern, true, true);
+        let server = server.unwrap();
+        assert_eq!(
+            server.era(),
+            &Era::Modern {
+                version: MODERN_PROTOCOL_VERSION.into()
+            }
+        );
+        // Never sent `initialize`, and every request carried modern `_meta`.
+        assert_eq!(methods(&sent), ["server/discover", "tools/list"]);
+        assert!(sent
+            .iter()
+            .all(|(_, version)| version.as_deref() == Some(MODERN_PROTOCOL_VERSION)));
+        assert!(server
+            .extensions()
+            .contains_key("io.modelcontextprotocol/tasks"));
+    }
+
+    #[test]
+    fn prefer_modern_falls_back_when_a_legacy_server_refuses_discovery() {
+        for discover in [Discover::MethodNotFound, Discover::OtherRevision] {
+            let (server, sent) = connect(discover, true, true);
+            let server = server.unwrap();
+            assert_eq!(
+                server.era(),
+                &Era::Legacy {
+                    version: PROTOCOL_VERSION.into()
+                }
+            );
+            assert_eq!(
+                methods(&sent),
+                ["server/discover", "initialize", "tools/list"]
+            );
+            // The legacy handshake must not carry the modern metadata.
+            assert_eq!(sent[1].1, None);
+            assert_eq!(sent[2].1, None);
+        }
+    }
+
+    #[test]
+    fn prefer_modern_reports_both_refusals_when_nothing_answers() {
+        let (server, sent) = connect(Discover::MethodNotFound, false, true);
+        let failure = match server {
+            Err(failure) => failure,
+            Ok(_) => panic!("connection should fail"),
+        };
+        assert_eq!(methods(&sent), ["server/discover", "initialize"]);
+        assert!(
+            failure
+                .detail
+                .contains("server/discover probe failed first"),
+            "{}",
+            failure.detail
+        );
+    }
+
+    #[test]
+    fn prefer_modern_surfaces_auth_and_health_failures_without_initialize() {
+        let (server, sent) = connect(Discover::Unauthorized, true, true);
+        let failure = match server {
+            Err(failure) => failure,
+            Ok(_) => panic!("connection should fail"),
+        };
+        assert!(matches!(
+            failure.kind,
+            crate::call_failure::CallFailureKind::Auth { .. }
+        ));
+        assert_eq!(methods(&sent), ["server/discover"]);
+
+        let (server, sent) = connect(Discover::Silent, true, true);
+        let failure = match server {
+            Err(failure) => failure,
+            Ok(_) => panic!("connection should fail"),
+        };
+        assert!(matches!(
+            failure.kind,
+            crate::call_failure::CallFailureKind::Timeout { .. }
+        ));
+        assert_eq!(methods(&sent), ["server/discover"]);
     }
 }
