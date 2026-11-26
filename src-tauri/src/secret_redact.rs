@@ -4084,12 +4084,17 @@ struct MaskRanges<'a> {
 }
 
 impl MaskRanges<'_> {
-    fn add(&mut self, marker: String, range: (u64, u64)) -> std::io::Result<()> {
-        match self.groups.iter_mut().find(|(m, _)| *m == marker) {
-            Some((_, ranges)) => ranges.push(range),
-            None => self.groups.push((marker, vec![range])),
+    /// Queue the ranges of one span (its pieces in the file), flushing only
+    /// between spans so a span split over pieces is journaled as one.
+    fn add(&mut self, marker: String, span: Vec<(u64, u64)>) -> std::io::Result<()> {
+        if span.is_empty() {
+            return Ok(());
         }
-        self.count += 1;
+        self.count += span.len();
+        match self.groups.iter_mut().find(|(m, _)| *m == marker) {
+            Some((_, ranges)) => ranges.extend(span),
+            None => self.groups.push((marker, span)),
+        }
         if self.count >= self.batch {
             self.flush()?;
         }
@@ -4098,6 +4103,13 @@ impl MaskRanges<'_> {
 
     /// One journaled pass per distinct marker, each range masked with it.
     fn flush(&mut self) -> std::io::Result<()> {
+        #[cfg(test)]
+        if !self.groups.is_empty() {
+            tests::MASK_BATCHES.with(|b| {
+                b.borrow_mut()
+                    .push(self.groups.iter().flat_map(|(_, r)| r.clone()).collect())
+            });
+        }
         for (marker, ranges) in std::mem::take(&mut self.groups) {
             let mask = |len: usize| -> Vec<u8> {
                 if marker.len() <= len {
@@ -4174,7 +4186,16 @@ impl MaskText {
             (len, 0)
         } else {
             let hold = mask_hold(m, &self.logical, &starts);
-            let cut = back_chars(&self.logical, hold, FRAGMENT_CHARS.max(1));
+            let fragment = FRAGMENT_CHARS.max(1);
+            let mut cut = back_chars(&self.logical, hold, fragment);
+            // An encoded fragment takes more source bytes per char: keep
+            // enough of them for the fragment to be decoded whole next time.
+            let wide = back_chars(&self.logical, hold, fragment * ENCODED_CHAR_BYTES);
+            if crate::secret_normalize::has_encoding(&String::from_utf8_lossy(
+                &self.logical[wide..hold],
+            )) {
+                cut = wide;
+            }
             (cut, hold - cut)
         };
         // A span crossing the cut would be masked in part.
@@ -4204,6 +4225,7 @@ impl MaskText {
             .segs
             .partition_point(|&(p, _)| p <= s)
             .saturating_sub(1);
+        let mut span = Vec::new();
         for k in first..self.segs.len() {
             let (ls, offset) = self.segs[k];
             let le = self.segs.get(k + 1).map_or(self.logical.len(), |&(p, _)| p);
@@ -4212,13 +4234,10 @@ impl MaskText {
             }
             let (from, to) = (s.max(ls), e.min(le));
             if from < to {
-                out.add(
-                    marker.clone(),
-                    (offset + (from - ls) as u64, (to - from) as u64),
-                )?;
+                span.push((offset + (from - ls) as u64, (to - from) as u64));
             }
         }
-        Ok(())
+        out.add(marker, span)
     }
 
     /// Drop logical `..cut`, keeping the rest at the start.
@@ -4275,19 +4294,30 @@ fn mask_hold(m: &Matcher, bytes: &[u8], starts: &[usize]) -> usize {
 }
 
 /// The offset `n` chars before `at` in `bytes` (UTF-8 continuation bytes are
-/// not counted), or 0.
+/// not counted), or 0. A step is one char of at most 4 bytes, or one byte of a
+/// run of continuation bytes that is not UTF-8, so it never goes back more
+/// than `4 * n` bytes.
 fn back_chars(bytes: &[u8], mut at: usize, n: usize) -> usize {
     for _ in 0..n {
         if at == 0 {
             break;
         }
+        let end = at;
         at -= 1;
-        while at > 0 && bytes[at] & 0xC0 == 0x80 {
+        while at > 0 && end - at < 4 && bytes[at] & 0xC0 == 0x80 {
             at -= 1;
+        }
+        // Not the lead byte of a char ending at `end`: one byte only.
+        if bytes[at] & 0xC0 == 0x80 || std::str::from_utf8(&bytes[at..end]).is_err() {
+            at = end - 1;
         }
     }
     at
 }
+
+/// The source bytes an encoded char can take: `&#0000090;` is ten, and a
+/// percent or JSON escape (or two levels of them) fewer.
+const ENCODED_CHAR_BYTES: usize = 10;
 
 /// Read the rest of a line of `reader` into `line` (with its `\n`), until it
 /// holds `cap` bytes. Returns whether the line ended (at `\n` or at the end of
@@ -4407,9 +4437,15 @@ fn mask_locked_with(
                     .rposition(|&b| b != b'\n' && b != b'\r')
                     .map_or(0, |i| i + 1)
             } else {
-                match std::str::from_utf8(&line) {
+                let keep = match std::str::from_utf8(&line) {
                     Err(e) if e.error_len().is_none() && e.valid_up_to() > 0 => e.valid_up_to(),
                     _ => line.len(),
+                };
+                // A `\r` at the end may be the start of a `\r\n` the next part
+                // ends: it waits for it, and is text only if no `\n` follows.
+                match line[..keep].iter().rposition(|&b| b != b'\r') {
+                    Some(i) if keep == line.len() => i + 1,
+                    _ => keep,
                 }
             };
             let used = if ended { line.len() } else { keep };
@@ -7670,8 +7706,128 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An 8-char fragment percent-encoded takes 24 source bytes, so a cut
+    /// keeping 8 source chars would leave it truncated for the next window.
+    #[test]
+    fn an_encoded_fragment_across_a_window_cut_matches_a_whole_search() {
+        let secret = "Vq8mZ2rT5wK9pL3x";
+        let m = m(&[("LONG", secret)]);
+        let mut content = String::new();
+        for i in 0..8 {
+            let piece = &secret[i..i + 9];
+            content.push_str(&format!(
+                "[debug] {i} GET /x?k={} 401\n",
+                percent_all(piece)
+            ));
+            content.push_str(&format!(
+                "[debug] {i} echo {} done\n",
+                json_escape_all(piece)
+            ));
+        }
+        let dir = mask_fixture("encoded-fragment-cut");
+        let whole =
+            String::from_utf8(masked_with(&m, &dir, content.as_bytes(), ONE_WINDOW)).unwrap();
+        assert!(!whole.contains(&percent_all(&secret[2..11])), "{whole}");
+        for line in [4, 7, 13, 29, usize::MAX] {
+            for window in 1..=60 {
+                let limits = MaskLimits {
+                    window,
+                    line,
+                    batch: 2,
+                };
+                let streamed = masked_with(&m, &dir, content.as_bytes(), limits);
+                assert_eq!(
+                    String::from_utf8_lossy(&streamed),
+                    whole,
+                    "line {line} window {window}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `\r\n` split by the line limit is a line end, not text: the secret
+    /// wrapped at it is masked as when the line is read whole.
+    #[test]
+    fn a_crlf_split_by_the_line_limit_still_ends_the_line() {
+        let secret = "sk-live-9Qx7Lm2Pw4Rt8Zk";
+        let m = m(&[("KEY", secret)]);
+        let dir = mask_fixture("crlf-split");
+        for split in 1..secret.len() {
+            let (a, b) = secret.split_at(split);
+            let first = format!("[warn] wrapped {a}\r\n");
+            let content = format!("{first}{b} end\r\nnext\r\r\nlast\r");
+            let whole =
+                String::from_utf8(masked_with(&m, &dir, content.as_bytes(), ONE_WINDOW)).unwrap();
+            assert!(!whole.contains(secret), "{whole}");
+            assert_eq!(whole.matches("\r\n").count(), 3, "{whole:?}");
+            // `first.len() - 1` ends the first part with the `\r`.
+            for line in [4, 9, first.len() - 1, first.len()] {
+                for window in [1, 7, usize::MAX] {
+                    let limits = MaskLimits {
+                        window,
+                        line,
+                        batch: 2,
+                    };
+                    let streamed = masked_with(&m, &dir, content.as_bytes(), limits);
+                    assert_eq!(
+                        String::from_utf8_lossy(&streamed),
+                        whole,
+                        "split {split} line {line} window {window}"
+                    );
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Each piece of one match split over lines is journaled in the same
+    /// batch, however small batches are, so no piece is masked without the
+    /// others.
+    #[test]
+    fn a_split_match_is_journaled_in_one_batch() {
+        let secret = "sk-live-9Qx7Lm2Pw4Rt8Zk";
+        let m = m(&[("KEY", secret)]);
+        let (a, b) = secret.split_at(9);
+        let content = format!("[warn] wrapped {a}\n{b} end\n");
+        let dir = mask_fixture("split-batch");
+        MASK_BATCHES.with(|b| b.borrow_mut().clear());
+        let limits = MaskLimits {
+            window: usize::MAX,
+            line: usize::MAX,
+            batch: 1,
+        };
+        let out = String::from_utf8(masked_with(&m, &dir, content.as_bytes(), limits)).unwrap();
+        assert!(!out.contains(a) && !out.contains(b), "{out}");
+        let batches = MASK_BATCHES.with(|b| b.take());
+        assert_eq!(batches.len(), 1, "{batches:?}");
+        assert_eq!(batches[0].len(), 2, "{batches:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run of continuation bytes that is not UTF-8 counts a byte a step, so
+    /// the cut never scans back further than four bytes a char.
+    #[test]
+    fn back_chars_is_bounded_by_bytes() {
+        let mut bytes = vec![b'a'];
+        bytes.extend(std::iter::repeat_n(0x80, 100_000));
+        let len = bytes.len();
+        assert_eq!(back_chars(&bytes, len, 8), len - 8);
+        assert_eq!(back_chars(&bytes, len, len + 5), 0);
+        let text = "aé€😀b".as_bytes();
+        assert_eq!(back_chars(text, text.len(), 1), text.len() - 1);
+        assert_eq!(back_chars(text, text.len(), 2), text.len() - 5);
+        assert_eq!(back_chars(text, text.len(), 4), 1);
+        assert_eq!(back_chars(text, text.len(), 5), 0);
+        // A cut-off char is one byte a step.
+        let cut = &text[..text.len() - 2];
+        assert_eq!(back_chars(cut, cut.len(), 1), cut.len() - 1);
+    }
+
     thread_local! {
         pub(super) static MASK_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub(super) static MASK_BATCHES: std::cell::RefCell<Vec<Vec<(u64, u64)>>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
 
     /// Memory stays bounded by the window, the longest line and the held

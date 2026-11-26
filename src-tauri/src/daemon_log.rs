@@ -457,9 +457,9 @@ impl RelayOut {
         if let Some(out) = &self.out {
             rotation.reopen_at = None;
             rotation.written = out.metadata().map(|m| m.len()).unwrap_or(0);
-            if rotation.written < MAX_LOG_BYTES {
-                rotation.retry_at = 0;
-            }
+            // A threshold set for the file before is no use for this one (a
+            // failed rename sets its own after this returns).
+            rotation.retry_at = 0;
         }
     }
 }
@@ -1016,16 +1016,19 @@ fn log_tail(path: &Path, max: u64) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     let start = len.saturating_sub(max);
-    file.seek(std::io::SeekFrom::Start(start)).ok()?;
+    // The byte before the tail too, to tell whether its first line is whole.
+    let before = u64::from(start > 0);
+    file.seek(std::io::SeekFrom::Start(start - before)).ok()?;
     let mut tail = Vec::new();
-    file.take(max).read_to_end(&mut tail).ok()?;
-    let whole = if start > 0 {
-        tail.iter()
+    file.take(max + before).read_to_end(&mut tail).ok()?;
+    let whole = match tail.first() {
+        Some(&b) if before == 1 && b != b'\n' => tail
+            .iter()
             .position(|&b| b == b'\n')
-            .map_or(tail.len(), |i| i + 1)
-    } else {
-        0
-    };
+            .map_or(tail.len(), |i| i + 1),
+        _ => before as usize,
+    }
+    .min(tail.len());
     Some(String::from_utf8_lossy(&tail[whole..]).into_owned())
 }
 
@@ -2484,6 +2487,31 @@ mod tests {
         assert_eq!(last_panic_of(&dir, pid), None);
         std::fs::write(&previous, vec![b'x'; 5 * MAX_LOG_BYTES as usize]).unwrap();
         assert_eq!(last_panic_of(&dir, pid), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tail that starts right after a line end starts with a whole line,
+    /// which is kept: here the only panic.
+    #[test]
+    fn a_panic_starting_exactly_at_the_tail_is_found() {
+        let dir = scratch("panic-tail-edge");
+        let previous = dir.join(format!("{LOG_FILE}.1"));
+        let pid = 4_242_425;
+        let panic = format!("2 pid={pid} panic in thread 'router' at src/router.rs:9:9: boom\n");
+        let rest = PANIC_SCAN_BYTES as usize - panic.len();
+        let after = format!("{}\n", "y".repeat(rest - 1));
+        let content = format!("{}\n{panic}{after}", "x".repeat(4_096));
+        std::fs::write(&previous, &content).unwrap();
+        let tail = log_tail(&previous, PANIC_SCAN_BYTES).unwrap();
+        assert_eq!(tail.len() as u64, PANIC_SCAN_BYTES);
+        assert!(tail.starts_with(&panic));
+        assert_eq!(
+            last_panic_of(&dir, pid).as_deref(),
+            Some("panic in thread 'router' at src/router.rs:9:9: boom")
+        );
+        // One byte more and the panic line is cut off, so dropped.
+        let tail = log_tail(&previous, PANIC_SCAN_BYTES - 1).unwrap();
+        assert_eq!(tail, after);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
