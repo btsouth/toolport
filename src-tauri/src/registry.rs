@@ -4924,6 +4924,13 @@ pub(crate) fn take_lock_busy() -> bool {
     LOCK_BUSY.replace(false)
 }
 
+/// [`lock_at`] tried once, without waiting: for a writer that must never stall
+/// behind another holder (the stderr relay rotating `daemon.log`) and tries
+/// again later instead.
+pub(crate) fn lock_once_at(path: &Path) -> Result<FileLock, String> {
+    try_lock_once(path)
+}
+
 fn try_lock_once(path: &Path) -> Result<FileLock, String> {
     let file = open_lock_file(path)?;
     #[cfg(test)]

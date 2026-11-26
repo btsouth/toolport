@@ -65,6 +65,12 @@ pub fn link_count(file: &File) -> std::io::Result<u64> {
     Ok(sys::ident(file)?.links)
 }
 
+/// The identity of the open file `file`: (device, inode) on Unix, (volume
+/// serial, file index) on Windows. Two handles with one identity name one file.
+pub fn file_id(file: &File) -> std::io::Result<(u64, u64)> {
+    Ok(sys::ident(file)?.id)
+}
+
 /// Whether a stream's output differs from its input, compared as both are
 /// produced (the output may lag behind, holding text back).
 #[derive(Default)]
@@ -199,11 +205,16 @@ pub fn rewrite_stream(
 /// Crash-safe same-length masking of byte ranges in `path`. Writes a journal
 /// holding the file name, the file's identity and the ranges (never content),
 /// masks each range, fsyncs, then removes the journal.
+///
+/// With `expected_id` (the identity of the file the ranges were found in, from
+/// [`file_id`]), a file that was replaced since is an error and nothing is
+/// written: its offsets would mask the wrong bytes of another file.
 pub fn mask_ranges(
     dir: &Path,
     path: &Path,
     ranges: &[(u64, u64)],
     mask_for: &dyn Fn(usize) -> Vec<u8>,
+    expected_id: Option<(u64, u64)>,
 ) -> std::io::Result<bool> {
     let loc = match locate(dir, path)? {
         Ok(loc) => loc,
@@ -216,6 +227,12 @@ pub fn mask_ranges(
     let ident = sys::ident(&file)?;
     if ident.links > 1 {
         return Err(multi_link_error(&loc.name.to_string_lossy()));
+    }
+    if expected_id.is_some_and(|id| id != ident.id) {
+        return Err(std::io::Error::other(format!(
+            "{} was replaced while the secret scrub masked it; the cleanup finishes on the next start",
+            loc.name.to_string_lossy()
+        )));
     }
     let size = ident.size;
     let ranges: Vec<(u64, u64)> = ranges
@@ -1078,7 +1095,7 @@ mod tests {
             open_inside(&dir.0, &link).unwrap(),
             Err(Skip::Symlink)
         ));
-        assert!(!mask_ranges(&dir.0, &link, &[(0, 3)], &|n| vec![b'#'; n]).unwrap());
+        assert!(!mask_ranges(&dir.0, &link, &[(0, 3)], &|n| vec![b'#'; n], None).unwrap());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "SECRET\n");
     }
 
@@ -1191,11 +1208,17 @@ mod tests {
         let dir = TempDir::new("mask");
         let path = dir.0.join("daemon.log");
         std::fs::write(&path, "key=SECRET1 and SECRET2\n").unwrap();
-        let masked = mask_ranges(&dir.0, &path, &[(4, 7), (16, 7)], &|n| {
-            let mut m = b"[r]".to_vec();
-            m.truncate(n);
-            m
-        })
+        let masked = mask_ranges(
+            &dir.0,
+            &path,
+            &[(4, 7), (16, 7)],
+            &|n| {
+                let mut m = b"[r]".to_vec();
+                m.truncate(n);
+                m
+            },
+            None,
+        )
         .unwrap();
         assert!(masked);
         assert_eq!(
@@ -1204,8 +1227,26 @@ mod tests {
         );
         assert!(leftovers(&dir.0).is_empty());
         // Ranges past the end are ignored rather than extending the file.
-        assert!(!mask_ranges(&dir.0, &path, &[(20, 100)], &|n| vec![b'#'; n]).unwrap());
+        assert!(!mask_ranges(&dir.0, &path, &[(20, 100)], &|n| vec![b'#'; n], None).unwrap());
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 24);
+    }
+
+    /// A file replaced between two batches of one scrub is never masked at
+    /// the offsets found in the file it replaced.
+    #[test]
+    fn mask_ranges_refuses_a_replaced_file() {
+        let dir = TempDir::new("mask-replaced");
+        let path = dir.0.join("daemon.log");
+        std::fs::write(&path, "key=SECRET1\n").unwrap();
+        let id = file_id(&File::open(&path).unwrap()).unwrap();
+        let other = dir.0.join("other.log");
+        std::fs::write(&other, "unrelated text\n").unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        assert!(mask_ranges(&dir.0, &path, &[(4, 7)], &|n| vec![b'#'; n], Some(id)).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "unrelated text\n");
+        assert!(leftovers(&dir.0).is_empty());
+        let now = file_id(&File::open(&path).unwrap()).unwrap();
+        assert!(mask_ranges(&dir.0, &path, &[(4, 7)], &|n| vec![b'#'; n], Some(now)).unwrap());
     }
 
     #[test]
