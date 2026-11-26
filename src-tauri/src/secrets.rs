@@ -3796,6 +3796,62 @@ pub(crate) mod tests {
         assert_eq!(get_secret(sid, key), None);
     }
 
+    /// Run against a throwaway gnome-keyring whose default keyring is the
+    /// unencrypted kind, with `TOOLPORT_TEST_PLAINTEXT_KEYRING` naming its file.
+    #[test]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    #[ignore = "needs a throwaway gnome-keyring with an unencrypted default keyring"]
+    fn line_breaks_never_break_an_unencrypted_gnome_keyring() {
+        let Some(file) = std::env::var_os("TOOLPORT_TEST_PLAINTEXT_KEYRING") else {
+            panic!("set TOOLPORT_TEST_PLAINTEXT_KEYRING to the keyring file");
+        };
+        let _data = crate::registry::DataDirTestEnv::new(
+            "line_breaks_never_break_an_unencrypted_gnome_keyring",
+        );
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let parses = || {
+            let text = std::fs::read_to_string(&file).unwrap();
+            text.lines().all(|line| {
+                line.is_empty()
+                    || line.starts_with('#')
+                    || (line.starts_with('[') && line.ends_with(']'))
+                    || line.contains('=')
+            })
+        };
+        let settle = |want: bool| {
+            for _ in 0..50 {
+                if parses() == want {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            false
+        };
+        let config = "model = \"x\"\n\n[projects.\"/home/a\"]\ntrust_level = \"trusted\"\n";
+        let (old, new, key) = ("line-safe-old", "line-safe-new", "CLIENT_BACKUP");
+        let _old_cleanup = SecretCleanupGuard::new(old, key);
+        let _new_cleanup = SecretCleanupGuard::new(new, key);
+
+        // What 2.3.6 to 2.4.2 did: the text raw, which the daemon writes raw.
+        let old_owner = crate::local_auth::owner(old).unwrap();
+        keyring::Entry::new(SERVICE, &account(&old_owner, key))
+            .unwrap()
+            .set_password(config)
+            .unwrap();
+        assert!(
+            settle(false),
+            "the raw write must reproduce the broken file"
+        );
+
+        assert_eq!(platform::repair_line_unsafe_items().unwrap(), 1);
+        assert!(settle(true), "the repair leaves a file the daemon can load");
+        set_secret(new, key, config).unwrap();
+        assert!(settle(true), "a new write stays loadable");
+        assert_eq!(get_secret(old, key).as_deref(), Some(config));
+        assert_eq!(get_secret(new, key).as_deref(), Some(config));
+        assert_eq!(platform::repair_line_unsafe_items().unwrap(), 0);
+    }
+
     #[test]
     #[cfg(target_os = "windows")]
     fn windows_oversized_secret_round_trips_updates_and_deletes() {
