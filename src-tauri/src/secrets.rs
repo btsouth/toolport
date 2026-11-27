@@ -4450,6 +4450,14 @@ pub(crate) mod tests {
         assert_eq!(damaged.len(), expect);
     }
 
+    /// A foreign test item: label, attributes, secret.
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    type ForeignItem = (
+        &'static str,
+        Vec<(&'static str, &'static str)>,
+        &'static str,
+    );
+
     /// Items by path: label, sorted attributes, secret bytes.
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     type ItemSnapshot =
@@ -4559,7 +4567,7 @@ pub(crate) mod tests {
                 let collection = service.get_default_collection().unwrap();
                 // Shapes other apps store: browsers' cookie keys, a token
                 // JSON, and look-alikes of Toolport's own attributes.
-                let foreign: [(&str, Vec<(&str, &str)>, &str); 6] = [
+                let foreign: [ForeignItem; 6] = [
                     (
                         "Chromium Safe Storage",
                         vec![
