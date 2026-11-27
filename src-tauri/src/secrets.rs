@@ -4522,10 +4522,7 @@ pub(crate) mod tests {
                 .filter(|(_, _, v)| v.contains('\\') || v.trim() != *v)
                 .count()
         };
-        let expect_repaired = toolport
-            .iter()
-            .filter(|(_, _, v)| line_safe::needs_encoding(v))
-            .count();
+
         let raw = |sid: &str, key: &str| {
             let owner = crate::local_auth::owner(sid).unwrap();
             keyring::Entry::new(SERVICE, &account(&owner, key)).unwrap()
@@ -4633,6 +4630,12 @@ pub(crate) mod tests {
                 .unwrap();
                 let damaged = line_safe::damaged_toolport_items_in(&dir);
                 assert_eq!(damaged.len(), expect_candidates, "{damaged:?}");
+                // Only what is held now can be kept; a value the daemon
+                // already emptied has nothing to encode.
+                let expect_repaired = held
+                    .iter()
+                    .filter(|value| line_safe::needs_encoding(value))
+                    .count();
                 assert_eq!(
                     platform::repair_line_unsafe_items(&damaged).unwrap(),
                     expect_repaired
