@@ -112,8 +112,11 @@ recover it by hand:
    with `[keyring]`) in a text editor. Find each item whose `display-name` starts
    with `client-backup-`. Delete it from its `[N]` line through the last
    `[N:attributeM]` group that follows, including the config text in between.
-   These items are only copies of client configs; the configs themselves are
-   untouched.
+   These are Toolport's saved copies of your client configs from before it
+   changed them, which it uses to restore them when you disconnect a client or
+   uninstall. Your current configs are untouched, but Toolport can no longer
+   restore those originals afterwards. The folder copy from step 2 still holds
+   them as plain text if you need one back.
 4. If a new keyring file was created, move it out of the folder, and make
    `~/.local/share/keyrings/default` name the old keyring (for example
    `Default_keyring`, without the extension).
