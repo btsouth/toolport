@@ -4450,12 +4450,16 @@ pub(crate) mod tests {
         assert_eq!(damaged.len(), expect);
     }
 
+    /// Items by path: label, sorted attributes, secret bytes.
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    type ItemSnapshot =
+        std::collections::BTreeMap<String, (String, Vec<(String, String)>, Vec<u8>)>;
+
     /// Every item in every collection that is not Toolport's, as
     /// `path -> (label, sorted attributes, secret bytes)`. The repair must
     /// never change one, add one or remove one.
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    fn foreign_items_snapshot(
-    ) -> std::collections::BTreeMap<String, (String, Vec<(String, String)>, Vec<u8>)> {
+    fn foreign_items_snapshot() -> ItemSnapshot {
         let service =
             dbus_secret_service::SecretService::connect(dbus_secret_service::EncryptionType::Dh)
                 .unwrap();
@@ -4540,16 +4544,12 @@ pub(crate) mod tests {
             let owner = crate::local_auth::owner(sid).unwrap();
             keyring::Entry::new(SERVICE, &account(&owner, key)).unwrap()
         };
-        let save = |snapshot: &std::collections::BTreeMap<
-            String,
-            (String, Vec<(String, String)>, Vec<u8>),
-        >| {
+        let save = |snapshot: &ItemSnapshot| {
             std::fs::write(&snapshot_file, serde_json::to_vec(snapshot).unwrap()).unwrap();
         };
-        let load =
-            || -> std::collections::BTreeMap<String, (String, Vec<(String, String)>, Vec<u8>)> {
-                serde_json::from_slice(&std::fs::read(&snapshot_file).unwrap()).unwrap()
-            };
+        let load = || -> ItemSnapshot {
+            serde_json::from_slice(&std::fs::read(&snapshot_file).unwrap()).unwrap()
+        };
         match phase.as_str() {
             "seed" => {
                 let service = dbus_secret_service::SecretService::connect(
