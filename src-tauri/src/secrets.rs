@@ -252,8 +252,8 @@ mod line_safe {
         flush(&mut items, &current, &mut attribute);
         let collection = collection_path(identifier);
         items
-            .into_iter()
-            .filter_map(|(_, item)| {
+            .into_values()
+            .filter_map(|item| {
                 let account = item.username?;
                 let backup = account.starts_with(super::BACKUP_ACCOUNT_PREFIX);
                 (item.service.as_deref() == Some(super::SERVICE)
