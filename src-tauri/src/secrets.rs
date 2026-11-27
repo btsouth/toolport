@@ -1664,10 +1664,16 @@ mod platform {
                     if item.is_locked().unwrap_or(true) {
                         return Ok(false);
                     }
-                    let attributes = item.get_attributes().map_err(|error| classify(&error))?;
-                    if attributes.get("service").map(String::as_str) != Some(SERVICE)
-                        || attributes.get("username") != Some(&target.account)
-                    {
+                    // Toolport's own item, by the daemon's live attributes,
+                    // never by what the file says.
+                    let ours = || -> Result<bool, State> {
+                        let attributes = item.get_attributes().map_err(|error| classify(&error))?;
+                        Ok(
+                            attributes.get("service").map(String::as_str) == Some(SERVICE)
+                                && attributes.get("username") == Some(&target.account),
+                        )
+                    };
+                    if !ours()? {
                         return Ok(false);
                     }
                     let bytes = item.get_secret().map_err(|error| classify(&error))?;
@@ -1680,6 +1686,13 @@ mod platform {
                         return Ok(false);
                     }
                     let stored = super::line_safe::encode(&text);
+                    // Again just before the write: the Secret Service has no
+                    // compare-and-set, so this keeps the window in which a
+                    // deleted item's path could name another app's new item
+                    // as small as it can be.
+                    if !ours()? {
+                        return Ok(false);
+                    }
                     item.set_secret(stored.as_bytes(), "text/plain")
                         .map_err(|error| classify(&error))?;
                     Ok(true)
@@ -3706,7 +3719,7 @@ pub(crate) mod tests {
                 &format!("{BACKUP_ACCOUNT_PREFIX}def::1"),
                 r"C:\\Users",
             ),
-            // A credential with a backslash is left for its owner.
+            // A credential with a backslash comes back changed at a reload.
             keyring_item(10, SERVICE, "srv::PATH", r"C:\\Users"),
             // Already encoded, and another app's damage: not Toolport's.
             keyring_item(11, SERVICE, "srv::NEW", &encoded),
