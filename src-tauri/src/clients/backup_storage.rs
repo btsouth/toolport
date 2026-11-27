@@ -807,7 +807,8 @@ pub(super) fn warnings() -> Vec<String> {
 pub(crate) fn install_account(dir: &Path) -> String {
     let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.into());
     format!(
-        "client-backup-{}",
+        "{}{}",
+        crate::secrets::BACKUP_ACCOUNT_PREFIX,
         crate::registry::sha256_hex(&dir.to_string_lossy())
     )
 }

@@ -9,6 +9,9 @@ const SERVICE: &str = "conduit-mcp";
 pub(crate) mod purge;
 
 const INTERNAL_SERVER_ID: &str = "__toolport_internal__";
+
+/// Every client-config backup's vault account starts with this.
+pub(crate) const BACKUP_ACCOUNT_PREFIX: &str = "client-backup-";
 #[cfg(not(test))]
 const TASK_HANDLE_KEY: &str = "__task_handle_key__";
 
@@ -42,6 +45,285 @@ fn keychain_gateway_path(
 
 fn account(server_id: &str, key: &str) -> String {
     format!("{server_id}::{key}")
+}
+
+/// gnome-keyring's unencrypted keyring (the default on Omarchy) saves each
+/// secret raw on one line of a key file. A value with a line break turns the
+/// rest of it into lines the daemon cannot parse, so at the next login it
+/// rejects the whole keyring and every app on the desktop loses its saved
+/// logins. Leading and trailing whitespace does not survive that line either,
+/// and the daemon unescapes the line when it loads the file again, so a value
+/// with a backslash comes back changed or empty.
+/// On the Secret Service those values are stored base64-encoded behind
+/// [`line_safe::MARKER`]; every other value is stored exactly as before.
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+mod line_safe {
+    use base64::Engine;
+    use std::borrow::Cow;
+
+    pub(super) const MARKER: &str = "toolport-line-safe-b64:";
+
+    /// True when `value` cannot be stored raw on one key file line, or would
+    /// read back as an encoded value. GKeyFile strips ASCII whitespace only.
+    pub(super) fn needs_encoding(value: &str) -> bool {
+        value.starts_with(MARKER)
+            || value.chars().any(|c| c.is_control() || c == '\\')
+            || value.trim_matches(|c: char| c.is_ascii_whitespace()) != value
+    }
+
+    /// A gnome-keyring group header: `[keyring]`, an item `[N]`, or one of
+    /// its `[N:attributeM]` or `[N:aclM]` groups.
+    /// An item id, as a number (for order) and as written (for its path).
+    type Id = (u64, String);
+
+    enum Header {
+        Keyring,
+        Item(Id),
+        Attribute(Id),
+        Acl,
+    }
+
+    fn header(line: &str) -> Option<Header> {
+        let name = line.strip_prefix('[')?.strip_suffix(']')?;
+        if name == "keyring" {
+            return Some(Header::Keyring);
+        }
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        let (item, rest) = name.split_once(':').unwrap_or((name, ""));
+        if !digits(item) {
+            return None;
+        }
+        let id = (item.parse().ok()?, item.to_string());
+        if rest.is_empty() {
+            Some(Header::Item(id))
+        } else if rest.strip_prefix("attribute").is_some_and(digits) {
+            Some(Header::Attribute(id))
+        } else if rest.strip_prefix("acl").is_some_and(digits) {
+            Some(Header::Acl)
+        } else {
+            None
+        }
+    }
+
+    /// A key the daemon writes: lowercase words joined by hyphens.
+    fn daemon_key(line: &str) -> Option<(&str, &str)> {
+        line.split_once('=').filter(|(key, _)| {
+            !key.is_empty() && key.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+        })
+    }
+
+    /// True when `text`, an unencrypted keyring file, has a line that is not
+    /// one of the daemon's own groups or keys: the daemon rejects it at the
+    /// next load. A config's lines would pass a looser "group or key=value"
+    /// test and load back as a phantom item, so only the real shapes count.
+    #[cfg(test)]
+    pub(super) fn unloadable_key_file(text: &str) -> bool {
+        !text
+            .lines()
+            .all(|line| line.is_empty() || header(line).is_some() || daemon_key(line).is_some())
+    }
+
+    /// A key file value as GKeyFile reads it: `\s`, `\n`, `\t`, `\r` and
+    /// `\\` unescaped.
+    fn unescape(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        let mut chars = value.chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('s') => out.push(' '),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some(other) => out.push(other),
+                None => out.push('\\'),
+            }
+        }
+        out
+    }
+
+    /// A Toolport item an unencrypted keyring file shows stored raw in a
+    /// way the file cannot hold: its D-Bus object path and its account.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct Damaged {
+        pub(super) path: String,
+        pub(super) account: String,
+    }
+
+    /// gnome-keyring's object path for the collection a keyring file holds:
+    /// the file's name, with every byte that is not a letter or digit as `_xx`.
+    pub(super) fn collection_path(identifier: &str) -> String {
+        let mut path = String::from("/org/freedesktop/secrets/collection/");
+        for byte in identifier.bytes() {
+            if byte.is_ascii_alphanumeric() {
+                path.push(byte as char);
+            } else {
+                path.push_str(&format!("_{byte:02x}"));
+            }
+        }
+        path
+    }
+
+    /// The Toolport items in unencrypted keyring file `text` (collection
+    /// `identifier`) that may hold a value stored raw that the file cannot
+    /// carry. When any line is not the daemon's (a value's line breaks
+    /// spilled into lines of their own) every Toolport item in the file is a
+    /// candidate: a spilled line can read as another item's header, so the
+    /// owner cannot be told from the text. Otherwise the candidates are the
+    /// Toolport items whose raw line holds a backslash or edge whitespace,
+    /// which the daemon changes when it loads the file again. The repair
+    /// checks each candidate's live value, so a candidate needs no repair.
+    pub(super) fn damaged_toolport_items(identifier: &str, text: &str) -> Vec<Damaged> {
+        #[derive(Default)]
+        struct Item {
+            raw_unsafe: bool,
+            service: Option<String>,
+            username: Option<String>,
+        }
+        let mut items = std::collections::BTreeMap::<Id, Item>::new();
+        let mut file_damaged = false;
+        let mut attribute: (Option<String>, Option<String>) = (None, None);
+        let mut current: Option<Header> = None;
+        let mut seen = std::collections::HashSet::<String>::new();
+        let flush = |items: &mut std::collections::BTreeMap<Id, Item>,
+                     current: &Option<Header>,
+                     attribute: &mut (Option<String>, Option<String>)| {
+            if let (Some(Header::Attribute(id)), (Some(name), Some(value))) =
+                (current, std::mem::take(attribute))
+            {
+                let item = items.entry(id.clone()).or_default();
+                match name.as_str() {
+                    "service" => item.service = Some(unescape(&value)),
+                    "username" => item.username = Some(unescape(&value)),
+                    _ => {}
+                }
+            }
+        };
+        for line in text.lines() {
+            if let Some(next) = header(line) {
+                flush(&mut items, &current, &mut attribute);
+                if let Header::Item(id) = &next {
+                    items.entry(id.clone()).or_default();
+                }
+                current = Some(next);
+                seen.clear();
+                continue;
+            }
+            if line.is_empty() {
+                continue;
+            }
+            let key = daemon_key(line);
+            let ok = match (&current, key) {
+                (Some(Header::Item(id)), Some(("secret", value))) => {
+                    if !value.starts_with(MARKER)
+                        && (value.contains('\\')
+                            || value.trim_matches(|c: char| c.is_ascii_whitespace()) != value)
+                    {
+                        items.entry(id.clone()).or_default().raw_unsafe = true;
+                    }
+                    true
+                }
+                // A secret that is not text, written as hex.
+                (Some(Header::Item(_)), Some(("binary-secret", _))) => true,
+                (
+                    Some(Header::Item(..)),
+                    Some(("item-type" | "display-name" | "mtime" | "ctime", _)),
+                ) => true,
+                (Some(Header::Attribute(_)), Some(("name", value))) => {
+                    attribute.0 = Some(value.to_string());
+                    true
+                }
+                (Some(Header::Attribute(_)), Some(("value", value))) => {
+                    attribute.1 = Some(value.to_string());
+                    true
+                }
+                (Some(Header::Attribute(_)), Some(("type", _))) => true,
+                (Some(Header::Keyring | Header::Acl), Some(_)) => true,
+                _ => false,
+            };
+            // A key the group already has is spill too: GKeyFile keeps the
+            // last copy, so the secret or its times read back wrong.
+            let repeated = key.is_some_and(|(name, _)| !seen.insert(name.to_string()));
+            if !ok || repeated {
+                file_damaged = true;
+            }
+        }
+        flush(&mut items, &current, &mut attribute);
+        let collection = collection_path(identifier);
+        items
+            .into_iter()
+            .filter_map(|((_, digits), item)| {
+                let account = item.username?;
+                (item.service.as_deref() == Some(super::SERVICE)
+                    && (file_damaged || item.raw_unsafe))
+                    .then(|| Damaged {
+                        path: format!("{collection}/{digits}"),
+                        account,
+                    })
+            })
+            .collect()
+    }
+
+    /// [`damaged_toolport_items`] for every unencrypted keyring file in
+    /// `dir`. Encrypted keyrings are skipped: they store any bytes.
+    pub(super) fn damaged_toolport_items_in(dir: &std::path::Path) -> Vec<Damaged> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "keyring") {
+                continue;
+            }
+            let (Some(identifier), Ok(bytes)) = (
+                path.file_stem().and_then(|stem| stem.to_str()),
+                std::fs::read(&path),
+            ) else {
+                continue;
+            };
+            if bytes.starts_with(b"[keyring]") {
+                found.extend(damaged_toolport_items(
+                    identifier,
+                    &String::from_utf8_lossy(&bytes),
+                ));
+            }
+        }
+        found
+    }
+
+    /// gnome-keyring's keyring directory for this user.
+    pub(super) fn keyring_dir() -> Option<std::path::PathBuf> {
+        let data = std::env::var_os("XDG_DATA_HOME")
+            .filter(|dir| !dir.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|home| home.join(".local/share")))?;
+        Some(data.join("keyrings"))
+    }
+
+    pub(super) fn encode(value: &str) -> Cow<'_, str> {
+        if needs_encoding(value) {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+            Cow::Owned(format!("{MARKER}{encoded}"))
+        } else {
+            Cow::Borrowed(value)
+        }
+    }
+
+    /// The value [`encode`] was given. `Err` when the marker is there but what
+    /// follows is not base64 of text.
+    pub(super) fn decode(stored: String) -> Result<String, String> {
+        let Some(encoded) = stored.strip_prefix(MARKER) else {
+            return Ok(stored);
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded.trim())
+            .map_err(|_| "stored secret has a damaged encoding".to_string())?;
+        String::from_utf8(bytes).map_err(|_| "stored secret has a damaged encoding".to_string())
+    }
 }
 
 // ── macOS ──────────────────────────────────────────────────────────────────
@@ -1074,7 +1356,8 @@ mod platform {
 
     pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
         invalidate_backup_read(server_id, key);
-        with_service(|| Entry::new(SERVICE, &account(server_id, key))?.set_password(value))
+        let stored = super::line_safe::encode(value);
+        with_service(|| Entry::new(SERVICE, &account(server_id, key))?.set_password(&stored))
             .map_err(|e| e.to_string())
     }
 
@@ -1097,7 +1380,9 @@ mod platform {
         read: Result<String, keyring::Error>,
     ) -> Result<Option<String>, super::ReadFailure> {
         match read {
-            Ok(v) => Ok(Some(v)),
+            Ok(v) => super::line_safe::decode(v)
+                .map(Some)
+                .map_err(super::ReadFailure::Damaged),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e @ keyring::Error::BadEncoding(_)) => {
                 Err(super::ReadFailure::Damaged(e.to_string()))
@@ -1338,8 +1623,9 @@ mod platform {
             backup_deadline()?;
             let bytes = item.get_secret().map_err(|error| classify(&error))?;
             String::from_utf8(bytes)
-                .map(Some)
                 .map_err(|_| State::Corrupt)
+                .and_then(|text| super::line_safe::decode(text).map_err(|_| State::Corrupt))
+                .map(Some)
         });
         BACKUP_BATCH.with(|slot| {
             if let Some(batch) = slot.borrow_mut().as_mut() {
@@ -1347,6 +1633,80 @@ mod platform {
             }
         });
         result
+    }
+
+    /// Re-store, encoded, each of the `damaged` items (found in an
+    /// unencrypted keyring file) that is unlocked at its path and whose live
+    /// value a key file line cannot carry: a line break breaks the whole
+    /// file, and a backslash or edge whitespace comes back changed, or with
+    /// line breaks, at the next load. The daemon still holds the items in memory and rewrites
+    /// its file on the change, so the keyring loads again at the next login.
+    /// Never unlocks or prompts; a locked item waits for a later start. Each
+    /// item takes the keyring locks on its own, so a gateway never waits
+    /// behind the whole pass.
+    pub(super) fn repair_line_unsafe_items(
+        damaged: &[super::line_safe::Damaged],
+    ) -> Result<usize, super::BackupSecretError> {
+        use super::BackupSecretError as State;
+        with_backup_batch(|| {
+            let mut repaired = 0;
+            for target in damaged {
+                let result = with_backup_service(|service| {
+                    // That file's item, opened by its path with no search: a
+                    // search of a locked store can ask (KeePassXC opens its
+                    // unlock dialog for one), and the same account elsewhere
+                    // (an encrypted keyring, another provider) stays unread.
+                    let Ok(path) = dbus_secret_service::Path::new(target.path.clone()) else {
+                        return Ok(false);
+                    };
+                    let item = dbus_secret_service::Item::new(service, path);
+                    // A property read; a missing item fails it.
+                    if item.is_locked().unwrap_or(true) {
+                        return Ok(false);
+                    }
+                    // Toolport's own item, by the daemon's live attributes,
+                    // never by what the file says.
+                    let ours = || -> Result<bool, State> {
+                        let attributes = item.get_attributes().map_err(|error| classify(&error))?;
+                        Ok(
+                            attributes.get("service").map(String::as_str) == Some(SERVICE)
+                                && attributes.get("username") == Some(&target.account),
+                        )
+                    };
+                    if !ours()? {
+                        return Ok(false);
+                    }
+                    let bytes = item.get_secret().map_err(|error| classify(&error))?;
+                    let Ok(text) = String::from_utf8(bytes) else {
+                        return Ok(false);
+                    };
+                    if text.starts_with(super::line_safe::MARKER)
+                        || !super::line_safe::needs_encoding(&text)
+                    {
+                        return Ok(false);
+                    }
+                    let stored = super::line_safe::encode(&text);
+                    // Again just before the write: the Secret Service has no
+                    // compare-and-set, so this keeps the window in which a
+                    // deleted item's path could name another app's new item
+                    // as small as it can be.
+                    if !ours()? {
+                        return Ok(false);
+                    }
+                    item.set_secret(stored.as_bytes(), "text/plain")
+                        .map_err(|error| classify(&error))?;
+                    Ok(true)
+                });
+                match result {
+                    Ok(true) => repaired += 1,
+                    Ok(false) => {}
+                    // Out of time or no service: keep what was re-stored.
+                    Err(State::Unavailable) => break,
+                    Err(_) => {}
+                }
+            }
+            Ok(repaired)
+        })
     }
 
     /// Never prompt, even if an item locks between SearchItems and Delete.
@@ -2731,6 +3091,47 @@ pub(crate) fn backup_secret_status(
     platform::get_backup_secret_status(owner.as_str(), key)
 }
 
+/// Start-up repair of Toolport items an older version stored raw in a way
+/// gnome-keyring's unencrypted keyring cannot hold (see [`line_safe`]): line
+/// breaks make the daemon reject the whole file at the next login. Only the
+/// items an unencrypted keyring file on disk shows damaged are read, and only
+/// in that file's own collection, so every other start reads no secret. A
+/// repaired credential reads as encoded text to a gateway still
+/// running from an older version until that gateway restarts; left raw, it
+/// would cost every app on the desktop its logins. Returns how many were
+/// re-stored; never prompts.
+pub(crate) fn repair_line_unsafe_items() -> usize {
+    #[cfg(test)]
+    {
+        0
+    }
+    #[cfg(all(not(test), not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        if file::active() || locked_store::locked() {
+            return 0;
+        }
+        let damaged = line_safe::keyring_dir()
+            .map(|dir| line_safe::damaged_toolport_items_in(&dir))
+            .unwrap_or_default();
+        if damaged.is_empty() {
+            return 0;
+        }
+        match platform::repair_line_unsafe_items(&damaged) {
+            Ok(0) | Err(_) => 0,
+            Ok(repaired) => {
+                crate::gatewaylog::append(&format!(
+                    "re-stored {repaired} keyring item(s) encoded that an unencrypted keyring could not hold; a gateway from an older version reads them after it restarts"
+                ));
+                repaired
+            }
+        }
+    }
+    #[cfg(all(not(test), any(target_os = "macos", target_os = "windows")))]
+    {
+        0
+    }
+}
+
 /// Vault-only backup access, with no interactive unlock during Linux recovery.
 pub(crate) fn get_backup_secret_result(
     server_id: &str,
@@ -3224,6 +3625,272 @@ pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    #[test]
+    fn ordinary_values_are_stored_exactly_as_before() {
+        for value in ["sk-abc123", "", "a b", "{\"token\":\"x\"}", "pässwörd"] {
+            assert!(matches!(
+                line_safe::encode(value),
+                std::borrow::Cow::Borrowed(_)
+            ));
+            assert_eq!(line_safe::decode(value.to_string()).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn values_a_key_file_line_cannot_carry_round_trip_encoded() {
+        let config = "model = \"x\"\n\n[projects.\"/home/a\"]\ntrust_level = \"trusted\"\n";
+        for value in [
+            config,
+            "line\r\nbreak",
+            " leading",
+            "trailing ",
+            "tab\tinside",
+            "nul\0inside",
+            r#"{"path":"C:\\Users\\a"}"#,
+            r"literal \n",
+            "toolport-line-safe-b64:looks encoded",
+        ] {
+            let stored = line_safe::encode(value);
+            assert!(stored.starts_with(line_safe::MARKER), "{value:?}");
+            assert!(!stored.chars().any(char::is_control), "{value:?}");
+            assert_eq!(stored.trim(), stored);
+            assert_eq!(line_safe::decode(stored.into_owned()).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn unicode_edge_whitespace_is_not_encoded() {
+        // GKeyFile strips ASCII whitespace only, so these are stored raw.
+        assert!(!line_safe::needs_encoding("token\u{a0}"));
+        assert!(!line_safe::needs_encoding("\u{2009}token"));
+    }
+
+    #[test]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    fn the_keyring_dir_is_gnome_keyrings_own() {
+        if let Some(dir) = line_safe::keyring_dir() {
+            assert!(dir.ends_with("keyrings"), "{}", dir.display());
+        }
+    }
+
+    const LOADABLE_KEYRING: &str = "[keyring]\ndisplay-name=Default keyring\nctime=0\nmtime=0\nlock-on-idle=false\nlock-after=false\n\n[6]\nitem-type=0\ndisplay-name=Chromium Safe Storage\nsecret=abc=def\nmtime=1\nctime=1\n\n[6:attribute0]\nname=application\ntype=string\nvalue=chromium\n";
+
+    #[test]
+    fn the_daemons_own_keyring_file_loads() {
+        assert!(!line_safe::unloadable_key_file(LOADABLE_KEYRING));
+        let with_acl = format!(
+            "{LOADABLE_KEYRING}\n[6:acl0]\ndisplay-name=app\npath=/usr/bin/app\ntypes-allowed=all\n"
+        );
+        assert!(!line_safe::unloadable_key_file(&with_acl));
+        assert!(line_safe::damaged_toolport_items("Default_keyring", &with_acl).is_empty());
+    }
+
+    /// An unencrypted keyring item as the daemon writes it, `secret` raw.
+    fn keyring_item(id: u64, service: &str, username: &str, secret: &str) -> String {
+        format!(
+            "\n[{id}]\nitem-type=0\ndisplay-name={username}\nsecret={secret}\nmtime=1\nctime=1\n\n[{id}:attribute0]\nname=service\ntype=string\nvalue={service}\n\n[{id}:attribute1]\nname=username\ntype=string\nvalue={username}\n"
+        )
+    }
+
+    #[test]
+    fn only_toolport_items_stored_raw_in_a_damaging_way_are_repaired() {
+        let backup = format!("{BACKUP_ACCOUNT_PREFIX}abc::9");
+        let encoded = line_safe::encode("a\nb").into_owned();
+        let text = [
+            LOADABLE_KEYRING.to_string(),
+            // A raw multi-line backup: its lines spill into the file.
+            keyring_item(
+                7,
+                SERVICE,
+                &backup,
+                "model = \"x\"\n[projects.\"/a\"]\nenabled=true",
+            ),
+            // A raw multi-line credential.
+            keyring_item(
+                8,
+                SERVICE,
+                "srv::PEM",
+                "-----BEGIN-----\nMIIabc\n-----END-----",
+            ),
+            // A backup whose backslash the daemon unescapes at a reload.
+            keyring_item(
+                9,
+                SERVICE,
+                &format!("{BACKUP_ACCOUNT_PREFIX}def::1"),
+                r"C:\\Users",
+            ),
+            // A credential with a backslash comes back changed at a reload.
+            keyring_item(10, SERVICE, "srv::PATH", r"C:\\Users"),
+            // Already encoded, and another app's damage: not Toolport's.
+            keyring_item(11, SERVICE, "srv::NEW", &encoded),
+            keyring_item(12, "other-app", "x", "a\nb"),
+            // A binary secret is the daemon's own key, not spill to blame on
+            // the healthy Toolport item before it.
+            keyring_item(19, SERVICE, "srv::OK", "fine"),
+            keyring_item(16, SERVICE, "srv::BIN", "x").replace("secret=x", "binary-secret=00ff"),
+            // Key-shaped spill after a line that reads as a header.
+            keyring_item(17, SERVICE, "srv::FAKE", "a\n[5]\nk=v"),
+            // Spill made only of the item's own keys.
+            keyring_item(18, SERVICE, "srv::DUP", "tok\nmtime=5"),
+            // Continuation lines that pass as keys still belong to the item.
+            keyring_item(13, SERVICE, "srv::JSON", "{\nenabled=true\n}"),
+            // A raw secret holding a line that reads as another item's header.
+            keyring_item(5, "other-app", "y", "fine"),
+            keyring_item(14, SERVICE, "srv::HDR", "line1\n[5]\nfoo"),
+            // The file escapes attribute values; the account is unescaped.
+            keyring_item(15, SERVICE, r"srv::A\\B", "a\nb c"),
+        ]
+        .concat();
+        let found = line_safe::damaged_toolport_items("Default_keyring", &text);
+        let path = |id: u64| format!("/org/freedesktop/secrets/collection/Default_5fkeyring/{id}");
+        // Spilled lines can pass for another item's header, so in a damaged
+        // file every Toolport item is a candidate, and no other app's item
+        // ever is. The repair checks each live value before it writes.
+        let toolport: Vec<(u64, String)> = vec![
+            (7, backup.clone()),
+            (8, "srv::PEM".into()),
+            (9, format!("{BACKUP_ACCOUNT_PREFIX}def::1")),
+            (10, "srv::PATH".into()),
+            (11, "srv::NEW".into()),
+            (13, "srv::JSON".into()),
+            (14, "srv::HDR".into()),
+            (15, r"srv::A\B".into()),
+            (16, "srv::BIN".into()),
+            (17, "srv::FAKE".into()),
+            (18, "srv::DUP".into()),
+            (19, "srv::OK".into()),
+        ];
+        assert_eq!(
+            found,
+            toolport
+                .into_iter()
+                .map(|(id, account)| line_safe::Damaged {
+                    path: path(id),
+                    account
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn in_a_loadable_file_only_raw_values_the_daemon_changes_are_candidates() {
+        let encoded = line_safe::encode(r"C:\x").into_owned();
+        let text = [
+            LOADABLE_KEYRING.to_string(),
+            // The daemon unescapes these at its next load; `\n` turns into
+            // a line break that breaks the file at the save after that.
+            keyring_item(
+                1,
+                SERVICE,
+                &format!("{BACKUP_ACCOUNT_PREFIX}a::1"),
+                r#"{"note":"a\nb \"q\""}"#,
+            ),
+            keyring_item(
+                2,
+                SERVICE,
+                "srv::KEY",
+                r#"{"private_key":"-----BEGIN-----\nMII"}"#,
+            ),
+            keyring_item(3, SERVICE, "srv::PAD", " padded"),
+            // Stored as before and read back as before.
+            keyring_item(4, SERVICE, "srv::PLAIN", "plain-token-123"),
+            keyring_item(5, SERVICE, "srv::ENC", &encoded),
+            // Another app's backslash is never Toolport's to touch.
+            keyring_item(26, "other-app", "u", r"C:\Users"),
+        ]
+        .concat();
+        assert!(!line_safe::unloadable_key_file(&text));
+        let found = line_safe::damaged_toolport_items("Default_keyring", &text);
+        let accounts: Vec<_> = found.iter().map(|item| item.account.as_str()).collect();
+        assert_eq!(
+            accounts,
+            vec![
+                format!("{BACKUP_ACCOUNT_PREFIX}a::1").as_str(),
+                "srv::KEY",
+                "srv::PAD"
+            ]
+        );
+    }
+
+    #[test]
+    fn collection_paths_escape_like_gnome_keyring() {
+        assert_eq!(
+            line_safe::collection_path("Default_keyring"),
+            "/org/freedesktop/secrets/collection/Default_5fkeyring"
+        );
+        assert_eq!(
+            line_safe::collection_path("login"),
+            "/org/freedesktop/secrets/collection/login"
+        );
+        assert_eq!(
+            line_safe::collection_path("my keys-2"),
+            "/org/freedesktop/secrets/collection/my_20keys_2d2"
+        );
+    }
+
+    #[test]
+    fn a_raw_config_in_a_keyring_file_is_caught() {
+        for raw in [
+            "secret=model = \"x\"\n[[skills.config]]\nenabled = true\n",
+            "secret=model = \"x\"\n[projects.\"/home/a\"]\ntrust_level = \"trusted\"\n",
+            "secret=-----BEGIN KEY-----\nMIIabc\n-----END KEY-----\n",
+        ] {
+            let text = format!("{LOADABLE_KEYRING}\n[7]\nitem-type=0\n{raw}mtime=1\nctime=1\n");
+            assert!(line_safe::unloadable_key_file(&text), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn the_start_up_repair_reads_only_unencrypted_files_with_damage() {
+        let root = std::env::temp_dir().join(format!(
+            "toolport-line-safe-keyrings-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        struct Remove(std::path::PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _remove = Remove(root.clone());
+        let dir = root.as_path();
+        assert!(line_safe::damaged_toolport_items_in(&dir.join("missing")).is_empty());
+        std::fs::write(dir.join("Default_keyring.keyring"), LOADABLE_KEYRING).unwrap();
+        // An encrypted keyring holds any bytes; its lines mean nothing.
+        std::fs::write(
+            dir.join("login.keyring"),
+            b"GnomeKeyring\n\r\0\n\0\0\0\0garbage\n[1]\nmore\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("notes.txt"), "[[not a keyring]]\n").unwrap();
+        assert!(line_safe::damaged_toolport_items_in(dir).is_empty());
+        std::fs::write(
+            dir.join("Other.keyring"),
+            format!(
+                "{LOADABLE_KEYRING}{}",
+                keyring_item(7, SERVICE, "srv::KEY", "a = 1\n[[x]]")
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            line_safe::damaged_toolport_items_in(dir),
+            vec![line_safe::Damaged {
+                path: "/org/freedesktop/secrets/collection/Other/7".into(),
+                account: "srv::KEY".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_damaged_encoded_value_is_an_error_not_garbage() {
+        assert!(line_safe::decode(format!("{}not base64!", line_safe::MARKER)).is_err());
+        let not_text =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0xff, 0xfe]);
+        assert!(line_safe::decode(format!("{}{not_text}", line_safe::MARKER)).is_err());
+    }
+
     /// Serializes tests that read or mutate the process-global `CONDUIT_SECRET_KEY`
     /// env var (and thus `file::active()`). Without this, a test that sets the var
     /// races with a sibling that assumes the keychain path, causing spurious
@@ -3645,6 +4312,408 @@ pub(crate) mod tests {
         assert_eq!(get_secret(sid, key).as_deref(), Some("s3cr3t"));
         delete_secret(sid, key).unwrap();
         assert_eq!(get_secret(sid, key), None);
+    }
+
+    /// Run against a throwaway gnome-keyring whose default keyring is the
+    /// unencrypted kind, with `TOOLPORT_TEST_PLAINTEXT_KEYRING` naming its file.
+    #[test]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    #[ignore = "needs a throwaway gnome-keyring with an unencrypted default keyring"]
+    fn line_breaks_never_break_an_unencrypted_gnome_keyring() {
+        let Some(file) = std::env::var_os("TOOLPORT_TEST_PLAINTEXT_KEYRING") else {
+            panic!("set TOOLPORT_TEST_PLAINTEXT_KEYRING to the keyring file");
+        };
+        let _data = crate::registry::DataDirTestEnv::new(
+            "line_breaks_never_break_an_unencrypted_gnome_keyring",
+        );
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::path::Path::new(&file).parent().unwrap().to_path_buf();
+        let parses = || {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let loads = !line_safe::unloadable_key_file(&text);
+            assert_eq!(loads, line_safe::damaged_toolport_items_in(&dir).is_empty());
+            loads
+        };
+        let settle = |want: bool| {
+            for _ in 0..50 {
+                if parses() == want {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            false
+        };
+        let config = "model = \"x\"\n\n[projects.\"/home/a\"]\ntrust_level = \"trusted\"\n[[skills.config]]\n";
+        let (old, new, key) = (
+            "client-backup-line-safe-old",
+            "client-backup-line-safe-new",
+            "CLIENT_BACKUP",
+        );
+        let (pem_sid, path_sid, cred_key) = ("line-safe-pem", "line-safe-path", "API_KEY");
+        let pem = "-----BEGIN KEY-----\nabc\n-----END KEY-----\n";
+        let windows_path = r"C:\Users\a";
+        let _old_cleanup = SecretCleanupGuard::new(old, key);
+        let _new_cleanup = SecretCleanupGuard::new(new, key);
+        let _pem_cleanup = SecretCleanupGuard::new(pem_sid, cred_key);
+        let _path_cleanup = SecretCleanupGuard::new(path_sid, cred_key);
+        let raw = |sid: &str, key: &str| {
+            let owner = crate::local_auth::owner(sid).unwrap();
+            keyring::Entry::new(SERVICE, &account(&owner, key)).unwrap()
+        };
+
+        // What 2.3.6 to 2.4.2 did: the text raw, which the daemon writes raw.
+        raw(old, key).set_password(config).unwrap();
+        raw(pem_sid, cred_key).set_password(pem).unwrap();
+        // Comes back changed at a reload, so it is repaired too.
+        raw(path_sid, cred_key).set_password(windows_path).unwrap();
+        assert!(
+            settle(false),
+            "the raw write must reproduce the broken file"
+        );
+
+        let damaged = line_safe::damaged_toolport_items_in(&dir);
+        assert_eq!(damaged.len(), 3, "{damaged:?}");
+        assert!(damaged.iter().all(|item| item
+            .path
+            .starts_with("/org/freedesktop/secrets/collection/Default_5fkeyring/")));
+        assert_eq!(platform::repair_line_unsafe_items(&damaged).unwrap(), 3);
+        assert!(settle(true), "the repair leaves a file the daemon can load");
+        assert_eq!(
+            get_secret(path_sid, cred_key).as_deref(),
+            Some(windows_path)
+        );
+        set_secret(new, key, config).unwrap();
+        assert!(settle(true), "a new write stays loadable");
+        assert_eq!(get_secret(old, key).as_deref(), Some(config));
+        assert_eq!(get_secret(new, key).as_deref(), Some(config));
+        assert_eq!(get_secret(pem_sid, cred_key).as_deref(), Some(pem));
+        assert!(line_safe::damaged_toolport_items_in(&dir).is_empty());
+        assert_eq!(platform::repair_line_unsafe_items(&damaged).unwrap(), 0);
+    }
+
+    /// Values read back after gnome-keyring reloads its unencrypted file:
+    /// `TOOLPORT_TEST_KEYRING_PHASE=write`, restart the daemon, then `=read`.
+    #[test]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    #[ignore = "needs a throwaway gnome-keyring restarted between two runs"]
+    fn values_survive_an_unencrypted_gnome_keyring_reload() {
+        let phase = std::env::var("TOOLPORT_TEST_KEYRING_PHASE").unwrap_or_default();
+        let _data = crate::registry::DataDirTestEnv::new(
+            "values_survive_an_unencrypted_gnome_keyring_reload",
+        );
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sid = "line-safe-reload";
+        let values = [
+            "model = \"x\"\n[projects.\"/home/a\"]\n[[skills.config]]\n",
+            r#"{"path":"C:\\Users\\a","quote":"say \"hi\""}"#,
+            r"literal \n and \t and \\ and \s",
+            " padded ",
+            "plain-token-123",
+        ];
+        match phase.as_str() {
+            "write" => {
+                for (index, value) in values.iter().enumerate() {
+                    set_secret(sid, &format!("K{index}"), value).unwrap();
+                }
+            }
+            "read" => {
+                for (index, value) in values.iter().enumerate() {
+                    let key = format!("K{index}");
+                    assert_eq!(get_secret(sid, &key).as_deref(), Some(*value), "{key}");
+                    delete_secret(sid, &key).unwrap();
+                }
+            }
+            other => panic!("set TOOLPORT_TEST_KEYRING_PHASE to write or read, not {other:?}"),
+        }
+    }
+
+    /// The damage check on a real keyring file named by
+    /// `TOOLPORT_TEST_KEYRING_FILE`, expecting `TOOLPORT_TEST_EXPECT_DAMAGED`
+    /// items. Prints only item paths and accounts, never a secret.
+    #[test]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    #[ignore = "reads a keyring file named by TOOLPORT_TEST_KEYRING_FILE"]
+    fn the_damage_check_on_a_real_keyring_file() {
+        let file = std::path::PathBuf::from(
+            std::env::var_os("TOOLPORT_TEST_KEYRING_FILE").expect("keyring file"),
+        );
+        let expect: usize = std::env::var("TOOLPORT_TEST_EXPECT_DAMAGED")
+            .expect("expected count")
+            .parse()
+            .unwrap();
+        let text = String::from_utf8_lossy(&std::fs::read(&file).unwrap()).into_owned();
+        let identifier = file.file_stem().unwrap().to_str().unwrap();
+        let damaged = line_safe::damaged_toolport_items(identifier, &text);
+        for item in &damaged {
+            println!("damaged: {} {}", item.path, item.account);
+        }
+        assert_eq!(damaged.len(), expect);
+    }
+
+    /// A foreign test item: label, attributes, secret.
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    type ForeignItem = (
+        &'static str,
+        Vec<(&'static str, &'static str)>,
+        &'static str,
+    );
+
+    /// Items by path: label, sorted attributes, secret bytes.
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    type ItemSnapshot =
+        std::collections::BTreeMap<String, (String, Vec<(String, String)>, Vec<u8>)>;
+
+    /// Every item in every collection that is not Toolport's, as
+    /// `path -> (label, sorted attributes, secret bytes)`. The repair must
+    /// never change one, add one or remove one.
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    fn foreign_items_snapshot() -> ItemSnapshot {
+        let service =
+            dbus_secret_service::SecretService::connect(dbus_secret_service::EncryptionType::Dh)
+                .unwrap();
+        let mut out = std::collections::BTreeMap::new();
+        for collection in service.get_all_collections().unwrap() {
+            for item in collection.get_all_items().unwrap() {
+                let attributes = item.get_attributes().unwrap();
+                if attributes.get("service").map(String::as_str) == Some(SERVICE) {
+                    continue;
+                }
+                let mut sorted: Vec<_> = attributes.into_iter().collect();
+                sorted.sort();
+                out.insert(
+                    item.path.to_string(),
+                    (
+                        item.get_label().unwrap(),
+                        sorted,
+                        item.get_secret().unwrap(),
+                    ),
+                );
+            }
+        }
+        out
+    }
+
+    /// Other apps' items in an unencrypted keyring that also holds Toolport
+    /// items 2.3.6 to 2.4.2 stored raw. Run by a script that drives a
+    /// throwaway gnome-keyring through `TOOLPORT_TEST_KEYRING_PHASE`:
+    /// `seed` (raw Toolport items beside other apps' items), `repair` (the
+    /// start-up repair; nothing foreign changes), the daemon restarted to
+    /// reload the file, then `reloaded` (the file loaded; every item reads
+    /// back). `TOOLPORT_TEST_SNAPSHOT` names a file kept between phases.
+    /// `broken` instead runs the repair after the daemon already rejected
+    /// the file at start, as at the login after the bug: nothing may change.
+    #[test]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    #[ignore = "needs a throwaway gnome-keyring driven through several phases"]
+    fn the_start_up_repair_never_touches_another_apps_items() {
+        let phase = std::env::var("TOOLPORT_TEST_KEYRING_PHASE").unwrap_or_default();
+        let file = std::path::PathBuf::from(
+            std::env::var_os("TOOLPORT_TEST_PLAINTEXT_KEYRING").expect("keyring file"),
+        );
+        let dir = file.parent().unwrap().to_path_buf();
+        let snapshot_file =
+            std::path::PathBuf::from(std::env::var_os("TOOLPORT_TEST_SNAPSHOT").expect("snapshot"));
+        let _data = crate::registry::DataDirTestEnv::new(
+            "the_start_up_repair_never_touches_another_apps_items",
+        );
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let config = "model = \"x\"\n\n[projects.\"/home/a\"]\ntrust_level = \"trusted\"\n[[skills.config]]\nenabled = true\n[4:attribute0]\nname=service\n";
+        let pem = "-----BEGIN KEY-----\nabc\n-----END KEY-----\n";
+        // A JSON client config holds escapes: one line, but the daemon
+        // unescapes it when it reloads the file (two such backups on the
+        // machine that found the bug came back empty).
+        let json_config = r#"{"mcpServers":{"a":{"command":"C:\\bin\\a.exe","args":["--x"],"note":"line one\nline two \"quoted\""}}}"#;
+        let sa_json = r#"{"type":"service_account","private_key":"-----BEGIN PRIVATE KEY-----\nMIIEv\n-----END PRIVATE KEY-----\n"}"#;
+        let all_toolport = [
+            ("client-backup-scenario", "CLIENT_BACKUP", config),
+            ("client-backup-scenario-json", "CLIENT_BACKUP", json_config),
+            ("scenario-pem", "API_KEY", pem),
+            // A service account key: one line, with `\n` escapes.
+            ("scenario-sa", "GOOGLE_CREDENTIALS", sa_json),
+            ("scenario-plain", "API_KEY", "plain-token-123"),
+        ];
+        // `TOOLPORT_TEST_SCENARIO=escapes`: only one-line values, so the file
+        // still loads and the repair finds them by their raw escapes alone.
+        let escapes_only = std::env::var("TOOLPORT_TEST_SCENARIO").as_deref() == Ok("escapes");
+        let toolport: Vec<_> = all_toolport
+            .into_iter()
+            .filter(|(_, _, value)| !escapes_only || !value.contains('\n'))
+            .collect();
+        let expect_candidates = if toolport.iter().any(|(_, _, v)| v.contains('\n')) {
+            toolport.len()
+        } else {
+            toolport
+                .iter()
+                .filter(|(_, _, v)| v.contains('\\') || v.trim() != *v)
+                .count()
+        };
+
+        let raw = |sid: &str, key: &str| {
+            let owner = crate::local_auth::owner(sid).unwrap();
+            keyring::Entry::new(SERVICE, &account(&owner, key)).unwrap()
+        };
+        let save = |snapshot: &ItemSnapshot| {
+            std::fs::write(&snapshot_file, serde_json::to_vec(snapshot).unwrap()).unwrap();
+        };
+        let load = || -> ItemSnapshot {
+            serde_json::from_slice(&std::fs::read(&snapshot_file).unwrap()).unwrap()
+        };
+        match phase.as_str() {
+            "seed" => {
+                let service = dbus_secret_service::SecretService::connect(
+                    dbus_secret_service::EncryptionType::Dh,
+                )
+                .unwrap();
+                let collection = service.get_default_collection().unwrap();
+                // Shapes other apps store: browsers' cookie keys, a token
+                // JSON, and look-alikes of Toolport's own attributes.
+                let foreign: [ForeignItem; 6] = [
+                    (
+                        "Chromium Safe Storage",
+                        vec![
+                            ("application", "chromium"),
+                            ("xdg:schema", "chrome_libsecret_os_crypt_password_v2"),
+                        ],
+                        "dGhpcyBpcyBub3QgYSByZWFsIGtleQ==",
+                    ),
+                    (
+                        "Brave Safe Storage",
+                        vec![
+                            ("application", "brave"),
+                            ("xdg:schema", "chrome_libsecret_os_crypt_password_v2"),
+                        ],
+                        "YW5vdGhlciBmYWtlIGtleQ==",
+                    ),
+                    (
+                        "Some app token",
+                        vec![("service", "some-app"), ("username", "me@example.com")],
+                        "{\"access\":\"a.b.c\",\"refresh\":\"r\",\"exp\":1795575891}",
+                    ),
+                    (
+                        "Look-alike backup",
+                        vec![
+                            ("service", "conduit-mcp-other"),
+                            ("username", "client-backup-abc"),
+                        ],
+                        "not toolport's",
+                    ),
+                    (
+                        "Look-alike service",
+                        vec![
+                            ("service", "other"),
+                            ("username", "client-backup-def::CLIENT_BACKUP"),
+                        ],
+                        "also not toolport's",
+                    ),
+                    (
+                        "Padded but harmless",
+                        vec![("service", "padded-app"), ("username", "u")],
+                        "value with = and [brackets] and unicode é",
+                    ),
+                ];
+                for (label, attributes, secret) in &foreign {
+                    // Named here, as libsecret clients do: the daemon adds
+                    // the generic schema to an item without one on reload.
+                    let mut attributes: std::collections::HashMap<&str, &str> =
+                        attributes.iter().copied().collect();
+                    attributes
+                        .entry("xdg:schema")
+                        .or_insert("org.freedesktop.Secret.Generic");
+                    collection
+                        .create_item(label, attributes, secret.as_bytes(), true, "text/plain")
+                        .unwrap();
+                }
+                // What 2.3.6 to 2.4.2 stored, raw, between other apps' items.
+                for (sid, key, value) in toolport {
+                    raw(sid, key).set_password(value).unwrap();
+                }
+                let snapshot = foreign_items_snapshot();
+                assert_eq!(snapshot.len(), foreign.len());
+                save(&snapshot);
+            }
+            "repair" => {
+                // What the daemon holds now. gnome-keyring 50 reloads its own
+                // file while it runs, so a raw escape can be unescaped before
+                // any repair; the repair keeps what is held, never less.
+                let held: Vec<String> = toolport
+                    .iter()
+                    .map(|(sid, key, _)| raw(sid, key).get_password().unwrap())
+                    .collect();
+                for ((sid, _, value), now) in toolport.iter().zip(&held) {
+                    if now != value {
+                        println!("NOTICE: the daemon had already changed {sid} before the repair");
+                    }
+                }
+                std::fs::write(
+                    snapshot_file.with_extension("held"),
+                    serde_json::to_vec(&held).unwrap(),
+                )
+                .unwrap();
+                let damaged = line_safe::damaged_toolport_items_in(&dir);
+                assert_eq!(damaged.len(), expect_candidates, "{damaged:?}");
+                // Only what is held now can be kept; a value the daemon
+                // already emptied has nothing to encode.
+                let expect_repaired = held
+                    .iter()
+                    .filter(|value| line_safe::needs_encoding(value))
+                    .count();
+                assert_eq!(
+                    platform::repair_line_unsafe_items(&damaged).unwrap(),
+                    expect_repaired
+                );
+                assert_eq!(foreign_items_snapshot(), load(), "a foreign item changed");
+                for ((sid, key, _), held) in toolport.iter().zip(&held) {
+                    assert_eq!(get_secret(sid, key).as_ref(), Some(held), "{sid}");
+                }
+                // The plain credential is left exactly as it was stored.
+                assert_eq!(
+                    raw("scenario-plain", "API_KEY").get_password().unwrap(),
+                    "plain-token-123"
+                );
+                assert!(line_safe::damaged_toolport_items_in(&dir).is_empty());
+            }
+            "reloaded" => {
+                assert_eq!(foreign_items_snapshot(), load(), "a foreign item changed");
+                let held: Vec<String> = serde_json::from_slice(
+                    &std::fs::read(snapshot_file.with_extension("held")).unwrap(),
+                )
+                .unwrap();
+                for ((sid, key, _), held) in toolport.iter().zip(&held) {
+                    assert_eq!(get_secret(sid, key).as_ref(), Some(held), "{sid}");
+                }
+                assert!(line_safe::damaged_toolport_items_in(&dir).is_empty());
+                assert_eq!(
+                    platform::repair_line_unsafe_items(&line_safe::damaged_toolport_items_in(&dir))
+                        .unwrap(),
+                    0
+                );
+            }
+            "broken" => {
+                let before_file = std::fs::read(&file).unwrap();
+                let mut before_dir: Vec<_> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect();
+                before_dir.sort();
+                let before_items = foreign_items_snapshot();
+                let damaged = line_safe::damaged_toolport_items_in(&dir);
+                assert!(!damaged.is_empty(), "the file on disk shows the damage");
+                assert_eq!(platform::repair_line_unsafe_items(&damaged).unwrap(), 0);
+                assert_eq!(
+                    std::fs::read(&file).unwrap(),
+                    before_file,
+                    "the file changed"
+                );
+                let mut after_dir: Vec<_> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect();
+                after_dir.sort();
+                assert_eq!(after_dir, before_dir, "a keyring file was added or removed");
+                assert_eq!(foreign_items_snapshot(), before_items);
+            }
+            other => panic!("unknown TOOLPORT_TEST_KEYRING_PHASE {other:?}"),
+        }
     }
 
     #[test]
