@@ -71,12 +71,6 @@ mod line_safe {
             || value.trim_matches(|c: char| c.is_ascii_whitespace()) != value
     }
 
-    /// True when `value`, stored raw, breaks the whole keyring file rather
-    /// than only reading back changed.
-    pub(super) fn breaks_key_file(value: &str) -> bool {
-        value.contains(['\n', '\r'])
-    }
-
     /// A gnome-keyring group header: `[keyring]`, an item `[N]`, or one of
     /// its `[N:attributeM]` or `[N:aclM]` groups.
     /// An item id, as a number (for order) and as written (for its path).
@@ -174,23 +168,23 @@ mod line_safe {
     }
 
     /// The Toolport items in unencrypted keyring file `text` (collection
-    /// `identifier`) that were stored raw and damage it: a value whose line
-    /// breaks spill into lines of their own, or a client backup holding a
-    /// backslash, which the daemon unescapes when it loads the file. Lines
-    /// that are not the daemon's belong to the item before them.
+    /// `identifier`) that may hold a value stored raw that the file cannot
+    /// carry. When any line is not the daemon's (a value's line breaks
+    /// spilled into lines of their own) every Toolport item in the file is a
+    /// candidate: a spilled line can read as another item's header, so the
+    /// owner cannot be told from the text. Otherwise the candidates are the
+    /// Toolport items whose raw line holds a backslash or edge whitespace,
+    /// which the daemon changes when it loads the file again. The repair
+    /// checks each candidate's live value, so a candidate needs no repair.
     pub(super) fn damaged_toolport_items(identifier: &str, text: &str) -> Vec<Damaged> {
         #[derive(Default)]
         struct Item {
-            damaged: bool,
-            raw_backslash: bool,
+            raw_unsafe: bool,
             service: Option<String>,
             username: Option<String>,
         }
         let mut items = std::collections::BTreeMap::<Id, Item>::new();
-        // Stray lines belong to the item whose secret came last: a raw
-        // secret can hold a line that reads as another item's header.
-        let mut last: Option<Id> = None;
-        let mut secret_owner: Option<Id> = None;
+        let mut file_damaged = false;
         let mut attribute: (Option<String>, Option<String>) = (None, None);
         let mut current: Option<Header> = None;
         let mut seen = std::collections::HashSet::<String>::new();
@@ -213,7 +207,6 @@ mod line_safe {
                 flush(&mut items, &current, &mut attribute);
                 if let Header::Item(id) = &next {
                     items.entry(id.clone()).or_default();
-                    last = Some(id.clone());
                 }
                 current = Some(next);
                 seen.clear();
@@ -225,17 +218,16 @@ mod line_safe {
             let key = daemon_key(line);
             let ok = match (&current, key) {
                 (Some(Header::Item(id)), Some(("secret", value))) => {
-                    secret_owner = Some(id.clone());
-                    if !value.starts_with(MARKER) && value.contains('\\') {
-                        items.entry(id.clone()).or_default().raw_backslash = true;
+                    if !value.starts_with(MARKER)
+                        && (value.contains('\\')
+                            || value.trim_matches(|c: char| c.is_ascii_whitespace()) != value)
+                    {
+                        items.entry(id.clone()).or_default().raw_unsafe = true;
                     }
                     true
                 }
                 // A secret that is not text, written as hex.
-                (Some(Header::Item(id)), Some(("binary-secret", _))) => {
-                    secret_owner = Some(id.clone());
-                    true
-                }
+                (Some(Header::Item(_)), Some(("binary-secret", _))) => true,
                 (
                     Some(Header::Item(..)),
                     Some(("item-type" | "display-name" | "mtime" | "ctime", _)),
@@ -256,9 +248,7 @@ mod line_safe {
             // last copy, so the secret or its times read back wrong.
             let repeated = key.is_some_and(|(name, _)| !seen.insert(name.to_string()));
             if !ok || repeated {
-                if let Some(id) = secret_owner.clone().or_else(|| last.clone()) {
-                    items.entry(id).or_default().damaged = true;
-                }
+                file_damaged = true;
             }
         }
         flush(&mut items, &current, &mut attribute);
@@ -267,9 +257,8 @@ mod line_safe {
             .into_iter()
             .filter_map(|((_, digits), item)| {
                 let account = item.username?;
-                let backup = account.starts_with(super::BACKUP_ACCOUNT_PREFIX);
                 (item.service.as_deref() == Some(super::SERVICE)
-                    && (item.damaged || backup && item.raw_backslash))
+                    && (file_damaged || item.raw_unsafe))
                     .then(|| Damaged {
                         path: format!("{collection}/{digits}"),
                         account,
@@ -1647,10 +1636,10 @@ mod platform {
     }
 
     /// Re-store, encoded, each of the `damaged` items (found in an
-    /// unencrypted keyring file) that is unlocked at its path: any value
-    /// with a line break (those break the whole file), and client backups
-    /// (whole config files only the app reads) with anything a key file line
-    /// cannot carry. The daemon still holds the items in memory and rewrites
+    /// unencrypted keyring file) that is unlocked at its path and whose live
+    /// value a key file line cannot carry: a line break breaks the whole
+    /// file, and a backslash or edge whitespace comes back changed, or with
+    /// line breaks, at the next load. The daemon still holds the items in memory and rewrites
     /// its file on the change, so the keyring loads again at the next login.
     /// Never unlocks or prompts; a locked item waits for a later start. Each
     /// item takes the keyring locks on its own, so a gateway never waits
@@ -1662,7 +1651,6 @@ mod platform {
         with_backup_batch(|| {
             let mut repaired = 0;
             for target in damaged {
-                let backup = target.account.starts_with(super::BACKUP_ACCOUNT_PREFIX);
                 let result = with_backup_service(|service| {
                     // That file's item, opened by its path with no search: a
                     // search of a locked store can ask (KeePassXC opens its
@@ -1686,12 +1674,9 @@ mod platform {
                     let Ok(text) = String::from_utf8(bytes) else {
                         return Ok(false);
                     };
-                    let line_unsafe = if backup {
-                        super::line_safe::needs_encoding(&text)
-                    } else {
-                        super::line_safe::breaks_key_file(&text)
-                    };
-                    if text.starts_with(super::line_safe::MARKER) || !line_unsafe {
+                    if text.starts_with(super::line_safe::MARKER)
+                        || !super::line_safe::needs_encoding(&text)
+                    {
                         return Ok(false);
                     }
                     let stored = super::line_safe::encode(&text);
@@ -3098,7 +3083,7 @@ pub(crate) fn backup_secret_status(
 /// breaks make the daemon reject the whole file at the next login. Only the
 /// items an unencrypted keyring file on disk shows damaged are read, and only
 /// in that file's own collection, so every other start reads no secret. A
-/// repaired multi-line credential reads as encoded text to a gateway still
+/// repaired credential reads as encoded text to a gateway still
 /// running from an older version until that gateway restarts; left raw, it
 /// would cost every app on the desktop its logins. Returns how many were
 /// re-stored; never prompts.
@@ -3675,14 +3660,6 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn only_line_breaks_break_the_keyring_file() {
-        assert!(line_safe::breaks_key_file("a\nb"));
-        assert!(line_safe::breaks_key_file("a\rb"));
-        assert!(!line_safe::breaks_key_file(r"C:\Users\a"));
-        assert!(!line_safe::breaks_key_file(" padded "));
-    }
-
     const LOADABLE_KEYRING: &str = "[keyring]\ndisplay-name=Default keyring\nctime=0\nmtime=0\nlock-on-idle=false\nlock-after=false\n\n[6]\nitem-type=0\ndisplay-name=Chromium Safe Storage\nsecret=abc=def\nmtime=1\nctime=1\n\n[6:attribute0]\nname=application\ntype=string\nvalue=chromium\n";
 
     #[test]
@@ -3753,41 +3730,71 @@ pub(crate) mod tests {
         .concat();
         let found = line_safe::damaged_toolport_items("Default_keyring", &text);
         let path = |id: u64| format!("/org/freedesktop/secrets/collection/Default_5fkeyring/{id}");
+        // Spilled lines can pass for another item's header, so in a damaged
+        // file every Toolport item is a candidate, and no other app's item
+        // ever is. The repair checks each live value before it writes.
+        let toolport: Vec<(u64, String)> = vec![
+            (7, backup.clone()),
+            (8, "srv::PEM".into()),
+            (9, format!("{BACKUP_ACCOUNT_PREFIX}def::1")),
+            (10, "srv::PATH".into()),
+            (11, "srv::NEW".into()),
+            (13, "srv::JSON".into()),
+            (14, "srv::HDR".into()),
+            (15, r"srv::A\B".into()),
+            (16, "srv::BIN".into()),
+            (17, "srv::FAKE".into()),
+            (18, "srv::DUP".into()),
+            (19, "srv::OK".into()),
+        ];
         assert_eq!(
             found,
+            toolport
+                .into_iter()
+                .map(|(id, account)| line_safe::Damaged {
+                    path: path(id),
+                    account
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn in_a_loadable_file_only_raw_values_the_daemon_changes_are_candidates() {
+        let encoded = line_safe::encode(r"C:\x").into_owned();
+        let text = [
+            LOADABLE_KEYRING.to_string(),
+            // The daemon unescapes these at its next load; `\n` turns into
+            // a line break that breaks the file at the save after that.
+            keyring_item(
+                1,
+                SERVICE,
+                &format!("{BACKUP_ACCOUNT_PREFIX}a::1"),
+                r#"{"note":"a\nb \"q\""}"#,
+            ),
+            keyring_item(
+                2,
+                SERVICE,
+                "srv::KEY",
+                r#"{"private_key":"-----BEGIN-----\nMII"}"#,
+            ),
+            keyring_item(3, SERVICE, "srv::PAD", " padded"),
+            // Stored as before and read back as before.
+            keyring_item(4, SERVICE, "srv::PLAIN", "plain-token-123"),
+            keyring_item(5, SERVICE, "srv::ENC", &encoded),
+            // Another app's backslash is never Toolport's to touch.
+            keyring_item(26, "other-app", "u", r"C:\Users"),
+        ]
+        .concat();
+        assert!(!line_safe::unloadable_key_file(&text));
+        let found = line_safe::damaged_toolport_items("Default_keyring", &text);
+        let accounts: Vec<_> = found.iter().map(|item| item.account.as_str()).collect();
+        assert_eq!(
+            accounts,
             vec![
-                line_safe::Damaged {
-                    path: path(7),
-                    account: backup
-                },
-                line_safe::Damaged {
-                    path: path(8),
-                    account: "srv::PEM".into()
-                },
-                line_safe::Damaged {
-                    path: path(9),
-                    account: format!("{BACKUP_ACCOUNT_PREFIX}def::1")
-                },
-                line_safe::Damaged {
-                    path: path(13),
-                    account: "srv::JSON".into()
-                },
-                line_safe::Damaged {
-                    path: path(14),
-                    account: "srv::HDR".into()
-                },
-                line_safe::Damaged {
-                    path: path(15),
-                    account: r"srv::A\B".into()
-                },
-                line_safe::Damaged {
-                    path: path(17),
-                    account: "srv::FAKE".into()
-                },
-                line_safe::Damaged {
-                    path: path(18),
-                    account: "srv::DUP".into()
-                },
+                format!("{BACKUP_ACCOUNT_PREFIX}a::1").as_str(),
+                "srv::KEY",
+                "srv::PAD"
             ]
         );
     }
@@ -4344,7 +4351,7 @@ pub(crate) mod tests {
         // What 2.3.6 to 2.4.2 did: the text raw, which the daemon writes raw.
         raw(old, key).set_password(config).unwrap();
         raw(pem_sid, cred_key).set_password(pem).unwrap();
-        // Breaks only this value at a reload, so it is left for its owner.
+        // Comes back changed at a reload, so it is repaired too.
         raw(path_sid, cred_key).set_password(windows_path).unwrap();
         assert!(
             settle(false),
@@ -4352,15 +4359,15 @@ pub(crate) mod tests {
         );
 
         let damaged = line_safe::damaged_toolport_items_in(&dir);
-        assert_eq!(damaged.len(), 2, "{damaged:?}");
+        assert_eq!(damaged.len(), 3, "{damaged:?}");
         assert!(damaged.iter().all(|item| item
             .path
             .starts_with("/org/freedesktop/secrets/collection/Default_5fkeyring/")));
-        assert_eq!(platform::repair_line_unsafe_items(&damaged).unwrap(), 2);
+        assert_eq!(platform::repair_line_unsafe_items(&damaged).unwrap(), 3);
         assert!(settle(true), "the repair leaves a file the daemon can load");
         assert_eq!(
-            raw(path_sid, cred_key).get_password().unwrap(),
-            windows_path
+            get_secret(path_sid, cred_key).as_deref(),
+            Some(windows_path)
         );
         set_secret(new, key, config).unwrap();
         assert!(settle(true), "a new write stays loadable");
@@ -4491,10 +4498,13 @@ pub(crate) mod tests {
         // unescapes it when it reloads the file (two such backups on the
         // machine that found the bug came back empty).
         let json_config = r#"{"mcpServers":{"a":{"command":"C:\\bin\\a.exe","args":["--x"],"note":"line one\nline two \"quoted\""}}}"#;
+        let sa_json = r#"{"type":"service_account","private_key":"-----BEGIN PRIVATE KEY-----\nMIIEv\n-----END PRIVATE KEY-----\n"}"#;
         let toolport = [
             ("client-backup-scenario", "CLIENT_BACKUP", config),
             ("client-backup-scenario-json", "CLIENT_BACKUP", json_config),
             ("scenario-pem", "API_KEY", pem),
+            // A service account key: one line, with `\n` escapes.
+            ("scenario-sa", "GOOGLE_CREDENTIALS", sa_json),
             ("scenario-plain", "API_KEY", "plain-token-123"),
         ];
         let raw = |sid: &str, key: &str| {
@@ -4585,9 +4595,11 @@ pub(crate) mod tests {
                 save(&snapshot);
             }
             "repair" => {
+                // The file is damaged, so all five Toolport items are
+                // candidates; the plain one needs nothing.
                 let damaged = line_safe::damaged_toolport_items_in(&dir);
-                assert_eq!(damaged.len(), 3, "{damaged:?}");
-                assert_eq!(platform::repair_line_unsafe_items(&damaged).unwrap(), 3);
+                assert_eq!(damaged.len(), 5, "{damaged:?}");
+                assert_eq!(platform::repair_line_unsafe_items(&damaged).unwrap(), 4);
                 assert_eq!(foreign_items_snapshot(), load(), "a foreign item changed");
                 for (sid, key, value) in toolport {
                     assert_eq!(get_secret(sid, key).as_deref(), Some(value), "{sid}");
