@@ -3480,6 +3480,13 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    fn the_keyring_dir_is_gnome_keyrings_own() {
+        let dir = line_safe::keyring_dir().unwrap();
+        assert!(dir.ends_with("keyrings"), "{}", dir.display());
+    }
+
+    #[test]
     fn only_line_breaks_break_the_keyring_file() {
         assert!(line_safe::breaks_key_file("a\nb"));
         assert!(line_safe::breaks_key_file("a\rb"));
