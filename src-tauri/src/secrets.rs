@@ -193,6 +193,7 @@ mod line_safe {
         let mut secret_owner: Option<Id> = None;
         let mut attribute: (Option<String>, Option<String>) = (None, None);
         let mut current: Option<Header> = None;
+        let mut seen = std::collections::HashSet::<String>::new();
         let flush = |items: &mut std::collections::BTreeMap<Id, Item>,
                      current: &Option<Header>,
                      attribute: &mut (Option<String>, Option<String>)| {
@@ -215,6 +216,7 @@ mod line_safe {
                     last = Some(id.clone());
                 }
                 current = Some(next);
+                seen.clear();
                 continue;
             }
             if line.is_empty() {
@@ -250,14 +252,11 @@ mod line_safe {
                 (Some(Header::Keyring | Header::Acl), Some(_)) => true,
                 _ => false,
             };
-            if !ok {
-                // A key-shaped line under an item header is that item's own;
-                // anything else spilled from the secret before it.
-                let owner = match (&current, key) {
-                    (Some(Header::Item(id)), Some(_)) => Some(id.clone()),
-                    _ => secret_owner.clone().or_else(|| last.clone()),
-                };
-                if let Some(id) = owner {
+            // A key the group already has is spill too: GKeyFile keeps the
+            // last copy, so the secret or its times read back wrong.
+            let repeated = key.is_some_and(|(name, _)| !seen.insert(name.to_string()));
+            if !ok || repeated {
+                if let Some(id) = secret_owner.clone().or_else(|| last.clone()) {
                     items.entry(id).or_default().damaged = true;
                 }
             }
@@ -3735,8 +3734,14 @@ pub(crate) mod tests {
             // Already encoded, and another app's damage: not Toolport's.
             keyring_item(11, SERVICE, "srv::NEW", &encoded),
             keyring_item(12, "other-app", "x", "a\nb"),
-            // A binary secret is the daemon's own key, not spill.
-            "\n[16]\nitem-type=0\ndisplay-name=bin\nbinary-secret=00ff\nmtime=1\nctime=1\n".into(),
+            // A binary secret is the daemon's own key, not spill to blame on
+            // the healthy Toolport item before it.
+            keyring_item(19, SERVICE, "srv::OK", "fine"),
+            keyring_item(16, SERVICE, "srv::BIN", "x").replace("secret=x", "binary-secret=00ff"),
+            // Key-shaped spill after a line that reads as a header.
+            keyring_item(17, SERVICE, "srv::FAKE", "a\n[5]\nk=v"),
+            // Spill made only of the item's own keys.
+            keyring_item(18, SERVICE, "srv::DUP", "tok\nmtime=5"),
             // Continuation lines that pass as keys still belong to the item.
             keyring_item(13, SERVICE, "srv::JSON", "{\nenabled=true\n}"),
             // A raw secret holding a line that reads as another item's header.
@@ -3774,6 +3779,14 @@ pub(crate) mod tests {
                 line_safe::Damaged {
                     path: path(15),
                     account: r"srv::A\B".into()
+                },
+                line_safe::Damaged {
+                    path: path(17),
+                    account: "srv::FAKE".into()
+                },
+                line_safe::Damaged {
+                    path: path(18),
+                    account: "srv::DUP".into()
                 },
             ]
         );
