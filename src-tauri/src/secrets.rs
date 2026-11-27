@@ -51,7 +51,9 @@ fn account(server_id: &str, key: &str) -> String {
 /// secret raw on one line of a key file. A value with a line break turns the
 /// rest of it into lines the daemon cannot parse, so at the next login it
 /// rejects the whole keyring and every app on the desktop loses its saved
-/// logins. Leading and trailing whitespace does not survive that line either.
+/// logins. Leading and trailing whitespace does not survive that line either,
+/// and the daemon unescapes the line when it loads the file again, so a value
+/// with a backslash comes back changed or empty.
 /// On the Secret Service those values are stored base64-encoded behind
 /// [`line_safe::MARKER`]; every other value is stored exactly as before.
 #[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
@@ -64,7 +66,9 @@ mod line_safe {
     /// True when `value` cannot be stored raw on one key file line, or would
     /// read back as an encoded value.
     pub(super) fn needs_encoding(value: &str) -> bool {
-        value.starts_with(MARKER) || value.chars().any(char::is_control) || value.trim() != value
+        value.starts_with(MARKER)
+            || value.chars().any(|c| c.is_control() || c == '\\')
+            || value.trim() != value
     }
 
     pub(super) fn encode(value: &str) -> Cow<'_, str> {
@@ -3370,6 +3374,8 @@ pub(crate) mod tests {
             "trailing ",
             "tab\tinside",
             "nul\0inside",
+            r#"{"path":"C:\\Users\\a"}"#,
+            r"literal \n",
             "toolport-line-safe-b64:looks encoded",
         ] {
             let stored = line_safe::encode(value);
