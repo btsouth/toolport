@@ -79,10 +79,13 @@ mod line_safe {
 
     /// A gnome-keyring group header: `[keyring]`, an item `[N]`, or one of
     /// its `[N:attributeM]` or `[N:aclM]` groups.
+    /// An item id, as a number (for order) and as written (for its path).
+    type Id = (u64, String);
+
     enum Header {
         Keyring,
-        Item(u64, String),
-        Attribute(u64),
+        Item(Id),
+        Attribute(Id),
         Acl,
     }
 
@@ -96,9 +99,9 @@ mod line_safe {
         if !digits(item) {
             return None;
         }
-        let id = item.parse().ok()?;
+        let id = (item.parse().ok()?, item.to_string());
         if rest.is_empty() {
-            Some(Header::Item(id, item.to_string()))
+            Some(Header::Item(id))
         } else if rest.strip_prefix("attribute").is_some_and(digits) {
             Some(Header::Attribute(id))
         } else if rest.strip_prefix("acl").is_some_and(digits) {
@@ -178,26 +181,25 @@ mod line_safe {
     pub(super) fn damaged_toolport_items(identifier: &str, text: &str) -> Vec<Damaged> {
         #[derive(Default)]
         struct Item {
-            id: String,
             damaged: bool,
             raw_backslash: bool,
             service: Option<String>,
             username: Option<String>,
         }
-        let mut items = std::collections::BTreeMap::<u64, Item>::new();
+        let mut items = std::collections::BTreeMap::<Id, Item>::new();
         // Stray lines belong to the item whose secret came last: a raw
         // secret can hold a line that reads as another item's header.
-        let mut last: Option<u64> = None;
-        let mut secret_owner: Option<u64> = None;
+        let mut last: Option<Id> = None;
+        let mut secret_owner: Option<Id> = None;
         let mut attribute: (Option<String>, Option<String>) = (None, None);
         let mut current: Option<Header> = None;
-        let flush = |items: &mut std::collections::BTreeMap<u64, Item>,
+        let flush = |items: &mut std::collections::BTreeMap<Id, Item>,
                      current: &Option<Header>,
                      attribute: &mut (Option<String>, Option<String>)| {
             if let (Some(Header::Attribute(id)), (Some(name), Some(value))) =
                 (current, std::mem::take(attribute))
             {
-                let item = items.entry(*id).or_default();
+                let item = items.entry(id.clone()).or_default();
                 match name.as_str() {
                     "service" => item.service = Some(unescape(&value)),
                     "username" => item.username = Some(unescape(&value)),
@@ -208,9 +210,9 @@ mod line_safe {
         for line in text.lines() {
             if let Some(next) = header(line) {
                 flush(&mut items, &current, &mut attribute);
-                if let Header::Item(id, digits) = &next {
-                    items.entry(*id).or_default().id = digits.clone();
-                    last = Some(*id);
+                if let Header::Item(id) = &next {
+                    items.entry(id.clone()).or_default();
+                    last = Some(id.clone());
                 }
                 current = Some(next);
                 continue;
@@ -220,11 +222,16 @@ mod line_safe {
             }
             let key = daemon_key(line);
             let ok = match (&current, key) {
-                (Some(Header::Item(id, _)), Some(("secret", value))) => {
-                    secret_owner = Some(*id);
+                (Some(Header::Item(id)), Some(("secret", value))) => {
+                    secret_owner = Some(id.clone());
                     if !value.starts_with(MARKER) && value.contains('\\') {
-                        items.entry(*id).or_default().raw_backslash = true;
+                        items.entry(id.clone()).or_default().raw_backslash = true;
                     }
+                    true
+                }
+                // A secret that is not text, written as hex.
+                (Some(Header::Item(id)), Some(("binary-secret", _))) => {
+                    secret_owner = Some(id.clone());
                     true
                 }
                 (
@@ -244,7 +251,13 @@ mod line_safe {
                 _ => false,
             };
             if !ok {
-                if let Some(id) = secret_owner.or(last) {
+                // A key-shaped line under an item header is that item's own;
+                // anything else spilled from the secret before it.
+                let owner = match (&current, key) {
+                    (Some(Header::Item(id)), Some(_)) => Some(id.clone()),
+                    _ => secret_owner.clone().or_else(|| last.clone()),
+                };
+                if let Some(id) = owner {
                     items.entry(id).or_default().damaged = true;
                 }
             }
@@ -252,14 +265,14 @@ mod line_safe {
         flush(&mut items, &current, &mut attribute);
         let collection = collection_path(identifier);
         items
-            .into_values()
-            .filter_map(|item| {
+            .into_iter()
+            .filter_map(|((_, digits), item)| {
                 let account = item.username?;
                 let backup = account.starts_with(super::BACKUP_ACCOUNT_PREFIX);
                 (item.service.as_deref() == Some(super::SERVICE)
                     && (item.damaged || backup && item.raw_backslash))
                     .then(|| Damaged {
-                        path: format!("{collection}/{}", item.id),
+                        path: format!("{collection}/{digits}"),
                         account,
                     })
             })
@@ -3722,6 +3735,8 @@ pub(crate) mod tests {
             // Already encoded, and another app's damage: not Toolport's.
             keyring_item(11, SERVICE, "srv::NEW", &encoded),
             keyring_item(12, "other-app", "x", "a\nb"),
+            // A binary secret is the daemon's own key, not spill.
+            "\n[16]\nitem-type=0\ndisplay-name=bin\nbinary-secret=00ff\nmtime=1\nctime=1\n".into(),
             // Continuation lines that pass as keys still belong to the item.
             keyring_item(13, SERVICE, "srv::JSON", "{\nenabled=true\n}"),
             // A raw secret holding a line that reads as another item's header.
