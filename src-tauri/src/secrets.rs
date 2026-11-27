@@ -4537,14 +4537,15 @@ pub(crate) mod tests {
                     ),
                 ];
                 for (label, attributes, secret) in &foreign {
+                    // Named here, as libsecret clients do: the daemon adds
+                    // the generic schema to an item without one on reload.
+                    let mut attributes: std::collections::HashMap<&str, &str> =
+                        attributes.iter().copied().collect();
+                    attributes
+                        .entry("xdg:schema")
+                        .or_insert("org.freedesktop.Secret.Generic");
                     collection
-                        .create_item(
-                            label,
-                            attributes.iter().copied().collect(),
-                            secret.as_bytes(),
-                            true,
-                            "text/plain",
-                        )
+                        .create_item(label, attributes, secret.as_bytes(), true, "text/plain")
                         .unwrap();
                 }
                 // What 2.3.6 to 2.4.2 stored, raw, between other apps' items.
