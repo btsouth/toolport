@@ -77,46 +77,193 @@ mod line_safe {
         value.contains(['\n', '\r'])
     }
 
+    /// A gnome-keyring group header: `[keyring]`, an item `[N]`, or one of
+    /// its `[N:attributeM]` or `[N:aclM]` groups.
+    enum Header {
+        Keyring,
+        Item(u64),
+        Attribute(u64),
+        Acl,
+    }
+
+    fn header(line: &str) -> Option<Header> {
+        let name = line.strip_prefix('[')?.strip_suffix(']')?;
+        if name == "keyring" {
+            return Some(Header::Keyring);
+        }
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        let (item, rest) = name.split_once(':').unwrap_or((name, ""));
+        if !digits(item) {
+            return None;
+        }
+        let id = item.parse().ok()?;
+        if rest.is_empty() {
+            Some(Header::Item(id))
+        } else if rest.strip_prefix("attribute").is_some_and(digits) {
+            Some(Header::Attribute(id))
+        } else if rest.strip_prefix("acl").is_some_and(digits) {
+            Some(Header::Acl)
+        } else {
+            None
+        }
+    }
+
+    /// A key the daemon writes: lowercase words joined by hyphens.
+    fn daemon_key(line: &str) -> Option<(&str, &str)> {
+        line.split_once('=').filter(|(key, _)| {
+            !key.is_empty() && key.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+        })
+    }
+
     /// True when `text`, an unencrypted keyring file, has a line that is not
     /// one of the daemon's own groups or keys: the daemon rejects it at the
     /// next load. A config's lines would pass a looser "group or key=value"
     /// test and load back as a phantom item, so only the real shapes count.
     pub(super) fn unloadable_key_file(text: &str) -> bool {
-        !text.lines().all(|line| {
-            let group = line
-                .strip_prefix('[')
-                .and_then(|rest| rest.strip_suffix(']'))
-                .is_some_and(|name| {
-                    let mut parts = name.splitn(2, ":attribute");
-                    let item = parts.next().unwrap_or_default();
-                    (name == "keyring"
-                        || !item.is_empty() && item.bytes().all(|b| b.is_ascii_digit()))
-                        && parts
-                            .next()
-                            .is_none_or(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-                });
-            let key = line.split_once('=').is_some_and(|(key, _)| {
-                !key.is_empty() && key.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
-            });
-            line.is_empty() || group || key
-        })
+        !text
+            .lines()
+            .all(|line| line.is_empty() || header(line).is_some() || daemon_key(line).is_some())
     }
 
-    /// True when `dir` holds an unencrypted gnome-keyring file the daemon
-    /// will reject at the next load. Encrypted keyrings are skipped: they
-    /// store any bytes.
-    pub(super) fn broken_unencrypted_keyring_in(dir: &std::path::Path) -> bool {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return false;
+    /// A Toolport item an unencrypted keyring file shows stored raw in a
+    /// way the file cannot hold: its D-Bus object path and its account.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct Damaged {
+        pub(super) path: String,
+        pub(super) account: String,
+    }
+
+    /// gnome-keyring's object path for the collection a keyring file holds:
+    /// the file's name, with every byte that is not a letter or digit as `_xx`.
+    pub(super) fn collection_path(identifier: &str) -> String {
+        let mut path = String::from("/org/freedesktop/secrets/collection/");
+        for byte in identifier.bytes() {
+            if byte.is_ascii_alphanumeric() {
+                path.push(byte as char);
+            } else {
+                path.push_str(&format!("_{byte:02x}"));
+            }
+        }
+        path
+    }
+
+    /// The Toolport items in unencrypted keyring file `text` (collection
+    /// `identifier`) that were stored raw and damage it: a value whose line
+    /// breaks spill into lines of their own, or a client backup holding a
+    /// backslash, which the daemon unescapes when it loads the file. Lines
+    /// that are not the daemon's belong to the item before them.
+    pub(super) fn damaged_toolport_items(identifier: &str, text: &str) -> Vec<Damaged> {
+        #[derive(Default)]
+        struct Item {
+            damaged: bool,
+            raw_backslash: bool,
+            service: Option<String>,
+            username: Option<String>,
+        }
+        let mut items = std::collections::BTreeMap::<u64, Item>::new();
+        let mut last: Option<u64> = None;
+        let mut attribute: (Option<String>, Option<String>) = (None, None);
+        let mut current: Option<Header> = None;
+        let flush = |items: &mut std::collections::BTreeMap<u64, Item>,
+                     current: &Option<Header>,
+                     attribute: &mut (Option<String>, Option<String>)| {
+            if let (Some(Header::Attribute(id)), (Some(name), Some(value))) =
+                (current, std::mem::take(attribute))
+            {
+                let item = items.entry(*id).or_default();
+                match name.as_str() {
+                    "service" => item.service = Some(value),
+                    "username" => item.username = Some(value),
+                    _ => {}
+                }
+            }
         };
-        entries.flatten().any(|entry| {
+        for line in text.lines() {
+            if let Some(next) = header(line) {
+                flush(&mut items, &current, &mut attribute);
+                if let Header::Item(id) = next {
+                    items.entry(id).or_default();
+                    last = Some(id);
+                }
+                current = Some(next);
+                continue;
+            }
+            if line.is_empty() {
+                continue;
+            }
+            let key = daemon_key(line);
+            let ok = match (&current, key) {
+                (Some(Header::Item(id)), Some(("secret", value))) => {
+                    if !value.starts_with(MARKER) && value.contains('\\') {
+                        items.entry(*id).or_default().raw_backslash = true;
+                    }
+                    true
+                }
+                (
+                    Some(Header::Item(_)),
+                    Some(("item-type" | "display-name" | "mtime" | "ctime", _)),
+                ) => true,
+                (Some(Header::Attribute(_)), Some(("name", value))) => {
+                    attribute.0 = Some(value.to_string());
+                    true
+                }
+                (Some(Header::Attribute(_)), Some(("value", value))) => {
+                    attribute.1 = Some(value.to_string());
+                    true
+                }
+                (Some(Header::Attribute(_)), Some(("type", _))) => true,
+                (Some(Header::Keyring | Header::Acl), Some(_)) => true,
+                _ => false,
+            };
+            if !ok {
+                if let Some(id) = last {
+                    items.entry(id).or_default().damaged = true;
+                }
+            }
+        }
+        flush(&mut items, &current, &mut attribute);
+        let collection = collection_path(identifier);
+        items
+            .into_iter()
+            .filter_map(|(id, item)| {
+                let account = item.username?;
+                let backup = account.starts_with(super::BACKUP_ACCOUNT_PREFIX);
+                (item.service.as_deref() == Some(super::SERVICE)
+                    && (item.damaged || backup && item.raw_backslash))
+                    .then(|| Damaged {
+                        path: format!("{collection}/{id}"),
+                        account,
+                    })
+            })
+            .collect()
+    }
+
+    /// [`damaged_toolport_items`] for every unencrypted keyring file in
+    /// `dir`. Encrypted keyrings are skipped: they store any bytes.
+    pub(super) fn damaged_toolport_items_in(dir: &std::path::Path) -> Vec<Damaged> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        for entry in entries.flatten() {
             let path = entry.path();
-            path.extension().is_some_and(|ext| ext == "keyring")
-                && std::fs::read(&path).is_ok_and(|bytes| {
-                    bytes.starts_with(b"[keyring]")
-                        && unloadable_key_file(&String::from_utf8_lossy(&bytes))
-                })
-        })
+            if path.extension().is_none_or(|ext| ext != "keyring") {
+                continue;
+            }
+            let (Some(identifier), Ok(bytes)) = (
+                path.file_stem().and_then(|stem| stem.to_str()),
+                std::fs::read(&path),
+            ) else {
+                continue;
+            };
+            if bytes.starts_with(b"[keyring]") {
+                found.extend(damaged_toolport_items(
+                    identifier,
+                    &String::from_utf8_lossy(&bytes),
+                ));
+            }
+        }
+        found
     }
 
     /// gnome-keyring's keyring directory for this user.
@@ -1459,46 +1606,39 @@ mod platform {
         result
     }
 
-    /// Re-store, encoded, the unlocked Toolport items an older version saved
-    /// raw that an unencrypted keyring cannot hold: every value with a line
-    /// break (those break the whole file), and client backups (whole config
-    /// files only the app reads) with anything a key file line cannot carry.
-    /// Other credentials are left as they are, so a gateway still running
-    /// from an older version keeps reading what it wrote. The daemon still
-    /// holds the items in memory and rewrites its file on the change, so the
-    /// keyring loads again at the next login. Never unlocks or prompts; a
-    /// locked item waits for a later start. Each item takes the keyring locks
-    /// on its own, so a gateway never waits behind the whole pass.
-    pub(super) fn repair_line_unsafe_items() -> Result<usize, super::BackupSecretError> {
+    /// Re-store, encoded, each of the `damaged` items (found in an
+    /// unencrypted keyring file) that is still unlocked at its path: any value
+    /// with a line break (those break the whole file), and client backups
+    /// (whole config files only the app reads) with anything a key file line
+    /// cannot carry. The daemon still holds the items in memory and rewrites
+    /// its file on the change, so the keyring loads again at the next login.
+    /// Never unlocks or prompts; a locked item waits for a later start. Each
+    /// item takes the keyring locks on its own, so a gateway never waits
+    /// behind the whole pass.
+    pub(super) fn repair_line_unsafe_items(
+        damaged: &[super::line_safe::Damaged],
+    ) -> Result<usize, super::BackupSecretError> {
         use super::BackupSecretError as State;
         with_backup_batch(|| {
-            // Attributes only: no secret is read to list the accounts.
-            let accounts: Vec<String> = with_backup_service(|service| {
-                let found = service
-                    .search_items(std::collections::HashMap::from([("service", SERVICE)]))
-                    .map_err(|error| classify(&error))?;
-                Ok(found
-                    .unlocked
-                    .iter()
-                    .filter_map(|item| item.get_attributes().ok()?.get("username").cloned())
-                    .collect())
-            })?;
             let mut repaired = 0;
-            for account in accounts {
-                let backup = account.starts_with(super::BACKUP_ACCOUNT_PREFIX);
+            for target in damaged {
+                let backup = target.account.starts_with(super::BACKUP_ACCOUNT_PREFIX);
                 let result = with_backup_service(|service| {
                     let found = service
                         .search_items(std::collections::HashMap::from([
                             ("service", SERVICE),
-                            ("username", account.as_str()),
+                            ("username", target.account.as_str()),
                         ]))
                         .map_err(|error| classify(&error))?;
-                    let [item] = found.unlocked.as_slice() else {
+                    // That file's item only: the same account elsewhere (an
+                    // encrypted keyring, another provider) is left unread.
+                    let Some(item) = found
+                        .unlocked
+                        .iter()
+                        .find(|item| item.path.to_string() == target.path)
+                    else {
                         return Ok(false);
                     };
-                    if !found.locked.is_empty() {
-                        return Ok(false);
-                    }
                     let bytes = item.get_secret().map_err(|error| classify(&error))?;
                     let Ok(text) = String::from_utf8(bytes) else {
                         return Ok(false);
@@ -2910,10 +3050,14 @@ pub(crate) fn backup_secret_status(
     platform::get_backup_secret_status(owner.as_str(), key)
 }
 
-/// Start-up repair of items an older version stored raw with line breaks,
-/// which break gnome-keyring's unencrypted keyring at the next login (see
-/// [`line_safe`]). It runs only while such a keyring file on disk is already
-/// broken, so every other start reads no secret at all. Returns how many were
+/// Start-up repair of Toolport items an older version stored raw in a way
+/// gnome-keyring's unencrypted keyring cannot hold (see [`line_safe`]): line
+/// breaks make the daemon reject the whole file at the next login. Only the
+/// items an unencrypted keyring file on disk shows damaged are read, and only
+/// in that file's own collection, so every other start reads no secret. A
+/// repaired multi-line credential reads as encoded text to a gateway still
+/// running from an older version until that gateway restarts; left raw, it
+/// would cost every app on the desktop its logins. Returns how many were
 /// re-stored; never prompts.
 pub(crate) fn repair_line_unsafe_items() -> usize {
     #[cfg(test)]
@@ -2925,9 +3069,10 @@ pub(crate) fn repair_line_unsafe_items() -> usize {
         if file::active() || locked_store::locked() {
             return 0;
         }
-        if !line_safe::keyring_dir()
-            .is_some_and(|dir| line_safe::broken_unencrypted_keyring_in(&dir))
-        {
+        let damaged = line_safe::keyring_dir()
+            .map(|dir| line_safe::damaged_toolport_items_in(&dir))
+            .unwrap_or_default();
+        if damaged.is_empty() {
             return 0;
         }
         // A search of a locked store can itself ask (KeePassXC opens its
@@ -2935,11 +3080,11 @@ pub(crate) fn repair_line_unsafe_items() -> usize {
         if store_would_prompt() {
             return 0;
         }
-        match platform::repair_line_unsafe_items() {
+        match platform::repair_line_unsafe_items(&damaged) {
             Ok(0) | Err(_) => 0,
             Ok(repaired) => {
                 crate::gatewaylog::append(&format!(
-                    "re-stored {repaired} keyring item(s) whose line breaks would break an unencrypted keyring"
+                    "re-stored {repaired} keyring item(s) encoded that an unencrypted keyring could not hold; a gateway from an older version reads them after it restarts"
                 ));
                 repaired
             }
@@ -3487,8 +3632,9 @@ pub(crate) mod tests {
     #[test]
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     fn the_keyring_dir_is_gnome_keyrings_own() {
-        let dir = line_safe::keyring_dir().unwrap();
-        assert!(dir.ends_with("keyrings"), "{}", dir.display());
+        if let Some(dir) = line_safe::keyring_dir() {
+            assert!(dir.ends_with("keyrings"), "{}", dir.display());
+        }
     }
 
     #[test]
@@ -3504,6 +3650,95 @@ pub(crate) mod tests {
     #[test]
     fn the_daemons_own_keyring_file_loads() {
         assert!(!line_safe::unloadable_key_file(LOADABLE_KEYRING));
+        let with_acl = format!(
+            "{LOADABLE_KEYRING}\n[6:acl0]\ndisplay-name=app\npath=/usr/bin/app\ntypes-allowed=all\n"
+        );
+        assert!(!line_safe::unloadable_key_file(&with_acl));
+        assert!(line_safe::damaged_toolport_items("Default_keyring", &with_acl).is_empty());
+    }
+
+    /// An unencrypted keyring item as the daemon writes it, `secret` raw.
+    fn keyring_item(id: u64, service: &str, username: &str, secret: &str) -> String {
+        format!(
+            "\n[{id}]\nitem-type=0\ndisplay-name={username}\nsecret={secret}\nmtime=1\nctime=1\n\n[{id}:attribute0]\nname=service\ntype=string\nvalue={service}\n\n[{id}:attribute1]\nname=username\ntype=string\nvalue={username}\n"
+        )
+    }
+
+    #[test]
+    fn only_toolport_items_stored_raw_in_a_damaging_way_are_repaired() {
+        let backup = format!("{BACKUP_ACCOUNT_PREFIX}abc::9");
+        let encoded = line_safe::encode("a\nb").into_owned();
+        let text = [
+            LOADABLE_KEYRING.to_string(),
+            // A raw multi-line backup: its lines spill into the file.
+            keyring_item(
+                7,
+                SERVICE,
+                &backup,
+                "model = \"x\"\n[projects.\"/a\"]\nenabled=true",
+            ),
+            // A raw multi-line credential.
+            keyring_item(
+                8,
+                SERVICE,
+                "srv::PEM",
+                "-----BEGIN-----\nMIIabc\n-----END-----",
+            ),
+            // A backup whose backslash the daemon unescapes at a reload.
+            keyring_item(
+                9,
+                SERVICE,
+                &format!("{BACKUP_ACCOUNT_PREFIX}def::1"),
+                r"C:\\Users",
+            ),
+            // A credential with a backslash is left for its owner.
+            keyring_item(10, SERVICE, "srv::PATH", r"C:\\Users"),
+            // Already encoded, and another app's damage: not Toolport's.
+            keyring_item(11, SERVICE, "srv::NEW", &encoded),
+            keyring_item(12, "other-app", "x", "a\nb"),
+            // Continuation lines that pass as keys still belong to the item.
+            keyring_item(13, SERVICE, "srv::JSON", "{\nenabled=true\n}"),
+        ]
+        .concat();
+        let found = line_safe::damaged_toolport_items("Default_keyring", &text);
+        let path = |id: u64| format!("/org/freedesktop/secrets/collection/Default_5fkeyring/{id}");
+        assert_eq!(
+            found,
+            vec![
+                line_safe::Damaged {
+                    path: path(7),
+                    account: backup
+                },
+                line_safe::Damaged {
+                    path: path(8),
+                    account: "srv::PEM".into()
+                },
+                line_safe::Damaged {
+                    path: path(9),
+                    account: format!("{BACKUP_ACCOUNT_PREFIX}def::1")
+                },
+                line_safe::Damaged {
+                    path: path(13),
+                    account: "srv::JSON".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn collection_paths_escape_like_gnome_keyring() {
+        assert_eq!(
+            line_safe::collection_path("Default_keyring"),
+            "/org/freedesktop/secrets/collection/Default_5fkeyring"
+        );
+        assert_eq!(
+            line_safe::collection_path("login"),
+            "/org/freedesktop/secrets/collection/login"
+        );
+        assert_eq!(
+            line_safe::collection_path("my keys-2"),
+            "/org/freedesktop/secrets/collection/my_20keys_2d2"
+        );
     }
 
     #[test]
@@ -3519,7 +3754,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_start_up_repair_runs_only_for_a_broken_unencrypted_keyring() {
+    fn the_start_up_repair_reads_only_unencrypted_files_with_damage() {
         let root = std::env::temp_dir().join(format!(
             "toolport-line-safe-keyrings-{}",
             std::process::id()
@@ -3534,24 +3769,31 @@ pub(crate) mod tests {
         }
         let _remove = Remove(root.clone());
         let dir = root.as_path();
-        assert!(!line_safe::broken_unencrypted_keyring_in(
-            &dir.join("missing")
-        ));
+        assert!(line_safe::damaged_toolport_items_in(&dir.join("missing")).is_empty());
         std::fs::write(dir.join("Default_keyring.keyring"), LOADABLE_KEYRING).unwrap();
         // An encrypted keyring holds any bytes; its lines mean nothing.
         std::fs::write(
             dir.join("login.keyring"),
-            b"GnomeKeyring\n\r\0\n\0\0\0\0garbage\nmore\n",
+            b"GnomeKeyring\n\r\0\n\0\0\0\0garbage\n[1]\nmore\n",
         )
         .unwrap();
         std::fs::write(dir.join("notes.txt"), "[[not a keyring]]\n").unwrap();
-        assert!(!line_safe::broken_unencrypted_keyring_in(dir));
+        assert!(line_safe::damaged_toolport_items_in(dir).is_empty());
         std::fs::write(
             dir.join("Other.keyring"),
-            format!("{LOADABLE_KEYRING}\n[7]\nsecret=a = 1\n[[x]]\nmtime=1\n"),
+            format!(
+                "{LOADABLE_KEYRING}{}",
+                keyring_item(7, SERVICE, "srv::KEY", "a = 1\n[[x]]")
+            ),
         )
         .unwrap();
-        assert!(line_safe::broken_unencrypted_keyring_in(dir));
+        assert_eq!(
+            line_safe::damaged_toolport_items_in(dir),
+            vec![line_safe::Damaged {
+                path: "/org/freedesktop/secrets/collection/Other/7".into(),
+                account: "srv::KEY".into(),
+            }]
+        );
     }
 
     #[test]
@@ -4002,7 +4244,7 @@ pub(crate) mod tests {
         let parses = || {
             let text = std::fs::read_to_string(&file).unwrap();
             let loads = !line_safe::unloadable_key_file(&text);
-            assert_eq!(loads, !line_safe::broken_unencrypted_keyring_in(&dir));
+            assert_eq!(loads, line_safe::damaged_toolport_items_in(&dir).is_empty());
             loads
         };
         let settle = |want: bool| {
@@ -4042,7 +4284,12 @@ pub(crate) mod tests {
             "the raw write must reproduce the broken file"
         );
 
-        assert_eq!(platform::repair_line_unsafe_items().unwrap(), 2);
+        let damaged = line_safe::damaged_toolport_items_in(&dir);
+        assert_eq!(damaged.len(), 2, "{damaged:?}");
+        assert!(damaged.iter().all(|item| item
+            .path
+            .starts_with("/org/freedesktop/secrets/collection/Default_5fkeyring/")));
+        assert_eq!(platform::repair_line_unsafe_items(&damaged).unwrap(), 2);
         assert!(settle(true), "the repair leaves a file the daemon can load");
         assert_eq!(
             raw(path_sid, cred_key).get_password().unwrap(),
@@ -4053,7 +4300,8 @@ pub(crate) mod tests {
         assert_eq!(get_secret(old, key).as_deref(), Some(config));
         assert_eq!(get_secret(new, key).as_deref(), Some(config));
         assert_eq!(get_secret(pem_sid, cred_key).as_deref(), Some(pem));
-        assert_eq!(platform::repair_line_unsafe_items().unwrap(), 0);
+        assert!(line_safe::damaged_toolport_items_in(&dir).is_empty());
+        assert_eq!(platform::repair_line_unsafe_items(&damaged).unwrap(), 0);
     }
 
     /// Values read back after gnome-keyring reloads its unencrypted file:
