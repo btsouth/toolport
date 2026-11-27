@@ -4614,6 +4614,23 @@ pub(crate) mod tests {
                 save(&snapshot);
             }
             "repair" => {
+                // What the daemon holds now. gnome-keyring 50 reloads its own
+                // file while it runs, so a raw escape can be unescaped before
+                // any repair; the repair keeps what is held, never less.
+                let held: Vec<String> = toolport
+                    .iter()
+                    .map(|(sid, key, _)| raw(sid, key).get_password().unwrap())
+                    .collect();
+                for ((sid, _, value), now) in toolport.iter().zip(&held) {
+                    if now != value {
+                        println!("NOTICE: the daemon had already changed {sid} before the repair");
+                    }
+                }
+                std::fs::write(
+                    snapshot_file.with_extension("held"),
+                    serde_json::to_vec(&held).unwrap(),
+                )
+                .unwrap();
                 let damaged = line_safe::damaged_toolport_items_in(&dir);
                 assert_eq!(damaged.len(), expect_candidates, "{damaged:?}");
                 assert_eq!(
@@ -4621,8 +4638,8 @@ pub(crate) mod tests {
                     expect_repaired
                 );
                 assert_eq!(foreign_items_snapshot(), load(), "a foreign item changed");
-                for (sid, key, value) in toolport {
-                    assert_eq!(get_secret(sid, key).as_deref(), Some(value), "{sid}");
+                for ((sid, key, _), held) in toolport.iter().zip(&held) {
+                    assert_eq!(get_secret(sid, key).as_ref(), Some(held), "{sid}");
                 }
                 // The plain credential is left exactly as it was stored.
                 assert_eq!(
@@ -4633,8 +4650,12 @@ pub(crate) mod tests {
             }
             "reloaded" => {
                 assert_eq!(foreign_items_snapshot(), load(), "a foreign item changed");
-                for (sid, key, value) in toolport {
-                    assert_eq!(get_secret(sid, key).as_deref(), Some(value), "{sid}");
+                let held: Vec<String> = serde_json::from_slice(
+                    &std::fs::read(snapshot_file.with_extension("held")).unwrap(),
+                )
+                .unwrap();
+                for ((sid, key, _), held) in toolport.iter().zip(&held) {
+                    assert_eq!(get_secret(sid, key).as_ref(), Some(held), "{sid}");
                 }
                 assert!(line_safe::damaged_toolport_items_in(&dir).is_empty());
                 assert_eq!(
