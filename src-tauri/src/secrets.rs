@@ -9,6 +9,9 @@ const SERVICE: &str = "conduit-mcp";
 pub(crate) mod purge;
 
 const INTERNAL_SERVER_ID: &str = "__toolport_internal__";
+
+/// Every client-config backup's vault account starts with this.
+pub(crate) const BACKUP_ACCOUNT_PREFIX: &str = "client-backup-";
 #[cfg(not(test))]
 const TASK_HANDLE_KEY: &str = "__task_handle_key__";
 
@@ -1395,9 +1398,8 @@ mod platform {
         result
     }
 
-    /// Re-store, encoded, every unlocked Toolport item an older version saved
-    /// raw with text a key file line cannot carry (client backups are whole
-    /// config files). The daemon still holds those in memory and rewrites its
+    /// Re-store, encoded, every unlocked client backup an older version saved
+    /// raw with text a key file line cannot carry (they are whole config files). The daemon still holds those in memory and rewrites its
     /// file on the change, so the keyring loads again at the next login.
     /// Never unlocks or prompts; a locked item waits for a later start.
     pub(super) fn repair_line_unsafe_items() -> Result<usize, super::BackupSecretError> {
@@ -1409,6 +1411,19 @@ mod platform {
                 let mut repaired = 0;
                 for item in &found.unlocked {
                     backup_deadline()?;
+                    // Client backups only: they are what older versions saved
+                    // raw, and only the app reads them. Leaving every other
+                    // value alone keeps a gateway still running from an older
+                    // version reading what it wrote, and keeps start-up from
+                    // reading every credential.
+                    let backup = item.get_attributes().is_ok_and(|attributes| {
+                        attributes
+                            .get("username")
+                            .is_some_and(|name| name.starts_with(super::BACKUP_ACCOUNT_PREFIX))
+                    });
+                    if !backup {
+                        continue;
+                    }
                     let Ok(bytes) = item.get_secret() else {
                         continue;
                     };
@@ -2812,7 +2827,7 @@ pub(crate) fn backup_secret_status(
     platform::get_backup_secret_status(owner.as_str(), key)
 }
 
-/// Start-up repair of Secret Service items an older version stored raw with
+/// Start-up repair of client backups an older version stored raw with
 /// line breaks, which break gnome-keyring's unencrypted keyring at the next
 /// login (see [`line_safe`]). Returns how many were re-stored; never prompts.
 pub(crate) fn repair_line_unsafe_items() -> usize {
@@ -3842,7 +3857,11 @@ pub(crate) mod tests {
             false
         };
         let config = "model = \"x\"\n\n[projects.\"/home/a\"]\ntrust_level = \"trusted\"\n[[skills.config]]\n";
-        let (old, new, key) = ("line-safe-old", "line-safe-new", "CLIENT_BACKUP");
+        let (old, new, key) = (
+            "client-backup-line-safe-old",
+            "client-backup-line-safe-new",
+            "CLIENT_BACKUP",
+        );
         let _old_cleanup = SecretCleanupGuard::new(old, key);
         let _new_cleanup = SecretCleanupGuard::new(new, key);
 
@@ -3864,6 +3883,42 @@ pub(crate) mod tests {
         assert_eq!(get_secret(old, key).as_deref(), Some(config));
         assert_eq!(get_secret(new, key).as_deref(), Some(config));
         assert_eq!(platform::repair_line_unsafe_items().unwrap(), 0);
+    }
+
+    /// Values read back after gnome-keyring reloads its unencrypted file:
+    /// `TOOLPORT_TEST_KEYRING_PHASE=write`, restart the daemon, then `=read`.
+    #[test]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    #[ignore = "needs a throwaway gnome-keyring restarted between two runs"]
+    fn values_survive_an_unencrypted_gnome_keyring_reload() {
+        let phase = std::env::var("TOOLPORT_TEST_KEYRING_PHASE").unwrap_or_default();
+        let _data = crate::registry::DataDirTestEnv::new(
+            "values_survive_an_unencrypted_gnome_keyring_reload",
+        );
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sid = "line-safe-reload";
+        let values = [
+            "model = \"x\"\n[projects.\"/home/a\"]\n[[skills.config]]\n",
+            r#"{"path":"C:\\Users\\a","quote":"say \"hi\""}"#,
+            r"literal \n and \t and \\ and \s",
+            " padded ",
+            "plain-token-123",
+        ];
+        match phase.as_str() {
+            "write" => {
+                for (index, value) in values.iter().enumerate() {
+                    set_secret(sid, &format!("K{index}"), value).unwrap();
+                }
+            }
+            "read" => {
+                for (index, value) in values.iter().enumerate() {
+                    let key = format!("K{index}");
+                    assert_eq!(get_secret(sid, &key).as_deref(), Some(*value), "{key}");
+                    delete_secret(sid, &key).unwrap();
+                }
+            }
+            other => panic!("set TOOLPORT_TEST_KEYRING_PHASE to write or read, not {other:?}"),
+        }
     }
 
     #[test]
