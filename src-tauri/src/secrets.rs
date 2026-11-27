@@ -3809,13 +3809,27 @@ pub(crate) mod tests {
             "line_breaks_never_break_an_unencrypted_gnome_keyring",
         );
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Only the daemon's own groups and keys: a config's lines would pass a
+        // looser "group or key=value" test and load back as a phantom item.
         let parses = || {
             let text = std::fs::read_to_string(&file).unwrap();
             text.lines().all(|line| {
-                line.is_empty()
-                    || line.starts_with('#')
-                    || (line.starts_with('[') && line.ends_with(']'))
-                    || line.contains('=')
+                let group = line
+                    .strip_prefix('[')
+                    .and_then(|rest| rest.strip_suffix(']'))
+                    .is_some_and(|name| {
+                        let mut parts = name.splitn(2, ":attribute");
+                        let item = parts.next().unwrap_or_default();
+                        (name == "keyring"
+                            || !item.is_empty() && item.bytes().all(|b| b.is_ascii_digit()))
+                            && parts.next().is_none_or(|n| {
+                                !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+                            })
+                    });
+                let key = line.split_once('=').is_some_and(|(key, _)| {
+                    !key.is_empty() && key.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+                });
+                line.is_empty() || group || key
             })
         };
         let settle = |want: bool| {
@@ -3827,7 +3841,7 @@ pub(crate) mod tests {
             }
             false
         };
-        let config = "model = \"x\"\n\n[projects.\"/home/a\"]\ntrust_level = \"trusted\"\n";
+        let config = "model = \"x\"\n\n[projects.\"/home/a\"]\ntrust_level = \"trusted\"\n[[skills.config]]\n";
         let (old, new, key) = ("line-safe-old", "line-safe-new", "CLIENT_BACKUP");
         let _old_cleanup = SecretCleanupGuard::new(old, key);
         let _new_cleanup = SecretCleanupGuard::new(new, key);
