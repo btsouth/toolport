@@ -4499,7 +4499,7 @@ pub(crate) mod tests {
         // machine that found the bug came back empty).
         let json_config = r#"{"mcpServers":{"a":{"command":"C:\\bin\\a.exe","args":["--x"],"note":"line one\nline two \"quoted\""}}}"#;
         let sa_json = r#"{"type":"service_account","private_key":"-----BEGIN PRIVATE KEY-----\nMIIEv\n-----END PRIVATE KEY-----\n"}"#;
-        let toolport = [
+        let all_toolport = [
             ("client-backup-scenario", "CLIENT_BACKUP", config),
             ("client-backup-scenario-json", "CLIENT_BACKUP", json_config),
             ("scenario-pem", "API_KEY", pem),
@@ -4507,6 +4507,25 @@ pub(crate) mod tests {
             ("scenario-sa", "GOOGLE_CREDENTIALS", sa_json),
             ("scenario-plain", "API_KEY", "plain-token-123"),
         ];
+        // `TOOLPORT_TEST_SCENARIO=escapes`: only one-line values, so the file
+        // still loads and the repair finds them by their raw escapes alone.
+        let escapes_only = std::env::var("TOOLPORT_TEST_SCENARIO").as_deref() == Ok("escapes");
+        let toolport: Vec<_> = all_toolport
+            .into_iter()
+            .filter(|(_, _, value)| !escapes_only || !value.contains('\n'))
+            .collect();
+        let expect_candidates = if toolport.iter().any(|(_, _, v)| v.contains('\n')) {
+            toolport.len()
+        } else {
+            toolport
+                .iter()
+                .filter(|(_, _, v)| v.contains('\\') || v.trim() != *v)
+                .count()
+        };
+        let expect_repaired = toolport
+            .iter()
+            .filter(|(_, _, v)| line_safe::needs_encoding(v))
+            .count();
         let raw = |sid: &str, key: &str| {
             let owner = crate::local_auth::owner(sid).unwrap();
             keyring::Entry::new(SERVICE, &account(&owner, key)).unwrap()
@@ -4595,11 +4614,12 @@ pub(crate) mod tests {
                 save(&snapshot);
             }
             "repair" => {
-                // The file is damaged, so all five Toolport items are
-                // candidates; the plain one needs nothing.
                 let damaged = line_safe::damaged_toolport_items_in(&dir);
-                assert_eq!(damaged.len(), 5, "{damaged:?}");
-                assert_eq!(platform::repair_line_unsafe_items(&damaged).unwrap(), 4);
+                assert_eq!(damaged.len(), expect_candidates, "{damaged:?}");
+                assert_eq!(
+                    platform::repair_line_unsafe_items(&damaged).unwrap(),
+                    expect_repaired
+                );
                 assert_eq!(foreign_items_snapshot(), load(), "a foreign item changed");
                 for (sid, key, value) in toolport {
                     assert_eq!(get_secret(sid, key).as_deref(), Some(value), "{sid}");
