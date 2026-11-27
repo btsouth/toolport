@@ -4487,8 +4487,13 @@ pub(crate) mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let config = "model = \"x\"\n\n[projects.\"/home/a\"]\ntrust_level = \"trusted\"\n[[skills.config]]\nenabled = true\n[4:attribute0]\nname=service\n";
         let pem = "-----BEGIN KEY-----\nabc\n-----END KEY-----\n";
+        // A JSON client config holds escapes: one line, but the daemon
+        // unescapes it when it reloads the file (two such backups on the
+        // machine that found the bug came back empty).
+        let json_config = r#"{"mcpServers":{"a":{"command":"C:\\bin\\a.exe","args":["--x"],"note":"line one\nline two \"quoted\""}}}"#;
         let toolport = [
             ("client-backup-scenario", "CLIENT_BACKUP", config),
+            ("client-backup-scenario-json", "CLIENT_BACKUP", json_config),
             ("scenario-pem", "API_KEY", pem),
             ("scenario-plain", "API_KEY", "plain-token-123"),
         ];
@@ -4581,8 +4586,8 @@ pub(crate) mod tests {
             }
             "repair" => {
                 let damaged = line_safe::damaged_toolport_items_in(&dir);
-                assert_eq!(damaged.len(), 2, "{damaged:?}");
-                assert_eq!(platform::repair_line_unsafe_items(&damaged).unwrap(), 2);
+                assert_eq!(damaged.len(), 3, "{damaged:?}");
+                assert_eq!(platform::repair_line_unsafe_items(&damaged).unwrap(), 3);
                 assert_eq!(foreign_items_snapshot(), load(), "a foreign item changed");
                 for (sid, key, value) in toolport {
                     assert_eq!(get_secret(sid, key).as_deref(), Some(value), "{sid}");
