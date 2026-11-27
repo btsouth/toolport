@@ -6,6 +6,29 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [2.4.3] - 2026-11-26
+
+Toolport 2.4.3 fixes client backups breaking gnome-keyring's unencrypted
+keyring on Linux. Update and start Toolport before you next log out or reboot.
+
+### Fixed
+
+- Since 2.3.6, on Linux, Toolport stored client config backups raw in the
+  keyring. On gnome-keyring's unencrypted keyring (the Omarchy default) this
+  breaks the keyring at the next login, and every app loses its saved logins.
+  Update and start Toolport before you next log out or reboot. (#1445)
+- Toolport now repairs its own keyring entries at startup, so the keyring loads
+  again at the next login. It never touches other apps' entries. (#1445)
+- Credentials with backslashes, line breaks or leading or trailing spaces are now
+  stored encoded, so they read back exactly. A gateway from an older version
+  that is still running reads them wrongly until it restarts, so restart your
+  MCP clients after updating. Downgrading below 2.4.3 is not supported for those
+  values. (#1445)
+- If your keyring was already rejected at login, Toolport can't recover it
+  automatically. Follow the
+  [manual recovery steps](https://github.com/btsouth/toolport/blob/main/docs/troubleshooting.md#linux-every-app-signed-out-after-a-login-and-create-a-new-keyring)
+  or [open an issue](https://github.com/btsouth/toolport/issues).
+
 ## [2.4.2] - 2026-11-26
 
 Toolport 2.4.2 adds a per-server option to prefer the modern MCP handshake on

@@ -91,6 +91,41 @@
   wrapper leaves it holding the single-instance lock so the next launch hangs the
   same way.
 
+## Linux: every app signed out after a login, and "create a new keyring"
+
+Toolport 2.3.6 to 2.4.2 stored client config backups raw in the Secret Service.
+On gnome-keyring's unencrypted keyring (the Omarchy default) that breaks the
+keyring file, and at the next login the daemon rejects it. The journal shows
+`keyring was in an invalid or unrecognized format`, a prompt asks to create a
+new keyring, and every app loses its saved logins.
+
+Toolport 2.4.3 repairs its own entries at start, but only while the daemon still
+holds them, so update and start Toolport before you next log out or reboot. If
+your keyring was already rejected, the old file is still on disk and you can
+recover it by hand:
+
+1. If the "create a new keyring" prompt is open, cancel it. Quit the apps that
+   use the keyring, browsers included: a browser that runs without its key can
+   delete the cookies it cannot read.
+2. Copy `~/.local/share/keyrings` somewhere safe.
+3. Open the old file (usually `Default_keyring.keyring`, a text file that starts
+   with `[keyring]`) in a text editor. Find each item whose `display-name` starts
+   with `client-backup-`. Delete it from its `[N]` line through the last
+   `[N:attributeM]` group that follows, including the config text in between.
+   These are Toolport's saved copies of your client configs from before it
+   changed them, which it uses to restore them when you disconnect a client or
+   uninstall. Your current configs are untouched, but Toolport can no longer
+   restore those originals afterwards. The folder copy from step 2 still holds
+   them as plain text if you need one back.
+4. If a new keyring file was created, move it out of the folder, and make
+   `~/.local/share/keyrings/default` name the old keyring (for example
+   `Default_keyring`, without the extension).
+5. Run `systemctl --user restart gnome-keyring-daemon`, then log out and back in.
+
+If the journal still reports an invalid format, or you are unsure which lines to
+remove, [open an issue](https://github.com/btsouth/toolport/issues) before you
+change anything else.
+
 ## Known issues
 
 - **Linux only, glib `VariantStrIter` soundness ([RUSTSEC-2024-0429](https://rustsec.org/advisories/RUSTSEC-2024-0429)).**

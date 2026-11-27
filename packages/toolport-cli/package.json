@@ -1,6 +1,6 @@
 {
   "name": "@toolport/cli",
-  "version": "2.4.2",
+  "version": "2.4.3",
   "description": "One setup for every coding agent: check agents, find plaintext secrets, profile token use and bootstrap repos from toolport.toml.",
   "license": "MIT",
   "author": "South Forge AI",
@@ -36,10 +36,10 @@
     "test": "node --test test/"
   },
   "optionalDependencies": {
-    "@toolport/cli-darwin-arm64": "2.4.2",
-    "@toolport/cli-darwin-x64": "2.4.2",
-    "@toolport/cli-linux-arm64": "2.4.2",
-    "@toolport/cli-linux-x64": "2.4.2",
-    "@toolport/cli-win32-x64": "2.4.2"
+    "@toolport/cli-darwin-arm64": "2.4.3",
+    "@toolport/cli-darwin-x64": "2.4.3",
+    "@toolport/cli-linux-arm64": "2.4.3",
+    "@toolport/cli-linux-x64": "2.4.3",
+    "@toolport/cli-win32-x64": "2.4.3"
   }
 }
