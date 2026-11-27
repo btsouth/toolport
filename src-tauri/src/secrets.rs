@@ -119,6 +119,7 @@ mod line_safe {
     /// one of the daemon's own groups or keys: the daemon rejects it at the
     /// next load. A config's lines would pass a looser "group or key=value"
     /// test and load back as a phantom item, so only the real shapes count.
+    #[cfg(test)]
     pub(super) fn unloadable_key_file(text: &str) -> bool {
         !text
             .lines()
