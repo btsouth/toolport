@@ -4407,6 +4407,29 @@ pub(crate) mod tests {
         }
     }
 
+    /// The damage check on a real keyring file named by
+    /// `TOOLPORT_TEST_KEYRING_FILE`, expecting `TOOLPORT_TEST_EXPECT_DAMAGED`
+    /// items. Prints only item paths and accounts, never a secret.
+    #[test]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    #[ignore = "reads a keyring file named by TOOLPORT_TEST_KEYRING_FILE"]
+    fn the_damage_check_on_a_real_keyring_file() {
+        let file = std::path::PathBuf::from(
+            std::env::var_os("TOOLPORT_TEST_KEYRING_FILE").expect("keyring file"),
+        );
+        let expect: usize = std::env::var("TOOLPORT_TEST_EXPECT_DAMAGED")
+            .expect("expected count")
+            .parse()
+            .unwrap();
+        let text = String::from_utf8_lossy(&std::fs::read(&file).unwrap()).into_owned();
+        let identifier = file.file_stem().unwrap().to_str().unwrap();
+        let damaged = line_safe::damaged_toolport_items(identifier, &text);
+        for item in &damaged {
+            println!("damaged: {} {}", item.path, item.account);
+        }
+        assert_eq!(damaged.len(), expect);
+    }
+
     /// Every item in every collection that is not Toolport's, as
     /// `path -> (label, sorted attributes, secret bytes)`. The repair must
     /// never change one, add one or remove one.
