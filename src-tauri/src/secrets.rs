@@ -2930,6 +2930,11 @@ pub(crate) fn repair_line_unsafe_items() -> usize {
         {
             return 0;
         }
+        // A search of a locked store can itself ask (KeePassXC opens its
+        // unlock dialog for one), so a store that would ask waits too.
+        if store_would_prompt() {
+            return 0;
+        }
         match platform::repair_line_unsafe_items() {
             Ok(0) | Err(_) => 0,
             Ok(repaired) => {
