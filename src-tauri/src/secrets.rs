@@ -4407,6 +4407,209 @@ pub(crate) mod tests {
         }
     }
 
+    /// Every item in every collection that is not Toolport's, as
+    /// `path -> (label, sorted attributes, secret bytes)`. The repair must
+    /// never change one, add one or remove one.
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    fn foreign_items_snapshot(
+    ) -> std::collections::BTreeMap<String, (String, Vec<(String, String)>, Vec<u8>)> {
+        let service =
+            dbus_secret_service::SecretService::connect(dbus_secret_service::EncryptionType::Dh)
+                .unwrap();
+        let mut out = std::collections::BTreeMap::new();
+        for collection in service.get_all_collections().unwrap() {
+            for item in collection.get_all_items().unwrap() {
+                let attributes = item.get_attributes().unwrap();
+                if attributes.get("service").map(String::as_str) == Some(SERVICE) {
+                    continue;
+                }
+                let mut sorted: Vec<_> = attributes.into_iter().collect();
+                sorted.sort();
+                out.insert(
+                    item.path.to_string(),
+                    (
+                        item.get_label().unwrap(),
+                        sorted,
+                        item.get_secret().unwrap(),
+                    ),
+                );
+            }
+        }
+        out
+    }
+
+    /// Other apps' items in an unencrypted keyring that also holds Toolport
+    /// items 2.3.6 to 2.4.2 stored raw. Run by a script that drives a
+    /// throwaway gnome-keyring through `TOOLPORT_TEST_KEYRING_PHASE`:
+    /// `seed` (raw Toolport items beside other apps' items), `repair` (the
+    /// start-up repair; nothing foreign changes), the daemon restarted to
+    /// reload the file, then `reloaded` (the file loaded; every item reads
+    /// back). `TOOLPORT_TEST_SNAPSHOT` names a file kept between phases.
+    /// `broken` instead runs the repair after the daemon already rejected
+    /// the file at start, as at the login after the bug: nothing may change.
+    #[test]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    #[ignore = "needs a throwaway gnome-keyring driven through several phases"]
+    fn the_start_up_repair_never_touches_another_apps_items() {
+        let phase = std::env::var("TOOLPORT_TEST_KEYRING_PHASE").unwrap_or_default();
+        let file = std::path::PathBuf::from(
+            std::env::var_os("TOOLPORT_TEST_PLAINTEXT_KEYRING").expect("keyring file"),
+        );
+        let dir = file.parent().unwrap().to_path_buf();
+        let snapshot_file =
+            std::path::PathBuf::from(std::env::var_os("TOOLPORT_TEST_SNAPSHOT").expect("snapshot"));
+        let _data = crate::registry::DataDirTestEnv::new(
+            "the_start_up_repair_never_touches_another_apps_items",
+        );
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let config = "model = \"x\"\n\n[projects.\"/home/a\"]\ntrust_level = \"trusted\"\n[[skills.config]]\nenabled = true\n[4:attribute0]\nname=service\n";
+        let pem = "-----BEGIN KEY-----\nabc\n-----END KEY-----\n";
+        let toolport = [
+            ("client-backup-scenario", "CLIENT_BACKUP", config),
+            ("scenario-pem", "API_KEY", pem),
+            ("scenario-plain", "API_KEY", "plain-token-123"),
+        ];
+        let raw = |sid: &str, key: &str| {
+            let owner = crate::local_auth::owner(sid).unwrap();
+            keyring::Entry::new(SERVICE, &account(&owner, key)).unwrap()
+        };
+        let save = |snapshot: &std::collections::BTreeMap<
+            String,
+            (String, Vec<(String, String)>, Vec<u8>),
+        >| {
+            std::fs::write(&snapshot_file, serde_json::to_vec(snapshot).unwrap()).unwrap();
+        };
+        let load =
+            || -> std::collections::BTreeMap<String, (String, Vec<(String, String)>, Vec<u8>)> {
+                serde_json::from_slice(&std::fs::read(&snapshot_file).unwrap()).unwrap()
+            };
+        match phase.as_str() {
+            "seed" => {
+                let service = dbus_secret_service::SecretService::connect(
+                    dbus_secret_service::EncryptionType::Dh,
+                )
+                .unwrap();
+                let collection = service.get_default_collection().unwrap();
+                // Shapes other apps store: browsers' cookie keys, a token
+                // JSON, and look-alikes of Toolport's own attributes.
+                let foreign: [(&str, Vec<(&str, &str)>, &str); 6] = [
+                    (
+                        "Chromium Safe Storage",
+                        vec![
+                            ("application", "chromium"),
+                            ("xdg:schema", "chrome_libsecret_os_crypt_password_v2"),
+                        ],
+                        "dGhpcyBpcyBub3QgYSByZWFsIGtleQ==",
+                    ),
+                    (
+                        "Brave Safe Storage",
+                        vec![
+                            ("application", "brave"),
+                            ("xdg:schema", "chrome_libsecret_os_crypt_password_v2"),
+                        ],
+                        "YW5vdGhlciBmYWtlIGtleQ==",
+                    ),
+                    (
+                        "Some app token",
+                        vec![("service", "some-app"), ("username", "me@example.com")],
+                        "{\"access\":\"a.b.c\",\"refresh\":\"r\",\"exp\":1795575891}",
+                    ),
+                    (
+                        "Look-alike backup",
+                        vec![
+                            ("service", "conduit-mcp-other"),
+                            ("username", "client-backup-abc"),
+                        ],
+                        "not toolport's",
+                    ),
+                    (
+                        "Look-alike service",
+                        vec![
+                            ("service", "other"),
+                            ("username", "client-backup-def::CLIENT_BACKUP"),
+                        ],
+                        "also not toolport's",
+                    ),
+                    (
+                        "Padded but harmless",
+                        vec![("service", "padded-app"), ("username", "u")],
+                        "value with = and [brackets] and unicode é",
+                    ),
+                ];
+                for (label, attributes, secret) in &foreign {
+                    collection
+                        .create_item(
+                            label,
+                            attributes.iter().copied().collect(),
+                            secret.as_bytes(),
+                            true,
+                            "text/plain",
+                        )
+                        .unwrap();
+                }
+                // What 2.3.6 to 2.4.2 stored, raw, between other apps' items.
+                for (sid, key, value) in toolport {
+                    raw(sid, key).set_password(value).unwrap();
+                }
+                let snapshot = foreign_items_snapshot();
+                assert_eq!(snapshot.len(), foreign.len());
+                save(&snapshot);
+            }
+            "repair" => {
+                let damaged = line_safe::damaged_toolport_items_in(&dir);
+                assert_eq!(damaged.len(), 2, "{damaged:?}");
+                assert_eq!(platform::repair_line_unsafe_items(&damaged).unwrap(), 2);
+                assert_eq!(foreign_items_snapshot(), load(), "a foreign item changed");
+                for (sid, key, value) in toolport {
+                    assert_eq!(get_secret(sid, key).as_deref(), Some(value), "{sid}");
+                }
+                // The plain credential is left exactly as it was stored.
+                assert_eq!(
+                    raw("scenario-plain", "API_KEY").get_password().unwrap(),
+                    "plain-token-123"
+                );
+                assert!(line_safe::damaged_toolport_items_in(&dir).is_empty());
+            }
+            "reloaded" => {
+                assert_eq!(foreign_items_snapshot(), load(), "a foreign item changed");
+                for (sid, key, value) in toolport {
+                    assert_eq!(get_secret(sid, key).as_deref(), Some(value), "{sid}");
+                }
+                assert!(line_safe::damaged_toolport_items_in(&dir).is_empty());
+                assert_eq!(
+                    platform::repair_line_unsafe_items(&line_safe::damaged_toolport_items_in(&dir))
+                        .unwrap(),
+                    0
+                );
+            }
+            "broken" => {
+                let before_file = std::fs::read(&file).unwrap();
+                let mut before_dir: Vec<_> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect();
+                before_dir.sort();
+                let before_items = foreign_items_snapshot();
+                let damaged = line_safe::damaged_toolport_items_in(&dir);
+                assert!(!damaged.is_empty(), "the file on disk shows the damage");
+                assert_eq!(platform::repair_line_unsafe_items(&damaged).unwrap(), 0);
+                assert_eq!(
+                    std::fs::read(&file).unwrap(),
+                    before_file,
+                    "the file changed"
+                );
+                let mut after_dir: Vec<_> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect();
+                after_dir.sort();
+                assert_eq!(after_dir, before_dir, "a keyring file was added or removed");
+                assert_eq!(foreign_items_snapshot(), before_items);
+            }
+            other => panic!("unknown TOOLPORT_TEST_KEYRING_PHASE {other:?}"),
+        }
+    }
+
     #[test]
     #[cfg(target_os = "windows")]
     fn windows_oversized_secret_round_trips_updates_and_deletes() {
