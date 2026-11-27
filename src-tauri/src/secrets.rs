@@ -81,7 +81,7 @@ mod line_safe {
     /// its `[N:attributeM]` or `[N:aclM]` groups.
     enum Header {
         Keyring,
-        Item(u64),
+        Item(u64, String),
         Attribute(u64),
         Acl,
     }
@@ -98,7 +98,7 @@ mod line_safe {
         }
         let id = item.parse().ok()?;
         if rest.is_empty() {
-            Some(Header::Item(id))
+            Some(Header::Item(id, item.to_string()))
         } else if rest.strip_prefix("attribute").is_some_and(digits) {
             Some(Header::Attribute(id))
         } else if rest.strip_prefix("acl").is_some_and(digits) {
@@ -124,6 +124,28 @@ mod line_safe {
         !text
             .lines()
             .all(|line| line.is_empty() || header(line).is_some() || daemon_key(line).is_some())
+    }
+
+    /// A key file value as GKeyFile reads it: `\s`, `\n`, `\t`, `\r` and
+    /// `\\` unescaped.
+    fn unescape(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        let mut chars = value.chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('s') => out.push(' '),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some(other) => out.push(other),
+                None => out.push('\\'),
+            }
+        }
+        out
     }
 
     /// A Toolport item an unencrypted keyring file shows stored raw in a
@@ -156,13 +178,17 @@ mod line_safe {
     pub(super) fn damaged_toolport_items(identifier: &str, text: &str) -> Vec<Damaged> {
         #[derive(Default)]
         struct Item {
+            id: String,
             damaged: bool,
             raw_backslash: bool,
             service: Option<String>,
             username: Option<String>,
         }
         let mut items = std::collections::BTreeMap::<u64, Item>::new();
+        // Stray lines belong to the item whose secret came last: a raw
+        // secret can hold a line that reads as another item's header.
         let mut last: Option<u64> = None;
+        let mut secret_owner: Option<u64> = None;
         let mut attribute: (Option<String>, Option<String>) = (None, None);
         let mut current: Option<Header> = None;
         let flush = |items: &mut std::collections::BTreeMap<u64, Item>,
@@ -173,8 +199,8 @@ mod line_safe {
             {
                 let item = items.entry(*id).or_default();
                 match name.as_str() {
-                    "service" => item.service = Some(value),
-                    "username" => item.username = Some(value),
+                    "service" => item.service = Some(unescape(&value)),
+                    "username" => item.username = Some(unescape(&value)),
                     _ => {}
                 }
             }
@@ -182,9 +208,9 @@ mod line_safe {
         for line in text.lines() {
             if let Some(next) = header(line) {
                 flush(&mut items, &current, &mut attribute);
-                if let Header::Item(id) = next {
-                    items.entry(id).or_default();
-                    last = Some(id);
+                if let Header::Item(id, digits) = &next {
+                    items.entry(*id).or_default().id = digits.clone();
+                    last = Some(*id);
                 }
                 current = Some(next);
                 continue;
@@ -194,14 +220,15 @@ mod line_safe {
             }
             let key = daemon_key(line);
             let ok = match (&current, key) {
-                (Some(Header::Item(id)), Some(("secret", value))) => {
+                (Some(Header::Item(id, _)), Some(("secret", value))) => {
+                    secret_owner = Some(*id);
                     if !value.starts_with(MARKER) && value.contains('\\') {
                         items.entry(*id).or_default().raw_backslash = true;
                     }
                     true
                 }
                 (
-                    Some(Header::Item(_)),
+                    Some(Header::Item(..)),
                     Some(("item-type" | "display-name" | "mtime" | "ctime", _)),
                 ) => true,
                 (Some(Header::Attribute(_)), Some(("name", value))) => {
@@ -217,7 +244,7 @@ mod line_safe {
                 _ => false,
             };
             if !ok {
-                if let Some(id) = last {
+                if let Some(id) = secret_owner.or(last) {
                     items.entry(id).or_default().damaged = true;
                 }
             }
@@ -226,13 +253,13 @@ mod line_safe {
         let collection = collection_path(identifier);
         items
             .into_iter()
-            .filter_map(|(id, item)| {
+            .filter_map(|(_, item)| {
                 let account = item.username?;
                 let backup = account.starts_with(super::BACKUP_ACCOUNT_PREFIX);
                 (item.service.as_deref() == Some(super::SERVICE)
                     && (item.damaged || backup && item.raw_backslash))
                     .then(|| Damaged {
-                        path: format!("{collection}/{id}"),
+                        path: format!("{collection}/{}", item.id),
                         account,
                     })
             })
@@ -1608,7 +1635,7 @@ mod platform {
     }
 
     /// Re-store, encoded, each of the `damaged` items (found in an
-    /// unencrypted keyring file) that is still unlocked at its path: any value
+    /// unencrypted keyring file) that is unlocked at its path: any value
     /// with a line break (those break the whole file), and client backups
     /// (whole config files only the app reads) with anything a key file line
     /// cannot carry. The daemon still holds the items in memory and rewrites
@@ -1625,21 +1652,24 @@ mod platform {
             for target in damaged {
                 let backup = target.account.starts_with(super::BACKUP_ACCOUNT_PREFIX);
                 let result = with_backup_service(|service| {
-                    let found = service
-                        .search_items(std::collections::HashMap::from([
-                            ("service", SERVICE),
-                            ("username", target.account.as_str()),
-                        ]))
-                        .map_err(|error| classify(&error))?;
-                    // That file's item only: the same account elsewhere (an
-                    // encrypted keyring, another provider) is left unread.
-                    let Some(item) = found
-                        .unlocked
-                        .iter()
-                        .find(|item| item.path.to_string() == target.path)
-                    else {
+                    // That file's item, opened by its path with no search: a
+                    // search of a locked store can ask (KeePassXC opens its
+                    // unlock dialog for one), and the same account elsewhere
+                    // (an encrypted keyring, another provider) stays unread.
+                    let Ok(path) = dbus_secret_service::Path::new(target.path.clone()) else {
                         return Ok(false);
                     };
+                    let item = dbus_secret_service::Item::new(service, path);
+                    // A property read; a missing item fails it.
+                    if item.is_locked().unwrap_or(true) {
+                        return Ok(false);
+                    }
+                    let attributes = item.get_attributes().map_err(|error| classify(&error))?;
+                    if attributes.get("service").map(String::as_str) != Some(SERVICE)
+                        || attributes.get("username") != Some(&target.account)
+                    {
+                        return Ok(false);
+                    }
                     let bytes = item.get_secret().map_err(|error| classify(&error))?;
                     let Ok(text) = String::from_utf8(bytes) else {
                         return Ok(false);
@@ -3076,11 +3106,6 @@ pub(crate) fn repair_line_unsafe_items() -> usize {
         if damaged.is_empty() {
             return 0;
         }
-        // A search of a locked store can itself ask (KeePassXC opens its
-        // unlock dialog for one), so a store that would ask waits too.
-        if store_would_prompt() {
-            return 0;
-        }
         match platform::repair_line_unsafe_items(&damaged) {
             Ok(0) | Err(_) => 0,
             Ok(repaired) => {
@@ -3699,6 +3724,11 @@ pub(crate) mod tests {
             keyring_item(12, "other-app", "x", "a\nb"),
             // Continuation lines that pass as keys still belong to the item.
             keyring_item(13, SERVICE, "srv::JSON", "{\nenabled=true\n}"),
+            // A raw secret holding a line that reads as another item's header.
+            keyring_item(5, "other-app", "y", "fine"),
+            keyring_item(14, SERVICE, "srv::HDR", "line1\n[5]\nfoo"),
+            // The file escapes attribute values; the account is unescaped.
+            keyring_item(15, SERVICE, r"srv::A\\B", "a\nb c"),
         ]
         .concat();
         let found = line_safe::damaged_toolport_items("Default_keyring", &text);
@@ -3721,6 +3751,14 @@ pub(crate) mod tests {
                 line_safe::Damaged {
                     path: path(13),
                     account: "srv::JSON".into()
+                },
+                line_safe::Damaged {
+                    path: path(14),
+                    account: "srv::HDR".into()
+                },
+                line_safe::Damaged {
+                    path: path(15),
+                    account: r"srv::A\B".into()
                 },
             ]
         );
